@@ -133,6 +133,10 @@ export async function bootstrap(opts: BootstrapOpts = {}): Promise<BootstrapResu
   mkdirSync(dir, { recursive: true });
   persistTokenIntoEnvFile(join(dir, ".env"), claudeToken);
 
+  // install() is itself idempotent (see install.ts:418-441 — the bun-add gate
+  // skips re-linking when the package is already wired). That's what lets a
+  // failed mid-loop bootstrap retry cleanly on the next boot without
+  // double-installing the modules that already succeeded.
   for (const short of modules) {
     log(`bootstrap: — ${short} —`);
     const installOpts: InstallOpts = {
