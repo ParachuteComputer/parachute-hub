@@ -12,7 +12,7 @@
  * Routes (all bound to 127.0.0.1):
  *   /                                         → hub.html
  *   /hub.html                                 → hub.html
- *   /.well-known/parachute.json               → parachute.json
+ *   /.well-known/parachute.json               → built dynamically from services.json
  *   /.well-known/jwks.json                    → JWKS from hub.db
  *   /.well-known/oauth-authorization-server   → RFC 8414 metadata (issuer, endpoints)
  *   /oauth/authorize  (GET + POST)            → login → consent → auth code
@@ -23,9 +23,11 @@
  * Invoked as:
  *   bun <this-file> --port <n> --well-known-dir <path> [--db <path>] [--issuer <url>]
  *
- * `--well-known-dir` is the directory containing both `hub.html` and
- * `parachute.json` (both written by `parachute expose`). Kept as one flag so
- * the lifecycle side doesn't have to care how the hub server lays out files.
+ * `--well-known-dir` is the directory containing `hub.html` (written by
+ * `parachute expose`). The well-known doc is no longer served from this
+ * directory — it's built on every GET from `services.json` so changes to
+ * the installed-services list (e.g. `parachute vault create`) are visible
+ * immediately without a re-expose.
  *
  * `--db` is the path to `hub.db`. JWKS is served live from the DB so key
  * rotation takes effect on the next request without re-running
@@ -44,6 +46,7 @@ import {
   handleAdminLogoutPost,
 } from "./admin-handlers.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
+import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
 import { pemToJwk } from "./jwks.ts";
 import {
@@ -54,7 +57,9 @@ import {
   handleRevoke,
   handleToken,
 } from "./oauth-handlers.ts";
+import { readManifest } from "./services-manifest.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
+import { buildWellKnown } from "./well-known.ts";
 
 interface Args {
   port: number;
@@ -100,8 +105,13 @@ function parseArgs(argv: string[]): Args {
 }
 
 export interface HubFetchDeps {
-  /** Lazily opens (or returns a cached handle to) the hub DB. */
-  getDb: () => Database;
+  /**
+   * Lazily opens (or returns a cached handle to) the hub DB. Optional so
+   * tests can exercise routes that don't touch the DB (the well-known doc,
+   * static assets) without standing up a fixture; runtime returns 503 for
+   * DB-dependent routes when this is absent.
+   */
+  getDb?: () => Database;
   /**
    * Hub origin used as the OAuth `iss` claim and to build the authorization-
    * server metadata document. When omitted, OAuth endpoints fall back to the
@@ -109,6 +119,13 @@ export interface HubFetchDeps {
    * proxy where the request origin is the loopback.
    */
   issuer?: string;
+  /**
+   * Path to the services manifest read on each `/.well-known/parachute.json`
+   * GET. Tests point this at a tmpdir; production uses the default ecosystem
+   * path. Read-on-each-request (cheap — single ~KB JSON parse) is what makes
+   * the doc reflect `parachute vault create` etc. without re-running expose.
+   */
+  manifestPath?: string;
 }
 
 export function hubFetch(
@@ -116,9 +133,9 @@ export function hubFetch(
   deps?: HubFetchDeps,
 ): (req: Request) => Response | Promise<Response> {
   const hubHtmlPath = join(wellKnownDir, "hub.html");
-  const parachuteJsonPath = join(wellKnownDir, "parachute.json");
   const getDb = deps?.getDb;
   const configuredIssuer = deps?.issuer;
+  const manifestPath = deps?.manifestPath ?? SERVICES_MANIFEST_PATH;
 
   const oauthDeps = (req: Request) => ({
     issuer: configuredIssuer ?? new URL(req.url).origin,
@@ -150,15 +167,30 @@ export function hubFetch(
       if (req.method === "OPTIONS") {
         return new Response(null, { status: 204, headers: corsHeaders });
       }
-      if (!existsSync(parachuteJsonPath)) {
-        return new Response("parachute.json not found", {
-          status: 404,
-          headers: corsHeaders,
+      // Built dynamically from services.json on every request — that's what
+      // makes `parachute vault create` show up here without re-running
+      // expose. canonicalOrigin reuses the OAuth issuer fallback: prefer the
+      // configured public origin (set by `--issuer https://<fqdn>`), else
+      // the request's own origin (fine for direct loopback hits).
+      try {
+        const manifest = readManifest(manifestPath);
+        const canonicalOrigin = configuredIssuer ?? new URL(req.url).origin;
+        const doc = buildWellKnown({
+          services: manifest.services,
+          canonicalOrigin,
+        });
+        return new Response(JSON.stringify(doc), {
+          headers: { "content-type": "application/json", ...corsHeaders },
+        });
+      } catch (err) {
+        // ServicesManifestError lands here too — corrupt JSON or schema
+        // violation in services.json shouldn't crash the hub for everyone.
+        const msg = err instanceof Error ? err.message : String(err);
+        return new Response(JSON.stringify({ error: `well-known build failed: ${msg}` }), {
+          status: 500,
+          headers: { "content-type": "application/json", ...corsHeaders },
         });
       }
-      return new Response(Bun.file(parachuteJsonPath), {
-        headers: { "content-type": "application/json", ...corsHeaders },
-      });
     }
 
     if (pathname === "/.well-known/jwks.json") {
