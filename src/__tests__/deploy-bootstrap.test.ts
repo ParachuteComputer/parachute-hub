@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -51,6 +51,12 @@ describe("bootstrap — fresh-boot path", () => {
         parachute_version: "0.4.0-rc.27",
       });
       expect(result.marker).toEqual(marker);
+
+      // #137: writeMarkerAtomic uses tmp+rename. The rename must complete
+      // (otherwise readMarker on next boot picks up a half-written file),
+      // so no `bootstrap.json.tmp-*` should remain.
+      const tmpLeftover = readdirSync(h.dir).filter((f) => f.startsWith("bootstrap.json.tmp-"));
+      expect(tmpLeftover).toEqual([]);
     } finally {
       h.cleanup();
     }
