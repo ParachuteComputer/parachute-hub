@@ -22,7 +22,12 @@ import {
   readLastProvider,
   writeLastProvider,
 } from "../expose-last-provider.ts";
-import { getTailscaleStatus, isTailscaleInstalled } from "../tailscale/detect.ts";
+import {
+  type ProviderAvailability,
+  detectProviders,
+  isCloudflareReady,
+  isTailnetReady,
+} from "../providers/detect.ts";
 import { type Runner, defaultRunner } from "../tailscale/run.ts";
 import { type AuthPreflightOpts, runAuthPreflight } from "./expose-auth-preflight.ts";
 import {
@@ -130,40 +135,8 @@ function resolve(opts: ExposeInteractiveOpts): Resolved {
   };
 }
 
-interface Readiness {
-  tailscaleInstalled: boolean;
-  tailscaleLoggedIn: boolean;
-  tailscaleFunnelCap: boolean;
-  cloudflareInstalled: boolean;
-  cloudflareLoggedIn: boolean;
-}
-
-async function detectReadiness(r: Resolved): Promise<Readiness> {
-  const tailscaleInstalled = await isTailscaleInstalled(r.runner);
-  // One `tailscale status --json` covers both login state and Funnel cap.
-  // Skipped when the binary's missing — the call would just fail.
-  const { loggedIn: tailscaleLoggedIn, funnelCapable: tailscaleFunnelCap } = tailscaleInstalled
-    ? await getTailscaleStatus(r.runner)
-    : { loggedIn: false, funnelCapable: false };
-
-  const cloudflareInstalled = await isCloudflaredInstalled(r.runner);
-  const cloudflareLoggedIn = cloudflareInstalled ? isCloudflaredLoggedIn(r.cloudflaredHome) : false;
-
-  return {
-    tailscaleInstalled,
-    tailscaleLoggedIn,
-    tailscaleFunnelCap,
-    cloudflareInstalled,
-    cloudflareLoggedIn,
-  };
-}
-
-function isTailscaleReady(r: Readiness): boolean {
-  return r.tailscaleInstalled && r.tailscaleLoggedIn && r.tailscaleFunnelCap;
-}
-
-function isCloudflareReady(r: Readiness): boolean {
-  return r.cloudflareInstalled && r.cloudflareLoggedIn;
+async function probeReadiness(r: Resolved): Promise<ProviderAvailability> {
+  return detectProviders({ runner: r.runner, cloudflaredHome: r.cloudflaredHome });
 }
 
 type PickResult = ExposeProvider | "quit";
@@ -221,11 +194,11 @@ async function promptHostname(r: Resolved): Promise<string | undefined> {
  * an admin-console change scoped to the tailnet — the CLI impersonating
  * either would be presumptuous. User re-runs after fixing.
  */
-function printTailscaleSetupGuidance(r: Resolved, readiness: Readiness): void {
+function printTailscaleSetupGuidance(r: Resolved, readiness: ProviderAvailability): void {
   r.log("");
   r.log("Tailscale Funnel needs three things:");
   r.log("");
-  if (!readiness.tailscaleInstalled) {
+  if (!readiness.tailnet.available) {
     r.log("  1. Install Tailscale:");
     if (r.platform === "darwin") {
       r.log("       brew install tailscale");
@@ -235,13 +208,13 @@ function printTailscaleSetupGuidance(r: Resolved, readiness: Readiness): void {
   } else {
     r.log("  1. ✓ Tailscale is installed.");
   }
-  if (!readiness.tailscaleLoggedIn) {
+  if (!readiness.tailnet.loggedIn) {
     r.log("  2. Log this machine into your tailnet:");
     r.log("       tailscale up");
   } else {
     r.log("  2. ✓ This machine is logged in.");
   }
-  if (!readiness.tailscaleFunnelCap) {
+  if (!readiness.tailnet.funnelEnabled) {
     r.log("  3. Enable Funnel for this node in your tailnet ACLs:");
     r.log("       https://login.tailscale.com/admin/acls");
     r.log("     Add (or merge) this block under the ACL's top-level object:");
@@ -264,9 +237,12 @@ function printTailscaleSetupGuidance(r: Resolved, readiness: Readiness): void {
  * pointers and bail so the user can pick apt/dnf/tarball. Returns true only
  * when cloudflared is both present and logged in afterwards.
  */
-async function guideCloudflareSetup(r: Resolved, readiness: Readiness): Promise<boolean> {
-  let installed = readiness.cloudflareInstalled;
-  let loggedIn = readiness.cloudflareLoggedIn;
+async function guideCloudflareSetup(
+  r: Resolved,
+  readiness: ProviderAvailability,
+): Promise<boolean> {
+  let installed = readiness.cloudflare.available;
+  let loggedIn = readiness.cloudflare.loggedIn;
 
   if (!installed) {
     if (r.platform === "darwin") {
@@ -349,8 +325,8 @@ function defaultProviderFrom(lastPath: string): ExposeProvider {
 
 export async function exposePublicInteractive(opts: ExposeInteractiveOpts = {}): Promise<number> {
   const r = resolve(opts);
-  const readiness = await detectReadiness(r);
-  const tsReady = isTailscaleReady(readiness);
+  const readiness = await probeReadiness(r);
+  const tsReady = isTailnetReady(readiness);
   const cfReady = isCloudflareReady(readiness);
 
   let provider: ExposeProvider;
