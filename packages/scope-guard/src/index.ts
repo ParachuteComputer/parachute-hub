@@ -10,3 +10,13 @@
 
 export { extractBearer, looksLikeJwt, parseScopes } from "./parse";
 export { hasScope } from "./scope";
+export type { JwksGetter, JwksOptions } from "./jwks";
+export {
+  createScopeGuard,
+  HubJwtError,
+  type CreateScopeGuardOptions,
+  type HubJwtClaims,
+  type HubJwtErrorCode,
+  type ScopeGuard,
+  type ValidateHubJwtOptions,
+} from "./validate";
