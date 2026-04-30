@@ -392,6 +392,9 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   //     something new) falls through to the consent screen.
   const hasUnnamedVault = unnamedVaultVerbs(requestedScopes).length > 0;
   if (!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)) {
+    console.log(
+      `consent skipped: existing grant covers requested scope client_id=${client.clientId} user_id=${session.userId} scopes=${requestedScopes.join(" ")}`,
+    );
     return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
   }
 

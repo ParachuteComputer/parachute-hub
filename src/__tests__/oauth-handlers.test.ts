@@ -2777,6 +2777,47 @@ describe("handleAuthorizeGet — skip consent when scope already granted (#75)",
     }
   });
 
+  test("skip-consent emits an audit log line with client_id, user_id, and scopes (#120)", async () => {
+    const { db, cleanup } = await makeDb();
+    const originalLog = console.log;
+    const lines: string[] = [];
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const { recordGrant } = await import("../grants.ts");
+      recordGrant(db, user.id, reg.client.clientId, ["vault:default:read", "scribe:transcribe"]);
+
+      const getReq = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read scribe:transcribe",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "skip",
+        }),
+        { headers: { cookie: buildSessionCookie(session.id, 86400) } },
+      );
+      const getRes = handleAuthorizeGet(db, getReq, { issuer: ISSUER });
+      expect(getRes.status).toBe(302);
+
+      const skip = lines.find((l) => l.startsWith("consent skipped:"));
+      expect(skip).toBeDefined();
+      expect(skip).toContain(`client_id=${reg.client.clientId}`);
+      expect(skip).toContain(`user_id=${user.id}`);
+      expect(skip).toContain("scopes=vault:default:read scribe:transcribe");
+    } finally {
+      console.log = originalLog;
+      cleanup();
+    }
+  });
+
   test("subset of granted scopes also skips consent", async () => {
     const { db, cleanup } = await makeDb();
     try {
