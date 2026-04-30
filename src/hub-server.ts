@@ -47,6 +47,7 @@ import {
 } from "./admin-handlers.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
+import { HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
 import { pemToJwk } from "./jwks.ts";
 import {
@@ -57,6 +58,7 @@ import {
   handleRevoke,
   handleToken,
 } from "./oauth-handlers.ts";
+import { clearPid, writePid } from "./process-state.ts";
 import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
 import { buildWellKnown, isVaultEntry } from "./well-known.ts";
@@ -435,6 +437,26 @@ if (import.meta.main) {
     hostname: "127.0.0.1",
     fetch: hubFetch(wellKnownDir, { getDb, issuer }),
   });
+  // Register PID + port from the running hub itself so any startup path
+  // (spawn-via-`ensureHubRunning` or a direct `bun src/hub-server.ts` from
+  // a developer or supervisor) lands the same lifecycle files at
+  // ~/.parachute/hub/run/. Manual starts used to be invisible — `parachute
+  // expose` then spawned another hub that collided on 1939 (#148).
+  writePid(HUB_SVC, process.pid);
+  writeHubPort(port);
+  const cleanup = () => {
+    clearPid(HUB_SVC);
+    clearHubPort();
+  };
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on("exit", cleanup);
   console.log(
     `parachute-hub listening on http://127.0.0.1:${port} (dir=${wellKnownDir}, db=${dbPath}${
       issuer ? `, issuer=${issuer}` : ""

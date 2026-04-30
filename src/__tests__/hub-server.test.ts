@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { HUB_SVC, hubPortPath } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { findVaultUpstream, hubFetch } from "../hub-server.ts";
+import { pidPath } from "../process-state.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 
@@ -775,3 +778,58 @@ async function pickClosedPort(): Promise<number> {
   s.stop(true);
   return port;
 }
+
+const HUB_SERVER_PATH = fileURLToPath(new URL("../hub-server.ts", import.meta.url));
+
+async function pollUntil(check: () => boolean, timeoutMs = 3000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return true;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return false;
+}
+
+describe("hub-server.ts startup PID/port registration (#148)", () => {
+  test("manual `bun src/hub-server.ts` writes hub.pid and hub.port; SIGTERM clears them", async () => {
+    const port = await pickClosedPort();
+    const configDir = mkdtempSync(join(tmpdir(), "pcli-hub-startup-"));
+    const wellKnownDir = join(configDir, "well-known");
+    const dbPath = join(configDir, "hub.db");
+
+    const proc = Bun.spawn(
+      [
+        process.execPath,
+        HUB_SERVER_PATH,
+        "--port",
+        String(port),
+        "--well-known-dir",
+        wellKnownDir,
+        "--db",
+        dbPath,
+      ],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, PARACHUTE_HOME: configDir },
+      },
+    );
+    const pidFile = pidPath(HUB_SVC, configDir);
+    const portFile = hubPortPath(configDir);
+    try {
+      const ready = await pollUntil(() => existsSync(pidFile) && existsSync(portFile));
+      expect(ready).toBe(true);
+      expect(Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10)).toBe(proc.pid);
+      expect(Number.parseInt(readFileSync(portFile, "utf8").trim(), 10)).toBe(port);
+      proc.kill("SIGTERM");
+      await proc.exited;
+      // After SIGTERM the cleanup handler should have rm'd both files —
+      // proves manual starts also play nice with `parachute expose` teardown.
+      expect(existsSync(pidFile)).toBe(false);
+      expect(existsSync(portFile)).toBe(false);
+    } finally {
+      if (!proc.killed) proc.kill("SIGKILL");
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  }, 10_000);
+});
