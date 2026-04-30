@@ -149,6 +149,32 @@ describe("cli per-subcommand help", () => {
     expect(stdout).toMatch(/--tunnel-name\b/);
   });
 
+  test("expose public --skip-provider-check pins to Tailscale-Funnel default (skips auto-pick)", async () => {
+    // With PATH="" tailscale isn't on PATH, so exposePublic prints its own
+    // install hint. That's distinct from the auto-pick "no exposure provider
+    // is set up" output — proving the skip flag bypassed auto-pick and went
+    // straight to the Funnel path. If we regressed and skip-flag tumbled
+    // into auto-pick, we'd see the auto-pick neither-ready report instead.
+    const proc = Bun.spawn(
+      [process.execPath, CLI, "expose", "public", "--skip-provider-check"],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          ...process.env,
+          PATH: "",
+          HOME: "/tmp/parachute-hub-nonexistent-home",
+          PARACHUTE_HOME: "/tmp/parachute-hub-nonexistent-home",
+        },
+      },
+    );
+    const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(/tailscale is not installed or not on PATH/);
+    expect(stdout).not.toMatch(/no exposure provider is set up/);
+    expect(stdout).not.toMatch(/Auto-detected/);
+  });
+
   test("expose with missing --domain value exits 1", async () => {
     const { code, stderr } = await runCli(["expose", "public", "--cloudflare", "--domain"]);
     expect(code).toBe(1);

@@ -473,6 +473,14 @@ async function main(argv: string[]): Promise<number> {
       // environment is already pre-flighted and the auto-pick would just
       // print noise. Both paths run only on `expose public up`; tailnet
       // exposure has only one provider so nothing to pick.
+      //
+      // `domain` and `tunnelName` are deliberately *not* threaded into
+      // auto-pick. Both are Cloudflare-only flags; if a user passes them
+      // without `--cloudflare`, threading would silently route them to
+      // Cloudflare. Better to drop the flags here and let auto-pick decide
+      // purely from what's installed — if it lands on cloudflare-only-ready,
+      // it prints the explicit `--cloudflare --domain` hint instead of
+      // guessing intent.
       if (layer === "public" && action === "up" && !flagExtract.skipProviderCheck) {
         const { exposePublicAutoPick } = await import("./commands/expose-public-auto.ts");
         return await exposePublicAutoPick({ tailscaleOpts: exposeOpts });
@@ -487,9 +495,15 @@ async function main(argv: string[]): Promise<number> {
         return await runExposePublicOffAutoDetect({ tailscaleOffOpts: exposeOpts });
       }
 
-      return layer === "public"
-        ? await exposePublic(action, exposeOpts)
-        : await exposeTailnet(action, exposeOpts);
+      // `--skip-provider-check` fallthrough: pin to today's Tailscale-Funnel
+      // default for `expose public up`. Made explicit (rather than letting
+      // it tumble through the layer ternary) so the escape-hatch branch is
+      // visible at a glance.
+      if (layer === "public" && action === "up" && flagExtract.skipProviderCheck) {
+        return await exposePublic("up", exposeOpts);
+      }
+
+      return await exposeTailnet(action, exposeOpts);
     }
 
     case "start": {

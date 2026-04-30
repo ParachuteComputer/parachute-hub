@@ -28,6 +28,7 @@
  * tailscale/cloudflared.
  */
 
+import { DEFAULT_CLOUDFLARED_HOME } from "../cloudflare/detect.ts";
 import {
   type ProviderAvailability,
   type DetectProvidersOpts,
@@ -50,6 +51,8 @@ export interface ExposePublicAutoOpts {
   tailscaleOpts?: ExposeOpts;
   /** Forwarded to the Cloudflare handoff. */
   cloudflareOpts?: ExposeCloudflareOpts;
+  /** Override `~/.cloudflared` (parity with the interactive picker's seam). */
+  cloudflaredHome?: string;
   log?: (line: string) => void;
 
   /** Test seams. */
@@ -63,6 +66,7 @@ interface Resolved {
   tunnelName: string | undefined;
   tailscaleOpts: ExposeOpts;
   cloudflareOpts: ExposeCloudflareOpts;
+  cloudflaredHome: string;
   log: (line: string) => void;
   detectProvidersImpl: (opts: DetectProvidersOpts) => Promise<ProviderAvailability>;
   exposePublicImpl: (action: "up", opts: ExposeOpts) => Promise<number>;
@@ -75,6 +79,7 @@ function resolve(opts: ExposePublicAutoOpts): Resolved {
     tunnelName: opts.tunnelName,
     tailscaleOpts: opts.tailscaleOpts ?? {},
     cloudflareOpts: opts.cloudflareOpts ?? {},
+    cloudflaredHome: opts.cloudflaredHome ?? DEFAULT_CLOUDFLARED_HOME,
     log: opts.log ?? ((line) => console.log(line)),
     detectProvidersImpl: opts.detectProvidersImpl ?? detectProviders,
     exposePublicImpl: opts.exposePublicImpl ?? ((a, o) => defaultExposePublic(a, o)),
@@ -153,7 +158,7 @@ export async function exposePublicAutoPick(
   opts: ExposePublicAutoOpts = {},
 ): Promise<number> {
   const r = resolve(opts);
-  const availability = await r.detectProvidersImpl({});
+  const availability = await r.detectProvidersImpl({ cloudflaredHome: r.cloudflaredHome });
   const tsReady = isTailnetReady(availability);
   const cfReady = isCloudflareReady(availability);
 
