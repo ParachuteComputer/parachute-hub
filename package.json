@@ -11,6 +11,7 @@
   "bin": {
     "parachute": "src/cli.ts"
   },
+  "workspaces": ["packages/*"],
   "files": ["src", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
