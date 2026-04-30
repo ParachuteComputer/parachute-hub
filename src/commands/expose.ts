@@ -29,6 +29,7 @@ import {
   WELL_KNOWN_MOUNT,
   WELL_KNOWN_PATH,
   buildWellKnown,
+  isVaultEntry,
   shortName,
   writeWellKnownFile,
 } from "../well-known.ts";
@@ -120,6 +121,19 @@ const OAUTH_PATHS = [
 ] as const;
 
 /**
+ * Single tailscale serve mount that catches every `/vault/<name>/...` request
+ * and routes it through the hub. The hub then reads services.json on each
+ * request to pick the right vault backend (#144). Consolidating to one mount
+ * means `parachute vault create techne` is reachable on the tailnet without
+ * re-running `parachute expose` — only the hub-internal lookup needs to know
+ * about the new path.
+ *
+ * Trailing slash distinguishes the mount from `/vaults` (the create-vault
+ * POST endpoint, an exact-match on hub).
+ */
+const VAULT_MOUNT = "/vault/";
+
+/**
  * Remap legacy `paths: ["/"]` entries to `/<shortname>` so they don't collide
  * with the hub page at `/`. Emits a warning per remapped service. This is the
  * transitional path for services installed before the vault PR that writes
@@ -205,13 +219,29 @@ function planEntries(services: readonly ServiceEntry[], hubPort: number): ServeE
     target: serviceProxyTarget(hubPort, HUB_MOUNT),
     service: "hub",
   });
+  let anyVault = false;
   for (const s of services) {
+    if (isVaultEntry(s)) {
+      // Vault paths route through the single `/vault/` → hub mount below so
+      // `parachute vault create <name>` is reachable on the tailnet without
+      // a re-expose. Hub does the per-request services.json lookup (#144).
+      anyVault = true;
+      continue;
+    }
     const mount = s.paths[0] ?? `/${shortName(s.name)}`;
     entries.push({
       kind: "proxy",
       mount,
       target: serviceProxyTarget(s.port, mount),
       service: s.name,
+    });
+  }
+  if (anyVault) {
+    entries.push({
+      kind: "proxy",
+      mount: VAULT_MOUNT,
+      target: serviceProxyTarget(hubPort, VAULT_MOUNT),
+      service: "vault",
     });
   }
   entries.push({
