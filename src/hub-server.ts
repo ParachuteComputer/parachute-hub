@@ -57,9 +57,9 @@ import {
   handleRevoke,
   handleToken,
 } from "./oauth-handlers.ts";
-import { readManifest } from "./services-manifest.ts";
+import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
-import { buildWellKnown } from "./well-known.ts";
+import { buildWellKnown, isVaultEntry } from "./well-known.ts";
 
 interface Args {
   port: number;
@@ -104,6 +104,98 @@ function parseArgs(argv: string[]): Args {
   return { port, wellKnownDir, dbPath: dbPath ?? hubDbPath(), issuer };
 }
 
+/**
+ * Resolve which vault ServiceEntry should handle a given request pathname.
+ *
+ * Vault paths look like `/vault/<name>` or `/vault/<name>/<rest>`. A request
+ * matches a vault entry if the pathname equals one of its mount paths exactly
+ * or starts with `<mount>/`. When several mounts could match (one vault has
+ * `/vault` and another has `/vault/foo` — pathological but representable),
+ * the longer mount wins so the more specific install handles it.
+ *
+ * Returns `undefined` when no vault is mounted at this pathname; the caller
+ * 404s. The lookup is per-request because services.json mutates whenever
+ * `parachute vault create` runs and we don't want the user to re-expose just
+ * to make a freshly-created vault routable on the tailnet (#144).
+ */
+export function findVaultUpstream(
+  services: readonly ServiceEntry[],
+  pathname: string,
+): { port: number; mount: string; entry: ServiceEntry } | undefined {
+  let best: { port: number; mount: string; entry: ServiceEntry } | undefined;
+  for (const s of services) {
+    if (!isVaultEntry(s)) continue;
+    for (const path of s.paths) {
+      if (pathname === path || pathname.startsWith(`${path}/`)) {
+        if (!best || path.length > best.mount.length) {
+          best = { port: s.port, mount: path, entry: s };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Reverse-proxy a `/vault/<name>/*` request onto the vault backend's loopback
+ * port. The path is preserved end-to-end (vault since paraclaw#18 expects
+ * requests at `/vault/<name>/...` not stripped to `/...`), so the upstream URL
+ * mirrors the incoming pathname exactly.
+ *
+ * `manifestPath` is the services.json path from `HubFetchDeps`. Read on every
+ * proxied request so a vault created seconds ago is reachable without a
+ * re-expose — same dynamism as the well-known doc (#135).
+ *
+ * Returns `undefined` when no vault is currently mounted at this pathname so
+ * the caller falls through to the catch-all 404. Returns a 502 response when
+ * the upstream connection fails (vault crashed, port shifted) — the upstream
+ * URL was valid; we just couldn't reach it.
+ *
+ * Hop-by-hop notes: WebSocket upgrades and HTTP/2 trailers don't traverse
+ * fetch-based proxies cleanly. Vault uses neither today; if a future service
+ * needs them, switch to a Node http.IncomingMessage / http.request pair.
+ */
+async function proxyToVault(req: Request, manifestPath: string): Promise<Response | undefined> {
+  let services: readonly ServiceEntry[];
+  try {
+    services = readManifest(manifestPath).services;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return new Response(JSON.stringify({ error: `vault routing failed: ${msg}` }), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const url = new URL(req.url);
+  const match = findVaultUpstream(services, url.pathname);
+  if (!match) return undefined;
+
+  const upstream = `http://127.0.0.1:${match.port}${url.pathname}${url.search}`;
+  const headers = new Headers(req.headers);
+  // Host comes from the requester (tailnet FQDN); the loopback target wants
+  // its own. Bun's fetch fills it in when omitted.
+  headers.delete("host");
+
+  const init: RequestInit & { duplex?: "half" } = {
+    method: req.method,
+    headers,
+    redirect: "manual",
+  };
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    init.body = req.body;
+    init.duplex = "half";
+  }
+  try {
+    return await fetch(upstream, init);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return new Response(JSON.stringify({ error: `vault upstream unreachable: ${msg}` }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+}
+
 export interface HubFetchDeps {
   /**
    * Lazily opens (or returns a cached handle to) the hub DB. Optional so
@@ -141,7 +233,7 @@ export function hubFetch(
     issuer: configuredIssuer ?? new URL(req.url).origin,
   });
 
-  return (req) => {
+  return async (req) => {
     const url = new URL(req.url);
     const pathname = url.pathname;
 
@@ -314,6 +406,17 @@ export function hubFetch(
         return new Response("not found", { status: 404 });
       }
       return handleAdminConfigPost(getDb(), req, name);
+    }
+
+    // Dynamic vault routing — services.json is the source of truth, read per
+    // request so a `parachute vault create` performed after `parachute expose`
+    // is immediately reachable on the tailnet (#144). Tailscale serve mounts
+    // a single `/vault/` → hub entry; this handler picks the specific vault
+    // backend by longest-mount-prefix on every request.
+    if (pathname.startsWith("/vault/")) {
+      const proxied = await proxyToVault(req, manifestPath);
+      if (proxied) return proxied;
+      // Fall through to the catch-all 404 below — no vault claims this path.
     }
 
     return new Response("not found", { status: 404 });
