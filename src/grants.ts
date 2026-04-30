@@ -72,18 +72,24 @@ export function recordGrant(
   newScopes: readonly string[],
   now: Date = new Date(),
 ): Grant {
-  const existing = findGrant(db, userId, clientId);
-  const merged = new Set<string>(existing?.scopes ?? []);
-  for (const s of newScopes) {
-    if (s.length > 0) merged.add(s);
-  }
-  const scopes = Array.from(merged).sort();
-  const grantedAt = now.toISOString();
-  db.prepare(
-    `INSERT OR REPLACE INTO grants (user_id, client_id, scopes, granted_at)
-     VALUES (?, ?, ?, ?)`,
-  ).run(userId, clientId, scopes.join(" "), grantedAt);
-  return { userId, clientId, scopes, grantedAt };
+  // Wrapped in a transaction so the read-merge-write is atomic. Without
+  // this, two concurrent consents for the same (user, client) could both
+  // SELECT the same prior row and then race to INSERT OR REPLACE, with the
+  // later writer's UNION missing scopes the earlier writer added.
+  return db.transaction(() => {
+    const existing = findGrant(db, userId, clientId);
+    const merged = new Set<string>(existing?.scopes ?? []);
+    for (const s of newScopes) {
+      if (s.length > 0) merged.add(s);
+    }
+    const scopes = Array.from(merged).sort();
+    const grantedAt = now.toISOString();
+    db.prepare(
+      `INSERT OR REPLACE INTO grants (user_id, client_id, scopes, granted_at)
+       VALUES (?, ?, ?, ?)`,
+    ).run(userId, clientId, scopes.join(" "), grantedAt);
+    return { userId, clientId, scopes, grantedAt };
+  })();
 }
 
 /**

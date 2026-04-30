@@ -122,6 +122,30 @@ describe("grants module (#75)", () => {
     }
   });
 
+  test("recordGrant: concurrent calls produce one row with the union of scopes (#119)", async () => {
+    const h = await harness();
+    try {
+      // Fire two recordGrant calls "concurrently" via Promise.all. The
+      // transaction wrapper means the read-merge-write is atomic, so the
+      // second writer always sees the first writer's scopes — neither set
+      // gets dropped.
+      await Promise.all([
+        Promise.resolve().then(() => recordGrant(h.db, h.userId, h.clientId, ["a", "b"])),
+        Promise.resolve().then(() => recordGrant(h.db, h.userId, h.clientId, ["c", "d"])),
+      ]);
+      const rowCount = (
+        h.db
+          .prepare("SELECT COUNT(*) AS n FROM grants WHERE user_id = ? AND client_id = ?")
+          .get(h.userId, h.clientId) as { n: number }
+      ).n;
+      expect(rowCount).toBe(1);
+      const grant = findGrant(h.db, h.userId, h.clientId);
+      expect(new Set(grant?.scopes)).toEqual(new Set(["a", "b", "c", "d"]));
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("listGrantsForUser orders most-recent first", async () => {
     const h = await harness();
     try {
