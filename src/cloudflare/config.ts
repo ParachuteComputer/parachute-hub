@@ -3,8 +3,30 @@ import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "../config.ts";
 
 export const CLOUDFLARED_DIR = join(CONFIG_DIR, "cloudflared");
-export const CLOUDFLARED_CONFIG_PATH = join(CLOUDFLARED_DIR, "config.yml");
-export const CLOUDFLARED_LOG_PATH = join(CLOUDFLARED_DIR, "cloudflared.log");
+
+export const DEFAULT_TUNNEL_NAME = "parachute";
+
+/**
+ * Per-tunnel config + log file paths. Each tunnel gets its own subdirectory
+ * under `~/.parachute/cloudflared/<tunnelName>/` so multiple tunnels on one
+ * box don't trample each other's config.yml or interleave log lines.
+ *
+ * The default tunnel ("parachute") lives at
+ * `~/.parachute/cloudflared/parachute/{config.yml,cloudflared.log}` — a
+ * location change from pre-#32 (`~/.parachute/cloudflared/config.yml`).
+ * Re-running `parachute expose public --cloudflare` regenerates the file
+ * at the new path; the legacy file is left in place but unused.
+ */
+export function cloudflaredPathsFor(tunnelName: string): {
+  configPath: string;
+  logPath: string;
+} {
+  const dir = join(CLOUDFLARED_DIR, tunnelName);
+  return {
+    configPath: join(dir, "config.yml"),
+    logPath: join(dir, "cloudflared.log"),
+  };
+}
 
 export interface TunnelConfigOpts {
   tunnelUuid: string;
@@ -48,10 +70,7 @@ ingress:
 `;
 }
 
-export function writeConfig(
-  opts: TunnelConfigOpts,
-  configPath: string = CLOUDFLARED_CONFIG_PATH,
-): string {
+export function writeConfig(opts: TunnelConfigOpts, configPath: string): string {
   mkdirSync(dirname(configPath), { recursive: true });
   writeFileSync(configPath, renderConfig(opts));
   return configPath;

@@ -1,11 +1,6 @@
 import { mkdirSync, openSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import {
-  CLOUDFLARED_CONFIG_PATH,
-  CLOUDFLARED_LOG_PATH,
-  writeConfig,
-} from "../cloudflare/config.ts";
+import { dirname } from "node:path";
+import { DEFAULT_TUNNEL_NAME, cloudflaredPathsFor, writeConfig } from "../cloudflare/config.ts";
 import {
   DEFAULT_CLOUDFLARED_HOME,
   cloudflaredInstallHint,
@@ -14,9 +9,13 @@ import {
 } from "../cloudflare/detect.ts";
 import {
   CLOUDFLARED_STATE_PATH,
-  type CloudflaredState,
+  type CloudflaredTunnelRecord,
   clearCloudflaredState,
+  findTunnelRecord,
+  listTunnelRecords,
   readCloudflaredState,
+  withTunnelRecord,
+  withoutTunnelRecord,
   writeCloudflaredState,
 } from "../cloudflare/state.ts";
 import {
@@ -32,18 +31,20 @@ import { type AliveFn, defaultAlive } from "../process-state.ts";
 import { readManifest } from "../services-manifest.ts";
 import { type Runner, defaultRunner } from "../tailscale/run.ts";
 
-/**
- * Single canonical tunnel name reused across runs. Creating fresh tunnels
- * per invocation would leave orphaned tunnels in the user's Cloudflare
- * account every time they rotated hostnames; re-use keeps that clean.
- *
- * If someone needs multiple tunnels on one box (dev + prod, two domains),
- * we'll add `--tunnel-name` later. Single-tunnel covers the launch use case.
- */
-const TUNNEL_NAME = "parachute";
-
 const AUTH_DOC_URL =
   "https://github.com/ParachuteComputer/parachute-vault/blob/main/docs/auth-model.md";
+
+/**
+ * Tunnel-name validation. We mirror the conservative shape Cloudflare itself
+ * uses for tunnel identifiers — alphanumerics, hyphens, underscores — and
+ * keep it short enough to fit in a path segment without surprising the
+ * filesystem (e.g. macOS encoded NFC quirks). Anything more permissive would
+ * just push validation work onto the cloudflared binary.
+ */
+export function isValidTunnelName(name: string): boolean {
+  if (name.length === 0 || name.length > 64) return false;
+  return /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name);
+}
 
 /**
  * Hostname validation — permissive by design. We reject the obviously broken
@@ -86,9 +87,21 @@ export interface ExposeCloudflareOpts {
   log?: (line: string) => void;
   manifestPath?: string;
   statePath?: string;
-  /** Path to the cloudflared config.yml this invocation writes. */
+  /**
+   * Tunnel name targeted by this invocation. Defaults to `parachute` —
+   * the canonical single-tunnel name. Override to run multiple tunnels on
+   * one box (#32).
+   */
+  tunnelName?: string;
+  /**
+   * Path to the cloudflared config.yml this invocation writes. Defaults to
+   * the per-tunnel layout `~/.parachute/cloudflared/<tunnelName>/config.yml`.
+   */
   configPath?: string;
-  /** Path to the log file the spawned cloudflared appends to. */
+  /**
+   * Path to the log file the spawned cloudflared appends to. Defaults to
+   * the per-tunnel layout `~/.parachute/cloudflared/<tunnelName>/cloudflared.log`.
+   */
   logPath?: string;
   /** Override `~/.cloudflared` for tests and `$HOME`-free environments. */
   cloudflaredHome?: string;
@@ -103,6 +116,7 @@ interface Resolved {
   log: (line: string) => void;
   manifestPath: string;
   statePath: string;
+  tunnelName: string;
   configPath: string;
   logPath: string;
   cloudflaredHome: string;
@@ -110,6 +124,8 @@ interface Resolved {
 }
 
 function resolve(opts: ExposeCloudflareOpts): Resolved {
+  const tunnelName = opts.tunnelName ?? DEFAULT_TUNNEL_NAME;
+  const paths = cloudflaredPathsFor(tunnelName);
   return {
     runner: opts.runner ?? defaultRunner,
     spawner: opts.spawner ?? defaultCloudflaredSpawner,
@@ -118,8 +134,9 @@ function resolve(opts: ExposeCloudflareOpts): Resolved {
     log: opts.log ?? ((line) => console.log(line)),
     manifestPath: opts.manifestPath ?? SERVICES_MANIFEST_PATH,
     statePath: opts.statePath ?? CLOUDFLARED_STATE_PATH,
-    configPath: opts.configPath ?? CLOUDFLARED_CONFIG_PATH,
-    logPath: opts.logPath ?? CLOUDFLARED_LOG_PATH,
+    tunnelName,
+    configPath: opts.configPath ?? paths.configPath,
+    logPath: opts.logPath ?? paths.logPath,
     cloudflaredHome: opts.cloudflaredHome ?? DEFAULT_CLOUDFLARED_HOME,
     now: opts.now ?? (() => new Date()),
   };
@@ -152,6 +169,13 @@ export async function exposeCloudflareUp(
   opts: ExposeCloudflareOpts = {},
 ): Promise<number> {
   const r = resolve(opts);
+
+  if (!isValidTunnelName(r.tunnelName)) {
+    r.log(
+      `parachute expose public --cloudflare: --tunnel-name must be alphanumeric with -/_ (got "${r.tunnelName}").`,
+    );
+    return 1;
+  }
 
   if (!isValidHostname(hostname)) {
     r.log(
@@ -194,25 +218,25 @@ export async function exposeCloudflareUp(
 
   let tunnel: Tunnel | undefined;
   try {
-    tunnel = await findTunnelByName(r.runner, TUNNEL_NAME);
+    tunnel = await findTunnelByName(r.runner, r.tunnelName);
   } catch (err) {
     return reportCloudflaredError(err, r.log);
   }
   if (!tunnel) {
-    r.log(`Creating Cloudflare tunnel "${TUNNEL_NAME}"…`);
+    r.log(`Creating Cloudflare tunnel "${r.tunnelName}"…`);
     try {
-      tunnel = await createTunnel(r.runner, TUNNEL_NAME);
+      tunnel = await createTunnel(r.runner, r.tunnelName);
     } catch (err) {
       return reportCloudflaredError(err, r.log);
     }
     r.log(`✓ Created tunnel ${tunnel.id}`);
   } else {
-    r.log(`✓ Reusing existing tunnel "${TUNNEL_NAME}" (${tunnel.id})`);
+    r.log(`✓ Reusing existing tunnel "${r.tunnelName}" (${tunnel.id})`);
   }
 
   r.log(`Routing DNS: ${hostname} → tunnel ${tunnel.id}…`);
   try {
-    await routeDns(r.runner, TUNNEL_NAME, hostname);
+    await routeDns(r.runner, r.tunnelName, hostname);
   } catch (err) {
     if (err instanceof CloudflaredError) {
       r.log("");
@@ -241,32 +265,31 @@ export async function exposeCloudflareUp(
   );
   r.log(`✓ Wrote ${r.configPath}`);
 
-  const prior = readCloudflaredState(r.statePath);
+  const stateBefore = readCloudflaredState(r.statePath);
+  const prior = findTunnelRecord(stateBefore, r.tunnelName);
   if (prior && r.alive(prior.pid)) {
     try {
       r.kill(prior.pid, "SIGTERM");
       r.log(`Stopped prior cloudflared (pid ${prior.pid}).`);
     } catch {
-      // Process is already gone — safe to ignore; clearCloudflaredState drops the state file below.
+      // Process is already gone — safe to ignore; we replace the record below.
     }
   }
-  if (prior) clearCloudflaredState(r.statePath);
 
   const pid = r.spawner.spawn(
     ["cloudflared", "tunnel", "--config", r.configPath, "run"],
     r.logPath,
   );
 
-  const state: CloudflaredState = {
-    version: 1,
+  const record: CloudflaredTunnelRecord = {
     pid,
     tunnelUuid: tunnel.id,
-    tunnelName: TUNNEL_NAME,
+    tunnelName: r.tunnelName,
     hostname,
     startedAt: r.now().toISOString(),
     configPath: r.configPath,
   };
-  writeCloudflaredState(state, r.statePath);
+  writeCloudflaredState(withTunnelRecord(stateBefore, record), r.statePath);
 
   const baseUrl = `https://${hostname}`;
   // A well-formed vault manifest always lists at least one mount path. If
@@ -295,28 +318,45 @@ export async function exposeCloudflareUp(
 
 export async function exposeCloudflareOff(opts: ExposeCloudflareOpts = {}): Promise<number> {
   const r = resolve(opts);
-  const state = readCloudflaredState(r.statePath);
-  if (!state) {
-    r.log("No Cloudflare exposure recorded. Nothing to tear down.");
+  const stateBefore = readCloudflaredState(r.statePath);
+  const record = findTunnelRecord(stateBefore, r.tunnelName);
+  if (!record) {
+    if (stateBefore && Object.keys(stateBefore.tunnels).length > 0) {
+      const others = listTunnelRecords(stateBefore)
+        .map((t) => t.tunnelName)
+        .join(", ");
+      r.log(
+        `No Cloudflare exposure recorded for tunnel "${r.tunnelName}". Other tunnels: ${others}.`,
+      );
+    } else {
+      r.log("No Cloudflare exposure recorded. Nothing to tear down.");
+    }
     return 0;
   }
-  if (r.alive(state.pid)) {
+  if (r.alive(record.pid)) {
     try {
-      r.kill(state.pid, "SIGTERM");
-      r.log(`✓ Stopped cloudflared (pid ${state.pid}).`);
+      r.kill(record.pid, "SIGTERM");
+      r.log(`✓ Stopped cloudflared (pid ${record.pid}).`);
     } catch (err) {
       r.log(`✗ Failed to stop cloudflared: ${err instanceof Error ? err.message : String(err)}`);
       return 1;
     }
   } else {
-    r.log(`cloudflared (pid ${state.pid}) wasn't running; clearing stale state.`);
+    r.log(`cloudflared (pid ${record.pid}) wasn't running; clearing stale state.`);
   }
-  clearCloudflaredState(r.statePath);
-  r.log(`  ${state.hostname} is no longer reachable through this machine.`);
+  const stateAfter = withoutTunnelRecord(stateBefore, r.tunnelName);
+  if (stateAfter) {
+    writeCloudflaredState(stateAfter, r.statePath);
+  } else {
+    clearCloudflaredState(r.statePath);
+  }
+  r.log(`  ${record.hostname} is no longer reachable through this machine.`);
   r.log(
-    `  Tunnel "${state.tunnelName}" (${state.tunnelUuid}) remains defined in Cloudflare; re-running`,
+    `  Tunnel "${record.tunnelName}" (${record.tunnelUuid}) remains defined in Cloudflare; re-running`,
   );
-  r.log(`  \`parachute expose public --cloudflare --domain ${state.hostname}\` reuses it.`);
+  r.log(
+    `  \`parachute expose public --cloudflare --domain ${record.hostname}${record.tunnelName === DEFAULT_TUNNEL_NAME ? "" : ` --tunnel-name ${record.tunnelName}`}\` reuses it.`,
+  );
   return 0;
 }
 

@@ -144,19 +144,22 @@ function extractNamedFlag(
 
 /**
  * Extract the Cloudflare-mode flags from `parachute expose public …`:
- * `--cloudflare` (boolean) + `--domain=<host>` / `--domain <host>`. Returns
- * the stripped argv so the layer/action parser sees `[layer, action?]`
- * regardless of flag placement.
+ * `--cloudflare` (boolean), `--domain=<host>` / `--domain <host>`, and the
+ * optional `--tunnel-name=<name>` / `--tunnel-name <name>` (#32) used to
+ * coexist multiple tunnels on one box. Returns the stripped argv so the
+ * layer/action parser sees `[layer, action?]` regardless of flag placement.
  */
 function extractCloudflareFlags(args: string[]): {
   cloudflare: boolean;
   domain?: string;
+  tunnelName?: string;
   rest: string[];
   error?: string;
 } {
   const rest: string[] = [];
   let cloudflare = false;
   let domain: string | undefined;
+  let tunnelName: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--cloudflare") {
@@ -175,9 +178,27 @@ function extractCloudflareFlags(args: string[]): {
       if (!domain) return { cloudflare, rest, error: "--domain requires a hostname argument" };
       continue;
     }
+    if (a === "--tunnel-name") {
+      const v = args[i + 1];
+      if (!v) return { cloudflare, rest, error: "--tunnel-name requires a name argument" };
+      tunnelName = v;
+      i++;
+      continue;
+    }
+    if (a?.startsWith("--tunnel-name=")) {
+      tunnelName = a.slice("--tunnel-name=".length);
+      if (!tunnelName) return { cloudflare, rest, error: "--tunnel-name requires a name argument" };
+      continue;
+    }
     if (a !== undefined) rest.push(a);
   }
-  return { cloudflare, domain, rest };
+  const out: { cloudflare: boolean; domain?: string; tunnelName?: string; rest: string[] } = {
+    cloudflare,
+    rest,
+  };
+  if (domain !== undefined) out.domain = domain;
+  if (tunnelName !== undefined) out.tunnelName = tunnelName;
+  return out;
 }
 
 async function main(argv: string[]): Promise<number> {
@@ -324,8 +345,9 @@ async function main(argv: string[]): Promise<number> {
         const { exposeCloudflareUp, exposeCloudflareOff } = await import(
           "./commands/expose-cloudflare.ts"
         );
+        const cfOpts = cfExtract.tunnelName ? { tunnelName: cfExtract.tunnelName } : {};
         if (action === "off") {
-          return await exposeCloudflareOff();
+          return await exposeCloudflareOff(cfOpts);
         }
         if (!cfExtract.domain) {
           // Partial flag promotion: the user told us they want Cloudflare but
@@ -349,7 +371,7 @@ async function main(argv: string[]): Promise<number> {
           console.error("  parachute expose public");
           return 1;
         }
-        return await exposeCloudflareUp(cfExtract.domain);
+        return await exposeCloudflareUp(cfExtract.domain, cfOpts);
       }
 
       const exposeOpts = hubExtract.hubOrigin ? { hubOrigin: hubExtract.hubOrigin } : {};

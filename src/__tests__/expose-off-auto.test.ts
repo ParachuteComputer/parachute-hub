@@ -26,16 +26,22 @@ function tailscaleState(overrides: Partial<ExposeState> = {}): ExposeState {
   };
 }
 
-function cloudflaredState(overrides: Partial<CloudflaredState> = {}): CloudflaredState {
+function cloudflaredState(
+  overrides: { hostname?: string; tunnelName?: string; pid?: number } = {},
+): CloudflaredState {
+  const tunnelName = overrides.tunnelName ?? "vault-tunnel";
   return {
-    version: 1,
-    pid: 4242,
-    tunnelUuid: "11111111-2222-3333-4444-555555555555",
-    tunnelName: "vault-tunnel",
-    hostname: "vault.example.com",
-    startedAt: "2026-04-23T10:00:00.000Z",
-    configPath: "/tmp/config.yml",
-    ...overrides,
+    version: 2,
+    tunnels: {
+      [tunnelName]: {
+        pid: overrides.pid ?? 4242,
+        tunnelUuid: "11111111-2222-3333-4444-555555555555",
+        tunnelName,
+        hostname: overrides.hostname ?? "vault.example.com",
+        startedAt: "2026-04-23T10:00:00.000Z",
+        configPath: "/tmp/config.yml",
+      },
+    },
   };
 }
 

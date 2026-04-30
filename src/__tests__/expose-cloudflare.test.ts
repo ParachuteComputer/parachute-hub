@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readCloudflaredState, writeCloudflaredState } from "../cloudflare/state.ts";
+import {
+  type CloudflaredTunnelRecord,
+  findTunnelRecord,
+  readCloudflaredState,
+  withTunnelRecord,
+  writeCloudflaredState,
+} from "../cloudflare/state.ts";
 import {
   type CloudflaredSpawner,
   exposeCloudflareOff,
@@ -29,8 +35,8 @@ function makeEnv(opts: { includeVault?: boolean; loggedIn?: boolean } = {}): Tes
   const cloudflaredHome = join(dir, "cloudflared");
   const manifestPath = join(configDir, "services.json");
   const statePath = join(configDir, "cloudflared-state.json");
-  const configPath = join(configDir, "cloudflared", "config.yml");
-  const logPath = join(configDir, "cloudflared", "cloudflared.log");
+  const configPath = join(configDir, "cloudflared", "parachute", "config.yml");
+  const logPath = join(configDir, "cloudflared", "parachute", "cloudflared.log");
 
   require("node:fs").mkdirSync(configDir, { recursive: true });
   require("node:fs").mkdirSync(cloudflaredHome, { recursive: true });
@@ -148,13 +154,17 @@ describe("exposeCloudflareUp", () => {
 
       const state = readCloudflaredState(env.statePath);
       expect(state).toEqual({
-        version: 1,
-        pid: 42000,
-        tunnelUuid: uuid,
-        tunnelName: "parachute",
-        hostname: "vault.example.com",
-        startedAt: "2026-04-22T12:00:00.000Z",
-        configPath: env.configPath,
+        version: 2,
+        tunnels: {
+          parachute: {
+            pid: 42000,
+            tunnelUuid: uuid,
+            tunnelName: "parachute",
+            hostname: "vault.example.com",
+            startedAt: "2026-04-22T12:00:00.000Z",
+            configPath: env.configPath,
+          },
+        },
       });
 
       const yaml = readFileSync(env.configPath, "utf8");
@@ -231,6 +241,33 @@ describe("exposeCloudflareUp", () => {
       expect(code).toBe(1);
       expect(calls).toHaveLength(0);
       expect(logs.join("\n")).toContain("--domain must be a valid hostname");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("rejects invalid tunnel names up front", async () => {
+    const env = makeEnv();
+    try {
+      const { runner, calls } = queueRunner([]);
+      const { spawner } = fakeSpawner(0);
+      const logs: string[] = [];
+
+      const code = await exposeCloudflareUp("vault.example.com", {
+        runner,
+        spawner,
+        log: (l) => logs.push(l),
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        tunnelName: "bad name with spaces",
+      });
+
+      expect(code).toBe(1);
+      expect(calls).toHaveLength(0);
+      expect(logs.join("\n")).toContain("--tunnel-name must be alphanumeric");
     } finally {
       env.cleanup();
     }
@@ -353,18 +390,15 @@ describe("exposeCloudflareUp", () => {
   test("stops a prior cloudflared process before spawning a new one", async () => {
     const env = makeEnv();
     try {
-      writeCloudflaredState(
-        {
-          version: 1,
-          pid: 99999,
-          tunnelUuid: "old-tunnel-uuid",
-          tunnelName: "parachute",
-          hostname: "vault.example.com",
-          startedAt: "2026-04-21T00:00:00.000Z",
-          configPath: env.configPath,
-        },
-        env.statePath,
-      );
+      const priorRecord: CloudflaredTunnelRecord = {
+        pid: 99999,
+        tunnelUuid: "old-tunnel-uuid",
+        tunnelName: "parachute",
+        hostname: "vault.example.com",
+        startedAt: "2026-04-21T00:00:00.000Z",
+        configPath: env.configPath,
+      };
+      writeCloudflaredState({ version: 2, tunnels: { parachute: priorRecord } }, env.statePath);
 
       const { runner } = queueRunner([
         { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
@@ -396,7 +430,83 @@ describe("exposeCloudflareUp", () => {
       expect(code).toBe(0);
       expect(killed).toEqual([{ pid: 99999, sig: "SIGTERM" }]);
       const state = readCloudflaredState(env.statePath);
-      expect(state?.pid).toBe(42010);
+      expect(findTunnelRecord(state, "parachute")?.pid).toBe(42010);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("two tunnels with different --tunnel-name coexist in state", async () => {
+    const env = makeEnv();
+    try {
+      const uuidA = "aaaa1111-aaaa-1111-aaaa-111111111111";
+      const uuidB = "bbbb2222-bbbb-2222-bbbb-222222222222";
+      // Up #1 — default name "parachute"
+      const r1 = queueRunner([
+        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+        { code: 0, stdout: "[]", stderr: "" },
+        {
+          code: 0,
+          stdout: `Created tunnel parachute with id ${uuidA}\n`,
+          stderr: "",
+        },
+        { code: 0, stdout: "", stderr: "" },
+      ]);
+      const s1 = fakeSpawner(50001);
+      const code1 = await exposeCloudflareUp("alpha.example.com", {
+        runner: r1.runner,
+        spawner: s1.spawner,
+        alive: () => false,
+        kill: () => {},
+        log: () => {},
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        cloudflaredHome: env.cloudflaredHome,
+        // Use defaults for configPath/logPath so they're per-tunnel-derived.
+      });
+      expect(code1).toBe(0);
+
+      // Up #2 — explicit --tunnel-name "second"
+      const r2 = queueRunner([
+        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+        { code: 0, stdout: "[]", stderr: "" },
+        {
+          code: 0,
+          stdout: `Created tunnel second with id ${uuidB}\n`,
+          stderr: "",
+        },
+        { code: 0, stdout: "", stderr: "" },
+      ]);
+      const s2 = fakeSpawner(50002);
+      const code2 = await exposeCloudflareUp("beta.example.com", {
+        runner: r2.runner,
+        spawner: s2.spawner,
+        alive: () => false,
+        kill: () => {},
+        log: () => {},
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        cloudflaredHome: env.cloudflaredHome,
+        tunnelName: "second",
+      });
+      expect(code2).toBe(0);
+
+      // Both tunnels should be present in state, keyed by tunnel name.
+      const state = readCloudflaredState(env.statePath);
+      expect(Object.keys(state?.tunnels ?? {}).sort()).toEqual(["parachute", "second"]);
+      expect(findTunnelRecord(state, "parachute")?.hostname).toBe("alpha.example.com");
+      expect(findTunnelRecord(state, "second")?.hostname).toBe("beta.example.com");
+      expect(findTunnelRecord(state, "second")?.pid).toBe(50002);
+
+      // Each tunnel should have written its own config file at the per-tunnel
+      // path under `~/.parachute/cloudflared/<tunnelName>/config.yml`.
+      const cfgA = findTunnelRecord(state, "parachute")?.configPath ?? "";
+      const cfgB = findTunnelRecord(state, "second")?.configPath ?? "";
+      expect(cfgA).not.toBe(cfgB);
+      expect(cfgA.endsWith("/parachute/config.yml")).toBe(true);
+      expect(cfgB.endsWith("/second/config.yml")).toBe(true);
+      expect(existsSync(cfgA)).toBe(true);
+      expect(existsSync(cfgB)).toBe(true);
     } finally {
       env.cleanup();
     }
@@ -424,13 +534,17 @@ describe("exposeCloudflareOff", () => {
     try {
       writeCloudflaredState(
         {
-          version: 1,
-          pid: 55555,
-          tunnelUuid: "dddddddd-0000-0000-0000-000000000004",
-          tunnelName: "parachute",
-          hostname: "vault.example.com",
-          startedAt: "2026-04-22T12:00:00.000Z",
-          configPath: env.configPath,
+          version: 2,
+          tunnels: {
+            parachute: {
+              pid: 55555,
+              tunnelUuid: "dddddddd-0000-0000-0000-000000000004",
+              tunnelName: "parachute",
+              hostname: "vault.example.com",
+              startedAt: "2026-04-22T12:00:00.000Z",
+              configPath: env.configPath,
+            },
+          },
         },
         env.statePath,
       );
@@ -457,13 +571,17 @@ describe("exposeCloudflareOff", () => {
     try {
       writeCloudflaredState(
         {
-          version: 1,
-          pid: 55556,
-          tunnelUuid: "eeeeeeee-0000-0000-0000-000000000005",
-          tunnelName: "parachute",
-          hostname: "vault.example.com",
-          startedAt: "2026-04-22T12:00:00.000Z",
-          configPath: env.configPath,
+          version: 2,
+          tunnels: {
+            parachute: {
+              pid: 55556,
+              tunnelUuid: "eeeeeeee-0000-0000-0000-000000000005",
+              tunnelName: "parachute",
+              hostname: "vault.example.com",
+              startedAt: "2026-04-22T12:00:00.000Z",
+              configPath: env.configPath,
+            },
+          },
         },
         env.statePath,
       );
@@ -477,6 +595,83 @@ describe("exposeCloudflareOff", () => {
       expect(code).toBe(0);
       expect(killed).toEqual([]);
       expect(existsSync(env.statePath)).toBe(false);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("targets the named tunnel and leaves siblings intact", async () => {
+    const env = makeEnv();
+    try {
+      const recordA: CloudflaredTunnelRecord = {
+        pid: 60001,
+        tunnelUuid: "aaaa-uuid",
+        tunnelName: "alpha",
+        hostname: "alpha.example.com",
+        startedAt: "2026-04-23T10:00:00.000Z",
+        configPath: "/tmp/alpha/config.yml",
+      };
+      const recordB: CloudflaredTunnelRecord = {
+        pid: 60002,
+        tunnelUuid: "bbbb-uuid",
+        tunnelName: "beta",
+        hostname: "beta.example.com",
+        startedAt: "2026-04-23T11:00:00.000Z",
+        configPath: "/tmp/beta/config.yml",
+      };
+      writeCloudflaredState(
+        withTunnelRecord(withTunnelRecord(undefined, recordA), recordB),
+        env.statePath,
+      );
+
+      const killed: number[] = [];
+      const code = await exposeCloudflareOff({
+        statePath: env.statePath,
+        alive: () => true,
+        kill: (pid) => killed.push(pid),
+        log: () => {},
+        tunnelName: "alpha",
+      });
+      expect(code).toBe(0);
+      // Only alpha's pid is killed.
+      expect(killed).toEqual([60001]);
+
+      // beta is still recorded; alpha is gone.
+      const state = readCloudflaredState(env.statePath);
+      expect(findTunnelRecord(state, "alpha")).toBeUndefined();
+      expect(findTunnelRecord(state, "beta")).toEqual(recordB);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("reports tunnel-name mismatch and lists known tunnels", async () => {
+    const env = makeEnv();
+    try {
+      const recordA: CloudflaredTunnelRecord = {
+        pid: 60001,
+        tunnelUuid: "aaaa-uuid",
+        tunnelName: "alpha",
+        hostname: "alpha.example.com",
+        startedAt: "2026-04-23T10:00:00.000Z",
+        configPath: "/tmp/alpha/config.yml",
+      };
+      writeCloudflaredState({ version: 2, tunnels: { alpha: recordA } }, env.statePath);
+
+      const logs: string[] = [];
+      const code = await exposeCloudflareOff({
+        statePath: env.statePath,
+        alive: () => true,
+        kill: () => {},
+        log: (l) => logs.push(l),
+        tunnelName: "ghost",
+      });
+      expect(code).toBe(0);
+      expect(logs.join("\n")).toContain('No Cloudflare exposure recorded for tunnel "ghost"');
+      expect(logs.join("\n")).toContain("alpha");
+      // alpha is untouched.
+      const state = readCloudflaredState(env.statePath);
+      expect(findTunnelRecord(state, "alpha")).toEqual(recordA);
     } finally {
       env.cleanup();
     }

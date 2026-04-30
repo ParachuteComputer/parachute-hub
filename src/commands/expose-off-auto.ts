@@ -15,6 +15,10 @@
  *   - Both live     → prompt (TTY) for which to tear down, or `both`;
  *                     non-TTY tears down both (off means off).
  *
+ * Since #32 the cloudflared-state.json holds a map of tunnels keyed by
+ * name, so "cloudflare is live" means any tunnel record exists; tearing
+ * down "cloudflare" iterates every recorded tunnel.
+ *
  * `--cloudflare` still works as an explicit override and skips this module
  * entirely (see cli.ts). Shape mirrors the other Layer-N modules — every
  * side-effectful edge is an injectable seam so the full decision tree is
@@ -25,6 +29,7 @@ import { createInterface } from "node:readline/promises";
 import {
   CLOUDFLARED_STATE_PATH,
   type CloudflaredState,
+  listTunnelRecords,
   readCloudflaredState,
 } from "../cloudflare/state.ts";
 import { EXPOSE_STATE_PATH, type ExposeState, readExposeState } from "../expose-state.ts";
@@ -50,7 +55,9 @@ export interface ExposePublicOffAutoOpts {
    */
   tailscaleOffOpts?: ExposeOpts;
   /**
-   * Forwarded to the cloudflare teardown. Tests use it the same way.
+   * Forwarded to the cloudflare teardown. Tests use it the same way. The
+   * wrapper sets `tunnelName` per record when iterating; callers don't need
+   * to provide it.
    */
   cloudflareOffOpts?: ExposeCloudflareOpts;
 
@@ -95,15 +102,11 @@ function tailscalePublicIsLive(state: ExposeState | undefined): state is ExposeS
 }
 
 function cloudflareIsLive(state: CloudflaredState | undefined): state is CloudflaredState {
-  return !!state;
+  return !!state && Object.keys(state.tunnels).length > 0;
 }
 
 function tailscaleUrl(state: ExposeState): string {
   return `https://${state.canonicalFqdn}`;
-}
-
-function cloudflareUrl(state: CloudflaredState): string {
-  return `https://${state.hostname}`;
 }
 
 type BothChoice = "tailscale" | "cloudflare" | "both" | "cancel";
@@ -113,9 +116,14 @@ async function promptBothLive(
   tsState: ExposeState,
   cfState: CloudflaredState,
 ): Promise<BothChoice> {
+  const records = listTunnelRecords(cfState);
+  const cfSummary =
+    records.length === 1
+      ? `https://${records[0]?.hostname}`
+      : records.map((t) => `https://${t.hostname}`).join(", ");
   r.log("Two public exposures are currently live:");
   r.log(`  [1] Tailscale Funnel  — ${tailscaleUrl(tsState)}`);
-  r.log(`  [2] Cloudflare Tunnel — ${cloudflareUrl(cfState)}`);
+  r.log(`  [2] Cloudflare Tunnel — ${cfSummary}`);
   r.log("  [3] both");
   r.log("  [4] cancel");
   while (true) {
@@ -136,10 +144,18 @@ async function tearDownTailscale(r: Resolved, state: ExposeState): Promise<numbe
 }
 
 async function tearDownCloudflare(r: Resolved, state: CloudflaredState): Promise<number> {
-  const url = cloudflareUrl(state);
-  const code = await r.exposeCloudflareOffImpl(r.cloudflareOffOpts);
-  if (code === 0) r.log(`✓ Tore down Cloudflare Tunnel (was: ${url})`);
-  return code;
+  const records = listTunnelRecords(state);
+  let firstFailure = 0;
+  for (const record of records) {
+    const url = `https://${record.hostname}`;
+    const code = await r.exposeCloudflareOffImpl({
+      ...r.cloudflareOffOpts,
+      tunnelName: record.tunnelName,
+    });
+    if (code === 0) r.log(`✓ Tore down Cloudflare Tunnel (was: ${url})`);
+    if (code !== 0 && firstFailure === 0) firstFailure = code;
+  }
+  return firstFailure;
 }
 
 export async function runExposePublicOffAutoDetect(
