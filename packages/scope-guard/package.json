@@ -1,0 +1,37 @@
+{
+  "name": "@openparachute/scope-guard",
+  "version": "0.1.0-rc.1",
+  "description": "Hub-issued JWT validation for Parachute resource servers (vault, scribe, paraclaw, third-party modules).",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ParachuteComputer/parachute-hub.git",
+    "directory": "packages/scope-guard"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "bun run build",
+    "test": "bun test src",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "jose": "^6.2.2"
+  }
+}
