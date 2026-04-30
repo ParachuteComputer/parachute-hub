@@ -115,7 +115,13 @@ export async function bootstrap(opts: BootstrapOpts = {}): Promise<BootstrapResu
   // looks fine until the next deploy/restart wipes it. Warn loudly so a
   // misconfigured machine config gets caught before the user notices their
   // vault evaporated.
-  if ((env.PARACHUTE_HOME ?? "").length === 0 && dir.startsWith(homedir())) {
+  //
+  // We check `defaultConfigDir(env)` rather than the resolved `dir` so an
+  // injected `opts.configDir` (tests, future integration harnesses) doesn't
+  // false-positive when the override happens to live under homedir; the
+  // question is "what would the production resolver return for this env?",
+  // not "where is this particular invocation writing".
+  if ((env.PARACHUTE_HOME ?? "").length === 0 && defaultConfigDir(env).startsWith(homedir())) {
     log(`bootstrap: ⚠ PARACHUTE_HOME is not set — config dir resolved to ${dir} (under homedir).`);
     log(
       "  On a containerized deploy this is the ephemeral image layer; data will NOT survive restart.",

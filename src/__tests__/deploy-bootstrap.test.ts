@@ -186,12 +186,36 @@ describe("bootstrap — ephemeral-layer guard (#131)", () => {
     }
   });
 
-  test("does not warn when configDir lives outside homedir (typical test path)", async () => {
+  // #136: heuristic keys off the env (what production would resolve to), not
+  // the injected configDir. So even with configDir pointed at a tmpdir
+  // outside homedir, the warn still fires when PARACHUTE_HOME is unset —
+  // because in production, that same env would land at ~/.parachute.
+  test("warns based on env, not the injected configDir (closes #136)", async () => {
     const h = harness();
     try {
       const logs: string[] = [];
       await bootstrap({
         env: { CLAUDE_API_TOKEN: "sk-test" },
+        configDir: h.dir,
+        log: (l) => logs.push(l),
+        installFn: async () => 0,
+        now: FROZEN_NOW,
+      });
+      expect(logs.find((l) => l.includes("PARACHUTE_HOME is not set"))).toBeDefined();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // Symmetric case: PARACHUTE_HOME pointing at a non-homedir mount (the
+  // production shape on a Fly machine), configDir injected to a tmpdir
+  // for the test. Heuristic must NOT warn — env is correct.
+  test("does not warn when PARACHUTE_HOME points at a non-homedir mount", async () => {
+    const h = harness();
+    try {
+      const logs: string[] = [];
+      await bootstrap({
+        env: { CLAUDE_API_TOKEN: "sk-test", PARACHUTE_HOME: "/data" },
         configDir: h.dir,
         log: (l) => logs.push(l),
         installFn: async () => 0,
