@@ -66,20 +66,28 @@ export function isVaultEntry(entry: ServiceEntry): boolean {
 }
 
 /**
- * Derive a vault instance name. Prefer a `/vault/<name>` path segment; fall
- * back to the manifest-name suffix (`parachute-vault-work` → `work`); last
- * resort is "default".
+ * Derive a vault instance name from a single mount path + manifest name.
+ * Prefer a `/vault/<name>` path segment; fall back to the manifest-name
+ * suffix (`parachute-vault-work` → `work`); last resort is "default".
  */
-export function vaultInstanceName(entry: ServiceEntry): string {
-  const path = entry.paths[0];
+export function vaultInstanceNameFor(name: string, path: string | undefined): string {
   if (path) {
     const match = path.match(/^\/vault\/([^/]+)/);
     if (match?.[1]) return match[1];
   }
-  if (entry.name.startsWith(`${VAULT_MANIFEST_PREFIX}-`)) {
-    return entry.name.slice(VAULT_MANIFEST_PREFIX.length + 1);
+  if (name.startsWith(`${VAULT_MANIFEST_PREFIX}-`)) {
+    return name.slice(VAULT_MANIFEST_PREFIX.length + 1);
   }
   return "default";
+}
+
+/**
+ * Back-compat wrapper that resolves a vault instance name from the entry's
+ * first mount path. Prefer `vaultInstanceNameFor(name, path)` when iterating
+ * a multi-path entry.
+ */
+export function vaultInstanceName(entry: ServiceEntry): string {
+  return vaultInstanceNameFor(entry.name, entry.paths[0]);
 }
 
 export interface BuildWellKnownOpts {
@@ -97,18 +105,31 @@ export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
   const base = opts.canonicalOrigin.replace(/\/$/, "");
   const doc: WellKnownDocument = { vaults: [], services: [] };
   for (const s of opts.services) {
-    const path = s.paths[0] ?? "/";
-    const url = new URL(path, `${base}/`).toString();
-    const infoPath = joinInfoPath(path);
-    const infoUrl = new URL(infoPath, `${base}/`).toString();
-    doc.services.push({ name: s.name, url, path, version: s.version, infoUrl });
-    if (isVaultEntry(s)) {
-      doc.vaults.push({ name: vaultInstanceName(s), url, version: s.version });
-    } else {
-      const key = shortName(s.name);
-      const bucket = (doc[key] as WellKnownServiceEntry[] | undefined) ?? [];
-      bucket.push({ url, version: s.version });
-      doc[key] = bucket;
+    // Vault services are mounted at one path per vault instance — a single
+    // ServiceEntry with `paths: ["/vault/default", "/vault/techne"]` represents
+    // two distinct vault instances behind the same backend. Iterate each path
+    // so consumers (paraclaw vault picker, hub page) see every instance
+    // (closes #141). Non-vault services keep the legacy paths[0] semantic;
+    // multi-path on those is treated as aliases rather than separate
+    // installs.
+    const isVault = isVaultEntry(s);
+    const pathsToEmit = isVault && s.paths.length > 0 ? s.paths : [s.paths[0] ?? "/"];
+    for (const path of pathsToEmit) {
+      const url = new URL(path, `${base}/`).toString();
+      const infoUrl = new URL(joinInfoPath(path), `${base}/`).toString();
+      doc.services.push({ name: s.name, url, path, version: s.version, infoUrl });
+      if (isVault) {
+        doc.vaults.push({
+          name: vaultInstanceNameFor(s.name, path),
+          url,
+          version: s.version,
+        });
+      } else {
+        const key = shortName(s.name);
+        const bucket = (doc[key] as WellKnownServiceEntry[] | undefined) ?? [];
+        bucket.push({ url, version: s.version });
+        doc[key] = bucket;
+      }
     }
   }
   return doc;
