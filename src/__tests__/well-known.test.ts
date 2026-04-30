@@ -193,6 +193,63 @@ describe("buildWellKnown", () => {
     expect(doc.vaults.map((v) => v.name).sort()).toEqual(["default", "work"]);
   });
 
+  test("single vault ServiceEntry with multiple paths emits one entry per path (closes #141)", () => {
+    // Reflects the post-#179/vault#208 manifest shape: one parachute-vault
+    // backend hosts every vault instance, expressed as one ServiceEntry with
+    // multiple paths.
+    const multi: ServiceEntry = {
+      ...vault,
+      paths: ["/vault/default", "/vault/techne"],
+    };
+    const doc = buildWellKnown({
+      services: [multi],
+      canonicalOrigin: "https://x.example",
+    });
+    expect(doc.vaults).toEqual([
+      { name: "default", url: "https://x.example/vault/default", version: "0.2.4" },
+      { name: "techne", url: "https://x.example/vault/techne", version: "0.2.4" },
+    ]);
+    // services[] mirrors the per-path expansion so the hub page and any
+    // generic consumer iterate every instance.
+    expect(doc.services).toEqual([
+      {
+        name: "parachute-vault",
+        url: "https://x.example/vault/default",
+        path: "/vault/default",
+        version: "0.2.4",
+        infoUrl: "https://x.example/vault/default/.parachute/info",
+      },
+      {
+        name: "parachute-vault",
+        url: "https://x.example/vault/techne",
+        path: "/vault/techne",
+        version: "0.2.4",
+        infoUrl: "https://x.example/vault/techne/.parachute/info",
+      },
+    ]);
+  });
+
+  test("multi-path vault entry is independent of multi-ServiceEntry shape (#141)", () => {
+    // A user could plausibly mix shapes: one multi-path bare `parachute-vault`
+    // plus a separately-installed `parachute-vault-archive`. All instances
+    // should surface.
+    const multi: ServiceEntry = {
+      ...vault,
+      paths: ["/vault/default", "/vault/techne"],
+    };
+    const archive: ServiceEntry = {
+      ...vault,
+      name: "parachute-vault-archive",
+      paths: ["/vault/archive"],
+      port: 1942,
+    };
+    const doc = buildWellKnown({
+      services: [multi, archive],
+      canonicalOrigin: "https://x.example",
+    });
+    expect(doc.vaults.map((v) => v.name).sort()).toEqual(["archive", "default", "techne"]);
+  });
+
   test("handles canonicalOrigin with trailing slash", () => {
     const doc = buildWellKnown({
       services: [vault],
