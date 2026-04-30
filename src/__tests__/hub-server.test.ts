@@ -351,6 +351,29 @@ describe("hubFetch routing", () => {
     }
   });
 
+  test("every DB-dependent route returns 503 when getDb is absent (closes #139)", async () => {
+    const h = makeHarness();
+    try {
+      const fetch = hubFetch(h.dir);
+      const cases: Array<[string, RequestInit]> = [
+        ["/oauth/token", { method: "POST" }],
+        ["/oauth/register", { method: "POST" }],
+        ["/oauth/revoke", { method: "POST" }],
+        ["/vaults", { method: "POST" }],
+        ["/admin/login", { method: "POST" }],
+        ["/admin/logout", { method: "POST" }],
+        ["/admin/config", { method: "GET" }],
+        ["/admin/config/example", { method: "POST" }],
+      ];
+      for (const [path, init] of cases) {
+        const res = await fetch(req(path, init));
+        expect(res.status).toBe(503);
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("/oauth/token rejects non-POST with 405", async () => {
     const h = makeHarness();
     try {

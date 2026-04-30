@@ -57,7 +57,7 @@ export interface ExposeOpts {
   statePath?: string;
   wellKnownPath?: string;
   hubPath?: string;
-  /** Directory holding hub.html + parachute.json (passed to the hub server). */
+  /** Directory holding hub.html (passed to the hub server). */
   wellKnownDir?: string;
   configDir?: string;
   port?: number;
@@ -361,6 +361,9 @@ export async function exposeUp(layer: ExposeLayer, opts: ExposeOpts = {}): Promi
     );
   }
 
+  // Kept for manual debugging / inspection only — the hub server now builds
+  // /.well-known/parachute.json dynamically from services.json at request time
+  // (#135), so this on-disk copy is no longer load-bearing for any consumer.
   const wellKnownDoc = buildWellKnown({ services, canonicalOrigin });
   writeWellKnownFile(wellKnownDoc, wellKnownFilePath);
   log(`Wrote ${wellKnownFilePath}`);
@@ -490,6 +493,8 @@ export async function exposeOff(layer: ExposeLayer, opts: ExposeOpts = {}): Prom
   }
 
   clearExposeState(statePath);
+  // Pair to the debug-only write at expose-up — clean up the inspection artifact
+  // on teardown so it doesn't outlive the layer it described.
   if (existsSync(wellKnownFilePath)) {
     unlinkSync(wellKnownFilePath);
   }
