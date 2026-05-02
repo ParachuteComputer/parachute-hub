@@ -118,9 +118,9 @@ describe("validateModuleManifest", () => {
     expect(() => validateModuleManifest({ ...VALID, managementUrl: 7 }, "x")).toThrow(
       /managementUrl/,
     );
-    expect(() => validateModuleManifest({ ...VALID, managementUrl: "no-leading-slash" }, "x")).toThrow(
-      /path starting with "\/" or a full http\(s\) URL/,
-    );
+    expect(() =>
+      validateModuleManifest({ ...VALID, managementUrl: "no-leading-slash" }, "x"),
+    ).toThrow(/path starting with "\/" or a full http\(s\) URL/);
     expect(() =>
       validateModuleManifest({ ...VALID, managementUrl: "ftp://example.com" }, "x"),
     ).toThrow(/http:.*https:/);

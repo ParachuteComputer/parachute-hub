@@ -54,6 +54,10 @@ import { HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
 import { pemToJwk } from "./jwks.ts";
 import {
+  type ModuleManifest,
+  readModuleManifest as defaultReadModuleManifest,
+} from "./module-manifest.ts";
+import {
   authorizationServerMetadata,
   handleAuthorizeGet,
   handleAuthorizePost,
@@ -62,10 +66,6 @@ import {
   handleToken,
 } from "./oauth-handlers.ts";
 import { clearPid, writePid } from "./process-state.ts";
-import {
-  type ModuleManifest,
-  readModuleManifest as defaultReadModuleManifest,
-} from "./module-manifest.ts";
 import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
 import { buildWellKnown, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";

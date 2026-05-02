@@ -386,7 +386,9 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
 function asManagementUrl(v: unknown, where: string): string | undefined {
   if (v === undefined) return undefined;
   if (typeof v !== "string" || v.length === 0) {
-    throw new ModuleManifestError(`${where}: "managementUrl" must be a non-empty string if present`);
+    throw new ModuleManifestError(
+      `${where}: "managementUrl" must be a non-empty string if present`,
+    );
   }
   // Two valid shapes: a path starting with "/" or a full http(s) URL.
   if (v.startsWith("/")) return v;
