@@ -78,11 +78,19 @@ bun run typecheck    # tsc --noEmit
 bun run test         # vitest run
 ```
 
-`web/ui/dist/` is committed in `.gitignore` — the hub serves it from a
-co-located bundle that Vite produces during release builds. Until a
-release pipeline lands, run `bun run build` locally; `src/hub-server.ts`
-handles a missing `dist/` by 503ing the `/hub/*` routes with a hint to
-build the SPA.
+`web/ui/dist/` is gitignored — the hub serves it from a co-located bundle
+that Vite produces. The root `package.json` wires this for you: a
+`postinstall` hook runs `bun run build:spa` after every `bun install` in
+the repo root, and `prepublishOnly` rebuilds before `bun publish` so
+the npm tarball ships a fresh `web/ui/dist/`. The `files` array in the
+root `package.json` includes `web/ui/dist`, so consumers of the
+published `@openparachute/hub` package get the bundle even though they
+don't get the SPA source.
+
+If you ever need to manually rebuild, `cd web/ui && bun run build` still
+works. `src/hub-server.ts` handles a missing `dist/` by 503ing the
+`/hub/*` routes with a hint to run the build — usually means the
+postinstall hasn't run yet.
 
 ## Brand tokens
 
