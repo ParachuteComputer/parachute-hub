@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/hub",
-  "version": "0.4.0-rc.38",
+  "version": "0.4.0-rc.39",
   "description": "parachute — the local hub for the Parachute ecosystem (discovery, ports, lifecycle, soon OAuth).",
   "license": "AGPL-3.0",
   "publishConfig": {
@@ -19,7 +19,7 @@
   },
   "scripts": {
     "start": "bun src/cli.ts",
-    "test": "bun test",
+    "test": "bun test ./src",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
