@@ -287,8 +287,9 @@ function spaContentType(pathname: string): string {
 /**
  * Serve a single file under the SPA mount, falling back to `index.html`
  * for client-side-routed paths (anything that doesn't resolve to a real
- * file under `dist/`). Path-traversal guard is the substring check on
- * the resolved absolute path — Bun.file gives us no built-in clamp.
+ * file under `dist/`). Path-traversal is blocked twice: the asset-shape
+ * filter rejects sub-paths containing "..", and the resolved absolute
+ * path is checked to start with `dist/` before any read.
  */
 async function serveSpa(spaDistDir: string, pathname: string): Promise<Response> {
   if (!existsSync(spaDistDir)) {
@@ -302,9 +303,9 @@ async function serveSpa(spaDistDir: string, pathname: string): Promise<Response>
   const indexPath = join(spaDistDir, "index.html");
 
   // Empty / mount-root / any non-asset request → SPA shell. The router takes
-  // it from there. Path traversal can't escape because we only construct a
-  // candidate path for assets that look like static files (have an extension
-  // and don't contain "..") — bare paths get the shell.
+  // it from there. First defense against traversal: bare paths and anything
+  // containing ".." never enter the asset branch — they fall through to the
+  // shell below.
   const looksLikeAsset = sub.length > 0 && /\.[a-z0-9]+$/i.test(sub) && !sub.includes("..");
   if (!looksLikeAsset) {
     return new Response(Bun.file(indexPath), {
@@ -313,7 +314,8 @@ async function serveSpa(spaDistDir: string, pathname: string): Promise<Response>
   }
 
   const filePath = resolve(spaDistDir, `.${sub}`);
-  // Belt-and-braces: if resolution lands outside dist/, deny.
+  // Second defense: even if a future tweak loosens looksLikeAsset, refuse
+  // any resolved path that escapes dist/. Belt-and-braces.
   if (!filePath.startsWith(`${spaDistDir}/`)) {
     return new Response("not found", { status: 404 });
   }

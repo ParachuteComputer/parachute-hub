@@ -110,6 +110,13 @@ export async function createVault(input: CreateVaultInput): Promise<CreateVaultR
     // the cached JWT lapsed mid-flight. Drop the cache; the auth helper
     // navigates to /admin/login on the next mint attempt if the cookie has
     // also expired. Surface the 401 so the form can re-issue cleanly.
+    //
+    // Deliberate: we don't auto-mint-and-retry transparently. A failed
+    // POST gets surfaced to the operator and a re-click drives the next
+    // attempt — which mints fresh after `clearCachedToken`. Manual retry
+    // keeps a stale-token mid-submit visible (vs. silently swallowing
+    // a state mismatch) and avoids retrying a request the user might
+    // not actually want repeated.
     clearCachedToken();
     throw new HttpError(res.status, await readError(res));
   }

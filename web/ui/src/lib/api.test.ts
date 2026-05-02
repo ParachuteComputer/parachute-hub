@@ -132,6 +132,28 @@ describe("createVault", () => {
     );
   });
 
+  it("on 200 idempotent re-POST returns the existing entry without a token", async () => {
+    // Server short-circuits when the vault already exists: same name + url +
+    // version, but no fresh `token` (we only emit once, on first create).
+    // NewVault.tsx must handle the missing-token branch without claiming
+    // success-with-banner.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(200, {
+          name: "work",
+          url: "http://hub.local/vault/work/",
+          version: "0.5.1",
+        }),
+      ),
+    );
+    const api = await import("./api.ts");
+    const result = await api.createVault({ name: "work" });
+    expect(result.name).toBe("work");
+    expect(result.token).toBeUndefined();
+    expect(result.paths).toBeUndefined();
+  });
+
   it("on 401 clears the cached token and throws HttpError(401)", async () => {
     vi.stubGlobal(
       "fetch",
