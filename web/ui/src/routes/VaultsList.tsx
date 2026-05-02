@@ -46,8 +46,10 @@ export function VaultsList() {
       const target = resolveManagementUrl(vault.url, vault.managementUrl);
       // Per vault PR #219 contract: SPA reads `#token=<jwt>` from
       // location.hash on bootstrap, then strips it via replaceState.
+      // JWTs are base64url, so every byte is fragment-safe — no URL
+      // encoding needed.
       const sep = target.includes("#") ? "&" : "#";
-      window.location.assign(`${target}${sep}token=${encodeURIComponent(minted.token)}`);
+      window.location.assign(`${target}${sep}token=${minted.token}`);
     } catch (err) {
       const message =
         err instanceof HttpError

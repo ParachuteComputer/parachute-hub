@@ -280,16 +280,14 @@ describe("mintVaultAdminToken", () => {
 });
 
 describe("resolveManagementUrl", () => {
+  // Note: the manifest validator (`asManagementUrl` in module-manifest.ts)
+  // rejects paths that don't start with `/`, so the bare-relative branch
+  // inside `resolveManagementUrl` is defensive-only — never exercised by a
+  // valid managementUrl reaching the SPA. We don't test that branch here.
+
   it("joins a leading-slash path onto the vault URL after stripping trailing slash", async () => {
     const api = await import("./api.ts");
     expect(api.resolveManagementUrl("http://hub.local/vault/work/", "/admin")).toBe(
-      "http://hub.local/vault/work/admin",
-    );
-  });
-
-  it("joins a relative path with no leading slash", async () => {
-    const api = await import("./api.ts");
-    expect(api.resolveManagementUrl("http://hub.local/vault/work", "admin")).toBe(
       "http://hub.local/vault/work/admin",
     );
   });

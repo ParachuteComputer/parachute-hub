@@ -557,7 +557,7 @@ export function hubFetch(
 
     if (pathname.startsWith("/admin/vault-admin-token/")) {
       if (!getDb) return new Response("hub db not configured", { status: 503 });
-      const vaultName = pathname.slice("/admin/vault-admin-token/".length);
+      const vaultName = decodeURIComponent(pathname.slice("/admin/vault-admin-token/".length));
       // The vault name must correspond to an actual vault instance — same
       // shape the well-known doc derives. Source from services.json so a
       // freshly-created vault is mintable on the next request without a
