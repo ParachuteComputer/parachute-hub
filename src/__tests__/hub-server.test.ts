@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +27,10 @@ function makeHarness(): Harness {
 
 function req(path: string, init?: RequestInit): Request {
   return new Request(`http://127.0.0.1/${path.replace(/^\//, "")}`, init);
+}
+
+function mkdirIfMissing(dir: string): void {
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
 function vaultEntry(name: string): ServiceEntry {
@@ -344,6 +348,80 @@ describe("hubFetch routing", () => {
     }
   });
 
+  test("/hub/ serves index.html when the SPA bundle exists", async () => {
+    const h = makeHarness();
+    try {
+      const dist = join(h.dir, "dist");
+      writeFileSync(join(h.dir, "hub.html"), "<html>hub</html>");
+      mkdirIfMissing(dist);
+      writeFileSync(join(dist, "index.html"), "<!doctype html><div id=root></div>");
+      const fetch = hubFetch(h.dir, { spaDistDir: dist });
+      const res = await fetch(req("/hub/"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(await res.text()).toContain("<div id=root>");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/hub/vaults (client-side route) falls back to index.html", async () => {
+    const h = makeHarness();
+    try {
+      const dist = join(h.dir, "dist");
+      mkdirIfMissing(dist);
+      writeFileSync(join(dist, "index.html"), "<!doctype html><div id=root></div>");
+      const res = await hubFetch(h.dir, { spaDistDir: dist })(req("/hub/vaults"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(await res.text()).toContain("<div id=root>");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/hub/assets/*.js is served with the matching content-type", async () => {
+    const h = makeHarness();
+    try {
+      const dist = join(h.dir, "dist");
+      const assets = join(dist, "assets");
+      mkdirIfMissing(dist);
+      mkdirIfMissing(assets);
+      writeFileSync(join(dist, "index.html"), "<!doctype html>");
+      writeFileSync(join(assets, "main.js"), "console.log('hi');");
+      const res = await hubFetch(h.dir, { spaDistDir: dist })(req("/hub/assets/main.js"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("application/javascript; charset=utf-8");
+      expect(await res.text()).toContain("console.log");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/hub/* returns 503 with build hint when dist is missing", async () => {
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir, { spaDistDir: join(h.dir, "missing") })(req("/hub/"));
+      expect(res.status).toBe(503);
+      expect(await res.text()).toContain("bun run build");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/hub rejects non-GET methods with 405", async () => {
+    const h = makeHarness();
+    try {
+      const dist = join(h.dir, "dist");
+      mkdirIfMissing(dist);
+      writeFileSync(join(dist, "index.html"), "<!doctype html>");
+      const res = await hubFetch(h.dir, { spaDistDir: dist })(req("/hub/", { method: "POST" }));
+      expect(res.status).toBe(405);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("/oauth/authorize without configured db returns 503", async () => {
     const h = makeHarness();
     try {
@@ -367,6 +445,7 @@ describe("hubFetch routing", () => {
         ["/admin/logout", { method: "POST" }],
         ["/admin/config", { method: "GET" }],
         ["/admin/config/example", { method: "POST" }],
+        ["/admin/host-admin-token", { method: "GET" }],
       ];
       for (const [path, init] of cases) {
         const res = await fetch(req(path, init));

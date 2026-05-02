@@ -37,7 +37,8 @@
 
 import type { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   handleAdminConfigGet,
   handleAdminConfigPost,
@@ -45,6 +46,7 @@ import {
   handleAdminLoginPost,
   handleAdminLogoutPost,
 } from "./admin-handlers.ts";
+import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
@@ -220,6 +222,111 @@ export interface HubFetchDeps {
    * the doc reflect `parachute vault create` etc. without re-running expose.
    */
   manifestPath?: string;
+  /**
+   * Directory containing the built SPA bundle (`index.html` + `assets/`). When
+   * absent, the hub auto-resolves to `<repo>/web/ui/dist/` — handy for the
+   * default bun-linked checkout. Tests point this at a fixture (or omit it +
+   * disable the mount). When the dir doesn't exist on disk, `/hub/*` routes
+   * 503 with a "run `bun run build` in web/ui" hint.
+   */
+  spaDistDir?: string;
+}
+
+/**
+ * Resolve the SPA bundle dir. We anchor to this file's location so a
+ * `bun src/hub-server.ts` from any cwd still finds `<repo>/web/ui/dist/`.
+ * Tests / production override via `HubFetchDeps.spaDistDir`.
+ */
+function defaultSpaDistDir(): string {
+  // import.meta.dir is the dir holding *this* file (`src/`); the SPA bundle
+  // sits at `<repo>/web/ui/dist/`, two hops up + over.
+  const here = dirname(fileURLToPath(import.meta.url));
+  return resolve(here, "..", "web", "ui", "dist");
+}
+
+const SPA_MOUNT = "/hub";
+
+/**
+ * Pick a content type for static assets the SPA build produces. Vite's
+ * standard fingerprinted output is the realistic surface — js / css / svg /
+ * png / woff2 / ico. We don't reach for a full mime db; mismatches show up
+ * loud (a `.js` served as `text/html` is unmistakable) and the list is
+ * trivially extensible if a future feature adds an asset type.
+ */
+function spaContentType(pathname: string): string {
+  const ext = pathname.slice(pathname.lastIndexOf(".") + 1).toLowerCase();
+  switch (ext) {
+    case "html":
+      return "text/html; charset=utf-8";
+    case "js":
+    case "mjs":
+      return "application/javascript; charset=utf-8";
+    case "css":
+      return "text/css; charset=utf-8";
+    case "svg":
+      return "image/svg+xml";
+    case "png":
+      return "image/png";
+    case "ico":
+      return "image/x-icon";
+    case "woff2":
+      return "font/woff2";
+    case "woff":
+      return "font/woff";
+    case "json":
+      return "application/json";
+    case "map":
+      return "application/json";
+    case "txt":
+      return "text/plain; charset=utf-8";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+/**
+ * Serve a single file under the SPA mount, falling back to `index.html`
+ * for client-side-routed paths (anything that doesn't resolve to a real
+ * file under `dist/`). Path-traversal guard is the substring check on
+ * the resolved absolute path — Bun.file gives us no built-in clamp.
+ */
+async function serveSpa(spaDistDir: string, pathname: string): Promise<Response> {
+  if (!existsSync(spaDistDir)) {
+    return new Response(
+      "hub SPA bundle not found — run `bun run build` in web/ui/ to produce dist/",
+      { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } },
+    );
+  }
+  // Strip the mount prefix; "/hub" → "", "/hub/" → "/", "/hub/x" → "/x".
+  const sub = pathname === SPA_MOUNT ? "" : pathname.slice(SPA_MOUNT.length);
+  const indexPath = join(spaDistDir, "index.html");
+
+  // Empty / mount-root / any non-asset request → SPA shell. The router takes
+  // it from there. Path traversal can't escape because we only construct a
+  // candidate path for assets that look like static files (have an extension
+  // and don't contain "..") — bare paths get the shell.
+  const looksLikeAsset = sub.length > 0 && /\.[a-z0-9]+$/i.test(sub) && !sub.includes("..");
+  if (!looksLikeAsset) {
+    return new Response(Bun.file(indexPath), {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
+  }
+
+  const filePath = resolve(spaDistDir, `.${sub}`);
+  // Belt-and-braces: if resolution lands outside dist/, deny.
+  if (!filePath.startsWith(`${spaDistDir}/`)) {
+    return new Response("not found", { status: 404 });
+  }
+  if (!existsSync(filePath)) {
+    // Asset request that doesn't resolve to a real file → SPA shell.
+    // (e.g. `/hub/vaults` with a typo'd extension shouldn't 404 the page.)
+    return new Response(Bun.file(indexPath), {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
+  }
+  return new Response(Bun.file(filePath), {
+    headers: { "content-type": spaContentType(filePath) },
+  });
 }
 
 export function hubFetch(
@@ -230,6 +337,7 @@ export function hubFetch(
   const getDb = deps?.getDb;
   const configuredIssuer = deps?.issuer;
   const manifestPath = deps?.manifestPath ?? SERVICES_MANIFEST_PATH;
+  const spaDistDir = deps?.spaDistDir ?? defaultSpaDistDir();
 
   const oauthDeps = (req: Request) => ({
     issuer: configuredIssuer ?? new URL(req.url).origin,
@@ -376,6 +484,23 @@ export function hubFetch(
         return new Response("hub db not configured", { status: 503 });
       }
       return handleCreateVault(req, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+      });
+    }
+
+    // Hub vault-management SPA. Mount root + nested routes both land here;
+    // serveSpa picks index.html vs. an asset by extension. Only GET — POSTs
+    // for vault create go to /vaults, not the SPA mount. (HEAD is harmless
+    // but we keep the contract narrow.)
+    if (pathname === SPA_MOUNT || pathname.startsWith(`${SPA_MOUNT}/`)) {
+      if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+      return serveSpa(spaDistDir, pathname);
+    }
+
+    if (pathname === "/admin/host-admin-token") {
+      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      return handleHostAdminToken(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
       });
