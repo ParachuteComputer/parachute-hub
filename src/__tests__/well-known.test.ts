@@ -258,6 +258,50 @@ describe("buildWellKnown", () => {
     expect(doc.vaults[0]?.url).toBe("https://parachute.taildf9ce2.ts.net/vault/default");
   });
 
+  test("managementUrl rides through when the resolver returns one", () => {
+    const doc = buildWellKnown({
+      services: [vault],
+      canonicalOrigin: "https://x.example",
+      managementUrlFor: () => "/admin",
+    });
+    expect(doc.vaults[0]?.managementUrl).toBe("/admin");
+  });
+
+  test("managementUrl absent when the resolver returns undefined", () => {
+    const doc = buildWellKnown({
+      services: [vault],
+      canonicalOrigin: "https://x.example",
+      managementUrlFor: () => undefined,
+    });
+    expect(doc.vaults[0]).not.toHaveProperty("managementUrl");
+  });
+
+  test("managementUrl is per-entry — multi-instance vaults can differ", () => {
+    const work: ServiceEntry = {
+      ...vault,
+      name: "parachute-vault-work",
+      paths: ["/vault/work"],
+      port: 1941,
+    };
+    const doc = buildWellKnown({
+      services: [vault, work],
+      canonicalOrigin: "https://x.example",
+      managementUrlFor: (e) => (e.name === "parachute-vault-work" ? "/admin" : undefined),
+    });
+    const byName = new Map(doc.vaults.map((v) => [v.name, v.managementUrl]));
+    expect(byName.get("default")).toBeUndefined();
+    expect(byName.get("work")).toBe("/admin");
+  });
+
+  test("managementUrl is not emitted on non-vault services", () => {
+    const doc = buildWellKnown({
+      services: [notes],
+      canonicalOrigin: "https://x.example",
+      managementUrlFor: () => "/admin",
+    });
+    expect(doc.notes).toEqual([{ url: "https://x.example/notes", version: "0.0.1" }]);
+  });
+
   test("falls back to / for empty paths", () => {
     const entry: ServiceEntry = { ...vault, paths: [] };
     const doc = buildWellKnown({

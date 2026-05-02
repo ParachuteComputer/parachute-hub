@@ -91,4 +91,18 @@ describe("isRequestableScope", () => {
   test("true for unknown scopes (third-party module scopes pass through)", () => {
     expect(isRequestableScope("notes:something-new")).toBe(true);
   });
+
+  // Per-vault admin scopes are pattern-matched as non-requestable so the
+  // public OAuth flow can never mint vault:<name>:admin — only the local
+  // session-cookie endpoint at /admin/vault-admin-token/<name> can.
+  test("false for any vault:<name>:admin scope", () => {
+    expect(isRequestableScope("vault:default:admin")).toBe(false);
+    expect(isRequestableScope("vault:work:admin")).toBe(false);
+    expect(isRequestableScope("vault:my-techne_2:admin")).toBe(false);
+  });
+
+  test("vault:<name>:read|write stays requestable (only :admin is locked down)", () => {
+    expect(isRequestableScope("vault:default:read")).toBe(true);
+    expect(isRequestableScope("vault:work:write")).toBe(true);
+  });
 });

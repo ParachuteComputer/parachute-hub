@@ -144,6 +144,56 @@ describe("hubFetch routing", () => {
     }
   });
 
+  // hub#158: each vault entry's module.json:managementUrl rides through to
+  // the well-known doc. The SPA reads it to decide whether to render a
+  // "Manage" link on the row.
+  test("/.well-known/parachute.json surfaces managementUrl from the vault module manifest", async () => {
+    const h = makeHarness();
+    try {
+      const entryWithInstallDir: ServiceEntry = { ...vaultEntry("default"), installDir: "/fake" };
+      writeManifest({ services: [entryWithInstallDir] }, h.manifestPath);
+      const res = await hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        // Stand in for module-manifest.readModuleManifest — production reads
+        // <installDir>/.parachute/module.json off disk.
+        readModuleManifest: async () => ({
+          name: "vault",
+          manifestName: "parachute-vault",
+          kind: "api",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/health",
+          managementUrl: "/admin",
+        }),
+      })(req("/.well-known/parachute.json"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        vaults: Array<{ name: string; managementUrl?: string }>;
+      };
+      expect(body.vaults).toHaveLength(1);
+      expect(body.vaults[0]?.managementUrl).toBe("/admin");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/.well-known/parachute.json omits managementUrl when manifest has none", async () => {
+    const h = makeHarness();
+    try {
+      const entryWithInstallDir: ServiceEntry = { ...vaultEntry("default"), installDir: "/fake" };
+      writeManifest({ services: [entryWithInstallDir] }, h.manifestPath);
+      const res = await hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        readModuleManifest: async () => null,
+      })(req("/.well-known/parachute.json"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { vaults: Array<{ managementUrl?: string }> };
+      expect(body.vaults[0]).not.toHaveProperty("managementUrl");
+    } finally {
+      h.cleanup();
+    }
+  });
+
   // The bug this PR fixes: `parachute vault create techne` updates
   // services.json but the old code only re-derived parachute.json on
   // `parachute expose`. With the dynamic build, the second GET reflects

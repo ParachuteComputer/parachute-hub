@@ -53,7 +53,7 @@ import {
   signRefreshToken,
 } from "./jwt-sign.ts";
 import { type AuthorizeFormParams, renderConsent, renderError, renderLogin } from "./oauth-ui.ts";
-import { NON_REQUESTABLE_SCOPES, isRequestableScope } from "./scope-explanations.ts";
+import { isNonRequestableScope, isRequestableScope } from "./scope-explanations.ts";
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
 import {
   type ServicesManifest,
@@ -260,7 +260,7 @@ export function authorizationServerMetadata(deps: OAuthDeps): Response {
 
 /** Find any requested scopes that the public flow refuses to mint. */
 function findNonRequestableScopes(scopes: readonly string[]): string[] {
-  return scopes.filter((s) => NON_REQUESTABLE_SCOPES.has(s));
+  return scopes.filter(isNonRequestableScope);
 }
 
 // --- /oauth/authorize ------------------------------------------------------

@@ -95,6 +95,41 @@ describe("listVaults", () => {
     const api = await import("./api.ts");
     expect(await api.listVaults()).toEqual([]);
   });
+
+  it("passes managementUrl through when the vault entry declares one", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(200, {
+          vaults: [
+            {
+              name: "work",
+              url: "http://hub.local/vault/work/",
+              version: "0.5.1",
+              managementUrl: "/admin",
+            },
+          ],
+        }),
+      ),
+    );
+    const api = await import("./api.ts");
+    const [v] = await api.listVaults();
+    expect(v?.managementUrl).toBe("/admin");
+  });
+
+  it("omits managementUrl when the vault entry doesn't declare one", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(200, {
+          vaults: [{ name: "legacy", url: "http://hub.local/vault/legacy/", version: "0.4.0" }],
+        }),
+      ),
+    );
+    const api = await import("./api.ts");
+    const [v] = await api.listVaults();
+    expect(v?.managementUrl).toBeUndefined();
+  });
 });
 
 describe("createVault", () => {
@@ -182,5 +217,85 @@ describe("createVault", () => {
       status: 400,
       message: '"name" must be a non-empty string',
     });
+  });
+});
+
+describe("mintVaultAdminToken", () => {
+  it("calls the per-vault mint endpoint with same-origin credentials", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(200, {
+        token: "jwt-abc",
+        expires_at: "2026-01-01T00:00:00.000Z",
+        scopes: ["vault:work:admin"],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const api = await import("./api.ts");
+    const minted = await api.mintVaultAdminToken("work");
+
+    expect(minted).toEqual({
+      token: "jwt-abc",
+      expiresAt: "2026-01-01T00:00:00.000Z",
+      scopes: ["vault:work:admin"],
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/admin/vault-admin-token/work",
+      expect.objectContaining({
+        method: "GET",
+        credentials: "same-origin",
+        headers: expect.objectContaining({ accept: "application/json" }),
+      }),
+    );
+  });
+
+  it("URL-encodes the vault name (defense — server already validates)", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(200, {
+        token: "t",
+        expires_at: "2026-01-01T00:00:00.000Z",
+        scopes: [],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await import("./api.ts");
+    await api.mintVaultAdminToken("with space");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/admin/vault-admin-token/with%20space",
+      expect.anything(),
+    );
+  });
+
+  it("throws HttpError on non-2xx", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(401, { error: "unauthenticated" })),
+    );
+    const api = await import("./api.ts");
+    await expect(api.mintVaultAdminToken("work")).rejects.toMatchObject({
+      name: "HttpError",
+      status: 401,
+    });
+  });
+});
+
+describe("resolveManagementUrl", () => {
+  // Note: the manifest validator (`asManagementUrl` in module-manifest.ts)
+  // rejects paths that don't start with `/`, so the bare-relative branch
+  // inside `resolveManagementUrl` is defensive-only — never exercised by a
+  // valid managementUrl reaching the SPA. We don't test that branch here.
+
+  it("joins a leading-slash path onto the vault URL after stripping trailing slash", async () => {
+    const api = await import("./api.ts");
+    expect(api.resolveManagementUrl("http://hub.local/vault/work/", "/admin")).toBe(
+      "http://hub.local/vault/work/admin",
+    );
+  });
+
+  it("returns absolute http(s) URLs verbatim", async () => {
+    const api = await import("./api.ts");
+    expect(
+      api.resolveManagementUrl("http://hub.local/vault/work/", "https://elsewhere.example/manage"),
+    ).toBe("https://elsewhere.example/manage");
   });
 });

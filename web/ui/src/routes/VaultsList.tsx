@@ -10,16 +10,56 @@
  */
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { type VaultListing, listVaults } from "../lib/api.ts";
+import {
+  HttpError,
+  type VaultListing,
+  listVaults,
+  mintVaultAdminToken,
+  resolveManagementUrl,
+} from "../lib/api.ts";
 
 type State =
   | { kind: "loading" }
   | { kind: "ok"; vaults: VaultListing[] }
   | { kind: "error"; message: string };
 
+/**
+ * Per-row mint state. Lives here (not in api.ts) because it's UI-local —
+ * the user clicks Manage, we surface a spinner / error inline, and on
+ * success we hand off via `window.location.assign`. No retry, no cache.
+ */
+type ManageState =
+  | { kind: "idle" }
+  | { kind: "minting"; name: string }
+  | { kind: "error"; name: string; message: string };
+
 export function VaultsList() {
   const [state, setState] = useState<State>({ kind: "loading" });
   const [reload, setReload] = useState(0);
+  const [manage, setManage] = useState<ManageState>({ kind: "idle" });
+
+  async function onManage(vault: VaultListing): Promise<void> {
+    if (!vault.managementUrl) return;
+    setManage({ kind: "minting", name: vault.name });
+    try {
+      const minted = await mintVaultAdminToken(vault.name);
+      const target = resolveManagementUrl(vault.url, vault.managementUrl);
+      // Per vault PR #219 contract: SPA reads `#token=<jwt>` from
+      // location.hash on bootstrap, then strips it via replaceState.
+      // JWTs are base64url, so every byte is fragment-safe — no URL
+      // encoding needed.
+      const sep = target.includes("#") ? "&" : "#";
+      window.location.assign(`${target}${sep}token=${minted.token}`);
+    } catch (err) {
+      const message =
+        err instanceof HttpError
+          ? `mint failed (${err.status}): ${err.message}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      setManage({ kind: "error", name: vault.name, message });
+    }
+  }
 
   useEffect(() => {
     // `reload` is the trigger — re-running the effect on bump is the
@@ -97,24 +137,49 @@ export function VaultsList() {
         </div>
       ) : (
         <div style={{ marginTop: "1rem" }}>
-          {state.vaults.map((v) => (
-            <Link key={v.name} to={`/vaults/${encodeURIComponent(v.name)}`} className="vault-row">
-              <div className="body">
-                <div className="name">
-                  <code>{v.name}</code>
-                  <span className="tag muted" title="Vault version">
-                    v{v.version}
+          {state.vaults.map((v) => {
+            const isMinting = manage.kind === "minting" && manage.name === v.name;
+            const rowError = manage.kind === "error" && manage.name === v.name ? manage : null;
+            return (
+              <div key={v.name} className="vault-row">
+                <div className="body">
+                  <div className="name">
+                    <code>{v.name}</code>
+                    <span className="tag muted" title="Vault version">
+                      v{v.version}
+                    </span>
+                  </div>
+                  <div className="dim url">
+                    <code>{v.url}</code>
+                  </div>
+                  {rowError ? (
+                    <div className="error-banner" style={{ marginTop: "0.5rem" }}>
+                      <code>{rowError.message}</code>
+                    </div>
+                  ) : null}
+                </div>
+                {v.managementUrl ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void onManage(v);
+                    }}
+                    disabled={isMinting}
+                    aria-label={`Manage vault ${v.name}`}
+                  >
+                    {isMinting ? "Opening…" : "Manage"}
+                  </button>
+                ) : (
+                  <span
+                    className="muted"
+                    title="This vault has no admin SPA — manage with parachute-vault on the host."
+                  >
+                    CLI only
                   </span>
-                </div>
-                <div className="dim url">
-                  <code>{v.url}</code>
-                </div>
+                )}
               </div>
-              <span className="chev" aria-hidden="true">
-                ›
-              </span>
-            </Link>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

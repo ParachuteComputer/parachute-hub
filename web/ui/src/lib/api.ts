@@ -18,6 +18,19 @@ export interface VaultListing {
   version: string;
   /** Path under the hub origin where the vault is mounted (e.g. /vault/work). */
   path: string;
+  /**
+   * Vault-declared admin entry point from `/.parachute/module.json`. Either an
+   * absolute URL or a path relative to the vault's mounted URL. Absent when
+   * the vault has no admin SPA wired (CLI-only management).
+   */
+  managementUrl?: string;
+}
+
+export interface MintedVaultAdminToken {
+  token: string;
+  /** ISO 8601 expiry — vault SPA recomputes its refresh window from this. */
+  expiresAt: string;
+  scopes: string[];
 }
 
 export interface CreateVaultInput {
@@ -61,17 +74,21 @@ export async function listVaults(): Promise<VaultListing[]> {
     throw new HttpError(res.status, `well-known fetch failed: ${res.status}`);
   }
   const body = (await res.json()) as {
-    vaults?: Array<{ name: string; url: string; version: string }>;
+    vaults?: Array<{ name: string; url: string; version: string; managementUrl?: string }>;
     services?: Array<{ name: string; path: string }>;
   };
   const vaults = body.vaults ?? [];
   const services = body.services ?? [];
-  return vaults.map((v) => ({
-    name: v.name,
-    url: v.url,
-    version: v.version,
-    path: pathFor(v.name, v.url, services),
-  }));
+  return vaults.map((v) => {
+    const listing: VaultListing = {
+      name: v.name,
+      url: v.url,
+      version: v.version,
+      path: pathFor(v.name, v.url, services),
+    };
+    if (v.managementUrl) listing.managementUrl = v.managementUrl;
+    return listing;
+  });
 }
 
 function pathFor(
@@ -124,6 +141,46 @@ export async function createVault(input: CreateVaultInput): Promise<CreateVaultR
     throw new HttpError(res.status, await readError(res));
   }
   return (await res.json()) as CreateVaultResult;
+}
+
+/**
+ * Mint a per-vault admin JWT (`vault:<name>:admin`) by trading the
+ * `parachute_hub_session` cookie. Used by the "Manage" button to bootstrap
+ * the vault's own admin SPA via a `#token=...` URL fragment.
+ *
+ * Same session-cookie origin as `getHostAdminToken()`, so we don't reuse
+ * the host-admin Bearer here — the endpoint reads the cookie directly.
+ * On 401 the operator's session is gone; we surface the error so the
+ * caller can hand off to /admin/login.
+ */
+export async function mintVaultAdminToken(name: string): Promise<MintedVaultAdminToken> {
+  const res = await fetch(`/admin/vault-admin-token/${encodeURIComponent(name)}`, {
+    method: "GET",
+    headers: { accept: "application/json" },
+    credentials: "same-origin",
+  });
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  const body = (await res.json()) as { token: string; expires_at: string; scopes: string[] };
+  if (!body.token || !body.expires_at) {
+    throw new HttpError(500, "/admin/vault-admin-token returned malformed body");
+  }
+  return { token: body.token, expiresAt: body.expires_at, scopes: body.scopes ?? [] };
+}
+
+/**
+ * Resolve a vault's `managementUrl` against the vault's mounted URL.
+ * Absolute URL → returned verbatim. Path → joined onto `vaultUrl` after
+ * stripping the trailing slash so we don't double-slash.
+ *
+ * Exported for direct testing; `VaultsList` calls it before redirecting.
+ */
+export function resolveManagementUrl(vaultUrl: string, managementUrl: string): string {
+  if (/^https?:\/\//i.test(managementUrl)) return managementUrl;
+  const base = vaultUrl.replace(/\/+$/, "");
+  const tail = managementUrl.startsWith("/") ? managementUrl : `/${managementUrl}`;
+  return `${base}${tail}`;
 }
 
 async function readError(res: Response): Promise<string> {

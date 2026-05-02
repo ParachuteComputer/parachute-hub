@@ -47,11 +47,16 @@ import {
   handleAdminLogoutPost,
 } from "./admin-handlers.ts";
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
+import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
 import { pemToJwk } from "./jwks.ts";
+import {
+  type ModuleManifest,
+  readModuleManifest as defaultReadModuleManifest,
+} from "./module-manifest.ts";
 import {
   authorizationServerMetadata,
   handleAuthorizeGet,
@@ -63,7 +68,7 @@ import {
 import { clearPid, writePid } from "./process-state.ts";
 import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
-import { buildWellKnown, isVaultEntry } from "./well-known.ts";
+import { buildWellKnown, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 interface Args {
   port: number;
@@ -230,6 +235,43 @@ export interface HubFetchDeps {
    * 503 with a "run `bun run build` in web/ui" hint.
    */
   spaDistDir?: string;
+  /**
+   * Override the per-module `.parachute/module.json` reader. Production reads
+   * from disk via `module-manifest.readModuleManifest`; tests inject a fake
+   * to drive `managementUrl` into the well-known doc without standing up
+   * fixture installDirs.
+   */
+  readModuleManifest?: (installDir: string) => Promise<ModuleManifest | null>;
+}
+
+/**
+ * For each vault `ServiceEntry` with a known `installDir`, read its
+ * `.parachute/module.json` and surface the optional `managementUrl`. Returns
+ * a `name → managementUrl` map keyed by services.json entry name.
+ *
+ * Quiet on per-entry errors: a malformed module.json on one vault shouldn't
+ * 500 the entire well-known doc — its row just renders without a "Manage"
+ * link. The validator already throws structured errors from
+ * `readModuleManifest`; logging them once here is the right floor.
+ */
+async function loadManagementUrls(
+  services: readonly ServiceEntry[],
+  read: (installDir: string) => Promise<ModuleManifest | null>,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  await Promise.all(
+    services.map(async (s) => {
+      if (!isVaultEntry(s) || !s.installDir) return;
+      try {
+        const m = await read(s.installDir);
+        if (m?.managementUrl) out.set(s.name, m.managementUrl);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`well-known: skipping managementUrl for ${s.name}: ${msg}`);
+      }
+    }),
+  );
+  return out;
 }
 
 /**
@@ -379,9 +421,14 @@ export function hubFetch(
       try {
         const manifest = readManifest(manifestPath);
         const canonicalOrigin = configuredIssuer ?? new URL(req.url).origin;
+        const managementUrlByName = await loadManagementUrls(
+          manifest.services,
+          deps?.readModuleManifest ?? defaultReadModuleManifest,
+        );
         const doc = buildWellKnown({
           services: manifest.services,
           canonicalOrigin,
+          managementUrlFor: (entry) => managementUrlByName.get(entry.name),
         });
         return new Response(JSON.stringify(doc), {
           headers: { "content-type": "application/json", ...corsHeaders },
@@ -505,6 +552,26 @@ export function hubFetch(
       return handleHostAdminToken(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
+      });
+    }
+
+    if (pathname.startsWith("/admin/vault-admin-token/")) {
+      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      const vaultName = decodeURIComponent(pathname.slice("/admin/vault-admin-token/".length));
+      // The vault name must correspond to an actual vault instance — same
+      // shape the well-known doc derives. Source from services.json so a
+      // freshly-created vault is mintable on the next request without a
+      // restart.
+      const manifest = readManifest(manifestPath);
+      const knownVaultNames = new Set<string>();
+      for (const s of manifest.services) {
+        if (!isVaultEntry(s)) continue;
+        for (const path of s.paths) knownVaultNames.add(vaultInstanceNameFor(s.name, path));
+      }
+      return handleVaultAdminToken(req, vaultName, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        knownVaultNames,
       });
     }
 

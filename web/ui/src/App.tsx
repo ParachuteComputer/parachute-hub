@@ -1,6 +1,5 @@
 import { Link, Route, Routes } from "react-router-dom";
 import { NewVault } from "./routes/NewVault.tsx";
-import { VaultDetail } from "./routes/VaultDetail.tsx";
 import { VaultsList } from "./routes/VaultsList.tsx";
 
 export function App() {
@@ -20,7 +19,6 @@ export function App() {
         <Route path="/" element={<VaultsList />} />
         <Route path="/vaults" element={<VaultsList />} />
         <Route path="/vaults/new" element={<NewVault />} />
-        <Route path="/vaults/:name" element={<VaultDetail />} />
         <Route
           path="*"
           element={
