@@ -97,6 +97,39 @@ describe("validateModuleManifest", () => {
     expect(m.displayName).toBe("Demo");
     expect(m.tagline).toBe("a demo module");
   });
+
+  test("managementUrl accepts a leading-slash path", () => {
+    const m = validateModuleManifest({ ...VALID, managementUrl: "/admin" }, "x");
+    expect(m.managementUrl).toBe("/admin");
+  });
+
+  test("managementUrl accepts an absolute https URL", () => {
+    const m = validateModuleManifest(
+      { ...VALID, managementUrl: "https://admin.example.com/" },
+      "x",
+    );
+    expect(m.managementUrl).toBe("https://admin.example.com/");
+  });
+
+  test("managementUrl rejects empty / non-string / non-url-or-path", () => {
+    expect(() => validateModuleManifest({ ...VALID, managementUrl: "" }, "x")).toThrow(
+      /managementUrl/,
+    );
+    expect(() => validateModuleManifest({ ...VALID, managementUrl: 7 }, "x")).toThrow(
+      /managementUrl/,
+    );
+    expect(() => validateModuleManifest({ ...VALID, managementUrl: "no-leading-slash" }, "x")).toThrow(
+      /path starting with "\/" or a full http\(s\) URL/,
+    );
+    expect(() =>
+      validateModuleManifest({ ...VALID, managementUrl: "ftp://example.com" }, "x"),
+    ).toThrow(/http:.*https:/);
+  });
+
+  test("managementUrl absent stays absent", () => {
+    const m = validateModuleManifest(VALID, "x");
+    expect(m.managementUrl).toBeUndefined();
+  });
 });
 
 describe("readModuleManifest", () => {

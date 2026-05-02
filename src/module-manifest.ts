@@ -99,6 +99,21 @@ export interface ModuleManifest {
    * portal skips the module rather than rendering an empty form.
    */
   readonly configSchema?: ConfigSchema;
+  /**
+   * Where the module's admin UI lives. Hub renders a "Manage" link when set
+   * (see `parachute-patterns/patterns/module-json-extensibility.md`).
+   *
+   * Two shapes:
+   *   - A relative path (e.g. `"/admin"`) — hub resolves against the module's
+   *     mounted URL: `<module-url><managementUrl>`. Most first-party modules
+   *     take this path so the admin UI rides the same Tailscale Funnel cap.
+   *   - A full absolute URL — hub uses verbatim. Escape hatch for modules
+   *     whose admin UI is hosted off-origin.
+   *
+   * Absent = no link rendered (CLI-only management). Same back-compat rule
+   * as `hasAuth` / `init` / `urlForEntry`.
+   */
+  readonly managementUrl?: string;
 }
 
 export class ModuleManifestError extends Error {
@@ -349,6 +364,7 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
 
   const dependencies = asDependencies(m.dependencies, where);
   const configSchema = asConfigSchema(m.configSchema, where);
+  const managementUrl = asManagementUrl(m.managementUrl, where);
 
   const out: ModuleManifest = { name, manifestName, kind, port, paths, health };
   if (displayName !== undefined) (out as { displayName?: string }).displayName = displayName;
@@ -361,7 +377,33 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
   if (configSchema !== undefined) {
     (out as { configSchema?: ConfigSchema }).configSchema = configSchema;
   }
+  if (managementUrl !== undefined) {
+    (out as { managementUrl?: string }).managementUrl = managementUrl;
+  }
   return out;
+}
+
+function asManagementUrl(v: unknown, where: string): string | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "string" || v.length === 0) {
+    throw new ModuleManifestError(`${where}: "managementUrl" must be a non-empty string if present`);
+  }
+  // Two valid shapes: a path starting with "/" or a full http(s) URL.
+  if (v.startsWith("/")) return v;
+  try {
+    const u = new URL(v);
+    if (u.protocol !== "http:" && u.protocol !== "https:") {
+      throw new ModuleManifestError(
+        `${where}: "managementUrl" absolute form must use http: or https:`,
+      );
+    }
+    return v;
+  } catch (err) {
+    if (err instanceof ModuleManifestError) throw err;
+    throw new ModuleManifestError(
+      `${where}: "managementUrl" must be a path starting with "/" or a full http(s) URL`,
+    );
+  }
 }
 
 /**
