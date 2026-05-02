@@ -77,9 +77,17 @@ export const FIRST_PARTY_SCOPES = Object.keys(SCOPE_EXPLANATIONS).sort();
 
 /**
  * Scopes the hub will not mint via the public OAuth flow. Operator-only —
- * available exclusively through the local operator-token mint path
- * (`parachute auth rotate-operator`), which doesn't traverse
- * `/oauth/authorize`. Listed here so the issuer can:
+ * available exclusively through local mint paths that have already proven
+ * the caller is the on-box operator:
+ *
+ *   - `parachute auth rotate-operator` writes the long-lived operator token
+ *     (`~/.parachute/operator.token`, mode 0600) for service accounts.
+ *   - `GET /admin/host-admin-token` exchanges a valid `parachute_hub_session`
+ *     cookie (set by `/admin/login` after a password check) for a
+ *     short-lived JWT consumed by the in-tree vault-management SPA.
+ *
+ * Both surfaces predicate on local-operator identity that the public OAuth
+ * flow can't establish. Listed here so the issuer can:
  *
  *   1. Reject early at `/oauth/authorize` with RFC 6749 `invalid_scope`
  *      rather than letting the request walk to the consent screen.
