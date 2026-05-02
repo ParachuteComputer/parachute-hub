@@ -61,6 +61,10 @@ import {
   handleToken,
 } from "./oauth-handlers.ts";
 import { clearPid, writePid } from "./process-state.ts";
+import {
+  type ModuleManifest,
+  readModuleManifest as defaultReadModuleManifest,
+} from "./module-manifest.ts";
 import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
 import { buildWellKnown, isVaultEntry } from "./well-known.ts";
@@ -230,6 +234,43 @@ export interface HubFetchDeps {
    * 503 with a "run `bun run build` in web/ui" hint.
    */
   spaDistDir?: string;
+  /**
+   * Override the per-module `.parachute/module.json` reader. Production reads
+   * from disk via `module-manifest.readModuleManifest`; tests inject a fake
+   * to drive `managementUrl` into the well-known doc without standing up
+   * fixture installDirs.
+   */
+  readModuleManifest?: (installDir: string) => Promise<ModuleManifest | null>;
+}
+
+/**
+ * For each vault `ServiceEntry` with a known `installDir`, read its
+ * `.parachute/module.json` and surface the optional `managementUrl`. Returns
+ * a `name → managementUrl` map keyed by services.json entry name.
+ *
+ * Quiet on per-entry errors: a malformed module.json on one vault shouldn't
+ * 500 the entire well-known doc — its row just renders without a "Manage"
+ * link. The validator already throws structured errors from
+ * `readModuleManifest`; logging them once here is the right floor.
+ */
+async function loadManagementUrls(
+  services: readonly ServiceEntry[],
+  read: (installDir: string) => Promise<ModuleManifest | null>,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  await Promise.all(
+    services.map(async (s) => {
+      if (!isVaultEntry(s) || !s.installDir) return;
+      try {
+        const m = await read(s.installDir);
+        if (m?.managementUrl) out.set(s.name, m.managementUrl);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`well-known: skipping managementUrl for ${s.name}: ${msg}`);
+      }
+    }),
+  );
+  return out;
 }
 
 /**
@@ -379,9 +420,14 @@ export function hubFetch(
       try {
         const manifest = readManifest(manifestPath);
         const canonicalOrigin = configuredIssuer ?? new URL(req.url).origin;
+        const managementUrlByName = await loadManagementUrls(
+          manifest.services,
+          deps?.readModuleManifest ?? defaultReadModuleManifest,
+        );
         const doc = buildWellKnown({
           services: manifest.services,
           canonicalOrigin,
+          managementUrlFor: (entry) => managementUrlByName.get(entry.name),
         });
         return new Response(JSON.stringify(doc), {
           headers: { "content-type": "application/json", ...corsHeaders },

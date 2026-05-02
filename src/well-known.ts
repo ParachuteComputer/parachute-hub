@@ -12,6 +12,13 @@ export interface WellKnownVaultEntry {
   name: string;
   url: string;
   version: string;
+  /**
+   * Where the vault's admin SPA lives. Path-or-URL per
+   * `parachute-patterns/patterns/module-json-extensibility.md`. Hub renders
+   * a "Manage" link when present. Sourced from the vault module's
+   * `.parachute/module.json:managementUrl`.
+   */
+  managementUrl?: string;
 }
 
 /**
@@ -93,6 +100,13 @@ export function vaultInstanceName(entry: ServiceEntry): string {
 export interface BuildWellKnownOpts {
   services: readonly ServiceEntry[];
   canonicalOrigin: string;
+  /**
+   * Optional resolver mapping a `ServiceEntry` to its `module.json:managementUrl`,
+   * if any. Synchronous so the well-known build stays a pure transform; the
+   * caller (hub-server.ts) loads manifests once per request and passes them
+   * in. Returning `undefined` means "no admin SPA" and hub renders no link.
+   */
+  managementUrlFor?: (entry: ServiceEntry) => string | undefined;
 }
 
 /** Join a base origin and a path without double slashes — "/" stays "/". */
@@ -119,11 +133,14 @@ export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
       const infoUrl = new URL(joinInfoPath(path), `${base}/`).toString();
       doc.services.push({ name: s.name, url, path, version: s.version, infoUrl });
       if (isVault) {
-        doc.vaults.push({
+        const managementUrl = opts.managementUrlFor?.(s);
+        const entry: WellKnownVaultEntry = {
           name: vaultInstanceNameFor(s.name, path),
           url,
           version: s.version,
-        });
+        };
+        if (managementUrl !== undefined) entry.managementUrl = managementUrl;
+        doc.vaults.push(entry);
       } else {
         const key = shortName(s.name);
         const bucket = (doc[key] as WellKnownServiceEntry[] | undefined) ?? [];
