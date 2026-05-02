@@ -243,6 +243,7 @@ export function startHelp(): string {
 Usage:
   parachute start                   start every installed service
   parachute start <service>         start just that one
+  parachute start hub               start the internal hub (port 1939)
 
 What it does:
   For each target service, spawns its start command detached, redirects
@@ -253,16 +254,23 @@ What it does:
   If a stale PID file exists (process died without cleanup), it's cleared
   and the service starts fresh.
 
+  \`parachute start hub\` brings up the internal hub directly (normally
+  spawned implicitly by \`parachute expose\`). Useful when restarting a
+  hub that crashed without an active expose layer.
+
 Flags:
   --hub-origin <url>    override PARACHUTE_HUB_ORIGIN passed to services
-                        (default: current expose-state hub origin, else loopback)
+                        (default: current expose-state hub origin, else loopback).
+                        For \`start hub\`, also doubles as the hub's --issuer.
 
 Examples:
   parachute start                   bring everything up
   parachute start vault             just vault
+  parachute start hub               just the internal hub
   parachute logs vault              watch what just started
 
 Start commands by service:
+  hub       bun <cli>/hub-server.ts --port <picked> ...
   vault     parachute-vault serve
   scribe    parachute-scribe serve
   channel   parachute-channel daemon
@@ -276,6 +284,7 @@ export function stopHelp(): string {
 Usage:
   parachute stop                    stop every installed service
   parachute stop <service>          stop just that one
+  parachute stop hub                stop the internal hub
 
 What it does:
   Sends SIGTERM, waits up to 10s for a clean exit, then escalates to
@@ -283,9 +292,13 @@ What it does:
 
   No-op if the service wasn't running.
 
+  Bare \`parachute stop\` (no service) does NOT stop the hub — that's
+  managed by the active expose layer (or \`parachute stop hub\` directly).
+
 Examples:
   parachute stop                    stop everything before sleep
   parachute stop vault              just vault
+  parachute stop hub                just the internal hub
 `;
 }
 
@@ -295,6 +308,7 @@ export function restartHelp(): string {
 Usage:
   parachute restart                 restart every installed service
   parachute restart <service>       restart just that one
+  parachute restart hub             restart the internal hub
 
 What it does:
   Equivalent to \`parachute stop <svc> && parachute start <svc>\`.
@@ -340,6 +354,7 @@ export function logsHelp(): string {
 Usage:
   parachute logs <service>          print the last 200 lines
   parachute logs <service> -f       tail the log (like \`tail -f\`)
+  parachute logs hub                logs for the internal hub
 
 Log file:
   ~/.parachute/<service>/logs/<service>.log

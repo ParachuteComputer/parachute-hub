@@ -565,7 +565,7 @@ async function main(argv: string[]): Promise<number> {
       const svc = rest[0];
       if (!svc) {
         console.error("usage: parachute logs <service> [-f]");
-        console.error(`services: ${knownServices().join(", ")}`);
+        console.error(`services: hub, ${knownServices().join(", ")}`);
         return 1;
       }
       const follow = rest.includes("-f") || rest.includes("--follow");
