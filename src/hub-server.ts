@@ -39,6 +39,7 @@ import type { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { handleListGrants, handleRevokeGrant } from "./admin-grants.ts";
 import {
   handleAdminConfigGet,
   handleAdminConfigPost,
@@ -572,6 +573,26 @@ export function hubFetch(
         db: getDb(),
         issuer: oauthDeps(req).issuer,
         knownVaultNames,
+      });
+    }
+
+    if (pathname === "/api/grants") {
+      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      return handleListGrants(req, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+      });
+    }
+
+    if (pathname.startsWith("/api/grants/")) {
+      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      const clientId = decodeURIComponent(pathname.slice("/api/grants/".length));
+      if (!clientId || clientId.includes("/")) {
+        return new Response("not found", { status: 404 });
+      }
+      return handleRevokeGrant(req, clientId, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
       });
     }
 
