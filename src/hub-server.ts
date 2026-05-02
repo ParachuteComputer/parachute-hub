@@ -47,6 +47,7 @@ import {
   handleAdminLogoutPost,
 } from "./admin-handlers.ts";
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
+import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
@@ -67,7 +68,7 @@ import {
 } from "./module-manifest.ts";
 import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
-import { buildWellKnown, isVaultEntry } from "./well-known.ts";
+import { buildWellKnown, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 interface Args {
   port: number;
@@ -551,6 +552,26 @@ export function hubFetch(
       return handleHostAdminToken(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
+      });
+    }
+
+    if (pathname.startsWith("/admin/vault-admin-token/")) {
+      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      const vaultName = pathname.slice("/admin/vault-admin-token/".length);
+      // The vault name must correspond to an actual vault instance — same
+      // shape the well-known doc derives. Source from services.json so a
+      // freshly-created vault is mintable on the next request without a
+      // restart.
+      const manifest = readManifest(manifestPath);
+      const knownVaultNames = new Set<string>();
+      for (const s of manifest.services) {
+        if (!isVaultEntry(s)) continue;
+        for (const path of s.paths) knownVaultNames.add(vaultInstanceNameFor(s.name, path));
+      }
+      return handleVaultAdminToken(req, vaultName, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        knownVaultNames,
       });
     }
 

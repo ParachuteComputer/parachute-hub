@@ -106,9 +106,26 @@ export const FIRST_PARTY_SCOPES = Object.keys(SCOPE_EXPLANATIONS).sort();
  */
 export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set(["parachute:host:admin"]);
 
+/**
+ * Per-vault `vault:<name>:admin` scopes are also non-requestable: they let
+ * the holder mint, revoke, and rotate tokens for a specific vault instance,
+ * which is operator-only territory. Like `parachute:host:admin`, these are
+ * minted by a session-cookie-gated hub endpoint (`/admin/vault-admin-token/:name`),
+ * never by the public OAuth flow.
+ *
+ * Pattern-based because the set is open-ended — every vault instance the
+ * operator creates implies a new scope, and we don't want to enumerate them.
+ */
+const VAULT_ADMIN_RE = /^vault:[a-zA-Z0-9_-]+:admin$/;
+
+/** True when the scope is non-requestable via the public OAuth flow. */
+export function isNonRequestableScope(scope: string): boolean {
+  return NON_REQUESTABLE_SCOPES.has(scope) || VAULT_ADMIN_RE.test(scope);
+}
+
 /** True when the scope can appear in a public `/oauth/authorize` request. */
 export function isRequestableScope(scope: string): boolean {
-  return !NON_REQUESTABLE_SCOPES.has(scope);
+  return !isNonRequestableScope(scope);
 }
 
 export function explainScope(scope: string): ScopeExplanation | null {
