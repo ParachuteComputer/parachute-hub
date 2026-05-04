@@ -144,7 +144,47 @@ describe("handleVaultAdminToken", () => {
     const validated = await validateAccessToken(harness.db, body.token, ISSUER);
     expect(validated.payload.sub).toBe(userId);
     expect(validated.payload.iss).toBe(ISSUER);
+    // Per-vault audience: vault validates `aud === "vault.<name>"` against
+    // its own URL-bound config (parachute-vault src/auth.ts ~line 167).
+    // A constant `aud: "hub"` here would be rejected by every vault.
+    expect(validated.payload.aud).toBe("vault.work");
     const scopeClaim = (validated.payload as { scope?: string }).scope ?? "";
     expect(scopeClaim.split(/\s+/)).toContain("vault:work:admin");
+  });
+
+  test("audience is per-vault — different vaults get different aud claims", async () => {
+    // Regression for PR #173 follow-up: a single shared audience constant
+    // meant a token minted for vault `boulder` carried `aud: "hub"` and
+    // got rejected by vault's strict-equality check against
+    // `vault.boulder`. Mint twice and confirm each token is bound to its
+    // own vault.
+    const { cookie } = await withSession();
+    const namesSet = known("default", "boulder");
+
+    const reqDefault = new Request(`${ISSUER}/admin/vault-admin-token/default`, {
+      headers: { cookie },
+    });
+    const resDefault = await handleVaultAdminToken(reqDefault, "default", {
+      db: harness.db,
+      issuer: ISSUER,
+      knownVaultNames: namesSet,
+    });
+    expect(resDefault.status).toBe(200);
+    const bodyDefault = (await resDefault.json()) as { token: string };
+    const validatedDefault = await validateAccessToken(harness.db, bodyDefault.token, ISSUER);
+    expect(validatedDefault.payload.aud).toBe("vault.default");
+
+    const reqBoulder = new Request(`${ISSUER}/admin/vault-admin-token/boulder`, {
+      headers: { cookie },
+    });
+    const resBoulder = await handleVaultAdminToken(reqBoulder, "boulder", {
+      db: harness.db,
+      issuer: ISSUER,
+      knownVaultNames: namesSet,
+    });
+    expect(resBoulder.status).toBe(200);
+    const bodyBoulder = (await resBoulder.json()) as { token: string };
+    const validatedBoulder = await validateAccessToken(harness.db, bodyBoulder.token, ISSUER);
+    expect(validatedBoulder.payload.aud).toBe("vault.boulder");
   });
 });

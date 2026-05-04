@@ -25,7 +25,6 @@ import { findSession, parseSessionCookie } from "./sessions.ts";
 
 /** Short TTL — matches host-admin-token. SPA re-fetches on near-expiry. */
 export const VAULT_ADMIN_TOKEN_TTL_SECONDS = 10 * 60;
-const VAULT_ADMIN_AUDIENCE = "hub";
 const VAULT_ADMIN_CLIENT_ID = "parachute-hub-spa";
 
 /** Same shape as the manifest name validator — keeps URL-injection out. */
@@ -59,10 +58,18 @@ export async function handleVaultAdminToken(
     return jsonError(401, "unauthenticated", "no admin session — sign in at /admin/login first");
   }
   const scope = `vault:${vaultName}:admin`;
+  // Per-vault audience: vault validates the JWT's `aud` claim against
+  // `vault.<name>` derived from its own URL-bound config (vault src/auth.ts
+  // line ~167 — `expectedAudience: vault.${vaultConfig.name}`). Same shape
+  // as `inferAudience` in oauth-handlers.ts for the public OAuth flow, so
+  // hub-minted and OAuth-minted tokens are indistinguishable to vault. A
+  // single `audience: "hub"` constant here was wrong end-to-end and broke
+  // every Manage-button click against the vault SPA (PR #173 follow-up).
+  const audience = `vault.${vaultName}`;
   const minted = await signAccessToken(deps.db, {
     sub: session.userId,
     scopes: [scope],
-    audience: VAULT_ADMIN_AUDIENCE,
+    audience,
     clientId: VAULT_ADMIN_CLIENT_ID,
     issuer: deps.issuer,
     ttlSeconds: VAULT_ADMIN_TOKEN_TTL_SECONDS,
