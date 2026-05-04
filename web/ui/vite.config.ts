@@ -1,12 +1,13 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
-// The hub mounts this SPA at `/hub/` (see src/hub-server.ts dispatch table).
-// Build default IS the canonical mount so asset URLs resolve under the hub
-// path on tailnet — the same drift paraclaw#25 hit when its base was `/`.
-// Override with `VITE_BASE_PATH=/` for stand-alone dev served at the origin
-// root.
-const basePath = normalizeBase(process.env.VITE_BASE_PATH ?? "/hub/");
+// The hub mounts this SPA at `/vault/` (primary, since hub#168-realignment) and
+// keeps `/hub/` mounted for back-compat (`/hub/permissions` lives there). Asset
+// URLs are origin-absolute and resolve under `/vault/assets/...` regardless of
+// which mount served the HTML — the same drift paraclaw#25 hit when its base
+// was `/`. Override with `VITE_BASE_PATH=/` for stand-alone dev served at the
+// origin root.
+const basePath = normalizeBase(process.env.VITE_BASE_PATH ?? "/vault/");
 
 function normalizeBase(input: string): string {
   let b = input.startsWith("/") ? input : `/${input}`;
@@ -20,7 +21,7 @@ export default defineConfig({
   server: {
     port: 5174,
     proxy: {
-      // Dev server runs under /hub/ to mirror the production mount. The hub's
+      // Dev server runs under /vault/ to mirror the production mount. The hub's
       // admin + vault API lives at the origin root (/admin/*, /vaults,
       // /.well-known/*) so we only proxy those exact prefixes — everything
       // else falls through to the SPA's static assets.
