@@ -672,8 +672,10 @@ export function hubFetch(
     //      SPA routes. Multi-segment requests like `/vault/<unknown>/health`
     //      are vault-API shapes targeting a non-existent vault and 404 —
     //      otherwise the SPA shell would mask backend 404s with HTML.
-    //      Caveat: a vault named `new` or `assets` would shadow the SPA
-    //      route — `RESERVED_VAULT_NAMES` already enforces this.
+    //      `new` and `assets` are reserved vault names (see
+    //      `RESERVED_VAULT_NAMES` in admin-vaults.ts) so an operator
+    //      can't register a vault that shadows the SPA's create route or
+    //      its static asset bundle.
     if (pathname === "/vault") {
       if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
       return serveSpa(spaDistDir, pathname, "/vault");

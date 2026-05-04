@@ -998,6 +998,57 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
       h.cleanup();
     }
   });
+
+  test("single-segment /vault/<name> picks proxy when registered, SPA shell when not", async () => {
+    // Two cases share one fixture so the contrast is explicit:
+    //   - `/vault/default` is registered → proxy answers (200, JSON tag).
+    //   - `/vault/nonexistent` has no match → falls through to the SPA
+    //     shell (200, text/html). The SPA's :name route renders client-side
+    //     and shows a 404 in-app, but at the wire it's the shell.
+    // This is the routing-order seam #173 introduced — proxy is consulted
+    // before the SPA fallback, and the fallback only triggers when no
+    // vault claims the path.
+    const h = makeHarness();
+    const upstream = startUpstream("default-vault");
+    try {
+      const dist = join(h.dir, "dist");
+      mkdirIfMissing(dist);
+      writeFileSync(join(dist, "index.html"), "<!doctype html><div id=root></div>");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, {
+        spaDistDir: dist,
+        manifestPath: h.manifestPath,
+      });
+
+      const proxied = await fetcher(req("/vault/default"));
+      expect(proxied.status).toBe(200);
+      expect(proxied.headers.get("content-type")).toContain("application/json");
+      const body = (await proxied.json()) as { tag: string; pathname: string };
+      expect(body.tag).toBe("default-vault");
+      expect(body.pathname).toBe("/vault/default");
+
+      const shelled = await fetcher(req("/vault/nonexistent"));
+      expect(shelled.status).toBe(200);
+      expect(shelled.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(await shelled.text()).toContain("<div id=root>");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
 });
 
 /** Find a port that no one is listening on by binding briefly and releasing. */
