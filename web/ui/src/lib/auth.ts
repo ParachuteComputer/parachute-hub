@@ -50,6 +50,23 @@ function loginRedirectUrl(): string {
 }
 
 /**
+ * Navigate to /admin/login (round-tripping the current SPA URL via `next=`)
+ * and return a never-resolving Promise so the caller's continuation never
+ * runs. The browser is about to tear down the page; surfacing a "session
+ * expired" error to the operator gives them no useful action — the right
+ * UX is "you've already left."
+ *
+ * Shared between the host-admin mint here and the per-vault mint in
+ * `lib/api.ts:mintVaultAdminToken`. Both endpoints rely on the same
+ * `parachute_hub_session` cookie, so a 401 on either means the same thing
+ * and deserves the same handler.
+ */
+export function redirectToLoginAndHang<T>(): Promise<T> {
+  window.location.replace(loginRedirectUrl());
+  return new Promise<T>(() => {});
+}
+
+/**
  * Returns the cached host-admin JWT, refreshing it if it's about to expire
  * (or if we don't have one yet). Concurrent callers share the in-flight
  * fetch — we don't want a burst of API calls to mint a token each.
@@ -78,11 +95,7 @@ async function fetchToken(): Promise<string> {
   });
   if (res.status === 401) {
     cached = null;
-    window.location.replace(loginRedirectUrl());
-    // Hang — the navigation will tear down this page. Returning a rejected
-    // promise would surface "session expired" errors the operator can't act
-    // on; the right UX is "you've already left."
-    return new Promise<string>(() => {});
+    return redirectToLoginAndHang<string>();
   }
   if (!res.ok) {
     throw new Error(`/admin/host-admin-token failed: ${res.status} ${await res.text()}`);

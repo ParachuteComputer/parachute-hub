@@ -15,6 +15,11 @@ import * as auth from "./auth.ts";
 vi.mock("./auth.ts", () => ({
   getHostAdminToken: vi.fn(),
   clearCachedToken: vi.fn(),
+  // Default to a hanging promise so 401 paths in api.ts behave like the
+  // real helper (the page is mid-redirect, the continuation never runs).
+  // Individual tests stub this differently when they need to assert the
+  // redirect side-effect.
+  redirectToLoginAndHang: vi.fn(() => new Promise(() => {})),
 }));
 
 beforeEach(() => {
@@ -266,15 +271,38 @@ describe("mintVaultAdminToken", () => {
     );
   });
 
-  it("throws HttpError on non-2xx", async () => {
+  it("on 401 calls redirectToLoginAndHang (no error surfaces)", async () => {
+    // Same shape as auth.ts:fetchToken — a missing session means the page
+    // is about to navigate to /admin/login. Surfacing an HttpError gave
+    // operators the raw "no admin session" string with no recourse
+    // (PR #173 follow-up bug).
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => jsonResponse(401, { error: "unauthenticated" })),
     );
     const api = await import("./api.ts");
+    const pending = api.mintVaultAdminToken("work");
+    // Yield once so the fetch + status branch can run.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(auth.redirectToLoginAndHang).toHaveBeenCalledTimes(1);
+    // The promise never resolves — match the contract callers rely on. Race
+    // against a microtask flush so the test doesn't hang.
+    const winner = await Promise.race([
+      pending.then(() => "resolved"),
+      new Promise((r) => setTimeout(() => r("hung"), 10)),
+    ]);
+    expect(winner).toBe("hung");
+  });
+
+  it("throws HttpError on non-401 non-2xx (e.g. 500)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(500, { error: "boom" })),
+    );
+    const api = await import("./api.ts");
     await expect(api.mintVaultAdminToken("work")).rejects.toMatchObject({
       name: "HttpError",
-      status: 401,
+      status: 500,
     });
   });
 });
