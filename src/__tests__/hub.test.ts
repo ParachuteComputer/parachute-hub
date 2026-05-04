@@ -13,10 +13,10 @@ describe("renderHub", () => {
     expect(html).toContain("<script>");
   });
 
-  test("fetches /.well-known/parachute.json and iterates services[]", () => {
+  test("fetches /.well-known/parachute.json and reads services[] + vaults[]", () => {
     expect(html).toContain("/.well-known/parachute.json");
     expect(html).toContain("doc.services");
-    expect(html).toContain("infoUrl");
+    expect(html).toContain("doc.vaults");
   });
 
   test("uses parachute.computer sage palette and serif/sans fonts", () => {
@@ -30,72 +30,78 @@ describe("renderHub", () => {
     expect(html).toContain("prefers-color-scheme: dark");
   });
 
-  test("falls back to a generic icon when service has none", () => {
+  test("falls back to a generic icon for module tiles", () => {
     expect(html).toContain("fallbackIcon");
   });
 
-  test("branches card rendering on info.kind (api/tool → interactive, else link)", () => {
-    // Script picks the element type and wires up toggling based on info.kind.
-    expect(html).toContain("isInteractiveKind");
-    expect(html).toContain("'api'");
-    expect(html).toContain("'tool'");
-    expect(html).toContain("'frontend'");
+  test("renders one tile per module type, not per service instance", () => {
+    expect(html).toContain("aggregate(services, vaults)");
+    expect(html).toContain("renderTile");
+    expect(html).toContain("MODULE_ORDER");
   });
 
-  test("interactive cards get keyboard + aria affordances", () => {
-    expect(html).toContain("role");
-    expect(html).toContain("tabindex");
-    expect(html).toContain("aria-expanded");
-    expect(html).toContain("Enter");
+  test("known module display order is vault → scribe → notes → claw", () => {
+    expect(html).toContain("['vault', 'scribe', 'notes', 'claw']");
   });
 
-  test("detail panel surfaces OAuth discovery, MCP, open-in-Notes, service URL", () => {
-    expect(html).toContain("/.well-known/oauth-authorization-server");
-    expect(html).toContain("info.mcpUrl");
-    expect(html).toContain("info.openInNotesUrl");
-    expect(html).toContain("Service URL");
-    expect(html).toContain("OAuth discovery");
+  test("vault tile counts vaults[] (per instance) and links to /hub/vaults", () => {
+    // Vault count is the length of doc.vaults — one entry per /vault/<name>
+    // mount, so a single ServiceEntry with paths=[a,b,c] still shows "3
+    // registered". The manage link is the hub's vault SPA, never an
+    // individual vault backend.
+    expect(html).toContain("vaults.length");
+    expect(html).toContain("'/hub/vaults'");
   });
 
-  test("details panel is hidden until the card is expanded", () => {
-    expect(html).toContain(".details {");
-    expect(html).toContain("display: none");
-    expect(html).toContain(".card.expanded .details");
+  test("non-vault tiles take their manageUrl from the service's path", () => {
+    // shortName('parachute-scribe') = 'scribe' → tile links to svc.path,
+    // which is whatever the module declared (e.g. /scribe, /notes, /claw).
+    // Hardcoding the link would silently break on a custom mount.
+    expect(html).toContain("manageUrl: svc.path");
   });
 
-  test("lazy-fetches /.parachute/config/schema + /.parachute/config on first expand", () => {
-    expect(html).toContain("fetchConfig");
-    expect(html).toContain("/.parachute/config/schema");
-    expect(html).toContain("/.parachute/config");
-    // Lazy: fetch happens inside the toggle, guarded by configLoaded.
-    expect(html).toContain("configLoaded");
+  test("tiles for module types with zero instances are hidden", () => {
+    // Aggregate only inserts a group when the type has at least one entry;
+    // tilesInOrder iterates the map. No "0 registered" surface.
+    expect(html).not.toContain("0 registered");
+    expect(html).toContain("count === 1 ? '1 registered'");
   });
 
-  test("renders config form fields with disabled inputs (read-only in this launch)", () => {
-    expect(html).toContain("renderConfigField");
-    expect(html).toContain("input.disabled = true");
-    expect(html).toContain("aria-readonly");
-    // Hint text tells users where to edit instead.
-    expect(html).toContain("read-only in this launch");
+  test("module labels are humanized (Vault / Scribe / Notes / Claw)", () => {
+    expect(html).toContain("vault: 'Vault'");
+    expect(html).toContain("scribe: 'Scribe'");
+    expect(html).toContain("notes: 'Notes'");
+    expect(html).toContain("claw: 'Claw'");
   });
 
-  test("config field types: enum→select, boolean→checkbox, number→number, uri→url", () => {
-    expect(html).toContain("schema.enum");
-    expect(html).toContain("'checkbox'");
-    expect(html).toContain("'number'");
-    expect(html).toContain("'url'");
+  test("vault-name detection covers parachute-vault and parachute-vault-<name>", () => {
+    // Phase-1 multi-vault keeps a single ServiceEntry with multiple paths
+    // (parachute-vault), but the door is open for per-instance entries
+    // (parachute-vault-techne). isVaultName has to accept both.
+    expect(html).toContain("isVaultName");
+    expect(html).toContain("'parachute-vault'");
+    expect(html).toContain("'parachute-vault-'");
   });
 
-  test("writeOnly fields render a bullet placeholder instead of the raw value", () => {
-    expect(html).toContain("writeOnly");
-    // Six bullets as the placeholder (template literal resolves \u2022 → •).
-    expect(html).toContain("\u2022\u2022\u2022\u2022\u2022\u2022");
+  test("empty state when no modules are registered", () => {
+    expect(html).toContain("No modules installed yet");
+    expect(html).toContain("parachute install vault");
   });
 
-  test("schema 404 path renders nothing (no error surfaced)", () => {
-    // fetchConfig returns null on non-ok; caller skips render.
-    expect(html).toContain("if (!schemaResp || !schemaResp.ok) return null");
-    expect(html).toContain("if (data)");
+  test("error state surfaces the underlying message", () => {
+    expect(html).toContain("Could not load modules");
+  });
+
+  test("does not retain the per-service interactive-card / config-form code", () => {
+    // The home page is now a directory of modules — per-instance config
+    // forms and detail panels live behind the Manage links (vault SPA at
+    // /hub/vaults, the running module's own UI elsewhere). Keeping the
+    // dead code around is a maintenance trap.
+    expect(html).not.toContain("renderConfigField");
+    expect(html).not.toContain("fetchConfig");
+    expect(html).not.toContain("kind-badge");
+    expect(html).not.toContain("info.mcpUrl");
+    expect(html).not.toContain("info.openInNotesUrl");
   });
 });
 
