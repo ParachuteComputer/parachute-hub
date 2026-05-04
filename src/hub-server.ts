@@ -287,7 +287,23 @@ function defaultSpaDistDir(): string {
   return resolve(here, "..", "web", "ui", "dist");
 }
 
-const SPA_MOUNT = "/hub";
+/**
+ * The SPA serves at two mounts:
+ *
+ * - `/vault` — primary, since hub#168-realignment. Matches the operator
+ *   pattern of `/<module>` as the entry point (alongside `/notes`, `/claw`,
+ *   `/scribe`). VaultsList, NewVault, and per-vault detail routes hang off
+ *   here.
+ * - `/hub` — back-compat. `/hub/permissions` (cross-vault grants) is a hub
+ *   concern and stays where bookmarks expect it. `/hub/vaults*` is a 301 to
+ *   `/vault*` further up the dispatch — keeping it out of this mount.
+ *
+ * Both mounts serve the same SPA bundle. Asset URLs are origin-absolute
+ * (`/vault/assets/...`) per the build base, so the HTML loads correctly
+ * regardless of which mount served it. main.tsx detects the active mount
+ * at runtime and configures react-router's `basename` accordingly.
+ */
+type SpaMount = "/vault" | "/hub";
 
 /**
  * Pick a content type for static assets the SPA build produces. Vite's
@@ -333,16 +349,19 @@ function spaContentType(pathname: string): string {
  * file under `dist/`). Path-traversal is blocked twice: the asset-shape
  * filter rejects sub-paths containing "..", and the resolved absolute
  * path is checked to start with `dist/` before any read.
+ *
+ * `mount` is the prefix being served (`/vault` or `/hub`); we strip it
+ * from `pathname` to land on the file path inside `dist/`.
  */
-async function serveSpa(spaDistDir: string, pathname: string): Promise<Response> {
+async function serveSpa(spaDistDir: string, pathname: string, mount: SpaMount): Promise<Response> {
   if (!existsSync(spaDistDir)) {
     return new Response(
       "hub SPA bundle not found — run `bun run build` in web/ui/ to produce dist/",
       { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   }
-  // Strip the mount prefix; "/hub" → "", "/hub/" → "/", "/hub/x" → "/x".
-  const sub = pathname === SPA_MOUNT ? "" : pathname.slice(SPA_MOUNT.length);
+  // Strip the mount prefix; "/vault" → "", "/vault/" → "/", "/vault/x" → "/x".
+  const sub = pathname === mount ? "" : pathname.slice(mount.length);
   const indexPath = join(spaDistDir, "index.html");
 
   // Empty / mount-root / any non-asset request → SPA shell. The router takes
@@ -364,7 +383,7 @@ async function serveSpa(spaDistDir: string, pathname: string): Promise<Response>
   }
   if (!existsSync(filePath)) {
     // Asset request that doesn't resolve to a real file → SPA shell.
-    // (e.g. `/hub/vaults` with a typo'd extension shouldn't 404 the page.)
+    // (e.g. `/vault/foo` with a typo'd extension shouldn't 404 the page.)
     return new Response(Bun.file(indexPath), {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
@@ -539,13 +558,14 @@ export function hubFetch(
       });
     }
 
-    // Hub vault-management SPA. Mount root + nested routes both land here;
-    // serveSpa picks index.html vs. an asset by extension. Only GET — POSTs
-    // for vault create go to /vaults, not the SPA mount. (HEAD is harmless
-    // but we keep the contract narrow.)
-    if (pathname === SPA_MOUNT || pathname.startsWith(`${SPA_MOUNT}/`)) {
+    // /hub SPA mount (back-compat). Kept for `/hub/permissions` and any other
+    // hub-level admin surface that lived under /hub/ before the realignment.
+    // /hub/vaults* is a separate concern handled by the 301 redirect lower
+    // down — the redirect runs first so it never reaches here. Only GET —
+    // POSTs for vault create go to /vaults, not the SPA mount.
+    if (pathname === "/hub" || pathname.startsWith("/hub/")) {
       if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
-      return serveSpa(spaDistDir, pathname);
+      return serveSpa(spaDistDir, pathname, "/hub");
     }
 
     if (pathname === "/admin/host-admin-token") {
@@ -625,15 +645,32 @@ export function hubFetch(
       return handleAdminConfigPost(getDb(), req, name);
     }
 
-    // Dynamic vault routing — services.json is the source of truth, read per
-    // request so a `parachute vault create` performed after `parachute expose`
-    // is immediately reachable on the tailnet (#144). Tailscale serve mounts
-    // a single `/vault/` → hub entry; this handler picks the specific vault
-    // backend by longest-mount-prefix on every request.
+    // /vault — primary SPA mount + dynamic per-vault proxy share this
+    // namespace. Order matters:
+    //   1. `/vault` exact → SPA shell (vault list).
+    //   2. `/vault/<known-vault>/...` → proxy to the vault backend, picked
+    //      from services.json by longest-mount-prefix. Read per request so a
+    //      `parachute vault create` performed after `parachute expose` is
+    //      immediately reachable (#144).
+    //   3. `/vault/<anything else>` → SPA shell. `/vault/new`, `/vault/<name>`
+    //      detail (planned), and `/vault/assets/*` static assets all land
+    //      here. Caveat: a vault named `new` or `assets` would shadow the
+    //      SPA route — relying on the operator not naming vaults after
+    //      reserved-looking words is the same shape the existing
+    //      RESERVED_VAULT_NAMES set uses.
+    if (pathname === "/vault") {
+      if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+      return serveSpa(spaDistDir, pathname, "/vault");
+    }
     if (pathname.startsWith("/vault/")) {
       const proxied = await proxyToVault(req, manifestPath);
       if (proxied) return proxied;
-      // Fall through to the catch-all 404 below — no vault claims this path.
+      // No vault claims this path — fall through to the SPA shell so the
+      // client-side router can render a `/new`, `/:name`, etc. route. Only
+      // GET reaches the SPA; non-GET writes that don't hit a vault upstream
+      // are operator errors, not SPA traffic, so 404 them.
+      if (req.method !== "GET") return new Response("not found", { status: 404 });
+      return serveSpa(spaDistDir, pathname, "/vault");
     }
 
     return new Response("not found", { status: 404 });
