@@ -411,6 +411,21 @@ export function hubFetch(
     const url = new URL(req.url);
     const pathname = url.pathname;
 
+    // 301 back-compat: `/hub/vaults*` was the SPA's vault-management entry
+    // before hub#168-realignment. Bookmarks and any cached operator-typed
+    // URLs land here; permanent redirect keeps them working without leaving
+    // a dangling SPA route. Query string preserved; fragment is client-side
+    // and survives the redirect at the browser. Method-agnostic — even a
+    // misrouted POST gets the redirect, since there's no /hub/vaults POST
+    // endpoint to protect.
+    if (pathname === "/hub/vaults" || pathname.startsWith("/hub/vaults/")) {
+      const newPath = `/vault${pathname.slice("/hub/vaults".length)}`;
+      return new Response("", {
+        status: 301,
+        headers: { location: `${newPath}${url.search}` },
+      });
+    }
+
     if (pathname === "/" || pathname === "/hub.html") {
       if (!existsSync(hubHtmlPath)) {
         return new Response("hub.html not found", { status: 404 });
