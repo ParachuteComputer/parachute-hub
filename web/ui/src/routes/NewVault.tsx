@@ -158,7 +158,7 @@ function CreatedView({
           <h3>Your vault token (shown once)</h3>
           <p className="muted">
             This is the only time the hub will show this token. Copy it and store it somewhere safe
-            — a password manager, the operator's notes, paraclaw's secrets store. If you lose it,
+            — a password manager, the operator's notes, parachute-agent's secrets store. If you lose it,
             you'll need to mint a new one from the vault directly.
           </p>
           <div className="token-box">
