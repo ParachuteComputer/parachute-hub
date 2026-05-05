@@ -2,7 +2,7 @@
   "name": "@openparachute/hub-web-ui",
   "version": "0.0.1-rc.1",
   "private": true,
-  "description": "Hub web UI — Vite + React + TypeScript. Vault management SPA mounted under /hub/.",
+  "description": "Hub web UI — Vite + React + TypeScript. Vault management SPA mounted at /vault (and /hub for back-compat).",
   "license": "AGPL-3.0",
   "type": "module",
   "scripts": {

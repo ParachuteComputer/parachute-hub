@@ -287,7 +287,23 @@ function defaultSpaDistDir(): string {
   return resolve(here, "..", "web", "ui", "dist");
 }
 
-const SPA_MOUNT = "/hub";
+/**
+ * The SPA serves at two mounts:
+ *
+ * - `/vault` — primary, since hub#168-realignment. Matches the operator
+ *   pattern of `/<module>` as the entry point (alongside `/notes`, `/claw`,
+ *   `/scribe`). VaultsList, NewVault, and per-vault detail routes hang off
+ *   here.
+ * - `/hub` — back-compat. `/hub/permissions` (cross-vault grants) is a hub
+ *   concern and stays where bookmarks expect it. `/hub/vaults*` is a 301 to
+ *   `/vault*` further up the dispatch — keeping it out of this mount.
+ *
+ * Both mounts serve the same SPA bundle. Asset URLs are origin-absolute
+ * (`/vault/assets/...`) per the build base, so the HTML loads correctly
+ * regardless of which mount served it. main.tsx detects the active mount
+ * at runtime and configures react-router's `basename` accordingly.
+ */
+type SpaMount = "/vault" | "/hub";
 
 /**
  * Pick a content type for static assets the SPA build produces. Vite's
@@ -333,16 +349,19 @@ function spaContentType(pathname: string): string {
  * file under `dist/`). Path-traversal is blocked twice: the asset-shape
  * filter rejects sub-paths containing "..", and the resolved absolute
  * path is checked to start with `dist/` before any read.
+ *
+ * `mount` is the prefix being served (`/vault` or `/hub`); we strip it
+ * from `pathname` to land on the file path inside `dist/`.
  */
-async function serveSpa(spaDistDir: string, pathname: string): Promise<Response> {
+async function serveSpa(spaDistDir: string, pathname: string, mount: SpaMount): Promise<Response> {
   if (!existsSync(spaDistDir)) {
     return new Response(
       "hub SPA bundle not found — run `bun run build` in web/ui/ to produce dist/",
       { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   }
-  // Strip the mount prefix; "/hub" → "", "/hub/" → "/", "/hub/x" → "/x".
-  const sub = pathname === SPA_MOUNT ? "" : pathname.slice(SPA_MOUNT.length);
+  // Strip the mount prefix; "/vault" → "", "/vault/" → "/", "/vault/x" → "/x".
+  const sub = pathname === mount ? "" : pathname.slice(mount.length);
   const indexPath = join(spaDistDir, "index.html");
 
   // Empty / mount-root / any non-asset request → SPA shell. The router takes
@@ -364,7 +383,7 @@ async function serveSpa(spaDistDir: string, pathname: string): Promise<Response>
   }
   if (!existsSync(filePath)) {
     // Asset request that doesn't resolve to a real file → SPA shell.
-    // (e.g. `/hub/vaults` with a typo'd extension shouldn't 404 the page.)
+    // (e.g. `/vault/foo` with a typo'd extension shouldn't 404 the page.)
     return new Response(Bun.file(indexPath), {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
@@ -391,6 +410,21 @@ export function hubFetch(
   return async (req) => {
     const url = new URL(req.url);
     const pathname = url.pathname;
+
+    // 301 back-compat: `/hub/vaults*` was the SPA's vault-management entry
+    // before hub#168-realignment. Bookmarks and any cached operator-typed
+    // URLs land here; permanent redirect keeps them working without leaving
+    // a dangling SPA route. Query string preserved; fragment is client-side
+    // and survives the redirect at the browser. Method-agnostic — even a
+    // misrouted POST gets the redirect, since there's no /hub/vaults POST
+    // endpoint to protect.
+    if (pathname === "/hub/vaults" || pathname.startsWith("/hub/vaults/")) {
+      const newPath = `/vault${pathname.slice("/hub/vaults".length)}`;
+      return new Response("", {
+        status: 301,
+        headers: { location: `${newPath}${url.search}` },
+      });
+    }
 
     if (pathname === "/" || pathname === "/hub.html") {
       if (!existsSync(hubHtmlPath)) {
@@ -539,13 +573,14 @@ export function hubFetch(
       });
     }
 
-    // Hub vault-management SPA. Mount root + nested routes both land here;
-    // serveSpa picks index.html vs. an asset by extension. Only GET — POSTs
-    // for vault create go to /vaults, not the SPA mount. (HEAD is harmless
-    // but we keep the contract narrow.)
-    if (pathname === SPA_MOUNT || pathname.startsWith(`${SPA_MOUNT}/`)) {
+    // /hub SPA mount (back-compat). Kept for `/hub/permissions` and any other
+    // hub-level admin surface that lived under /hub/ before the realignment.
+    // /hub/vaults* is a separate concern handled by the 301 redirect lower
+    // down — the redirect runs first so it never reaches here. Only GET —
+    // POSTs for vault create go to /vaults, not the SPA mount.
+    if (pathname === "/hub" || pathname.startsWith("/hub/")) {
       if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
-      return serveSpa(spaDistDir, pathname);
+      return serveSpa(spaDistDir, pathname, "/hub");
     }
 
     if (pathname === "/admin/host-admin-token") {
@@ -625,15 +660,34 @@ export function hubFetch(
       return handleAdminConfigPost(getDb(), req, name);
     }
 
-    // Dynamic vault routing — services.json is the source of truth, read per
-    // request so a `parachute vault create` performed after `parachute expose`
-    // is immediately reachable on the tailnet (#144). Tailscale serve mounts
-    // a single `/vault/` → hub entry; this handler picks the specific vault
-    // backend by longest-mount-prefix on every request.
+    // /vault — primary SPA mount + dynamic per-vault proxy share this
+    // namespace. Order matters:
+    //   1. `/vault` exact → SPA shell (vault list).
+    //   2. `/vault/<known-vault>/...` → proxy to the vault backend, picked
+    //      from services.json by longest-mount-prefix. Read per request so a
+    //      `parachute vault create` performed after `parachute expose` is
+    //      immediately reachable (#144).
+    //   3. `/vault/<spa-route>` → SPA shell. Only single-segment paths
+    //      (`/vault/new`, `/vault/<name>`) and `/vault/assets/*` count as
+    //      SPA routes. Multi-segment requests like `/vault/<unknown>/health`
+    //      are vault-API shapes targeting a non-existent vault and 404 —
+    //      otherwise the SPA shell would mask backend 404s with HTML.
+    //      `new` and `assets` are reserved vault names (see
+    //      `RESERVED_VAULT_NAMES` in admin-vaults.ts) so an operator
+    //      can't register a vault that shadows the SPA's create route or
+    //      its static asset bundle.
+    if (pathname === "/vault") {
+      if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+      return serveSpa(spaDistDir, pathname, "/vault");
+    }
     if (pathname.startsWith("/vault/")) {
       const proxied = await proxyToVault(req, manifestPath);
       if (proxied) return proxied;
-      // Fall through to the catch-all 404 below — no vault claims this path.
+      const sub = pathname.slice("/vault/".length);
+      const isSpaRoute = !sub.includes("/") || sub.startsWith("assets/");
+      if (!isSpaRoute) return new Response("not found", { status: 404 });
+      if (req.method !== "GET") return new Response("not found", { status: 404 });
+      return serveSpa(spaDistDir, pathname, "/vault");
     }
 
     return new Response("not found", { status: 404 });

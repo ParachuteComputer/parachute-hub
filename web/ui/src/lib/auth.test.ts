@@ -54,7 +54,7 @@ describe("getHostAdminToken", () => {
     );
     const replace = vi.fn();
     vi.stubGlobal("window", {
-      location: { pathname: "/vaults/new", search: "?x=1", replace },
+      location: { pathname: "/vault/new", search: "?x=1", replace },
     } as unknown as Window & typeof globalThis);
 
     const auth = await import("./auth.ts");
@@ -65,7 +65,7 @@ describe("getHostAdminToken", () => {
     await new Promise((r) => setTimeout(r, 0));
 
     expect(replace).toHaveBeenCalledWith(
-      `/admin/login?next=${encodeURIComponent("/vaults/new?x=1")}`,
+      `/admin/login?next=${encodeURIComponent("/vault/new?x=1")}`,
     );
   });
 

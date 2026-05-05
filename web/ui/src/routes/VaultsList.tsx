@@ -98,7 +98,7 @@ export function VaultsList() {
       <div>
         <div className="list-header">
           <h2>Vaults</h2>
-          <Link to="/vaults/new">
+          <Link to="/new">
             <button type="button">New vault</button>
           </Link>
         </div>
@@ -116,7 +116,7 @@ export function VaultsList() {
     <div>
       <div className="list-header">
         <h2>Vaults ({state.vaults.length})</h2>
-        <Link to="/vaults/new">
+        <Link to="/new">
           <button type="button">New vault</button>
         </Link>
       </div>
@@ -132,7 +132,7 @@ export function VaultsList() {
             Create your first vault to start storing tokens, secrets, and notes scoped to this hub.
           </p>
           <p style={{ marginTop: "0.75rem" }}>
-            <Link to="/vaults/new">Create a vault →</Link>
+            <Link to="/new">Create a vault →</Link>
           </p>
         </div>
       ) : (

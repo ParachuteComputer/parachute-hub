@@ -44,13 +44,14 @@ describe("renderHub", () => {
     expect(html).toContain("['vault', 'scribe', 'notes', 'claw']");
   });
 
-  test("vault tile counts vaults[] (per instance) and links to /hub/vaults", () => {
+  test("vault tile counts vaults[] (per instance) and links to /vault", () => {
     // Vault count is the length of doc.vaults — one entry per /vault/<name>
     // mount, so a single ServiceEntry with paths=[a,b,c] still shows "3
-    // registered". The manage link is the hub's vault SPA, never an
-    // individual vault backend.
+    // registered". The manage link is the hub's vault SPA at /vault
+    // (renamed from /hub/vaults in the realignment), never an individual
+    // vault backend.
     expect(html).toContain("vaults.length");
-    expect(html).toContain("'/hub/vaults'");
+    expect(html).toContain("'/vault'");
   });
 
   test("non-vault tiles take their manageUrl from the service's path", () => {
@@ -95,7 +96,7 @@ describe("renderHub", () => {
   test("does not retain the per-service interactive-card / config-form code", () => {
     // The home page is now a directory of modules — per-instance config
     // forms and detail panels live behind the Manage links (vault SPA at
-    // /hub/vaults, the running module's own UI elsewhere). Keeping the
+    // /vault, the running module's own UI elsewhere). Keeping the
     // dead code around is a maintenance trap.
     expect(html).not.toContain("renderConfigField");
     expect(html).not.toContain("fetchConfig");

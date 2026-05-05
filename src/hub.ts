@@ -11,7 +11,7 @@ import { CONFIG_DIR } from "./config.ts";
  * but at three vaults plus scribe + notes + claw the page reads as a flat
  * list of instances rather than the modules themselves (#168). The new shape
  * aggregates: "Vault — 3 registered — Manage →" links to the per-vault SPA at
- * `/hub/vaults`; "Scribe — 1 registered" links to the running scribe instance;
+ * `/vault`; "Scribe — 1 registered" links to the running scribe instance;
  * etc. Zero-count types are hidden entirely.
  *
  * The file stays self-contained (inline CSS + JS, no external assets) so
@@ -273,7 +273,7 @@ const HTML = `<!doctype html>
   // Aggregate services + vaults into one entry per module type. Vault is
   // special-cased because its count comes from doc.vaults[] (one entry per
   // vault instance / mount path) and its manage link goes to the hub's
-  // per-vault SPA at /hub/vaults — not to any single vault backend.
+  // per-vault SPA at /vault — not to any single vault backend.
   function aggregate(services, vaults) {
     const groups = new Map();
     if (vaults.length > 0) {
@@ -281,7 +281,7 @@ const HTML = `<!doctype html>
         type: 'vault',
         label: 'Vault',
         count: vaults.length,
-        manageUrl: '/hub/vaults',
+        manageUrl: '/vault',
       });
     }
     for (const svc of services) {

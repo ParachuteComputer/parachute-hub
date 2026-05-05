@@ -57,10 +57,7 @@ describe("VaultsList", () => {
     vi.mocked(api.listVaults).mockResolvedValue([]);
     renderList();
     await waitFor(() => expect(screen.getByText(/no vaults yet/i)).toBeInTheDocument());
-    expect(screen.getByRole("link", { name: /create a vault/i })).toHaveAttribute(
-      "href",
-      "/vaults/new",
-    );
+    expect(screen.getByRole("link", { name: /create a vault/i })).toHaveAttribute("href", "/new");
   });
 
   it("renders one row per vault with name + version + URL", async () => {

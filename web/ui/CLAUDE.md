@@ -1,31 +1,52 @@
 # Hub web UI
 
-Vite + React + TypeScript SPA mounted at `/hub/` on the running hub. Serves
-the vault management surface (Phase 1: list + create; Phase 2+ will add
-mint/revoke/config).
+Vite + React + TypeScript SPA. The bundle serves at two mounts on the
+running hub: `/vault/*` (primary, since the hub#168 realignment) and
+`/hub/*` (back-compat for `/hub/permissions` and any bookmark that
+predates the rename). Vault management Phase 1 surfaces: list + create;
+Phase 2+ will add mint/revoke/config.
 
 ## Mount-aware contract
 
-The same bundle has to work two places:
+Same bundle, two mounts. Asset URLs are origin-absolute
+(`/vault/assets/...`) per Vite's `base` setting, which means the HTML
+loads correctly regardless of which mount served it. The mount-specific
+state is the react-router `basename`, detected at runtime in
+`src/main.tsx`:
 
-- **Production / tailnet** — served by `src/hub-server.ts` at `/hub/*`.
-  Vite's `base` defaults to `/hub/` (`vite.config.ts`), so asset URLs come
-  out as `/hub/assets/...` and react-router's `basename` resolves to
-  `/hub`.
-- **Dev** (`bun run dev`) — Vite serves at `http://127.0.0.1:5174/hub/`
-  with a proxy that forwards `/admin`, `/vaults`, and `/.well-known` to
-  `HUB_ORIGIN` (default `http://127.0.0.1:1939`). Override the base with
-  `VITE_BASE_PATH=/` if you need to dev against the origin root.
+- `window.location.pathname` starts with `/vault` → `basename = "/vault"`
+- `window.location.pathname` starts with `/hub`   → `basename = "/hub"`
+- otherwise → `basename = ""` (dev / origin root)
+
+`src/App.tsx` uses the same detection to swap route sets — under `/vault`
+the SPA renders the vault list / create / detail; under `/hub` it
+renders `/permissions` (cross-vault grants) and otherwise 404s.
+
+**Production / tailnet.** `src/hub-server.ts` mounts the SPA at both
+prefixes. `/hub/vaults*` is intercepted earlier and 301-redirected to
+`/vault*`. `/vault/<name>/*` first tries the dynamic vault proxy
+(longest-mount-prefix off `services.json`); only single-segment SPA
+routes (`/vault`, `/vault/new`, `/vault/<name>`) and `/vault/assets/*`
+fall through to the SPA shell when no vault matches. Multi-segment
+`/vault/<unknown>/*` requests 404 instead of being masked by HTML.
+
+**Dev** (`bun run dev`). Vite serves at `http://127.0.0.1:5174/vault/`
+with a proxy that forwards `/admin`, `/vaults`, and `/.well-known` to
+`HUB_ORIGIN` (default `http://127.0.0.1:1939`). Override the base with
+`VITE_BASE_PATH=/` if you need to dev against the origin root.
 
 `scripts/verify-base.mjs` runs after every build and aborts if
-`dist/index.html` doesn't carry the `/hub/`-prefixed asset URLs — same
+`dist/index.html` doesn't carry the `/vault/`-prefixed asset URLs — same
 regression check paraclaw#25 codified after a silent base-drift.
 
 **Lesson: never hardcode a leading-slash URL** in `Link to=`, `fetch`,
-or `<a href>`. `Link` resolves against `BASE_URL` automatically; `fetch`
-calls hit the origin root regardless of mount, which is what we want for
-`/.well-known/parachute.json` and `/vaults`. If you need the mounted
-prefix, use `import.meta.env.BASE_URL`.
+or `<a href>` for in-SPA navigation. `Link` resolves against the active
+basename automatically; `fetch` calls hit the origin root regardless of
+mount, which is what we want for `/.well-known/parachute.json` and
+`/vaults`. If you need the mounted prefix, use
+`import.meta.env.BASE_URL`. Cross-mount nav (e.g. `/vault` → `/hub/permissions`)
+must use `<a href>`, since `<Link>` resolves against the active basename
+and would mangle the absolute path.
 
 ## Auth
 
@@ -49,7 +70,7 @@ narrowest possible.
 web/ui/
 ├── index.html              # vite entry, mounts #root
 ├── package.json            # @openparachute/hub-web-ui
-├── vite.config.ts          # base=/hub/ + dev proxy
+├── vite.config.ts          # base=/vault/ + dev proxy
 ├── vitest.config.ts        # jsdom + setup file
 ├── tsconfig.json
 ├── scripts/verify-base.mjs # post-build regression check
@@ -61,9 +82,9 @@ web/ui/
     │   ├── auth.ts         # session→JWT mint, in-memory cache
     │   └── api.ts          # listVaults + createVault
     ├── routes/
-    │   ├── VaultsList.tsx  # /vaults
-    │   ├── NewVault.tsx    # /vaults/new (single-emit pvt_* banner)
-    │   └── VaultDetail.tsx # /vaults/:name (Phase 2 placeholder)
+    │   ├── VaultsList.tsx  # / (under /vault basename)
+    │   ├── NewVault.tsx    # /new (single-emit pvt_* banner)
+    │   └── VaultDetail.tsx # /:name (Phase 2 placeholder)
     └── test/setup.ts
 ```
 
@@ -72,7 +93,7 @@ web/ui/
 ```sh
 cd web/ui
 bun install
-bun run dev          # http://127.0.0.1:5174/hub/  (proxies to :1939)
+bun run dev          # http://127.0.0.1:5174/vault/  (proxies to :1939)
 bun run build        # → dist/  (then verify-base.mjs)
 bun run typecheck    # tsc --noEmit
 bun run test         # vitest run
@@ -89,9 +110,9 @@ though they don't get the SPA source.
 
 If you ever need to manually rebuild, `cd web/ui && bun run build` still
 works. `src/hub-server.ts` handles a missing `dist/` by 503ing the
-`/hub/*` routes with a hint to run the build — usually means the
-postinstall hasn't run yet, or fired with `--ignore-scripts` (which
-suppresses lifecycle hooks).
+`/vault/*` and `/hub/*` SPA routes with a hint to run the build —
+usually means the postinstall hasn't run yet, or fired with
+`--ignore-scripts` (which suppresses lifecycle hooks).
 
 ## Brand tokens
 

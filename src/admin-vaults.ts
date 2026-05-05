@@ -39,8 +39,10 @@
  * we don't reimplement DB+yaml+token writes here. Mirrors D1 in the design
  * doc: hub orchestrates the CLI, doesn't replace it.
  *
- * Idempotency: name validation matches `parachute-vault create` (regex +
- * "list" reserved). When a vault with the requested name already exists,
+ * Idempotency: name validation matches `parachute-vault create`'s rules
+ * (regex + "list" reserved), with `new` and `assets` also reserved at
+ * the hub edge for SPA-route shadowing. When a vault with the requested
+ * name already exists,
  * we return 200 with the existing entry rather than re-running the CLI —
  * the CLI itself rejects an existing name with exit 1, but a re-POST is
  * usually a UI retry, not an error to the caller.
@@ -54,9 +56,16 @@ import { type WellKnownVaultEntry, isVaultEntry, vaultInstanceNameFor } from "./
 /** Scope required to call POST /vaults. */
 export const HOST_ADMIN_SCOPE = "parachute:host:admin";
 
-/** Mirror parachute-vault's `cmdCreate` validation rules. */
+/**
+ * Mirror parachute-vault's `cmdCreate` validation rules, plus hub-only
+ * reservations for SPA-route shadowing. `list` matches the CLI; `new` and
+ * `assets` would collide with `/vault/new` (the SPA's create-vault route)
+ * and `/vault/assets/*` (the SPA's static asset bundle) respectively, so
+ * the hub rejects them at the API edge before a vault under those names
+ * can register and capture the proxy path.
+ */
 const VAULT_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const RESERVED_VAULT_NAMES = new Set(["list"]);
+const RESERVED_VAULT_NAMES = new Set(["list", "new", "assets"]);
 
 export interface CreateVaultRequest {
   name: string;

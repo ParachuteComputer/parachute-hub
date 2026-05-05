@@ -32,10 +32,10 @@ afterEach(() => {
 
 function renderForm() {
   return render(
-    <MemoryRouter initialEntries={["/vaults/new"]}>
+    <MemoryRouter initialEntries={["/new"]}>
       <Routes>
-        <Route path="/vaults/new" element={<NewVault />} />
-        <Route path="/vaults/:name" element={<div>detail</div>} />
+        <Route path="/new" element={<NewVault />} />
+        <Route path="/:name" element={<div>detail</div>} />
       </Routes>
     </MemoryRouter>,
   );

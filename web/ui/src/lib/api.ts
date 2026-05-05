@@ -10,7 +10,7 @@
  * the admin endpoint after a fresh mint, the auth helper navigates the
  * browser to /admin/login — we don't try to recover.
  */
-import { clearCachedToken, getHostAdminToken } from "./auth.ts";
+import { clearCachedToken, getHostAdminToken, redirectToLoginAndHang } from "./auth.ts";
 
 export interface VaultListing {
   name: string;
@@ -150,8 +150,9 @@ export async function createVault(input: CreateVaultInput): Promise<CreateVaultR
  *
  * Same session-cookie origin as `getHostAdminToken()`, so we don't reuse
  * the host-admin Bearer here — the endpoint reads the cookie directly.
- * On 401 the operator's session is gone; we surface the error so the
- * caller can hand off to /admin/login.
+ * On 401 the operator's session is gone; we redirect to /admin/login and
+ * hang the promise — same shape as `getHostAdminToken()` so the operator
+ * never sees a "no admin session" message they can't act on.
  */
 export async function mintVaultAdminToken(name: string): Promise<MintedVaultAdminToken> {
   const res = await fetch(`/admin/vault-admin-token/${encodeURIComponent(name)}`, {
@@ -159,6 +160,9 @@ export async function mintVaultAdminToken(name: string): Promise<MintedVaultAdmi
     headers: { accept: "application/json" },
     credentials: "same-origin",
   });
+  if (res.status === 401) {
+    return redirectToLoginAndHang<MintedVaultAdminToken>();
+  }
   if (!res.ok) {
     throw new HttpError(res.status, await readError(res));
   }

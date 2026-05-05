@@ -398,15 +398,24 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/hub/ serves index.html when the SPA bundle exists", async () => {
+  // SPA mounts after hub#168-realignment:
+  //   /vault — primary (vault list, NewVault, etc.)
+  //   /hub   — back-compat (only /hub/permissions; /hub/vaults* is 301'd
+  //            below, /hub/ root falls through to the SPA's 404 route)
+  //
+  // Same bundle at both mounts. Build base is /vault/, so asset URLs are
+  // origin-absolute and resolve regardless of which mount served the HTML.
+
+  test("/vault serves index.html when the SPA bundle exists", async () => {
     const h = makeHarness();
     try {
       const dist = join(h.dir, "dist");
-      writeFileSync(join(h.dir, "hub.html"), "<html>hub</html>");
       mkdirIfMissing(dist);
       writeFileSync(join(dist, "index.html"), "<!doctype html><div id=root></div>");
-      const fetch = hubFetch(h.dir, { spaDistDir: dist });
-      const res = await fetch(req("/hub/"));
+      writeManifest({ services: [] }, h.manifestPath);
+      const res = await hubFetch(h.dir, { spaDistDir: dist, manifestPath: h.manifestPath })(
+        req("/vault"),
+      );
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
       expect(await res.text()).toContain("<div id=root>");
@@ -415,13 +424,19 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/hub/vaults (client-side route) falls back to index.html", async () => {
+  test("/vault/new (client-side route, no matching vault) falls back to index.html", async () => {
+    // Routing-order check: `new` isn't a known vault, so proxyToVault
+    // returns undefined and we fall through to the SPA shell. The router
+    // takes over client-side and renders the NewVault form.
     const h = makeHarness();
     try {
       const dist = join(h.dir, "dist");
       mkdirIfMissing(dist);
       writeFileSync(join(dist, "index.html"), "<!doctype html><div id=root></div>");
-      const res = await hubFetch(h.dir, { spaDistDir: dist })(req("/hub/vaults"));
+      writeManifest({ services: [] }, h.manifestPath);
+      const res = await hubFetch(h.dir, { spaDistDir: dist, manifestPath: h.manifestPath })(
+        req("/vault/new"),
+      );
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
       expect(await res.text()).toContain("<div id=root>");
@@ -430,7 +445,7 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/hub/assets/*.js is served with the matching content-type", async () => {
+  test("/vault/assets/*.js is served with the matching content-type", async () => {
     const h = makeHarness();
     try {
       const dist = join(h.dir, "dist");
@@ -439,7 +454,10 @@ describe("hubFetch routing", () => {
       mkdirIfMissing(assets);
       writeFileSync(join(dist, "index.html"), "<!doctype html>");
       writeFileSync(join(assets, "main.js"), "console.log('hi');");
-      const res = await hubFetch(h.dir, { spaDistDir: dist })(req("/hub/assets/main.js"));
+      writeManifest({ services: [] }, h.manifestPath);
+      const res = await hubFetch(h.dir, { spaDistDir: dist, manifestPath: h.manifestPath })(
+        req("/vault/assets/main.js"),
+      );
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toBe("application/javascript; charset=utf-8");
       expect(await res.text()).toContain("console.log");
@@ -448,10 +466,55 @@ describe("hubFetch routing", () => {
     }
   });
 
+  test("/vault/* returns 503 with build hint when dist is missing", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const res = await hubFetch(h.dir, {
+        spaDistDir: join(h.dir, "missing"),
+        manifestPath: h.manifestPath,
+      })(req("/vault"));
+      expect(res.status).toBe(503);
+      expect(await res.text()).toContain("bun run build");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/vault rejects non-GET methods with 405", async () => {
+    const h = makeHarness();
+    try {
+      const dist = join(h.dir, "dist");
+      mkdirIfMissing(dist);
+      writeFileSync(join(dist, "index.html"), "<!doctype html>");
+      const res = await hubFetch(h.dir, { spaDistDir: dist })(req("/vault", { method: "POST" }));
+      expect(res.status).toBe(405);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/hub/permissions serves the SPA shell (back-compat mount)", async () => {
+    const h = makeHarness();
+    try {
+      const dist = join(h.dir, "dist");
+      mkdirIfMissing(dist);
+      writeFileSync(join(dist, "index.html"), "<!doctype html><div id=root></div>");
+      const res = await hubFetch(h.dir, { spaDistDir: dist })(req("/hub/permissions"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(await res.text()).toContain("<div id=root>");
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("/hub/* returns 503 with build hint when dist is missing", async () => {
     const h = makeHarness();
     try {
-      const res = await hubFetch(h.dir, { spaDistDir: join(h.dir, "missing") })(req("/hub/"));
+      const res = await hubFetch(h.dir, { spaDistDir: join(h.dir, "missing") })(
+        req("/hub/permissions"),
+      );
       expect(res.status).toBe(503);
       expect(await res.text()).toContain("bun run build");
     } finally {
@@ -465,8 +528,45 @@ describe("hubFetch routing", () => {
       const dist = join(h.dir, "dist");
       mkdirIfMissing(dist);
       writeFileSync(join(dist, "index.html"), "<!doctype html>");
-      const res = await hubFetch(h.dir, { spaDistDir: dist })(req("/hub/", { method: "POST" }));
+      const res = await hubFetch(h.dir, { spaDistDir: dist })(
+        req("/hub/permissions", { method: "POST" }),
+      );
       expect(res.status).toBe(405);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/hub/vaults issues a 301 redirect to /vault", async () => {
+    // Back-compat for bookmarks. The exact mount path used to be /hub/vaults
+    // before the realignment; permanent redirect keeps stale URLs working.
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/hub/vaults"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/vault");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/hub/vaults/new redirects to /vault/new", async () => {
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/hub/vaults/new"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/vault/new");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/hub/vaults/* preserves the query string in the redirect", async () => {
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/hub/vaults/foo?bar=1&baz=2"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/vault/foo?bar=1&baz=2");
     } finally {
       h.cleanup();
     }
@@ -893,6 +993,57 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
       const res = await fetcher(req("/vault/keeper/health"));
       expect(res.status).toBe(404);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("single-segment /vault/<name> picks proxy when registered, SPA shell when not", async () => {
+    // Two cases share one fixture so the contrast is explicit:
+    //   - `/vault/default` is registered → proxy answers (200, JSON tag).
+    //   - `/vault/nonexistent` has no match → falls through to the SPA
+    //     shell (200, text/html). The SPA's :name route renders client-side
+    //     and shows a 404 in-app, but at the wire it's the shell.
+    // This is the routing-order seam #173 introduced — proxy is consulted
+    // before the SPA fallback, and the fallback only triggers when no
+    // vault claims the path.
+    const h = makeHarness();
+    const upstream = startUpstream("default-vault");
+    try {
+      const dist = join(h.dir, "dist");
+      mkdirIfMissing(dist);
+      writeFileSync(join(dist, "index.html"), "<!doctype html><div id=root></div>");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, {
+        spaDistDir: dist,
+        manifestPath: h.manifestPath,
+      });
+
+      const proxied = await fetcher(req("/vault/default"));
+      expect(proxied.status).toBe(200);
+      expect(proxied.headers.get("content-type")).toContain("application/json");
+      const body = (await proxied.json()) as { tag: string; pathname: string };
+      expect(body.tag).toBe("default-vault");
+      expect(body.pathname).toBe("/vault/default");
+
+      const shelled = await fetcher(req("/vault/nonexistent"));
+      expect(shelled.status).toBe(200);
+      expect(shelled.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(await shelled.text()).toContain("<div id=root>");
     } finally {
       upstream.stop();
       h.cleanup();

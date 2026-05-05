@@ -73,7 +73,7 @@ export function NewVault() {
     return (
       <CreatedView
         result={state.result}
-        onDone={() => navigate(`/vaults/${encodeURIComponent(state.result.name)}`)}
+        onDone={() => navigate(`/${encodeURIComponent(state.result.name)}`)}
       />
     );
   }
@@ -120,7 +120,7 @@ export function NewVault() {
           >
             {state.kind === "submitting" ? "Creating…" : "Create vault"}
           </button>
-          <Link to="/vaults" className="muted">
+          <Link to="/" className="muted">
             Cancel
           </Link>
         </div>
@@ -182,7 +182,7 @@ function CreatedView({
             <code>parachute-vault mint-token</code>.
           </p>
           <div className="actions">
-            <Link to={`/vaults/${encodeURIComponent(result.name)}`}>
+            <Link to={`/${encodeURIComponent(result.name)}`}>
               <button type="button">Continue</button>
             </Link>
           </div>

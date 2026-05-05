@@ -230,6 +230,47 @@ describe("POST /vaults — body validation", () => {
       h.cleanup();
     }
   });
+
+  test('400 when name is "new" (would shadow SPA create route)', async () => {
+    // Without the reservation, a vault named "new" would capture
+    // `/vault/new` via the dynamic-proxy lookup and render the SPA's
+    // create-vault page unreachable.
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const res = await call({ db, manifestPath: h.manifestPath, body: { name: "new" } });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error_description: string };
+        expect(body.error_description).toMatch(/reserved/i);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test('400 when name is "assets" (would shadow SPA static bundle)', async () => {
+    // A vault named "assets" would capture `/vault/assets/*` and break
+    // SPA JS/CSS loading at both /vault and /hub mounts.
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const res = await call({ db, manifestPath: h.manifestPath, body: { name: "assets" } });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error_description: string };
+        expect(body.error_description).toMatch(/reserved/i);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 describe("POST /vaults — orchestration", () => {
