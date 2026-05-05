@@ -214,8 +214,10 @@ interface ResolvedTarget {
    * Lifecycle spec resolved at request time. First-party comes from
    * `getSpec(short)`; third-party comes from
    * `getSpecFromInstallDir(entry.installDir, ...)`. May be undefined when
-   * a row has neither — lifecycle prints "lifecycle not yet supported"
-   * for that service rather than crashing the whole sweep.
+   * a row has neither — `start` prints the actionable "no installDir"
+   * re-install message for an installDir-less third-party row, or
+   * "lifecycle not yet supported" otherwise; `stop`/`logs` keep working
+   * via pidfile/logfile semantics keyed by `short`.
    */
   spec: ServiceSpec | undefined;
 }
@@ -248,6 +250,13 @@ async function specForEntry(
  * `module.json` (which is what install copied to `entry.name` for
  * third-party). First-party are addressed by their short name (vault,
  * notes, …) and matched via `shortNameForManifest`.
+ *
+ * Named-path detail: a third-party row whose name matches but lacks
+ * `installDir` resolves to the entry with `spec: undefined` (rather than
+ * an "unknown service" error). `stop`/`logs` handle the spec-less case
+ * via pidfile/logfile semantics; `start` surfaces an actionable
+ * re-install hint downstream. The genuinely-unknown path (no first-party
+ * fallback AND no row in services.json) still errors as `unknown service`.
  */
 async function resolveTargets(
   svc: string | undefined,
