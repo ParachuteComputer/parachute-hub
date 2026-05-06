@@ -43,6 +43,7 @@ import {
 } from "./clients.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { isCoveredByGrant, recordGrant } from "./grants.ts";
+import { VAULT_VERBS, inferAudience } from "./jwt-audience.ts";
 import {
   ACCESS_TOKEN_TTL_SECONDS,
   RefreshTokenInsertError,
@@ -68,8 +69,6 @@ import {
 } from "./sessions.ts";
 import { getUserByUsername, verifyPassword } from "./users.ts";
 import { isVaultEntry, shortName, vaultInstanceNameFor } from "./well-known.ts";
-
-const VAULT_VERBS = new Set(["read", "write", "admin"]);
 
 /** Verbs whose unnamed `vault:<verb>` form needs picker disambiguation. */
 function unnamedVaultVerbs(scopes: string[]): string[] {
@@ -1054,36 +1053,6 @@ function mapAuthCodeError(err: unknown): Response {
   }
   const msg = err instanceof Error ? err.message : String(err);
   return jsonResponse({ error: "server_error", error_description: msg }, 500);
-}
-
-/**
- * Picks the JWT `aud` claim based on the requested scopes. Per the
- * vault-config-and-scopes design (Phase 1+2):
- *   - A named `vault:<name>:<verb>` → `vault.<name>` (RFC 8707-style resource
- *     binding; vault enforces this strict-equality against the URL-derived
- *     vault name).
- *   - An unnamed `<service>:<verb>` → `<service>` (legacy shape; vault's
- *     strict-check rejects unnamed `vault:*` audiences, so the consent
- *     picker rewrites those before this is reached).
- *
- * Named vault scopes win over unnamed ones — an OAuth flow that mixes
- * `vault:work:read` + `scribe:transcribe` audiences is grounded on the vault
- * (the more sensitive resource), and tokens are issued per-flow anyway.
- */
-function inferAudience(scopes: string[]): string {
-  for (const s of scopes) {
-    const parts = s.split(":");
-    const name = parts[1];
-    const verb = parts[2];
-    if (parts.length === 3 && parts[0] === "vault" && name && verb && VAULT_VERBS.has(verb)) {
-      return `vault.${name}`;
-    }
-  }
-  for (const s of scopes) {
-    const colon = s.indexOf(":");
-    if (colon > 0) return s.slice(0, colon);
-  }
-  return "hub";
 }
 
 // --- /oauth/register -------------------------------------------------------

@@ -25,7 +25,13 @@ import { listGrantsForUser, revokeGrant } from "../grants.ts";
 import { HUB_DEFAULT_PORT, readHubPort } from "../hub-control.ts";
 import { openHubDb } from "../hub-db.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
-import { issueOperatorToken } from "../operator-token.ts";
+import { inferAudience } from "../jwt-audience.ts";
+import { signAccessToken, validateAccessToken } from "../jwt-sign.ts";
+import {
+  OPERATOR_TOKEN_CLIENT_ID,
+  issueOperatorToken,
+  readOperatorTokenFile,
+} from "../operator-token.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import {
   SingleUserModeError,
@@ -54,6 +60,7 @@ const HUB_LOCAL_SUBCOMMANDS = new Set([
   "set-password",
   "list-users",
   "rotate-operator",
+  "mint-token",
   "pending-clients",
   "approve-client",
   "list-grants",
@@ -73,6 +80,9 @@ Usage:
   parachute auth 2fa backup-codes      Regenerate backup codes
   parachute auth rotate-key            Rotate the hub's JWT signing key
   parachute auth rotate-operator       Mint a fresh ~/.parachute/operator.token
+  parachute auth mint-token --scope <scope> [--aud <aud>] [--ttl <duration>] [--sub <sub>]
+                                       Mint a scope-narrow JWT against the
+                                       operator's identity (stdout = JWT)
   parachute auth pending-clients       List OAuth clients awaiting approval
   parachute auth approve-client <id>   Approve a pending OAuth client
   parachute auth list-grants [--username <name>]
@@ -103,6 +113,15 @@ rotate-operator mints a fresh long-lived operator token at
 ~/.parachute/operator.token (mode 0600). Local CLI tools read this file
 as their bearer when calling on-box services. set-password also writes
 the file on first-run / password reset.
+
+mint-token issues a single scope-narrow JWT against the operator's
+identity, signed with the same key as OAuth-issued tokens. Pipeable:
+\`parachute auth mint-token --scope scribe:transcribe | pbcopy\`. The
+audience defaults via the same inference rule the OAuth flow uses
+(named \`vault:<name>:<verb>\` → \`vault.<name>\`, otherwise the first
+colon-prefixed scope's namespace, fallback \`hub\`). TTL defaults to 90d,
+caps at 365d. Requires a valid ~/.parachute/operator.token (run
+\`parachute auth set-password\` or \`rotate-operator\` first).
 
 pending-clients + approve-client gate /oauth/register against operator
 approval (closes #74). Self-served DCR registrations land as 'pending'
@@ -571,6 +590,177 @@ function runRevokeGrant(args: readonly string[], deps: AuthDeps): number {
   }
 }
 
+interface MintTokenFlags {
+  scope?: string;
+  aud?: string;
+  ttl?: string;
+  sub?: string;
+  error?: string;
+}
+
+function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
+  let scope: string | undefined;
+  let aud: string | undefined;
+  let ttl: string | undefined;
+  let sub: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--scope") {
+      const v = args[++i];
+      if (!v) return { error: "--scope requires a value" };
+      scope = v;
+    } else if (a?.startsWith("--scope=")) {
+      scope = a.slice("--scope=".length);
+      if (!scope) return { error: "--scope requires a value" };
+    } else if (a === "--aud") {
+      const v = args[++i];
+      if (!v) return { error: "--aud requires a value" };
+      aud = v;
+    } else if (a?.startsWith("--aud=")) {
+      aud = a.slice("--aud=".length);
+      if (!aud) return { error: "--aud requires a value" };
+    } else if (a === "--ttl") {
+      const v = args[++i];
+      if (!v) return { error: "--ttl requires a value" };
+      ttl = v;
+    } else if (a?.startsWith("--ttl=")) {
+      ttl = a.slice("--ttl=".length);
+      if (!ttl) return { error: "--ttl requires a value" };
+    } else if (a === "--sub") {
+      const v = args[++i];
+      if (!v) return { error: "--sub requires a value" };
+      sub = v;
+    } else if (a?.startsWith("--sub=")) {
+      sub = a.slice("--sub=".length);
+      if (!sub) return { error: "--sub requires a value" };
+    } else {
+      return { error: `unknown flag "${a}"` };
+    }
+  }
+  return { scope, aud, ttl, sub };
+}
+
+const MINT_TOKEN_TTL_DEFAULT_SECONDS = 90 * 24 * 60 * 60;
+const MINT_TOKEN_TTL_MAX_SECONDS = 365 * 24 * 60 * 60;
+
+/**
+ * Parse a Go-ish duration string: integer + one of d/h/m/s. Caps at 365d.
+ * `90d` → 7776000. We don't honor Go's stdlib `time.ParseDuration` exactly
+ * (no `d` there), so this is a small custom parser to keep the operator
+ * surface obvious.
+ */
+function parseTtl(input: string): { seconds: number } | { error: string } {
+  const m = /^(\d+)(d|h|m|s)$/.exec(input);
+  if (!m) return { error: `invalid --ttl "${input}" — expected e.g. 90d, 24h, 30m, 60s` };
+  const n = Number.parseInt(m[1]!, 10);
+  if (!Number.isFinite(n) || n <= 0) return { error: `invalid --ttl "${input}" — must be > 0` };
+  const unit = m[2]!;
+  const mult = unit === "d" ? 86400 : unit === "h" ? 3600 : unit === "m" ? 60 : 1;
+  const seconds = n * mult;
+  if (seconds > MINT_TOKEN_TTL_MAX_SECONDS) {
+    return { error: `--ttl "${input}" exceeds 365d cap` };
+  }
+  return { seconds };
+}
+
+async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<number> {
+  const flags = parseMintTokenFlags(args);
+  if (flags.error) {
+    console.error(`parachute auth mint-token: ${flags.error}`);
+    return 1;
+  }
+  if (!flags.scope) {
+    console.error("parachute auth mint-token: --scope is required");
+    console.error(
+      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--ttl <duration>] [--sub <sub>]",
+    );
+    return 1;
+  }
+
+  const scopes = flags.scope.split(/\s+/).filter((s) => s.length > 0);
+  if (scopes.length === 0) {
+    console.error("parachute auth mint-token: --scope must contain at least one scope");
+    return 1;
+  }
+
+  let ttlSeconds = MINT_TOKEN_TTL_DEFAULT_SECONDS;
+  if (flags.ttl) {
+    const parsed = parseTtl(flags.ttl);
+    if ("error" in parsed) {
+      console.error(`parachute auth mint-token: ${parsed.error}`);
+      return 1;
+    }
+    ttlSeconds = parsed.seconds;
+  }
+
+  const configDir = deps.configDir ?? CONFIG_DIR;
+  const operatorToken = await readOperatorTokenFile(configDir);
+  if (!operatorToken) {
+    console.error(
+      "parachute auth mint-token: no operator token found at ~/.parachute/operator.token",
+    );
+    console.error(
+      "run `parachute auth set-password` (first run) or `parachute auth rotate-operator` to mint one",
+    );
+    return 1;
+  }
+
+  const issuer = resolveHubIssuer(deps.hubOrigin, configDir);
+
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    let operatorSub: string;
+    try {
+      const validated = await validateAccessToken(db, operatorToken, issuer);
+      const sub = validated.payload.sub;
+      if (typeof sub !== "string" || sub.length === 0) {
+        console.error("parachute auth mint-token: operator token has no sub claim");
+        return 1;
+      }
+      // Scope gate: a valid signature + non-expired JWT at this path is not
+      // sufficient — the token must carry operator-equivalent scope. Without
+      // this, a narrowly-scoped JWT stashed at ~/.parachute/operator.token
+      // would be treated as operator-bearer and mint arbitrary tokens
+      // (privilege escalation: narrow → arbitrary). Only set-password and
+      // rotate-operator legitimately write to this path; both seed the full
+      // OPERATOR_TOKEN_SCOPES set, so hub:admin is the right gate.
+      const tokenScope =
+        typeof validated.payload.scope === "string"
+          ? validated.payload.scope.split(/\s+/).filter((s) => s.length > 0)
+          : [];
+      if (!tokenScope.includes("hub:admin")) {
+        console.error("parachute auth mint-token: operator token lacks hub:admin scope");
+        console.error("run `parachute auth rotate-operator` to mint a fresh one");
+        return 1;
+      }
+      operatorSub = sub;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`parachute auth mint-token: operator token invalid — ${msg}`);
+      console.error(
+        "run `parachute auth rotate-operator` to mint a fresh one, or check that the hub origin matches",
+      );
+      return 1;
+    }
+
+    const audience = flags.aud ?? inferAudience(scopes);
+    const sub = flags.sub ?? operatorSub;
+
+    const minted = await signAccessToken(db, {
+      sub,
+      scopes,
+      audience,
+      clientId: OPERATOR_TOKEN_CLIENT_ID,
+      issuer,
+      ttlSeconds,
+    });
+    console.log(minted.token);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
 function runListUsers(deps: AuthDeps): number {
   const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
   try {
@@ -638,6 +828,15 @@ export async function auth(args: readonly string[], deps: AuthDeps | Runner = {}
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`parachute auth rotate-operator: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "mint-token") {
+      try {
+        return await runMintToken(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth mint-token: ${msg}`);
         return 1;
       }
     }
