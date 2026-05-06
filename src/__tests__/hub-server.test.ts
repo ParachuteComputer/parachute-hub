@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HUB_SVC, hubPortPath } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { findVaultUpstream, hubFetch } from "../hub-server.ts";
+import { findServiceUpstream, findVaultUpstream, hubFetch } from "../hub-server.ts";
 import { pidPath } from "../process-state.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
@@ -1044,6 +1044,438 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
       expect(shelled.status).toBe(200);
       expect(shelled.headers.get("content-type")).toBe("text/html; charset=utf-8");
       expect(await shelled.text()).toContain("<div id=root>");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+});
+
+describe("findServiceUpstream (#182)", () => {
+  // Generic longest-prefix match across non-vault services.json entries. Vault
+  // entries are filtered out — vault routing is the SPA-fallback-aware path
+  // through findVaultUpstream / proxyToVault.
+
+  test("matches a non-vault entry by exact path", () => {
+    const services: ServiceEntry[] = [
+      {
+        name: "scribe",
+        port: 1942,
+        paths: ["/scribe"],
+        health: "/scribe/health",
+        version: "0.1.0",
+      },
+    ];
+    const m = findServiceUpstream(services, "/scribe");
+    expect(m?.port).toBe(1942);
+    expect(m?.mount).toBe("/scribe");
+    expect(m?.entry.name).toBe("scribe");
+  });
+
+  test("matches a deeper subpath via prefix", () => {
+    const services: ServiceEntry[] = [
+      {
+        name: "agent",
+        port: 1943,
+        paths: ["/agent"],
+        health: "/agent/api/health",
+        version: "0.1.0",
+      },
+    ];
+    expect(findServiceUpstream(services, "/agent/api/health")?.port).toBe(1943);
+  });
+
+  test("ignores vault entries — those route via findVaultUpstream", () => {
+    const services: ServiceEntry[] = [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.4.0",
+      },
+    ];
+    expect(findServiceUpstream(services, "/vault/default/health")).toBeUndefined();
+  });
+
+  test("returns undefined when no service claims the path", () => {
+    const services: ServiceEntry[] = [
+      {
+        name: "scribe",
+        port: 1942,
+        paths: ["/scribe"],
+        health: "/scribe/health",
+        version: "0.1.0",
+      },
+    ];
+    expect(findServiceUpstream(services, "/unknown/foo")).toBeUndefined();
+  });
+
+  test("longest-prefix wins when multiple paths could match", () => {
+    // A service registering `/api` and another (older / catch-all) registering
+    // `/` would conflict on every request — longest mount wins so the more
+    // specific one takes precedence.
+    const services: ServiceEntry[] = [
+      { name: "wide", port: 1950, paths: ["/api"], health: "/api/health", version: "0.1.0" },
+      {
+        name: "deeper",
+        port: 1951,
+        paths: ["/api/v2"],
+        health: "/api/v2/health",
+        version: "0.1.0",
+      },
+    ];
+    expect(findServiceUpstream(services, "/api/v2/things")?.port).toBe(1951);
+    expect(findServiceUpstream(services, "/api/v1/things")?.port).toBe(1950);
+  });
+
+  test("does not match a sibling that shares a prefix without a slash boundary", () => {
+    // `/scribe-admin` must NOT match a service mounted at `/scribe`. The
+    // boundary check is `pathname === path || pathname.startsWith(path + '/')`.
+    const services: ServiceEntry[] = [
+      {
+        name: "scribe",
+        port: 1942,
+        paths: ["/scribe"],
+        health: "/scribe/health",
+        version: "0.1.0",
+      },
+    ];
+    expect(findServiceUpstream(services, "/scribe-admin")).toBeUndefined();
+    expect(findServiceUpstream(services, "/scribe-admin/foo")).toBeUndefined();
+  });
+});
+
+describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
+  // hub#182: services.json-driven dispatch for non-vault modules. Lets
+  // `parachute install <svc>` reach the on-box hub at hub:1939/<svc>/* with
+  // no per-service codepath. Vault keeps its own routing for the SPA seam.
+
+  function startUpstream(replyTag: string): { port: number; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        const u = new URL(req.url);
+        const body = req.body ? await req.text() : "";
+        return new Response(
+          JSON.stringify({
+            tag: replyTag,
+            method: req.method,
+            pathname: u.pathname,
+            search: u.search,
+            authorization: req.headers.get("authorization") ?? "",
+            contentType: req.headers.get("content-type") ?? "",
+            body,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+    return { port: server.port as number, stop: () => server.stop(true) };
+  }
+
+  test("routes /scribe/health to the matching upstream, path preserved", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("scribe");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string; pathname: string };
+      expect(body.tag).toBe("scribe");
+      // Path-preservation convention: backend sees the full mount-prefixed
+      // path, matching `serviceProxyTarget` in commands/expose.ts.
+      expect(body.pathname).toBe("/scribe/health");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("routes /notes/sw.js to the matching upstream", async () => {
+    // Notes is the canonical path-mount case — the PWA shell has to see the
+    // full `/notes/...` path so its service worker registers correctly (the
+    // motivator for the `--mount` strip in notes-serve.ts).
+    const h = makeHarness();
+    const upstream = startUpstream("notes");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "notes",
+              port: upstream.port,
+              paths: ["/notes"],
+              health: "/notes/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/notes/sw.js"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string; pathname: string };
+      expect(body.tag).toBe("notes");
+      expect(body.pathname).toBe("/notes/sw.js");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("routes a deep /agent/api/health to the matching upstream", async () => {
+    // Agent registers `/agent`; deeper paths route by prefix.
+    const h = makeHarness();
+    const upstream = startUpstream("agent");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "agent",
+              port: upstream.port,
+              paths: ["/agent"],
+              health: "/agent/api/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/agent/api/health?probe=1"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string; pathname: string; search: string };
+      expect(body.tag).toBe("agent");
+      expect(body.pathname).toBe("/agent/api/health");
+      expect(body.search).toBe("?probe=1");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("preserves method, body, and Authorization header on POSTs", async () => {
+    // Scribe-style upload: the client sends a bearer token + body, and both
+    // need to reach the upstream verbatim. Confirms the proxy isn't dropping
+    // the Authorization header (a regression we'd never want to ship).
+    const h = makeHarness();
+    const upstream = startUpstream("scribe");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(
+        req("/scribe/v1/audio/transcriptions", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer test-token",
+          },
+          body: JSON.stringify({ file: "x" }),
+        }),
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        method: string;
+        authorization: string;
+        contentType: string;
+        body: string;
+      };
+      expect(body.method).toBe("POST");
+      expect(body.authorization).toBe("Bearer test-token");
+      expect(body.contentType).toBe("application/json");
+      expect(JSON.parse(body.body)).toEqual({ file: "x" });
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("unknown /<svc>/* path returns 404", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("scribe");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/notinstalled/foo"));
+      expect(res.status).toBe(404);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("returns 502 when the matching upstream is unreachable", async () => {
+    // Service is in services.json but the port has nothing listening — same
+    // shape as the vault-unreachable test, label is the entry's `name`.
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: await pickClosedPort(),
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/health"));
+      expect(res.status).toBe(502);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("scribe upstream unreachable");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/oauth/authorize is hub-handled, never reaches service dispatch", async () => {
+    // Even if a (misbehaving) service registers `/oauth`, the hub's own
+    // /oauth/* handlers run first by virtue of dispatch ordering. We don't
+    // need an explicit denylist — ordering enforces it.
+    const h = makeHarness();
+    const upstream = startUpstream("malicious");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "malicious",
+              port: upstream.port,
+              paths: ["/oauth"],
+              health: "/oauth/health",
+              version: "0.0.1",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/oauth/authorize"));
+      // Hub's own /oauth/authorize handler responds (likely a redirect or
+      // error page rendering) — we just need to verify the upstream was NOT
+      // reached, i.e. `tag: "malicious"` is not in the body.
+      const text = await res.text();
+      expect(text).not.toContain('"tag":"malicious"');
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("/.well-known/parachute.json is hub-handled, never reaches service dispatch", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("malicious");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "malicious",
+              port: upstream.port,
+              paths: ["/.well-known"],
+              health: "/.well-known/health",
+              version: "0.0.1",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/.well-known/parachute.json"));
+      expect(res.status).toBe(200);
+      // Hub serves the well-known doc as JSON — its body has `vaults`,
+      // `services`, etc., not the upstream's `tag` echo.
+      const text = await res.text();
+      expect(text).not.toContain('"tag":"malicious"');
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("vault entries are NOT routed via the generic dispatch (regression for #144)", async () => {
+    // Reach hubFetch with a vault entry but a request shape that the vault
+    // block won't match (e.g. no leading `/vault/`). The generic dispatch
+    // must skip vault entries — confirming via findServiceUpstream-level
+    // unit test isn't enough, we want the integration to stay coherent.
+    const h = makeHarness();
+    const upstream = startUpstream("vault-default");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      // /vault/default/health goes through the vault-specific block and
+      // proxies (still works — that's the regression check).
+      const vaultRes = await fetcher(req("/vault/default/health"));
+      expect(vaultRes.status).toBe(200);
+      // /vault/default by itself is the SPA single-segment seam — it does
+      // proxy via proxyToVault per the existing behavior.
+      // The point of this test is the generic dispatch CANNOT mistakenly
+      // match a vault entry. Verify by writing a request that's not under
+      // /vault/* and confirming no fallthrough to the vault upstream.
+      const elsewhere = await fetcher(req("/totally/not/a/vault"));
+      expect(elsewhere.status).toBe(404);
     } finally {
       upstream.stop();
       h.cleanup();

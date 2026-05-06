@@ -759,6 +759,13 @@ export function hubFetch(
       return serveSpa(spaDistDir, pathname, "/vault");
     }
 
+    // Generic services.json-driven dispatch for non-vault modules. Reaches
+    // here only after every hub-owned prefix above has had its turn — so
+    // `/`, `/admin/*`, `/oauth/*`, `/.well-known/*`, `/hub/*`, `/vault/*`,
+    // `/api/*` are excluded by ordering, not by an explicit denylist (#182).
+    const proxied = await proxyToService(req, manifestPath);
+    if (proxied) return proxied;
+
     return new Response("not found", { status: 404 });
   };
 }
