@@ -45,6 +45,22 @@ export interface ServiceEntry {
    * can use clean relative paths in their `startCmd`.
    */
   installDir?: string;
+  /**
+   * When `true`, the hub's `/<svc>/*` proxy strips the matched mount prefix
+   * before forwarding so the backend sees a bare path (e.g. `/health` rather
+   * than `/scribe/health`). Default `false` keeps the prefix intact, which
+   * matches what notes / agent / vault expect today.
+   *
+   * Per-module rather than uniform because conventions differ:
+   *   - notes-serve.ts strips internally via `--mount`; expects the prefix.
+   *   - parachute-agent reads PARACHUTE_AGENT_WEB_MOUNT and strips itself.
+   *   - parachute-vault routes by `/vault/<name>/...` and expects the prefix.
+   *   - parachute-scribe serves bare paths (`/health`, `/v1/...`); the proxy
+   *     must strip. Eventually scribe should accept its own `--mount` flag
+   *     and join the always-prefixed convention; until then this opt-in
+   *     bridges the gap. Tracked in parachute-scribe (separate issue).
+   */
+  stripPrefix?: boolean;
 }
 
 export interface ServicesManifest {
@@ -105,11 +121,16 @@ function validateEntry(raw: unknown, where: string): ServiceEntry {
   if (installDir !== undefined && (typeof installDir !== "string" || installDir.length === 0)) {
     throw new ServicesManifestError(`${where}: "installDir" must be a non-empty string if present`);
   }
+  const stripPrefix = e.stripPrefix;
+  if (stripPrefix !== undefined && typeof stripPrefix !== "boolean") {
+    throw new ServicesManifestError(`${where}: "stripPrefix" must be a boolean if present`);
+  }
   const entry: ServiceEntry = { name, port, paths: paths as string[], health, version };
   if (displayName !== undefined) entry.displayName = displayName;
   if (tagline !== undefined) entry.tagline = tagline;
   if (publicExposure !== undefined) entry.publicExposure = publicExposure as PublicExposure;
   if (installDir !== undefined) entry.installDir = installDir;
+  if (stripPrefix !== undefined) entry.stripPrefix = stripPrefix;
   return entry;
 }
 

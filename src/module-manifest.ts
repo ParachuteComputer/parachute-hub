@@ -114,6 +114,15 @@ export interface ModuleManifest {
    * as `hasAuth` / `init` / `urlForEntry`.
    */
   readonly managementUrl?: string;
+  /**
+   * When `true`, the hub's `/<svc>/*` proxy strips the matched mount prefix
+   * before forwarding (so the backend sees `/health` rather than
+   * `/<name>/health`). Default `false` matches the prefix-aware convention
+   * notes / agent / vault already follow. Carried into services.json via
+   * `seedEntryFromManifest`. See `ServiceEntry.stripPrefix` for the full
+   * per-module rationale.
+   */
+  readonly stripPrefix?: boolean;
 }
 
 export class ModuleManifestError extends Error {
@@ -365,6 +374,13 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
   const dependencies = asDependencies(m.dependencies, where);
   const configSchema = asConfigSchema(m.configSchema, where);
   const managementUrl = asManagementUrl(m.managementUrl, where);
+  let stripPrefix: boolean | undefined;
+  if (m.stripPrefix !== undefined) {
+    if (typeof m.stripPrefix !== "boolean") {
+      throw new ModuleManifestError(`${where}: "stripPrefix" must be a boolean if present`);
+    }
+    stripPrefix = m.stripPrefix;
+  }
 
   const out: ModuleManifest = { name, manifestName, kind, port, paths, health };
   if (displayName !== undefined) (out as { displayName?: string }).displayName = displayName;
@@ -379,6 +395,9 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
   }
   if (managementUrl !== undefined) {
     (out as { managementUrl?: string }).managementUrl = managementUrl;
+  }
+  if (stripPrefix !== undefined) {
+    (out as { stripPrefix?: boolean }).stripPrefix = stripPrefix;
   }
   return out;
 }

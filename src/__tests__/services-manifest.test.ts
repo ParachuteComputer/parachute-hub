@@ -196,6 +196,32 @@ describe("services-manifest", () => {
       cleanup();
     }
   });
+
+  test("round-trips optional stripPrefix (true and false)", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const stripping: ServiceEntry = { ...vault, stripPrefix: true };
+      upsertService(stripping, path);
+      expect(readManifest(path).services[0]).toEqual(stripping);
+
+      const explicitFalse: ServiceEntry = { ...vault, stripPrefix: false };
+      upsertService(explicitFalse, path);
+      expect(readManifest(path).services[0]).toEqual(explicitFalse);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("rejects non-boolean stripPrefix", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      expect(() =>
+        upsertService({ ...vault, stripPrefix: "yes" as unknown as boolean }, path),
+      ).toThrow(/stripPrefix/);
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("claw → agent migration", () => {

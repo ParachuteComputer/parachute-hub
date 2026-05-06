@@ -147,40 +147,39 @@ export function findVaultUpstream(
 }
 
 /**
- * Reverse-proxy a `/vault/<name>/*` request onto the vault backend's loopback
- * port. The path is preserved end-to-end (vault since paraclaw#18 expects
- * requests at `/vault/<name>/...` not stripped to `/...`), so the upstream URL
- * mirrors the incoming pathname exactly.
+ * Forward a request to a loopback service on `127.0.0.1:<port>`. By default
+ * the incoming pathname + query are preserved verbatim; pass `targetPath` to
+ * rewrite the path (e.g. when the caller has stripped a mount prefix because
+ * the backend serves bare routes). Query string is always preserved from the
+ * incoming URL.
  *
- * `manifestPath` is the services.json path from `HubFetchDeps`. Read on every
- * proxied request so a vault created seconds ago is reachable without a
- * re-expose — same dynamism as the well-known doc (#135).
+ * Note: this is **not** equivalent to the tailscale convention. `tailscale
+ * serve <mount>=<target>` strips the mount before forwarding, so
+ * `serviceProxyTarget` in `commands/expose.ts` works by making mount and
+ * target byte-equal. The hub's fetch-based proxy does no stripping unless the
+ * caller asks; per-service preferences vary (scribe wants bare paths, notes
+ * / agent / vault want the prefix), so the decision lives one layer up in
+ * `proxyToService` / `proxyToVault`.
  *
- * Returns `undefined` when no vault is currently mounted at this pathname so
- * the caller falls through to the catch-all 404. Returns a 502 response when
- * the upstream connection fails (vault crashed, port shifted) — the upstream
- * URL was valid; we just couldn't reach it.
+ * Returns 502 when the loopback fetch fails — port valid, target unreachable
+ * (service crashed, port shifted, mid-restart). `serviceLabel` is folded into
+ * the error message so 502 bodies say `vault upstream unreachable` /
+ * `scribe upstream unreachable` etc.
  *
  * Hop-by-hop notes: WebSocket upgrades and HTTP/2 trailers don't traverse
- * fetch-based proxies cleanly. Vault uses neither today; if a future service
- * needs them, switch to a Node http.IncomingMessage / http.request pair.
+ * fetch-based proxies cleanly. No on-box service uses either today; if one
+ * eventually needs them, switch to a Node http.IncomingMessage / http.request
+ * pair.
  */
-async function proxyToVault(req: Request, manifestPath: string): Promise<Response | undefined> {
-  let services: readonly ServiceEntry[];
-  try {
-    services = readManifest(manifestPath).services;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return new Response(JSON.stringify({ error: `vault routing failed: ${msg}` }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    });
-  }
+async function proxyRequest(
+  req: Request,
+  port: number,
+  serviceLabel: string,
+  targetPath?: string,
+): Promise<Response> {
   const url = new URL(req.url);
-  const match = findVaultUpstream(services, url.pathname);
-  if (!match) return undefined;
-
-  const upstream = `http://127.0.0.1:${match.port}${url.pathname}${url.search}`;
+  const path = targetPath ?? url.pathname;
+  const upstream = `http://127.0.0.1:${port}${path}${url.search}`;
   const headers = new Headers(req.headers);
   // Host comes from the requester (tailnet FQDN); the loopback target wants
   // its own. Bun's fetch fills it in when omitted.
@@ -199,11 +198,102 @@ async function proxyToVault(req: Request, manifestPath: string): Promise<Respons
     return await fetch(upstream, init);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return new Response(JSON.stringify({ error: `vault upstream unreachable: ${msg}` }), {
+    return new Response(JSON.stringify({ error: `${serviceLabel} upstream unreachable: ${msg}` }), {
       status: 502,
       headers: { "content-type": "application/json" },
     });
   }
+}
+
+/**
+ * Reverse-proxy a `/vault/<name>/*` request onto the vault backend.
+ * `manifestPath` is the services.json path from `HubFetchDeps`. Read on every
+ * proxied request so a vault created seconds ago is reachable without a
+ * re-expose — same dynamism as the well-known doc (#135).
+ *
+ * Returns `undefined` when no vault claims this pathname so the caller can
+ * fall through to the SPA shell fallback for unknown vault names (the seam
+ * #173 introduced).
+ */
+async function proxyToVault(req: Request, manifestPath: string): Promise<Response | undefined> {
+  let services: readonly ServiceEntry[];
+  try {
+    services = readManifest(manifestPath).services;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return new Response(JSON.stringify({ error: `vault routing failed: ${msg}` }), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const url = new URL(req.url);
+  const match = findVaultUpstream(services, url.pathname);
+  if (!match) return undefined;
+  return proxyRequest(req, match.port, "vault");
+}
+
+/**
+ * Resolve which (non-vault) ServiceEntry should handle a given request.
+ * Generic longest-prefix match across every service's `paths[]`. Vault
+ * entries are filtered out — they're routed by `findVaultUpstream` /
+ * `proxyToVault`, which encode the vault-specific SPA-fallback seam.
+ *
+ * Returns `undefined` when no service claims the pathname; the caller 404s.
+ */
+export function findServiceUpstream(
+  services: readonly ServiceEntry[],
+  pathname: string,
+): { port: number; mount: string; entry: ServiceEntry } | undefined {
+  let best: { port: number; mount: string; entry: ServiceEntry } | undefined;
+  for (const s of services) {
+    if (isVaultEntry(s)) continue;
+    for (const path of s.paths) {
+      if (pathname === path || pathname.startsWith(`${path}/`)) {
+        if (!best || path.length > best.mount.length) {
+          best = { port: s.port, mount: path, entry: s };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Reverse-proxy a request onto whichever non-vault service registers a
+ * matching `paths[]` prefix in services.json. Wired after every specific
+ * handler in `hubFetch` so the exclusion list (`/`, `/admin/*`, `/oauth/*`,
+ * `/.well-known/*`, `/hub/*`, `/vault/*`, `/api/*`) is enforced by ordering:
+ * those specific handlers run first and never reach this dispatch.
+ *
+ * Read services.json on every request so a `parachute install <svc>` made
+ * seconds ago is reachable without a hub restart — same dynamism as the
+ * well-known doc and `proxyToVault`.
+ *
+ * Honors `entry.stripPrefix`: when `true` the matched mount prefix is
+ * removed from the forwarded path so the backend sees a bare route
+ * (`/scribe/health` becomes `/health`). Default (`false` / absent) forwards
+ * the full path — matches what notes / agent / vault expect.
+ *
+ * Returns `undefined` when no service claims the pathname; caller 404s.
+ */
+async function proxyToService(req: Request, manifestPath: string): Promise<Response | undefined> {
+  let services: readonly ServiceEntry[];
+  try {
+    services = readManifest(manifestPath).services;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return new Response(JSON.stringify({ error: `service routing failed: ${msg}` }), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const url = new URL(req.url);
+  const match = findServiceUpstream(services, url.pathname);
+  if (!match) return undefined;
+  const targetPath = match.entry.stripPrefix
+    ? url.pathname.slice(match.mount.length) || "/"
+    : undefined;
+  return proxyRequest(req, match.port, match.entry.name, targetPath);
 }
 
 export interface HubFetchDeps {
@@ -689,6 +779,13 @@ export function hubFetch(
       if (req.method !== "GET") return new Response("not found", { status: 404 });
       return serveSpa(spaDistDir, pathname, "/vault");
     }
+
+    // Generic services.json-driven dispatch for non-vault modules. Reaches
+    // here only after every hub-owned prefix above has had its turn — so
+    // `/`, `/admin/*`, `/oauth/*`, `/.well-known/*`, `/hub/*`, `/vault/*`,
+    // `/api/*` are excluded by ordering, not by an explicit denylist (#182).
+    const proxied = await proxyToService(req, manifestPath);
+    if (proxied) return proxied;
 
     return new Response("not found", { status: 404 });
   };
