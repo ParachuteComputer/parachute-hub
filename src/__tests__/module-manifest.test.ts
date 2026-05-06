@@ -130,6 +130,19 @@ describe("validateModuleManifest", () => {
     const m = validateModuleManifest(VALID, "x");
     expect(m.managementUrl).toBeUndefined();
   });
+
+  test("stripPrefix accepts boolean true and false; rejects non-boolean", () => {
+    expect(validateModuleManifest({ ...VALID, stripPrefix: true }, "x").stripPrefix).toBe(true);
+    expect(validateModuleManifest({ ...VALID, stripPrefix: false }, "x").stripPrefix).toBe(false);
+    expect(() => validateModuleManifest({ ...VALID, stripPrefix: "yes" }, "x")).toThrow(
+      /stripPrefix/,
+    );
+  });
+
+  test("stripPrefix absent stays absent", () => {
+    const m = validateModuleManifest(VALID, "x");
+    expect(m.stripPrefix).toBeUndefined();
+  });
 });
 
 describe("readModuleManifest", () => {

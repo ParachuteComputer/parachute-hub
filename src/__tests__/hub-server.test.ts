@@ -1272,10 +1272,10 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
     }
   });
 
-  test("preserves method, body, and Authorization header on POSTs", async () => {
-    // Scribe-style upload: the client sends a bearer token + body, and both
-    // need to reach the upstream verbatim. Confirms the proxy isn't dropping
-    // the Authorization header (a regression we'd never want to ship).
+  test("preserves method, multipart body, and Authorization on POSTs", async () => {
+    // Scribe-shaped upload: multipart/form-data with a bearer token. Multipart
+    // is what real scribe clients send; if the proxy strips the boundary or
+    // drops Authorization, scribe rejects the request before transcribing.
     const h = makeHarness();
     const upstream = startUpstream("scribe");
     try {
@@ -1294,14 +1294,14 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
         h.manifestPath,
       );
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const form = new FormData();
+      form.append("model", "whisper-1");
+      form.append("file", new Blob([new Uint8Array([1, 2, 3, 4])]), "audio.wav");
       const res = await fetcher(
         req("/scribe/v1/audio/transcriptions", {
           method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: "Bearer test-token",
-          },
-          body: JSON.stringify({ file: "x" }),
+          headers: { authorization: "Bearer test-token" },
+          body: form,
         }),
       );
       expect(res.status).toBe(200);
@@ -1313,8 +1313,155 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
       };
       expect(body.method).toBe("POST");
       expect(body.authorization).toBe("Bearer test-token");
-      expect(body.contentType).toBe("application/json");
-      expect(JSON.parse(body.body)).toEqual({ file: "x" });
+      // Bun's fetch sets the boundary; we just need to confirm the
+      // multipart content-type survived.
+      expect(body.contentType).toMatch(/^multipart\/form-data;\s*boundary=/);
+      // And the body bytes — the boundary marker the upstream echoes back
+      // should contain the form fields we sent.
+      expect(body.body).toContain('name="model"');
+      expect(body.body).toContain("whisper-1");
+      expect(body.body).toContain('name="file"');
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("stripPrefix=true forwards the bare path (mount removed)", async () => {
+    // The scribe-shaped case from real life: scribe's HTTP routes are
+    // `/health`, `/v1/...` — no `/scribe` prefix. When the entry sets
+    // stripPrefix:true the hub strips the mount before forwarding so the
+    // backend sees `/health` rather than `/scribe/health`. Without this,
+    // every proxied scribe request 404s at the backend.
+    const h = makeHarness();
+    const upstream = startUpstream("scribe");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+              stripPrefix: true,
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/v1/audio/transcriptions?model=whisper-1"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string; pathname: string; search: string };
+      expect(body.tag).toBe("scribe");
+      // Backend sees the bare path — `/scribe` is stripped.
+      expect(body.pathname).toBe("/v1/audio/transcriptions");
+      // Query string is always preserved verbatim regardless of stripPrefix.
+      expect(body.search).toBe("?model=whisper-1");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("stripPrefix=true: request to bare mount becomes `/`", async () => {
+    // Edge case: pathname === mount. Slicing yields the empty string; the
+    // proxy normalizes to `/` so the backend sees a valid path.
+    const h = makeHarness();
+    const upstream = startUpstream("scribe");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/health",
+              version: "0.1.0",
+              stripPrefix: true,
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { pathname: string };
+      expect(body.pathname).toBe("/");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("stripPrefix absent (default false) preserves the prefix — no behavior change for existing entries", async () => {
+    // Migration safety: a services.json entry written before stripPrefix
+    // existed (e.g. notes / agent rows already on disk) must continue to
+    // forward the full path. The /notes/sw.js test above already exercises
+    // this in the happy case; this test makes the absence-of-flag → keep-
+    // prefix contract explicit.
+    const h = makeHarness();
+    const upstream = startUpstream("notes");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "notes",
+              port: upstream.port,
+              paths: ["/notes"],
+              health: "/notes/health",
+              version: "0.1.0",
+              // stripPrefix intentionally omitted — must default to false.
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/notes/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { pathname: string };
+      expect(body.pathname).toBe("/notes/health");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("stripPrefix=false explicitly preserves the prefix", async () => {
+    // The opposite explicit-declaration of the previous test: an operator
+    // who writes `stripPrefix: false` in services.json gets the same
+    // keep-prefix behavior as omitting the field. Confirms validator round-
+    // tripping doesn't lose the explicit-false (separate from the absent
+    // case which is checked above).
+    const h = makeHarness();
+    const upstream = startUpstream("notes");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "notes",
+              port: upstream.port,
+              paths: ["/notes"],
+              health: "/notes/health",
+              version: "0.1.0",
+              stripPrefix: false,
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/notes/sw.js"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { pathname: string };
+      expect(body.pathname).toBe("/notes/sw.js");
     } finally {
       upstream.stop();
       h.cleanup();

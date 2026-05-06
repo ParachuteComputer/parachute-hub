@@ -199,6 +199,7 @@ export function seedEntryFromManifest(manifest: ModuleManifest): ServiceEntry {
   };
   if (manifest.displayName !== undefined) entry.displayName = manifest.displayName;
   if (manifest.tagline !== undefined) entry.tagline = manifest.tagline;
+  if (manifest.stripPrefix !== undefined) entry.stripPrefix = manifest.stripPrefix;
   return entry;
 }
 
@@ -319,6 +320,13 @@ const SCRIBE_FALLBACK: FirstPartyFallback = {
     paths: ["/scribe"],
     health: "/scribe/health",
     startCmd: ["parachute-scribe", "serve"],
+    // Scribe's HTTP routes are bare (`/health`, `/v1/...`), unlike notes /
+    // agent which strip the mount themselves. Until scribe ships a `--mount`
+    // flag (tracked upstream in parachute-scribe), the hub strips the
+    // `/scribe` prefix before forwarding so a request to
+    // `hub:1939/scribe/v1/audio/transcriptions` reaches scribe as
+    // `/v1/audio/transcriptions`.
+    stripPrefix: true,
   },
   extras: {
     // No auth gate today. Scribe's launch PR adds optional SCRIBE_AUTH_TOKEN;

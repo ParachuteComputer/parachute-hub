@@ -147,12 +147,19 @@ export function findVaultUpstream(
 }
 
 /**
- * Forward a request to a loopback service on `127.0.0.1:<port>`, preserving
- * pathname + query verbatim. Path-preservation matches the existing tailscale
- * convention (`serviceProxyTarget` in `commands/expose.ts`: mount and target
- * path are equal byte-for-byte so tailscale's strip-then-forward is a no-op
- * and the backend sees the full path it expects). Vault since paraclaw#18,
- * scribe / notes / agent today all rely on this end-to-end path shape.
+ * Forward a request to a loopback service on `127.0.0.1:<port>`. By default
+ * the incoming pathname + query are preserved verbatim; pass `targetPath` to
+ * rewrite the path (e.g. when the caller has stripped a mount prefix because
+ * the backend serves bare routes). Query string is always preserved from the
+ * incoming URL.
+ *
+ * Note: this is **not** equivalent to the tailscale convention. `tailscale
+ * serve <mount>=<target>` strips the mount before forwarding, so
+ * `serviceProxyTarget` in `commands/expose.ts` works by making mount and
+ * target byte-equal. The hub's fetch-based proxy does no stripping unless the
+ * caller asks; per-service preferences vary (scribe wants bare paths, notes
+ * / agent / vault want the prefix), so the decision lives one layer up in
+ * `proxyToService` / `proxyToVault`.
  *
  * Returns 502 when the loopback fetch fails — port valid, target unreachable
  * (service crashed, port shifted, mid-restart). `serviceLabel` is folded into
@@ -164,9 +171,15 @@ export function findVaultUpstream(
  * eventually needs them, switch to a Node http.IncomingMessage / http.request
  * pair.
  */
-async function proxyRequest(req: Request, port: number, serviceLabel: string): Promise<Response> {
+async function proxyRequest(
+  req: Request,
+  port: number,
+  serviceLabel: string,
+  targetPath?: string,
+): Promise<Response> {
   const url = new URL(req.url);
-  const upstream = `http://127.0.0.1:${port}${url.pathname}${url.search}`;
+  const path = targetPath ?? url.pathname;
+  const upstream = `http://127.0.0.1:${port}${path}${url.search}`;
   const headers = new Headers(req.headers);
   // Host comes from the requester (tailnet FQDN); the loopback target wants
   // its own. Bun's fetch fills it in when omitted.
@@ -256,6 +269,11 @@ export function findServiceUpstream(
  * seconds ago is reachable without a hub restart — same dynamism as the
  * well-known doc and `proxyToVault`.
  *
+ * Honors `entry.stripPrefix`: when `true` the matched mount prefix is
+ * removed from the forwarded path so the backend sees a bare route
+ * (`/scribe/health` becomes `/health`). Default (`false` / absent) forwards
+ * the full path — matches what notes / agent / vault expect.
+ *
  * Returns `undefined` when no service claims the pathname; caller 404s.
  */
 async function proxyToService(req: Request, manifestPath: string): Promise<Response | undefined> {
@@ -272,7 +290,10 @@ async function proxyToService(req: Request, manifestPath: string): Promise<Respo
   const url = new URL(req.url);
   const match = findServiceUpstream(services, url.pathname);
   if (!match) return undefined;
-  return proxyRequest(req, match.port, match.entry.name);
+  const targetPath = match.entry.stripPrefix
+    ? url.pathname.slice(match.mount.length) || "/"
+    : undefined;
+  return proxyRequest(req, match.port, match.entry.name, targetPath);
 }
 
 export interface HubFetchDeps {
