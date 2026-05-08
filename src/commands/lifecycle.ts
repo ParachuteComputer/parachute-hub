@@ -137,6 +137,24 @@ export interface LifecycleOpts {
   /** Poll interval while waiting for SIGTERM to land. */
   pollIntervalMs?: number;
   /**
+   * How long `start` sleeps before re-checking `alive(pid)` to catch the
+   * spawn-then-immediately-die failure shape (hub#194: notes-serve crashed
+   * 50ms in on Bun.resolveSync, but `start` reported success because the
+   * spawn returned a pid). 250ms is the default in production — long
+   * enough to catch real silent-crashes (resolve failures, port
+   * collisions, missing args) without making `parachute start` feel
+   * laggy.
+   *
+   * Defaulting policy: if `alive` is not overridden, the settle defaults
+   * to 0 (skipped). Stub spawners hand back fake pids that the real
+   * `defaultAlive` would mark as dead, which would make every existing
+   * stub-spawner test fail spuriously. Tests that want to exercise the
+   * settle path inject both `alive` and `startSettleMs` explicitly.
+   * Production paths use the real `defaultAlive` and get the real 250ms
+   * settle.
+   */
+  startSettleMs?: number;
+  /**
    * Override the hub origin passed to services as PARACHUTE_HUB_ORIGIN. If
    * unset, `start` derives it from `expose-state.json` (when exposed) or
    * the hub.port file (local dev). Undefined → no env var is set at all,
@@ -168,6 +186,7 @@ interface Resolved {
   log: (line: string) => void;
   killWaitMs: number;
   pollIntervalMs: number;
+  startSettleMs: number;
   hubOrigin: string | undefined;
   ensureHub: (opts: EnsureHubOpts) => Promise<EnsureHubResult>;
   stopHubFn: (opts: StopHubOpts) => Promise<boolean>;
@@ -186,6 +205,14 @@ function resolve(opts: LifecycleOpts): Resolved {
     log: opts.log ?? ((line) => console.log(line)),
     killWaitMs: opts.killWaitMs ?? 10_000,
     pollIntervalMs: opts.pollIntervalMs ?? 200,
+    // See `LifecycleOpts.startSettleMs` doc. Production (no spawner
+    // override, no alive override) gets the 250ms settle. Tests that
+    // inject a stub spawner without a stub alive get 0 — `defaultAlive`
+    // against a fake pid would always report dead and break unrelated
+    // tests. Tests that want to exercise the settle path explicitly
+    // override `alive`, which re-enables the default 250ms.
+    startSettleMs:
+      opts.startSettleMs ?? (opts.spawner === undefined || opts.alive !== undefined ? 250 : 0),
     hubOrigin: resolveHubOrigin(opts.hubOrigin, configDir),
     ensureHub: opts.hub?.ensureRunning ?? ensureHubRunning,
     stopHubFn: opts.hub?.stop ?? stopHub,
@@ -371,16 +398,38 @@ export async function start(svc: string | undefined, opts: LifecycleOpts = {}): 
     if (entry.installDir) spawnerOpts.cwd = entry.installDir;
     const passOpts =
       spawnerOpts.env !== undefined || spawnerOpts.cwd !== undefined ? spawnerOpts : undefined;
+    let pid: number;
     try {
-      const pid = r.spawner.spawn(cmd, logFile, passOpts);
-      writePid(short, pid, r.configDir);
-      r.log(`✓ ${short} started (pid ${pid}); logs: ${logFile}`);
-      if (r.hubOrigin) r.log(`  ${HUB_ORIGIN_ENV}=${r.hubOrigin}`);
+      pid = r.spawner.spawn(cmd, logFile, passOpts);
     } catch (err) {
       failures++;
       const msg = err instanceof Error ? err.message : String(err);
       r.log(`✗ ${short} failed to start: ${msg}`);
+      continue;
     }
+    writePid(short, pid, r.configDir);
+
+    // Settle-poll for spawn-then-immediately-die (hub#194). A spawn returning
+    // a pid only proves the kernel forked the process; the child may exit
+    // microseconds later if its main code path throws before listening
+    // (e.g. notes-serve's Bun.resolveSync failing for bun-linked installs).
+    // Without this poll, we'd report success and the operator would chase
+    // a phantom 502.
+    if (r.startSettleMs > 0) {
+      await r.sleep(r.startSettleMs);
+      if (!r.alive(pid)) {
+        clearPid(short, r.configDir);
+        failures++;
+        r.log(
+          `✗ ${short} failed to start: spawned pid ${pid} but the process exited within ${r.startSettleMs}ms.`,
+        );
+        r.log(`  Tail the log for details: tail -50 ${logFile}`);
+        continue;
+      }
+    }
+
+    r.log(`✓ ${short} started (pid ${pid}); logs: ${logFile}`);
+    if (r.hubOrigin) r.log(`  ${HUB_ORIGIN_ENV}=${r.hubOrigin}`);
   }
   return failures === 0 ? 0 : 1;
 }

@@ -25,6 +25,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 interface Args {
@@ -67,16 +68,76 @@ export function normalizeMount(raw: string): string {
   return raw.replace(/\/+$/, "");
 }
 
-function resolveNotesDist(): string {
-  const pkgPath = Bun.resolveSync("@openparachute/notes/package.json", process.cwd());
-  const root = dirname(pkgPath);
-  const dist = join(root, "dist");
-  if (!existsSync(dist)) {
-    throw new Error(
-      `@openparachute/notes is installed but has no dist/ directory at ${dist}. The package may not ship a prebuilt bundle — ask the notes maintainer to add a prepublishOnly build step.`,
-    );
+/**
+ * Candidate base directories that `Bun.resolveSync` walks from when looking
+ * for `@openparachute/notes/package.json`. Order matters:
+ *
+ *   1. `process.cwd()` — works when notes-serve is invoked from inside the
+ *      notes checkout (e.g. via `installDir` cwd in lifecycle.ts) or from
+ *      any project that depends on `@openparachute/notes`.
+ *   2. `~/.bun/install/global/node_modules` — modern Bun's global-install
+ *      layout. This is where `bun add -g @openparachute/notes` lands the
+ *      package, and where `bun link @openparachute/notes` symlinks it.
+ *   3. `~/.bun/install/global` — defensive fallback for older Bun layouts.
+ *
+ * Hub itself does NOT depend on `@openparachute/notes`, so when
+ * `parachute start notes` is run from the hub repo dir, the cwd-relative
+ * resolve walks ancestral node_modules and finds nothing. Bun does not
+ * auto-consult the global install dir, so bun-linked installs fail to
+ * resolve without (2)/(3). hub#194: Aaron hit silent 502 on tailnet
+ * `/notes/` because of this — fixed by trying the global install dirs.
+ *
+ * Exported (and parameterized via `cwd`/`home`) so tests can drive the
+ * resolution order against a real fixture install without monkey-patching
+ * `Bun.resolveSync`.
+ */
+export function notesDistCandidates(cwd: string, home: string): string[] {
+  return [cwd, join(home, ".bun/install/global/node_modules"), join(home, ".bun/install/global")];
+}
+
+export interface ResolveNotesDistDeps {
+  cwd?: string;
+  home?: string;
+  /** Override `Bun.resolveSync` for tests. */
+  resolveSync?: (specifier: string, base: string) => string;
+  existsSync?: (path: string) => boolean;
+}
+
+export function resolveNotesDistFrom(deps: ResolveNotesDistDeps = {}): string {
+  const cwd = deps.cwd ?? process.cwd();
+  const home = deps.home ?? homedir();
+  const resolveSync = deps.resolveSync ?? Bun.resolveSync;
+  const exists = deps.existsSync ?? existsSync;
+  const candidates = notesDistCandidates(cwd, home);
+  const resolveErrors: string[] = [];
+  for (const base of candidates) {
+    let pkgPath: string;
+    try {
+      pkgPath = resolveSync("@openparachute/notes/package.json", base);
+    } catch (err) {
+      resolveErrors.push(`  - ${base}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    const root = dirname(pkgPath);
+    const dist = join(root, "dist");
+    if (!exists(dist)) {
+      // Found the package but it has no dist/. This is a hard error
+      // (package shipped without a prebuilt bundle); don't fall through to
+      // other candidates — they'd resolve to the same package and report
+      // the same problem.
+      throw new Error(
+        `@openparachute/notes resolved at ${root} has no dist/ directory at ${dist}. The package may not ship a prebuilt bundle — ask the notes maintainer to add a prepublishOnly build step.`,
+      );
+    }
+    return dist;
   }
-  return dist;
+  throw new Error(
+    `Could not resolve @openparachute/notes from any of:\n${resolveErrors.join("\n")}\nIs the package installed? Try \`bun add -g @openparachute/notes\` or \`parachute install notes\`.`,
+  );
+}
+
+function resolveNotesDist(): string {
+  return resolveNotesDistFrom();
 }
 
 function mimeFor(path: string): string | undefined {

@@ -248,7 +248,11 @@ describe("parachute start", () => {
         configDir: h.configDir,
         manifestPath: h.manifestPath,
         spawner,
-        alive: () => false,
+        // Stale 4242 is dead; the freshly spawned 7777 is alive — the
+        // post-spawn settle (hub#194) calls alive(pid) on the new pid,
+        // so we differentiate per-pid rather than blanket-false.
+        alive: (pid) => pid === 7777,
+        sleep: async () => {},
         log: () => {},
       });
       expect(code).toBe(0);
@@ -629,6 +633,94 @@ describe("parachute start", () => {
     }
   });
 
+  test("hub#194: reports failure when child dies before the settle window", async () => {
+    // The bug: `parachute start notes` reported `✓ notes started (pid X)`
+    // but notes-serve crashed milliseconds later on a Bun.resolveSync
+    // failure, leaving tailnet `/notes/` 502'ing. Fix: after spawn, sleep
+    // ~250ms then re-check alive(pid). If dead, clear pidfile, log
+    // failure, return non-zero. This regression test pins the post-fix
+    // shape with a stub alive that always reports dead and a fast settle.
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const spawner = makeSpawner([4242]);
+      const lines: string[] = [];
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        alive: () => false, // child dies immediately after spawn
+        sleep: async () => {}, // skip the real wait in tests
+        startSettleMs: 1, // any non-zero value engages the check
+        log: (l) => lines.push(l),
+      });
+      expect(code).toBe(1);
+      expect(spawner.calls).toHaveLength(1);
+      // pidfile is cleared so a follow-up `start` doesn't report
+      // already-running against a corpse.
+      expect(readPid("vault", h.configDir)).toBeUndefined();
+      const out = lines.join("\n");
+      expect(out).toMatch(/✗ vault failed to start/);
+      expect(out).toMatch(/exited within 1ms/);
+      expect(out).toMatch(/Tail the log/);
+      expect(out).not.toMatch(/✓ vault started/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub#194: settle path passes when child stays alive past the window", async () => {
+    // Companion to the above — verifies the success-path shape doesn't
+    // regress. Stub alive returns true so the post-spawn check passes,
+    // and we still see the `✓ ... started` line.
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const spawner = makeSpawner([4242]);
+      const lines: string[] = [];
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        alive: () => true,
+        sleep: async () => {},
+        startSettleMs: 1,
+        log: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      expect(readPid("vault", h.configDir)).toBe(4242);
+      expect(lines.join("\n")).toMatch(/✓ vault started \(pid 4242\)/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub#194: settle skipped when startSettleMs is 0", async () => {
+    // Defense — don't regress the test-default policy. With a stub
+    // spawner and no `alive` override, the resolved settle is 0 (see
+    // resolve() in lifecycle.ts), so the post-spawn check is bypassed
+    // entirely and even an `alive: () => false` doesn't matter.
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const spawner = makeSpawner([4242]);
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        startSettleMs: 0,
+        // intentionally omit alive — defaultAlive against a fake pid
+        // would normally report dead, but startSettleMs: 0 skips the
+        // call entirely.
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      expect(readPid("vault", h.configDir)).toBe(4242);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("third-party with no startCmd in module.json reports lifecycle-unsupported", async () => {
     const h = makeHarness();
     try {
@@ -802,7 +894,10 @@ describe("parachute restart", () => {
         manifestPath: h.manifestPath,
         spawner,
         kill: (pid, sig) => killed.push([pid, sig]),
-        alive: () => false,
+        // Stale 4242 is dead (stop's stale-pid path skips the kill);
+        // freshly spawned 7777 is alive past the post-spawn settle
+        // (hub#194). Per-pid differentiation rather than blanket-false.
+        alive: (pid) => pid === 7777,
         sleep: async () => {},
         log: () => {},
       });
