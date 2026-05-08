@@ -64,6 +64,7 @@ import {
   SESSION_TTL_MS,
   buildSessionCookie,
   createSession,
+  findActiveSession,
   findSession,
   parseSessionCookie,
 } from "./sessions.ts";
@@ -1065,19 +1066,71 @@ interface RegisterRequestBody {
 }
 
 /**
+ * CSRF defense for the cookie-based DCR auto-approve path (closes #199).
+ *
+ * Compares the request's `Origin` (or `Referer` as fallback) against the
+ * configured issuer origin. URL.origin compares scheme + host + port —
+ * port-only mismatches reject. A request with neither header is treated as
+ * suspicious and rejected: cookie-bearing POSTs from same-origin browsers
+ * always send Origin (per Fetch standard) and almost always send Referer,
+ * so a header-stripped request is more likely a curl probe or a privacy
+ * extension on a third-party site than a legitimate same-origin caller.
+ *
+ * SameSite=Lax on the session cookie (sessions.ts:buildSessionCookie) is the
+ * browser-side defense layer; this function is the server-side belt.
+ */
+function originMatchesIssuer(req: Request, issuer: string): boolean {
+  const origin = req.headers.get("origin");
+  if (origin) {
+    try {
+      return new URL(origin).origin === new URL(issuer).origin;
+    } catch {
+      return false;
+    }
+  }
+  const referer = req.headers.get("referer");
+  if (referer) {
+    try {
+      return new URL(referer).origin === new URL(issuer).origin;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
  * POST /oauth/register — RFC 7591 Dynamic Client Registration.
  *
  * Approval gate (closes #74). New rows land as `pending` by default and
  * cannot participate in OAuth flows until an operator runs
- * `parachute auth approve-client <id>`. The single bypass is presenting an
- * `Authorization: Bearer <operator-token>` whose token carries the
- * `hub:admin` scope — the install-time path used by first-party modules so
- * `parachute install vault` can self-register without a human follow-up.
+ * `parachute auth approve-client <id>`. Two bypass paths:
+ *
+ * 1. **Operator-bearer** (#74). `Authorization: Bearer <operator-token>` whose
+ *    token carries the `hub:admin` scope — the install-time path used by
+ *    first-party modules so `parachute install vault` can self-register
+ *    without a human follow-up.
+ * 2. **Operator-session** (#199). A valid `parachute_hub_session` cookie
+ *    plus a same-origin `Origin`/`Referer` header. The browser path: an
+ *    operator hitting their own SPA from their own browser is by definition
+ *    operator-authenticated, so re-requiring approval is friction without
+ *    benefit. CSRF defense is `originMatchesIssuer` + the cookie's
+ *    `SameSite=Lax` attribute.
  *
  * If a bearer is presented but invalid or insufficient, we reject with the
  * RFC 6750 shape rather than silently downgrading to the public path: a
  * caller who tried to authenticate but failed wants to know why, not get
  * `pending` back and wonder why their module can't OAuth.
+ *
+ * Access-control matrix:
+ *   no auth                       → pending
+ *   bearer (hub:admin)            → approved (#74)
+ *   bearer (other scope)          → 403 insufficient_scope
+ *   bearer (malformed)            → 401 invalid_token
+ *   session cookie + same-origin  → approved (#199)
+ *   session cookie + cross-origin → pending (CSRF defense)
+ *   session cookie + no Origin/Referer → pending
+ *   expired/unknown session       → pending
  */
 export async function handleRegister(
   db: Database,
@@ -1122,6 +1175,20 @@ export async function handleRegister(
     } catch (err) {
       if (err instanceof AdminAuthError) return adminAuthErrorResponse(err);
       throw err;
+    }
+  }
+  // Operator-session auto-approve (closes #199). The browser path:
+  // operator-authenticated SPA on the hub's own origin can self-register a
+  // client without dropping to a terminal. Two gates: (1) a live (un-expired)
+  // session row keyed by the cookie, (2) Origin/Referer matches the issuer
+  // origin so a cross-site forgery can't ride the cookie. Quietly stays
+  // `pending` on any failure — unlike the bearer path, we don't surface an
+  // error, because absence of session/origin is the *normal* unauthenticated
+  // public-DCR shape.
+  if (status === "pending") {
+    const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
+    if (session && originMatchesIssuer(req, deps.issuer)) {
+      status = "approved";
     }
   }
   const confidential = body.token_endpoint_auth_method === "client_secret_post";

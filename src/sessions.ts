@@ -113,3 +113,22 @@ export function parseSessionCookie(cookieHeader: string | null): string | null {
   }
   return null;
 }
+
+/**
+ * Returns the active (un-expired) session for this request, or null. The
+ * canonical "is the operator logged in to this hub?" check — combines
+ * `parseSessionCookie` + `findSession` (which already enforces expiry) so
+ * callers don't repeat the parse+find+null-check dance.
+ *
+ * Caller decides what to do on null — admin pages redirect to
+ * `/admin/login?next=<path>`, OAuth's DCR endpoint falls through to
+ * status=`pending` (closes #199).
+ */
+export function findActiveSession(
+  db: Database,
+  req: Request,
+  now: () => Date = () => new Date(),
+): Session | null {
+  const sid = parseSessionCookie(req.headers.get("cookie"));
+  return sid ? findSession(db, sid, now) : null;
+}
