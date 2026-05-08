@@ -570,6 +570,41 @@ describe("expose tailnet up", () => {
       h.cleanup();
     }
   });
+
+  // 2FA warning is public-layer only (#186). Tailnet ingress is
+  // tailscale-authed at the proxy, so /admin/login isn't on the open
+  // internet — the warning is moot here even when 2FA is unset.
+  test("tailnet bringup does NOT fire the 2FA warning even when not enrolled", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const { spawner } = makeHubSpawner(1111);
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        wellKnownDir: h.wellKnownDir,
+        configDir: h.configDir,
+        hubEnsureOpts: hubEnsureOpts(spawner),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+        vaultAuthStatus: {
+          hasOwnerPassword: false,
+          hasTotp: false,
+          tokenCount: 0,
+          vaultNames: [],
+        },
+      });
+      expect(code).toBe(0);
+      expect(logs.join("\n")).not.toContain("2FA is not enrolled");
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 describe("expose tailnet off", () => {
@@ -891,6 +926,77 @@ describe("expose public up", () => {
       expect(offs).toHaveLength(1);
       const state = readExposeState(h.statePath);
       expect(state?.layer).toBe("public");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // 2FA-enrollment warning (#186). Funnel exposure makes /admin/login
+  // reachable on the open internet just like cloudflare; the warning lives in
+  // a shared helper (`expose-2fa-warning.ts`) wired into both paths.
+  test("2FA not enrolled → warning fires on the public layer", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const { spawner } = makeHubSpawner(1111);
+      const logs: string[] = [];
+      const code = await exposePublic("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        wellKnownDir: h.wellKnownDir,
+        configDir: h.configDir,
+        hubEnsureOpts: hubEnsureOpts(spawner),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+        vaultAuthStatus: {
+          hasOwnerPassword: true,
+          hasTotp: false,
+          tokenCount: 0,
+          vaultNames: ["default"],
+        },
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toContain("2FA is not enrolled");
+      expect(joined).toContain("parachute auth 2fa enroll");
+      // /admin/login pointer uses the canonical https://<fqdn> origin.
+      expect(joined).toContain("https://parachute.taildf9ce2.ts.net/admin/login");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("2FA enrolled → warning suppressed on the public layer", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const { spawner } = makeHubSpawner(1111);
+      const logs: string[] = [];
+      const code = await exposePublic("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        wellKnownDir: h.wellKnownDir,
+        configDir: h.configDir,
+        hubEnsureOpts: hubEnsureOpts(spawner),
+        servicePortProbe: allServicesUp,
+        log: (l) => logs.push(l),
+        vaultAuthStatus: {
+          hasOwnerPassword: true,
+          hasTotp: true,
+          tokenCount: 1,
+          vaultNames: ["default"],
+        },
+      });
+      expect(code).toBe(0);
+      expect(logs.join("\n")).not.toContain("2FA is not enrolled");
     } finally {
       h.cleanup();
     }

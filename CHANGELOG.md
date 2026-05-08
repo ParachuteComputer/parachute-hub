@@ -2,6 +2,20 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.5-rc.1] - 2026-05-08
+
+### Added
+
+- **`parachute expose public` warns when 2FA is not enrolled.** Lands as the next layer of defense after #188's `/admin/login` rate-limit floor. `/admin/login` became reachable across all layers (loopback / tailnet / public) when 0.5.3-rc.1 collapsed the access-control matrix into the hub; on cloudflare or Tailscale Funnel, that's the open internet, where 2FA is the difference between "password is the only wall" and "password + something-you-have." Both bringup paths (`expose-cloudflare.ts` and the public branch of `expose.ts`) now check `readVaultAuthStatus().hasTotp` after the tunnel is up but before returning, and print a contextual warning + the one-line `parachute auth 2fa enroll` remediation when 2FA is absent. Warning-only by design — hard-gating would surprise operators mid-flow; the tunnel is up regardless. Tailnet exposure is moot (tailscale-authed at the proxy) so the warning is public-layer only. (#186)
+- **`is2FAEnrolled()` + `printPublic2FAWarning()` helper module (`src/commands/expose-2fa-warning.ts`).** Wraps the existing `readVaultAuthStatus().hasTotp` probe in a focused, testable surface. Source-of-truth is vault's `config.yaml` `totp_secret` field — the hub's `users` table has no TOTP column today (it'll gain one when hub-admin login verifies TOTP against vault). The hub already forwards `parachute auth 2fa enroll` to `parachute-vault` (see `commands/auth.ts` `VAULT_FORWARDED_SUBCOMMANDS`), so the read-side stays consistent with the write-side.
+- **`vaultHome` and `vaultAuthStatus` test seams on `ExposeCloudflareOpts` and `ExposeOpts`.** Production callers omit; tests inject either a tmp `vaultHome` (so the probe reads a controlled `config.yaml`) or a pre-computed `VaultAuthStatus` (so the probe is bypassed entirely). Mirrors the pattern `expose-auth-preflight.ts` already uses for the interactive wizard.
+
+### Why this lands now
+
+Rate-limit floor (#188) caps brute-force throughput at 5 attempts / 15-minute sliding window per IP. 2FA is the primary defense once an attacker is past the floor — without TOTP, a leaked password is full admin access. The expose-public moment is the natural surfacing point: it's the only place where the operator's previously-loopback `/admin/login` becomes a public-internet target, and they're already paying attention to security copy from `printAuthGuidance` / the tailnet-public note.
+
+The warning lands ahead of hub-admin TOTP verification on `POST /admin/login` itself — that's a follow-up. Today's flow nudges operators to enroll in vault now so they're ready when verification ships, and so any operator on cloudflare-fronted hub today has the strongest practical defense available.
+
 ## [0.5.4-rc.2] - 2026-05-08
 
 Review nit fold (PR #188) — no behavior change.
