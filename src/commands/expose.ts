@@ -17,9 +17,9 @@ import {
   stopHub,
 } from "../hub-control.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
-import { HUB_MOUNT, HUB_PATH, writeHubFile } from "../hub.ts";
+import { HUB_PATH, writeHubFile } from "../hub.ts";
 import { type AliveFn, processState } from "../process-state.ts";
-import { effectivePublicExposure, shortNameForManifest } from "../service-spec.ts";
+import { shortNameForManifest } from "../service-spec.ts";
 import { type ServiceEntry, readManifest } from "../services-manifest.ts";
 import { type ServeEntry, bringupCommand, teardownCommand } from "../tailscale/commands.ts";
 import { getFqdn, isTailscaleInstalled } from "../tailscale/detect.ts";
@@ -29,7 +29,6 @@ import {
   WELL_KNOWN_MOUNT,
   WELL_KNOWN_PATH,
   buildWellKnown,
-  isVaultEntry,
   shortName,
   writeWellKnownFile,
 } from "../well-known.ts";
@@ -39,17 +38,24 @@ import { restart } from "./lifecycle.ts";
  * Two exposure layers share a single tailscale serve config on this node.
  * Public layer adds `--funnel` to each handler; everything else is identical.
  *
- * Funnel constraint: Tailscale allows at most three public HTTPS ports per
- * node (443, 8443, 10000). Path-routing packs every service onto a single
- * port — that's why we default to one `--https=443` and mount services under
- * `/vault`, `/notes`, etc. rather than giving each service its own port or
- * subdomain. Subdomain-per-service requires the Tailscale Services feature
- * (virtual-IP advertisement) and is deferred.
+ * Single-rule shape: tailnet bringup emits exactly one `tailscale serve`
+ * mount — `/ → http://127.0.0.1:<hubPort>/`. The hub does all internal
+ * routing per request: hub UI, OAuth, well-known, vault SPA + per-vault
+ * proxy, and generic services.json-driven `/<svc>/*` dispatch. Layer
+ * detection (loopback / tailnet / public) and `publicExposure` enforcement
+ * also live in the hub (`layerOf` + `effectivePublicExposure`), so this
+ * plan layer no longer partitions services up-front. Cloudflare ingress
+ * shipped the same shape on 0.5.2 in #178; this closes the symmetry.
  *
- * Hub + well-known entries are HTTP proxies to an internal Bun.serve (see
- * `hub-control.ts`). They used to be `--set-path=<mount> <file>` entries but
- * macOS `tailscaled` runs sandboxed and can't read arbitrary files; proxy
- * mode is the only reliable shape.
+ * Funnel constraint, mostly historical now: Tailscale allows at most three
+ * public HTTPS ports per node (443, 8443, 10000). With one rule there is
+ * one port — symbolic but the constraint is what motivated path-routing
+ * over subdomain-per-service in the first place.
+ *
+ * Hub mount is an HTTP proxy to the internal Bun.serve (see `hub-control.ts`).
+ * Used to be `--set-path=<mount> <file>` entries but macOS `tailscaled` runs
+ * sandboxed and can't read arbitrary files; proxy mode is the only reliable
+ * shape.
  */
 
 export interface ExposeOpts {
@@ -104,166 +110,49 @@ export interface ExposeOpts {
 const HUB_DEPENDENT_SHORTS = ["vault"] as const;
 
 /**
- * OAuth paths the hub serves natively. The mount path is what clients see;
- * the target is the hub's loopback origin (where `hub-server.ts` is
- * listening). tailscale strips the mount before forwarding, so the target
- * must include the same path so the hub-server router sees the full URL.
- *
- * Pre-cli#58 (PR (c)) these were proxied to vault's `/vault/<name>/oauth/*`
- * handlers; after PR (c) the hub IS the OAuth IdP and vault validates
- * hub-issued JWTs (vault#169).
+ * Single tailscale serve mount: `/ → http://127.0.0.1:<hubPort>/`. The hub
+ * dispatches everything internally (hub page, /admin, /api, /hub SPA, /oauth,
+ * /.well-known, /vault SPA + proxy, /vaults POST, generic /<svc>/*), so the
+ * tailscale plan stays at this single rule regardless of how many services
+ * are installed. `publicExposure: "loopback"` enforcement happens inside the
+ * hub via `layerOf` — see `proxyToService` / `proxyToVault` in hub-server.ts.
  */
-const OAUTH_PATHS = [
-  "/.well-known/oauth-authorization-server",
-  "/oauth/authorize",
-  "/oauth/token",
-  "/oauth/register",
-] as const;
+const HUB_CATCHALL_MOUNT = "/";
 
 /**
- * Single tailscale serve mount that catches every `/vault/<name>/...` request
- * and routes it through the hub. The hub then reads services.json on each
- * request to pick the right vault backend (#144). Consolidating to one mount
- * means `parachute vault create techne` is reachable on the tailnet without
- * re-running `parachute expose` — only the hub-internal lookup needs to know
- * about the new path.
- *
- * Trailing slash distinguishes the mount from `/vaults` (the create-vault
- * POST endpoint, an exact-match on hub).
+ * Warn (but don't rewrite) for legacy `paths: ["/"]` entries. Pre-#144 these
+ * were remapped to `/<shortname>` so they didn't collide with the hub page
+ * at `/`. Now that the entire tailnet is one catchall to the hub, the hub
+ * dispatches by services.json `paths[]` per request — a `paths: ["/"]` entry
+ * still wouldn't route correctly, but the failure is hub-side rather than a
+ * tailscale plan collision. Emit the warning so operators know to re-install.
  */
-const VAULT_MOUNT = "/vault/";
-
-/**
- * Remap legacy `paths: ["/"]` entries to `/<shortname>` so they don't collide
- * with the hub page at `/`. Emits a warning per remapped service. This is the
- * transitional path for services installed before the vault PR that writes
- * `paths: ["/vault/<default>"]` — once `parachute install` is re-run those
- * entries update themselves and this branch goes dormant.
- */
-function remapLegacyRoot(
-  services: readonly ServiceEntry[],
-  log: (line: string) => void,
-): ServiceEntry[] {
-  return services.map((s) => {
-    const first = s.paths[0];
-    if (first !== "/") return s;
+function warnLegacyRoot(services: readonly ServiceEntry[], log: (line: string) => void): void {
+  for (const s of services) {
+    if (s.paths[0] !== "/") continue;
     const sn = shortName(s.name);
-    const remapped = `/${sn}`;
     log(
-      `note: ${s.name} claims "/"; hub page lives there — exposing at "${remapped}" instead. Re-run \`parachute install ${sn}\` to update services.json.`,
+      `note: ${s.name} claims "/"; hub page lives there — re-run \`parachute install ${sn}\` to update services.json.`,
     );
-    return { ...s, paths: [remapped, ...s.paths.slice(1)] };
-  });
+  }
 }
 
 /**
- * Partition services into ones that will be mounted on the layer versus ones
- * that stay loopback-only. "allowed" services go on the serve plan; every
- * other effective exposure state (explicit loopback, explicit auth-required,
- * spec-default auth-required) is withheld. Hidden services still appear in
- * services.json so on-box callers reach them at http://127.0.0.1:<port>.
+ * Build the tailscale plan: one rule, `/ → http://127.0.0.1:<hubPort>/`.
+ * Hub does internal dispatch (UI, OAuth, well-known, vault SPA + per-vault
+ * proxy, generic /<svc>/* services.json dispatch) and per-request layer
+ * gating for `publicExposure: "loopback"` services. See `layerOf` in
+ * `hub-server.ts` for the access-control matrix.
  */
-interface ExposurePartition {
-  exposed: ServiceEntry[];
-  hidden: Array<{ entry: ServiceEntry; reason: string }>;
-}
-
-function partitionByExposure(services: readonly ServiceEntry[]): ExposurePartition {
-  const exposed: ServiceEntry[] = [];
-  const hidden: Array<{ entry: ServiceEntry; reason: string }> = [];
-  for (const s of services) {
-    const eff = effectivePublicExposure(s);
-    if (eff === "allowed") {
-      exposed.push(s);
-      continue;
-    }
-    // Explicit declaration tells the user exactly what the service asked for;
-    // a spec-derived default points at the usual cause (no auth configured).
-    let reason: string;
-    if (s.publicExposure === "loopback") {
-      reason = "loopback-only by service declaration";
-    } else if (s.publicExposure === "auth-required") {
-      reason = "auth-required: service reports auth is not yet configured";
-    } else {
-      reason = "auth-required: service has no auth gate — set the service's auth token to expose";
-    }
-    hidden.push({ entry: s, reason });
-  }
-  return { exposed, hidden };
-}
-
-/**
- * Compose the tailscale serve target URL for a service rooted at `mount`.
- *
- * `tailscale serve --set-path=<mount> <target>` strips `<mount>` from the
- * incoming request path before forwarding. So if the backend expects
- * requests to keep arriving at `<mount>/...` (every SPA with a configured
- * base path, plus vault's `/vault/<name>/` API root) the target URL must
- * include the same mount path — otherwise the backend sees requests at `/`,
- * emits a redirect back to its real base, tailscale strips again, and the
- * client loops on `ERR_TOO_MANY_REDIRECTS`.
- *
- * The rule of thumb is: mount and target path must match byte-for-byte
- * (including trailing slash state), so tailscale's strip-then-forward is a
- * no-op and the backend sees the full path it expects.
- */
-function serviceProxyTarget(port: number, mount: string): string {
-  return `http://127.0.0.1:${port}${mount}`;
-}
-
-function planEntries(services: readonly ServiceEntry[], hubPort: number): ServeEntry[] {
-  const entries: ServeEntry[] = [];
-  entries.push({
-    kind: "proxy",
-    mount: HUB_MOUNT,
-    target: serviceProxyTarget(hubPort, HUB_MOUNT),
-    service: "hub",
-  });
-  let anyVault = false;
-  for (const s of services) {
-    if (isVaultEntry(s)) {
-      // Vault paths route through the single `/vault/` → hub mount below so
-      // `parachute vault create <name>` is reachable on the tailnet without
-      // a re-expose. Hub does the per-request services.json lookup (#144).
-      anyVault = true;
-      continue;
-    }
-    const mount = s.paths[0] ?? `/${shortName(s.name)}`;
-    entries.push({
+function planEntries(hubPort: number): ServeEntry[] {
+  return [
+    {
       kind: "proxy",
-      mount,
-      target: serviceProxyTarget(s.port, mount),
-      service: s.name,
-    });
-  }
-  if (anyVault) {
-    entries.push({
-      kind: "proxy",
-      mount: VAULT_MOUNT,
-      target: serviceProxyTarget(hubPort, VAULT_MOUNT),
-      service: "vault",
-    });
-  }
-  entries.push({
-    kind: "proxy",
-    mount: WELL_KNOWN_MOUNT,
-    target: serviceProxyTarget(hubPort, WELL_KNOWN_MOUNT),
-    service: "well-known",
-  });
-
-  // The hub is the OAuth IdP — mount the four endpoints at the canonical
-  // origin and proxy them to the hub's loopback. tailscale strips the mount
-  // before forwarding, so the target keeps the same path (matches the
-  // `serviceProxyTarget` rule of thumb in the doc above).
-  for (const oauthPath of OAUTH_PATHS) {
-    entries.push({
-      kind: "proxy",
-      mount: oauthPath,
-      target: serviceProxyTarget(hubPort, oauthPath),
-      service: "hub:oauth",
-    });
-  }
-  return entries;
+      mount: HUB_CATCHALL_MOUNT,
+      target: `http://127.0.0.1:${hubPort}/`,
+      service: "hub",
+    },
+  ];
 }
 
 async function runEach(
@@ -366,12 +255,13 @@ export async function exposeUp(layer: ExposeLayer, opts: ExposeOpts = {}): Promi
     }
   }
 
-  const allServices = remapLegacyRoot(manifest.services, log);
-  // Split out loopback/auth-required services before planning the serve routes.
-  // Hidden services keep their /127.0.0.1:<port> accessibility for on-box
-  // callers (e.g., vault's transcription-worker dialing scribe); they just
-  // don't land on tailnet/funnel.
-  const { exposed: services, hidden } = partitionByExposure(allServices);
+  // Plan no longer partitions services — every service goes through the
+  // single hub catchall, and hub gates per request (`publicExposure` +
+  // `layerOf` in hub-server.ts). Just surface the legacy `paths: ["/"]`
+  // warning so operators know to re-install. `warnLegacyRoot` is
+  // side-effect-only (warning to `log`); use `manifest.services` directly
+  // downstream.
+  warnLegacyRoot(manifest.services, log);
 
   /**
    * Probe each service port before wiring tailscale up. A service that's
@@ -381,7 +271,7 @@ export async function exposeUp(layer: ExposeLayer, opts: ExposeOpts = {}): Promi
    */
   const portProbe = opts.servicePortProbe ?? (async (p: number) => !(await defaultPortProbe(p)));
   const probeResults = await Promise.all(
-    services.map(async (s) => ({ svc: s, up: await portProbe(s.port) })),
+    manifest.services.map(async (s) => ({ svc: s, up: await portProbe(s.port) })),
   );
   for (const { svc, up } of probeResults) {
     if (up) continue;
@@ -394,7 +284,7 @@ export async function exposeUp(layer: ExposeLayer, opts: ExposeOpts = {}): Promi
   // Kept for manual debugging / inspection only — the hub server now builds
   // /.well-known/parachute.json dynamically from services.json at request time
   // (#135), so this on-disk copy is no longer load-bearing for any consumer.
-  const wellKnownDoc = buildWellKnown({ services, canonicalOrigin });
+  const wellKnownDoc = buildWellKnown({ services: manifest.services, canonicalOrigin });
   writeWellKnownFile(wellKnownDoc, wellKnownFilePath);
   log(`Wrote ${wellKnownFilePath}`);
   writeHubFile(hubFilePath);
@@ -416,7 +306,7 @@ export async function exposeUp(layer: ExposeLayer, opts: ExposeOpts = {}): Promi
     hubPort = existing;
   } else {
     const hub = await ensureHubRunning({
-      reservedPorts: services.map((s) => s.port),
+      reservedPorts: manifest.services.map((s) => s.port),
       ...(opts.hubEnsureOpts ?? {}),
       configDir,
       wellKnownDir,
@@ -428,14 +318,11 @@ export async function exposeUp(layer: ExposeLayer, opts: ExposeOpts = {}): Promi
     else log(`✓ hub already running (pid ${hub.pid}, port ${hub.port}).`);
   }
 
-  const entries = planEntries(services, hubPort);
+  const entries = planEntries(hubPort);
   log(`Exposing under ${canonicalOrigin} (${layerLabel(layer)}, path-routing, port ${port}):`);
   for (const e of entries) {
     const suffix = e.kind === "proxy" ? `→ ${e.target}  (${e.service})` : `→ ${e.target}`;
     log(`  ${e.mount.padEnd(30, " ")} ${suffix}`);
-  }
-  for (const { entry: hiddenSvc, reason } of hidden) {
-    log(`  (${hiddenSvc.name} is loopback-only — ${reason})`);
   }
 
   const cmds = entries.map((e) => bringupCommand(e, { port, funnel }));

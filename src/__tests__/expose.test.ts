@@ -112,7 +112,11 @@ function seedServices(path: string): void {
 const allServicesUp = async () => true;
 
 describe("expose tailnet up", () => {
-  test("mounts hub proxy at /, one proxy per service, plus well-known proxy", async () => {
+  test("emits exactly one catchall mount: / → http://127.0.0.1:<hubPort>/", async () => {
+    // Single-rule symmetry with cloudflare ingress (#178). Hub does all
+    // internal dispatch (UI, OAuth, well-known, vault SPA + per-vault proxy,
+    // generic /<svc>/* services dispatch) so the tailscale plan stays at
+    // one mount regardless of how many services are installed.
     const h = makeHarness();
     try {
       seedServices(h.manifestPath);
@@ -136,47 +140,20 @@ describe("expose tailnet up", () => {
       const serveCalls = calls.filter(
         (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
       );
-      // 4 baseline (hub + wk + vault + notes) + 4 OAuth proxies (vault present).
-      expect(serveCalls).toHaveLength(8);
+      // Exactly one bringup: `/ → http://127.0.0.1:<hubPort>/`.
+      expect(serveCalls).toHaveLength(1);
       // Tailnet mode never uses funnel — neither the old flag nor the new subcommand.
       expect(serveCalls.every((c) => !c.includes("--funnel"))).toBe(true);
       expect(calls.every((c) => c[1] !== "funnel")).toBe(true);
 
-      const mounts = serveCalls.map((c) => c.find((a) => a.startsWith("--set-path="))).sort();
-      // Vault paths consolidate to a single `/vault/` mount → hub (#144);
-      // the hub then picks the specific vault instance per request from
-      // services.json. Notes (and other non-vault services) keep their
-      // direct mount.
-      expect(mounts).toEqual([
-        "--set-path=/",
-        "--set-path=/.well-known/oauth-authorization-server",
-        "--set-path=/.well-known/parachute.json",
-        "--set-path=/notes",
-        "--set-path=/oauth/authorize",
-        "--set-path=/oauth/register",
-        "--set-path=/oauth/token",
-        "--set-path=/vault/",
-      ]);
+      const mounts = serveCalls.map((c) => c.find((a) => a.startsWith("--set-path=")));
+      expect(mounts).toEqual(["--set-path=/"]);
 
-      // Hub + well-known now point at localhost HTTP, not a file path.
-      // Target path mirrors mount exactly so tailscale's strip-then-forward
-      // is a no-op; otherwise SPAs at /<mount>/ redirect-loop.
-      const hubCall = serveCalls.find((c) => c.includes("--set-path=/"));
-      expect(hubCall?.[hubCall.length - 1]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
-
-      const wkCall = serveCalls.find((c) => c.includes("--set-path=/.well-known/parachute.json"));
-      expect(wkCall?.[wkCall.length - 1]).toMatch(
-        /^http:\/\/127\.0\.0\.1:\d+\/\.well-known\/parachute\.json$/,
-      );
-
-      // Non-vault service targets include the mount path so tailscale's
-      // strip-then-forward is a no-op against base-aware backends.
-      const notesCall = serveCalls.find((c) => c.includes("--set-path=/notes"));
-      expect(notesCall?.[notesCall.length - 1]).toBe("http://127.0.0.1:5173/notes");
-      // Vault mount targets the hub's loopback port (the hub re-proxies to
-      // the right vault backend on each request) — port is dynamic per test.
-      const vaultCall = serveCalls.find((c) => c.includes("--set-path=/vault/"));
-      expect(vaultCall?.[vaultCall.length - 1]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/vault\/$/);
+      // Hub catchall target is the hub loopback root with trailing slash so
+      // tailscale's strip-then-forward is a no-op (mount and target match
+      // byte-for-byte).
+      const hubCall = serveCalls[0] ?? [];
+      expect(hubCall[hubCall.length - 1]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
 
       expect(existsSync(h.wellKnownPath)).toBe(true);
       expect(existsSync(h.hubPath)).toBe(true);
@@ -186,9 +163,9 @@ describe("expose tailnet up", () => {
       const state = readExposeState(h.statePath);
       expect(state?.layer).toBe("tailnet");
       expect(state?.mode).toBe("path");
-      expect(state?.entries).toHaveLength(8);
-      // All entries are proxy now — no file-backed tailscale serve.
-      expect(state?.entries.every((e) => e.kind === "proxy")).toBe(true);
+      expect(state?.entries).toHaveLength(1);
+      expect(state?.entries[0]?.mount).toBe("/");
+      expect(state?.entries[0]?.kind).toBe("proxy");
     } finally {
       h.cleanup();
     }
@@ -224,10 +201,11 @@ describe("expose tailnet up", () => {
     }
   });
 
-  test("trailing-slash mount preserves trailing slash in target URL", async () => {
-    // Aaron hit ERR_TOO_MANY_REDIRECTS on /notes/ because tailscale strips
-    // the prefix, Vite (base=/notes) redirects back to /notes/, tailscale
-    // strips again, loop. Pinning target = mount byte-for-byte breaks that.
+  test("hub catchall target ends in `/` so tailscale strip-then-forward is a no-op", async () => {
+    // Aaron hit ERR_TOO_MANY_REDIRECTS on /notes/ pre-collapse because
+    // tailscale strips the prefix and Vite (base=/notes) redirects back to
+    // /notes/. Mount and target byte-equal breaks that loop. Now that there's
+    // one catchall, the same rule applies to the hub root: `/ → http://…/`.
     const h = makeHarness();
     try {
       upsertService(
@@ -258,15 +236,20 @@ describe("expose tailnet up", () => {
       const serveCalls = calls.filter(
         (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
       );
-      const notesCall = serveCalls.find((c) => c.includes("--set-path=/notes/"));
-      expect(notesCall).toBeDefined();
-      expect(notesCall?.[notesCall.length - 1]).toBe("http://127.0.0.1:5173/notes/");
+      expect(serveCalls).toHaveLength(1);
+      const call = serveCalls[0] ?? [];
+      expect(call).toContain("--set-path=/");
+      expect(call[call.length - 1]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
     } finally {
       h.cleanup();
     }
   });
 
-  test("legacy paths:[/] entry is remapped to /<shortname> with warning", async () => {
+  test("legacy paths:[/] entry warns operator (no rewrite — hub dispatches per request)", async () => {
+    // Pre-collapse this remapped to /<shortname>; now the hub does dispatch
+    // per services.json, so a paths:["/"] entry would still collide with the
+    // hub UI but the failure surface is hub-side, not tailscale-plan-side.
+    // Keep the warn so operators know to re-install.
     const h = makeHarness();
     try {
       upsertService(
@@ -290,16 +273,12 @@ describe("expose tailnet up", () => {
       });
       expect(code).toBe(0);
 
+      // Plan is still exactly one catchall regardless of the legacy entry.
       const serveCalls = calls.filter(
         (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
       );
-      const mounts = serveCalls.map((c) => c.find((a) => a.startsWith("--set-path="))).sort();
-      // Even with the legacy `/` remap, the vault rolls into the consolidated
-      // `/vault/` mount → hub. The remap warning still fires; the mount shape
-      // just doesn't reflect the original `/<shortname>` since #144.
-      expect(mounts).toContain("--set-path=/vault/");
-      expect(mounts).toContain("--set-path=/");
-      expect(mounts.filter((m) => m === "--set-path=/")).toHaveLength(1);
+      expect(serveCalls).toHaveLength(1);
+      expect(serveCalls[0]).toContain("--set-path=/");
 
       expect(logs.join("\n")).toMatch(/parachute-vault claims "\/"; hub page lives there/);
     } finally {
@@ -435,11 +414,12 @@ describe("expose tailnet up", () => {
       expect(joined).toMatch(/parachute-notes \(port 5173\) is not responding/);
       expect(joined).toMatch(/parachute start notes/);
       expect(joined).not.toMatch(/parachute-vault.*not responding/);
-      // Bringup still happened — 4 service entries + 4 OAuth proxies got staged.
+      // Bringup still happened — single hub catchall regardless of which
+      // services responded to the probe.
       const serveCalls = calls.filter(
         (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
       );
-      expect(serveCalls).toHaveLength(8);
+      expect(serveCalls).toHaveLength(1);
     } finally {
       h.cleanup();
     }
@@ -484,7 +464,10 @@ describe("expose tailnet up", () => {
     }
   });
 
-  test("emits 4 OAuth proxies targeting the hub origin (hub IS the IdP)", async () => {
+  test("hub catchall serves OAuth + well-known internally — no separate mount per endpoint", async () => {
+    // OAuth (hub IS the IdP) and well-known (parachute.json + JWKS +
+    // oauth-authorization-server metadata) are dispatched by the hub from
+    // the single catchall. State + bringup carry exactly one entry.
     const h = makeHarness();
     try {
       seedServices(h.manifestPath);
@@ -507,26 +490,10 @@ describe("expose tailnet up", () => {
       const serveCalls = calls.filter(
         (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
       );
-      const oauthTargets = new Map<string, string>();
-      for (const c of serveCalls) {
-        const mount = c.find((a) => a.startsWith("--set-path="))?.slice("--set-path=".length);
-        if (
-          mount &&
-          (mount.startsWith("/oauth/") || mount === "/.well-known/oauth-authorization-server")
-        ) {
-          oauthTargets.set(mount, c[c.length - 1] ?? "");
-        }
-      }
-      expect(oauthTargets.get("/.well-known/oauth-authorization-server")).toMatch(
-        /^http:\/\/127\.0\.0\.1:\d+\/\.well-known\/oauth-authorization-server$/,
-      );
-      expect(oauthTargets.get("/oauth/authorize")).toMatch(
-        /^http:\/\/127\.0\.0\.1:\d+\/oauth\/authorize$/,
-      );
-      expect(oauthTargets.get("/oauth/token")).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/oauth\/token$/);
-      expect(oauthTargets.get("/oauth/register")).toMatch(
-        /^http:\/\/127\.0\.0\.1:\d+\/oauth\/register$/,
-      );
+      // Single catchall — no per-endpoint OAuth or well-known mounts.
+      expect(serveCalls).toHaveLength(1);
+      const mounts = serveCalls.map((c) => c.find((a) => a.startsWith("--set-path=")));
+      expect(mounts).toEqual(["--set-path=/"]);
 
       const state = readExposeState(h.statePath);
       expect(state?.hubOrigin).toBe("https://parachute.taildf9ce2.ts.net");
@@ -535,7 +502,10 @@ describe("expose tailnet up", () => {
     }
   });
 
-  test("emits OAuth proxies even when no vault is installed (hub IS the IdP)", async () => {
+  test("plan is one catchall regardless of which services are installed", async () => {
+    // Pre-collapse this varied: with vault installed we got more mounts than
+    // without. Now the count is constant — the hub dispatches from
+    // services.json per request, so the tailscale plan doesn't enumerate.
     const h = makeHarness();
     try {
       upsertService(
@@ -567,15 +537,7 @@ describe("expose tailnet up", () => {
       const serveCalls = calls.filter(
         (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
       );
-      // Hub + well-known + notes + 4 OAuth proxies = 7. The hub serves OAuth
-      // regardless of which services are installed.
-      expect(serveCalls).toHaveLength(7);
-      const oauthMounts = serveCalls
-        .map((c) => c.find((a) => a.startsWith("--set-path=")))
-        .filter(
-          (m): m is string => !!m && (m.includes("/oauth/") || m.endsWith("authorization-server")),
-        );
-      expect(oauthMounts).toHaveLength(4);
+      expect(serveCalls).toHaveLength(1);
     } finally {
       h.cleanup();
     }
@@ -821,8 +783,9 @@ describe("expose public up", () => {
       const funnelCalls = calls.filter(
         (c) => c[0] === "tailscale" && c[1] === "funnel" && c.includes("--bg"),
       );
-      // 4 baseline mounts + 4 OAuth proxies (vault seeded).
-      expect(funnelCalls).toHaveLength(8);
+      // Single hub catchall — public mode shape now matches tailnet (#178
+      // landed the cloudflare-side single-rule; this closes tailnet).
+      expect(funnelCalls).toHaveLength(1);
       // Never emit the legacy `serve --funnel` shape.
       expect(calls.every((c) => !c.includes("--funnel"))).toBe(true);
       expect(calls.every((c) => !(c[1] === "serve" && c.includes("--bg")))).toBe(true);
@@ -830,7 +793,7 @@ describe("expose public up", () => {
       const state = readExposeState(h.statePath);
       expect(state?.layer).toBe("public");
       expect(state?.funnel).toBe(true);
-      expect(state?.entries).toHaveLength(8);
+      expect(state?.entries).toHaveLength(1);
 
       expect(logs.join("\n")).toMatch(/Public exposure active/);
     } finally {
@@ -1023,15 +986,21 @@ describe("expose public off", () => {
   });
 });
 
-describe("expose publicExposure filter", () => {
-  // Launch-blocker: services without auth should never be mounted on
-  // tailnet/funnel. The filter reads `publicExposure` from each entry (or
-  // derives a safe default from the service spec) and withholds non-"allowed"
-  // services from the tailscale serve plan.
-  test("explicit loopback keeps the service off the serve plan", async () => {
+describe("expose plan is layer-agnostic — gating moved to hub", () => {
+  // Pre-collapse the tailscale plan partitioned services by publicExposure
+  // and withheld loopback/auth-required entries. Now the plan is always one
+  // catchall to the hub, which gates per request via `effectivePublicExposure`
+  // + `layerOf` (see hub-server.ts). These tests confirm the plan stays
+  // single-rule regardless of services' exposure declarations; per-request
+  // gating is exercised in hub-server.test.ts.
+
+  test("plan stays one catchall when a loopback-only service is installed", async () => {
+    // Pre-collapse, scribe (publicExposure: "loopback") was withheld from the
+    // plan with an operator-visible warning. Now scribe is on the plan via
+    // the hub catchall — the hub returns 404 to non-loopback callers per
+    // hub-server's `proxyToService` layer-gate. Plan stays one mount.
     const h = makeHarness();
     try {
-      // Vault is mounted as usual; scribe declares loopback and is withheld.
       upsertService(
         {
           name: "parachute-vault",
@@ -1056,7 +1025,6 @@ describe("expose publicExposure filter", () => {
       );
       const { runner, calls } = makeRunner();
       const { spawner } = makeHubSpawner(1111);
-      const logs: string[] = [];
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
@@ -1067,41 +1035,29 @@ describe("expose publicExposure filter", () => {
         configDir: h.configDir,
         hubEnsureOpts: hubEnsureOpts(spawner),
         servicePortProbe: allServicesUp,
-        log: (l) => logs.push(l),
+        log: () => {},
       });
       expect(code).toBe(0);
-
       const serveCalls = calls.filter(
         (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
       );
-      const mounts = serveCalls.map((c) => c.find((a) => a.startsWith("--set-path=")));
-      // Vault rolls into the consolidated `/vault/` mount → hub (#144);
-      // its 4 OAuth proxies, hub, and well-known are still individually
-      // mounted. /scribe is loopback-only and absent.
-      expect(mounts).toContain("--set-path=/vault/");
-      expect(mounts).not.toContain("--set-path=/scribe");
+      expect(serveCalls).toHaveLength(1);
+      expect(serveCalls[0]).toContain("--set-path=/");
 
-      // Operator-visible notice explaining the withhold.
-      expect(logs.join("\n")).toMatch(
-        /parachute-scribe is loopback-only — loopback-only by service declaration/,
-      );
-
-      // State file reflects the reduced plan so teardown doesn't trip on
-      // entries that were never brought up.
+      // State carries one entry — hub catchall. No /scribe or /vault/* in state.
       const state = readExposeState(h.statePath);
-      expect(state?.entries.some((e) => e.mount === "/scribe")).toBe(false);
+      expect(state?.entries).toHaveLength(1);
+      expect(state?.entries[0]?.mount).toBe("/");
     } finally {
       h.cleanup();
     }
   });
 
-  test("explicit auth-required behaves like loopback at launch", async () => {
-    // auth-required is the future-looking declaration for a service that
-    // wants auth but hasn't confirmed it's configured. Today the CLI treats
-    // it identically to loopback — still no funnel/tailnet exposure.
+  test("plan stays one catchall regardless of mix of publicExposure values", async () => {
+    // Mix: allowed, loopback, auth-required, and absent. Plan is one mount.
     const h = makeHarness();
     try {
-      seedServices(h.manifestPath); // vault + notes, both allowed by default
+      seedServices(h.manifestPath); // vault + notes
       upsertService(
         {
           name: "parachute-channel",
@@ -1113,40 +1069,6 @@ describe("expose publicExposure filter", () => {
         },
         h.manifestPath,
       );
-      const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
-      const logs: string[] = [];
-      const code = await exposeTailnet("up", {
-        runner,
-        manifestPath: h.manifestPath,
-        statePath: h.statePath,
-        wellKnownPath: h.wellKnownPath,
-        hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
-        configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
-        servicePortProbe: allServicesUp,
-        log: (l) => logs.push(l),
-      });
-      expect(code).toBe(0);
-      const mounts = calls
-        .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
-        .map((c) => c.find((a) => a.startsWith("--set-path=")));
-      expect(mounts).not.toContain("--set-path=/channel");
-      expect(logs.join("\n")).toMatch(/parachute-channel is loopback-only — auth-required/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("missing publicExposure + spec kind=api, hasAuth=false → loopback default (scribe)", async () => {
-    // Scribe today has no auth gate; its ServiceSpec says so (kind: "api",
-    // hasAuth: false). With publicExposure absent we should still withhold.
-    // This is the safe-by-default case for services that haven't yet been
-    // updated to declare their exposure.
-    const h = makeHarness();
-    try {
-      seedServices(h.manifestPath);
       upsertService(
         {
           name: "parachute-scribe",
@@ -1160,51 +1082,6 @@ describe("expose publicExposure filter", () => {
       );
       const { runner, calls } = makeRunner();
       const { spawner } = makeHubSpawner(1111);
-      const logs: string[] = [];
-      const code = await exposeTailnet("up", {
-        runner,
-        manifestPath: h.manifestPath,
-        statePath: h.statePath,
-        wellKnownPath: h.wellKnownPath,
-        hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
-        configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
-        servicePortProbe: allServicesUp,
-        log: (l) => logs.push(l),
-      });
-      expect(code).toBe(0);
-      const mounts = calls
-        .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
-        .map((c) => c.find((a) => a.startsWith("--set-path=")));
-      expect(mounts).not.toContain("--set-path=/scribe");
-      // Reason text points operators at the missing auth gate.
-      expect(logs.join("\n")).toMatch(
-        /parachute-scribe is loopback-only — auth-required: service has no auth gate/,
-      );
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("missing publicExposure on a known auth'd api service (vault) still exposes", async () => {
-    // vault's ServiceSpec has hasAuth: true, so the absence of publicExposure
-    // should not hide it — the back-compat path for every vault entry written
-    // before this field existed.
-    const h = makeHarness();
-    try {
-      upsertService(
-        {
-          name: "parachute-vault",
-          port: 1940,
-          paths: ["/vault/default"],
-          health: "/vault/default/health",
-          version: "0.2.4",
-        },
-        h.manifestPath,
-      );
-      const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
@@ -1218,53 +1095,10 @@ describe("expose publicExposure filter", () => {
         log: () => {},
       });
       expect(code).toBe(0);
-      const mounts = calls
-        .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
-        .map((c) => c.find((a) => a.startsWith("--set-path=")));
-      // Vault → consolidated `/vault/` mount (#144).
-      expect(mounts).toContain("--set-path=/vault/");
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("unknown third-party service without publicExposure defaults to allowed", async () => {
-    // A service not in SERVICE_SPECS has no kind/hasAuth signal. We err on
-    // the side of preserving current behavior (back-compat) so operators'
-    // existing exposures don't silently stop working on upgrade. If the
-    // third-party wants to opt out, they can write publicExposure: "loopback"
-    // into their services.json entry.
-    const h = makeHarness();
-    try {
-      upsertService(
-        {
-          name: "parachute-rando",
-          port: 1947,
-          paths: ["/rando"],
-          health: "/rando/health",
-          version: "0.0.1",
-        },
-        h.manifestPath,
+      const serveCalls = calls.filter(
+        (c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"),
       );
-      const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
-      const code = await exposeTailnet("up", {
-        runner,
-        manifestPath: h.manifestPath,
-        statePath: h.statePath,
-        wellKnownPath: h.wellKnownPath,
-        hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
-        configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
-        servicePortProbe: allServicesUp,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      const mounts = calls
-        .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
-        .map((c) => c.find((a) => a.startsWith("--set-path=")));
-      expect(mounts).toContain("--set-path=/rando");
+      expect(serveCalls).toHaveLength(1);
     } finally {
       h.cleanup();
     }
@@ -1595,12 +1429,15 @@ describe("expose teardown tolerance for already-gone entries", () => {
   });
 });
 
-describe("expose vault mount consolidation (#144)", () => {
-  // Pre-#144: tailscale plan emitted one mount per vault path. New vault →
-  // had to re-run `parachute expose` to get a tailnet route. Post-#144: a
-  // single `/vault/` → hub mount, hub does the per-request lookup.
+describe("expose: vault routing fully internal to hub", () => {
+  // Pre-#144: one tailscale mount per vault path. #144 collapsed those to a
+  // single `/vault/ → hub` mount. This PR collapses one step further: vault
+  // routing is just a slice of the hub catchall now. Hub's `proxyToVault`
+  // (in hub-server.ts) still dispatches per services.json on each request,
+  // so `parachute vault create <name>` is reachable without re-expose; the
+  // tailscale plan just no longer carries a vault-specific entry.
 
-  test("single vault, single path → exactly one /vault/ mount, no per-instance entry", async () => {
+  test("single vault, single path → still one catchall, no /vault/* tailscale rule", async () => {
     const h = makeHarness();
     try {
       upsertService(
@@ -1631,59 +1468,16 @@ describe("expose vault mount consolidation (#144)", () => {
       const mounts = calls
         .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
         .map((c) => c.find((a) => a.startsWith("--set-path=")));
-      expect(mounts).toContain("--set-path=/vault/");
-      expect(mounts).not.toContain("--set-path=/vault/default");
+      expect(mounts).toEqual(["--set-path=/"]);
     } finally {
       h.cleanup();
     }
   });
 
-  test("multi-path single ServiceEntry still emits exactly one /vault/ mount", async () => {
-    // The current vault manifest shape: one ServiceEntry whose `paths` lists
-    // every instance. The plan must collapse them all to the hub-routed
-    // `/vault/` instead of one mount per instance.
-    const h = makeHarness();
-    try {
-      upsertService(
-        {
-          name: "parachute-vault",
-          port: 1940,
-          paths: ["/vault/default", "/vault/techne"],
-          health: "/vault/default/health",
-          version: "0.4.0",
-        },
-        h.manifestPath,
-      );
-      const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
-      const code = await exposeTailnet("up", {
-        runner,
-        manifestPath: h.manifestPath,
-        statePath: h.statePath,
-        wellKnownPath: h.wellKnownPath,
-        hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
-        configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
-        servicePortProbe: allServicesUp,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      const mounts = calls
-        .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
-        .map((c) => c.find((a) => a.startsWith("--set-path=")));
-      const vaultMounts = mounts.filter((m) => m?.startsWith("--set-path=/vault"));
-      expect(vaultMounts).toEqual(["--set-path=/vault/"]);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("multiple separate vault ServiceEntries still emit exactly one /vault/ mount", async () => {
-    // Pathological but representable: someone might install a second
-    // parachute-vault-archive backend alongside the bare parachute-vault.
-    // Both fold into the single `/vault/` mount; hub disambiguates per
-    // request.
+  test("multiple separate vault ServiceEntries → still one catchall", async () => {
+    // Pathological but representable: a second parachute-vault-archive
+    // alongside the bare parachute-vault. Both reachable via the hub
+    // catchall; hub picks the backend per request.
     const h = makeHarness();
     try {
       upsertService(
@@ -1724,48 +1518,7 @@ describe("expose vault mount consolidation (#144)", () => {
       const mounts = calls
         .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
         .map((c) => c.find((a) => a.startsWith("--set-path=")));
-      const vaultMounts = mounts.filter((m) => m?.startsWith("--set-path=/vault"));
-      expect(vaultMounts).toEqual(["--set-path=/vault/"]);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("no vault installed → no /vault/ mount in the plan", async () => {
-    const h = makeHarness();
-    try {
-      upsertService(
-        {
-          name: "parachute-notes",
-          port: 5173,
-          paths: ["/notes"],
-          health: "/notes/health",
-          version: "0.0.1",
-        },
-        h.manifestPath,
-      );
-      const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
-      const code = await exposeTailnet("up", {
-        runner,
-        manifestPath: h.manifestPath,
-        statePath: h.statePath,
-        wellKnownPath: h.wellKnownPath,
-        hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
-        configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
-        servicePortProbe: allServicesUp,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      const mounts = calls
-        .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
-        .map((c) => c.find((a) => a.startsWith("--set-path=")));
-      expect(mounts).not.toContain("--set-path=/vault/");
-      // /notes is still individually mounted — non-vault services keep
-      // their direct route.
-      expect(mounts).toContain("--set-path=/notes");
+      expect(mounts).toEqual(["--set-path=/"]);
     } finally {
       h.cleanup();
     }

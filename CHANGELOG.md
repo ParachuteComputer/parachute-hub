@@ -2,6 +2,38 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.3-rc.2] - 2026-05-08
+
+Review nit fold (PR #187) — no behavior change beyond test coverage.
+
+### Changed
+
+- **`layerOf` matches `Tailscale-Funnel-Request: ?1` by value, not presence.** The structured-header value is the contract per `tailscale.com/ipnlocal/serve.go`; comparing on value (rather than `!== null`) makes the classifier's intent explicit and prevents a future loosening from accidentally accepting any value. CF-Ray / CF-Connecting-IP stay on presence-checks (open-string identifiers, no canonical value).
+- **`warnLegacyRoot` typed as `void`; unused binding dropped at the call site.** The function has been warning-only since the path-rewrite was removed in 0.5.3-rc.1; `const services = warnLegacyRoot(...)` implied a transform that wasn't happening. Caller now uses `manifest.services` directly downstream.
+
+### Added
+
+- **Test: unknown third-party service (no `FIRST_PARTY_FALLBACKS` row, no explicit `publicExposure`) defaults to `"allowed"` and reaches the public layer.** Regression-guards anyone tightening `effectivePublicExposure`'s default toward `"loopback"` — that would silently 404 every third-party module installed via `module.json` on tailnet/public exposure.
+
+## [0.5.3-rc.1] - 2026-05-08
+
+### Added
+
+- **Hub-side request-layer detection (`layerOf`).** Every request reaching `127.0.0.1:1939` is classified into `loopback` / `tailnet` / `public` by inspecting the proxy headers each trusted forwarder injects: `Tailscale-User-Login` (tailnet, authed via `tailscale serve`), `Tailscale-Funnel-Request: ?1` (public, Tailscale Funnel — verified against `serve.go addTailscaleIdentityHeaders`), `CF-Ray` / `CF-Connecting-IP` (public, cloudflared tunnel), or none of the above (loopback). Spoofing isn't a concern: hub binds 127.0.0.1, so external requests can't reach the listener except via these forwarders. Drives the new `publicExposure` enforcement below.
+- **`publicExposure: "loopback"` enforcement on `/<svc>/*` and `/vault/<name>/*` dispatch.** `effectivePublicExposure(entry)` was already exposed by `service-spec.ts`; `proxyToService` and `proxyToVault` now consult it and 404 when the layer mismatches (loopback service hit from tailnet/public). `allowed` and `auth-required` pass through; the service does its own auth. **Hub-owned routes (`/`, `/admin/*`, `/api/*`, `/hub/*`, `/oauth/*`, `/.well-known/*`, `/vault/*` SPA mount, `POST /vaults`) are NOT layer-blocked** — they reach all layers and rely on app-level auth (admin session cookie + 2FA, OAuth, per-route logic). This is the access-control matrix the redirected single-ingress design committed to.
+
+### Changed
+
+- **`parachute expose tailnet up` collapses to a single tailscale rule.** Pre-collapse the planner emitted one mount per service: hub root, well-known, four OAuth proxies, `/vault/`, plus one per non-vault service — eight mounts for a baseline vault+notes install. New shape: `tailscale serve --bg --https=443 --set-path=/ http://127.0.0.1:<hubPort>/` and the hub does all internal dispatch. `parachute expose public` (Tailscale Funnel) emits the symmetric single rule. Closes the symmetry gap with the cloudflare side that shipped in #178 on 0.5.2; the access-control matrix now lives uniformly in the hub regardless of which forwarder admitted the request.
+- **`partitionByExposure` removed from the tailnet plan layer.** Its job (filtering loopback/auth-required services off the tailscale plan) is moot now that every service rides the catchall. The hub gates per request via `effectivePublicExposure` + `layerOf`. Operator-visible "X is loopback-only" warnings at expose time are gone — the equivalent operator signal is hub returning 404 for those routes from non-loopback callers.
+- **Legacy `paths: ["/"]` entries warn but no longer get rewritten in-memory.** Pre-collapse the planner remapped them to `/<shortname>` so they didn't collide with the hub's tailscale `/` mount. With one catchall, the collision is hub-side; the warning still fires so operators know to re-install. (No services in the wild have ever shipped this shape on a release version.)
+
+### Migration / impact
+
+- Operators with `parachute expose tailnet` already up: re-run after upgrading. The teardown-then-bringup sweep in `exposeUp` handles old multi-mount state correctly via the recorded `entries[]` in `expose-state.json`.
+- Operators with `publicExposure: "loopback"` services in `services.json`: behavior is materially equivalent (those routes were unreachable from tailnet/public before because the plan withheld them; now they're 404 because the hub gate fires). `auth-required` services that lacked an actual auth gate: were withheld pre-collapse, now reach all layers and rely on the service to gate. **Verify your service is actually auth-gating before relying on this** (#185 tracks rate-limiting on `/admin/login` since `/admin` is now public-reachable with cloudflare/funnel exposure; #186 tracks an `expose public` warning when 2FA isn't enrolled).
+- Tailnet exposure now matches cloudflare: one ingress rule, all policy in hub.
+
 ## [0.5.2] - 2026-05-06
 
 ### Added

@@ -67,6 +67,7 @@ import {
   handleToken,
 } from "./oauth-handlers.ts";
 import { clearPid, writePid } from "./process-state.ts";
+import { effectivePublicExposure } from "./service-spec.ts";
 import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
 import { buildWellKnown, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
@@ -144,6 +145,65 @@ export function findVaultUpstream(
     }
   }
   return best;
+}
+
+/**
+ * The trust layer a request arrived through. Hub binds `127.0.0.1:1939`, so
+ * every request reaches it via one of three trusted forwarders (or directly
+ * over loopback). The forwarder injects characteristic headers that we use to
+ * classify; nothing else can reach the listener, so spoofing isn't a concern.
+ *
+ *   "loopback" — direct localhost call (CLI, on-box service, dev shell).
+ *   "tailnet"  — `tailscale serve` forwarding an authed tailnet user.
+ *   "public"   — `tailscale funnel` (public-over-tailnet, unauthed) OR a
+ *                cloudflared tunnel forwarding from the public internet.
+ *
+ * Used to gate `publicExposure: "loopback"` services on the generic
+ * `/<svc>/*` dispatch (the hub's only layer-gate). Hub-owned paths (`/`,
+ * `/admin/*`, `/api/*`, `/hub/*`, `/oauth/*`, `/.well-known/*`, `/vault/*`,
+ * `/vaults`) reach all layers and rely on app-level auth (admin session
+ * cookie + 2FA, OAuth, per-service tokens) — they are NOT layer-blocked.
+ */
+export type RequestLayer = "loopback" | "tailnet" | "public";
+
+/**
+ * Classify the trust layer for an incoming request by inspecting proxy
+ * headers. Order matters: cloudflared headers come first because cloudflared
+ * could in principle be deployed alongside tailscale on the same node.
+ *
+ * Header reference (verified against tailscale serve.go on 2026-05-08):
+ *   - `Tailscale-User-Login` is set ONLY by `tailscale serve` for an authed
+ *     tailnet user. Tagged-source nodes don't get it. Funnel never sets it.
+ *   - `Tailscale-Funnel-Request: ?1` is set ONLY by Tailscale Funnel.
+ *     Mutually exclusive with `Tailscale-User-Login` (the serve.go path
+ *     returns early when funneled).
+ *   - `CF-Ray` and `CF-Connecting-IP` are set by Cloudflare's edge for
+ *     anything proxied through a cloudflared tunnel.
+ *
+ * Spoofing isn't a concern: hub binds `127.0.0.1:1939`, so external requests
+ * can't reach the listener except via these trusted forwarders. Tailscale
+ * specifically strips the same headers from incoming requests before
+ * re-injecting them, so even a malicious tailnet peer can't impersonate a
+ * different user. We could mirror that strip-on-arrival defense, but it's
+ * belt-and-braces given the bind shape.
+ *
+ * Default to "loopback" when no proxy headers are present — that's the
+ * direct-localhost case. Funnel without `Tailscale-Funnel-Request` would
+ * also fall here, but Tailscale always sets the header on funneled
+ * requests, so this branch only fires for true loopback callers.
+ */
+export function layerOf(req: Request): RequestLayer {
+  const h = req.headers;
+  if (h.get("cf-ray") !== null || h.get("cf-connecting-ip") !== null) return "public";
+  // Match the structured-header value (`?1`) rather than mere presence:
+  // serve.go only ever emits `?1`, so insisting on the canonical value keeps
+  // the classifier's intent obvious to a future reader (don't loosen this to
+  // `!== null` — Tailscale's contract is the value, not the header name).
+  // CF-Ray / CF-Connecting-IP are open-string identifiers with no canonical
+  // value to compare against, hence the presence-check above.
+  if (h.get("tailscale-funnel-request") === "?1") return "public";
+  if (h.get("tailscale-user-login") !== null) return "tailnet";
+  return "loopback";
 }
 
 /**
@@ -229,6 +289,12 @@ async function proxyToVault(req: Request, manifestPath: string): Promise<Respons
   const url = new URL(req.url);
   const match = findVaultUpstream(services, url.pathname);
   if (!match) return undefined;
+  // Layer-gate on `publicExposure: "loopback"` — hide the entry from non-
+  // loopback callers as if it doesn't exist. "allowed" / "auth-required"
+  // pass through; the service does its own auth.
+  if (effectivePublicExposure(match.entry) === "loopback" && layerOf(req) !== "loopback") {
+    return new Response("not found", { status: 404 });
+  }
   return proxyRequest(req, match.port, "vault");
 }
 
@@ -290,6 +356,14 @@ async function proxyToService(req: Request, manifestPath: string): Promise<Respo
   const url = new URL(req.url);
   const match = findServiceUpstream(services, url.pathname);
   if (!match) return undefined;
+  // Layer-gate on `publicExposure: "loopback"`. From the perspective of a
+  // tailnet/public caller, a loopback-only service must be indistinguishable
+  // from "not installed" — 404, not 403, so we don't leak the existence of
+  // the route. "allowed" / "auth-required" pass through; the service does
+  // its own auth.
+  if (effectivePublicExposure(match.entry) === "loopback" && layerOf(req) !== "loopback") {
+    return new Response("not found", { status: 404 });
+  }
   const targetPath = match.entry.stripPrefix
     ? url.pathname.slice(match.mount.length) || "/"
     : undefined;

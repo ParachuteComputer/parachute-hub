@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HUB_SVC, hubPortPath } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { findServiceUpstream, findVaultUpstream, hubFetch } from "../hub-server.ts";
+import { findServiceUpstream, findVaultUpstream, hubFetch, layerOf } from "../hub-server.ts";
 import { pidPath } from "../process-state.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
@@ -1623,6 +1623,418 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
       // /vault/* and confirming no fallthrough to the vault upstream.
       const elsewhere = await fetcher(req("/totally/not/a/vault"));
       expect(elsewhere.status).toBe(404);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+});
+
+describe("layerOf — classify trust layer from proxy headers", () => {
+  // Hub binds 127.0.0.1:1939; only trusted forwarders (cloudflared,
+  // tailscaled-serve, tailscaled-funnel) reach the listener. Spoofing isn't
+  // a concern. layerOf inspects the headers each forwarder injects.
+
+  test("no proxy headers → loopback (direct localhost call)", () => {
+    expect(layerOf(req("/"))).toBe("loopback");
+  });
+
+  test("Tailscale-User-Login → tailnet (authed via tailscale serve)", () => {
+    // Set verbatim per Tailscale docs / serve.go addTailscaleIdentityHeaders.
+    const r = req("/", { headers: { "Tailscale-User-Login": "alice@example.com" } });
+    expect(layerOf(r)).toBe("tailnet");
+  });
+
+  test("Tailscale-Funnel-Request: ?1 → public (Tailscale Funnel)", () => {
+    // Tailscale Funnel sets this header on every funneled connection per
+    // serve.go; mutually exclusive with Tailscale-User-Login.
+    const r = req("/", { headers: { "Tailscale-Funnel-Request": "?1" } });
+    expect(layerOf(r)).toBe("public");
+  });
+
+  test("CF-Ray → public (Cloudflare tunnel)", () => {
+    const r = req("/", { headers: { "CF-Ray": "abc123-DEN" } });
+    expect(layerOf(r)).toBe("public");
+  });
+
+  test("CF-Connecting-IP → public (Cloudflare tunnel — alt header shape)", () => {
+    const r = req("/", { headers: { "CF-Connecting-IP": "203.0.113.42" } });
+    expect(layerOf(r)).toBe("public");
+  });
+
+  test("Cloudflare wins over tailscale headers (cloudflared-then-serve hop, defensive)", () => {
+    // If a node ran both forwarders chained, the outer-most public layer
+    // wins. Defensive — not a recommended deployment shape.
+    const r = req("/", {
+      headers: { "CF-Ray": "abc", "Tailscale-User-Login": "alice@example.com" },
+    });
+    expect(layerOf(r)).toBe("public");
+  });
+
+  test("Tailscale-Funnel-Request wins over Tailscale-User-Login (defensive)", () => {
+    // serve.go can't actually set both — funnel returns early. Defensive.
+    const r = req("/", {
+      headers: {
+        "Tailscale-Funnel-Request": "?1",
+        "Tailscale-User-Login": "alice@example.com",
+      },
+    });
+    expect(layerOf(r)).toBe("public");
+  });
+});
+
+describe("hubFetch publicExposure layer-gate (proxyToService)", () => {
+  // The hub's only layer-gate. effectivePublicExposure(entry) === "loopback"
+  // → 404 on tailnet/public; pass through on loopback. "allowed" /
+  // "auth-required" reach all layers (service does its own auth gate).
+
+  function startUpstream(replyTag: string): { port: number; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () =>
+        new Response(JSON.stringify({ tag: replyTag }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    return { port: server.port as number, stop: () => server.stop(true) };
+  }
+
+  test("publicExposure: loopback + tailnet header → 404 (gate hides the route)", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("loopback-only");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "loopback-only",
+              port: upstream.port,
+              paths: ["/loopback-only"],
+              health: "/loopback-only/health",
+              version: "0.1.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const r = req("/loopback-only/anything", {
+        headers: { "Tailscale-User-Login": "alice@example.com" },
+      });
+      const res = await fetcher(r);
+      expect(res.status).toBe(404);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("publicExposure: loopback + public header → 404 (gate hides the route)", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("loopback-only");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "loopback-only",
+              port: upstream.port,
+              paths: ["/loopback-only"],
+              health: "/loopback-only/health",
+              version: "0.1.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const r = req("/loopback-only/anything", { headers: { "CF-Ray": "abc123" } });
+      const res = await fetcher(r);
+      expect(res.status).toBe(404);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("publicExposure: loopback + no headers → reaches upstream (loopback layer)", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("loopback-only");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "loopback-only",
+              port: upstream.port,
+              paths: ["/loopback-only"],
+              health: "/loopback-only/health",
+              version: "0.1.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/loopback-only/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string };
+      expect(body.tag).toBe("loopback-only");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("publicExposure: allowed + tailnet header → reaches upstream (no gate)", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("allowed");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "allowed",
+              port: upstream.port,
+              paths: ["/allowed"],
+              health: "/allowed/health",
+              version: "0.1.0",
+              publicExposure: "allowed",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const r = req("/allowed/health", {
+        headers: { "Tailscale-User-Login": "alice@example.com" },
+      });
+      const res = await fetcher(r);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string };
+      expect(body.tag).toBe("allowed");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("publicExposure: auth-required + public header → reaches upstream (service self-gates)", async () => {
+    // The service does its own auth check; the hub passes through.
+    const h = makeHarness();
+    const upstream = startUpstream("auth-required");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "auth-required",
+              port: upstream.port,
+              paths: ["/auth-required"],
+              health: "/auth-required/health",
+              version: "0.1.0",
+              publicExposure: "auth-required",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const r = req("/auth-required/health", { headers: { "CF-Ray": "abc123" } });
+      const res = await fetcher(r);
+      expect(res.status).toBe(200);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("scribe (kind=api, hasAuth=false default) → loopback gate fires from public layer", async () => {
+    // Spec-derived default for scribe is "auth-required" (NOT loopback —
+    // see effectivePublicExposure in service-spec.ts). So the hub passes
+    // through; this test confirms the spec-default isn't accidentally
+    // loopback-gating well-known services.
+    const h = makeHarness();
+    const upstream = startUpstream("scribe");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+              // publicExposure absent — exercises spec-derived default
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const r = req("/scribe/health", { headers: { "CF-Ray": "abc123" } });
+      const res = await fetcher(r);
+      // auth-required → pass through; service does its own gate.
+      expect(res.status).toBe(200);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("unknown third-party service (no SERVICE_SPECS row, no publicExposure) → defaults to allowed, reaches public layer", async () => {
+    // Third-party modules installed via `module.json` aren't in
+    // FIRST_PARTY_FALLBACKS, so effectivePublicExposure has no spec to
+    // derive from. The contract documented on effectivePublicExposure is
+    // "default to 'allowed'", which means the gate must NOT fire from the
+    // public layer for an unknown service that didn't opt into a stricter
+    // exposure. Regression-guards anyone tightening the default to
+    // "loopback" without realizing it would silently 404 every
+    // third-party module on tailnet/public.
+    const h = makeHarness();
+    const upstream = startUpstream("unknown-thirdparty");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-unknown-thirdparty",
+              port: upstream.port,
+              paths: ["/parachute-unknown-thirdparty"],
+              health: "/parachute-unknown-thirdparty/health",
+              version: "0.1.0",
+              // publicExposure absent — exercises the unknown-spec default path
+              // kind absent — no SERVICE_SPECS / FIRST_PARTY_FALLBACKS row matches
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const r = req("/parachute-unknown-thirdparty/health", {
+        headers: { "CF-Ray": "abc123" },
+      });
+      const res = await fetcher(r);
+      // Default "allowed" → no gate. Forwarded to upstream.
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string };
+      expect(body.tag).toBe("unknown-thirdparty");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+});
+
+describe("hubFetch publicExposure layer-gate (proxyToVault)", () => {
+  // Same gate, applied to /vault/<name>/* dispatch. A vault entry that
+  // declares publicExposure: "loopback" is hidden from non-loopback callers.
+
+  function startVaultUpstream(replyTag: string): { port: number; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () =>
+        new Response(JSON.stringify({ tag: replyTag }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    return { port: server.port as number, stop: () => server.stop(true) };
+  }
+
+  test("vault publicExposure: loopback + tailnet header → 404", async () => {
+    const h = makeHarness();
+    const upstream = startVaultUpstream("vault-private");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-private",
+              port: upstream.port,
+              paths: ["/vault/private"],
+              health: "/vault/private/health",
+              version: "0.4.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const r = req("/vault/private/health", {
+        headers: { "Tailscale-User-Login": "alice@example.com" },
+      });
+      const res = await fetcher(r);
+      expect(res.status).toBe(404);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("vault publicExposure: loopback + no headers → reaches vault backend", async () => {
+    const h = makeHarness();
+    const upstream = startVaultUpstream("vault-private");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-private",
+              port: upstream.port,
+              paths: ["/vault/private"],
+              health: "/vault/private/health",
+              version: "0.4.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/vault/private/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string };
+      expect(body.tag).toBe("vault-private");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("vault publicExposure: allowed + tailnet header → reaches backend", async () => {
+    const h = makeHarness();
+    const upstream = startVaultUpstream("vault-public");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+              publicExposure: "allowed",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const r = req("/vault/default/health", {
+        headers: { "Tailscale-User-Login": "alice@example.com" },
+      });
+      const res = await fetcher(r);
+      expect(res.status).toBe(200);
     } finally {
       upstream.stop();
       h.cleanup();
