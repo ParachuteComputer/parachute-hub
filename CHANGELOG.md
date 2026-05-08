@@ -2,6 +2,24 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.6-rc.1] - 2026-05-08
+
+Bundled fix for two `proxyToService` / `proxyToVault` dispatch edge cases that hub#187's tests missed. Both surfaced during operator diagnostics on Aaron's box (2026-05-08); both make the hub silently 404 a real on-box backend.
+
+### Fixed
+
+- **Trailing-slash mount paths now match sub-paths in `findServiceUpstream` / `findVaultUpstream` (closes #197).** A services.json entry written with `paths: ["/notes/"]` (trailing slash) used to match only the exact pathname `/notes/` and never any sub-path, because `pathname.startsWith("/notes//")` is always false (URLs don't have double slashes). Operator-visible symptom on Aaron's box: notes blank screen — the SPA shell loaded at `/notes/` but every `/notes/assets/*.js` request 404'd from hub. Fix: normalize trailing slashes (`path.replace(/\/+$/, "") || "/"`) before the equality + prefix check, in both matchers. The `|| "/"` branch keeps a bare-root mount `"/"` stable rather than collapsing to the empty string. The reported `match.mount` is the normalized form so callers computing `pathname.slice(match.mount.length)` (the stripPrefix path) get a consistent answer regardless of how the entry was written on disk.
+- **`proxyToService` / `proxyToVault` honor `stripPrefix` from `FIRST_PARTY_FALLBACKS` when the on-disk entry omits it (closes #196).** Scribe v0.4.0 doesn't write `stripPrefix: true` to its services.json entry — the declaration only lives in hub's `SCRIBE_FALLBACK.manifest.stripPrefix` (`src/service-spec.ts`). Pre-#187 this didn't matter because the per-service `tailscale serve` plan baked the path into the target URL (`/scribe → http://127.0.0.1:1943/scribe`); post-#187 routing went through hub which wasn't consulting the fallback registry. Result: `/scribe/health` got forwarded verbatim to scribe, scribe served bare paths and 404'd. Fix: new `stripPrefixFor(entry)` helper consulted by both proxies — explicit on-entry wins, otherwise consult `FIRST_PARTY_FALLBACKS` keyed by short name (same shape as how `effectivePublicExposure` already handles fallback derivation in service-spec.ts), default `false` (preserving existing keep-prefix default for unknown / third-party services). Scribe-side companion is parachute-scribe#40 (canonical-port-on-boot regression — different diagnostic, same operator). `proxyToVault` gets the same shape for symmetry; no first-party vault fallback declares `stripPrefix` today, so this is a no-op in practice.
+
+### Added
+
+- **Tests: `findServiceUpstream` / `findVaultUpstream` trailing-slash regression coverage (`src/__tests__/hub-server.test.ts`).** Two unit tests pin the new normalization (one each for service and vault matchers), plus a hubFetch end-to-end test that drives a `/notes/assets/index-XXX.js` request through a `paths: ["/notes/"]` entry to a fixture upstream and asserts the path is forwarded verbatim. A bare-root `paths: ["/"]` test pins the `|| "/"` branch's stability without changing the existing exact-match-only contract for catchall mounts.
+- **Tests: hubFetch end-to-end coverage for the FIRST_PARTY_FALLBACKS stripPrefix derivation (`src/__tests__/hub-server.test.ts`).** Three tests cover the three precedence rungs: (1) `parachute-scribe` entry without `stripPrefix` resolves to the SCRIBE_FALLBACK's `stripPrefix: true` and the backend sees the bare `/health` path; (2) explicit `stripPrefix: false` on the entry overrides the fallback (full path forwarded); (3) third-party service whose manifestName isn't in FIRST_PARTY_FALLBACKS gets the default keep-prefix behavior (no accidental strip).
+
+### Why this lands now
+
+Both edge cases broke real operator setups today during diagnostics on Aaron's box. Filed as #196 / #197 alongside two further tactical issues (#194 `notes-serve` `Bun.resolveSync` from hub cwd, #195 port collision validation) — those are bigger fixes / separate PRs. This bundle sticks to the two regressions whose root cause is hub#187 missing edge cases in proxy dispatch, so the fix is small and surgical.
+
 ## [0.5.5] - 2026-05-08
 
 Promotes the 0.5.5-rc cycle (#187 layer-aware proxy + #188 admin-login rate-limit + #191 2FA-not-enrolled warning) to stable, plus a small content-only / formatting-only housekeeping bundle. Skips the `-rc.N` step per the doc-only-changes rule (no semantic code changes since rc.2). No intermediate RCs were published to npm during the cycle; this is the first publish to `@latest`.

@@ -746,6 +746,31 @@ describe("findVaultUpstream (#144)", () => {
     expect(m?.mount).toBe("/vault/inner");
     expect(m?.port).toBe(1941);
   });
+
+  // #197: a services.json entry written with a trailing slash on the mount
+  // path (e.g. `paths: ["/vault/default/"]`) used to only match the exact
+  // pathname `/vault/default/` and silently drop every sub-path because
+  // `pathname.startsWith("/vault/default//")` is always false. Normalize
+  // trailing slashes before comparison so sub-paths route correctly.
+  test("trailing-slash mount path matches sub-paths (#197)", () => {
+    const trailing: ServiceEntry = {
+      name: "parachute-vault",
+      port: 1940,
+      paths: ["/vault/default/"],
+      health: "/vault/default/health",
+      version: "0.4.0",
+    };
+    const exact = findVaultUpstream([trailing], "/vault/default");
+    expect(exact?.port).toBe(1940);
+    // mount is reported normalized (trailing slash stripped) so callers
+    // computing `pathname.slice(match.mount.length)` get the same answer
+    // regardless of how the entry was written on disk.
+    expect(exact?.mount).toBe("/vault/default");
+
+    const sub = findVaultUpstream([trailing], "/vault/default/notes/abc");
+    expect(sub?.port).toBe(1940);
+    expect(sub?.mount).toBe("/vault/default");
+  });
 });
 
 describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
@@ -1143,6 +1168,62 @@ describe("findServiceUpstream (#182)", () => {
     ];
     expect(findServiceUpstream(services, "/scribe-admin")).toBeUndefined();
     expect(findServiceUpstream(services, "/scribe-admin/foo")).toBeUndefined();
+  });
+
+  // #197: a services.json entry written with a trailing slash on the mount
+  // path (e.g. `paths: ["/notes/"]`) used to only match the exact pathname
+  // `/notes/` and silently drop every sub-path because
+  // `pathname.startsWith("/notes//")` is always false. Notes blank-screen
+  // on Aaron's box (2026-05-08) was the operator-visible symptom: the SPA
+  // shell loaded but every `/notes/assets/*.js` 404'd. Normalize trailing
+  // slashes before comparison.
+  test("trailing-slash mount path matches sub-paths (#197)", () => {
+    const services: ServiceEntry[] = [
+      {
+        name: "parachute-notes",
+        port: 1942,
+        paths: ["/notes/"],
+        health: "/notes/health",
+        version: "0.1.0",
+      },
+    ];
+    const exact = findServiceUpstream(services, "/notes");
+    expect(exact?.port).toBe(1942);
+    // mount is reported normalized (trailing slash stripped) so callers
+    // computing `pathname.slice(match.mount.length)` (the stripPrefix path)
+    // get the same answer regardless of how the entry was written on disk.
+    expect(exact?.mount).toBe("/notes");
+
+    const asset = findServiceUpstream(services, "/notes/assets/index-XXX.js");
+    expect(asset?.port).toBe(1942);
+    expect(asset?.mount).toBe("/notes");
+    expect(asset?.entry.name).toBe("parachute-notes");
+  });
+
+  test('mount path "/" survives normalization without collapsing to empty string (#197)', () => {
+    // Edge case: `"/".replace(/\/+$/, "")` yields the empty string; the
+    // `|| "/"` branch keeps it stable so an exact-`/` request still matches.
+    // Pre-fix this branch wasn't reachable (legacy `paths: ["/"]` entries
+    // are already remapped to `/<shortname>` in-memory by services-manifest;
+    // the test pins the lookup-level behavior so a future regression in the
+    // remap layer doesn't silently 404 every catchall request).
+    //
+    // Sub-path matching for `/`-mounted entries is intentionally not asserted
+    // here — that would change the existing "exact match only" behavior
+    // captured in `pathname === path || pathname.startsWith(path + '/')`,
+    // which never matched `/anything` when `path === "/"` (since `"//"` is
+    // not a real URL prefix).
+    const services: ServiceEntry[] = [
+      {
+        name: "catchall",
+        port: 1950,
+        paths: ["/"],
+        health: "/health",
+        version: "0.1.0",
+      },
+    ];
+    expect(findServiceUpstream(services, "/")?.port).toBe(1950);
+    expect(findServiceUpstream(services, "/")?.mount).toBe("/");
   });
 });
 
@@ -1623,6 +1704,160 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
       // /vault/* and confirming no fallthrough to the vault upstream.
       const elsewhere = await fetcher(req("/totally/not/a/vault"));
       expect(elsewhere.status).toBe(404);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("trailing-slash entry routes sub-paths end-to-end (#197)", async () => {
+    // Operator-symptom regression: notes blank-screen on Aaron's box
+    // (2026-05-08). services.json had `paths: ["/notes/"]` (trailing slash),
+    // which used to make the matcher return undefined for every sub-path
+    // because `pathname.startsWith("/notes//")` is always false. Hub
+    // returned 404 for `/notes/assets/*.js` even though the SPA shell
+    // loaded fine, breaking the page silently.
+    const h = makeHarness();
+    const upstream = startUpstream("notes");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-notes",
+              port: upstream.port,
+              paths: ["/notes/"],
+              health: "/notes/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/notes/assets/index-XXX.js"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string; pathname: string };
+      expect(body.tag).toBe("notes");
+      // Path is forwarded verbatim — no stripPrefix on the notes entry, so
+      // backend sees the full mount-prefixed path.
+      expect(body.pathname).toBe("/notes/assets/index-XXX.js");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("FIRST_PARTY_FALLBACKS supplies stripPrefix when entry omits it (#196)", async () => {
+    // Operator-symptom regression: scribe `/scribe/health` 404 on Aaron's
+    // box (2026-05-08). Scribe v0.4.0 doesn't write `stripPrefix: true` to
+    // its services.json entry; the declaration only lives in hub's
+    // SCRIBE_FALLBACK manifest. Pre-#187 this didn't matter because the
+    // per-service `tailscale serve` plan baked the path into the target
+    // URL; post-#187 routing went through hub which wasn't consulting the
+    // fallback registry. Result: hub forwarded `/scribe/health` verbatim
+    // to scribe at :1943, scribe served bare paths and 404'd. Fix: hub-
+    // side fallback merge in `stripPrefixFor`.
+    //
+    // Use a `parachute-scribe` manifestName so `shortNameForManifest`
+    // resolves to "scribe" → SCRIBE_FALLBACK (which declares
+    // `stripPrefix: true`). The entry itself omits stripPrefix to mirror
+    // what scribe v0.4.0 actually writes today.
+    const h = makeHarness();
+    const upstream = startUpstream("scribe");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.4.0",
+              // stripPrefix intentionally omitted — must be derived from
+              // FIRST_PARTY_FALLBACKS.scribe.manifest.stripPrefix.
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string; pathname: string };
+      expect(body.tag).toBe("scribe");
+      // The mount prefix is stripped — backend sees the bare `/health`
+      // route that scribe v0.4.0 actually serves.
+      expect(body.pathname).toBe("/health");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("explicit stripPrefix:false on entry overrides FIRST_PARTY_FALLBACKS (#196)", async () => {
+    // Explicit-on-entry must win, even when the fallback would default to
+    // stripping. Documents the precedence ordering: explicit > fallback >
+    // false. Without this, an operator who deliberately writes
+    // `"stripPrefix": false` couldn't opt out of the fallback's strip.
+    const h = makeHarness();
+    const upstream = startUpstream("scribe");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.4.0",
+              stripPrefix: false,
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { pathname: string };
+      // Explicit false wins — full path forwarded.
+      expect(body.pathname).toBe("/scribe/health");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("third-party service without fallback does not strip (#196)", async () => {
+    // Default behavior contract: a service whose manifestName isn't in
+    // FIRST_PARTY_FALLBACKS and whose entry omits stripPrefix gets the
+    // pre-#196 keep-prefix behavior. No accidental strip on third-party
+    // installs.
+    const h = makeHarness();
+    const upstream = startUpstream("third-party");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "third-party-service",
+              port: upstream.port,
+              paths: ["/third"],
+              health: "/third/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/third/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { pathname: string };
+      expect(body.pathname).toBe("/third/health");
     } finally {
       upstream.stop();
       h.cleanup();
