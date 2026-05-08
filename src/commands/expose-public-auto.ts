@@ -30,8 +30,8 @@
 
 import { DEFAULT_CLOUDFLARED_HOME } from "../cloudflare/detect.ts";
 import {
-  type ProviderAvailability,
   type DetectProvidersOpts,
+  type ProviderAvailability,
   detectProviders,
   isCloudflareReady,
   isTailnetReady,
@@ -143,9 +143,7 @@ function reportCloudflareNeedsDomain(r: Resolved): number {
   r.log("Re-run with the hostname:");
   r.log("  parachute expose public --cloudflare --domain vault.example.com");
   r.log("");
-  r.log(
-    "The hostname's apex domain must already be a zone on your Cloudflare account.",
-  );
+  r.log("The hostname's apex domain must already be a zone on your Cloudflare account.");
   return 1;
 }
 
@@ -154,9 +152,7 @@ function reportCloudflareNeedsDomain(r: Resolved): number {
  * (`--tailnet` / `--cloudflare`) was supplied AND we're not in a TTY (the TTY
  * path runs `expose-interactive.ts` instead).
  */
-export async function exposePublicAutoPick(
-  opts: ExposePublicAutoOpts = {},
-): Promise<number> {
+export async function exposePublicAutoPick(opts: ExposePublicAutoOpts = {}): Promise<number> {
   const r = resolve(opts);
   const availability = await r.detectProvidersImpl({ cloudflaredHome: r.cloudflaredHome });
   const tsReady = isTailnetReady(availability);
