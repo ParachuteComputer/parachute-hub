@@ -511,6 +511,107 @@ describe("exposeCloudflareUp", () => {
       env.cleanup();
     }
   });
+
+  // 2FA-enrollment warning (#186). The cloudflare path is always public —
+  // every successful bringup makes /admin/login reachable on the open
+  // internet, where 2FA is the primary defense beyond #188's rate-limit floor.
+  describe("2FA-enrollment warning", () => {
+    test("not enrolled → warning fires after the success block", async () => {
+      const env = makeEnv();
+      try {
+        const uuid = "cccccccc-0000-0000-0000-000000000003";
+        const { runner } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+          { code: 0, stdout: "[]", stderr: "" },
+          {
+            code: 0,
+            stdout: `Tunnel credentials written to ${env.cloudflaredHome}/${uuid}.json.\nCreated tunnel parachute with id ${uuid}\n`,
+            stderr: "",
+          },
+          { code: 0, stdout: "", stderr: "" },
+        ]);
+        const { spawner } = fakeSpawner(42100);
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("vault.example.com", {
+          runner,
+          spawner,
+          alive: () => false,
+          kill: () => {},
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          // No password, no 2FA — fully wide open. The warning should still
+          // fire; password-recovery copy already lives in `printAuthGuidance`.
+          vaultAuthStatus: {
+            hasOwnerPassword: false,
+            hasTotp: false,
+            tokenCount: 0,
+            vaultNames: [],
+          },
+        });
+
+        expect(code).toBe(0);
+        const joined = logs.join("\n");
+        expect(joined).toContain("2FA is not enrolled");
+        expect(joined).toContain("https://vault.example.com/admin/login");
+        expect(joined).toContain("parachute auth 2fa enroll");
+      } finally {
+        env.cleanup();
+      }
+    });
+
+    test("enrolled → warning suppressed (no '2FA is not enrolled' line)", async () => {
+      const env = makeEnv();
+      try {
+        const uuid = "dddddddd-0000-0000-0000-000000000004";
+        const { runner } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+          { code: 0, stdout: "[]", stderr: "" },
+          {
+            code: 0,
+            stdout: `Tunnel credentials written to ${env.cloudflaredHome}/${uuid}.json.\nCreated tunnel parachute with id ${uuid}\n`,
+            stderr: "",
+          },
+          { code: 0, stdout: "", stderr: "" },
+        ]);
+        const { spawner } = fakeSpawner(42101);
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("vault.example.com", {
+          runner,
+          spawner,
+          alive: () => false,
+          kill: () => {},
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          vaultAuthStatus: {
+            hasOwnerPassword: true,
+            hasTotp: true,
+            tokenCount: 1,
+            vaultNames: ["default"],
+          },
+        });
+
+        expect(code).toBe(0);
+        const joined = logs.join("\n");
+        expect(joined).not.toContain("2FA is not enrolled");
+        // The existing `printAuthGuidance` 2FA-recommend bullet is unrelated
+        // to the new contextual warning and stays in place — assert it on a
+        // shape that doesn't collide with the warning text.
+        expect(joined).toContain("(recommended) TOTP + backup codes");
+      } finally {
+        env.cleanup();
+      }
+    });
+  });
 });
 
 describe("exposeCloudflareOff", () => {

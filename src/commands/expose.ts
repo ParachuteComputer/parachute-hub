@@ -24,6 +24,7 @@ import { type ServiceEntry, readManifest } from "../services-manifest.ts";
 import { type ServeEntry, bringupCommand, teardownCommand } from "../tailscale/commands.ts";
 import { getFqdn, isTailscaleInstalled } from "../tailscale/detect.ts";
 import { type Runner, defaultRunner } from "../tailscale/run.ts";
+import type { VaultAuthStatus } from "../vault/auth-status.ts";
 import {
   WELL_KNOWN_DIR,
   WELL_KNOWN_MOUNT,
@@ -32,6 +33,7 @@ import {
   shortName,
   writeWellKnownFile,
 } from "../well-known.ts";
+import { printPublic2FAWarning } from "./expose-2fa-warning.ts";
 import { restart } from "./lifecycle.ts";
 
 /**
@@ -98,6 +100,18 @@ export interface ExposeOpts {
    * spawning real child processes.
    */
   restartService?: (short: string) => Promise<number>;
+  /**
+   * Override `~/.parachute/vault` for the 2FA-enrollment probe on the public
+   * (Funnel) layer. Tests point at a tmp dir; production omits and the probe
+   * defaults to the resolved vault home. (#186)
+   */
+  vaultHome?: string;
+  /**
+   * Pre-computed vault auth status, primarily for tests. When set,
+   * `printPublic2FAWarning` consults this instead of reading
+   * `<vaultHome>/config.yaml` from disk. (#186)
+   */
+  vaultAuthStatus?: VaultAuthStatus;
 }
 
 /**
@@ -356,6 +370,20 @@ export async function exposeUp(layer: ExposeLayer, opts: ExposeOpts = {}): Promi
   }
   log(`  Discovery: ${canonicalOrigin}${WELL_KNOWN_MOUNT}`);
   log(`  OAuth issuer: ${hubOrigin}`);
+
+  // 2FA-enrollment warning, public-layer only. /admin/login became reachable
+  // from every layer when 0.5.3-rc.1 collapsed the access-control matrix into
+  // the hub; on Funnel that means the open internet, where 2FA is the
+  // defense beyond #188's rate-limit floor. Tailnet exposure stays
+  // tailscale-authed at the ingress so the warning is moot there. See #186.
+  if (layer === "public") {
+    printPublic2FAWarning({
+      log,
+      publicUrl: canonicalOrigin,
+      ...(opts.vaultHome !== undefined ? { vaultHome: opts.vaultHome } : {}),
+      ...(opts.vaultAuthStatus !== undefined ? { status: opts.vaultAuthStatus } : {}),
+    });
+  }
 
   // Auto-restart services that cache the hub origin. Aaron hit this on launch
   // day: after `expose public` first-run, vault kept its stale (loopback)

@@ -30,6 +30,8 @@ import { SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type AliveFn, defaultAlive } from "../process-state.ts";
 import { readManifest } from "../services-manifest.ts";
 import { type Runner, defaultRunner } from "../tailscale/run.ts";
+import type { VaultAuthStatus } from "../vault/auth-status.ts";
+import { printPublic2FAWarning } from "./expose-2fa-warning.ts";
 
 const AUTH_DOC_URL =
   "https://github.com/ParachuteComputer/parachute-vault/blob/main/docs/auth-model.md";
@@ -106,6 +108,18 @@ export interface ExposeCloudflareOpts {
   /** Override `~/.cloudflared` for tests and `$HOME`-free environments. */
   cloudflaredHome?: string;
   now?: () => Date;
+  /**
+   * Override `~/.parachute/vault` for the 2FA-enrollment probe. Tests
+   * point at a tmp dir; production omits and the probe defaults to the
+   * resolved vault home. (#186)
+   */
+  vaultHome?: string;
+  /**
+   * Pre-computed vault auth status, primarily for tests. When set,
+   * `printPublic2FAWarning` consults this instead of reading
+   * `<vaultHome>/config.yaml` from disk. (#186)
+   */
+  vaultAuthStatus?: VaultAuthStatus;
 }
 
 interface Resolved {
@@ -121,6 +135,8 @@ interface Resolved {
   logPath: string;
   cloudflaredHome: string;
   now: () => Date;
+  vaultHome: string | undefined;
+  vaultAuthStatus: VaultAuthStatus | undefined;
 }
 
 function resolve(opts: ExposeCloudflareOpts): Resolved {
@@ -139,6 +155,8 @@ function resolve(opts: ExposeCloudflareOpts): Resolved {
     logPath: opts.logPath ?? paths.logPath,
     cloudflaredHome: opts.cloudflaredHome ?? DEFAULT_CLOUDFLARED_HOME,
     now: opts.now ?? (() => new Date()),
+    vaultHome: opts.vaultHome,
+    vaultAuthStatus: opts.vaultAuthStatus,
   };
 }
 
@@ -313,6 +331,15 @@ export async function exposeCloudflareUp(
   r.log("Point a claude.ai / ChatGPT connector at:");
   r.log(`  ${vaultUrl}`);
   printAuthGuidance(r.log, vaultUrl);
+  // 2FA-enrollment warning when /admin/login is now reachable on the public
+  // internet but the operator hasn't enrolled TOTP. Cloudflare exposure is
+  // always public; tailnet/funnel mirrors this in `expose.ts`. See #186.
+  printPublic2FAWarning({
+    log: r.log,
+    publicUrl: baseUrl,
+    ...(r.vaultHome !== undefined ? { vaultHome: r.vaultHome } : {}),
+    ...(r.vaultAuthStatus !== undefined ? { status: r.vaultAuthStatus } : {}),
+  });
   return 0;
 }
 
