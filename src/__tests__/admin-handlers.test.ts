@@ -13,6 +13,7 @@ import {
 import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import type { ConfigSchema, ModuleManifest } from "../module-manifest.ts";
+import { __resetForTests as resetRateLimit } from "../rate-limit.ts";
 import type { ServicesManifest } from "../services-manifest.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession, findSession } from "../sessions.ts";
 import { createUser } from "../users.ts";
@@ -106,6 +107,10 @@ function fakeReadManifest(installDir: string): Promise<ModuleManifest | null> {
 let harness: Harness;
 beforeEach(() => {
   harness = makeHarness();
+  // Per-test rate-limit state — login tests share the UNKNOWN_IP sentinel
+  // bucket since they don't set CF-Connecting-IP, so without a reset the
+  // 6th test in this file would 429 spuriously.
+  resetRateLimit();
 });
 afterEach(() => {
   harness.cleanup();
@@ -221,6 +226,93 @@ describe("handleAdminLoginPost", () => {
     const res = await handleAdminLoginPost(harness.db, req);
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/admin/config");
+  });
+
+  // hub#185 — per-IP rate-limit (5 attempts / 15 min) on POST /admin/login.
+  test("6 rapid POSTs from same IP get 200/401×4/429 and the 429 carries Retry-After", async () => {
+    await createUser(harness.db, "admin", "correct-pw");
+    const buildReq = (password: string) => {
+      const { body, headers } = formBody({
+        [CSRF_FIELD_NAME]: TEST_CSRF,
+        username: "admin",
+        password,
+        next: "/admin/config",
+      });
+      return new Request("http://hub.test/admin/login", {
+        method: "POST",
+        headers: { ...headers, cookie: CSRF_COOKIE, "cf-connecting-ip": "203.0.113.42" },
+        body,
+      });
+    };
+    // First attempt: correct password → 302. Counts as attempt #1.
+    const first = await handleAdminLoginPost(harness.db, buildReq("correct-pw"));
+    expect(first.status).toBe(302);
+    // Attempts 2–5: wrong password → 401 each.
+    for (let i = 2; i <= 5; i++) {
+      const r = await handleAdminLoginPost(harness.db, buildReq("wrong"));
+      expect(r.status).toBe(401);
+    }
+    // Attempt 6: rate-limit fires before credential check → 429 + Retry-After.
+    const denied = await handleAdminLoginPost(harness.db, buildReq("wrong"));
+    expect(denied.status).toBe(429);
+    const retryAfter = denied.headers.get("retry-after");
+    expect(retryAfter).not.toBeNull();
+    const seconds = Number(retryAfter);
+    expect(seconds).toBeGreaterThan(0);
+    // Window is 15 min = 900s, so retry-after sits in (0, 900].
+    expect(seconds).toBeLessThanOrEqual(900);
+  });
+
+  test("rate-limit is per-IP: a different IP can still log in after another's bucket fills", async () => {
+    await createUser(harness.db, "admin", "pw");
+    const buildReq = (ip: string, password: string) => {
+      const { body, headers } = formBody({
+        [CSRF_FIELD_NAME]: TEST_CSRF,
+        username: "admin",
+        password,
+        next: "/admin/config",
+      });
+      return new Request("http://hub.test/admin/login", {
+        method: "POST",
+        headers: { ...headers, cookie: CSRF_COOKIE, "cf-connecting-ip": ip },
+        body,
+      });
+    };
+    // Exhaust ip-a's bucket with 5 wrong-password attempts, then confirm 429.
+    for (let i = 0; i < 5; i++) {
+      await handleAdminLoginPost(harness.db, buildReq("203.0.113.7", "wrong"));
+    }
+    const aDenied = await handleAdminLoginPost(harness.db, buildReq("203.0.113.7", "wrong"));
+    expect(aDenied.status).toBe(429);
+    // Different IP: fresh bucket, correct credentials → 302.
+    const bOk = await handleAdminLoginPost(harness.db, buildReq("198.51.100.99", "pw"));
+    expect(bOk.status).toBe(302);
+  });
+
+  test("rate-limit fires before credential check (denied request never touches DB)", async () => {
+    // No user exists in the harness DB. First 5 attempts should be 401
+    // ("Invalid credentials" — no such user). 6th should be 429 with the
+    // rate-limit body, NOT a credential-failure body.
+    const buildReq = () => {
+      const { body, headers } = formBody({
+        [CSRF_FIELD_NAME]: TEST_CSRF,
+        username: "ghost",
+        password: "x",
+        next: "/admin/config",
+      });
+      return new Request("http://hub.test/admin/login", {
+        method: "POST",
+        headers: { ...headers, cookie: CSRF_COOKIE, "cf-connecting-ip": "203.0.113.99" },
+        body,
+      });
+    };
+    for (let i = 0; i < 5; i++) {
+      const r = await handleAdminLoginPost(harness.db, buildReq());
+      expect(r.status).toBe(401);
+    }
+    const denied = await handleAdminLoginPost(harness.db, buildReq());
+    expect(denied.status).toBe(429);
+    expect(await denied.text()).toContain("Too many login attempts");
   });
 });
 

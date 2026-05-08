@@ -31,6 +31,7 @@ import { restart as lifecycleRestart } from "./commands/lifecycle.ts";
 import { CONFIG_DIR } from "./config.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import type { ModuleManifest } from "./module-manifest.ts";
+import { checkAndRecord, clientIpFromRequest } from "./rate-limit.ts";
 import {
   type ServicesManifest,
   readManifest as readServicesManifest,
@@ -106,7 +107,11 @@ export function handleAdminLoginGet(_db: Database, req: Request): Response {
   return htmlResponse(renderAdminLogin({ next, csrfToken: csrf.token }), 200, extra);
 }
 
-export async function handleAdminLoginPost(db: Database, req: Request): Promise<Response> {
+export async function handleAdminLoginPost(
+  db: Database,
+  req: Request,
+  deps: AdminLoginDeps = {},
+): Promise<Response> {
   const form = await req.formData();
   const formCsrf = form.get(CSRF_FIELD_NAME);
   if (!verifyCsrfToken(req, typeof formCsrf === "string" ? formCsrf : null)) {
@@ -116,6 +121,24 @@ export async function handleAdminLoginPost(db: Database, req: Request): Promise<
         message: "The form's CSRF token did not match. Reload the page and try again.",
       }),
       400,
+    );
+  }
+  // Rate-limit gate fires *after* CSRF (so a junk cross-site POST doesn't
+  // burn a bucket slot for the victim's IP) but *before* credential check.
+  // Every legitimate login attempt — wrong password, missing user, eventually
+  // failed-2FA (#186) — counts toward the same bucket so an attacker can't
+  // partition the cooldown across stages.
+  const clientIp = clientIpFromRequest(req);
+  const now = deps.now ? deps.now() : new Date();
+  const gate = checkAndRecord(clientIp, now);
+  if (!gate.allowed) {
+    return htmlResponse(
+      renderAdminError({
+        title: "Too many login attempts",
+        message: `Too many login attempts from this IP. Try again in ${gate.retryAfterSeconds ?? 1} seconds.`,
+      }),
+      429,
+      { "retry-after": String(gate.retryAfterSeconds ?? 1) },
     );
   }
   const username = String(form.get("username") ?? "");
@@ -145,6 +168,17 @@ export async function handleAdminLoginPost(db: Database, req: Request): Promise<
   const session = createSession(db, { userId: user.id });
   const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
   return redirect(next, { "set-cookie": cookie });
+}
+
+/**
+ * Test-injection seam for `handleAdminLoginPost`. Production callers omit
+ * `deps`; tests pass a deterministic clock so the rate-limit assertions
+ * don't race wall-clock time. Kept narrow — login doesn't share the wider
+ * `AdminDeps` because it doesn't load services / module manifests.
+ */
+export interface AdminLoginDeps {
+  /** Test seam — defaults to real clock. */
+  now?: () => Date;
 }
 
 // --- /admin/logout ---------------------------------------------------------
