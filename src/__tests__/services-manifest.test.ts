@@ -432,6 +432,137 @@ describe("services-manifest", () => {
       }
     });
   });
+
+  // Write-time port collision rejection (hub#205). The read-time gate above
+  // catches duplicate ports on the next `readManifest`, but without a
+  // matching write-side check `upsertService` happily writes a corrupt
+  // manifest to disk and only the next read surfaces the fault. A buggy
+  // service boot calling `upsertService({ name: "agent", port: 1944 })`
+  // while scribe is already at 1944 must fail before `writeManifest` runs.
+  // Same multi-vault carve-out applies.
+  describe("upsertService duplicate-port rejection (hub#205)", () => {
+    const scribe: ServiceEntry = {
+      name: "parachute-scribe",
+      port: 1944,
+      paths: ["/scribe"],
+      health: "/scribe/health",
+      version: "0.4.0",
+    };
+    const agent: ServiceEntry = {
+      name: "agent",
+      port: 1944,
+      paths: ["/agent"],
+      health: "/agent/health",
+      version: "0.1.0",
+    };
+
+    test("succeeds when adding a service at a non-conflicting port", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(scribe, path);
+        const m = upsertService({ ...agent, port: 1945 }, path);
+        expect(m.services).toHaveLength(2);
+        expect(m.services.map((s) => s.port).sort()).toEqual([1944, 1945]);
+        // And it actually wrote: a fresh read sees both rows.
+        expect(readManifest(path).services).toHaveLength(2);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("throws ServicesManifestError when adding a service at a port already claimed by a non-vault service", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(scribe, path);
+        expect(() => upsertService(agent, path)).toThrow(ServicesManifestError);
+        // Error names the colliding port and both services so an operator
+        // scanning logs knows which two rows to reconcile.
+        expect(() => upsertService(agent, path)).toThrow(/duplicate port 1944/);
+        expect(() => upsertService(agent, path)).toThrow(/parachute-scribe/);
+        expect(() => upsertService(agent, path)).toThrow(/agent/);
+        // Crucially: services.json was NOT corrupted on the failed write.
+        // The pre-existing row stays, and the agent row never lands.
+        const m = readManifest(path);
+        expect(m.services).toHaveLength(1);
+        expect(m.services[0]?.name).toBe("parachute-scribe");
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("succeeds when adding a vault row at a port already used by another vault row (multi-vault carve-out)", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        const vaultDefault: ServiceEntry = {
+          name: "parachute-vault-default",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/vault/default/health",
+          version: "0.4.0",
+        };
+        const vaultTechne: ServiceEntry = {
+          name: "parachute-vault-techne",
+          port: 1940,
+          paths: ["/vault/techne"],
+          health: "/vault/techne/health",
+          version: "0.4.0",
+        };
+        upsertService(vaultDefault, path);
+        const m = upsertService(vaultTechne, path);
+        expect(m.services).toHaveLength(2);
+        expect(m.services.map((s) => s.port)).toEqual([1940, 1940]);
+        // And persisted: a fresh read sees both vault rows on the same port,
+        // confirming readManifest's multi-vault carve-out matches the write
+        // side's.
+        expect(readManifest(path).services).toHaveLength(2);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("succeeds when UPDATING an existing entry's port to a non-conflicting port", () => {
+      // The update path (idx >= 0 in upsertService) replaces the row in-place
+      // before the duplicate-port check. Updating an entry's port to a value
+      // that collides with a DIFFERENT row must still throw, but moving an
+      // entry to a free port must succeed — including off canonical, which is
+      // a legitimate operator move (e.g., to dodge a third-party clash).
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(scribe, path); // port 1944
+        upsertService({ ...agent, port: 1945 }, path); // port 1945
+        // Move scribe from 1944 to 1948 (free): succeeds.
+        const m = upsertService({ ...scribe, port: 1948 }, path);
+        expect(m.services).toHaveLength(2);
+        const scribeRow = m.services.find((s) => s.name === "parachute-scribe");
+        expect(scribeRow?.port).toBe(1948);
+        // Fresh read: persisted state matches.
+        const persisted = readManifest(path);
+        expect(persisted.services.find((s) => s.name === "parachute-scribe")?.port).toBe(1948);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("throws when UPDATING an existing entry's port to one that collides with another row", () => {
+      // Companion to the above: the update path must NOT bypass the gate
+      // when the moved row's new port now collides with a different row.
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(scribe, path); // port 1944
+        upsertService({ ...agent, port: 1945 }, path); // port 1945
+        // Move scribe to 1945, where agent already lives: must throw.
+        expect(() => upsertService({ ...scribe, port: 1945 }, path)).toThrow(ServicesManifestError);
+        expect(() => upsertService({ ...scribe, port: 1945 }, path)).toThrow(/duplicate port 1945/);
+        // And the on-disk state stayed coherent — scribe at 1944, agent at
+        // 1945 — because the gate fires before writeManifest.
+        const persisted = readManifest(path);
+        expect(persisted.services.find((s) => s.name === "parachute-scribe")?.port).toBe(1944);
+        expect(persisted.services.find((s) => s.name === "agent")?.port).toBe(1945);
+      } finally {
+        cleanup();
+      }
+    });
+  });
 });
 
 describe("claw → agent migration", () => {

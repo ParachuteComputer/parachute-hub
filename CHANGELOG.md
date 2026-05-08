@@ -2,6 +2,22 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.7-rc.4] - 2026-05-08
+
+Symmetric write-time port-collision gate on `services-manifest.ts:upsertService`. Closes the asymmetry left after #204: read-time `validateManifest` rejects duplicate ports, but the write side happily landed corrupt state on disk and only the next read surfaced the fault. Defense-in-depth — the boot-overwrite root causes are fixed in parachute-scribe#41 + parachute-agent#146 — but "shouldn't happen" isn't "can't happen."
+
+### Fixed
+
+- **`upsertService` rejects writes that would land a duplicate port in `services.json` (closes #205).** New `assertNoDuplicatePorts(entries, where)` helper extracted out of `validateManifest` so both read and write paths apply the same gate without the write side re-validating every entry's shape (the merged manifest's entries are already typed `ServiceEntry`; what's interesting is the property of the merged set, not any individual entry). After the in-memory upsert merge but before `writeManifest`, the helper runs across `current.services`; if two distinct services would share a port the call throws `ServicesManifestError` with the same message shape as the read path (`<path>: duplicate port 1944 — claimed by both "parachute-scribe" and "agent". Edit services.json to give each service a unique port.`). The previous shape would write the corrupt manifest, leave bad state on disk, and only surface the fault on the next `readManifest` (`parachute status` / `parachute start` / per-request hub-server reads). Same multi-vault carve-out as the read side: `parachute-vault*` rows sharing a port is intentional — one process serves N vault instances on a single port at distinct mount paths — and only fires when at least one of the conflicting names isn't a `parachute-vault*` row. The update path (in-place replace by name when the row already exists) runs the gate after the replace, so moving a row to a free port succeeds and moving a row to a colliding port is rejected with on-disk state left coherent.
+
+### Added
+
+- **Tests: `upsertService` write-time duplicate-port rejection coverage (`src/__tests__/services-manifest.test.ts`, new `upsertService duplicate-port rejection (hub#205)` describe block).** Five new cases. Add a service at a non-conflicting port → succeeds (and the persisted file matches); add a service at a port already claimed by a non-vault service → throws `ServicesManifestError` with port + both names in the message AND the existing row stays put (no corrupt write); add a `parachute-vault-*` row at a port already used by another `parachute-vault-*` row → succeeds (multi-vault carve-out); UPDATE an existing entry's port to a free port → succeeds; UPDATE an existing entry's port to a colliding port → throws and on-disk state stays coherent (scribe at 1944, agent at 1945, scribe-trying-to-move-to-1945 rejected before any write).
+
+### Out of scope
+
+- **`assignServicePort` `.env` PORT preservation (flagged on hub#204 + patterns#45 reviews).** Different layer — `assignServicePort` writes to a service's `.env` file, not `services.json` — and a meaningful separate concern (operator-edited PORT preservation across re-installs is a deliberate behavior; what the reviewer flagged is a stale-`.env`-vs-fresh-`services.json` reconciliation question). Filed as hub#206 for design discussion; this PR stays scoped to #205's write-time validation of `services.json`.
+
 ## [0.5.7-rc.3] - 2026-05-08
 
 Hub-side defense-in-depth on the silent-port-collision class fixed upstream in parachute-scribe#41 + parachute-agent#146. `services.json` parsing now hard-rejects two distinct services on the same port; `parachute status` flags canonical-port drift inline so an operator-visible warning replaces a silent miswire.
