@@ -42,7 +42,7 @@ import {
   buildSessionCookie,
   createSession,
   deleteSession,
-  findSession,
+  findActiveSession,
   parseSessionCookie,
 } from "./sessions.ts";
 import { getUserByUsername, verifyPassword } from "./users.ts";
@@ -74,15 +74,6 @@ function redirect(location: string, extra: Record<string, string> = {}): Respons
 }
 
 // --- session gate ----------------------------------------------------------
-
-/**
- * Return the active session for this request, or null. Caller decides what
- * to do on null — most paths should redirect to `/admin/login?next=<path>`.
- */
-function activeSession(db: Database, req: Request) {
-  const sid = parseSessionCookie(req.headers.get("cookie"));
-  return sid ? findSession(db, sid) : null;
-}
 
 function loginRedirect(req: Request, extra: Record<string, string> = {}): Response {
   const url = new URL(req.url);
@@ -217,7 +208,7 @@ export async function handleAdminConfigGet(
   req: Request,
   deps: AdminDeps = {},
 ): Promise<Response> {
-  const session = activeSession(db, req);
+  const session = findActiveSession(db, req);
   if (!session) return loginRedirect(req);
 
   const csrf = ensureCsrfToken(req);
@@ -241,7 +232,7 @@ export async function handleAdminConfigPost(
   moduleName: string,
   deps: AdminDeps = {},
 ): Promise<Response> {
-  const session = activeSession(db, req);
+  const session = findActiveSession(db, req);
   if (!session) return loginRedirect(req);
 
   const form = await req.formData();

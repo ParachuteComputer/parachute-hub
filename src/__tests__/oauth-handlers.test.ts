@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerClient } from "../clients.ts";
+import { getClient, registerClient } from "../clients.ts";
 import { CSRF_COOKIE_NAME } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { validateAccessToken } from "../jwt-sign.ts";
@@ -2238,6 +2238,198 @@ describe("DCR approval gate (#74)", () => {
       expect(res.status).toBe(401);
       const body = (await res.json()) as Record<string, unknown>;
       expect(body.error).toBe("invalid_token");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// closes #199 — DCR auto-approve for the operator's own browser. A valid
+// `parachute_hub_session` cookie indicates the operator is authenticated as
+// themselves; combined with a same-origin Origin/Referer (the CSRF gate)
+// that's enough to skip the manual `parachute auth approve-client` step.
+describe("DCR auto-approve via session cookie (#199)", () => {
+  const SESSION_COOKIE_TTL_S = Math.floor(SESSION_TTL_MS / 1000);
+
+  function registerRequest(
+    headers: Record<string, string>,
+    bodyExtra: Record<string, unknown> = {},
+  ): Request {
+    return new Request(`${ISSUER}/oauth/register`, {
+      method: "POST",
+      body: JSON.stringify({
+        redirect_uris: ["https://app.example/cb"],
+        ...bodyExtra,
+      }),
+      headers: { "content-type": "application/json", ...headers },
+    });
+  }
+
+  test("valid session cookie + matching Origin → status approved (response + DB)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const req = registerRequest({
+        cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S),
+        origin: ISSUER,
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("approved");
+      // Persisted, not just response-shaped.
+      const row = getClient(db, body.client_id as string);
+      expect(row?.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("valid session cookie + cross-origin Origin → status pending (CSRF defense)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const req = registerRequest({
+        cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S),
+        origin: "https://attacker.example",
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("valid session cookie + Origin matching exact origin (port included) → approved", async () => {
+    // URL.origin includes scheme + host + port, so a port-mismatched Origin
+    // must NOT match. https://hub.example:8443 ≠ https://hub.example.
+    const { db, cleanup } = await makeDb();
+    try {
+      const issuer = "https://hub.example:8443";
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+
+      // Exact match (scheme + host + port) → approved.
+      const okReq = registerRequest({
+        cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S),
+        origin: "https://hub.example:8443",
+      });
+      const okRes = await handleRegister(db, okReq, { issuer });
+      expect(((await okRes.json()) as Record<string, unknown>).status).toBe("approved");
+
+      // Port-mismatched Origin (default 443 vs 8443) → pending.
+      const badReq = registerRequest({
+        cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S),
+        origin: "https://hub.example",
+      });
+      const badRes = await handleRegister(db, badReq, { issuer });
+      expect(((await badRes.json()) as Record<string, unknown>).status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("valid session cookie + matching Referer (no Origin) → approved (Referer fallback)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const req = registerRequest({
+        cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S),
+        referer: `${ISSUER}/notes/`,
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("valid session cookie + no Origin AND no Referer → pending (deny without proof of origin)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const req = registerRequest({
+        cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S),
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("expired session cookie + matching Origin → pending (expiry check)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      // Session created in the "now()" frame, but handleRegister sees a much
+      // later clock — findSession (via findActiveSession) treats it as expired.
+      const session = createSession(db, { userId: user.id });
+      const future = new Date(Date.now() + SESSION_TTL_MS + 60_000);
+      const req = registerRequest({
+        cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S),
+        origin: ISSUER,
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER, now: () => future });
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("invalid session cookie (id not in DB) + matching Origin → pending", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const req = registerRequest({
+        cookie: buildSessionCookie("not-a-real-session-id", SESSION_COOKIE_TTL_S),
+        origin: ISSUER,
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("no cookie at all → pending (current public-DCR behavior)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const req = registerRequest({ origin: ISSUER });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("operator-bearer header (existing path) still → approved (regression)", async () => {
+    // The new cookie-based path must not regress the bearer-based path that
+    // first-party install (#74) depends on. Same setup as the #74 test, no
+    // cookie supplied — bearer alone must continue to land approved.
+    const { db, cleanup } = await makeDb();
+    try {
+      const { rotateSigningKey } = await import("../signing-keys.ts");
+      const { mintOperatorToken } = await import("../operator-token.ts");
+      rotateSigningKey(db);
+      const user = await createUser(db, "owner", "pw");
+      const operator = await mintOperatorToken(db, user.id, { issuer: ISSUER });
+
+      const req = registerRequest({ authorization: `Bearer ${operator.token}` });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("approved");
     } finally {
       cleanup();
     }

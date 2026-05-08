@@ -2,6 +2,20 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.7-rc.1] - 2026-05-08
+
+Adds a second auto-approve path on RFC 7591 Dynamic Client Registration: a valid `parachute_hub_session` cookie plus a same-origin `Origin`/`Referer` header skips the manual `parachute auth approve-client` step. The operator hitting their own SPA from their own browser is by definition operator-authenticated; re-requiring approval was friction without benefit.
+
+### Added
+
+- **`/oauth/register` auto-approves when a valid session cookie + matching Origin/Referer is present (closes #199).** Companion path to the operator-bearer (`hub:admin`) auto-approve introduced in #74. Surfaced 2026-05-08 when Aaron tried to link Notes to a vault and hit "App not yet approved" on `POST /oauth/authorize` — every fresh `client_id` from a browser SPA needed a terminal drop-out. Two gates in the new path: (1) `findActiveSession(db, req)` — un-expired session row keyed by the `parachute_hub_session` cookie, (2) `originMatchesIssuer(req, issuer)` — `URL.origin` exact match (scheme + host + port) against the request's `Origin` (or `Referer` as fallback). Belt-and-suspenders CSRF defense alongside the cookie's `SameSite=Lax` attribute. SPA-side companion work: parachute-agent#140 + parachute-notes#106 (`credentials: 'include'` on the DCR fetch).
+- **`findActiveSession(db, req, now?)` exported from `src/sessions.ts`.** Refactor: the private `activeSession` helper from `src/admin-handlers.ts` moved up to `sessions.ts` and renamed for use by both admin handlers and the new DCR cookie-based auto-approve path. DRY: removes the duplicate parse-cookie + find-session + null-check dance.
+- **Tests: nine regression cases for the new path (`src/__tests__/oauth-handlers.test.ts`, `DCR auto-approve via session cookie (#199)`).** Valid session + matching Origin → approved (verified in both response body + DB row); valid session + cross-origin Origin → pending (CSRF defense); exact-origin port-sensitivity (`https://hub.example:8443` ≠ `https://hub.example`); Referer fallback when no Origin header; no Origin AND no Referer → pending (deny without proof of origin); expired session → pending; unknown session id → pending; no cookie → pending; operator-bearer regression test pins #74's path still works without a cookie.
+
+### Why this lands now
+
+Friction every time a fresh `client_id` is created from a browser-side SPA. Aaron hit it earlier today on Notes vault-link; paraclaw#138 surfaced one cache-staleness trigger that creates fresh `client_id`s. The friction will keep coming as more SPAs ship. The hub-side change is independent and ships first; agent + notes' `credentials: 'include'` PRs become effective the moment the deployed hub recognizes the cookie.
+
 ## [0.5.6-rc.1] - 2026-05-08
 
 Bundled fix for two `proxyToService` / `proxyToVault` dispatch edge cases that hub#187's tests missed. Both surfaced during operator diagnostics on Aaron's box (2026-05-08); both make the hub silently 404 a real on-box backend.
