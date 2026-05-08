@@ -88,6 +88,40 @@ describe("checkAndRecord — bucket fill / drain", () => {
     // At exactly WINDOW_MS, the oldest is gone → admitted, not denied.
     expect(r.allowed).toBe(true);
   });
+
+  test("Retry-After natural value is always >= 1 in the deny branch (1ms-remaining case)", () => {
+    // The `Math.max(1, ...)` clamp at rate-limit.ts:90 is defense-in-depth:
+    // the deny branch requires `pruned.length >= MAX_ATTEMPTS`, which means
+    // every retained timestamp is strictly inside the window, so
+    // `resetAtMs - now > 0` strictly, so `Math.ceil(positive / 1000) >= 1`.
+    // This test pins that invariant: at `WINDOW_MS - 1ms` after the cohort,
+    // 1ms remains until the oldest falls off → unclamped value is
+    // `Math.ceil(1 / 1000) = 1`, the minimum natural value.
+    const t0 = new Date("2026-05-08T12:00:00Z");
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      checkAndRecord("ip-a", t0);
+    }
+    const denied = checkAndRecord("ip-a", new Date(t0.getTime() + WINDOW_MS - 1));
+    expect(denied.allowed).toBe(false);
+    expect(denied.retryAfterSeconds).toBe(1);
+  });
+
+  test("Retry-After is >= 1 across every denied step from t0 to the boundary", () => {
+    // Belt-and-suspenders sweep: walk `now` from t0 up to (but not including)
+    // the boundary in 100ms steps and assert every denied response has
+    // `retryAfterSeconds >= 1`. Locks in the "natural value never drops to
+    // zero in the deny branch" invariant the clamp guards.
+    const t0 = new Date("2026-05-08T12:00:00Z");
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      checkAndRecord("ip-a", t0);
+    }
+    for (let dt = 0; dt < WINDOW_MS; dt += 100) {
+      const r = checkAndRecord("ip-a", new Date(t0.getTime() + dt));
+      expect(r.allowed).toBe(false);
+      expect(r.retryAfterSeconds).toBeDefined();
+      expect(r.retryAfterSeconds as number).toBeGreaterThanOrEqual(1);
+    }
+  });
 });
 
 describe("checkAndRecord — multi-IP independence", () => {

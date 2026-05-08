@@ -48,8 +48,11 @@ export interface RateLimitResult {
   allowed: boolean;
   /**
    * Seconds until the bucket reset (oldest in-window timestamp falls off).
-   * Only set when `allowed` is false. Always >= 1 to give a non-zero
-   * `Retry-After` header value even at the boundary.
+   * Only set when `allowed` is false. Always >= 1: the deny branch only
+   * fires when the oldest in-window timestamp is strictly inside the
+   * window, so `Math.ceil(positiveMs / 1000) >= 1` naturally. The
+   * `Math.max(1, ...)` clamp inside `checkAndRecord` is a defense-in-depth
+   * floor in case the filter logic is ever loosened.
    */
   retryAfterSeconds?: number;
 }
@@ -84,15 +87,21 @@ export function checkAndRecord(key: string, now: Date): RateLimitResult {
   if (pruned.length >= MAX_ATTEMPTS) {
     // Reset moment = oldest in-window attempt + WINDOW_MS. `pruned[0]` is
     // the oldest because timestamps are appended in order. Subtract `now`
-    // for seconds-until-reset; clamp to >= 1 so Retry-After never reads 0
-    // at the exact boundary.
+    // for seconds-until-reset. The unclamped value is provably >= 1 in this
+    // branch (see below), but `Math.max(1, ...)` stays as a defense-in-depth
+    // floor so Retry-After never reads 0 if the filter logic is ever
+    // loosened. Reasoning: the deny branch requires `pruned.length >=
+    // MAX_ATTEMPTS`, which implies every entry survived the `t > cutoff`
+    // filter, i.e. `pruned[0] > now - WINDOW_MS` strictly, i.e. `resetAtMs -
+    // now > 0` strictly, i.e. `Math.ceil(positive / 1000) >= 1`.
     const resetAtMs = (pruned[0] ?? now.getTime()) + WINDOW_MS;
     const retryAfterSeconds = Math.max(1, Math.ceil((resetAtMs - now.getTime()) / 1000));
-    // Persist the prune so the bucket doesn't carry stale entries forward
-    // past their window. (Skipping this would leak a tiny amount of memory
-    // when an attacker stops hitting a denied IP.)
-    if (pruned.length === 0) buckets.delete(key);
-    else buckets.set(key, pruned);
+    // Denied attempt: the bucket is still full (>= MAX_ATTEMPTS in-window
+    // entries), so unconditionally re-store the pruned slice. Persisting the
+    // prune keeps stale entries from leaking forward past their window. We
+    // do NOT delete here — that branch is structurally unreachable in deny
+    // because deny requires a non-empty `pruned`.
+    buckets.set(key, pruned);
     return { allowed: false, retryAfterSeconds };
   }
 

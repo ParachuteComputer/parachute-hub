@@ -2,6 +2,20 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.4-rc.2] - 2026-05-08
+
+Review nit fold (PR #188) — no behavior change.
+
+### Changed
+
+- **Drop unreachable `pruned.length === 0` branch in `checkAndRecord`'s deny path (`src/rate-limit.ts`).** The deny branch only fires when `pruned.length >= MAX_ATTEMPTS`, so the `if (pruned.length === 0) buckets.delete(key)` arm was structurally unreachable; the `else buckets.set(key, pruned)` arm was the only path that ever ran. Replaced the if/else with an unconditional `buckets.set(key, pruned)` plus a comment explaining the deny-bucket-is-still-full intent so a future reader doesn't reintroduce a confused `delete` arm.
+- **Document the `Math.max(1, ...)` clamp on `retryAfterSeconds` as defense-in-depth.** The unclamped value is provably `>= 1` in the deny branch (every retained timestamp is strictly inside the window, so `resetAtMs - now > 0` strictly, so `Math.ceil(positiveMs / 1000) >= 1`). The clamp stays as a belt-and-suspenders floor in case the filter logic is ever loosened. JSDoc on `RateLimitResult.retryAfterSeconds` updated to reflect this.
+
+### Added
+
+- **Test: `retryAfterSeconds === 1` at the 1-ms-remaining boundary (`src/__tests__/rate-limit.test.ts`).** Pins the minimum natural value the `Math.ceil((resetAtMs - now) / 1000)` calculation produces in the deny branch, which is what the existing clamp would catch if the filter logic regressed.
+- **Test: sweep `now` from t0 across the full window in 100ms steps and assert every denied response has `retryAfterSeconds >= 1`.** Belt-and-suspenders invariant check that the deny branch never produces a sub-1 unclamped value.
+
 ## [0.5.4-rc.1] - 2026-05-08
 
 ### Added
