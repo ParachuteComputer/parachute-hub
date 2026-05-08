@@ -67,7 +67,11 @@ import {
   handleToken,
 } from "./oauth-handlers.ts";
 import { clearPid, writePid } from "./process-state.ts";
-import { effectivePublicExposure } from "./service-spec.ts";
+import {
+  FIRST_PARTY_FALLBACKS,
+  effectivePublicExposure,
+  shortNameForManifest,
+} from "./service-spec.ts";
 import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
 import { buildWellKnown, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
@@ -137,9 +141,16 @@ export function findVaultUpstream(
   for (const s of services) {
     if (!isVaultEntry(s)) continue;
     for (const path of s.paths) {
-      if (pathname === path || pathname.startsWith(`${path}/`)) {
-        if (!best || path.length > best.mount.length) {
-          best = { port: s.port, mount: path, entry: s };
+      // Normalize trailing slashes before comparison (#197). A services.json
+      // entry written with `paths: ["/vault/default/"]` would otherwise only
+      // match the exact pathname `/vault/default/` and never any sub-path,
+      // because `pathname.startsWith("/vault/default//")` is always false.
+      // The "|| '/'" branch keeps a bare-root mount "/" stable rather than
+      // collapsing it to an empty string.
+      const norm = path.replace(/\/+$/, "") || "/";
+      if (pathname === norm || pathname.startsWith(`${norm}/`)) {
+        if (!best || norm.length > best.mount.length) {
+          best = { port: s.port, mount: norm, entry: s };
         }
       }
     }
@@ -295,7 +306,14 @@ async function proxyToVault(req: Request, manifestPath: string): Promise<Respons
   if (effectivePublicExposure(match.entry) === "loopback" && layerOf(req) !== "loopback") {
     return new Response("not found", { status: 404 });
   }
-  return proxyRequest(req, match.port, "vault");
+  // Symmetry with proxyToService (#196): honor `stripPrefix` with FIRST_-
+  // PARTY_FALLBACKS as a fallback source. No first-party vault fallback
+  // declares stripPrefix today (vault expects the full `/vault/<name>/*`
+  // path), so this is a no-op in practice — but reading the same shape in
+  // both proxies keeps the dispatch surface consistent for future readers.
+  const stripPrefix = stripPrefixFor(match.entry);
+  const targetPath = stripPrefix ? url.pathname.slice(match.mount.length) || "/" : undefined;
+  return proxyRequest(req, match.port, "vault", targetPath);
 }
 
 /**
@@ -314,9 +332,18 @@ export function findServiceUpstream(
   for (const s of services) {
     if (isVaultEntry(s)) continue;
     for (const path of s.paths) {
-      if (pathname === path || pathname.startsWith(`${path}/`)) {
-        if (!best || path.length > best.mount.length) {
-          best = { port: s.port, mount: path, entry: s };
+      // Normalize trailing slashes before comparison (#197). A services.json
+      // entry written with `paths: ["/notes/"]` would otherwise only match
+      // the exact pathname `/notes/` and never `/notes/assets/index.js` —
+      // `pathname.startsWith("/notes//")` is always false because URLs
+      // don't have double slashes. Result: SPA shell loads but every asset
+      // 404s (notes blank-screen on Aaron's box, 2026-05-08).
+      // The "|| '/'" branch keeps a bare-root mount "/" stable rather than
+      // collapsing it to an empty string.
+      const norm = path.replace(/\/+$/, "") || "/";
+      if (pathname === norm || pathname.startsWith(`${norm}/`)) {
+        if (!best || norm.length > best.mount.length) {
+          best = { port: s.port, mount: norm, entry: s };
         }
       }
     }
@@ -364,10 +391,32 @@ async function proxyToService(req: Request, manifestPath: string): Promise<Respo
   if (effectivePublicExposure(match.entry) === "loopback" && layerOf(req) !== "loopback") {
     return new Response("not found", { status: 404 });
   }
-  const targetPath = match.entry.stripPrefix
-    ? url.pathname.slice(match.mount.length) || "/"
-    : undefined;
+  // Consult FIRST_PARTY_FALLBACKS as a fallback for `stripPrefix` (#196).
+  // Scribe v0.4.0 doesn't write `stripPrefix: true` to its services.json
+  // entry — the declaration only lives in hub's SCRIBE_FALLBACK manifest.
+  // Pre-#187 this didn't matter because the per-service tailscale serve
+  // plan baked the path into the target URL; post-#187 routing went through
+  // hub which wasn't consulting the fallback registry. Same shape as how
+  // `effectivePublicExposure` already handles fallback derivation in
+  // service-spec.ts. Explicit-on-entry still wins; absent → fallback →
+  // false (preserving existing keep-prefix default for unknown services).
+  const stripPrefix = stripPrefixFor(match.entry);
+  const targetPath = stripPrefix ? url.pathname.slice(match.mount.length) || "/" : undefined;
   return proxyRequest(req, match.port, match.entry.name, targetPath);
+}
+
+/**
+ * Resolve effective `stripPrefix` for a service entry. Explicit on-entry
+ * wins; otherwise consult `FIRST_PARTY_FALLBACKS` keyed by short name (so
+ * scribe's vendored fallback supplies `stripPrefix: true` even when scribe's
+ * own boot doesn't write it). Defaults to `false` — keep the prefix —
+ * matching the pre-#196 dispatch behavior for unknown / third-party services.
+ */
+function stripPrefixFor(entry: ServiceEntry): boolean {
+  if (entry.stripPrefix !== undefined) return entry.stripPrefix;
+  const short = shortNameForManifest(entry.name);
+  const fb = short !== undefined ? FIRST_PARTY_FALLBACKS[short] : undefined;
+  return fb?.manifest.stripPrefix ?? false;
 }
 
 export interface HubFetchDeps {
