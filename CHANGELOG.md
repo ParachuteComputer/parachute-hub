@@ -2,6 +2,33 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.4-rc.2] - 2026-05-08
+
+Review nit fold (PR #188) — no behavior change.
+
+### Changed
+
+- **Drop unreachable `pruned.length === 0` branch in `checkAndRecord`'s deny path (`src/rate-limit.ts`).** The deny branch only fires when `pruned.length >= MAX_ATTEMPTS`, so the `if (pruned.length === 0) buckets.delete(key)` arm was structurally unreachable; the `else buckets.set(key, pruned)` arm was the only path that ever ran. Replaced the if/else with an unconditional `buckets.set(key, pruned)` plus a comment explaining the deny-bucket-is-still-full intent so a future reader doesn't reintroduce a confused `delete` arm.
+- **Document the `Math.max(1, ...)` clamp on `retryAfterSeconds` as defense-in-depth.** The unclamped value is provably `>= 1` in the deny branch (every retained timestamp is strictly inside the window, so `resetAtMs - now > 0` strictly, so `Math.ceil(positiveMs / 1000) >= 1`). The clamp stays as a belt-and-suspenders floor in case the filter logic is ever loosened. JSDoc on `RateLimitResult.retryAfterSeconds` updated to reflect this.
+
+### Added
+
+- **Test: `retryAfterSeconds === 1` at the 1-ms-remaining boundary (`src/__tests__/rate-limit.test.ts`).** Pins the minimum natural value the `Math.ceil((resetAtMs - now) / 1000)` calculation produces in the deny branch, which is what the existing clamp would catch if the filter logic regressed.
+- **Test: sweep `now` from t0 across the full window in 100ms steps and assert every denied response has `retryAfterSeconds >= 1`.** Belt-and-suspenders invariant check that the deny branch never produces a sub-1 unclamped value.
+
+## [0.5.4-rc.1] - 2026-05-08
+
+### Added
+
+- **Per-IP rate-limit on `POST /admin/login` (5 attempts / 15-minute sliding window).** Lands as a brute-force floor under `/admin/login`, which became reachable from every layer (loopback / tailnet / public) when 0.5.3-rc.1 collapsed the access-control matrix into the hub. On a cloudflare-fronted hub, that means the open internet — until #186 ships 2FA-on-login, this is the only thing slowing credential grinding. New module `src/rate-limit.ts` keeps a sliding-window timestamp list per IP and is wired into `handleAdminLoginPost` *after* CSRF (so cross-site junk doesn't burn slots) but *before* credential check (so 401s, missing-user, and eventually 2FA failures all count toward the same bucket — auth-stage independent). Exhaustion returns `429 Too Many Requests` with a `Retry-After` header pointing at the bucket-reset moment in seconds. Layer-independent: a buggy script hammering loopback gets 429'd just like a public attacker; tailnet logins all share the loopback bucket since `tailscale serve` proxies from `127.0.0.1`, which is acceptable because brute-force isn't the threat model on an authed-tailnet ingress. (#185)
+- **`clientIpFromRequest` IP-extraction helper (`src/rate-limit.ts`).** Priority order: `CF-Connecting-IP` (cloudflared sets this on every forwarded request, with the actual client IP rather than the cloudflare edge); `X-Forwarded-For` first hop (defensive fallback for any non-cloudflare proxy fronting hub); fall through to `UNKNOWN_IP_SENTINEL` so the limiter always has a key (direct-loopback callers all share one bucket, intended bound). No `Forwarded` (RFC 7239) parser today — `X-Forwarded-For` covers the operator-deploy reality and `Forwarded` is rare in this niche; can add when the first deployment needs it. (#185)
+- **Storage shape: in-memory `Map<ip, timestamps[]>` for the lifetime of the hub process.** Persistence isn't worth a SQLite write per attempt — process restart is itself a defense (the attacker loses progress against any one bucket). Memory is bounded by an opportunistic prune on every check; sentinel-bucket sharing keeps direct-loopback noise to one entry. (#185)
+- **`AdminLoginDeps` test seam on `handleAdminLoginPost`.** Production callers omit it (real clock); tests inject `now` so rate-limit assertions don't race wall-clock time. Kept narrow — login doesn't share the wider `AdminDeps` because it doesn't load services / module manifests. (#185)
+
+### Why this lands now
+
+Pre-#187, `/admin/login` was loopback-only on a tailnet/funnel-only deployment (the route lived on the hub which only listened on `127.0.0.1`). Post-#187 the access-control matrix moved into the hub itself, and every layer that admits requests at all admits `/admin/*`. For operators on cloudflare-only exposure that means a public-internet brute-force surface. 2FA (#186) is the primary defense and ships next; the rate-limit floor lands first because it's small, well-bounded, and gets some of the way there for operators who upgrade before the 2FA PR lands.
+
 ## [0.5.3-rc.2] - 2026-05-08
 
 Review nit fold (PR #187) — no behavior change beyond test coverage.
