@@ -384,10 +384,20 @@ export const FIRST_PARTY_FALLBACKS: Record<string, FirstPartyFallback> = {
 /**
  * Effective publicExposure for a service, given what's on its services.json
  * entry. Explicit wins. If absent, derive from the spec: known api/tool
- * services without declared auth fall back to "auth-required" (treated as
- * loopback at launch); everything else defaults to "allowed" — so vault,
- * notes, channel and unknown third-party services continue to be exposed
- * without needing to opt in.
+ * services without declared auth fall back to "auth-required"; everything
+ * else defaults to "allowed" — so vault, notes, channel and unknown
+ * third-party services continue to be exposed without needing to opt in.
+ *
+ * Layer behavior (post-#187 layer-aware proxy):
+ *   "allowed"        — reaches all layers (loopback / tailnet / public);
+ *                      service self-gates if it has any auth.
+ *   "loopback"       — hub layer-gates; tailnet/public requests 404 at
+ *                      proxyToService / proxyToVault before reaching the
+ *                      service.
+ *   "auth-required"  — reaches all layers; service self-gates. Same gate
+ *                      behavior as "allowed" today; the field documents
+ *                      operator/UI intent ("requires auth before exposing")
+ *                      separately from the loopback hard-block.
  */
 export function effectivePublicExposure(
   entry: ServiceEntry,
