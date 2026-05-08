@@ -149,28 +149,30 @@ function isVaultName(name: string): boolean {
   return name === "parachute-vault" || name.startsWith("parachute-vault-");
 }
 
-function validateManifest(raw: unknown, where: string): ServicesManifest {
-  if (!raw || typeof raw !== "object") {
-    throw new ServicesManifestError(`${where}: root must be an object`);
-  }
-  const services = (raw as Record<string, unknown>).services;
-  if (!Array.isArray(services)) {
-    throw new ServicesManifestError(`${where}: "services" must be an array`);
-  }
-  const entries = services.map((s, i) => validateEntry(s, `${where} services[${i}]`));
-  // Reject manifests where two distinct services share a port. Without this
-  // gate, both services land in services.json, the OS lets only one bind,
-  // and the hub reverse-proxy quietly routes everyone to whichever service
-  // won the race. That's exactly how parachute-hub#195 (scribe + agent both
-  // at 1944) produced a silent /agent → scribe miswire. The underlying
-  // overwrite bugs are fixed in parachute-scribe#41 + parachute-agent#146;
-  // this is the hub-side gate so the same class can't recur silently.
-  //
-  // Multi-vault is the deliberate exception: one parachute-vault process
-  // serves N vault instances on a single port at distinct mount paths, so
-  // multiple `parachute-vault*` rows sharing a port is intentional, not a
-  // collision. The check fires only when the conflicting names aren't
-  // both vault rows.
+/**
+ * Reject manifests where two distinct services share a port. Without this
+ * gate, both services land in services.json, the OS lets only one bind,
+ * and the hub reverse-proxy quietly routes everyone to whichever service
+ * won the race. That's exactly how parachute-hub#195 (scribe + agent both
+ * at 1944) produced a silent /agent → scribe miswire. The underlying
+ * overwrite bugs are fixed in parachute-scribe#41 + parachute-agent#146;
+ * this is the hub-side gate so the same class can't recur silently.
+ *
+ * Multi-vault is the deliberate exception: one parachute-vault process
+ * serves N vault instances on a single port at distinct mount paths, so
+ * multiple `parachute-vault*` rows sharing a port is intentional, not a
+ * collision. The check fires only when the conflicting names aren't
+ * both vault rows.
+ *
+ * Pulled out of `validateManifest` so the write side (`upsertService`) can
+ * apply the same gate after merging without re-validating every entry's
+ * shape — the merged manifest's entries are already typed `ServiceEntry`,
+ * but a duplicate-port collision is a property of the merged set, not of
+ * any individual entry. Read-side path runs this after `validateEntry`
+ * across the array; write-side path runs this on the post-merge entries.
+ * Both surface the same `ServicesManifestError` shape.
+ */
+function assertNoDuplicatePorts(entries: ServiceEntry[], where: string): void {
   const portsSeen = new Map<number, string>();
   for (const entry of entries) {
     const prev = portsSeen.get(entry.port);
@@ -181,6 +183,18 @@ function validateManifest(raw: unknown, where: string): ServicesManifest {
     }
     if (prev === undefined) portsSeen.set(entry.port, entry.name);
   }
+}
+
+function validateManifest(raw: unknown, where: string): ServicesManifest {
+  if (!raw || typeof raw !== "object") {
+    throw new ServicesManifestError(`${where}: root must be an object`);
+  }
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) {
+    throw new ServicesManifestError(`${where}: "services" must be an array`);
+  }
+  const entries = services.map((s, i) => validateEntry(s, `${where} services[${i}]`));
+  assertNoDuplicatePorts(entries, where);
   return { services: entries };
 }
 
@@ -259,6 +273,14 @@ export function upsertService(
   } else {
     current.services.push(entry);
   }
+  // Symmetric port-collision gate (closes hub#205). Read-time validation
+  // (`validateManifest` → `assertNoDuplicatePorts`) catches duplicates the
+  // next time `services.json` is read, but without this write-side check the
+  // bad state lives on disk for that window. A buggy service boot calling
+  // `upsertService({ name: "agent", port: 1944 })` while scribe is already
+  // at 1944 would otherwise succeed and corrupt the manifest. Same
+  // multi-vault carve-out as the read path.
+  assertNoDuplicatePorts(current.services, path);
   writeManifest(current, path);
   return current;
 }
