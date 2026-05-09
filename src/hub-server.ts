@@ -16,6 +16,7 @@
  *   /.well-known/jwks.json                    → JWKS from hub.db
  *   /.well-known/oauth-authorization-server   → RFC 8414 metadata (issuer, endpoints)
  *   /oauth/authorize  (GET + POST)            → login → consent → auth code
+ *   /oauth/authorize/approve (POST)           → inline DCR approve form (#208)
  *   /oauth/token      (POST)                  → authorization_code + refresh_token grants
  *   /oauth/register   (POST)                  → RFC 7591 dynamic client registration
  *   anything else                             → 404
@@ -60,6 +61,7 @@ import {
 } from "./module-manifest.ts";
 import {
   authorizationServerMetadata,
+  handleApproveClientPost,
   handleAuthorizeGet,
   handleAuthorizePost,
   handleRegister,
@@ -750,6 +752,18 @@ export function hubFetch(
       if (req.method === "GET") return handleAuthorizeGet(getDb(), req, oauthDeps(req));
       if (req.method === "POST") return handleAuthorizePost(getDb(), req, oauthDeps(req));
       return new Response("method not allowed", { status: 405 });
+    }
+
+    // Inline approve form for the operator-driven pending-client flow (#208).
+    // Receives `client_id` + `csrf_token` + `return_to` from the form rendered
+    // by handleAuthorizeGet when the operator hits a pending client. Three
+    // gates inside the handler: CSRF, active session, same-origin Origin.
+    if (pathname === "/oauth/authorize/approve") {
+      if (!getDb) {
+        return new Response("hub db not configured", { status: 503 });
+      }
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+      return handleApproveClientPost(getDb(), req, oauthDeps(req));
     }
 
     if (pathname === "/oauth/token") {

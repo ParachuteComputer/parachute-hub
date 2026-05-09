@@ -10,6 +10,7 @@ import { validateAccessToken } from "../jwt-sign.ts";
 import {
   authorizationServerMetadata,
   buildServicesCatalog,
+  handleApproveClientPost,
   handleAuthorizeGet,
   handleAuthorizePost,
   handleRegister,
@@ -3325,6 +3326,521 @@ describe("handleAuthorizeGet — skip consent when scope already granted (#75)",
       expect(new Set(grant?.scopes)).toEqual(
         new Set(["vault:default:read", "vault:default:write", "scribe:transcribe"]),
       );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// closes #208 — inline "Approve this app" form on the pending-client page
+// (cross-origin SPA recovery). Same security model as #199/#200 DCR
+// auto-approve: valid session + matching Origin = trusted operator. The
+// CSRF token is the third belt — a cross-origin POST with a leaked session
+// cookie still fails because the rendered token won't match.
+describe("inline approve button on pending /oauth/authorize (#208)", () => {
+  const SESSION_COOKIE_TTL_S = Math.floor(SESSION_TTL_MS / 1000);
+
+  function pendingAuthorizeUrl(clientId: string): string {
+    const { challenge } = makePkce();
+    return authorizeUrl({
+      client_id: clientId,
+      redirect_uri: "https://app.example/cb",
+      response_type: "code",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      scope: "vault:read",
+      state: "rt-208",
+    });
+  }
+
+  test("session absent → page renders WITHOUT approve form (CLI-only fallback)", async () => {
+    // Regression: pre-#208 behavior preserved when no session cookie is
+    // present. The CLI-fallback message must still be visible so an operator
+    // who arrived from a fresh browser knows what to do.
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "MyApp",
+        status: "pending",
+      });
+      const req = new Request(pendingAuthorizeUrl(reg.client.clientId));
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(403);
+      const html = await res.text();
+      expect(html).toContain("App not yet approved");
+      // CLI-fallback message present — the only way to recover without a session.
+      expect(html).toContain("approve-client");
+      // No form element pointing at the approve endpoint.
+      expect(html).not.toContain('action="/oauth/authorize/approve"');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("session valid + matching Origin → page renders WITH approve form + CSRF token", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "MyApp",
+        status: "pending",
+      });
+      const req = new Request(pendingAuthorizeUrl(reg.client.clientId), {
+        headers: {
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(403);
+      const html = await res.text();
+      expect(html).toContain("App not yet approved");
+      // The form posts to the approve endpoint
+      expect(html).toContain('action="/oauth/authorize/approve"');
+      expect(html).toContain('name="client_id"');
+      expect(html).toContain(`value="${reg.client.clientId}"`);
+      // CSRF token present in the form
+      expect(html).toContain(`value="${TEST_CSRF}"`);
+      // return_to carries the original authorize URL so the post-approve
+      // redirect lands the operator back on the same flow.
+      expect(html).toContain('name="return_to"');
+      expect(html).toContain("/oauth/authorize?");
+      expect(html).toContain("rt-208"); // state echoed via return_to URL
+      // Display fields present so operator can verify what they're approving.
+      expect(html).toContain("MyApp");
+      expect(html).toContain(reg.client.clientId);
+      expect(html).toContain("https://app.example/cb");
+      // CLI fallback still visible.
+      expect(html).toContain("approve-client");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST happy path: CSRF + session + matching Origin → DB flips approved + 302 to authorize URL", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const returnTo = `/oauth/authorize?client_id=${reg.client.clientId}&state=rt-208`;
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: returnTo,
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe(returnTo);
+      // DB row flipped, not just response-shaped.
+      const row = getClient(db, reg.client.clientId);
+      expect(row?.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST: invalid CSRF → 403", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: "wrong-token",
+        client_id: reg.client.clientId,
+        return_to: `/oauth/authorize?client_id=${reg.client.clientId}`,
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(403);
+      // Row stays pending.
+      const row = getClient(db, reg.client.clientId);
+      expect(row?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST: no session cookie → 401", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: `/oauth/authorize?client_id=${reg.client.clientId}`,
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: CSRF_COOKIE,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(401);
+      // Row stays pending.
+      const row = getClient(db, reg.client.clientId);
+      expect(row?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST: cross-origin Origin → 403 (CSRF defense)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: `/oauth/authorize?client_id=${reg.client.clientId}`,
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: "https://attacker.example",
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(403);
+      // Row stays pending.
+      const row = getClient(db, reg.client.clientId);
+      expect(row?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST: Origin: 'null' (sandbox iframe / opaque origin) → 403", async () => {
+    // Opaque-origin contexts (sandboxed iframes, some `data:` and `file:`
+    // pages) send the literal string "null" as the Origin header. The DCR
+    // /register path covers this; the inline-approve endpoint must reject it
+    // too. originMatchesIssuer() handles this correctly because new URL("null")
+    // throws → returns false; this test pins that contract.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: `/oauth/authorize?client_id=${reg.client.clientId}`,
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: "null",
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(403);
+      // Row stays pending.
+      const row = getClient(db, reg.client.clientId);
+      expect(row?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST: idempotent on already-approved client (double-click / refresh)", async () => {
+    // approveClient() short-circuits if the row is already approved
+    // (clients.ts:153). A double-click or page refresh should not error —
+    // the second POST also succeeds with a 302 to return_to and the row
+    // stays approved. This pins idempotency end-to-end.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const returnTo = `/oauth/authorize?client_id=${reg.client.clientId}&state=rt-208`;
+      const buildReq = () => {
+        const form = new URLSearchParams({
+          __csrf: TEST_CSRF,
+          client_id: reg.client.clientId,
+          return_to: returnTo,
+        });
+        return new Request(`${ISSUER}/oauth/authorize/approve`, {
+          method: "POST",
+          body: form,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+            origin: ISSUER,
+          },
+        });
+      };
+
+      // First POST: pending → approved.
+      const first = await handleApproveClientPost(db, buildReq(), { issuer: ISSUER });
+      expect(first.status).toBe(302);
+      expect(first.headers.get("location")).toBe(returnTo);
+      expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
+
+      // Second POST (same client_id, same form): also succeeds, no error.
+      const second = await handleApproveClientPost(db, buildReq(), { issuer: ISSUER });
+      expect(second.status).toBe(302);
+      expect(second.headers.get("location")).toBe(returnTo);
+      expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST: unknown client_id → 404", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: "no-such-client-id",
+        return_to: "/oauth/authorize?client_id=no-such-client-id",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(404);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST: malicious return_to (absolute URL) → 400 (open-redirect defense)", async () => {
+    // The form must always supply a hub-relative /oauth/authorize?... URL.
+    // Anything else is either an open-redirect attempt or a misuse — refuse
+    // to follow it. return_to is validated BEFORE the DB mutation, so a bad
+    // value also leaves the client row at status=pending.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: "https://evil.example/steal",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(400);
+      // No redirect to evil.example.
+      expect(res.headers.get("location")).toBeNull();
+      // DB row remains pending — validate-before-mutate ordering.
+      const row = getClient(db, reg.client.clientId);
+      expect(row?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST: scheme-relative return_to (//evil.example) → 400", async () => {
+    // `//evil.example/foo` is a scheme-relative URL — browsers resolve it
+    // against the current scheme to land at https://evil.example/foo.
+    // Reject anything that doesn't start with a single `/`.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: "//evil.example/foo",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(400);
+      // DB row remains pending — validate-before-mutate ordering.
+      const row = getClient(db, reg.client.clientId);
+      expect(row?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST: return_to off /oauth/authorize path (e.g. /admin/config) → 400", async () => {
+    // Even hub-relative paths must target the authorize endpoint. A
+    // hand-crafted form trying to redirect to /admin/config or any other
+    // hub surface is misuse — this endpoint exists to re-enter the OAuth
+    // flow, nothing else.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: "/admin/config",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(400);
+      // DB row remains pending — validate-before-mutate ordering.
+      const row = getClient(db, reg.client.clientId);
+      expect(row?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("end-to-end: GET (pending) → POST approve → GET (now approved) renders consent", async () => {
+    // The full redirect chain. Sessions and CSRF carry across all three
+    // requests in the same cookie. The final GET sees status=approved and
+    // renders the consent screen.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "RoundTrip",
+        status: "pending",
+      });
+      const cookie = `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`;
+      const authorizeHref = pendingAuthorizeUrl(reg.client.clientId);
+
+      // Step 1: GET /oauth/authorize on a pending client renders the approve form.
+      const getRes = handleAuthorizeGet(
+        db,
+        new Request(authorizeHref, { headers: { cookie, origin: ISSUER } }),
+        { issuer: ISSUER },
+      );
+      expect(getRes.status).toBe(403);
+      const getHtml = await getRes.text();
+      expect(getHtml).toContain('action="/oauth/authorize/approve"');
+
+      // Pull the return_to value the form would submit. It's the path+search
+      // of the authorize URL.
+      const authorizeUrlParsed = new URL(authorizeHref);
+      const returnTo = `${authorizeUrlParsed.pathname}${authorizeUrlParsed.search}`;
+
+      // Step 2: POST the approve form.
+      const postForm = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: returnTo,
+      });
+      const postRes = await handleApproveClientPost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize/approve`, {
+          method: "POST",
+          body: postForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie,
+            origin: ISSUER,
+          },
+        }),
+        { issuer: ISSUER },
+      );
+      expect(postRes.status).toBe(302);
+      expect(postRes.headers.get("location")).toBe(returnTo);
+
+      // Step 3: GET /oauth/authorize again — now the client is approved, so
+      // the operator lands on the consent screen.
+      const reentryRes = handleAuthorizeGet(
+        db,
+        new Request(authorizeHref, { headers: { cookie, origin: ISSUER } }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      expect(reentryRes.status).toBe(200);
+      const consentHtml = await reentryRes.text();
+      // Consent screen markers (renderConsent uses these).
+      expect(consentHtml).toContain('name="__action" value="consent"');
+      expect(consentHtml).toContain("Authorize");
+      expect(consentHtml).toContain("RoundTrip");
     } finally {
       cleanup();
     }

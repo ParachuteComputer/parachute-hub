@@ -8,6 +8,7 @@
  *   - GET  /.well-known/oauth-authorization-server  (RFC 8414 metadata)
  *   - GET  /oauth/authorize                          (login → consent → code)
  *   - POST /oauth/authorize                          (form posts: login + consent)
+ *   - POST /oauth/authorize/approve                  (operator-driven inline DCR approval, #208)
  *   - POST /oauth/token                              (grant_type=authorization_code | refresh_token)
  *   - POST /oauth/register                           (RFC 7591 DCR)
  *   - POST /oauth/revoke                             (RFC 7009 token revocation)
@@ -35,6 +36,7 @@ import {
   type ClientStatus,
   type OAuthClient,
   type RegisteredClient,
+  approveClient,
   getClient,
   isValidRedirectUri,
   registerClient,
@@ -53,7 +55,13 @@ import {
   signAccessToken,
   signRefreshToken,
 } from "./jwt-sign.ts";
-import { type AuthorizeFormParams, renderConsent, renderError, renderLogin } from "./oauth-ui.ts";
+import {
+  type AuthorizeFormParams,
+  renderApprovePending,
+  renderConsent,
+  renderError,
+  renderLogin,
+} from "./oauth-ui.ts";
 import { isNonRequestableScope, isRequestableScope } from "./scope-explanations.ts";
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
 import {
@@ -292,12 +300,63 @@ function parseAuthorizeFormParams(url: URL): AuthorizeFormParams | { error: stri
   };
 }
 
-/** HTML response for pending clients hitting /oauth/authorize. */
-function pendingClientHtml(): Response {
-  return htmlError(
-    "App not yet approved",
-    "This client_id is registered but has not been approved by the hub operator. Ask the operator to run `parachute auth approve-client` for this app, then try again.",
+/**
+ * "App not yet approved" page (#74) for /oauth/authorize. When the request
+ * carries a valid operator session AND a same-origin Origin/Referer, render
+ * the inline approve form (#208) so one click flips the client to `approved`
+ * and the OAuth flow re-enters at consent. Otherwise fall back to the
+ * pre-#208 CLI-only message ("ask operator to run `parachute auth
+ * approve-client <id>`").
+ *
+ * The session-bound approve gate mirrors the same-origin DCR auto-approve
+ * gate on `/oauth/register` (#199, #200): valid session cookie + matching
+ * Origin/Referer = trusted operator action. Cross-origin or session-less
+ * GETs see the CLI-fallback message; the button never renders for them, so
+ * the POST handler can't be tricked into approving via a hand-crafted form
+ * either (CSRF token won't match).
+ *
+ * The form's `return_to` carries the original `/oauth/authorize?...` URL so
+ * the post-approve redirect lands the operator back on the same flow with
+ * the now-approved client. The POST handler validates `return_to` is a
+ * hub-relative path before following it (open-redirect defense).
+ */
+function pendingClientResponse(
+  db: Database,
+  req: Request,
+  client: OAuthClient,
+  authorizeUrl: URL,
+  deps: OAuthDeps,
+): Response {
+  const requestedScopes = (authorizeUrl.searchParams.get("scope") ?? "")
+    .split(" ")
+    .filter((s) => s.length > 0);
+  const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
+  const sameOrigin = originMatchesIssuer(req, deps.issuer);
+  const csrf = ensureCsrfToken(req);
+  const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
+  if (session && sameOrigin) {
+    const returnTo = `${authorizeUrl.pathname}${authorizeUrl.search}`;
+    return htmlResponse(
+      renderApprovePending({
+        clientName: client.clientName ?? client.clientId,
+        clientId: client.clientId,
+        redirectUris: client.redirectUris,
+        requestedScopes,
+        approveForm: { csrfToken: csrf.token, returnTo },
+      }),
+      403,
+      extra,
+    );
+  }
+  return htmlResponse(
+    renderApprovePending({
+      clientName: client.clientName ?? client.clientId,
+      clientId: client.clientId,
+      redirectUris: client.redirectUris,
+      requestedScopes,
+    }),
     403,
+    extra,
   );
 }
 
@@ -346,7 +405,9 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     // matched it against a registered client. Render an HTML error.
     return htmlError("Unknown application", "This client_id is not registered with this hub.", 400);
   }
-  if (client.status !== "approved") return pendingClientHtml();
+  if (client.status !== "approved") {
+    return pendingClientResponse(db, req, client, url, deps);
+  }
   try {
     requireRegisteredRedirectUri(client, parsed.redirectUri);
   } catch {
@@ -537,7 +598,18 @@ async function handleConsentSubmit(
   if (!client) {
     return htmlError("Unknown application", "This client_id is not registered with this hub.", 400);
   }
-  if (client.status !== "approved") return pendingClientHtml();
+  if (client.status !== "approved") {
+    // Defensive: consent only renders for approved clients, so a non-approved
+    // status here means the row was unapproved between render and submit (or
+    // the form was hand-crafted). The approve UI requires a known authorize
+    // URL to round-trip via `return_to`, which we don't reconstruct here —
+    // surface the static error and let the operator restart from the SPA.
+    return htmlError(
+      "App not yet approved",
+      `This client_id is registered but has not been approved. Run \`parachute auth approve-client ${client.clientId}\` from a terminal, then try again.`,
+      403,
+    );
+  }
   try {
     requireRegisteredRedirectUri(client, params.redirectUri);
   } catch {
@@ -601,6 +673,104 @@ async function handleConsentSubmit(
   // still match.
   recordGrant(db, session.userId, client.clientId, scopes, deps.now?.() ?? new Date());
   return issueAuthCodeRedirect(db, params, scopes, session.userId, deps);
+}
+
+/**
+ * POST /oauth/authorize/approve — operator-driven inline approval of a
+ * pending DCR client (closes #208). The cross-origin SPA case the
+ * same-origin DCR auto-approve (#199, #200) doesn't cover: an SPA on a
+ * different origin can't ride the cookie path during DCR, so its
+ * freshly-registered client_id lands `pending` and the operator hits
+ * "App not yet approved" on /oauth/authorize. This endpoint flips that
+ * client to `approved` in one click and redirects back into the OAuth flow.
+ *
+ * Three-belt security model. All three must pass:
+ *
+ *   1. Valid CSRF token (double-submit cookie). Defends against a malicious
+ *      cross-origin POST that rides the session cookie's SameSite=Lax.
+ *      Token was minted at GET render time and embedded in the form.
+ *   2. Active operator session (`findActiveSession`). The operator must be
+ *      logged into this hub from the browser submitting the form — no
+ *      session means no operator authority to approve anything.
+ *   3. Origin/Referer matches the issuer (`originMatchesIssuer`). Same
+ *      shape as the DCR auto-approve gate (#199, #200): a same-origin POST
+ *      proves the form was rendered by *this hub*, not a forged page.
+ *
+ * `return_to` validation: the form embeds the original authorize URL so
+ * the post-approve redirect lands the operator back on `/oauth/authorize`
+ * with the now-approved client. We refuse anything that doesn't start with
+ * `/oauth/authorize?` — open-redirect defense, plus a hand-crafted form
+ * trying to use this endpoint as a generic redirect-after-approve gadget
+ * shouldn't succeed at smuggling an off-path target.
+ */
+export async function handleApproveClientPost(
+  db: Database,
+  req: Request,
+  deps: OAuthDeps,
+): Promise<Response> {
+  const form = await req.formData();
+  const formCsrf = form.get(CSRF_FIELD_NAME);
+  if (!verifyCsrfToken(req, typeof formCsrf === "string" ? formCsrf : null)) {
+    return htmlError(
+      "Invalid form submission",
+      "The form's CSRF token did not match. Reload the page and try again.",
+      403,
+    );
+  }
+  const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
+  if (!session) {
+    return htmlError(
+      "Sign in required",
+      "You must be signed in to this hub to approve an app. Sign in and try again.",
+      401,
+    );
+  }
+  if (!originMatchesIssuer(req, deps.issuer)) {
+    return htmlError(
+      "Cross-origin request rejected",
+      "The approve form must be submitted from this hub's own origin.",
+      403,
+    );
+  }
+  const clientId = String(form.get("client_id") ?? "");
+  if (!clientId) {
+    return htmlError("Invalid form submission", "Missing client_id.", 400);
+  }
+  const client = getClient(db, clientId);
+  if (!client) {
+    return htmlError("Unknown application", "This client_id is not registered with this hub.", 404);
+  }
+  // Validate return_to BEFORE the DB mutation: if an authenticated operator
+  // submits a hand-crafted form with a bad return_to, we refuse without
+  // committing the client to `approved`. Practical risk is low (all three
+  // belts already passed), but ordering matters — validate, then mutate.
+  const returnTo = String(form.get("return_to") ?? "");
+  if (!isSafeAuthorizeReturnTo(returnTo)) {
+    return htmlError(
+      "Invalid form submission",
+      "The return_to value is not a hub-relative /oauth/authorize URL.",
+      400,
+    );
+  }
+  approveClient(db, clientId);
+  return redirectResponse(returnTo);
+}
+
+/**
+ * Validate a form-submitted `return_to` value. Must be a hub-relative URL
+ * (no scheme, no double-slash) targeting `/oauth/authorize` with a query
+ * string — anything else is either an open-redirect attempt or a misuse of
+ * the endpoint. Empty string is rejected (the form always supplies one).
+ */
+function isSafeAuthorizeReturnTo(value: string): boolean {
+  if (!value) return false;
+  // Reject scheme-relative ("//evil.example/foo") and absolute URLs. Only
+  // single-slash root-relative paths are allowed.
+  if (!value.startsWith("/") || value.startsWith("//")) return false;
+  // Must target the authorize endpoint with a query string. The OAuth flow
+  // re-enters via GET /oauth/authorize?<original-params>; anything off-path
+  // is a misuse.
+  return value.startsWith("/oauth/authorize?");
 }
 
 function paramsFromForm(form: Awaited<ReturnType<Request["formData"]>>): AuthorizeFormParams {
