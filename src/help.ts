@@ -44,9 +44,9 @@ Services:
 What it does:
   1. bun add -g @openparachute/<service>[@<tag>]
   2. run any service-specific init (e.g. \`parachute-vault init\`)
-  3. assign a canonical port (1939–1949) and write \`PORT=<port>\` into
-     \`~/.parachute/<service>/.env\`. Idempotent — an existing PORT wins, so
-     re-installs and operator-edited ports survive across upgrades.
+  3. assign a canonical port (1939–1949) and reflect it in
+     \`~/.parachute/services.json\` — the single source of truth at boot
+     (services follow a 4-tier resolvePort ladder; services.json wins).
   4. verify the service registered itself in ~/.parachute/services.json
   5. for scribe in a TTY: prompt for transcription provider + API key
      (or take \`--scribe-provider\` / \`--scribe-key\`)

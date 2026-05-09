@@ -1,23 +1,32 @@
-import { parseEnvFile, upsertEnvLine, writeEnvFile } from "./env-file.ts";
 import { CANONICAL_PORT_MAX, CANONICAL_PORT_MIN, PORT_RESERVATIONS } from "./service-spec.ts";
 
 /**
- * The CLI is the port authority for Parachute services. At install time it
- * picks a port for each service, writes `PORT=<port>` into the service's
- * `~/.parachute/<svc>/.env`, and reflects the chosen port in services.json.
- * Services keep a compiled-in fallback (e.g. vault → 1940) so a stand-alone
- * `bun run` still works, but the CLI's PORT env var wins on installs it
- * manages.
+ * The hub is the port authority for Parachute services. At install time it
+ * picks a port for each service and reflects the chosen port in
+ * `services.json`. That manifest is the single source of truth at boot
+ * (parachute-scribe#41 / parachute-agent#146 / parachute-agent#148): each
+ * service reads `services.json` first and only falls through to lower-tier
+ * sources (its own config, the bare `PORT` env, the compiled-in canonical
+ * default) when the manifest doesn't pin a port. So writing PORT into the
+ * service's `.env` is no longer load-bearing — services.json wins.
+ *
+ * Pre-hub#206, install also wrote `PORT=<port>` into `~/.parachute/<svc>/.env`
+ * and preserved any pre-existing value across re-installs ("operator-edited
+ * port survives upgrade"). Post-#206 (option A from the design discussion):
+ * we stop writing PORT to `.env` entirely. The duplicate state was at best
+ * dead weight and at worst a source of drift — operators editing
+ * `services.json` would get re-stamped by a stale `.env` PORT on the next
+ * `parachute install`. Existing `.env` PORT lines stay where they are
+ * (harmless — service-side resolvePort reads services.json first; the bare
+ * PORT env tier is the lowest priority).
  *
  * Why up-front assignment instead of detect-on-collision-at-boot:
  *   - Two services racing to bind the same port produces an opaque "address in
- *     use" deep inside one of them. Assigning at install lets the CLI keep
+ *     use" deep inside one of them. Assigning at install lets the hub keep
  *     a single coherent picture of who owns what.
  *   - The hub's reverse-proxy targets are computed from services.json. If a
  *     service silently falls back to a different port at runtime, the hub
  *     proxies to a dead port and the user sees a 502 with no explanation.
- *   - Re-installs stay idempotent: the existing `PORT=` in .env wins, so a
- *     user who edited their port keeps it across upgrades.
  */
 
 export type AssignmentSource = "canonical" | "fallback-in-range" | "fallback-out-of-range";
@@ -72,8 +81,6 @@ export function assignPort(
 }
 
 export interface AssignServicePortOpts {
-  /** Path to the service's `.env` file. */
-  readonly envPath: string;
   /** Canonical default for this service, or undefined for third-party. */
   readonly canonical?: number;
   /** Ports we already know to be taken. */
@@ -82,41 +89,27 @@ export interface AssignServicePortOpts {
 
 export interface AssignServicePortResult {
   readonly port: number;
-  /** "preserved" when an existing PORT in .env was kept; otherwise the
-   *  source from `assignPort`. */
-  readonly source: "preserved" | AssignmentSource;
-  /** True when we wrote PORT into .env on this call. */
-  readonly written: boolean;
+  readonly source: AssignmentSource;
   /** Warning to surface to the user, if any. */
   readonly warning?: string;
 }
 
 /**
- * Reconcile a service's PORT with its `.env`. Idempotent:
- *   - If PORT is already set in .env, preserve it (`source: "preserved"`).
- *     Re-installs and user-edited ports survive across upgrades.
- *   - Otherwise call `assignPort` and write `PORT=<port>` into .env.
+ * Assign a port for a service at install time.
  *
- * Reads only the value of PORT from .env; everything else is round-tripped
- * untouched via `parseEnvFile` / `upsertEnvLine` / `writeEnvFile`.
+ * As of hub#206 this is a thin wrapper over `assignPort`: services.json is
+ * the source of truth for service ports (parachute-scribe#41 /
+ * parachute-agent#146 / parachute-agent#148 / parachute-patterns#45), so the
+ * install path no longer touches the service's `.env`. The wrapper still
+ * exists to give the install path a stable seam — `collectOccupiedPorts`
+ * feeds into the same shape regardless of how the underlying picker
+ * evolves — and to keep the warning return path centralized.
  */
 export function assignServicePort(opts: AssignServicePortOpts): AssignServicePortResult {
-  const env = parseEnvFile(opts.envPath);
-  const existing = env.values.PORT;
-  if (existing !== undefined && /^[1-9]\d{0,4}$/.test(existing)) {
-    const port = Number(existing);
-    if (port > 0 && port < 65536) {
-      return { port, source: "preserved", written: false };
-    }
-  }
-
   const assignment = assignPort(opts.canonical, opts.occupied);
-  const nextLines = upsertEnvLine(env.lines, "PORT", String(assignment.port));
-  writeEnvFile(opts.envPath, nextLines);
   const result: AssignServicePortResult = {
     port: assignment.port,
     source: assignment.source,
-    written: true,
   };
   if (assignment.warning) {
     return { ...result, warning: assignment.warning };

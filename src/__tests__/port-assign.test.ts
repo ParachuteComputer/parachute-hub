@@ -74,103 +74,92 @@ describe("assignPort (pure)", () => {
   });
 });
 
-describe("assignServicePort (.env round-trip)", () => {
-  test("preserves an existing PORT in .env (idempotent re-install)", () => {
-    const { dir, cleanup } = makeTempDir();
-    try {
-      const envPath = join(dir, ".env");
-      writeFileSync(envPath, "PORT=1944\nOTHER=keepme\n");
-      const result = assignServicePort({
-        envPath,
-        canonical: 1940,
-        // Even though canonical is free, the existing .env wins.
-        occupied: [],
-      });
-      expect(result.port).toBe(1944);
-      expect(result.source).toBe("preserved");
-      expect(result.written).toBe(false);
-      // File untouched — no rewrite means OTHER stays as-is.
-      const text = readFileSync(envPath, "utf8");
-      expect(text).toContain("PORT=1944");
-      expect(text).toContain("OTHER=keepme");
-    } finally {
-      cleanup();
-    }
-  });
+describe("assignServicePort (hub#206 — services.json is authoritative)", () => {
+  // Post-hub#206 assignServicePort is a thin wrapper over assignPort: the
+  // install path no longer touches the service's .env, since services.json
+  // is the single source of truth and the duplicate state caused drift on
+  // re-install. These tests pin the new contract:
+  //   1. The function returns the assigned port + source/warning.
+  //   2. It does not write to .env. Pre-existing .env files are untouched
+  //      (no PORT line added, no PORT line removed, no other lines mutated).
+  //   3. There's no "preserved" source — a stale .env PORT does NOT survive
+  //      a re-install (operators edit services.json now).
 
-  test("writes PORT into a fresh .env when canonical is free", () => {
+  test("returns canonical when free, does not touch .env", () => {
     const { dir, cleanup } = makeTempDir();
     try {
       const envPath = join(dir, "subdir", ".env");
       const result = assignServicePort({
-        envPath,
         canonical: 1940,
         occupied: [],
       });
       expect(result.port).toBe(1940);
       expect(result.source).toBe("canonical");
-      expect(result.written).toBe(true);
       expect(result.warning).toBeUndefined();
-      expect(existsSync(envPath)).toBe(true);
-      expect(readFileSync(envPath, "utf8")).toContain("PORT=1940");
+      // No .env file gets created — subdir doesn't even exist.
+      expect(existsSync(envPath)).toBe(false);
     } finally {
       cleanup();
     }
   });
 
-  test("writes a fallback PORT and surfaces the warning when canonical is occupied", () => {
+  test("does NOT preserve a pre-existing PORT in .env (services.json is authoritative)", () => {
+    // Pre-hub#206 a stale `.env` PORT survived a re-install — operators
+    // editing services.json would get re-stamped by the .env. Post-#206
+    // services.json wins; the .env PORT is ignored at install time and
+    // also at boot (per the 4-tier ladder in scribe/agent).
     const { dir, cleanup } = makeTempDir();
     try {
       const envPath = join(dir, ".env");
+      const before = "PORT=1944\nOTHER=keepme\n";
+      writeFileSync(envPath, before);
       const result = assignServicePort({
-        envPath,
+        canonical: 1940,
+        occupied: [],
+      });
+      // We assigned the canonical port, NOT the stale 1944 from .env.
+      expect(result.port).toBe(1940);
+      expect(result.source).toBe("canonical");
+      // The .env file is bit-for-bit untouched — PORT line and other lines
+      // both stay. (No new PORT line written, no existing PORT rewritten.)
+      const after = readFileSync(envPath, "utf8");
+      expect(after).toBe(before);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("returns fallback port and warning when canonical is occupied; .env untouched", () => {
+    const { dir, cleanup } = makeTempDir();
+    try {
+      const envPath = join(dir, ".env");
+      // Pre-existing .env with non-PORT content.
+      const before = "FOO=bar\n";
+      writeFileSync(envPath, before);
+      const result = assignServicePort({
         canonical: 1940,
         occupied: [1940],
       });
       expect(result.port).toBe(1944);
       expect(result.source).toBe("fallback-in-range");
-      expect(result.written).toBe(true);
       expect(result.warning).toMatch(/canonical port 1940 is in use/);
-      expect(readFileSync(envPath, "utf8")).toContain("PORT=1944");
+      // .env stays bit-for-bit identical.
+      expect(readFileSync(envPath, "utf8")).toBe(before);
     } finally {
       cleanup();
     }
   });
 
-  test("ignores a non-numeric PORT and assigns a fresh one", () => {
+  test("third-party (no canonical) gets first reservation slot; no .env created", () => {
     const { dir, cleanup } = makeTempDir();
     try {
       const envPath = join(dir, ".env");
-      writeFileSync(envPath, "PORT=garbage\n");
       const result = assignServicePort({
-        envPath,
-        canonical: 1940,
         occupied: [],
       });
-      expect(result.port).toBe(1940);
-      expect(result.written).toBe(true);
-      // The garbage value got upserted to a real number.
-      expect(readFileSync(envPath, "utf8")).toContain("PORT=1940");
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("preserves surrounding lines on rewrite", () => {
-    const { dir, cleanup } = makeTempDir();
-    try {
-      const envPath = join(dir, ".env");
-      writeFileSync(envPath, "FOO=bar\nBAZ=qux\n");
-      const result = assignServicePort({
-        envPath,
-        canonical: 1940,
-        occupied: [],
-      });
-      expect(result.written).toBe(true);
-      const text = readFileSync(envPath, "utf8");
-      expect(text).toContain("FOO=bar");
-      expect(text).toContain("BAZ=qux");
-      expect(text).toContain("PORT=1940");
+      expect(result.port).toBe(1944);
+      expect(result.source).toBe("fallback-in-range");
+      expect(existsSync(envPath)).toBe(false);
     } finally {
       cleanup();
     }

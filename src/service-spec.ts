@@ -19,20 +19,29 @@ import type { ServiceEntry } from "./services-manifest.ts";
  * (see hub-control.ts) — if something else is on 1939 we fail loudly rather
  * than walking up into a service's slot.
  *
- * **CLI is the port authority.** `parachute install <svc>` picks the port at
- * install time and writes `PORT=<port>` into `~/.parachute/<svc>/.env`.
- * lifecycle.start merges that .env into the spawn env, so the next daemon
- * boot binds the port the CLI assigned. Algorithm (see port-assign.ts):
+ * **Hub is the port authority.** `parachute install <svc>` picks the port
+ * at install time and reflects it in `services.json`. Algorithm (see
+ * port-assign.ts):
  *
  *   1. Prefer the canonical slot (`spec.seedEntry().port`).
  *   2. On collision, walk the unassigned range (1944–1949 today).
  *   3. Range exhausted: assign past 1949 with a warning.
  *
- * Idempotent: an existing `PORT=` in .env wins, so re-installs and
- * operator-edited ports survive across upgrades. Services keep their
- * compiled-in fallbacks (vault → 1940 etc.) so a stand-alone `bun run`
- * still works without a CLI-managed .env, but the CLI's PORT wins on any
- * install it manages.
+ * `services.json` is the single source of truth at boot: each service
+ * follows a 4-tier resolvePort ladder (services.json → service config →
+ * bare PORT env → compiled-in canonical default), per parachute-scribe#41,
+ * parachute-agent#146, parachute-agent#148, and parachute-patterns#45.
+ * Pre-hub#206 the install path also wrote `PORT=<port>` into the service's
+ * `~/.parachute/<svc>/.env`; post-#206 it doesn't — services.json wins,
+ * the duplicate `.env` PORT was at best dead weight and at worst a source
+ * of drift on re-install (a stale `.env` PORT would re-stamp services.json
+ * even after an operator had fixed it).
+ *
+ * Operator override is now "edit services.json" (or `parachute config`
+ * once that lands), not "edit `.env`". Pre-#206 stale `.env` PORT lines on
+ * existing operator machines stay where they are — harmless, since the
+ * boot-time ladder reads services.json before falling through to the bare
+ * PORT env tier — and future installs no longer touch them.
  *
  * **No speculative reservations.** Future first-party modules claim a slot
  * the moment they ship, not before — pre-reservation for unbuilt things has

@@ -264,9 +264,11 @@ describe("install", () => {
 
   test("CLI overrides a non-canonical port written by init when canonical is free", async () => {
     // Pre-#53 the CLI deferred to whatever port the service's init wrote
-    // (e.g. 5173, Vite's dev default for notes). With CLI-as-port-authority
-    // the canonical slot wins when free: the manifest is updated and the
-    // .env carries PORT=<canonical> so the next daemon boot binds it.
+    // (e.g. 5173, Vite's dev default for notes). With hub-as-port-authority
+    // the canonical slot wins when free: services.json is updated to the
+    // canonical port (post-hub#206 the install path no longer touches .env;
+    // services.json is the single source of truth at boot per the 4-tier
+    // resolvePort ladder in scribe/agent).
     const { path, configDir, cleanup } = makeTempPath();
     try {
       const logs: string[] = [];
@@ -1047,11 +1049,14 @@ describe("install", () => {
     }
   });
 
-  // CLI-as-port-authority (#53). Install assigns the service's port up front
-  // and writes `PORT=<port>` into `<configDir>/<svc>/.env`. lifecycle.start
-  // merges that .env into spawn env, so the next daemon boot binds the port
-  // the CLI picked.
-  test("install writes PORT=<canonical> to .env when the slot is free", async () => {
+  // Hub-as-port-authority (#53), services.json-is-authoritative (#206).
+  // Install picks the service's port up front and reflects it in
+  // services.json. Pre-#206 it also wrote `PORT=<port>` into the service's
+  // `.env`; post-#206 it doesn't — services.json is the single source of
+  // truth at boot per the 4-tier resolvePort ladder in scribe#41 / agent#146
+  // / agent#148, so the duplicate `.env` PORT was at best dead weight and
+  // at worst a source of drift on re-install.
+  test("install reflects canonical port in services.json without writing PORT to .env (hub#206)", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       const code = await install("vault", {
@@ -1064,34 +1069,38 @@ describe("install", () => {
         log: () => {},
       });
       expect(code).toBe(0);
-      const envText = readFileSync(join(configDir, "vault", ".env"), "utf8");
-      expect(envText).toContain("PORT=1940");
+      // services.json is authoritative — that's where the port lives.
+      const entry = findService("parachute-vault", path);
+      expect(entry?.port).toBe(1940);
+      // .env should NOT have a PORT line. The directory may not even
+      // exist (nothing in this test path writes to the service's config
+      // dir); if it does, the file shouldn't carry PORT.
+      const envPath = join(configDir, "vault", ".env");
+      if (existsSync(envPath)) {
+        expect(readFileSync(envPath, "utf8")).not.toMatch(/^PORT=/m);
+      }
     } finally {
       cleanup();
     }
   });
 
-  test("install preserves a pre-existing PORT in .env across re-installs", async () => {
+  test("install does NOT preserve a pre-existing PORT in .env across re-installs (hub#206)", async () => {
+    // Pre-#206 a stale `.env` PORT survived a re-install: an operator
+    // who edited services.json to fix a duplicate would get re-stamped
+    // by the .env on the next `parachute install`. Post-#206 services.json
+    // is authoritative; the install path leaves `.env` alone but
+    // services.json reflects the freshly-assigned port. The stale `.env`
+    // PORT is harmless because the boot-time resolvePort ladder reads
+    // services.json before falling through to the bare PORT env tier.
     const { path, configDir, cleanup } = makeTempPath();
     try {
-      // First install assigns canonical 1940.
-      await install("vault", {
-        runner: async () => 0,
-        manifestPath: path,
-        configDir,
-        startService: async () => 0,
-        isLinked: () => false,
-        portProbe: async () => false,
-        log: () => {},
-      });
-      // Hand-edit .env to use a custom port (operator override).
       const envPath = join(configDir, "vault", ".env");
-      const original = readFileSync(envPath, "utf8");
-      const edited = original.replace("PORT=1940", "PORT=1947");
-      const { writeFileSync } = await import("node:fs");
-      writeFileSync(envPath, edited);
+      const { mkdirSync, writeFileSync } = await import("node:fs");
+      mkdirSync(join(configDir, "vault"), { recursive: true });
+      // Pre-existing .env with an operator-edited (now-stale) PORT.
+      const before = "PORT=1947\nOTHER=keepme\n";
+      writeFileSync(envPath, before);
 
-      // Second install must preserve the operator's choice, not stomp it.
       await install("vault", {
         runner: async () => 0,
         manifestPath: path,
@@ -1101,13 +1110,20 @@ describe("install", () => {
         portProbe: async () => false,
         log: () => {},
       });
-      expect(readFileSync(envPath, "utf8")).toContain("PORT=1947");
+
+      // services.json gets the freshly-assigned canonical port (1940),
+      // NOT the stale 1947 from .env.
+      const entry = findService("parachute-vault", path);
+      expect(entry?.port).toBe(1940);
+      // .env is bit-for-bit untouched: the stale PORT stays, OTHER stays,
+      // and we did NOT rewrite the file with a new PORT line.
+      expect(readFileSync(envPath, "utf8")).toBe(before);
     } finally {
       cleanup();
     }
   });
 
-  test("install falls back inside the canonical range when the slot is occupied", async () => {
+  test("install falls back inside the canonical range when the slot is occupied (hub#206 — no .env write)", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       // Pretend something else is on 1940.
@@ -1133,11 +1149,14 @@ describe("install", () => {
       });
       expect(code).toBe(0);
       // First reservation slot is 1944.
-      const envText = readFileSync(join(configDir, "vault", ".env"), "utf8");
-      expect(envText).toContain("PORT=1944");
       const entry = findService("parachute-vault", path);
       expect(entry?.port).toBe(1944);
       expect(logs.join("\n")).toMatch(/canonical port 1940 is in use/);
+      // .env is not touched.
+      const envPath = join(configDir, "vault", ".env");
+      if (existsSync(envPath)) {
+        expect(readFileSync(envPath, "utf8")).not.toMatch(/^PORT=/m);
+      }
     } finally {
       cleanup();
     }

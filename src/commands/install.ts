@@ -545,28 +545,26 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     }
   }
 
-  // CLI-as-port-authority (#53): pick the service's port now and persist it
-  // via `~/.parachute/<svc>/.env`. lifecycle.start merges that .env into the
-  // spawn env (PR #50), so the next daemon boot binds the port we picked.
-  // Idempotent — an existing PORT in .env wins, so re-installs and
-  // user-edited ports survive across upgrades. Compiled-in service-side
-  // fallbacks (vault → 1940 etc.) stay; this just adds a CLI-managed
-  // override.
+  // Hub-as-port-authority (#53): pick the service's port now and reflect it
+  // in services.json. Pre-hub#206 the install path also wrote `PORT=<port>`
+  // into the service's `.env`; post-#206 (option A) services.json is the
+  // single source of truth — services follow the 4-tier resolvePort ladder
+  // (services.json → service config → bare PORT env → compiled-in default,
+  // per parachute-scribe#41 / parachute-agent#146 / parachute-agent#148 /
+  // parachute-patterns#45), so the duplicate `.env` PORT was at best dead
+  // weight and at worst a source of drift on re-install. Existing `.env`
+  // PORT lines on operator machines stay where they are — harmless — and
+  // future installs no longer touch them.
   const preInitEntry = findService(entryName, manifestPath);
   const probe = opts.portProbe ?? defaultPortProbe;
   const occupied = await collectOccupiedPorts(manifestPath, entryName, preInitEntry?.port, probe);
-  const envPath = join(configDir, short, ".env");
   const canonicalPort = spec.seedEntry?.().port ?? preInitEntry?.port;
   const portResult = assignServicePort({
-    envPath,
     canonical: canonicalPort,
     occupied,
   });
   if (portResult.warning) {
     log(`⚠ ${portResult.warning}`);
-  }
-  if (portResult.written) {
-    log(`Wrote PORT=${portResult.port} to ${envPath}.`);
   }
 
   // Find-or-seed the manifest entry. Re-read after the seed write so a silent

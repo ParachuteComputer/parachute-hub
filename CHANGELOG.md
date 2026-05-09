@@ -2,6 +2,32 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.7-rc.6] - 2026-05-08
+
+Stop writing `PORT=` to service `.env` files at install time. Services.json is authoritative for service ports — services follow a 4-tier `resolvePort` ladder (services.json → service config → bare PORT env → compiled-in canonical default) per parachute-scribe#41 / parachute-agent#146 / parachute-agent#148, codified at the ecosystem level in parachute-patterns#45 — so the duplicate `.env` PORT was at best dead weight and at worst a source of drift on re-install. Existing `.env` files keep their stale PORT (harmless — service-side `resolvePort` reads services.json first; the bare PORT env tier is the lowest priority). Closes #206.
+
+### Fixed
+
+- **`assignServicePort` no longer writes `PORT=<port>` to the service's `.env` (closes #206).** Pre-#206 the install path read the service's `.env`, preserved any pre-existing PORT (`source: "preserved"`), and otherwise wrote `PORT=<assigned>` into the file via `parseEnvFile` / `upsertEnvLine` / `writeEnvFile`. Post-#206 the function is a thin wrapper over `assignPort`: it picks a port (canonical → unassigned reservation → past-range with warning) and returns `{ port, source, warning? }`. The `.env` is not read, not created, not mutated. Operators who edit `services.json` to fix a duplicate-port collision (e.g. after the read-time #204 / write-time #205 gates flag one) no longer get re-stamped by a stale `.env` PORT on the next `parachute install`. The `installDir`-stamping, services.json seed/update, and auto-wire / scribe-provider code paths in `commands/install.ts` are unchanged — they still drive services.json to the freshly-assigned port. The "Wrote PORT=… to <envPath>" log line goes away with the write; the assigned port surfaces via the existing "✓ <name> registered on port <n>" line and any fallback warning. Picked option A from the hub#206 design conversation; alternatives B (warn on disagreement, keep `.env` precedence) and C (interactive reconcile) added behavioral surface for what's now a pure-historical concern — services.json wins, full stop.
+
+### Added
+
+- **Tests: `assignServicePort` rewritten to pin the new contract (`src/__tests__/port-assign.test.ts`, new `assignServicePort (hub#206 — services.json is authoritative)` describe block, 4 cases).** Returns canonical when free (no .env created); does NOT preserve a pre-existing PORT in `.env` (the function returns the canonical assignment AND leaves the file bit-for-bit identical — no PORT rewrite, no other-line mutation); returns fallback port + warning when canonical is occupied (`.env` still bit-for-bit untouched); third-party with no canonical gets the first reservation slot, no `.env` created. The pre-#206 `.env` round-trip cases (`preserves an existing PORT`, `writes PORT into a fresh .env`, `writes a fallback PORT`, `ignores a non-numeric PORT`, `preserves surrounding lines on rewrite`) are intentionally gone — they tested behavior that no longer exists.
+- **Tests: `install.test.ts` cases asserting `.env` PORT now invert (3 updated cases).** `install reflects canonical port in services.json without writing PORT to .env (hub#206)` — services.json carries 1940; if `<configDir>/vault/.env` exists at all, it doesn't have a PORT line. `install does NOT preserve a pre-existing PORT in .env across re-installs (hub#206)` — pre-existing `PORT=1947` in `.env` is left bit-for-bit untouched, services.json gets the freshly-assigned canonical 1940 (the operator's now-stale `.env` PORT is harmless because the boot-time ladder reads services.json first). `install falls back inside the canonical range when the slot is occupied (hub#206 — no .env write)` — services.json carries the fallback 1944, `.env` stays absent / has no PORT line, the canonical-is-in-use warning still surfaces.
+
+### Doc
+
+- **`port-assign.ts` / `service-spec.ts` / `help.ts` doc comments rewritten.** Pre-#206 wording ("CLI is the port authority… writes `PORT=<port>` into `~/.parachute/<svc>/.env`… idempotent, an existing PORT in .env wins") was load-bearing for the old behavior; the new wording explains that `services.json` is the single source of truth at boot per the 4-tier ladder, that operator override is now "edit services.json" (or `parachute config` once that lands), and that pre-#206 stale `.env` PORT lines on existing operator machines are harmless and untouched.
+
+### Migration
+
+- **Nothing for operators to do.** Stale `PORT=` lines in existing `~/.parachute/<svc>/.env` files are ignored by services that follow the documented 4-tier ladder (scribe ≥ #41, agent ≥ #146 / #148, future modules per parachute-patterns#45). They can be left alone or trimmed by hand; either is fine. Future `parachute install` runs will not re-add or rewrite them.
+
+### Out of scope
+
+- **`parachute doctor` (issue hub#203).** Recovery / self-repair tool for misconfigured `services.json` is its own design discussion and explicitly deferred indefinitely per the 2026-05-08 design call. This PR doesn't touch it.
+- **The DCR doc in patterns#46.** Separate parallel work on the patterns repo, not in scope here.
+
 ## [0.5.7-rc.5] - 2026-05-08
 
 Inline "Approve this app" form on the pending-DCR-client page when the request carries an authenticated operator session. Closes the cross-origin SPA recovery gap left by #199/#200's same-origin DCR auto-approve: a fresh client_id minted by an SPA on a different origin (notes-on-tailnet talking to hub-on-localhost, or any first-load with cleared browser state) lands `pending`, hits "App not yet approved" on `/oauth/authorize`, and previously had no in-flow recovery — operator had to drop to a terminal and run `parachute auth approve-client <id>`. Now: one click in the same browser tab approves and re-enters the OAuth flow at consent. Picked over A2 (SameSite=None auto-approve) and A3 (popup-relay) per the 2026-05-08 design conversation — boring, secure, honest UX.
