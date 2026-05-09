@@ -97,6 +97,33 @@ export interface ErrorViewProps {
   status: number;
 }
 
+/**
+ * Props for the "App not yet approved" view rendered when an unapproved
+ * client lands on `/oauth/authorize`. When `session` is true the operator is
+ * authenticated to this hub from the browser making the request, so we render
+ * an inline approve form (closes #208). When false we fall back to the
+ * pre-#208 CLI-only message.
+ */
+export interface ApprovePendingViewProps {
+  /** Display name to show — falls back to client_id when no name was supplied at DCR. */
+  clientName: string;
+  clientId: string;
+  redirectUris: string[];
+  /** Scopes parsed from the original `/oauth/authorize?scope=` query param. */
+  requestedScopes: string[];
+  /**
+   * When set, render the inline approve form. The form posts to
+   * `/oauth/authorize/approve` with the CSRF token + a `return_to` URL the
+   * server will redirect to after the approve commits — the original
+   * `/oauth/authorize?...` URL so the OAuth flow re-enters with the now-
+   * approved client and lands on the consent screen.
+   */
+  approveForm?: {
+    csrfToken: string;
+    returnTo: string;
+  };
+}
+
 export function renderLogin(props: LoginViewProps): string {
   const { params, errorMessage, csrfToken } = props;
   const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
@@ -202,6 +229,79 @@ function renderVaultPicker(picker: VaultPicker): string {
           <div class="vault-options">${options}
           </div>
         </section>`;
+}
+
+/**
+ * "App not yet approved" page (#74). When the request carries a valid
+ * operator session (#208), render the inline approve form so one click lands
+ * the client as `approved` and re-enters the OAuth flow at consent. Without
+ * a session, fall back to the original CLI-only message — anyone hitting
+ * /oauth/authorize unauthenticated to the hub itself can't be trusted to
+ * approve a DCR client from the browser, so they need to drop to a terminal
+ * and run `parachute auth approve-client <id>`.
+ *
+ * The CLI fallback hint is shown in BOTH branches: a button-equipped operator
+ * may still want the CLI invocation handy (different machine, scriptable
+ * context). The button is the easy path; the CLI is always-available.
+ */
+export function renderApprovePending(props: ApprovePendingViewProps): string {
+  const { clientName, clientId, redirectUris, requestedScopes, approveForm } = props;
+  const redirectList = redirectUris.map((u) => `<li><code>${escapeHtml(u)}</code></li>`).join("");
+  const scopeRows =
+    requestedScopes.length === 0
+      ? `<li class="scope scope-empty">No scopes requested — the app gets a session token only.</li>`
+      : requestedScopes.map(renderScopeRow).join("\n");
+  const formSection = approveForm
+    ? `
+      <form method="POST" action="/oauth/authorize/approve" class="auth-form approve-form">
+        ${renderCsrfHiddenInput(approveForm.csrfToken)}
+        <input type="hidden" name="client_id" value="${escapeHtml(clientId)}" />
+        <input type="hidden" name="return_to" value="${escapeHtml(approveForm.returnTo)}" />
+        <button type="submit" class="btn btn-primary">Approve and continue</button>
+      </form>
+      <p class="approve-cli-hint">
+        Or run <code>parachute auth approve-client ${escapeHtml(clientId)}</code> from a terminal.
+      </p>`
+    : `
+      <p class="approve-cli-hint">
+        Ask the operator to run <code>parachute auth approve-client ${escapeHtml(clientId)}</code>
+        from a terminal, then try again.
+      </p>`;
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        <div class="brand">
+          <span class="brand-mark">⌬</span>
+          <span class="brand-name">Parachute</span>
+        </div>
+        <h1>App not yet approved</h1>
+        <p class="subtitle">
+          ${escapeHtml(clientName)} is registered with this hub but hasn't been approved yet.
+          Review the details below before approving.
+        </p>
+      </div>
+      <section class="approve-meta">
+        <h2 class="scopes-title">Application</h2>
+        <p class="approve-meta-row">
+          <span class="approve-meta-label">name</span>
+          <code class="approve-meta-value">${escapeHtml(clientName)}</code>
+        </p>
+        <p class="approve-meta-row">
+          <span class="approve-meta-label">client_id</span>
+          <code class="approve-meta-value">${escapeHtml(clientId)}</code>
+        </p>
+        <div class="approve-meta-row approve-meta-row-block">
+          <span class="approve-meta-label">redirect_uris</span>
+          <ul class="approve-redirect-list">${redirectList}</ul>
+        </div>
+      </section>
+      <section class="scopes">
+        <h2 class="scopes-title">Permissions requested</h2>
+        <ul class="scope-list">${scopeRows}</ul>
+      </section>
+      ${formSection}
+    </div>`;
+  return baseDocument("App not yet approved", body);
 }
 
 export function renderError(props: ErrorViewProps): string {
@@ -541,6 +641,73 @@ const STYLES = `
   }
   .vault-picker-empty .picker-help { color: ${PALETTE.danger}; }
   .vault-picker-empty .picker-help code { color: ${PALETTE.fg}; }
+
+  .approve-meta {
+    margin: 0 0 1.25rem;
+    padding: 0.75rem 0.85rem;
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    background: ${PALETTE.bgSoft};
+  }
+  .approve-meta .scopes-title { margin-bottom: 0.5rem; }
+  .approve-meta-row {
+    margin: 0 0 0.4rem;
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+  .approve-meta-row:last-child { margin-bottom: 0; }
+  .approve-meta-row-block { flex-direction: column; gap: 0.25rem; }
+  .approve-meta-label {
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.7rem;
+    color: ${PALETTE.fgDim};
+  }
+  .approve-meta-value {
+    font-family: ${FONT_MONO};
+    font-size: 0.82rem;
+    background: ${PALETTE.cardBg};
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    color: ${PALETTE.fg};
+    word-break: break-all;
+  }
+  .approve-redirect-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .approve-redirect-list li code {
+    font-family: ${FONT_MONO};
+    font-size: 0.82rem;
+    background: ${PALETTE.cardBg};
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    color: ${PALETTE.fg};
+    word-break: break-all;
+  }
+  .approve-form { gap: 0; }
+  .approve-cli-hint {
+    margin-top: 1rem;
+    padding-top: 0.85rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+    color: ${PALETTE.fgMuted};
+    font-size: 0.85rem;
+  }
+  .approve-cli-hint code {
+    font-family: ${FONT_MONO};
+    font-size: 0.8rem;
+    background: ${PALETTE.bgSoft};
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    color: ${PALETTE.fg};
+    word-break: break-all;
+  }
 
   .badge {
     display: inline-block;
