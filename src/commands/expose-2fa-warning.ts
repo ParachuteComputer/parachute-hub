@@ -1,9 +1,9 @@
 /**
  * Public-exposure 2FA-enrollment warning (#186). Lands as the next layer of
- * defense after #188's `/admin/login` rate-limit floor: once the operator
- * brings up cloudflare or Tailscale Funnel, `/admin/login` is reachable from
- * the public internet on every layer admitting traffic. 2FA is the difference
- * between "password is the only wall" and "password + something-you-have."
+ * defense after #188's `/login` rate-limit floor: once the operator brings
+ * up cloudflare or Tailscale Funnel, `/login` is reachable from the public
+ * internet on every layer admitting traffic. 2FA is the difference between
+ * "password is the only wall" and "password + something-you-have."
  *
  * Why this is a warning, not a hard gate: hard-gating would surprise operators
  * mid-flow — they ran `parachute expose public` to expose, not to be told
@@ -71,8 +71,8 @@ export function printPublic2FAWarning(opts: Public2FAWarningOpts): boolean {
     return false;
   }
   log("");
-  log("⚠ 2FA is not enrolled. /admin is now reachable on the public internet");
-  log(`  (${opts.publicUrl}/admin/login). Anyone who guesses your password`);
+  log("⚠ 2FA is not enrolled. /login is now reachable on the public internet");
+  log(`  (${opts.publicUrl}/login). Anyone who guesses your password`);
   log("  is in. Strongly recommended:");
   log("");
   log("    parachute auth 2fa enroll");

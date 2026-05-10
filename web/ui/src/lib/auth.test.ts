@@ -47,7 +47,7 @@ describe("getHostAdminToken", () => {
     );
   });
 
-  it("on 401 calls window.location.replace with /admin/login?next=…", async () => {
+  it("on 401 calls window.location.replace with /login?next=…", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response("", { status: 401 })),
@@ -64,9 +64,7 @@ describe("getHostAdminToken", () => {
     void auth.getHostAdminToken();
     await new Promise((r) => setTimeout(r, 0));
 
-    expect(replace).toHaveBeenCalledWith(
-      `/admin/login?next=${encodeURIComponent("/vault/new?x=1")}`,
-    );
+    expect(replace).toHaveBeenCalledWith(`/login?next=${encodeURIComponent("/vault/new?x=1")}`);
   });
 
   it("dedupes concurrent in-flight mint requests", async () => {
