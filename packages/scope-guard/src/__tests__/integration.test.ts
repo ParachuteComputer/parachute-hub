@@ -20,7 +20,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../../../../src/hub-db.ts";
 import { pemToJwk } from "../../../../src/jwks.ts";
-import { signAccessToken } from "../../../../src/jwt-sign.ts";
+import {
+  listActiveRevocations,
+  recordTokenMint,
+  revokeTokenByJti,
+  signAccessToken,
+} from "../../../../src/jwt-sign.ts";
 import { getAllPublicKeys } from "../../../../src/signing-keys.ts";
 import { extractBearer, hasScope } from "../index";
 import { HubJwtError, createScopeGuard } from "../validate";
@@ -40,11 +45,15 @@ function startHarness(): Harness {
     port: 0,
     fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname !== "/.well-known/jwks.json") {
-        return new Response("not found", { status: 404 });
+      if (url.pathname === "/.well-known/jwks.json") {
+        const keys = getAllPublicKeys(db).map((k) => pemToJwk(k.publicKeyPem, k.kid));
+        return Response.json({ keys });
       }
-      const keys = getAllPublicKeys(db).map((k) => pemToJwk(k.publicKeyPem, k.kid));
-      return Response.json({ keys });
+      if (url.pathname === "/.well-known/parachute-revocation.json") {
+        const jtis = listActiveRevocations(db, new Date());
+        return Response.json({ generated_at: new Date().toISOString(), jtis });
+      }
+      return new Response("not found", { status: 404 });
     },
   });
   return {
@@ -148,5 +157,45 @@ describe("integration: real hub JWT through scope-guard", () => {
     }
     expect(caught?.code).toBe("audience");
     guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("revoked token via real hub revocation list → HubJwtError(code: 'revoked')", async () => {
+    const { token, jti, expiresAt } = await signAccessToken(h.db, {
+      sub: "user-1",
+      scopes: ["vault:work:read"],
+      audience: "vault.work",
+      clientId: "test-client",
+      issuer: h.origin,
+    });
+    // Register the mint, then revoke. Together these reproduce the path the
+    // hub takes for a CLI-minted access token that an operator later kills:
+    // `recordTokenMint` writes the row, `revokeTokenByJti` flips revoked_at,
+    // and `listActiveRevocations` (which the well-known endpoint serves)
+    // surfaces the jti to consumers.
+    recordTokenMint(h.db, {
+      jti,
+      createdVia: "cli_mint",
+      subject: "user-1",
+      clientId: "test-client",
+      scopes: ["vault:work:read"],
+      expiresAt,
+    });
+    expect(revokeTokenByJti(h.db, jti, new Date())).toBe(true);
+    expect(listActiveRevocations(h.db, new Date())).toContain(jti);
+
+    // Tight TTL so we don't depend on cache-staleness for this test.
+    const guard = createScopeGuard({ hubOrigin: h.origin, revocationTtlMs: 1 });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(token, { expectedAudience: "vault.work" });
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught).toBeInstanceOf(HubJwtError);
+    expect(caught?.code).toBe("revoked");
+    expect(caught?.message).toContain(jti);
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
   });
 });

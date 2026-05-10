@@ -1,6 +1,11 @@
 import { type JWTPayload, jwtVerify } from "jose";
 import { type JwksGetter, type JwksOptions, getOrCreateJwksGetter, resetCache } from "./jwks";
 import { parseScopes } from "./parse";
+import {
+  type RevocationCache,
+  type RevocationFetcher,
+  createRevocationCache,
+} from "./revocation-cache";
 
 /**
  * Hub-issued JWT validation, factored out of vault/scribe/parachute-agent's
@@ -46,7 +51,22 @@ export type HubJwtErrorCode =
   | "kid"
   | "jwks"
   | "audience"
-  | "shape";
+  | "shape"
+  /**
+   * The token's `jti` is in the hub's revocation list. The token has been
+   * intentionally retired by the operator (compromise cleanup, key rotation,
+   * etc.) — distinct from "we couldn't load the list," which is `revocation_unavailable`.
+   */
+  | "revoked"
+  /**
+   * Couldn't load the revocation list and have no last-good cache yet, so we
+   * fail-closed and reject. Operationally distinct from `revoked`: the token
+   * may be perfectly valid; the AS side has a problem (hub down, cold start,
+   * network blip). Operators chasing a regression need this discrimination
+   * at the moment of failure rather than seeing every cold-cache 401 look
+   * like an intentional revocation.
+   */
+  | "revocation_unavailable";
 
 /**
  * Single error class for all validation failures. Branch on `code` rather
@@ -84,6 +104,27 @@ export interface CreateScopeGuardOptions {
    * static keys) can use it to bypass the network entirely.
    */
   jwksGetter?: JwksGetter;
+
+  /**
+   * Inject a revocation-list fetcher. Tests use this to drive list contents
+   * (revoked / clear / failure) deterministically without needing a real
+   * `<origin>/.well-known/parachute-revocation.json` endpoint. Production
+   * uses the default fetcher (`globalThis.fetch` against the hub origin).
+   */
+  revocationFetcher?: RevocationFetcher;
+
+  /**
+   * Override the revocation cache TTL (ms). Tests use small values to
+   * exercise stale/refresh paths without sleeping. Defaults to 60s, matching
+   * hub's published `Cache-Control: max-age=60` on the revocation endpoint.
+   */
+  revocationTtlMs?: number;
+
+  /**
+   * Test seam for time used inside the revocation cache. Defaults to
+   * `Date.now`. Override to drive freshness windows deterministically.
+   */
+  revocationNow?: () => number;
 }
 
 export interface ValidateHubJwtOptions {
@@ -114,6 +155,13 @@ export interface ScopeGuard {
    * jose getter by re-fetching after `cacheMaxAge`).
    */
   resetJwksCache(): void;
+
+  /**
+   * Drop this guard's revocation-list cache. Tests use this to start cases
+   * from a clean fail-closed state; production callers shouldn't need it
+   * (the cache refreshes itself on TTL expiry).
+   */
+  resetRevocationCache(): void;
 }
 
 function resolveOrigin(input: string | (() => string)): string {
@@ -132,6 +180,24 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
   function pickGetter(origin: string): JwksGetter {
     if (injected) return injected;
     return getOrCreateJwksGetter(origin, jwksOpts);
+  }
+
+  // One revocation cache per guard, lazily bound to whatever the origin
+  // resolves to on first use. The hubOrigin resolver may layer env-var
+  // precedence (per CreateScopeGuardOptions); we honour that by binding the
+  // cache to the resolved value the first time it's needed and rebuilding
+  // if the origin ever changes (rare in practice — process-stable).
+  let revocation: { origin: string; cache: RevocationCache } | undefined;
+  function pickRevocationCache(origin: string): RevocationCache {
+    if (revocation && revocation.origin === origin) return revocation.cache;
+    const cache = createRevocationCache({
+      origin,
+      fetcher: opts.revocationFetcher,
+      ttlMs: opts.revocationTtlMs,
+      now: opts.revocationNow,
+    });
+    revocation = { origin, cache };
+    return cache;
   }
 
   return {
@@ -184,6 +250,33 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
       const clientIdRaw = (payload as { client_id?: unknown }).client_id;
       const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;
 
+      // Revocation enforcement runs LAST — only consulted if the JWT is
+      // otherwise valid. Cheaper checks (signature, iss, aud, expiry) reject
+      // first, so a bad signature never costs a network roundtrip. A token
+      // with no jti claim can't appear on any revocation list (lists are
+      // keyed by jti); we let it through. The hub always stamps jti on
+      // OAuth-issued tokens — only ad-hoc/legacy tokens lack one, and those
+      // are out of scope for revocation.
+      if (jti !== undefined) {
+        const cache = pickRevocationCache(origin);
+        const outcome = await cache.check(jti);
+        if (outcome === "revoked") {
+          // Surface the jti in the error message for operator audit visibility.
+          // Consumers translate this to a generic 401 for the unauthenticated
+          // caller; the jti is a server-side log artifact, not a response body.
+          throw new HubJwtError(
+            "revoked",
+            `hub JWT revoked: jti "${jti}" is in the revocation list`,
+          );
+        }
+        if (outcome === "unknown") {
+          throw new HubJwtError(
+            "revocation_unavailable",
+            "hub JWT cannot be validated: revocation list unavailable (no last-good cache)",
+          );
+        }
+      }
+
       return { sub: payload.sub, scopes, aud, jti, clientId };
     },
 
@@ -191,6 +284,11 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
       if (injected) return; // injected getter has no cache we own
       const origin = resolveOrigin(hubOrigin);
       resetCache(origin);
+    },
+
+    resetRevocationCache() {
+      if (revocation) revocation.cache.reset();
+      revocation = undefined;
     },
   };
 }

@@ -12,6 +12,13 @@ export { extractBearer, looksLikeJwt, parseScopes } from "./parse";
 export { hasScope } from "./scope";
 export type { JwksGetter, JwksOptions } from "./jwks";
 export {
+  REVOCATION_CACHE_TTL_MS,
+  defaultRevocationFetcher,
+  type RevocationCheckOutcome,
+  type RevocationFetcher,
+  type RevocationListBody,
+} from "./revocation-cache";
+export {
   createScopeGuard,
   HubJwtError,
   type CreateScopeGuardOptions,

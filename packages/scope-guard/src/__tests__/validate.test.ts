@@ -39,20 +39,28 @@ interface JwksFixture {
   stop: () => void;
   setKeys: (keys: Keypair[]) => void;
   setUnreachable: (down: boolean) => void;
+  setRevokedJtis: (jtis: string[]) => void;
+  setRevocationUnreachable: (down: boolean) => void;
 }
 
 function startJwksFixture(): JwksFixture {
   let keys: Keypair[] = [];
   let down = false;
+  let revokedJtis: string[] = [];
+  let revocationDown = false;
   const server = Bun.serve({
     port: 0,
     fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname !== "/.well-known/jwks.json") {
-        return new Response("not found", { status: 404 });
+      if (url.pathname === "/.well-known/jwks.json") {
+        if (down) return new Response("upstream down", { status: 503 });
+        return Response.json({ keys: keys.map((k) => k.publicJwk) });
       }
-      if (down) return new Response("upstream down", { status: 503 });
-      return Response.json({ keys: keys.map((k) => k.publicJwk) });
+      if (url.pathname === "/.well-known/parachute-revocation.json") {
+        if (revocationDown) return new Response("upstream down", { status: 503 });
+        return Response.json({ generated_at: new Date().toISOString(), jtis: revokedJtis });
+      }
+      return new Response("not found", { status: 404 });
     },
   });
   return {
@@ -63,6 +71,12 @@ function startJwksFixture(): JwksFixture {
     },
     setUnreachable: (v) => {
       down = v;
+    },
+    setRevokedJtis: (next) => {
+      revokedJtis = [...next];
+    },
+    setRevocationUnreachable: (v) => {
+      revocationDown = v;
     },
   };
 }
@@ -113,6 +127,8 @@ afterAll(() => {
 beforeEach(() => {
   fixture.setUnreachable(false);
   fixture.setKeys([kp]);
+  fixture.setRevokedJtis([]);
+  fixture.setRevocationUnreachable(false);
 });
 
 function makeGuard() {
@@ -346,5 +362,211 @@ describe("createScopeGuard — injected JWKS getter", () => {
     });
     // Should not throw; should not affect the injected getter's state.
     expect(() => guard.resetJwksCache()).not.toThrow();
+  });
+});
+
+describe("createScopeGuard — revocation enforcement", () => {
+  test("revoked jti → HubJwtError(code: 'revoked'), message includes jti", async () => {
+    fixture.setRevokedJtis(["jti-doomed"]);
+    const guard = makeGuard();
+    const token = await signJwt(kp, { iss: fixture.origin, jti: "jti-doomed" });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(token);
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught).toBeInstanceOf(HubJwtError);
+    expect(caught?.code).toBe("revoked");
+    expect(caught?.message).toMatch(/jti-doomed/);
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("clear jti → passes", async () => {
+    fixture.setRevokedJtis(["someone-else"]);
+    const guard = makeGuard();
+    const token = await signJwt(kp, { iss: fixture.origin, jti: "jti-fine" });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.jti).toBe("jti-fine");
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("revocation list unreachable + no last-good cache → 'revocation_unavailable'", async () => {
+    fixture.setRevocationUnreachable(true);
+    const guard = makeGuard();
+    const token = await signJwt(kp, { iss: fixture.origin });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(token);
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught?.code).toBe("revocation_unavailable");
+    expect(caught?.message).toMatch(/revocation list unavailable/);
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("revocation list unreachable but last-good cache exists → fail-open", async () => {
+    fixture.setRevokedJtis(["jti-x"]);
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      revocationTtlMs: 50, // small TTL so we can hit "stale" quickly
+    });
+
+    // Warm the cache with a successful fetch.
+    const warmupToken = await signJwt(kp, { iss: fixture.origin, jti: "jti-clear" });
+    expect((await guard.validateHubJwt(warmupToken)).jti).toBe("jti-clear");
+
+    // Hub goes down. After TTL elapses we'd refetch — verify fail-open uses
+    // the last-good list instead of throwing 'revocation_unavailable'.
+    fixture.setRevocationUnreachable(true);
+    await Bun.sleep(60);
+
+    // jti-x was in the last-good list → still rejected.
+    const revokedToken = await signJwt(kp, { iss: fixture.origin, jti: "jti-x" });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(revokedToken);
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught?.code).toBe("revoked");
+
+    // A clear jti still passes.
+    const stillClear = await signJwt(kp, { iss: fixture.origin, jti: "jti-fresh" });
+    expect((await guard.validateHubJwt(stillClear)).jti).toBe("jti-fresh");
+
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("check ordering: bad signature rejected without consulting revocation list", async () => {
+    let revocationCalls = 0;
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      revocationFetcher: async () => {
+        revocationCalls += 1;
+        return { generated_at: new Date().toISOString(), jtis: [] };
+      },
+    });
+    const otherKp = await makeKeypair("k1"); // same kid, different key
+    const token = await signJwt(otherKp, { iss: fixture.origin });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(token);
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught?.code).toBe("signature");
+    expect(revocationCalls).toBe(0);
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("check ordering: audience mismatch rejected without consulting revocation list", async () => {
+    let revocationCalls = 0;
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      revocationFetcher: async () => {
+        revocationCalls += 1;
+        return { generated_at: new Date().toISOString(), jtis: [] };
+      },
+    });
+    const token = await signJwt(kp, { iss: fixture.origin, aud: "vault.work" });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(token, { expectedAudience: "vault.personal" });
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught?.code).toBe("audience");
+    expect(revocationCalls).toBe(0);
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("check ordering: expired token rejected without consulting revocation list", async () => {
+    let revocationCalls = 0;
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      revocationFetcher: async () => {
+        revocationCalls += 1;
+        return { generated_at: new Date().toISOString(), jtis: [] };
+      },
+    });
+    const past = Math.floor(Date.now() / 1000) - 10;
+    const token = await signJwt(kp, { iss: fixture.origin, expiresAtSeconds: past });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(token);
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught?.code).toBe("expired");
+    expect(revocationCalls).toBe(0);
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("concurrent validations during refresh share a single fetch", async () => {
+    let inFlightResolve: ((v: { generated_at: string; jtis: string[] }) => void) | undefined;
+    let calls = 0;
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      revocationFetcher: () => {
+        calls += 1;
+        return new Promise((resolve) => {
+          inFlightResolve = resolve;
+        });
+      },
+    });
+    const tokens = await Promise.all(
+      Array.from({ length: 5 }, (_, i) => signJwt(kp, { iss: fixture.origin, jti: `jti-${i}` })),
+    );
+
+    const results = Promise.all(tokens.map((t) => guard.validateHubJwt(t)));
+    // Validation goes through async jose signature verification before the
+    // cache lookup; one Promise.resolve() isn't enough for all 5 to reach
+    // refresh(). Sleep a beat so the whole pipeline drains up to the
+    // pending in-flight fetcher promise.
+    await Bun.sleep(20);
+    expect(calls).toBe(1); // single-flight
+
+    inFlightResolve!({ generated_at: new Date().toISOString(), jtis: [] });
+    const claims = await results;
+    expect(claims.map((c) => c.jti)).toEqual(["jti-0", "jti-1", "jti-2", "jti-3", "jti-4"]);
+    expect(calls).toBe(1);
+
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("token without jti skips revocation lookup entirely", async () => {
+    let revocationCalls = 0;
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      revocationFetcher: async () => {
+        revocationCalls += 1;
+        return { generated_at: new Date().toISOString(), jtis: [] };
+      },
+    });
+    // Hand-build a token with no jti.
+    const iat = Math.floor(Date.now() / 1000);
+    const tokenNoJti = await new SignJWT({ scope: "vault:read", client_id: "test-client" })
+      .setProtectedHeader({ alg: "RS256", kid: kp.kid })
+      .setIssuer(fixture.origin)
+      .setSubject("user-1")
+      .setAudience("operator")
+      .setIssuedAt(iat)
+      .setExpirationTime(iat + 60)
+      .sign(kp.privateKey);
+    const claims = await guard.validateHubJwt(tokenNoJti);
+    expect(claims.jti).toBeUndefined();
+    expect(revocationCalls).toBe(0);
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
   });
 });

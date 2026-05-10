@@ -2,6 +2,22 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.8-rc.3] - 2026-05-10
+
+Foundation work for [hub#212](https://github.com/ParachuteComputer/parachute-hub/issues/212) Phase 4 (RS-side revocation enforcement). Hub itself ships unchanged at the runtime surface — its own `validateAccessToken` already consults the local DB. The change here is in the workspace-vendored `@openparachute/scope-guard` package, which moves to `0.2.0` with revocation-list enforcement folded into `validateHubJwt`. Vault / scribe / parachute-agent will adopt independently in follow-up PRs once Aaron publishes scope-guard 0.2.0 to npm.
+
+### Changed
+
+- **`@openparachute/scope-guard` 0.1.0 → 0.2.0** — adds `RevocationCache`, splits new `HubJwtErrorCode` values (`"revoked"`, `"revocation_unavailable"`), and integrates revocation enforcement as the last step of `validateHubJwt`. See `packages/scope-guard/CHANGELOG.md` for the full surface change.
+- The workspace-vendored scope-guard is consumed at runtime only by tests in this repo (hub's own auth paths use the local `validateAccessToken`). Hub tests pass unchanged: 1157/1157.
+
+### Out of scope (this PR)
+
+- Vault / scribe / parachute-agent dep bumps + adoption (separate PRs after Aaron publishes scope-guard 0.2.0).
+- Admin UI for revocation listing (Phase 2).
+- `pvt_*` deprecation (Phase 6).
+- `UsedOperatorToken.refreshed` cleanup (Phase 2 followup, hub#216).
+
 ## [0.5.8-rc.2] - 2026-05-09
 
 Token registry + mint API + revocation list endpoint — Phase 1 of the hub-as-sole-AS migration tracked in [#212](https://github.com/ParachuteComputer/parachute-hub/issues/212). Five components, all hub-side, additive (no breaking changes to existing surfaces). Closes Phase 1 and absorbs Phase 5 (CLI relocation — the canonical `parachute auth mint-token` already exists per #179, this PR extends it).
