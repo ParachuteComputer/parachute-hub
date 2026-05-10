@@ -5,22 +5,29 @@ import { CONFIG_DIR } from "./config.ts";
 /**
  * Hub page served at `/` when the node is exposed.
  *
- * The page is split into two sections:
+ * The page is split into two sections, organized by **ownership**:
  *
- *   - **Use** — per-service primary human affordances. Browse notes
- *     (the Notes PWA, which is the vault-content browse path); transcribe
- *     audio (Scribe); run agents (Agent). Entries are dynamic, derived
- *     from `/.well-known/parachute.json`; only installed services show up.
- *     Vault deliberately doesn't have its own Use entry — its content is
- *     browsed via Notes, so a separate "Vault" tile would just send the
- *     operator to the admin SPA, which is exactly the friction Aaron
- *     flagged ("clicked Vault, took me to hub management").
+ *   - **Services** — surfaces provided by the modules running on this
+ *     hub. Browse notes (the Notes PWA); transcribe audio (Scribe); run
+ *     agents (Agent). Each entry points at the service's own UI; the
+ *     service owns what's behind the link (use, config, admin —
+ *     whatever it chooses to surface). Entries are dynamic, derived
+ *     from `/.well-known/parachute.json`; only installed services show
+ *     up. Vault deliberately doesn't have its own Services entry — its
+ *     content is browsed via Notes, so a separate "Vault" tile would
+ *     just send the operator to the admin SPA, which is exactly the
+ *     friction Aaron flagged ("clicked Vault, took me to hub management").
  *
- *   - **Admin** — hub-served admin SPA routes for cross-cutting host
+ *   - **Admin** — hub-owned admin surfaces for cross-cutting host
  *     concerns. Always visible: even with zero vaults installed, an
  *     operator may want to provision the first one. Three entries:
  *     Vaults (provisioning), Permissions (OAuth consent grants), Tokens
  *     (registry mint/list/revoke).
+ *
+ * The Services-vs-Admin axis is ownership, not function: services-owned
+ * UIs vs hub-owned UIs. The first cut framed it as "Use vs Admin" but
+ * that broke down once you noticed real services have UIs that mix use,
+ * config, and admin together — the cleaner cut is who's hosting the UI.
  *
  * The file stays self-contained (inline CSS + JS, no external assets) so
  * `tailscale serve` can mount it directly from disk with `--set-path=/`.
@@ -236,11 +243,11 @@ const HTML = `<!doctype html>
     <p class="tagline">Your personal-computing modules.</p>
   </header>
 
-  <section class="section" id="use-section">
-    <h2>Use</h2>
-    <p class="section-sub">Browse, transcribe, and run — the everyday surfaces.</p>
-    <div class="grid" id="use-grid" aria-live="polite">
-      <div class="empty" id="use-loading">Loading…</div>
+  <section class="section" id="services-section">
+    <h2>Services</h2>
+    <p class="section-sub">Surfaces provided by services running on this hub.</p>
+    <div class="grid" id="services-grid" aria-live="polite">
+      <div class="empty" id="services-loading">Loading…</div>
     </div>
   </section>
 
@@ -256,20 +263,20 @@ const HTML = `<!doctype html>
 </main>
 <script>
 (async () => {
-  const useGrid = document.getElementById('use-grid');
+  const servicesGrid = document.getElementById('services-grid');
   const adminGrid = document.getElementById('admin-grid');
 
-  // Use entries: per-service primary affordances. Hardcoded short→label map;
-  // path is derived from services.json so custom mounts still work.
+  // Services entries: each service's primary surface. Hardcoded short→label
+  // map; path is derived from services.json so custom mounts still work.
   // Vault deliberately omitted — its content is browsed via Notes (which
   // is its own entry below). Operators provision/admin vaults from the
   // /admin/vaults card in the Admin section.
-  const USE_LABELS = {
-    notes:  { title: 'Browse notes', desc: 'Open the Notes PWA over your vault.' },
-    scribe: { title: 'Transcribe audio', desc: 'Send audio to Scribe.' },
-    agent:  { title: 'Run agents', desc: 'Open the Agent runtime.' },
+  const SERVICE_LABELS = {
+    notes:  { title: 'Notes', desc: 'Browse your vault content.' },
+    scribe: { title: 'Scribe', desc: 'Transcribe audio.' },
+    agent:  { title: 'Agent', desc: 'Run agents on this hub.' },
   };
-  const USE_ORDER = ['notes', 'scribe', 'agent'];
+  const SERVICE_ORDER = ['notes', 'scribe', 'agent'];
 
   // Admin entries: always visible. Even a fresh hub with zero vaults wants
   // the operator to find /admin/vaults. Hardcoded — they live in the
@@ -325,9 +332,9 @@ const HTML = `<!doctype html>
     }
   }
 
-  function renderUse(services) {
+  function renderServices(services) {
     // Group services by short type. Multiple instances of the same type
-    // (e.g. two scribes) collapse into one Use entry pointing at the first
+    // (e.g. two scribes) collapse into one entry pointing at the first
     // — operators with that posture will know which one they meant.
     // Vault entries are skipped per the comment above.
     const byType = new Map();
@@ -338,22 +345,22 @@ const HTML = `<!doctype html>
     }
 
     const tiles = [];
-    for (const t of USE_ORDER) {
+    for (const t of SERVICE_ORDER) {
       const path = byType.get(t);
       if (!path) continue;
-      const labels = USE_LABELS[t];
+      const labels = SERVICE_LABELS[t];
       tiles.push({ title: labels.title, desc: labels.desc, href: path });
     }
 
-    useGrid.innerHTML = '';
+    servicesGrid.innerHTML = '';
     if (tiles.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'empty';
       empty.innerHTML = 'No services installed yet. Try <code>parachute install vault</code>.';
-      useGrid.appendChild(empty);
+      servicesGrid.appendChild(empty);
       return;
     }
-    for (const tile of tiles) useGrid.appendChild(renderTile(tile));
+    for (const tile of tiles) servicesGrid.appendChild(renderTile(tile));
   }
 
   // Admin section is static — render synchronously so the operator sees it
@@ -365,9 +372,9 @@ const HTML = `<!doctype html>
     if (!wk.ok) throw new Error('well-known fetch failed: ' + wk.status);
     const doc = await wk.json();
     const services = Array.isArray(doc.services) ? doc.services : [];
-    renderUse(services);
+    renderServices(services);
   } catch (err) {
-    useGrid.innerHTML = '<div class="error">Could not load services: ' +
+    servicesGrid.innerHTML = '<div class="error">Could not load services: ' +
       (err && err.message ? err.message : String(err)) + '</div>';
   }
 })();

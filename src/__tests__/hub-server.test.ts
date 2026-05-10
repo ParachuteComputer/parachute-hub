@@ -623,6 +623,43 @@ describe("hubFetch routing", () => {
     }
   });
 
+  // Login surface rename redirects (auth-UX cleanup): /admin/login and
+  // /admin/logout 301 to /login and /logout. Path-only test — the
+  // handlers themselves are exercised through the existing
+  // handleAdminLoginGet/Post + handleAdminLogoutPost test files.
+  test("301: /admin/login → /login", async () => {
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/admin/login"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/login");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("301: /admin/login preserves the next= query param", async () => {
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/admin/login?next=/admin/config"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/login?next=/admin/config");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("301: /admin/logout → /logout", async () => {
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/admin/logout"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/logout");
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("/hub/<unknown> (no SPA mount anymore) → 404", async () => {
     const h = makeHarness();
     try {
@@ -655,8 +692,11 @@ describe("hubFetch routing", () => {
         ["/oauth/register", { method: "POST" }],
         ["/oauth/revoke", { method: "POST" }],
         ["/vaults", { method: "POST" }],
-        ["/admin/login", { method: "POST" }],
-        ["/admin/logout", { method: "POST" }],
+        // /login + /logout — canonical names since the auth-UX rename;
+        // /admin/login + /admin/logout 301-redirect to here (separate
+        // tests pin the redirects themselves).
+        ["/login", { method: "POST" }],
+        ["/logout", { method: "POST" }],
         ["/admin/config", { method: "GET" }],
         ["/admin/config/example", { method: "POST" }],
         ["/admin/host-admin-token", { method: "GET" }],

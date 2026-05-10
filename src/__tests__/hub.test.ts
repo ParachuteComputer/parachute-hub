@@ -29,37 +29,46 @@ describe("renderHub", () => {
     expect(html).toContain("prefers-color-scheme: dark");
   });
 
-  test("renders two sections: Use and Admin, each with its own heading + grid", () => {
-    expect(html).toContain('id="use-section"');
+  test("renders two sections: Services and Admin, each with its own heading + grid", () => {
+    expect(html).toContain('id="services-section"');
     expect(html).toContain('id="admin-section"');
-    expect(html).toContain('id="use-grid"');
+    expect(html).toContain('id="services-grid"');
     expect(html).toContain('id="admin-grid"');
-    expect(html).toContain("<h2>Use</h2>");
+    expect(html).toContain("<h2>Services</h2>");
     expect(html).toContain("<h2>Admin</h2>");
   });
 
-  test("Use section labels: Browse notes / Transcribe audio / Run agents", () => {
-    expect(html).toContain("'Browse notes'");
-    expect(html).toContain("'Transcribe audio'");
-    expect(html).toContain("'Run agents'");
+  test("Services section sub-text frames the section as service-owned surfaces", () => {
+    // Services-vs-Admin axis is OWNERSHIP (services own their UIs vs
+    // hub owns host admin), not function. The sub-text reflects that —
+    // earlier "Browse, transcribe, and run" framing put it on the
+    // function axis, which broke down once you noticed services have
+    // UIs that mix use / config / admin.
+    expect(html).toContain("Surfaces provided by services");
   });
 
-  test("Use entries use the path declared in services.json (custom mounts work)", () => {
-    // Operators may mount a service at a non-default path; the Use tile
+  test("Services entry labels: Notes / Scribe / Agent", () => {
+    expect(html).toContain("'Notes'");
+    expect(html).toContain("'Scribe'");
+    expect(html).toContain("'Agent'");
+  });
+
+  test("Services entries use the path declared in services.json (custom mounts work)", () => {
+    // Operators may mount a service at a non-default path; the tile
     // surfaces that path verbatim rather than hardcoding `/notes`/etc.
     expect(html).toContain("svc.path");
   });
 
-  test("Vault is intentionally excluded from the Use section", () => {
+  test("Vault is intentionally excluded from the Services section", () => {
     // Aaron's friction: clicking 'Vault' on discovery took him to hub
-    // management, not to vault content. Resolution: Vault has no Use
-    // entry — its content is browsed via Notes (which has its own
-    // entry). Vault provisioning lives under Admin.
+    // management, not to vault content. Resolution: Vault has no
+    // Services entry — its content is browsed via Notes (which has its
+    // own entry). Vault provisioning lives under Admin.
     expect(html).toContain("Vault deliberately omitted");
     expect(html).toContain("isVaultName");
   });
 
-  test("Use section ordering is notes → scribe → agent", () => {
+  test("Services section ordering is notes → scribe → agent", () => {
     expect(html).toContain("['notes', 'scribe', 'agent']");
   });
 

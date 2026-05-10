@@ -55,7 +55,7 @@ export async function handleVaultAdminToken(
   const sid = parseSessionCookie(req.headers.get("cookie"));
   const session = sid ? findSession(deps.db, sid) : null;
   if (!session) {
-    return jsonError(401, "unauthenticated", "no admin session — sign in at /admin/login first");
+    return jsonError(401, "unauthenticated", "no admin session — sign in at /login first");
   }
   const scope = `vault:${vaultName}:admin`;
   // Per-vault audience: vault validates the JWT's `aud` claim against

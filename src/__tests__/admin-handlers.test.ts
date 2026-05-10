@@ -330,7 +330,7 @@ describe("handleAdminLogoutPost (#113)", () => {
     expect(res.headers.get("set-cookie")).toBeNull();
   });
 
-  test("clears session cookie, deletes session row, and redirects to /admin/login", async () => {
+  test("clears session cookie, deletes session row, and redirects to /login", async () => {
     const user = await createUser(harness.db, "admin", "pw");
     const session = createSession(harness.db, { userId: user.id });
     const cookie = `${CSRF_COOKIE}; ${buildSessionCookie(
@@ -338,14 +338,14 @@ describe("handleAdminLogoutPost (#113)", () => {
       Math.floor(SESSION_TTL_MS / 1000),
     )}`;
     const { body, headers } = formBody({ [CSRF_FIELD_NAME]: TEST_CSRF });
-    const req = new Request("http://hub.test/admin/logout", {
+    const req = new Request("http://hub.test/logout", {
       method: "POST",
       headers: { ...headers, cookie },
       body,
     });
     const res = await handleAdminLogoutPost(harness.db, req);
     expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/admin/login");
+    expect(res.headers.get("location")).toBe("/login");
     const setCookie = res.headers.get("set-cookie") ?? "";
     expect(setCookie).toContain("parachute_hub_session=;");
     expect(setCookie).toContain("Max-Age=0");
@@ -354,24 +354,24 @@ describe("handleAdminLogoutPost (#113)", () => {
 
   test("idempotent — clears cookie even with no active session", async () => {
     const { body, headers } = formBody({ [CSRF_FIELD_NAME]: TEST_CSRF });
-    const req = new Request("http://hub.test/admin/logout", {
+    const req = new Request("http://hub.test/logout", {
       method: "POST",
       headers: { ...headers, cookie: CSRF_COOKIE },
       body,
     });
     const res = await handleAdminLogoutPost(harness.db, req);
     expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/admin/login");
+    expect(res.headers.get("location")).toBe("/login");
     expect(res.headers.get("set-cookie") ?? "").toContain("parachute_hub_session=;");
   });
 });
 
 describe("handleAdminConfigGet", () => {
-  test("redirects unauthenticated requests to /admin/login", async () => {
+  test("redirects unauthenticated requests to /login", async () => {
     const req = new Request("http://hub.test/admin/config");
     const res = await handleAdminConfigGet(harness.db, req);
     expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/admin/login?next=%2Fadmin%2Fconfig");
+    expect(res.headers.get("location")).toBe("/login?next=%2Fadmin%2Fconfig");
   });
 
   test("renders the empty-state when no module declares a configSchema", async () => {
@@ -426,7 +426,7 @@ describe("handleAdminConfigPost", () => {
     return formBody({ [CSRF_FIELD_NAME]: TEST_CSRF, ...values });
   }
 
-  test("redirects unauthenticated requests to /admin/login", async () => {
+  test("redirects unauthenticated requests to /login", async () => {
     const { body, headers } = postBody({ transcribe_provider: "openai" });
     const req = new Request("http://hub.test/admin/config/vault", {
       method: "POST",
@@ -439,7 +439,7 @@ describe("handleAdminConfigPost", () => {
       readManifest: fakeReadManifest,
     });
     expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toContain("/admin/login");
+    expect(res.headers.get("location")).toContain("/login");
   });
 
   test("returns 400 when the CSRF token is wrong", async () => {

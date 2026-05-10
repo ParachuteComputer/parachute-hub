@@ -20,6 +20,7 @@
  *   /hub/permissions                           → 301 → /admin/permissions
  *   /hub/tokens                                → 301 → /admin/tokens
  *   /hub, /hub/                                → 301 → /admin/vaults
+ *   /admin/login, /admin/logout                → 301 → /login, /logout
  *
  *   # Discovery + well-known.
  *   /, /hub.html                               → hub.html (the discovery page)
@@ -44,8 +45,8 @@
  *   /api/auth/tokens              (GET)        → paginated registry list
  *   /api/grants                   (GET)        → OAuth consent grants list
  *   /api/grants/<client_id>       (DELETE)     → revoke a single OAuth grant
- *   /admin/login                  (GET + POST) → operator password login
- *   /admin/logout                 (POST)       → end admin session
+ *   /login                        (GET + POST) → operator password login
+ *   /logout                       (POST)       → end admin session
  *   /admin/config                 (GET)        → operator config view
  *   /admin/config/<key>           (POST)       → operator config write
  *
@@ -724,6 +725,24 @@ export function hubFetch(
       });
     }
 
+    // Login surface rename: `/admin/login` and `/admin/logout` 301 to the
+    // canonical `/login` and `/logout`. The names were "admin" only by
+    // historical accident — the handlers serve every parachute auth flow
+    // (operator, OAuth user-redirect, future SPA sign-in). Renaming makes
+    // the surface name match its actual scope.
+    if (pathname === "/admin/login") {
+      return new Response("", {
+        status: 301,
+        headers: { location: `/login${url.search}` },
+      });
+    }
+    if (pathname === "/admin/logout") {
+      return new Response("", {
+        status: 301,
+        headers: { location: `/logout${url.search}` },
+      });
+    }
+
     if (pathname === "/" || pathname === "/hub.html") {
       if (!existsSync(hubHtmlPath)) {
         return new Response("hub.html not found", { status: 404 });
@@ -999,14 +1018,20 @@ export function hubFetch(
       });
     }
 
-    if (pathname === "/admin/login") {
+    // Canonical login/logout. The handlers themselves are unchanged from
+    // when they lived at /admin/login + /admin/logout; the rename surfaced
+    // via #231-followup so the URL reflects the surface's actual scope
+    // (entry point for ALL parachute auth — not admin-only). The
+    // /admin/login and /admin/logout paths 301 to here, dispatched at the
+    // top of this fn alongside the other back-compat redirects.
+    if (pathname === "/login") {
       if (!getDb) return new Response("hub db not configured", { status: 503 });
       if (req.method === "GET") return handleAdminLoginGet(getDb(), req);
       if (req.method === "POST") return handleAdminLoginPost(getDb(), req);
       return new Response("method not allowed", { status: 405 });
     }
 
-    if (pathname === "/admin/logout") {
+    if (pathname === "/logout") {
       if (!getDb) return new Response("hub db not configured", { status: 503 });
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
       return handleAdminLogoutPost(getDb(), req);

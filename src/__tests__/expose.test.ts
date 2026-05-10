@@ -963,8 +963,8 @@ describe("expose public up", () => {
       const joined = logs.join("\n");
       expect(joined).toContain("2FA is not enrolled");
       expect(joined).toContain("parachute auth 2fa enroll");
-      // /admin/login pointer uses the canonical https://<fqdn> origin.
-      expect(joined).toContain("https://parachute.taildf9ce2.ts.net/admin/login");
+      // /login pointer uses the canonical https://<fqdn> origin.
+      expect(joined).toContain("https://parachute.taildf9ce2.ts.net/login");
     } finally {
       h.cleanup();
     }

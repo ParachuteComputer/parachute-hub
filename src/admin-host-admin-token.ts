@@ -23,7 +23,7 @@
  * Both paths require already-proved local-operator identity:
  *   - operator-token mint runs as the operator's unix user.
  *   - this endpoint requires a valid `parachute_hub_session` cookie, which
- *     was set by `/admin/login` after a password check.
+ *     was set by `/login` after a password check.
  *
  * Tokens minted here are deliberately NOT persisted in the `tokens` table
  * (no refresh, no revocation tracking). They expire on their own; the SPA
@@ -62,7 +62,7 @@ export async function handleHostAdminToken(
   const sid = parseSessionCookie(req.headers.get("cookie"));
   const session = sid ? findSession(deps.db, sid) : null;
   if (!session) {
-    return jsonError(401, "unauthenticated", "no admin session — sign in at /admin/login first");
+    return jsonError(401, "unauthenticated", "no admin session — sign in at /login first");
   }
   const minted = await signAccessToken(deps.db, {
     sub: session.userId,

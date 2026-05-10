@@ -2,6 +2,44 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.8-rc.12] - 2026-05-10
+
+Auth-UX cleanup, A/B of an A+B+C bundle (C — signed-in indicator via `/api/me` — lands separately as rc.13). Two changes addressing surface-naming friction Aaron raised after rc.11:
+
+### Changed
+
+- **Discovery page sections relabeled `Use` → `Services`.** The Use/Admin axis was a function split (use vs admin) that broke down once you noticed real services have UIs that mix use, config, and admin together. The cleaner cut is **ownership** (services own their UIs vs hub owns host admin). Heading and sub-text updated to reflect that — sub-text is now "Surfaces provided by services running on this hub." Per-service entry labels also tightened: "Browse notes" → "Notes" (and similarly for Scribe/Agent), with a one-line desc that says what the service does. Vault stays excluded from Services for the same reason as rc.11 (its content is browsed via Notes; provisioning lives under Admin).
+- **Login + logout surface rename: `/admin/login` → `/login`, `/admin/logout` → `/logout`.** The `/admin/` prefix read as "admin-only" but the handlers serve every parachute auth flow — operator login, OAuth user redirect, the future SPA sign-in. Renaming makes the URL match the surface's actual scope. Old paths 301-redirect to the new ones (with query-string preservation for `?next=…`) so cached operator URLs and OAuth-flow `next=` redirects keep working.
+
+### Added
+
+- **301 redirects** for the renamed login surface: `/admin/login → /login`, `/admin/logout → /logout`. Preserve `?next=…` query strings for the OAuth and operator-bookmark cases.
+
+### Updated to match the rename
+
+- `loginRedirect` (the unauthenticated-admin-page redirect target) now points at `/login`.
+- `handleAdminLogoutPost` final destination now redirects to `/login`.
+- Login form `action` in `admin-config-ui.ts` now POSTs to `/login`.
+- Error messages on the bearer-mint endpoints now say "sign in at /login".
+- Vite dev proxy entries for `/login` + `/logout` (was `/admin/login` + `/admin/logout`).
+- Comments in `rate-limit.ts`, `sessions.ts`, `scope-explanations.ts`, `admin-host-admin-token.ts`, `hub-server.ts` route-table.
+
+### Out of scope (rc.13)
+
+- **Signed-in indicator on hub-served surfaces.** Aaron's "signed in as X / sign out" affordance for the discovery page + admin SPA. The `/api/me` endpoint backing it is designed (per-session CSRF token included, both consumers source from one mental model) but ships in the next PR for focused review.
+
+### Test gate
+
+All test suites pass. New coverage in this PR:
+
+- `hub-server.test.ts` — 3 new redirect tests for `/admin/login → /login` (with and without `?next=…`) and `/admin/logout → /logout`.
+- `hub.test.ts` updated for the Services relabel — section heading, sub-text framing, per-entry labels, retired old "Use" assertions.
+- `admin-handlers.test.ts` updated for the `/login` final destination (logout redirect target + admin-config unauthenticated redirect target).
+
+Typecheck (both packages): clean. biome: clean.
+
+(Test-count numbers intentionally omitted — the canonical-vs-combined ambiguity is tracked at hub#219.)
+
 ## [0.5.8-rc.11] - 2026-05-10
 
 Holistic restructure of the integrated hub experience — the bigger redesign Aaron asked for after rc.10's small relabel ("clicked Vault on discovery, took me to hub management — there's confusion between use vs admin"). Discovery page split into Use / Admin; the admin SPA relocates to `/admin/*` with 301 redirects from the prior `/vault` and `/hub/*` mounts. Closes hub#231.

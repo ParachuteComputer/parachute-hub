@@ -121,7 +121,7 @@ export function parseSessionCookie(cookieHeader: string | null): string | null {
  * callers don't repeat the parse+find+null-check dance.
  *
  * Caller decides what to do on null — admin pages redirect to
- * `/admin/login?next=<path>`, OAuth's DCR endpoint falls through to
+ * `/login?next=<path>`, OAuth's DCR endpoint falls through to
  * status=`pending` (closes #199).
  */
 export function findActiveSession(

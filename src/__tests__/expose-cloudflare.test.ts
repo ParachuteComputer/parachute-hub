@@ -557,7 +557,7 @@ describe("exposeCloudflareUp", () => {
         expect(code).toBe(0);
         const joined = logs.join("\n");
         expect(joined).toContain("2FA is not enrolled");
-        expect(joined).toContain("https://vault.example.com/admin/login");
+        expect(joined).toContain("https://vault.example.com/login");
         expect(joined).toContain("parachute auth 2fa enroll");
       } finally {
         env.cleanup();

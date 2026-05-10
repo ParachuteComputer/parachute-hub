@@ -61,7 +61,7 @@ ${body}
 </html>`;
 }
 
-// --- /admin/login ----------------------------------------------------------
+// --- /login ---------------------------------------------------------------
 
 export interface AdminLoginProps {
   /** Continuation path after successful login — submitted as a hidden field. */
@@ -85,7 +85,7 @@ export function renderAdminLogin(props: AdminLoginProps): string {
         <p class="subtitle">to administer this hub</p>
       </div>
       ${error}
-      <form method="POST" action="/admin/login" class="auth-form">
+      <form method="POST" action="/login" class="auth-form">
         ${renderCsrfHiddenInput(csrfToken)}
         <input type="hidden" name="next" value="${escapeAttr(next)}" />
         <label class="field">

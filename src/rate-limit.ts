@@ -1,10 +1,13 @@
 /**
- * Per-IP rate-limit on `POST /admin/login`. Lands as a floor under brute-force
+ * Per-IP rate-limit on `POST /login`. Lands as a floor under brute-force
  * after hub#187 collapsed the public-reach matrix: with a cloudflare tunnel
- * up, `/admin/login` is now reachable from the open internet, and 2FA (#186)
+ * up, `/login` is now reachable from the open internet, and 2FA (#186)
  * is the next PR rather than this one. A 5-attempts-per-15-minute bucket per
  * IP is the standard login-form floor; it's not the primary defense, just the
  * one that turns "infinite credential grinding" into "rotate IPs".
+ *
+ * (Endpoint was `/admin/login` pre-rename; bucket logic is path-agnostic so
+ * the rename was a comment-only change here.)
  *
  * Shape: sliding window. Each key keeps the last N attempt timestamps; on a
  * new attempt we prune anything older than the window, count what remains,

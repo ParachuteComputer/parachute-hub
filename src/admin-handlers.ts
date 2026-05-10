@@ -1,15 +1,19 @@
 /**
- * HTTP handlers for the hub admin surface — login (`/admin/login`) and the
+ * HTTP handlers for the hub admin surface — login (`/login`) and the
  * config portal (`/admin/config`, `/admin/config/<name>`). Sessions ride the
  * same `parachute_hub_session` cookie that the OAuth login mints, since PR
  * #112 widened the cookie path from `/oauth/` to `/`.
  *
+ * `/login` (was `/admin/login` pre-#231-followup) is the canonical entry
+ * for ALL parachute auth — admin operators, OAuth user flows, etc. The
+ * `/admin/login` and `/admin/logout` paths 301-redirect for back-compat.
+ *
  * Every state-changing POST is double-submit-CSRF protected
  * (`parachute_hub_csrf` cookie + `__csrf` form field, constant-time compare),
- * and every authenticated GET issues a 302 to `/admin/login?next=<path>`
- * when no session is found rather than rendering an inline login form —
- * keeps each route's intent clean and lets the operator bookmark
- * `/admin/config` without thinking about state.
+ * and every authenticated GET issues a 302 to `/login?next=<path>` when
+ * no session is found rather than rendering an inline login form — keeps
+ * each route's intent clean and lets the operator bookmark `/admin/config`
+ * without thinking about state.
  */
 import type { Database } from "bun:sqlite";
 import {
@@ -78,7 +82,7 @@ function redirect(location: string, extra: Record<string, string> = {}): Respons
 function loginRedirect(req: Request, extra: Record<string, string> = {}): Response {
   const url = new URL(req.url);
   const next = `${url.pathname}${url.search}`;
-  return redirect(`/admin/login?next=${encodeURIComponent(next)}`, extra);
+  return redirect(`/login?next=${encodeURIComponent(next)}`, extra);
 }
 
 function safeNext(raw: string | null): string {
@@ -88,7 +92,12 @@ function safeNext(raw: string | null): string {
   return raw;
 }
 
-// --- /admin/login ----------------------------------------------------------
+// --- /login ---------------------------------------------------------------
+//
+// Renamed from `/admin/login` so the surface name reflects what it is — the
+// canonical entry for ALL parachute auth (operators, OAuth user flows,
+// etc.), not an admin-only door. `/admin/login` and `/admin/logout` 301
+// to here from `hub-server.ts` for back-compat.
 
 export function handleAdminLoginGet(_db: Database, req: Request): Response {
   const url = new URL(req.url);
@@ -172,7 +181,7 @@ export interface AdminLoginDeps {
   now?: () => Date;
 }
 
-// --- /admin/logout ---------------------------------------------------------
+// --- /logout --------------------------------------------------------------
 
 /**
  * POST-only — logout is state-changing, so it rides the same double-submit
@@ -181,8 +190,8 @@ export interface AdminLoginDeps {
  * but the safety belt is already on the bus).
  *
  * Always idempotent: clearing the cookie succeeds even if there's no
- * matching session row. Returns 302 → /admin/login so the operator lands
- * back on the form ready to re-authenticate.
+ * matching session row. Returns 302 → /login so the operator lands back
+ * on the form ready to re-authenticate.
  */
 export async function handleAdminLogoutPost(db: Database, req: Request): Promise<Response> {
   const form = await req.formData();
@@ -198,7 +207,7 @@ export async function handleAdminLogoutPost(db: Database, req: Request): Promise
   }
   const sid = parseSessionCookie(req.headers.get("cookie"));
   if (sid) deleteSession(db, sid);
-  return redirect("/admin/login", { "set-cookie": buildSessionClearCookie() });
+  return redirect("/login", { "set-cookie": buildSessionClearCookie() });
 }
 
 // --- /admin/config ---------------------------------------------------------

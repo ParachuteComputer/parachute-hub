@@ -28,11 +28,11 @@ export default defineConfig({
       //
       // Exact-prefix proxying for /admin/login and friends — but NOT a blanket
       // /admin proxy, which would steal the SPA's own /admin/vaults route.
-      "/admin/login": {
+      "/login": {
         target: process.env.HUB_ORIGIN ?? "http://127.0.0.1:1939",
         changeOrigin: true,
       },
-      "/admin/logout": {
+      "/logout": {
         target: process.env.HUB_ORIGIN ?? "http://127.0.0.1:1939",
         changeOrigin: true,
       },

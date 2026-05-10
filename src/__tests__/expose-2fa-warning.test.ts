@@ -81,7 +81,7 @@ describe("printPublic2FAWarning", () => {
     expect(fired).toBe(true);
     const joined = logs.join("\n");
     expect(joined).toContain("2FA is not enrolled");
-    expect(joined).toContain("https://vault.example.com/admin/login");
+    expect(joined).toContain("https://vault.example.com/login");
     expect(joined).toContain("parachute auth 2fa enroll");
   });
 
@@ -111,15 +111,13 @@ describe("printPublic2FAWarning", () => {
     expect(logs.some((l) => l.includes("2FA is not enrolled"))).toBe(true);
   });
 
-  test("embeds the supplied publicUrl into the /admin/login pointer", () => {
+  test("embeds the supplied publicUrl into the /login pointer", () => {
     const logs: string[] = [];
     printPublic2FAWarning({
       status: status({ hasTotp: false }),
       log: (l) => logs.push(l),
       publicUrl: "https://parachute.taildf9ce2.ts.net",
     });
-    expect(logs.some((l) => l.includes("https://parachute.taildf9ce2.ts.net/admin/login"))).toBe(
-      true,
-    );
+    expect(logs.some((l) => l.includes("https://parachute.taildf9ce2.ts.net/login"))).toBe(true);
   });
 });

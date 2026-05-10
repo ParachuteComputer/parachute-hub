@@ -107,7 +107,7 @@ export const FIRST_PARTY_SCOPES = Object.keys(SCOPE_EXPLANATIONS).sort();
  *   - `parachute auth rotate-operator` writes the long-lived operator token
  *     (`~/.parachute/operator.token`, mode 0600) for service accounts.
  *   - `GET /admin/host-admin-token` exchanges a valid `parachute_hub_session`
- *     cookie (set by `/admin/login` after a password check) for a
+ *     cookie (set by `/login` after a password check) for a
  *     short-lived JWT consumed by the in-tree vault-management SPA.
  *
  * Both surfaces predicate on local-operator identity that the public OAuth

@@ -1,13 +1,13 @@
 /**
  * Auth helper for the hub SPA. Unlike paraclaw's hub-as-issuer OAuth flow,
  * this SPA is served BY the hub itself — so it leans on the existing
- * password-gated `/admin/login` session cookie instead of running its own
- * OAuth dance.
+ * password-gated `/login` session cookie instead of running its own OAuth
+ * dance.
  *
  * Flow:
  *   1. SPA bootstrap calls `getHostAdminToken()`.
  *   2. That hits `GET /admin/host-admin-token`. The endpoint:
- *      - reads `parachute_hub_session` cookie (set by /admin/login)
+ *      - reads `parachute_hub_session` cookie (set by /login)
  *      - mints a short-lived (~10 min) JWT carrying both
  *        `parachute:host:admin` (vault provisioning, OAuth grant management)
  *        AND `parachute:host:auth` (the hub#212 Phase 2 token-registry
@@ -15,7 +15,7 @@
  *   3. Token is held in module-scoped state — NOT localStorage. Page
  *      snapshots can't carry it past a refresh, and XSS surface is the
  *      narrowest possible.
- *   4. On 401, redirect the browser to `/admin/login?next=<current path>`.
+ *   4. On 401, redirect the browser to `/login?next=<current path>`.
  *      The hub's standard login form then cookie-signs the operator and
  *      bounces back here.
  *
@@ -45,18 +45,18 @@ function tokenEndpoint(): string {
 function loginRedirectUrl(): string {
   // Round-trip the *current* SPA URL — origin + pathname + search — so the
   // post-login redirect drops the operator back where they started. Hash is
-  // intentionally dropped: the /admin/login `next=` param is server-rendered
-  // and doesn't survive a fragment round-trip cleanly.
+  // intentionally dropped: the /login `next=` param is server-rendered and
+  // doesn't survive a fragment round-trip cleanly.
   const next = `${window.location.pathname}${window.location.search}`;
-  return `/admin/login?next=${encodeURIComponent(next)}`;
+  return `/login?next=${encodeURIComponent(next)}`;
 }
 
 /**
- * Navigate to /admin/login (round-tripping the current SPA URL via `next=`)
- * and return a never-resolving Promise so the caller's continuation never
- * runs. The browser is about to tear down the page; surfacing a "session
- * expired" error to the operator gives them no useful action — the right
- * UX is "you've already left."
+ * Navigate to /login (round-tripping the current SPA URL via `next=`) and
+ * return a never-resolving Promise so the caller's continuation never runs.
+ * The browser is about to tear down the page; surfacing a "session expired"
+ * error to the operator gives them no useful action — the right UX is
+ * "you've already left."
  *
  * Shared between the host-admin mint here and the per-vault mint in
  * `lib/api.ts:mintVaultAdminToken`. Both endpoints rely on the same
@@ -73,9 +73,9 @@ export function redirectToLoginAndHang<T>(): Promise<T> {
  * (or if we don't have one yet). Concurrent callers share the in-flight
  * fetch — we don't want a burst of API calls to mint a token each.
  *
- * On 401 (no admin session), navigates the browser to /admin/login and
- * returns a never-resolving Promise so callers don't try to use a missing
- * token. Caller code does not need to check for null.
+ * On 401 (no admin session), navigates the browser to /login and returns a
+ * never-resolving Promise so callers don't try to use a missing token.
+ * Caller code does not need to check for null.
  */
 export async function getHostAdminToken(): Promise<string> {
   const now = Date.now();
