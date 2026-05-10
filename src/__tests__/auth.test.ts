@@ -556,6 +556,103 @@ describe("parachute auth rotate-operator", () => {
       tmp.cleanup();
     }
   });
+
+  // closes #213 — `--scope-set` flag.
+  test("--scope-set=start mints with parachute:host:start only", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout } = await captureOutput(() =>
+        auth(["rotate-operator", "--scope-set", "start"], deps),
+      );
+      expect(code).toBe(0);
+      expect(stdout).toContain("scope_set:  start");
+      const onDisk = await readOperatorTokenFile(tmp.dir);
+      expect(onDisk).not.toBeNull();
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const validated = await validateAccessToken(db, onDisk!, "http://127.0.0.1:1939");
+        expect(validated.payload.scope).toBe("parachute:host:start");
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--scope-set=admin (default) mints the full admin set", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout } = await captureOutput(() => auth(["rotate-operator"], deps));
+      expect(code).toBe(0);
+      expect(stdout).toContain("scope_set:  admin");
+      const onDisk = await readOperatorTokenFile(tmp.dir);
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const validated = await validateAccessToken(db, onDisk!, "http://127.0.0.1:1939");
+        const scopes = String(validated.payload.scope ?? "").split(" ");
+        expect(scopes).toContain("hub:admin");
+        expect(scopes).toContain("parachute:host:admin");
+        expect(scopes).toContain("vault:admin");
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--scope-set=bogus rejected with usage message", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stderr } = await captureOutput(() =>
+        auth(["rotate-operator", "--scope-set", "wallet"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("--scope-set must be one of");
+      expect(stderr).toContain("install");
+      expect(stderr).toContain("admin");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("unknown flag is rejected", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stderr } = await captureOutput(() =>
+        auth(["rotate-operator", "--bogus"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("unknown flag");
+    } finally {
+      tmp.cleanup();
+    }
+  });
 });
 
 // closes #74 — the operator's surface for the DCR approval gate. The CLI
@@ -858,6 +955,52 @@ describe("parachute auth mint-token", () => {
       } finally {
         db.close();
       }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  // closes #213 — auto-rotation banner must not leak into stdout (pipe purity).
+  test("operator token within 7d of expiry: auto-rotates, banner on stderr only", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      // Bootstrap: set-password to seed the user + signing key.
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      // Overwrite operator.token with one that's within 7d of expiry — the
+      // auto-rotation path should fire on the next mint-token invocation.
+      const { issueOperatorToken } = await import("../operator-token.ts");
+      const db = openHubDb(tmp.dbPath);
+      const originalOnDisk = await readOperatorTokenFile(tmp.dir);
+      try {
+        await issueOperatorToken(db, listUsers(db)[0]!.id, {
+          dir: tmp.dir,
+          issuer: "http://127.0.0.1:1939",
+          ttlSeconds: 24 * 60 * 60,
+        });
+      } finally {
+        db.close();
+      }
+
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "scribe:transcribe"], deps),
+      );
+      expect(code).toBe(0);
+      // The minted JWT is the only thing on stdout (pipe purity).
+      const token = stdout.trim();
+      expect(token.split(".").length).toBe(3);
+      expect(stdout).toBe(`${token}\n`);
+      // Auto-rotation banner went to stderr.
+      expect(stderr).toContain("auto-rotated");
+      expect(stderr).toContain("scope_set=admin");
+      // The on-disk operator.token was replaced.
+      const after = await readOperatorTokenFile(tmp.dir);
+      expect(after).not.toBeNull();
+      expect(after).not.toBe(originalOnDisk);
     } finally {
       tmp.cleanup();
     }

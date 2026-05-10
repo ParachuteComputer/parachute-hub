@@ -51,10 +51,18 @@ export interface SignAccessTokenOpts {
   jti?: string;
   /**
    * Override the default 15-minute access-token TTL. Long-lived tokens
-   * (operator-token, ~1y) pass an explicit value here.
+   * (operator-token, ~90d) pass an explicit value here.
    */
   ttlSeconds?: number;
   now?: () => Date;
+  /**
+   * Extra JWT claims merged into the payload. Used by operator-token to embed
+   * `pa_scope_set` (which scope-set the token was minted under) so an
+   * auto-rotation can preserve the operator's chosen narrowing across mints.
+   * Reserved claims (`scope`, `client_id`, `sub`, `iss`, `iat`, `exp`, `aud`,
+   * `jti`) are owned by this function and overwritten if passed here.
+   */
+  extraClaims?: Record<string, unknown>;
 }
 
 export interface SignedAccessToken {
@@ -74,6 +82,7 @@ export async function signAccessToken(
   const iat = Math.floor(nowMs / 1000);
   const exp = iat + (opts.ttlSeconds ?? ACCESS_TOKEN_TTL_SECONDS);
   const token = await new SignJWT({
+    ...(opts.extraClaims ?? {}),
     scope: opts.scopes.join(" "),
     client_id: opts.clientId,
   })

@@ -26,11 +26,15 @@ import { HUB_DEFAULT_PORT, readHubPort } from "../hub-control.ts";
 import { openHubDb } from "../hub-db.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
 import { inferAudience } from "../jwt-audience.ts";
-import { signAccessToken, validateAccessToken } from "../jwt-sign.ts";
+import { signAccessToken } from "../jwt-sign.ts";
 import {
   OPERATOR_TOKEN_CLIENT_ID,
+  OPERATOR_TOKEN_SCOPE_SET_NAMES,
+  type OperatorScopeSet,
+  OperatorTokenExpiredError,
+  isOperatorScopeSet,
   issueOperatorToken,
-  readOperatorTokenFile,
+  useOperatorTokenWithAutoRotate,
 } from "../operator-token.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import {
@@ -79,7 +83,10 @@ Usage:
   parachute auth 2fa disable           Disable 2FA (requires password)
   parachute auth 2fa backup-codes      Regenerate backup codes
   parachute auth rotate-key            Rotate the hub's JWT signing key
-  parachute auth rotate-operator       Mint a fresh ~/.parachute/operator.token
+  parachute auth rotate-operator [--scope-set <set>]
+                                       Mint a fresh ~/.parachute/operator.token
+                                       (set = install|start|expose|auth|vault|admin,
+                                       default admin)
   parachute auth mint-token --scope <scope> [--aud <aud>] [--ttl <duration>] [--sub <sub>]
                                        Mint a scope-narrow JWT against the
                                        operator's identity (stdout = JWT)
@@ -112,7 +119,22 @@ hours so cached client copies keep validating until their TTL expires.
 rotate-operator mints a fresh long-lived operator token at
 ~/.parachute/operator.token (mode 0600). Local CLI tools read this file
 as their bearer when calling on-box services. set-password also writes
-the file on first-run / password reset.
+the file on first-run / password reset. Default lifetime is 90d (was
+365d through 0.5.7); CLI flows that read the token within 7d of expiry
+auto-rotate it in place, so weekly users never see an expiry surprise.
+
+--scope-set chooses how broad the new token is:
+  install  — install/upgrade modules (vault:read for new-vault discovery)
+  start    — lifecycle modules (start/stop/restart/status)
+  expose   — bring tailnet / public exposure layers up and down
+  auth     — mint hub-issued tokens, manage user accounts
+  vault    — administer vaults (create / configure / delete)
+  admin    — superset of all above; pre-#213 default and current default
+
+Phase 1 of #213 ships the vocabulary + flag; Phase 2 (separate follow-up)
+wires per-command enforcement so an \`install\`-only token can't, say, run
+\`parachute expose public\`. Until then, --scope-set is a tool the cautious
+operator can opt into without breaking anyone.
 
 mint-token issues a single scope-narrow JWT against the operator's
 identity, signed with the same key as OAuth-issued tokens. Pipeable:
@@ -392,7 +414,46 @@ async function runSetPassword(args: readonly string[], deps: AuthDeps): Promise<
   }
 }
 
-async function runRotateOperator(deps: AuthDeps): Promise<number> {
+interface RotateOperatorFlags {
+  scopeSet?: OperatorScopeSet;
+  error?: string;
+}
+
+function parseRotateOperatorFlags(args: readonly string[]): RotateOperatorFlags {
+  let scopeSet: OperatorScopeSet | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--scope-set") {
+      const v = args[++i];
+      if (!v) return { error: "--scope-set requires a value" };
+      if (!isOperatorScopeSet(v)) {
+        return {
+          error: `--scope-set must be one of ${OPERATOR_TOKEN_SCOPE_SET_NAMES.join("|")}, got "${v}"`,
+        };
+      }
+      scopeSet = v;
+    } else if (a?.startsWith("--scope-set=")) {
+      const v = a.slice("--scope-set=".length);
+      if (!v) return { error: "--scope-set requires a value" };
+      if (!isOperatorScopeSet(v)) {
+        return {
+          error: `--scope-set must be one of ${OPERATOR_TOKEN_SCOPE_SET_NAMES.join("|")}, got "${v}"`,
+        };
+      }
+      scopeSet = v;
+    } else {
+      return { error: `unknown flag "${a}"` };
+    }
+  }
+  return scopeSet !== undefined ? { scopeSet } : {};
+}
+
+async function runRotateOperator(args: readonly string[], deps: AuthDeps): Promise<number> {
+  const flags = parseRotateOperatorFlags(args);
+  if (flags.error) {
+    console.error(`parachute auth rotate-operator: ${flags.error}`);
+    return 1;
+  }
   const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
   try {
     const users = listUsers(db);
@@ -406,9 +467,11 @@ async function runRotateOperator(deps: AuthDeps): Promise<number> {
     const issued = await issueOperatorToken(db, owner.id, {
       dir: deps.configDir,
       issuer: resolveHubIssuer(deps.hubOrigin, deps.configDir ?? CONFIG_DIR),
+      ...(flags.scopeSet !== undefined ? { scopeSet: flags.scopeSet } : {}),
     });
     console.log("Rotated operator token.");
     console.log(`  user:       ${owner.username}`);
+    console.log(`  scope_set:  ${issued.scopeSet}`);
     console.log(`  path:       ${issued.path}`);
     console.log(`  expires_at: ${issued.expiresAt}`);
     console.log(
@@ -694,47 +757,18 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   }
 
   const configDir = deps.configDir ?? CONFIG_DIR;
-  const operatorToken = await readOperatorTokenFile(configDir);
-  if (!operatorToken) {
-    console.error(
-      "parachute auth mint-token: no operator token found at ~/.parachute/operator.token",
-    );
-    console.error(
-      "run `parachute auth set-password` (first run) or `parachute auth rotate-operator` to mint one",
-    );
-    return 1;
-  }
-
   const issuer = resolveHubIssuer(deps.hubOrigin, configDir);
 
   const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
   try {
-    let operatorSub: string;
+    let used: Awaited<ReturnType<typeof useOperatorTokenWithAutoRotate>>;
     try {
-      const validated = await validateAccessToken(db, operatorToken, issuer);
-      const sub = validated.payload.sub;
-      if (typeof sub !== "string" || sub.length === 0) {
-        console.error("parachute auth mint-token: operator token has no sub claim");
-        return 1;
-      }
-      // Scope gate: a valid signature + non-expired JWT at this path is not
-      // sufficient — the token must carry operator-equivalent scope. Without
-      // this, a narrowly-scoped JWT stashed at ~/.parachute/operator.token
-      // would be treated as operator-bearer and mint arbitrary tokens
-      // (privilege escalation: narrow → arbitrary). Only set-password and
-      // rotate-operator legitimately write to this path; both seed the full
-      // OPERATOR_TOKEN_SCOPES set, so hub:admin is the right gate.
-      const tokenScope =
-        typeof validated.payload.scope === "string"
-          ? validated.payload.scope.split(/\s+/).filter((s) => s.length > 0)
-          : [];
-      if (!tokenScope.includes("hub:admin")) {
-        console.error("parachute auth mint-token: operator token lacks hub:admin scope");
-        console.error("run `parachute auth rotate-operator` to mint a fresh one");
-        return 1;
-      }
-      operatorSub = sub;
+      used = await useOperatorTokenWithAutoRotate(db, { configDir, issuer });
     } catch (err) {
+      if (err instanceof OperatorTokenExpiredError) {
+        console.error(`parachute auth mint-token: ${err.message}`);
+        return 1;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`parachute auth mint-token: operator token invalid — ${msg}`);
       console.error(
@@ -742,12 +776,51 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
       );
       return 1;
     }
+    if (!used) {
+      console.error(
+        "parachute auth mint-token: no operator token found at ~/.parachute/operator.token",
+      );
+      console.error(
+        "run `parachute auth set-password` (first run) or `parachute auth rotate-operator` to mint one",
+      );
+      return 1;
+    }
+    if (used.rotated) {
+      console.error(
+        `parachute auth mint-token: operator token within 7d of expiry — auto-rotated to ${used.rotated.expiresAt} (scope_set=${used.rotated.scopeSet})`,
+      );
+    }
+    const operatorSub = used.payload.sub;
+    if (typeof operatorSub !== "string" || operatorSub.length === 0) {
+      console.error("parachute auth mint-token: operator token has no sub claim");
+      return 1;
+    }
+    // Scope gate: a valid signature + non-expired JWT at this path is not
+    // sufficient — the token must carry operator-equivalent scope. Without
+    // this, a narrowly-scoped JWT stashed at ~/.parachute/operator.token
+    // would be treated as operator-bearer and mint arbitrary tokens
+    // (privilege escalation: narrow → arbitrary). Only set-password and
+    // rotate-operator legitimately write to this path; the `admin` scope-set
+    // is the only one that carries `hub:admin`, so this gate also enforces
+    // that scope-set narrowed tokens (install/start/expose/auth/vault) cannot
+    // mint arbitrary follow-on JWTs via this path.
+    const tokenScope =
+      typeof used.payload.scope === "string"
+        ? used.payload.scope.split(/\s+/).filter((s) => s.length > 0)
+        : [];
+    if (!tokenScope.includes("hub:admin")) {
+      console.error("parachute auth mint-token: operator token lacks hub:admin scope");
+      console.error(
+        "narrowed scope-sets (install/start/expose/auth/vault) can't mint follow-on tokens — run `parachute auth rotate-operator` to mint a fresh admin-set token",
+      );
+      return 1;
+    }
 
     const audience = flags.aud ?? inferAudience(scopes);
-    const sub = flags.sub ?? operatorSub;
+    const subjectForMint = flags.sub ?? operatorSub;
 
     const minted = await signAccessToken(db, {
-      sub,
+      sub: subjectForMint,
       scopes,
       audience,
       clientId: OPERATOR_TOKEN_CLIENT_ID,
@@ -824,7 +897,7 @@ export async function auth(args: readonly string[], deps: AuthDeps | Runner = {}
     }
     if (sub === "rotate-operator") {
       try {
-        return await runRotateOperator(normalized);
+        return await runRotateOperator(args.slice(1), normalized);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`parachute auth rotate-operator: ${msg}`);
