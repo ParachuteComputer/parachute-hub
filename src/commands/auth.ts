@@ -36,6 +36,7 @@ import {
   issueOperatorToken,
   useOperatorTokenWithAutoRotate,
 } from "../operator-token.ts";
+import { isNonRequestableScope } from "../scope-explanations.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import {
   SingleUserModeError,
@@ -814,6 +815,21 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   const scopes = flags.scope.split(/\s+/).filter((s) => s.length > 0);
   if (scopes.length === 0) {
     console.error("parachute auth mint-token: --scope must contain at least one scope");
+    return 1;
+  }
+
+  // Privilege-diffusion guard: mint paths cannot themselves mint tokens
+  // carrying non-requestable scopes (parachute:host:admin, the host:*
+  // narrow scopes, vault:<name>:admin). Holder of `parachute:host:auth`
+  // can mint vault/scribe/agent verb scopes for downstream services, but
+  // cannot mint another `:auth` (or any other non-requestable) without
+  // forced re-auth via the operator.token rotation path. Same set the
+  // public OAuth flow already rejects.
+  const blocked = scopes.filter((s) => isNonRequestableScope(s));
+  if (blocked.length > 0) {
+    console.error(
+      `parachute auth mint-token: scope ${blocked.join(", ")} is not requestable via mint-token; use OAuth flow or operator rotation`,
+    );
     return 1;
   }
 

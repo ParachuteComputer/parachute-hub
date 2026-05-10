@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { getClient, registerClient } from "../clients.ts";
 import { CSRF_COOKIE_NAME } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { validateAccessToken } from "../jwt-sign.ts";
+import { findTokenRowByJti, validateAccessToken } from "../jwt-sign.ts";
 import {
   authorizationServerMetadata,
   buildServicesCatalog,
@@ -1038,6 +1038,28 @@ describe("handleToken — full OAuth dance", () => {
       expect(tokenBody.services).toEqual({
         vault: { url: `${ISSUER}/vault/default`, version: "0.3.0" },
       });
+
+      // closes #215 reviewer F2 — Phase 1 code-grant access-token registry
+      // exemption pinning. The access token and refresh token share `jti`
+      // by design (signRefreshToken({ jti: access.jti, ... }) at the mint
+      // site), so the `tokens` row keyed by the access-token jti IS the
+      // shared row — refresh_token_hash is non-null, created_via is
+      // 'oauth_refresh'. We deliberately don't write a separate per-jti
+      // access-token row; revocation acts on the shared jti / family,
+      // bounded by the 15-min access TTL.
+      expect(payload.jti).toBeTruthy();
+      const row = findTokenRowByJti(db, payload.jti as string);
+      expect(row).not.toBeNull();
+      expect(row?.createdVia).toBe("oauth_refresh");
+      expect(row?.familyId).toBeTruthy();
+      // Verify the registry has exactly one row for this code-grant
+      // (not two — no separate access-token row).
+      const rowCount = (
+        db
+          .query<{ n: number }, [string]>("SELECT COUNT(*) as n FROM tokens WHERE jti = ?")
+          .get(payload.jti as string) ?? { n: 0 }
+      ).n;
+      expect(rowCount).toBe(1);
     } finally {
       cleanup();
     }

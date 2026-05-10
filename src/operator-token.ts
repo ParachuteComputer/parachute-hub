@@ -19,9 +19,12 @@
  * with an explicit re-auth message — auto-rotating from a dead token would
  * defeat the lifetime cap (security: forces a manual re-auth touch).
  *
- * The hub doesn't track operator-token jtis for revocation today (planned
- * for hub#212 Phase 1), so a leaked file stays valid until its TTL elapses.
- * Treat operator.token like an SSH private key.
+ * Operator-token jtis are tracked in the hub `tokens` registry as of
+ * hub#212 Phase 1 (created_via='operator_mint'); per-jti revocation is
+ * enforced via validateAccessToken's row.revokedAt check. A leaked file
+ * still stays valid until either its TTL elapses or the operator
+ * explicitly revokes the jti — treat operator.token like an SSH private
+ * key.
  */
 import type { Database } from "bun:sqlite";
 import { promises as fs } from "node:fs";

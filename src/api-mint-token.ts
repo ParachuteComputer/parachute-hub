@@ -26,6 +26,7 @@
 import type { Database } from "bun:sqlite";
 import { inferAudience } from "./jwt-audience.ts";
 import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
+import { isNonRequestableScope } from "./scope-explanations.ts";
 
 /** Default lifetime when --expires-in / `expires_in` is omitted. Matches the CLI. */
 export const API_MINT_TOKEN_DEFAULT_TTL_SECONDS = 90 * 24 * 60 * 60;
@@ -114,6 +115,22 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   const scopes = body.scope.split(/\s+/).filter((s) => s.length > 0);
   if (scopes.length === 0) {
     return jsonError(400, "invalid_request", "scope must contain at least one scope");
+  }
+
+  // Privilege-diffusion guard: mint paths cannot themselves mint tokens
+  // carrying non-requestable scopes (parachute:host:admin, the host:*
+  // narrow scopes, vault:<name>:admin). Holder of `parachute:host:auth`
+  // can mint vault/scribe/agent verb scopes for downstream services, but
+  // cannot mint another `:auth` (or any other non-requestable) without
+  // forced re-auth via the operator.token rotation path. Same set the
+  // public OAuth flow already rejects.
+  const blocked = scopes.filter((s) => isNonRequestableScope(s));
+  if (blocked.length > 0) {
+    return jsonError(
+      400,
+      "invalid_scope",
+      `scope ${blocked.join(", ")} is not requestable via mint-token; use OAuth flow or operator rotation`,
+    );
   }
 
   let audience: string;

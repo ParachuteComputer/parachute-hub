@@ -1488,6 +1488,29 @@ describe("parachute auth mint-token", () => {
     }
   });
 
+  // closes #215 reviewer F1 — privilege-diffusion guard on the CLI mint path.
+  test("CLI mint-token rejects parachute:host:auth (non-requestable scope)", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "parachute:host:auth"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("not requestable");
+      expect(stderr).toContain("parachute:host:auth");
+      // No token leaked to stdout.
+      expect(stdout).toBe("");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
   test("passing both --ttl and --expires-in is an error", async () => {
     const tmp = makeTmp();
     try {

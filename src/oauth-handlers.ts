@@ -966,6 +966,13 @@ async function handleTokenAuthorizationCode(
     issuer: deps.issuer,
     now: deps.now,
   });
+  // Phase 1 (#212) registry exemption: code-grant access tokens piggyback
+  // on the paired refresh token's `tokens` row (they share `jti` by
+  // design). We don't write a separate access-token row — revocation acts
+  // on the shared jti / family, and the 15-min access TTL bounds the
+  // window before per-jti re-validation is needed. A separate per-jti
+  // access-token row would double registry write volume on every OAuth
+  // grant + every refresh rotation; not worth the trade today.
   const refresh = signRefreshToken(db, {
     jti: access.jti,
     userId: redeemed.userId,

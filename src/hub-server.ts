@@ -865,7 +865,12 @@ export function hubFetch(
     }
 
     if (pathname === "/api/auth/mint-token") {
-      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      if (!getDb) {
+        return Response.json(
+          { error: "service_unavailable", error_description: "hub db not configured" },
+          { status: 503 },
+        );
+      }
       return handleApiMintToken(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,

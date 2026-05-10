@@ -293,6 +293,76 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     }
   });
 
+  // closes #215 reviewer F1 — privilege-diffusion guard.
+  test("400 invalid_scope when minting parachute:host:auth (non-requestable)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const resp = await handleApiMintToken(
+          jsonRequest({ scope: "parachute:host:auth" }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(400);
+        const body = (await resp.json()) as { error: string; error_description: string };
+        expect(body.error).toBe("invalid_scope");
+        expect(body.error_description).toContain("parachute:host:auth");
+        expect(body.error_description).toContain("not requestable");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("400 invalid_scope when multi-scope includes a non-requestable", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const resp = await handleApiMintToken(
+          jsonRequest(
+            { scope: "vault:default:write parachute:host:admin" },
+            { authorization: `Bearer ${op.token}` },
+          ),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(400);
+        const body = (await resp.json()) as { error: string; error_description: string };
+        expect(body.error).toBe("invalid_scope");
+        expect(body.error_description).toContain("parachute:host:admin");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("400 invalid_scope when minting vault:<name>:admin (regex non-requestable)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const resp = await handleApiMintToken(
+          jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(400);
+        const body = (await resp.json()) as { error: string };
+        expect(body.error).toBe("invalid_scope");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("405 on non-POST", async () => {
     const h = makeHarness();
     try {
