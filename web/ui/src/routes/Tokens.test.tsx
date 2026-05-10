@@ -368,6 +368,42 @@ describe("Tokens — revoke flow", () => {
   });
 });
 
+describe("Tokens — client_id rendering (F2)", () => {
+  it("renders client_id alongside identity for OAuth-style rows", async () => {
+    vi.mocked(api.listTokens).mockResolvedValue({
+      tokens: [
+        tokenRow("oauthrowAAAAAAAAAXXXX", {
+          client_id: "oauth-app-foo",
+          user_id: "shared-user-uuid",
+          subject: null,
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("shared-user-uuid")).toBeInTheDocument());
+    // client_id appears as code text following "client:" label.
+    expect(screen.getByText("oauth-app-foo")).toBeInTheDocument();
+    expect(screen.getByText(/client:/)).toBeInTheDocument();
+  });
+
+  it("renders parachute-hub client_id for CLI/operator-mint rows", async () => {
+    vi.mocked(api.listTokens).mockResolvedValue({
+      tokens: [
+        tokenRow("clirowAAAAAAAAAXXXX", {
+          client_id: "parachute-hub",
+          user_id: null,
+          subject: "operator",
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("operator")).toBeInTheDocument());
+    expect(screen.getByText("parachute-hub")).toBeInTheDocument();
+  });
+});
+
 describe("Tokens — pagination", () => {
   it("Load more appends next page; clears button when next_cursor goes null", async () => {
     const listMock = vi.mocked(api.listTokens);
@@ -390,6 +426,46 @@ describe("Tokens — pagination", () => {
     expect(screen.queryByRole("button", { name: /load more/i })).toBeNull();
     // Second call passed the cursor.
     expect(listMock).toHaveBeenLastCalledWith({ cursor: "cursor-1", revoked: "all" });
+  });
+
+  it("Load more is disabled while the next-page fetch is in flight (F1)", async () => {
+    const listMock = vi.mocked(api.listTokens);
+    listMock.mockResolvedValueOnce({
+      tokens: [tokenRow("page1aaaPPPPPPPXXXX")],
+      next_cursor: "cursor-1",
+    });
+    // Hold the second call open so we can inspect button state during the
+    // in-flight window — the whole point of F1 is "user double-clicks; we
+    // don't refire the fetch and overwrite each other's appended pages."
+    let resolveSecond: (page: api.AdminTokensPage) => void = () => {};
+    listMock.mockReturnValueOnce(
+      new Promise<api.AdminTokensPage>((resolve) => {
+        resolveSecond = resolve;
+      }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByText(/page1aaa…XXXX/)).toBeInTheDocument());
+
+    const loadMoreBtn = screen.getByRole("button", { name: /^load more$/i });
+    expect(loadMoreBtn).not.toBeDisabled();
+    fireEvent.click(loadMoreBtn);
+
+    // While the second fetch is pending: button text flips to "Loading…"
+    // AND it's disabled — so a second click can't refire the fetch.
+    await waitFor(() => expect(screen.getByRole("button", { name: /^loading…$/i })).toBeDisabled());
+    fireEvent.click(screen.getByRole("button", { name: /^loading…$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^loading…$/i }));
+    // Two extra clicks during the in-flight window — listTokens still only
+    // called twice total (initial + the one in-flight), not four times.
+    expect(listMock).toHaveBeenCalledTimes(2);
+
+    // Resolve the in-flight call. Button reverts to enabled "Load more"
+    // (or vanishes if next_cursor is null — here we set null to verify
+    // the cleanup path).
+    resolveSecond({ tokens: [tokenRow("page2bbbPPPPPPPYYYY")], next_cursor: null });
+    await waitFor(() => expect(screen.getByText(/page2bbb…YYYY/)).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: /^load more$/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^loading…$/i })).toBeNull();
   });
 });
 

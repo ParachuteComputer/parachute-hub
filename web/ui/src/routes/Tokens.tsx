@@ -72,6 +72,7 @@ export function Tokens() {
   const [form, setForm] = useState<MintFormFields>(EMPTY_FORM);
   const [revoke, setRevoke] = useState<RevokeState>({ kind: "idle" });
   const [showForm, setShowForm] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   useEffect(() => {
     void reload;
@@ -98,10 +99,17 @@ export function Tokens() {
 
   async function loadMore(): Promise<void> {
     if (list.kind !== "ok" || !list.nextCursor) return;
+    // Guard against double-clicks: a second invocation while the first
+    // request is in flight would close over the same `list.tokens` and
+    // overwrite the first call's appended page on resolve. The `disabled`
+    // attribute on the button is the primary defense; this state guard is
+    // belt-and-suspenders for fast-finger keyboard activation.
+    if (loadingMore) return;
     const opts: ListTokensOpts = { cursor: list.nextCursor };
     if (filter === "live") opts.revoked = "false";
     else if (filter === "revoked") opts.revoked = "true";
     else opts.revoked = "all";
+    setLoadingMore(true);
     try {
       const page = await listTokens(opts);
       setList({
@@ -112,6 +120,8 @@ export function Tokens() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setList({ kind: "error", message });
+    } finally {
+      setLoadingMore(false);
     }
   }
 
@@ -362,6 +372,7 @@ export function Tokens() {
         onConfirm: onConfirmRevoke,
         onLoadMore: loadMore,
         onRetry: () => setReload((n) => n + 1),
+        loadingMore,
       })}
     </div>
   );
@@ -374,9 +385,18 @@ interface RenderListProps {
   onConfirm: (jti: string) => Promise<void>;
   onLoadMore: () => Promise<void>;
   onRetry: () => void;
+  loadingMore: boolean;
 }
 
-function renderList({ list, revoke, setRevoke, onConfirm, onLoadMore, onRetry }: RenderListProps) {
+function renderList({
+  list,
+  revoke,
+  setRevoke,
+  onConfirm,
+  onLoadMore,
+  onRetry,
+  loadingMore,
+}: RenderListProps) {
   if (list.kind === "loading") {
     return <p className="muted">Loading…</p>;
   }
@@ -425,6 +445,12 @@ function renderList({ list, revoke, setRevoke, onConfirm, onLoadMore, onRetry }:
               <div className="dim" style={{ marginTop: "0.25rem" }}>
                 <span className="muted">identity: </span>
                 <code>{identity}</code>
+                {t.client_id ? (
+                  <>
+                    <span className="muted"> · client: </span>
+                    <code>{t.client_id}</code>
+                  </>
+                ) : null}
               </div>
               <div className="dim" style={{ marginTop: "0.25rem" }}>
                 <span className="muted">scope: </span>
@@ -514,11 +540,12 @@ function renderList({ list, revoke, setRevoke, onConfirm, onLoadMore, onRetry }:
           <button
             type="button"
             className="secondary"
+            disabled={loadingMore}
             onClick={() => {
               void onLoadMore();
             }}
           >
-            Load more
+            {loadingMore ? "Loading…" : "Load more"}
           </button>
         </div>
       ) : null}
