@@ -51,6 +51,8 @@ import {
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
+import { handleApiMintToken } from "./api-mint-token.ts";
+import { REVOCATION_LIST_MOUNT, handleRevocationList } from "./api-revocation-list.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
@@ -694,6 +696,30 @@ export function hubFetch(
       }
     }
 
+    if (pathname === REVOCATION_LIST_MOUNT) {
+      // Revocation list (hub#212 Phase 1). Public — same CORS posture as
+      // jwks.json since resource servers (vault/scribe/agent) fetch it
+      // cross-origin on the 60s polling cadence wired in Phase 4.
+      const corsHeaders = {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, OPTIONS",
+      };
+      if (req.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders });
+      }
+      if (!getDb) {
+        return new Response('{"error":"revocation list unavailable: db not configured"}', {
+          status: 503,
+          headers: { "content-type": "application/json", ...corsHeaders },
+        });
+      }
+      const resp = handleRevocationList(req, { db: getDb() });
+      // Layer the wildcard CORS over whatever cache-control the handler set.
+      const merged = new Headers(resp.headers);
+      for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
+      return new Response(resp.body, { status: resp.status, headers: merged });
+    }
+
     if (pathname === "/.well-known/jwks.json") {
       // JWKS is also a cross-origin fetch target (browser-side OAuth
       // libraries pull this to verify access tokens). Same wildcard CORS
@@ -835,6 +861,19 @@ export function hubFetch(
         db: getDb(),
         issuer: oauthDeps(req).issuer,
         knownVaultNames,
+      });
+    }
+
+    if (pathname === "/api/auth/mint-token") {
+      if (!getDb) {
+        return Response.json(
+          { error: "service_unavailable", error_description: "hub db not configured" },
+          { status: 503 },
+        );
+      }
+      return handleApiMintToken(req, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
       });
     }
 

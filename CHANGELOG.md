@@ -2,6 +2,61 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.8-rc.2] - 2026-05-09
+
+Token registry + mint API + revocation list endpoint — Phase 1 of the hub-as-sole-AS migration tracked in [#212](https://github.com/ParachuteComputer/parachute-hub/issues/212). Five components, all hub-side, additive (no breaking changes to existing surfaces). Closes Phase 1 and absorbs Phase 5 (CLI relocation — the canonical `parachute auth mint-token` already exists per #179, this PR extends it).
+
+### Added
+
+- **Token registry: `tokens` table v6 migration (Component 1).** Generalizes the OAuth-refresh-only `tokens` table into a unified registry across every issued JWT class. Three new columns: `permissions TEXT` (JSON, fine-grained constraints per the auth-architecture research doc §11.3), `created_via TEXT NOT NULL DEFAULT 'oauth_refresh'` (provenance: `oauth_refresh` / `cli_mint` / `operator_mint`), `subject TEXT` (non-user identity for service / operator mints — operator-mint rows store `"operator"` here while leaving `user_id` NULL). The `user_id` column drops its NOT NULL constraint (CLI/operator mints aren't tied to a hub user; OAuth-refresh rows still set it). SQLite has no `ALTER COLUMN` to drop NOT NULL, so the migration uses the recreate-and-rename pattern inside the migration transaction (atomic; nothing references `tokens` so the drop is safe). Existing rows backfill `created_via='oauth_refresh'` automatically via the column default. New indexes: `tokens_revoked` (powers the revocation-list filter), `tokens_subject` (lookup by non-user mint). Existing indexes (`tokens_user`, `tokens_active_refresh`, `tokens_family`) recreated post-rename. Pre-Phase-1 tokens (already issued before this migration) stay valid but unregistered; they expire on their own (15-min access tokens drained within the hour; pre-#213 365d operator tokens cap at their original expiry).
+- **`POST /api/auth/mint-token` HTTP endpoint (Component 3).** New file `src/api-mint-token.ts`. Companion to the CLI for automation that doesn't have local CLI access. Auth: `Authorization: Bearer <token>` whose `scope` claim contains `parachute:host:auth` (the new narrow scope from #213). Body shape: `{ scope, audience?, expires_in?, subject?, permissions? }` — same semantics as the CLI's `--scope` / `--aud` / `--expires-in` / `--sub` / `--permissions` flags. Returns `{ jti, token, expires_at, scope, permissions? }`. 401 / 403 / 400 / 405 surfaces match the OAuth error vocabulary. Wired into `hub-server.ts` dispatch. Every mint writes a registry row identical to the CLI path (`created_via='cli_mint'`).
+- **`GET /.well-known/parachute-revocation.json` revocation list endpoint (Component 5).** New file `src/api-revocation-list.ts`. Public endpoint (no auth — the list is harmless to expose; opaque jtis only). Returns `{ generated_at, jtis: [...] }` filtered to `revoked_at IS NOT NULL AND expires_at > now`. Already-expired jtis are filtered out (consumers' own `exp` check rejects them anyway; listing is noise). `Cache-Control: public, max-age=60` matches the polling cadence Phase 4 will wire on the resource-server side. Wildcard CORS posture identical to `/.well-known/jwks.json` — resource servers fetch this cross-origin.
+- **`recordTokenMint(db, opts)` helper in `src/jwt-sign.ts`.** The non-OAuth-refresh mint path; writes a registry row with the chosen `created_via` and `subject`. Used by `parachute auth mint-token`, the new HTTP endpoint, and the operator-mint paths.
+- **`revokeTokenByJti(db, jti, now)` helper in `src/jwt-sign.ts`.** Idempotent revocation: returns `true` when a row was updated (was un-revoked before), `false` when no row matches or the row was already revoked. Powers the future `/admin/tokens` admin UI revoke action (Phase 2) and any other explicit-revoke surface.
+- **`listActiveRevocations(db, now)` helper in `src/jwt-sign.ts`.** Returns the snapshot of currently-revoked-and-not-yet-expired jtis. Powers the revocation list endpoint.
+- **`tokenRowIdentity(row)` helper in `src/jwt-sign.ts`.** Returns the canonical "who is this token for" string — `userId ?? subject ?? ""`. Collapses the OAuth-vs-non-OAuth distinction for callers that don't care.
+- **`TokenCreatedVia` type exported from `src/jwt-sign.ts`** — `"oauth_refresh" | "cli_mint" | "operator_mint"`.
+
+### Changed
+
+- **`parachute auth mint-token` extended (Component 2).** New flags:
+  - `--permissions <JSON>` — JSON object encoding fine-grained constraints beyond OAuth scope. Round-trips into the JWT's `permissions` claim. Validated to be a JSON object (not a primitive, not an array); malformed JSON or non-object payloads are rejected with a usage error.
+  - `--expires-in <integer-seconds>` — canonical lifetime flag. Matches OAuth's `expires_in` claim semantics (the JWT `exp` is `iat + expires_in`). Integer-seconds only; values like `1d` go through the legacy `--ttl` flag.
+  - `--ttl` is now the **deprecated alias**: still works, still accepts the duration-string form (`90d` / `24h` / `30m` / `60s`), but emits a one-line stderr deprecation notice on use (`--ttl is deprecated; use --expires-in <seconds> instead (will be removed in 0.6.0)`). Passing both `--ttl` and `--expires-in` together is a usage error.
+  - Help text rewritten with the multi-scope syntax, the `--permissions` example, and the deprecation note.
+  - Every successful mint writes a `tokens` registry row (`created_via='cli_mint'`, `subject=<--sub or operator's sub>`, `user_id NULL` per the design — CLI mints aren't user-tied at the row level).
+- **Operator-token mints write to the registry (Component 4).** `mintOperatorToken` now calls `recordTokenMint(...)` after signing — `created_via='operator_mint'`, `subject="operator"`, `user_id NULL`. Auto-rotation rows from #213's `useOperatorTokenWithAutoRotate` get registered too. Both the original and the rotated row exist (the original isn't auto-revoked on rotation; it stays valid until its own `exp`). A future "revoke prior on rotation" toggle is a Phase 2 candidate; for now we accept the slightly larger registry for the simpler invariant.
+- **`signRefreshToken` explicitly stamps `created_via='oauth_refresh'`.** Previously the column didn't exist; v6's column default would handle pre-existing rows but new inserts go through this path now. Belt-and-suspenders with the migration default.
+- **`RefreshTokenRow.userId` is now `string | null`.** Reflects the v6 schema. OAuth callsites (`oauth-handlers.ts:1054`, line 1069 — refresh-token rotation path) add a runtime guard: if `findRefreshToken` returns a row with `userId === null` (shouldn't happen because `findRefreshToken` filters by `refresh_token_hash IS NOT NULL`, and only OAuth-refresh rows have a hash), surface a clean `invalid_grant` rather than letting the type-system lie cascade. Defense-in-depth; the runtime path is unreachable on a correct schema but the guard makes the contract explicit.
+- **`SignAccessTokenOpts.extraClaims` now used for the `permissions` claim too.** Previously only `pa_scope_set` rode this seam (#213). The `extraClaims` shape is unchanged; it just has more callers now.
+
+### Migration / impact
+
+- **Operators upgrading from 0.5.7-rc.* or 0.5.7 stable:** the v6 migration runs automatically on next `openHubDb()`. Existing OAuth refresh-token rows are backfilled with `created_via='oauth_refresh'`; their `permissions` and `subject` stay NULL. No data loss, no downtime.
+- **Operators with operator.token files from 0.5.7 or earlier:** still valid (the JWT carries its own `exp`, signed by hub's existing keys, validated by `validateAccessToken`). They don't have a registry row, but that's harmless — `validateAccessToken` only consults the registry to check `revoked_at`, and a missing row is treated as not-revoked. The next `parachute auth rotate-operator` (or the auto-rotation from #213) will register the new token.
+- **OAuth refresh-token rotation:** unchanged behavior. The new `userId` nullability guard is defense-in-depth; the runtime path is unreachable on correctly-shaped rows.
+- **Pre-existing access tokens:** still valid until expiry. The 15-minute default TTL means any pre-Phase-1 access tokens drain within the hour after deploy.
+
+### Out of scope (deferred to later phases of #212)
+
+- **Phase 2: admin UI `/admin/tokens` route** — list / revoke / inspect rows. Daytime work.
+- **Phase 4: vault / agent / scribe revocation-list consumers** — fetch `/.well-known/parachute-revocation.json` on a 60s TTL and reject any presented JWT whose `jti` appears. Resource-server side; this PR ships the issuer-side endpoint only.
+- **Phase 5: `parachute vault tokens create` → `parachute auth mint-token`** — partially absorbed into this PR (the canonical CLI path already exists; the `vault tokens create` path becomes a removable alias). Final cutover deferred to a Phase 5 cleanup PR.
+- **Phase 6: `pvt_*` deprecation in vault** — vault-side; out of scope here.
+- **Per-CLI-command scope-set enforcement (Phase 2 of #213)** — separate followup.
+
+### Tests
+
+`bun test ./src`: **1153 pass / 0 fail** (was 1118 / 0 on the 0.5.8-rc.1 tip). 35 new cases:
+
+- `src/__tests__/jwt-sign.test.ts` (+7): v6 schema shape via `PRAGMA table_info(tokens)`, `recordTokenMint` round-trip, duplicate-jti throws `RefreshTokenInsertError`, `revokeTokenByJti` idempotency + flips `revoked_at`, `listActiveRevocations` filters by `revoked_at AND expires_at>now`, `tokenRowIdentity` returns `userId ?? subject`, `signRefreshToken` stamps `created_via='oauth_refresh'`.
+- `src/__tests__/auth.test.ts` (+9): every mint writes registry row (`created_via='cli_mint'`), `--permissions` JSON object round-trips into JWT + registry, `--permissions` malformed JSON rejected, `--permissions` non-object (array) rejected, `--expires-in` (canonical) sets JWT TTL, `--expires-in` non-integer rejected, `--expires-in` over 365d cap rejected, `--ttl` deprecation notice on stderr but still works, both `--ttl` and `--expires-in` together rejected.
+- `src/__tests__/operator-token.test.ts` (+2): `mintOperatorToken` writes registry row (`created_via='operator_mint'`, `subject='operator'`, `user_id NULL`), auto-rotation writes a fresh row for the rotated token while leaving the original row in place.
+- `src/__tests__/api-mint-token.test.ts` (+11, new file): 401 no auth, 401 non-Bearer, 401 invalid bearer, 403 bearer without `parachute:host:auth`, happy path with admin operator token (registry row written, JWT round-trips), happy path with `--scope-set=auth` narrow operator token, `permissions` round-trip, 400 missing scope, 400 expires_in over cap, 400 permissions non-object, 405 non-POST.
+- `src/__tests__/api-revocation-list.test.ts` (+6, new file): empty list initially, returns revoked jti, filters out already-expired, OAuth-refresh rows participate (cross-class revocation), 405 non-GET, `revokeTokenByJti` idempotency.
+
+`bunx biome check .`: 171 files, no findings. `bun run typecheck`: clean.
+
 ## [0.5.8-rc.1] - 2026-05-09
 
 Operator-token hardening — first slice of the hub-as-sole-AS migration arc tracked in #212. This PR is scoped to #213's three pieces; the broader registry + revocation infrastructure lands in 0.5.8-rc.2 (#212 Phase 1).

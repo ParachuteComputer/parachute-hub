@@ -19,15 +19,18 @@
  * with an explicit re-auth message — auto-rotating from a dead token would
  * defeat the lifetime cap (security: forces a manual re-auth touch).
  *
- * The hub doesn't track operator-token jtis for revocation today (planned
- * for hub#212 Phase 1), so a leaked file stays valid until its TTL elapses.
- * Treat operator.token like an SSH private key.
+ * Operator-token jtis are tracked in the hub `tokens` registry as of
+ * hub#212 Phase 1 (created_via='operator_mint'); per-jti revocation is
+ * enforced via validateAccessToken's row.revokedAt check. A leaked file
+ * still stays valid until either its TTL elapses or the operator
+ * explicitly revokes the jti — treat operator.token like an SSH private
+ * key.
  */
 import type { Database } from "bun:sqlite";
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
 import { configDir } from "./config.ts";
-import { signAccessToken, validateAccessToken } from "./jwt-sign.ts";
+import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
 
 export const OPERATOR_TOKEN_FILENAME = "operator.token";
 /** Default operator-token lifetime — 90 days, was 365d through 0.5.7 (#213). */
@@ -157,6 +160,22 @@ export async function mintOperatorToken(
     ttlSeconds: opts.ttlSeconds ?? OPERATOR_TOKEN_TTL_SECONDS,
     extraClaims: { [OPERATOR_TOKEN_SCOPE_SET_CLAIM]: scopeSet },
     ...(opts.jti !== undefined ? { jti: opts.jti } : {}),
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
+  });
+  // Register every operator-mint with the unified token registry (hub#212
+  // Phase 1). Per design: operator-mint rows have user_id NULL; the
+  // subject column carries the canonical "operator" identity string.
+  // (Storing user_id here would require an FK-valid users row, which the
+  // operator-mint path doesn't always have access to in test fixtures —
+  // and conceptually the operator is a role, not a hub user.) Powers the
+  // revocation list endpoint.
+  recordTokenMint(db, {
+    jti: minted.jti,
+    createdVia: "operator_mint",
+    subject: "operator",
+    clientId: OPERATOR_TOKEN_CLIENT_ID,
+    scopes,
+    expiresAt: minted.expiresAt,
     ...(opts.now !== undefined ? { now: opts.now } : {}),
   });
   return { ...minted, scopeSet };

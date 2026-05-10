@@ -26,7 +26,7 @@ import { HUB_DEFAULT_PORT, readHubPort } from "../hub-control.ts";
 import { openHubDb } from "../hub-db.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
 import { inferAudience } from "../jwt-audience.ts";
-import { signAccessToken } from "../jwt-sign.ts";
+import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
 import {
   OPERATOR_TOKEN_CLIENT_ID,
   OPERATOR_TOKEN_SCOPE_SET_NAMES,
@@ -36,6 +36,7 @@ import {
   issueOperatorToken,
   useOperatorTokenWithAutoRotate,
 } from "../operator-token.ts";
+import { isNonRequestableScope } from "../scope-explanations.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import {
   SingleUserModeError,
@@ -87,9 +88,12 @@ Usage:
                                        Mint a fresh ~/.parachute/operator.token
                                        (set = install|start|expose|auth|vault|admin,
                                        default admin)
-  parachute auth mint-token --scope <scope> [--aud <aud>] [--ttl <duration>] [--sub <sub>]
+  parachute auth mint-token --scope <scope> [--aud <aud>] [--expires-in <seconds>]
+                                            [--sub <sub>] [--permissions <json>]
                                        Mint a scope-narrow JWT against the
-                                       operator's identity (stdout = JWT)
+                                       operator's identity (stdout = JWT).
+                                       --ttl <duration> is the deprecated
+                                       alias (use --expires-in seconds).
   parachute auth pending-clients       List OAuth clients awaiting approval
   parachute auth approve-client <id>   Approve a pending OAuth client
   parachute auth list-grants [--username <name>]
@@ -141,9 +145,28 @@ identity, signed with the same key as OAuth-issued tokens. Pipeable:
 \`parachute auth mint-token --scope scribe:transcribe | pbcopy\`. The
 audience defaults via the same inference rule the OAuth flow uses
 (named \`vault:<name>:<verb>\` → \`vault.<name>\`, otherwise the first
-colon-prefixed scope's namespace, fallback \`hub\`). TTL defaults to 90d,
-caps at 365d. Requires a valid ~/.parachute/operator.token (run
-\`parachute auth set-password\` or \`rotate-operator\` first).
+colon-prefixed scope's namespace, fallback \`hub\`). Lifetime defaults
+to 90d, caps at 365d.
+
+--scope accepts space-separated multi-scope (e.g.
+\`--scope "vault:default:read agent:wovenboulder:invoke"\`).
+
+--expires-in is the canonical lifetime flag — integer seconds (e.g.
+\`--expires-in 86400\` for 1 day). The legacy \`--ttl\` flag accepts a
+duration suffix (\`90d\` / \`24h\` / \`30m\` / \`60s\`) and is supported as
+a deprecated alias; passing it emits a one-line stderr deprecation
+notice. \`--ttl\` will be removed in 0.6.0.
+
+--permissions accepts a JSON object encoding fine-grained constraints
+beyond OAuth scope (e.g.
+\`--permissions '{"vault":{"default":{"write_tags":["health"]}}}'\`).
+Carried in the JWT as the \`permissions\` claim per the convergence
+section of the auth-architecture research doc.
+
+Every mint writes a row to the hub's token registry (one source of
+truth for revocation, admin UI introspection). Requires a valid
+~/.parachute/operator.token (run \`parachute auth set-password\` or
+\`rotate-operator\` first).
 
 pending-clients + approve-client gate /oauth/register against operator
 approval (closes #74). Self-served DCR registrations land as 'pending'
@@ -657,7 +680,11 @@ interface MintTokenFlags {
   scope?: string;
   aud?: string;
   ttl?: string;
+  expiresIn?: string;
   sub?: string;
+  permissions?: string;
+  /** True when --ttl was used (deprecated alias). Triggers a one-line stderr warning. */
+  ttlDeprecationSeen?: boolean;
   error?: string;
 }
 
@@ -665,7 +692,10 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
   let scope: string | undefined;
   let aud: string | undefined;
   let ttl: string | undefined;
+  let expiresIn: string | undefined;
   let sub: string | undefined;
+  let permissions: string | undefined;
+  let ttlDeprecationSeen = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--scope") {
@@ -686,9 +716,18 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
       const v = args[++i];
       if (!v) return { error: "--ttl requires a value" };
       ttl = v;
+      ttlDeprecationSeen = true;
     } else if (a?.startsWith("--ttl=")) {
       ttl = a.slice("--ttl=".length);
       if (!ttl) return { error: "--ttl requires a value" };
+      ttlDeprecationSeen = true;
+    } else if (a === "--expires-in") {
+      const v = args[++i];
+      if (!v) return { error: "--expires-in requires a value" };
+      expiresIn = v;
+    } else if (a?.startsWith("--expires-in=")) {
+      expiresIn = a.slice("--expires-in=".length);
+      if (!expiresIn) return { error: "--expires-in requires a value" };
     } else if (a === "--sub") {
       const v = args[++i];
       if (!v) return { error: "--sub requires a value" };
@@ -696,11 +735,21 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
     } else if (a?.startsWith("--sub=")) {
       sub = a.slice("--sub=".length);
       if (!sub) return { error: "--sub requires a value" };
+    } else if (a === "--permissions") {
+      const v = args[++i];
+      if (!v) return { error: "--permissions requires a value" };
+      permissions = v;
+    } else if (a?.startsWith("--permissions=")) {
+      permissions = a.slice("--permissions=".length);
+      if (!permissions) return { error: "--permissions requires a value" };
     } else {
       return { error: `unknown flag "${a}"` };
     }
   }
-  return { scope, aud, ttl, sub };
+  if (ttl !== undefined && expiresIn !== undefined) {
+    return { error: "pass --expires-in OR --ttl, not both (--ttl is the deprecated alias)" };
+  }
+  return { scope, aud, ttl, expiresIn, sub, permissions, ttlDeprecationSeen };
 }
 
 const MINT_TOKEN_TTL_DEFAULT_SECONDS = 90 * 24 * 60 * 60;
@@ -708,9 +757,9 @@ const MINT_TOKEN_TTL_MAX_SECONDS = 365 * 24 * 60 * 60;
 
 /**
  * Parse a Go-ish duration string: integer + one of d/h/m/s. Caps at 365d.
- * `90d` → 7776000. We don't honor Go's stdlib `time.ParseDuration` exactly
- * (no `d` there), so this is a small custom parser to keep the operator
- * surface obvious.
+ * `90d` → 7776000. Used by the deprecated --ttl alias. The canonical
+ * --expires-in flag takes a raw integer seconds value (per OAuth's
+ * `expires_in` claim semantics — see `parseExpiresIn`).
  */
 function parseTtl(input: string): { seconds: number } | { error: string } {
   const m = /^(\d+)(d|h|m|s)$/.exec(input);
@@ -726,6 +775,29 @@ function parseTtl(input: string): { seconds: number } | { error: string } {
   return { seconds };
 }
 
+/**
+ * Parse the canonical --expires-in flag value as an integer seconds count.
+ * Matches OAuth's `expires_in` claim semantics — the JWT `exp` is
+ * `iat + expires_in`. Caps at 365d like the deprecated --ttl path.
+ */
+function parseExpiresIn(input: string): { seconds: number } | { error: string } {
+  if (!/^\d+$/.test(input)) {
+    return {
+      error: `invalid --expires-in "${input}" — expected an integer seconds count (e.g. 86400 = 1 day)`,
+    };
+  }
+  const seconds = Number.parseInt(input, 10);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return { error: `invalid --expires-in "${input}" — must be > 0` };
+  }
+  if (seconds > MINT_TOKEN_TTL_MAX_SECONDS) {
+    return {
+      error: `--expires-in "${input}" exceeds 365d cap (${MINT_TOKEN_TTL_MAX_SECONDS} seconds)`,
+    };
+  }
+  return { seconds };
+}
+
 async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<number> {
   const flags = parseMintTokenFlags(args);
   if (flags.error) {
@@ -735,7 +807,7 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   if (!flags.scope) {
     console.error("parachute auth mint-token: --scope is required");
     console.error(
-      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--ttl <duration>] [--sub <sub>]",
+      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--expires-in <seconds>] [--sub <sub>] [--permissions <json>]",
     );
     return 1;
   }
@@ -746,14 +818,62 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
     return 1;
   }
 
+  // Privilege-diffusion guard: mint paths cannot themselves mint tokens
+  // carrying non-requestable scopes (parachute:host:admin, the host:*
+  // narrow scopes, vault:<name>:admin). Holder of `parachute:host:auth`
+  // can mint vault/scribe/agent verb scopes for downstream services, but
+  // cannot mint another `:auth` (or any other non-requestable) without
+  // forced re-auth via the operator.token rotation path. Same set the
+  // public OAuth flow already rejects.
+  const blocked = scopes.filter((s) => isNonRequestableScope(s));
+  if (blocked.length > 0) {
+    console.error(
+      `parachute auth mint-token: scope ${blocked.join(", ")} is not requestable via mint-token; use OAuth flow or operator rotation`,
+    );
+    return 1;
+  }
+
+  let permissions: string | undefined;
+  if (flags.permissions !== undefined) {
+    try {
+      // Parse to validate well-formedness — round-trip through JSON.stringify
+      // so we hand the JWT a canonicalized payload (no operator-introduced
+      // whitespace, no comments, no trailing commas).
+      const parsed = JSON.parse(flags.permissions) as unknown;
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        console.error(
+          'parachute auth mint-token: --permissions must be a JSON object (e.g. \'{"vault":{"default":{"write_tags":["health"]}}}\')',
+        );
+        return 1;
+      }
+      permissions = JSON.stringify(parsed);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`parachute auth mint-token: --permissions is not valid JSON — ${msg}`);
+      return 1;
+    }
+  }
+
   let ttlSeconds = MINT_TOKEN_TTL_DEFAULT_SECONDS;
-  if (flags.ttl) {
+  if (flags.expiresIn) {
+    const parsed = parseExpiresIn(flags.expiresIn);
+    if ("error" in parsed) {
+      console.error(`parachute auth mint-token: ${parsed.error}`);
+      return 1;
+    }
+    ttlSeconds = parsed.seconds;
+  } else if (flags.ttl) {
     const parsed = parseTtl(flags.ttl);
     if ("error" in parsed) {
       console.error(`parachute auth mint-token: ${parsed.error}`);
       return 1;
     }
     ttlSeconds = parsed.seconds;
+  }
+  if (flags.ttlDeprecationSeen) {
+    console.error(
+      "parachute auth mint-token: --ttl is deprecated; use --expires-in <seconds> instead (will be removed in 0.6.0)",
+    );
   }
 
   const configDir = deps.configDir ?? CONFIG_DIR;
@@ -818,6 +938,7 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
 
     const audience = flags.aud ?? inferAudience(scopes);
     const subjectForMint = flags.sub ?? operatorSub;
+    const permissionsClaim = permissions !== undefined ? JSON.parse(permissions) : undefined;
 
     const minted = await signAccessToken(db, {
       sub: subjectForMint,
@@ -826,7 +947,24 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
       clientId: OPERATOR_TOKEN_CLIENT_ID,
       issuer,
       ttlSeconds,
+      ...(permissionsClaim !== undefined ? { extraClaims: { permissions: permissionsClaim } } : {}),
     });
+
+    // Write a registry row (hub#212 Phase 1). Powers the revocation list
+    // endpoint and admin UI introspection. Per design: CLI-mint rows have
+    // user_id NULL; the subject column carries the chosen mint subject
+    // (--sub overrides operator-sub). The JWT is its own access token,
+    // not a refresh token, so refresh_token_hash + family_id stay NULL.
+    recordTokenMint(db, {
+      jti: minted.jti,
+      createdVia: "cli_mint",
+      subject: subjectForMint,
+      clientId: OPERATOR_TOKEN_CLIENT_ID,
+      scopes,
+      expiresAt: minted.expiresAt,
+      ...(permissions !== undefined ? { permissions } : {}),
+    });
+
     console.log(minted.token);
     return 0;
   } finally {

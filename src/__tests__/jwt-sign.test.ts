@@ -9,8 +9,13 @@ import {
   REFRESH_TOKEN_TTL_MS,
   RefreshTokenInsertError,
   findRefreshToken,
+  findTokenRowByJti,
+  listActiveRevocations,
+  recordTokenMint,
+  revokeTokenByJti,
   signAccessToken,
   signRefreshToken,
+  tokenRowIdentity,
   validateAccessToken,
 } from "../jwt-sign.ts";
 import { getActiveSigningKey, rotateSigningKey } from "../signing-keys.ts";
@@ -354,6 +359,206 @@ describe("validateAccessToken", () => {
       const enc = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
       const fake = `${enc(header)}.${enc(payload)}.sig`;
       await expect(validateAccessToken(db, fake)).rejects.toThrow(/missing kid/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// closes #212 Phase 1 — unified token registry helpers (recordTokenMint,
+// revokeTokenByJti, listActiveRevocations) and the v6 schema shape.
+describe("token registry (hub#212 Phase 1)", () => {
+  test("v6 schema: tokens has user_id NULLABLE + permissions/created_via/subject", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      // SQLite PRAGMA table_info reports column nullability + defaults; the
+      // bun:sqlite driver maps the row shape onto our type. The columns are
+      // (cid, name, type, notnull, dflt_value, pk) per SQLite docs.
+      type ColInfo = {
+        cid: number;
+        name: string;
+        type: string;
+        notnull: number;
+        dflt_value: string | null;
+        pk: number;
+      };
+      const cols = db.query<ColInfo, []>("PRAGMA table_info(tokens)").all();
+      const byName = new Map(cols.map((c) => [c.name, c]));
+      // Pre-v6: user_id NOT NULL. Post-v6: user_id NULLABLE.
+      expect(byName.get("user_id")?.notnull).toBe(0);
+      // New columns.
+      expect(byName.has("permissions")).toBe(true);
+      expect(byName.has("created_via")).toBe(true);
+      expect(byName.has("subject")).toBe(true);
+      // created_via has the back-compat default for pre-v6 rows.
+      expect(byName.get("created_via")?.dflt_value).toMatch(/oauth_refresh/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("recordTokenMint inserts a registry row matching the inputs", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const expiresAt = new Date(Date.now() + 86400_000).toISOString();
+      recordTokenMint(db, {
+        jti: "jti-cli-1",
+        createdVia: "cli_mint",
+        subject: "operator",
+        clientId: "parachute-hub",
+        scopes: ["vault:read", "scribe:transcribe"],
+        expiresAt,
+        permissions: '{"vault":{"default":{"read_tags":["public"]}}}',
+      });
+      const row = findTokenRowByJti(db, "jti-cli-1");
+      expect(row).not.toBeNull();
+      expect(row?.userId).toBeNull();
+      expect(row?.subject).toBe("operator");
+      expect(row?.createdVia).toBe("cli_mint");
+      expect(row?.scopes).toEqual(["vault:read", "scribe:transcribe"]);
+      expect(row?.expiresAt).toBe(expiresAt);
+      expect(row?.permissions).toBe('{"vault":{"default":{"read_tags":["public"]}}}');
+      expect(row?.revokedAt).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("recordTokenMint with a duplicate jti throws RefreshTokenInsertError", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const expiresAt = new Date(Date.now() + 86400_000).toISOString();
+      recordTokenMint(db, {
+        jti: "jti-dup",
+        createdVia: "operator_mint",
+        subject: "operator",
+        clientId: "parachute-hub",
+        scopes: ["hub:admin"],
+        expiresAt,
+      });
+      expect(() =>
+        recordTokenMint(db, {
+          jti: "jti-dup",
+          createdVia: "cli_mint",
+          subject: "operator",
+          clientId: "parachute-hub",
+          scopes: ["vault:read"],
+          expiresAt,
+        }),
+      ).toThrow(RefreshTokenInsertError);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("revokeTokenByJti flips revoked_at; second call returns false (idempotent)", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const expiresAt = new Date(Date.now() + 86400_000).toISOString();
+      recordTokenMint(db, {
+        jti: "jti-rev",
+        createdVia: "cli_mint",
+        subject: "operator",
+        clientId: "parachute-hub",
+        scopes: ["vault:read"],
+        expiresAt,
+      });
+      const now = new Date();
+      expect(revokeTokenByJti(db, "jti-rev", now)).toBe(true);
+      expect(revokeTokenByJti(db, "jti-rev", now)).toBe(false);
+      const row = findTokenRowByJti(db, "jti-rev");
+      expect(row?.revokedAt).toBe(now.toISOString());
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("listActiveRevocations filters by revoked_at AND expires_at>now", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const past = new Date(Date.now() - 86400_000).toISOString();
+      const future = new Date(Date.now() + 86400_000).toISOString();
+      // Two revoked rows: one expired, one active.
+      recordTokenMint(db, {
+        jti: "jti-revoked-expired",
+        createdVia: "cli_mint",
+        subject: "operator",
+        clientId: "parachute-hub",
+        scopes: ["vault:read"],
+        expiresAt: past,
+      });
+      recordTokenMint(db, {
+        jti: "jti-revoked-active",
+        createdVia: "cli_mint",
+        subject: "operator",
+        clientId: "parachute-hub",
+        scopes: ["vault:read"],
+        expiresAt: future,
+      });
+      // One non-revoked active row (control — must NOT appear).
+      recordTokenMint(db, {
+        jti: "jti-not-revoked",
+        createdVia: "cli_mint",
+        subject: "operator",
+        clientId: "parachute-hub",
+        scopes: ["vault:read"],
+        expiresAt: future,
+      });
+      const now = new Date();
+      revokeTokenByJti(db, "jti-revoked-expired", now);
+      revokeTokenByJti(db, "jti-revoked-active", now);
+      const list = listActiveRevocations(db, now);
+      expect(list).toEqual(["jti-revoked-active"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("tokenRowIdentity returns userId when present, else subject", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      rotateSigningKey(db);
+      const u = await createUser(db, "owner", "pw");
+      // OAuth refresh row: userId set, subject NULL.
+      const refresh = signRefreshToken(db, {
+        jti: "jti-oauth",
+        userId: u.id,
+        clientId: "parachute-hub",
+        scopes: ["vault:read"],
+      });
+      expect(refresh.familyId).toBeDefined();
+      const oauthRow = findTokenRowByJti(db, "jti-oauth")!;
+      expect(tokenRowIdentity(oauthRow)).toBe(u.id);
+
+      // CLI mint row: userId NULL, subject set.
+      recordTokenMint(db, {
+        jti: "jti-cli",
+        createdVia: "cli_mint",
+        subject: "operator",
+        clientId: "parachute-hub",
+        scopes: ["vault:read"],
+        expiresAt: new Date(Date.now() + 86400_000).toISOString(),
+      });
+      const cliRow = findTokenRowByJti(db, "jti-cli")!;
+      expect(tokenRowIdentity(cliRow)).toBe("operator");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("signRefreshToken explicitly stamps created_via='oauth_refresh'", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      rotateSigningKey(db);
+      const u = await createUser(db, "owner", "pw");
+      signRefreshToken(db, {
+        jti: "jti-oauth-stamped",
+        userId: u.id,
+        clientId: "parachute-hub",
+        scopes: ["vault:read"],
+      });
+      const row = findTokenRowByJti(db, "jti-oauth-stamped");
+      expect(row?.createdVia).toBe("oauth_refresh");
     } finally {
       cleanup();
     }

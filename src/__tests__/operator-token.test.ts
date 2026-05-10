@@ -429,3 +429,88 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
     }
   });
 });
+
+// closes #212 Phase 1 — operator-mint paths write to the unified token
+// registry so they show up in the revocation list and admin UI alongside
+// OAuth refresh tokens and CLI mints.
+describe("mintOperatorToken registry write (#212)", () => {
+  test("writes a tokens row with created_via='operator_mint', subject='operator', user_id NULL", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const minted = await mintOperatorToken(db, "user-abc", {
+          issuer: TEST_ISSUER,
+          scopeSet: "start",
+        });
+        const row = db
+          .query<
+            {
+              jti: string;
+              user_id: string | null;
+              subject: string | null;
+              created_via: string;
+              scopes: string;
+              expires_at: string;
+            },
+            [string]
+          >(
+            "SELECT jti, user_id, subject, created_via, scopes, expires_at FROM tokens WHERE jti = ?",
+          )
+          .get(minted.jti);
+        expect(row).not.toBeNull();
+        expect(row?.user_id).toBeNull();
+        expect(row?.subject).toBe("operator");
+        expect(row?.created_via).toBe("operator_mint");
+        expect(row?.scopes).toBe("parachute:host:start");
+        expect(row?.expires_at).toBe(minted.expiresAt);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("auto-rotation writes a fresh registry row for the rotated token", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const original = await issueOperatorToken(db, "user-abc", {
+          dir: h.dir,
+          issuer: TEST_ISSUER,
+          ttlSeconds: 24 * 60 * 60, // within rotation window
+        });
+        const used = await useOperatorTokenWithAutoRotate(db, {
+          configDir: h.dir,
+          issuer: TEST_ISSUER,
+        });
+        expect(used?.refreshed).toBe(true);
+        // The rotated token has a new jti.
+        const newJti = used!.payload.jti as string;
+        expect(newJti).not.toBe(original.jti);
+        const row = db
+          .query<{ jti: string; created_via: string }, [string]>(
+            "SELECT jti, created_via FROM tokens WHERE jti = ?",
+          )
+          .get(newJti);
+        expect(row).not.toBeNull();
+        expect(row?.created_via).toBe("operator_mint");
+        // Both the original and the rotated row exist (the original isn't
+        // auto-revoked — it stays valid until its own exp). Phase 2 may add
+        // a "revoke prior on rotation" toggle; for now we keep both.
+        const origRow = db
+          .query<{ jti: string }, [string]>("SELECT jti FROM tokens WHERE jti = ?")
+          .get(original.jti);
+        expect(origRow).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});

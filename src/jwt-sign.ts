@@ -113,6 +113,15 @@ export interface SignRefreshTokenOpts {
   now?: () => Date;
 }
 
+/**
+ * Provenance of a `tokens` row — which mint path wrote it. Drives the
+ * unified token registry semantics introduced in v6 (hub#212 Phase 1):
+ * one table for refresh tokens, one for CLI-minted access tokens, one
+ * for operator tokens. Different mint paths = different rows; revocation
+ * lookup + revocation list are uniform across all of them.
+ */
+export type TokenCreatedVia = "oauth_refresh" | "cli_mint" | "operator_mint";
+
 export interface SignedRefreshToken {
   /** Opaque token to return to the client. NOT recoverable from the DB. */
   token: string;
@@ -147,8 +156,8 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
   const familyId = opts.familyId ?? randomUUID();
   try {
     db.prepare(
-      `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO tokens (jti, user_id, client_id, scopes, refresh_token_hash, family_id, expires_at, created_at, created_via)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'oauth_refresh')`,
     ).run(
       opts.jti,
       opts.userId,
@@ -166,6 +175,96 @@ export function signRefreshToken(db: Database, opts: SignRefreshTokenOpts): Sign
     );
   }
   return { token, refreshTokenHash, familyId, expiresAt };
+}
+
+export interface RecordTokenMintOpts {
+  /** Same as the issued JWT's jti — keys the row. */
+  jti: string;
+  /** Provenance tag — drives admin UI grouping and the registry semantics. */
+  createdVia: Exclude<TokenCreatedVia, "oauth_refresh">;
+  /** Subject identity for non-user mints. Operator-mint rows pass "operator"; service-mint rows pass the service short name. */
+  subject: string;
+  /** Optional user_id when the mint was performed against a hub user (the mint-token CLI flow defaults to the operator's user). NULL for purely service-tied mints. */
+  userId?: string;
+  clientId: string;
+  scopes: string[];
+  /** ISO-8601 expiry. Same value as the JWT's `exp`. */
+  expiresAt: string;
+  /** Optional JSON-encoded permissions claim (per auth-architecture-shape.md §11.3). */
+  permissions?: string;
+  now?: () => Date;
+}
+
+/**
+ * Write a `tokens` row for a non-OAuth-refresh mint. The OAuth refresh
+ * path goes through `signRefreshToken` (which already inserts); this path
+ * is for CLI mint-token, the new POST /api/auth/mint-token endpoint, and
+ * operator-token mints (rotate-operator + the auto-rotation helper from
+ * #213).
+ *
+ * Every issued JWT must have a row in this table going forward — that's
+ * the contract the revocation list endpoint depends on. Pre-Phase-1
+ * tokens (already issued before this migration) are unregistered but
+ * harmless: they expire on their own (15-min access tokens drained
+ * within the hour; 365d operator tokens cap at their original expiry,
+ * with the new 90d auto-rotation taking over once an operator runs the
+ * CLI again).
+ */
+export function recordTokenMint(db: Database, opts: RecordTokenMintOpts): void {
+  const now = opts.now?.() ?? new Date();
+  try {
+    db.prepare(
+      `INSERT INTO tokens (
+        jti, user_id, client_id, scopes, expires_at, created_at,
+        permissions, created_via, subject
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      opts.jti,
+      opts.userId ?? null,
+      opts.clientId,
+      opts.scopes.join(" "),
+      opts.expiresAt,
+      now.toISOString(),
+      opts.permissions ?? null,
+      opts.createdVia,
+      opts.subject,
+    );
+  } catch (err) {
+    throw new RefreshTokenInsertError(
+      `failed to insert token registry row (jti=${opts.jti}, created_via=${opts.createdVia}): ${err instanceof Error ? err.message : String(err)}`,
+      err,
+    );
+  }
+}
+
+/**
+ * Mark a `tokens` row revoked by jti. Idempotent: a row already revoked
+ * keeps its existing `revoked_at`. Returns true when a row was updated
+ * (was un-revoked before), false when no row matches or the row was
+ * already revoked. Used by the new admin revoke path, the operator-mint
+ * rotation cleanup, and any future explicit-revoke surface.
+ */
+export function revokeTokenByJti(db: Database, jti: string, now: Date): boolean {
+  const res = db
+    .prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL")
+    .run(now.toISOString(), jti);
+  return Number(res.changes) > 0;
+}
+
+/**
+ * Snapshot of currently-revoked-and-not-yet-expired jtis. Powers the
+ * `/.well-known/parachute-revocation.json` endpoint. Already-expired jtis
+ * are filtered out (no need to advertise the obvious — every consumer
+ * checks `exp` itself; the revocation list exists for *unexpired*
+ * tokens whose validity got cut short).
+ */
+export function listActiveRevocations(db: Database, now: Date): string[] {
+  const rows = db
+    .query<{ jti: string }, [string]>(
+      "SELECT jti FROM tokens WHERE revoked_at IS NOT NULL AND expires_at > ? ORDER BY jti",
+    )
+    .all(now.toISOString());
+  return rows.map((r) => r.jti);
 }
 
 export interface ValidatedAccessToken {
@@ -218,9 +317,29 @@ export async function validateAccessToken(
  * decides what to do with `revokedAt` — the rotation path treats a revoked
  * row as theft (RFC 6819 §5.2.2.3).
  */
+/**
+ * Generic shape of a `tokens` row, post-v6. Covers OAuth refresh tokens
+ * (`createdVia === "oauth_refresh"`, `userId` set, `subject` null) and
+ * the new non-OAuth mint paths (`createdVia === "cli_mint" |
+ * "operator_mint"`, may have `userId` set if minted against a hub user,
+ * `subject` always set to the operator/service name).
+ *
+ * `identity` is the canonical "who is this token for" — `userId ??
+ * subject`. Use it when you don't care about the OAuth-vs-non distinction.
+ */
 export interface RefreshTokenRow {
   jti: string;
-  userId: string;
+  /**
+   * Hub user id when the row was OAuth-issued or minted against a hub
+   * user. Null for service-tied mints (where `subject` carries the
+   * service name).
+   */
+  userId: string | null;
+  /**
+   * Non-user subject: operator name, service short name, agent id. Null
+   * for OAuth refresh-token rows (those use `userId` directly).
+   */
+  subject: string | null;
   clientId: string;
   scopes: string[];
   /** Family identifier — shared across rotated descendants (#73). */
@@ -228,29 +347,49 @@ export interface RefreshTokenRow {
   expiresAt: string;
   revokedAt: string | null;
   createdAt: string;
+  /** Provenance tag — drives admin UI grouping. v6 onward this is set on every row. */
+  createdVia: TokenCreatedVia;
+  /** JSON-encoded fine-grained constraints (auth-architecture-shape.md §11.3). */
+  permissions: string | null;
+}
+
+/**
+ * Convenience: returns the canonical identity string for a tokens row,
+ * collapsing the OAuth-vs-non-OAuth distinction. OAuth rows return
+ * `userId`; CLI/operator-minted rows return `subject`. At least one is
+ * always set post-v6.
+ */
+export function tokenRowIdentity(row: RefreshTokenRow): string {
+  return row.userId ?? row.subject ?? "";
 }
 
 interface TokenRowDb {
   jti: string;
-  user_id: string;
+  user_id: string | null;
   client_id: string;
   scopes: string;
   family_id: string | null;
   expires_at: string;
   revoked_at: string | null;
   created_at: string;
+  permissions: string | null;
+  created_via: string;
+  subject: string | null;
 }
 
 function rowToRefreshToken(row: TokenRowDb): RefreshTokenRow {
   return {
     jti: row.jti,
     userId: row.user_id,
+    subject: row.subject,
     clientId: row.client_id,
     scopes: row.scopes.split(" ").filter((s) => s.length > 0),
     familyId: row.family_id ?? row.jti,
     expiresAt: row.expires_at,
     revokedAt: row.revoked_at,
     createdAt: row.created_at,
+    createdVia: (row.created_via as TokenCreatedVia) ?? "oauth_refresh",
+    permissions: row.permissions,
   };
 }
 

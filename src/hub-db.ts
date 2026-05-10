@@ -130,6 +130,69 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX tokens_family ON tokens (family_id) WHERE family_id IS NOT NULL;
     `,
   },
+  {
+    version: 6,
+    sql: `
+      -- Token registry generalization (closes hub#212 Phase 1). Until v6 the
+      -- tokens table only held OAuth refresh tokens; v6 generalizes it to a
+      -- single registry across every issued JWT class (refresh, access,
+      -- operator, mint-token). Three structural changes:
+      --
+      --   1. user_id becomes NULLABLE. OAuth-issued rows still set it to the
+      --      caller's user (canonical identity field). CLI-minted /
+      --      operator-minted rows leave user_id NULL and put the operator/
+      --      service name in the new \`subject\` column.
+      --   2. Three new columns: \`permissions\` (JSON, custom claim per
+      --      auth-architecture-shape.md §11.3), \`created_via\` (provenance
+      --      tag: oauth_refresh / cli_mint / operator_mint), \`subject\`
+      --      (non-user identity for service / operator mints).
+      --   3. Existing rows backfill \`created_via='oauth_refresh'\` because
+      --      the table was OAuth-refresh-only before v6.
+      --
+      -- SQLite has no ALTER COLUMN to drop NOT NULL, so we use the
+      -- recreate-and-rename pattern. Inside the migration transaction the
+      -- whole swap is atomic; concurrent reads (there are none — hub is
+      -- single-writer) wouldn't see a half-state. FKs from tokens → users
+      -- stay enforced for non-NULL user_id values; nothing references
+      -- tokens, so the drop is safe.
+      CREATE TABLE tokens_new (
+        jti TEXT PRIMARY KEY,
+        user_id TEXT REFERENCES users(id),
+        client_id TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        refresh_token_hash TEXT,
+        family_id TEXT,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL,
+        permissions TEXT,
+        created_via TEXT NOT NULL DEFAULT 'oauth_refresh',
+        subject TEXT
+      );
+      INSERT INTO tokens_new (
+        jti, user_id, client_id, scopes, refresh_token_hash, family_id,
+        expires_at, revoked_at, created_at,
+        permissions, created_via, subject
+      )
+      SELECT
+        jti, user_id, client_id, scopes, refresh_token_hash, family_id,
+        expires_at, revoked_at, created_at,
+        NULL, 'oauth_refresh', NULL
+      FROM tokens;
+      DROP TABLE tokens;
+      ALTER TABLE tokens_new RENAME TO tokens;
+      -- Recreate indexes (DROP TABLE took them with it).
+      CREATE INDEX tokens_user ON tokens (user_id) WHERE user_id IS NOT NULL;
+      CREATE INDEX tokens_active_refresh ON tokens (refresh_token_hash)
+        WHERE refresh_token_hash IS NOT NULL AND revoked_at IS NULL;
+      CREATE INDEX tokens_family ON tokens (family_id) WHERE family_id IS NOT NULL;
+      -- New: revocation list endpoint queries on (revoked_at, expires_at).
+      CREATE INDEX tokens_revoked ON tokens (revoked_at)
+        WHERE revoked_at IS NOT NULL;
+      -- Subject lookup for non-user mints (operator name, service name).
+      CREATE INDEX tokens_subject ON tokens (subject) WHERE subject IS NOT NULL;
+    `,
+  },
 ];
 
 export function openHubDb(path: string = hubDbPath()): Database {

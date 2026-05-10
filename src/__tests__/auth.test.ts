@@ -1287,4 +1287,247 @@ describe("parachute auth mint-token", () => {
       tmp.cleanup();
     }
   });
+
+  // closes #212 Phase 1 — registry write, --permissions, --expires-in,
+  // --ttl deprecation notice.
+  test("every successful mint writes a tokens registry row (created_via=cli_mint)", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "scribe:transcribe"], deps),
+      );
+      expect(code).toBe(0);
+      const token = stdout.trim();
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const validated = await validateAccessToken(db, token);
+        const jti = validated.payload.jti as string;
+        const row = db
+          .query<{ jti: string; created_via: string; subject: string | null }, [string]>(
+            "SELECT jti, created_via, subject FROM tokens WHERE jti = ?",
+          )
+          .get(jti);
+        expect(row).not.toBeNull();
+        expect(row?.created_via).toBe("cli_mint");
+        // Default subject = operator's sub (the hub user id).
+        expect(typeof row?.subject).toBe("string");
+        expect(row?.subject?.length).toBeGreaterThan(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--permissions JSON object round-trips into JWT + registry row", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const permissions = '{"vault":{"default":{"write_tags":["health"]}}}';
+      const { code, stdout } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "vault:default:write", "--permissions", permissions], deps),
+      );
+      expect(code).toBe(0);
+      const token = stdout.trim();
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const validated = await validateAccessToken(db, token);
+        expect(validated.payload.permissions).toEqual({
+          vault: { default: { write_tags: ["health"] } },
+        });
+        const jti = validated.payload.jti as string;
+        const row = db
+          .query<{ permissions: string }, [string]>("SELECT permissions FROM tokens WHERE jti = ?")
+          .get(jti);
+        expect(JSON.parse(row!.permissions)).toEqual({
+          vault: { default: { write_tags: ["health"] } },
+        });
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--permissions with malformed JSON is rejected", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "vault:read", "--permissions", "{not-json}"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("not valid JSON");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--permissions with non-object JSON (array) is rejected", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "vault:read", "--permissions", "[1,2,3]"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("must be a JSON object");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--expires-in (canonical) sets the JWT TTL in seconds", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "scribe:transcribe", "--expires-in", "7200"], deps),
+      );
+      expect(code).toBe(0);
+      const token = stdout.trim();
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const validated = await validateAccessToken(db, token);
+        const exp = validated.payload.exp as number;
+        const iat = validated.payload.iat as number;
+        expect(exp - iat).toBe(7200);
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--expires-in with non-integer value rejected", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "vault:read", "--expires-in", "1d"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("integer seconds count");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--expires-in over 365d cap rejected", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "vault:read", "--expires-in", String(366 * 86400)], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("365d cap");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--ttl emits deprecation notice on stderr but still works", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "scribe:transcribe", "--ttl", "1h"], deps),
+      );
+      expect(code).toBe(0);
+      expect(stdout.trim().split(".").length).toBe(3);
+      expect(stderr).toContain("--ttl is deprecated");
+      expect(stderr).toContain("--expires-in");
+      expect(stderr).toContain("0.6.0");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  // closes #215 reviewer F1 — privilege-diffusion guard on the CLI mint path.
+  test("CLI mint-token rejects parachute:host:auth (non-requestable scope)", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "parachute:host:auth"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("not requestable");
+      expect(stderr).toContain("parachute:host:auth");
+      // No token leaked to stdout.
+      expect(stdout).toBe("");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("passing both --ttl and --expires-in is an error", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "vault:read", "--ttl", "1h", "--expires-in", "3600"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("--ttl");
+      expect(stderr).toContain("--expires-in");
+    } finally {
+      tmp.cleanup();
+    }
+  });
 });
