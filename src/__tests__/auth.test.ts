@@ -1531,3 +1531,194 @@ describe("parachute auth mint-token", () => {
     }
   });
 });
+
+describe("parachute auth revoke-token", () => {
+  // Each test mints a fresh token via mint-token and then revokes it. Going
+  // through the public mint surface (rather than calling signAccessToken +
+  // recordTokenMint directly) keeps these tests honest about the contract:
+  // mint writes a registry row, revoke-token flips its bit, and a future
+  // round-trip through validateAccessToken would reject it. The Phase 4
+  // RS-side enforcement is exercised in scope-guard's own integration suite.
+
+  async function mintAJti(deps: AuthDeps): Promise<string> {
+    const { stdout } = await captureOutput(() =>
+      auth(["mint-token", "--scope", "scribe:transcribe"], deps),
+    );
+    const token = stdout.trim();
+    // Decode the unverified payload to recover the jti — every mint stamps one.
+    const [, payloadB64] = token.split(".");
+    const payload = JSON.parse(Buffer.from(payloadB64!, "base64url").toString("utf8")) as {
+      jti: string;
+    };
+    return payload.jti;
+  }
+
+  test("missing jti positional is a usage error", async () => {
+    const tmp = makeTmp();
+    try {
+      const { code, stderr } = await captureOutput(() =>
+        auth(["revoke-token"], { dbPath: tmp.dbPath, configDir: tmp.dir }),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("missing jti argument");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("unexpected flag is a usage error", async () => {
+    const tmp = makeTmp();
+    try {
+      const { code, stderr } = await captureOutput(() =>
+        auth(["revoke-token", "--reason", "compromise", "abc123"], {
+          dbPath: tmp.dbPath,
+          configDir: tmp.dir,
+        }),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("unexpected flag");
+      expect(stderr).toContain("--reason");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("revokes a fresh token and prints subject + scope", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const jti = await mintAJti(deps);
+      const { code, stdout, stderr } = await captureOutput(() => auth(["revoke-token", jti], deps));
+      expect(code).toBe(0);
+      expect(stderr).toBe("");
+      expect(stdout).toContain(`revoked: jti=${jti}`);
+      expect(stdout).toContain("subject=");
+      expect(stdout).toContain("scope=scribe:transcribe");
+
+      // Registry row really has revoked_at set now.
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const { findTokenRowByJti } = await import("../jwt-sign.ts");
+        const row = findTokenRowByJti(db, jti);
+        expect(row?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("re-revoke is idempotent: exit 0, prints existing revoked_at", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const jti = await mintAJti(deps);
+      const first = await captureOutput(() => auth(["revoke-token", jti], deps));
+      expect(first.code).toBe(0);
+
+      // Capture the timestamp from the first revoke for cross-check.
+      const db = openHubDb(tmp.dbPath);
+      let firstRevokedAt: string | null;
+      try {
+        const { findTokenRowByJti } = await import("../jwt-sign.ts");
+        firstRevokedAt = findTokenRowByJti(db, jti)?.revokedAt ?? null;
+      } finally {
+        db.close();
+      }
+      expect(firstRevokedAt).not.toBeNull();
+
+      const second = await captureOutput(() => auth(["revoke-token", jti], deps));
+      expect(second.code).toBe(0);
+      expect(second.stdout).toContain("already revoked at");
+      expect(second.stdout).toContain(firstRevokedAt!);
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("unknown jti exits 1 with not-found error", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stderr } = await captureOutput(() =>
+        auth(["revoke-token", "this-jti-does-not-exist"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("no token with jti this-jti-does-not-exist found in registry");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("operator token without parachute:host:auth is rejected", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      // Replace operator.token with a narrow JWT that lacks parachute:host:auth.
+      const db = openHubDb(tmp.dbPath);
+      let narrow: string;
+      try {
+        const owner = listUsers(db)[0]!;
+        const signed = await signAccessToken(db, {
+          sub: owner.id,
+          scopes: ["scribe:transcribe"],
+          audience: "scribe",
+          clientId: OPERATOR_TOKEN_CLIENT_ID,
+          issuer: "http://127.0.0.1:1939",
+          ttlSeconds: 3600,
+        });
+        narrow = signed.token;
+      } finally {
+        db.close();
+      }
+      await writeOperatorTokenFile(narrow, tmp.dir);
+
+      const { code, stderr } = await captureOutput(() => auth(["revoke-token", "any-jti"], deps));
+      expect(code).toBe(1);
+      expect(stderr).toContain("lacks parachute:host:auth scope");
+      expect(stderr).toContain("rotate-operator");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("missing operator.token is an actionable error", async () => {
+    const tmp = makeTmp();
+    try {
+      const { code, stderr } = await captureOutput(() =>
+        auth(["revoke-token", "any-jti"], { dbPath: tmp.dbPath, configDir: tmp.dir }),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("operator.token");
+      expect(stderr).toContain("rotate-operator");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("authHelp lists revoke-token alongside mint-token", () => {
+    expect(authHelp()).toContain("revoke-token");
+    expect(authHelp()).toContain("revoke-token <jti>");
+  });
+});

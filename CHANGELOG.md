@@ -2,6 +2,24 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.8-rc.4] - 2026-05-10
+
+Adds the operator-facing `parachute auth revoke-token <jti>` CLI — the missing companion to Phase 1's `revoked_at` column and revocation-list endpoint. Without this, end-to-end Phase 4 testing required reaching into `~/.parachute/hub/hub.db` with `sqlite3` and flipping the bit by hand. Distinct from the existing `revoke-grant` (retires OAuth *consent grants*) and `/oauth/revoke` (RFC 7009 refresh-token revocation): this revokes any *registry-row token* (CLI mints, operator mints, OAuth-issued access tokens) by jti.
+
+### Added
+
+- **`parachute auth revoke-token <jti>`** — flips `revoked_at` on the `tokens` row keyed by jti. Idempotent: re-revoking an already-revoked jti prints the existing `revoked_at` and exits 0. Not-found exits 1 with a clear "no token with jti X found in registry". On success, prints `revoked: jti=X, subject=..., scope=...` for operator audit trail.
+  - Auth gate: requires `parachute:host:auth` scope on the local `~/.parachute/operator.token` (the `auth` or `admin` scope-set covers this; narrower sets like `install`/`start`/`expose`/`vault` do not). Same gate semantics as `POST /api/auth/mint-token`.
+  - Auto-rotation banner (when the operator token is within 7d of expiry) goes to stderr; stdout stays focused on the revocation outcome.
+  - End-to-end semantics: revoke happens immediately in the local DB; the revocation list endpoint (`/.well-known/parachute-revocation.json`) picks the change up on its next 60s poll cycle; resource servers running `@openparachute/scope-guard@^0.2.0` then reject the JWT on subsequent requests.
+
+### Out of scope (deferred)
+
+- HTTP analog (`POST /api/auth/revoke-token`) — would mirror `api-mint-token.ts`'s ~80-LOC shape; deferred per the brief's <50 LOC budget for "ergonomically a few extra lines." Filed as a follow-up issue.
+- Bulk revoke (`--all-by-subject`, `--all-by-client`).
+- Revoke-by-subject convenience wrapper.
+- Admin UI revocation surface — Phase 2.
+
 ## [0.5.8-rc.3] - 2026-05-10
 
 Foundation work for [hub#212](https://github.com/ParachuteComputer/parachute-hub/issues/212) Phase 4 (RS-side revocation enforcement). Hub itself ships unchanged at the runtime surface — its own `validateAccessToken` already consults the local DB. The change here is in the workspace-vendored `@openparachute/scope-guard` package, which moves to `0.2.0` with revocation-list enforcement folded into `validateHubJwt`. Vault / scribe / parachute-agent will adopt independently in follow-up PRs once Aaron publishes scope-guard 0.2.0 to npm.

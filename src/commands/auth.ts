@@ -26,7 +26,12 @@ import { HUB_DEFAULT_PORT, readHubPort } from "../hub-control.ts";
 import { openHubDb } from "../hub-db.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
 import { inferAudience } from "../jwt-audience.ts";
-import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
+import {
+  findTokenRowByJti,
+  recordTokenMint,
+  revokeTokenByJti,
+  signAccessToken,
+} from "../jwt-sign.ts";
 import {
   OPERATOR_TOKEN_CLIENT_ID,
   OPERATOR_TOKEN_SCOPE_SET_NAMES,
@@ -66,6 +71,7 @@ const HUB_LOCAL_SUBCOMMANDS = new Set([
   "list-users",
   "rotate-operator",
   "mint-token",
+  "revoke-token",
   "pending-clients",
   "approve-client",
   "list-grants",
@@ -94,6 +100,10 @@ Usage:
                                        operator's identity (stdout = JWT).
                                        --ttl <duration> is the deprecated
                                        alias (use --expires-in seconds).
+  parachute auth revoke-token <jti>    Mark a registry-row token revoked
+                                       by jti. Idempotent: a re-revoke
+                                       prints the existing revoked_at and
+                                       exits 0.
   parachute auth pending-clients       List OAuth clients awaiting approval
   parachute auth approve-client <id>   Approve a pending OAuth client
   parachute auth list-grants [--username <name>]
@@ -167,6 +177,15 @@ Every mint writes a row to the hub's token registry (one source of
 truth for revocation, admin UI introspection). Requires a valid
 ~/.parachute/operator.token (run \`parachute auth set-password\` or
 \`rotate-operator\` first).
+
+revoke-token flips \`revoked_at\` on a registry row by jti. The
+revocation list endpoint
+(\`/.well-known/parachute-revocation.json\`) picks the change up on
+its next 60s poll; resource servers (vault / scribe / agent) on
+scope-guard 0.2.0+ then reject the JWT. Idempotent: re-revoking an
+already-revoked jti prints the existing revoked_at and exits 0.
+Requires \`parachute:host:auth\` on the operator token (the \`auth\`
+or \`admin\` scope-set).
 
 pending-clients + approve-client gate /oauth/register against operator
 approval (closes #74). Self-served DCR registrations land as 'pending'
@@ -972,6 +991,114 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   }
 }
 
+async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<number> {
+  // Single positional: the jti. No flags. (If we grow flags later — say,
+  // --reason for an audit string — they can join here without disrupting
+  // the positional contract.)
+  const positionals = args.filter((a) => !a.startsWith("--"));
+  const flags = args.filter((a) => a.startsWith("--"));
+  if (flags.length > 0) {
+    console.error(
+      `parachute auth revoke-token: unexpected flag "${flags[0]}" (this command takes a jti positional only)`,
+    );
+    return 1;
+  }
+  if (positionals.length === 0) {
+    console.error("parachute auth revoke-token: missing jti argument");
+    console.error("usage: parachute auth revoke-token <jti>");
+    return 1;
+  }
+  if (positionals.length > 1) {
+    console.error(
+      `parachute auth revoke-token: unexpected argument "${positionals[1]}" (only one jti at a time)`,
+    );
+    return 1;
+  }
+  const jti = positionals[0]!;
+
+  const configDir = deps.configDir ?? CONFIG_DIR;
+  const issuer = resolveHubIssuer(deps.hubOrigin, configDir);
+
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    let used: Awaited<ReturnType<typeof useOperatorTokenWithAutoRotate>>;
+    try {
+      used = await useOperatorTokenWithAutoRotate(db, { configDir, issuer });
+    } catch (err) {
+      if (err instanceof OperatorTokenExpiredError) {
+        console.error(`parachute auth revoke-token: ${err.message}`);
+        return 1;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`parachute auth revoke-token: operator token invalid — ${msg}`);
+      console.error(
+        "run `parachute auth rotate-operator` to mint a fresh one, or check that the hub origin matches",
+      );
+      return 1;
+    }
+    if (!used) {
+      console.error(
+        "parachute auth revoke-token: no operator token found at ~/.parachute/operator.token",
+      );
+      console.error(
+        "run `parachute auth set-password` (first run) or `parachute auth rotate-operator` to mint one",
+      );
+      return 1;
+    }
+    if (used.rotated) {
+      console.error(
+        `parachute auth revoke-token: operator token within 7d of expiry — auto-rotated to ${used.rotated.expiresAt} (scope_set=${used.rotated.scopeSet})`,
+      );
+    }
+    // Scope gate: same as the HTTP /api/auth/revoke-token endpoint will use
+    // (and the same as /api/auth/mint-token uses today). Mirrors the
+    // privilege-shape of mint — both surfaces hand the operator power that
+    // a narrow non-auth scope-set token shouldn't carry. The `auth`
+    // scope-set covers this; so does `admin` (superset).
+    const tokenScope =
+      typeof used.payload.scope === "string"
+        ? used.payload.scope.split(/\s+/).filter((s) => s.length > 0)
+        : [];
+    if (!tokenScope.includes("parachute:host:auth")) {
+      console.error("parachute auth revoke-token: operator token lacks parachute:host:auth scope");
+      console.error(
+        "narrowed scope-sets without `auth` (install/start/expose/vault) can't revoke tokens — run `parachute auth rotate-operator --scope-set auth` (or `admin`) for a token that can",
+      );
+      return 1;
+    }
+
+    const row = findTokenRowByJti(db, jti);
+    if (!row) {
+      console.error(`parachute auth revoke-token: no token with jti ${jti} found in registry`);
+      return 1;
+    }
+    if (row.revokedAt) {
+      // Idempotent re-revoke. Surface the existing timestamp so an operator
+      // who's not sure whether the previous attempt landed gets a clear
+      // confirmation it did.
+      console.log(`already revoked at ${row.revokedAt}: jti=${jti}`);
+      return 0;
+    }
+    const ok = revokeTokenByJti(db, jti, new Date());
+    if (!ok) {
+      // Race: row existed, then disappeared or got revoked between our
+      // lookups. Surface as not-found rather than silently succeeding —
+      // the operator should know nothing changed under their hand.
+      console.error(
+        `parachute auth revoke-token: jti ${jti} could not be revoked (race or concurrent change)`,
+      );
+      return 1;
+    }
+    const identity = row.userId ?? row.subject ?? "(unknown)";
+    console.log(
+      `revoked: jti=${jti}, subject=${identity}, scope=${row.scopes.join(" ") || "(none)"}`,
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
 function runListUsers(deps: AuthDeps): number {
   const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
   try {
@@ -1048,6 +1175,15 @@ export async function auth(args: readonly string[], deps: AuthDeps | Runner = {}
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`parachute auth mint-token: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "revoke-token") {
+      try {
+        return await runRevokeToken(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth revoke-token: ${msg}`);
         return 1;
       }
     }
