@@ -66,6 +66,30 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
       "Provision and manage vaults across this host (create new vaults, configure cross-vault settings).",
     level: "admin",
   },
+  // Fine-grained host scopes (#213) — the `parachute auth rotate-operator
+  // --scope-set <set>` vocabulary. Each is a narrowing of `parachute:host:admin`:
+  // an operator who wants a tighter token mints with one of these and uses
+  // it in place of the broad operator.token. Operator-only (non-requestable).
+  "parachute:host:install": {
+    label: "Install or upgrade Parachute modules on this host.",
+    level: "admin",
+  },
+  "parachute:host:start": {
+    label: "Lifecycle Parachute modules on this host (start, stop, restart, status).",
+    level: "admin",
+  },
+  "parachute:host:expose": {
+    label: "Bring tailnet or public exposure layers up and down on this host.",
+    level: "admin",
+  },
+  "parachute:host:auth": {
+    label: "Mint hub-issued tokens and manage user accounts on this host.",
+    level: "admin",
+  },
+  "parachute:host:vault": {
+    label: "Administer vaults on this host (create, configure, delete).",
+    level: "admin",
+  },
 };
 
 /**
@@ -104,7 +128,14 @@ export const FIRST_PARTY_SCOPES = Object.keys(SCOPE_EXPLANATIONS).sort();
  * intentional: the blast radius of compromised cross-vault admin doesn't
  * justify third-party requestability.
  */
-export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set(["parachute:host:admin"]);
+export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
+  "parachute:host:admin",
+  "parachute:host:install",
+  "parachute:host:start",
+  "parachute:host:expose",
+  "parachute:host:auth",
+  "parachute:host:vault",
+]);
 
 /**
  * Per-vault `vault:<name>:admin` scopes are also non-requestable: they let

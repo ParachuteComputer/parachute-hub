@@ -1,19 +1,24 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { validateAccessToken } from "../jwt-sign.ts";
+import { signAccessToken, validateAccessToken } from "../jwt-sign.ts";
 import {
   OPERATOR_TOKEN_AUDIENCE,
+  OPERATOR_TOKEN_AUTO_ROTATE_THRESHOLD_SECONDS,
+  OPERATOR_TOKEN_CLIENT_ID,
   OPERATOR_TOKEN_FILENAME,
   OPERATOR_TOKEN_SCOPES,
+  OPERATOR_TOKEN_SCOPE_SETS,
+  OPERATOR_TOKEN_SCOPE_SET_CLAIM,
   OPERATOR_TOKEN_TTL_SECONDS,
   issueOperatorToken,
   mintOperatorToken,
   operatorTokenPath,
   readOperatorTokenFile,
+  useOperatorTokenWithAutoRotate,
   writeOperatorTokenFile,
 } from "../operator-token.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
@@ -58,10 +63,19 @@ describe("mintOperatorToken", () => {
     }
   });
 
-  test("scopes include hub:admin + parachute:host:admin + vault:admin + scribe:admin + channel:send", () => {
+  test("admin scope-set includes hub:admin + parachute:host:* + vault/scribe/channel admins (#213)", () => {
+    // OPERATOR_TOKEN_SCOPES === OPERATOR_TOKEN_SCOPE_SETS.admin (back-compat
+    // alias). The pre-#213 set was 5 scopes; #213 added the fine-grained
+    // parachute:host:install/start/expose/auth/vault scopes to the admin
+    // superset (admin is "everything", per the scope-set vocabulary).
     expect(OPERATOR_TOKEN_SCOPES).toEqual([
       "hub:admin",
       "parachute:host:admin",
+      "parachute:host:install",
+      "parachute:host:start",
+      "parachute:host:expose",
+      "parachute:host:auth",
+      "parachute:host:vault",
       "vault:admin",
       "scribe:admin",
       "channel:send",
@@ -130,6 +144,283 @@ describe("issueOperatorToken", () => {
         const validated = await validateAccessToken(db, issued.token, TEST_ISSUER);
         expect(validated.payload.sub).toBe("user-xyz");
         expect(validated.payload.iss).toBe(TEST_ISSUER);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("operator token defaults (#213)", () => {
+  test("default lifetime is 90d (was 365d through 0.5.7)", () => {
+    expect(OPERATOR_TOKEN_TTL_SECONDS).toBe(90 * 24 * 60 * 60);
+  });
+
+  test("auto-rotate threshold is 7d", () => {
+    expect(OPERATOR_TOKEN_AUTO_ROTATE_THRESHOLD_SECONDS).toBe(7 * 24 * 60 * 60);
+  });
+});
+
+describe("mintOperatorToken scope-sets (#213)", () => {
+  test("default scope-set is admin and embeds the pa_scope_set claim", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const minted = await mintOperatorToken(db, "user-abc", { issuer: TEST_ISSUER });
+        expect(minted.scopeSet).toBe("admin");
+        const validated = await validateAccessToken(db, minted.token, TEST_ISSUER);
+        expect(validated.payload[OPERATOR_TOKEN_SCOPE_SET_CLAIM]).toBe("admin");
+        expect(validated.payload.scope).toBe(OPERATOR_TOKEN_SCOPE_SETS.admin.join(" "));
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--scope-set=start mints with parachute:host:start only", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const minted = await mintOperatorToken(db, "user-abc", {
+          issuer: TEST_ISSUER,
+          scopeSet: "start",
+        });
+        expect(minted.scopeSet).toBe("start");
+        const validated = await validateAccessToken(db, minted.token, TEST_ISSUER);
+        expect(validated.payload.scope).toBe("parachute:host:start");
+        expect(validated.payload[OPERATOR_TOKEN_SCOPE_SET_CLAIM]).toBe("start");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("install scope-set carries vault:read for new-vault discovery", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const minted = await mintOperatorToken(db, "u", {
+          issuer: TEST_ISSUER,
+          scopeSet: "install",
+        });
+        const validated = await validateAccessToken(db, minted.token, TEST_ISSUER);
+        const scopes = String(validated.payload.scope ?? "").split(" ");
+        expect(scopes).toContain("parachute:host:install");
+        expect(scopes).toContain("vault:read");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("admin set is the superset of all narrow sets", () => {
+    const admin = new Set(OPERATOR_TOKEN_SCOPE_SETS.admin);
+    for (const setName of ["install", "start", "expose", "auth", "vault"] as const) {
+      for (const scope of OPERATOR_TOKEN_SCOPE_SETS[setName]) {
+        // vault:read is in `install` but not (directly) in admin — admin
+        // carries vault:admin which subsumes :read at the resource server.
+        if (scope === "vault:read") continue;
+        expect(admin.has(scope)).toBe(true);
+      }
+    }
+  });
+});
+
+describe("readOperatorTokenFile permission warning (#213)", () => {
+  test("does not warn when file is mode 0600", async () => {
+    const h = makeHarness();
+    const origErr = console.error;
+    let stderr = "";
+    console.error = (...a: unknown[]) => {
+      stderr += `${a.map(String).join(" ")}\n`;
+    };
+    try {
+      await writeOperatorTokenFile("token-abc", h.dir);
+      await readOperatorTokenFile(h.dir);
+      expect(stderr).toBe("");
+    } finally {
+      console.error = origErr;
+      h.cleanup();
+    }
+  });
+
+  test("warns (without failing) when file is world-readable", async () => {
+    const h = makeHarness();
+    const origErr = console.error;
+    let stderr = "";
+    console.error = (...a: unknown[]) => {
+      stderr += `${a.map(String).join(" ")}\n`;
+    };
+    try {
+      const path = await writeOperatorTokenFile("token-abc", h.dir);
+      chmodSync(path, 0o644);
+      const round = await readOperatorTokenFile(h.dir);
+      expect(round).toBe("token-abc");
+      expect(stderr).toContain("operator token file");
+      expect(stderr).toContain("0644");
+      expect(stderr).toContain("chmod 0600");
+    } finally {
+      console.error = origErr;
+      h.cleanup();
+    }
+  });
+});
+
+describe("useOperatorTokenWithAutoRotate (#213)", () => {
+  test("returns the token unchanged when remaining lifetime > threshold", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const issued = await issueOperatorToken(db, "user-abc", {
+          dir: h.dir,
+          issuer: TEST_ISSUER,
+          // Default 90d, fresh — well above threshold.
+        });
+        const used = await useOperatorTokenWithAutoRotate(db, {
+          configDir: h.dir,
+          issuer: TEST_ISSUER,
+        });
+        expect(used).not.toBeNull();
+        expect(used?.refreshed).toBe(false);
+        expect(used?.rotated).toBeUndefined();
+        expect(used?.token).toBe(issued.token);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("auto-rotates when within 7d of expiry, preserving scope-set", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        // Mint with a 1-day TTL — well below the 7d threshold.
+        const original = await issueOperatorToken(db, "user-abc", {
+          dir: h.dir,
+          issuer: TEST_ISSUER,
+          scopeSet: "start",
+          ttlSeconds: 24 * 60 * 60,
+        });
+        expect(original.scopeSet).toBe("start");
+
+        const used = await useOperatorTokenWithAutoRotate(db, {
+          configDir: h.dir,
+          issuer: TEST_ISSUER,
+        });
+        expect(used).not.toBeNull();
+        expect(used?.refreshed).toBe(true);
+        expect(used?.rotated?.scopeSet).toBe("start");
+        // The on-disk token is now the rotated one.
+        const onDisk = await readOperatorTokenFile(h.dir);
+        expect(onDisk).toBe(used!.token);
+        expect(onDisk).not.toBe(original.token);
+        // The rotated token is still scope-set "start".
+        const validated = await validateAccessToken(db, used!.token, TEST_ISSUER);
+        expect(validated.payload[OPERATOR_TOKEN_SCOPE_SET_CLAIM]).toBe("start");
+        expect(validated.payload.scope).toBe("parachute:host:start");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("does NOT auto-rotate a non-operator-audience JWT stashed at the path (privilege guard)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        // Hand-sign a narrow JWT with aud=scribe (not "operator") and a
+        // 1-hour TTL. Even though it's within the rotation window, the
+        // helper must not silently upgrade it to a full operator token.
+        const signed = await signAccessToken(db, {
+          sub: "user-abc",
+          scopes: ["scribe:transcribe"],
+          audience: "scribe",
+          clientId: OPERATOR_TOKEN_CLIENT_ID,
+          issuer: TEST_ISSUER,
+          ttlSeconds: 3600,
+        });
+        await writeOperatorTokenFile(signed.token, h.dir);
+
+        const used = await useOperatorTokenWithAutoRotate(db, {
+          configDir: h.dir,
+          issuer: TEST_ISSUER,
+        });
+        expect(used).not.toBeNull();
+        expect(used?.refreshed).toBe(false);
+        expect(used?.rotated).toBeUndefined();
+        expect(used?.token).toBe(signed.token);
+        // On-disk file unchanged.
+        const onDisk = await readOperatorTokenFile(h.dir);
+        expect(onDisk).toBe(signed.token);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("returns null when no operator token file exists", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const used = await useOperatorTokenWithAutoRotate(db, {
+          configDir: h.dir,
+          issuer: TEST_ISSUER,
+        });
+        expect(used).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("validateAccessToken rejects a fully-expired token (jose enforces exp)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        // Mint a token that's already expired.
+        const expiredAt = new Date("2026-01-01T00:00:00Z");
+        const issued = await issueOperatorToken(db, "user-abc", {
+          dir: h.dir,
+          issuer: TEST_ISSUER,
+          ttlSeconds: 60,
+          now: () => expiredAt,
+        });
+        expect(issued.token.length).toBeGreaterThan(0);
+        await expect(
+          useOperatorTokenWithAutoRotate(db, { configDir: h.dir, issuer: TEST_ISSUER }),
+        ).rejects.toThrow();
       } finally {
         db.close();
       }
