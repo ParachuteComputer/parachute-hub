@@ -152,6 +152,28 @@ describe("validateModuleManifest", () => {
     expect(m.uiUrl).toBeUndefined();
   });
 
+  // Open-redirect regression: protocol-relative paths like "//evil.com" pass
+  // a naive `startsWith("/")` check but `new URL("//evil.com", base)` resolves
+  // to the foreign origin. A malicious third-party module could plant such a
+  // value in module.json:uiUrl and turn a discovery tile into an off-origin
+  // redirect. Both uiUrl and managementUrl are validated by the shared
+  // asPathOrUrl helper, so cover both.
+  test("uiUrl rejects protocol-relative paths (open-redirect regression)", () => {
+    expect(() => validateModuleManifest({ ...VALID, uiUrl: "//evil.com" }, "x")).toThrow(/uiUrl/);
+    expect(() => validateModuleManifest({ ...VALID, uiUrl: "//evil.com/path" }, "x")).toThrow(
+      /uiUrl/,
+    );
+  });
+
+  test("managementUrl rejects protocol-relative paths (open-redirect regression)", () => {
+    expect(() => validateModuleManifest({ ...VALID, managementUrl: "//evil.com" }, "x")).toThrow(
+      /managementUrl/,
+    );
+    expect(() =>
+      validateModuleManifest({ ...VALID, managementUrl: "//evil.com/admin" }, "x"),
+    ).toThrow(/managementUrl/);
+  });
+
   test("managementUrl absent stays absent", () => {
     const m = validateModuleManifest(VALID, "x");
     expect(m.managementUrl).toBeUndefined();

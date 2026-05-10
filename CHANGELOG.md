@@ -2,6 +2,19 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.8-rc.16] - 2026-05-10
+
+Reviewer folds on PR #238.
+
+### Security fix
+
+- **Reject protocol-relative paths in `uiUrl` / `managementUrl`** (open-redirect regression). `asPathOrUrl` previously accepted any string starting with `/`, including `"//evil.com"`. `new URL("//evil.com", "https://hub.example.com/")` resolves to `https://evil.com/` — a malicious third-party module could plant `uiUrl: "//evil.com"` in its `module.json` and turn a discovery tile into an off-origin redirect. Tightened the path-shape check to require a single leading `/` followed by at least one non-`/`. Regression tests cover both `uiUrl` and `managementUrl` since they share the helper.
+
+### Doc cleanup
+
+- Tightened `WellKnownServicesEntry.displayName` doc-comment to describe the actual fallback behavior (`module.json` first, `services.json` second).
+- Filled in `hub#238` placeholder in the C-not-B trace comment in `well-known.ts`.
+
 ## [0.5.8-rc.15] - 2026-05-10
 
 Hub consumer-side of Phase D (module.json `uiUrl` pattern). Discovery page Services tiles are now data-driven from each service's `module.json:uiUrl` rather than from a hardcoded `SERVICE_LABELS` map. Closes the consumer side of the cross-repo Phase D rollout (patterns#52, notes#109, paraclaw#152 / agent#…).

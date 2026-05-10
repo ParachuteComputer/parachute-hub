@@ -33,7 +33,7 @@ export interface WellKnownVaultEntry {
  * `loadUiUrls`/`loadManagementUrls`-style readers from the module's
  * `installDir/.parachute/module.json`, NOT from services.json (which gets
  * overwritten on service boot per the "services own the write side"
- * contract — see hub#... commit message for the C-not-B trace).
+ * contract — see hub#238 commit message for the C-not-B trace).
  */
 export interface WellKnownServicesEntry {
   name: string;
@@ -41,7 +41,11 @@ export interface WellKnownServicesEntry {
   path: string;
   version: string;
   infoUrl: string;
-  /** Human-readable label for the discovery page, sourced from `module.json:displayName`. */
+  /**
+   * Human-readable label for the discovery page. Sourced from
+   * `module.json:displayName` when available; falls back to
+   * `services.json:displayName` written at install time.
+   */
   displayName?: string;
   /** Where the service's primary user-facing UI lives, sourced from `module.json:uiUrl`. */
   uiUrl?: string;

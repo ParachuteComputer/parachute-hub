@@ -445,8 +445,12 @@ function asPathOrUrl(v: unknown, where: string, field: string): string | undefin
   if (typeof v !== "string" || v.length === 0) {
     throw new ModuleManifestError(`${where}: "${field}" must be a non-empty string if present`);
   }
-  // Two valid shapes: a path starting with "/" or a full http(s) URL.
-  if (v.startsWith("/")) return v;
+  // Two valid shapes: an absolute path starting with a single "/" or a full
+  // http(s) URL. Reject protocol-relative forms like "//evil.com" — they
+  // start with "/" but `new URL("//evil.com", base)` resolves to the foreign
+  // origin, which would let a malicious module render an off-origin tile and
+  // turn the discovery page into an open-redirect surface.
+  if (v.startsWith("/") && !v.startsWith("//")) return v;
   try {
     const u = new URL(v);
     if (u.protocol !== "http:" && u.protocol !== "https:") {
