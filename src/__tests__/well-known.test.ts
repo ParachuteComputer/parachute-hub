@@ -302,6 +302,75 @@ describe("buildWellKnown", () => {
     expect(doc.notes).toEqual([{ url: "https://x.example/notes", version: "0.0.1" }]);
   });
 
+  // Phase D consumer-side: services entries surface uiUrl + displayName +
+  // tagline so the discovery page can render data-driven Service tiles.
+  test("uiUrl resolver result rides into doc.services entry as absolute URL", () => {
+    const doc = buildWellKnown({
+      services: [notes],
+      canonicalOrigin: "https://x.example",
+      uiUrlFor: () => "/notes",
+    });
+    const svc = doc.services.find((s) => s.name === "parachute-notes");
+    expect(svc?.uiUrl).toBe("https://x.example/notes");
+  });
+
+  test("uiUrl absolute URL passes through verbatim", () => {
+    const doc = buildWellKnown({
+      services: [notes],
+      canonicalOrigin: "https://x.example",
+      uiUrlFor: () => "https://notes.example.com/app",
+    });
+    const svc = doc.services.find((s) => s.name === "parachute-notes");
+    expect(svc?.uiUrl).toBe("https://notes.example.com/app");
+  });
+
+  test("uiUrl absent when the resolver returns undefined (vault case)", () => {
+    const doc = buildWellKnown({
+      services: [vault, notes],
+      canonicalOrigin: "https://x.example",
+      uiUrlFor: (e) => (e.name === "parachute-notes" ? "/notes" : undefined),
+    });
+    const vaultSvc = doc.services.find((s) => s.name === "parachute-vault");
+    const notesSvc = doc.services.find((s) => s.name === "parachute-notes");
+    expect(vaultSvc).not.toHaveProperty("uiUrl");
+    expect(notesSvc?.uiUrl).toBe("https://x.example/notes");
+  });
+
+  test("displayName resolver overrides services.json displayName", () => {
+    const notesWithName: ServiceEntry = { ...notes, displayName: "FromServicesJson" };
+    const doc = buildWellKnown({
+      services: [notesWithName],
+      canonicalOrigin: "https://x.example",
+      displayNameFor: () => "FromModuleJson",
+    });
+    const svc = doc.services.find((s) => s.name === "parachute-notes");
+    expect(svc?.displayName).toBe("FromModuleJson");
+  });
+
+  test("displayName falls back to services.json when resolver returns undefined", () => {
+    const notesWithName: ServiceEntry = { ...notes, displayName: "FromServicesJson" };
+    const doc = buildWellKnown({
+      services: [notesWithName],
+      canonicalOrigin: "https://x.example",
+      displayNameFor: () => undefined,
+    });
+    const svc = doc.services.find((s) => s.name === "parachute-notes");
+    expect(svc?.displayName).toBe("FromServicesJson");
+  });
+
+  test("tagline rides through from services.json (no resolver needed)", () => {
+    const notesWithTagline: ServiceEntry = {
+      ...notes,
+      tagline: "Notes PWA backed by your vault.",
+    };
+    const doc = buildWellKnown({
+      services: [notesWithTagline],
+      canonicalOrigin: "https://x.example",
+    });
+    const svc = doc.services.find((s) => s.name === "parachute-notes");
+    expect(svc?.tagline).toBe("Notes PWA backed by your vault.");
+  });
+
   test("falls back to / for empty paths", () => {
     const entry: ServiceEntry = { ...vault, paths: [] };
     const doc = buildWellKnown({

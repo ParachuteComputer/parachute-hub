@@ -26,6 +26,14 @@ export interface WellKnownVaultEntry {
  * to iterate without having to know every service's shortName ahead of time.
  * `infoUrl` points at the service's `/.parachute/info` endpoint (relative to
  * its mount path) which the hub fetches client-side for displayName/tagline.
+ *
+ * `displayName` and `uiUrl` are both optional — the discovery page renders
+ * a Services tile when `uiUrl` is present, falling back to the manifest
+ * short name when `displayName` is absent. Both are sourced via hub-server's
+ * `loadUiUrls`/`loadManagementUrls`-style readers from the module's
+ * `installDir/.parachute/module.json`, NOT from services.json (which gets
+ * overwritten on service boot per the "services own the write side"
+ * contract — see hub#238 commit message for the C-not-B trace).
  */
 export interface WellKnownServicesEntry {
   name: string;
@@ -33,6 +41,16 @@ export interface WellKnownServicesEntry {
   path: string;
   version: string;
   infoUrl: string;
+  /**
+   * Human-readable label for the discovery page. Sourced from
+   * `module.json:displayName` when available; falls back to
+   * `services.json:displayName` written at install time.
+   */
+  displayName?: string;
+  /** Where the service's primary user-facing UI lives, sourced from `module.json:uiUrl`. */
+  uiUrl?: string;
+  /** One-line subtitle for the discovery tile, sourced from `services.json:tagline`. */
+  tagline?: string;
 }
 
 /**
@@ -107,6 +125,19 @@ export interface BuildWellKnownOpts {
    * in. Returning `undefined` means "no admin SPA" and hub renders no link.
    */
   managementUrlFor?: (entry: ServiceEntry) => string | undefined;
+  /**
+   * Optional resolver mapping a `ServiceEntry` to its `module.json:uiUrl`,
+   * if any. Same shape as `managementUrlFor`. Returning `undefined` means
+   * "no user-facing UI" and discovery omits the Services tile (e.g. vault
+   * has no `uiUrl` — its content browses through Notes).
+   */
+  uiUrlFor?: (entry: ServiceEntry) => string | undefined;
+  /**
+   * Optional resolver mapping a `ServiceEntry` to its `module.json:displayName`.
+   * Hub-server reads this at request time; falls back to the entry's own
+   * `displayName` (from services.json) when absent.
+   */
+  displayNameFor?: (entry: ServiceEntry) => string | undefined;
 }
 
 /** Join a base origin and a path without double slashes — "/" stays "/". */
@@ -131,7 +162,29 @@ export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
     for (const path of pathsToEmit) {
       const url = new URL(path, `${base}/`).toString();
       const infoUrl = new URL(joinInfoPath(path), `${base}/`).toString();
-      doc.services.push({ name: s.name, url, path, version: s.version, infoUrl });
+      const entry: WellKnownServicesEntry = {
+        name: s.name,
+        url,
+        path,
+        version: s.version,
+        infoUrl,
+      };
+      const displayName = opts.displayNameFor?.(s) ?? s.displayName;
+      if (displayName !== undefined) entry.displayName = displayName;
+      // Tagline rides on services.json (set by service-spec at install or
+      // by the service's own boot-time upsert). Read directly from the
+      // entry — no installDir round-trip needed since it's already
+      // persisted server-side and reasonably stable across reboots.
+      if (s.tagline !== undefined) entry.tagline = s.tagline;
+      // Resolve uiUrl: relative path → absolute URL against `base`; full
+      // http(s) URL → verbatim. Same rule managementUrl uses.
+      const uiUrlRaw = opts.uiUrlFor?.(s);
+      if (uiUrlRaw !== undefined) {
+        entry.uiUrl = /^https?:\/\//i.test(uiUrlRaw)
+          ? uiUrlRaw
+          : new URL(uiUrlRaw, `${base}/`).toString();
+      }
+      doc.services.push(entry);
       if (isVault) {
         const managementUrl = opts.managementUrlFor?.(s);
         const entry: WellKnownVaultEntry = {

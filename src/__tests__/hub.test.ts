@@ -47,29 +47,33 @@ describe("renderHub", () => {
     expect(html).toContain("Surfaces provided by services");
   });
 
-  test("Services entry labels: Notes / Scribe / Agent", () => {
-    expect(html).toContain("'Notes'");
-    expect(html).toContain("'Scribe'");
-    expect(html).toContain("'Agent'");
+  test("Services tiles are data-driven from each service's uiUrl + displayName", () => {
+    // Phase D consumer-side: SERVICE_LABELS / SERVICE_ORDER hardcoding
+    // retired. Each well-known services[] row carries displayName + uiUrl
+    // (sourced from module.json via hub-server's loadServiceUiMetadata);
+    // tiles render directly from those.
+    expect(html).toContain("svc.uiUrl");
+    expect(html).toContain("svc.displayName");
+    // No more hardcoded short→label map.
+    expect(html).not.toContain("'Notes', desc:");
+    expect(html).not.toContain("['notes', 'scribe', 'agent']");
   });
 
-  test("Services entries use the path declared in services.json (custom mounts work)", () => {
-    // Operators may mount a service at a non-default path; the tile
-    // surfaces that path verbatim rather than hardcoding `/notes`/etc.
-    expect(html).toContain("svc.path");
+  test("Services skip rule emerges from data, not name-checks (vault has no uiUrl)", () => {
+    // The previous `isVaultName` hardcoded skip is gone — vault doesn't
+    // declare uiUrl, so it naturally doesn't render. Other API-only
+    // modules (current or future) get the same treatment for free.
+    expect(html).toContain("if (!svc || !svc.uiUrl) continue;");
+    // The function definition is gone (the comment may still mention the
+    // name as historical context — we only care about the active code).
+    expect(html).not.toContain("function isVaultName");
   });
 
-  test("Vault is intentionally excluded from the Services section", () => {
-    // Aaron's friction: clicking 'Vault' on discovery took him to hub
-    // management, not to vault content. Resolution: Vault has no
-    // Services entry — its content is browsed via Notes (which has its
-    // own entry). Vault provisioning lives under Admin.
-    expect(html).toContain("Vault deliberately omitted");
-    expect(html).toContain("isVaultName");
-  });
-
-  test("Services section ordering is notes → scribe → agent", () => {
-    expect(html).toContain("['notes', 'scribe', 'agent']");
+  test("Services tiles sort alphabetically by displayName", () => {
+    // Per the module-json-extensibility pattern doc — default ordering
+    // until a `displayOrder` field surfaces. localeCompare keeps the
+    // ordering stable across locales for ASCII labels.
+    expect(html).toContain("a.title.localeCompare(b.title)");
   });
 
   test("Admin section is hardcoded (always visible) with three entries", () => {
@@ -86,9 +90,13 @@ describe("renderHub", () => {
     expect(html).toContain("Admin section is static");
   });
 
-  test("Use section empty state hints at install", () => {
-    expect(html).toContain("No services installed yet");
-    expect(html).toContain("parachute install vault");
+  test("Services section empty state guides operators to declare uiUrl", () => {
+    // Empty state under Phase D means "no installed service has declared
+    // uiUrl yet" — different shape from pre-D ("none installed at all").
+    // Hint points at the pattern doc since the fix is in module.json,
+    // not at install time.
+    expect(html).toContain("No services with a UI declared yet");
+    expect(html).toContain("module-json-extensibility");
   });
 
   test("Use section error state surfaces the underlying message", () => {

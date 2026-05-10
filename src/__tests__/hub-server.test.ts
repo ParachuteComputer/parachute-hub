@@ -246,6 +246,105 @@ describe("hubFetch routing", () => {
     }
   });
 
+  // Phase D consumer-side: each non-vault service entry's
+  // module.json:uiUrl + displayName ride through to doc.services. The
+  // discovery page (`/`) reads them to render data-driven Service tiles.
+  test("/.well-known/parachute.json surfaces uiUrl + displayName from non-vault module manifests", async () => {
+    const h = makeHarness();
+    try {
+      const notesEntry: ServiceEntry = {
+        name: "parachute-notes",
+        port: 5173,
+        paths: ["/notes"],
+        health: "/health",
+        version: "0.0.1",
+        installDir: "/fake/notes",
+      };
+      writeManifest({ services: [notesEntry] }, h.manifestPath);
+      const res = await hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        readModuleManifest: async () => ({
+          name: "notes",
+          manifestName: "parachute-notes",
+          kind: "frontend",
+          port: 5173,
+          paths: ["/notes"],
+          health: "/health",
+          uiUrl: "/notes",
+          displayName: "Notes",
+        }),
+      })(req("/.well-known/parachute.json"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        services: Array<{ name: string; uiUrl?: string; displayName?: string }>;
+      };
+      const svc = body.services.find((s) => s.name === "parachute-notes");
+      expect(svc?.uiUrl).toMatch(/\/notes$/);
+      expect(svc?.displayName).toBe("Notes");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/.well-known/parachute.json omits uiUrl when the non-vault manifest has none", async () => {
+    const h = makeHarness();
+    try {
+      const notesEntry: ServiceEntry = {
+        name: "parachute-notes",
+        port: 5173,
+        paths: ["/notes"],
+        health: "/health",
+        version: "0.0.1",
+        installDir: "/fake/notes",
+      };
+      writeManifest({ services: [notesEntry] }, h.manifestPath);
+      const res = await hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        readModuleManifest: async () => ({
+          name: "notes",
+          manifestName: "parachute-notes",
+          kind: "frontend",
+          port: 5173,
+          paths: ["/notes"],
+          health: "/health",
+          // no uiUrl declared — discovery page will skip the tile.
+        }),
+      })(req("/.well-known/parachute.json"));
+      const body = (await res.json()) as { services: Array<{ uiUrl?: string }> };
+      expect(body.services[0]).not.toHaveProperty("uiUrl");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/.well-known/parachute.json: uiUrl resolver is skipped for vault entries (loadManagementUrls handles vault)", async () => {
+    const h = makeHarness();
+    try {
+      const vaultWithDir: ServiceEntry = { ...vaultEntry("default"), installDir: "/fake/vault" };
+      writeManifest({ services: [vaultWithDir] }, h.manifestPath);
+      // The fake module.json declares uiUrl, but vault is supposed to be
+      // skipped by loadServiceUiMetadata (it has its own managementUrl
+      // path). So doc.services[vault] should NOT carry uiUrl.
+      const res = await hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        readModuleManifest: async () => ({
+          name: "vault",
+          manifestName: "parachute-vault",
+          kind: "api",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/health",
+          uiUrl: "/should-be-ignored",
+        }),
+      })(req("/.well-known/parachute.json"));
+      const body = (await res.json()) as { services: Array<{ name: string; uiUrl?: string }> };
+      const vaultSvc = body.services.find((s) => s.name === "parachute-vault");
+      expect(vaultSvc).not.toHaveProperty("uiUrl");
+    } finally {
+      h.cleanup();
+    }
+  });
+
   // The bug this PR fixes: `parachute vault create techne` updates
   // services.json but the old code only re-derived parachute.json on
   // `parachute expose`. With the dynamic build, the second GET reflects

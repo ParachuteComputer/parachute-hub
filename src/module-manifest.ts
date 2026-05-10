@@ -115,6 +115,27 @@ export interface ModuleManifest {
    */
   readonly managementUrl?: string;
   /**
+   * Where the module's primary user-facing UI lives. Hub renders a tile on
+   * the discovery page (`/`) Services section when set (see
+   * `parachute-patterns/patterns/module-json-extensibility.md` and the
+   * `loadUiUrls` resolver in `hub-server.ts`).
+   *
+   * Two shapes — same rules as `managementUrl`:
+   *   - A relative path (e.g. `"/notes"`, `"/agent"`) — hub resolves
+   *     against the canonical hub origin.
+   *   - A full absolute URL — hub uses verbatim.
+   *
+   * Absent = no Services tile rendered (the module is API-only or surfaces
+   * its UI via a sibling module — e.g. vault content browses through Notes,
+   * so vault has no `uiUrl`).
+   *
+   * Read at every discovery render via `installDir/.parachute/module.json`
+   * (mirrors how `managementUrl` is sourced for vaults). Not persisted in
+   * services.json — that file's "services own the write side" semantics
+   * would clobber any install-time copy on the next service boot.
+   */
+  readonly uiUrl?: string;
+  /**
    * When `true`, the hub's `/<svc>/*` proxy strips the matched mount prefix
    * before forwarding (so the backend sees `/health` rather than
    * `/<name>/health`). Default `false` matches the prefix-aware convention
@@ -374,6 +395,7 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
   const dependencies = asDependencies(m.dependencies, where);
   const configSchema = asConfigSchema(m.configSchema, where);
   const managementUrl = asManagementUrl(m.managementUrl, where);
+  const uiUrl = asUiUrl(m.uiUrl, where);
   let stripPrefix: boolean | undefined;
   if (m.stripPrefix !== undefined) {
     if (typeof m.stripPrefix !== "boolean") {
@@ -396,6 +418,9 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
   if (managementUrl !== undefined) {
     (out as { managementUrl?: string }).managementUrl = managementUrl;
   }
+  if (uiUrl !== undefined) {
+    (out as { uiUrl?: string }).uiUrl = uiUrl;
+  }
   if (stripPrefix !== undefined) {
     (out as { stripPrefix?: boolean }).stripPrefix = stripPrefix;
   }
@@ -403,26 +428,39 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
 }
 
 function asManagementUrl(v: unknown, where: string): string | undefined {
+  return asPathOrUrl(v, where, "managementUrl");
+}
+
+function asUiUrl(v: unknown, where: string): string | undefined {
+  return asPathOrUrl(v, where, "uiUrl");
+}
+
+/**
+ * Validate a "path or http(s) URL" field. Both `managementUrl` and `uiUrl`
+ * follow the same shape per the module-json-extensibility pattern doc;
+ * factored so the next URL-shaped field doesn't have to copy-paste.
+ */
+function asPathOrUrl(v: unknown, where: string, field: string): string | undefined {
   if (v === undefined) return undefined;
   if (typeof v !== "string" || v.length === 0) {
-    throw new ModuleManifestError(
-      `${where}: "managementUrl" must be a non-empty string if present`,
-    );
+    throw new ModuleManifestError(`${where}: "${field}" must be a non-empty string if present`);
   }
-  // Two valid shapes: a path starting with "/" or a full http(s) URL.
-  if (v.startsWith("/")) return v;
+  // Two valid shapes: an absolute path starting with a single "/" or a full
+  // http(s) URL. Reject protocol-relative forms like "//evil.com" — they
+  // start with "/" but `new URL("//evil.com", base)` resolves to the foreign
+  // origin, which would let a malicious module render an off-origin tile and
+  // turn the discovery page into an open-redirect surface.
+  if (v.startsWith("/") && !v.startsWith("//")) return v;
   try {
     const u = new URL(v);
     if (u.protocol !== "http:" && u.protocol !== "https:") {
-      throw new ModuleManifestError(
-        `${where}: "managementUrl" absolute form must use http: or https:`,
-      );
+      throw new ModuleManifestError(`${where}: "${field}" absolute form must use http: or https:`);
     }
     return v;
   } catch (err) {
     if (err instanceof ModuleManifestError) throw err;
     throw new ModuleManifestError(
-      `${where}: "managementUrl" must be a path starting with "/" or a full http(s) URL`,
+      `${where}: "${field}" must be a path starting with "/" or a full http(s) URL`,
     );
   }
 }

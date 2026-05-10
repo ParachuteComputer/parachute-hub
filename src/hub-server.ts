@@ -543,6 +543,50 @@ async function loadManagementUrls(
 }
 
 /**
+ * For each NON-vault `ServiceEntry` with a known `installDir`, read its
+ * `.parachute/module.json` and surface the optional `uiUrl` and
+ * `displayName`. Returns two `name → value` maps keyed by services.json
+ * entry name. Mirrors `loadManagementUrls` (vault is the analog there;
+ * non-vault services are the analog here — vaults are user-facing via
+ * Notes, not their own UI).
+ *
+ * Why read at request time and not from services.json: services own the
+ * write side of services.json (`upsertService` replaces the whole entry
+ * on every boot), so any install-time copy of `uiUrl` / `displayName`
+ * would be clobbered the first time the service writes its own entry.
+ * Reading from `installDir/module.json` at request time avoids the gap
+ * and matches the established `managementUrl` precedent.
+ *
+ * Quiet on per-entry errors: a malformed module.json on one service
+ * shouldn't 500 the entire well-known doc — its row just renders without
+ * a Services tile. The validator already throws structured errors from
+ * `readModuleManifest`; logging them once here is the right floor.
+ */
+async function loadServiceUiMetadata(
+  services: readonly ServiceEntry[],
+  read: (installDir: string) => Promise<ModuleManifest | null>,
+): Promise<{ uiUrls: Map<string, string>; displayNames: Map<string, string> }> {
+  const uiUrls = new Map<string, string>();
+  const displayNames = new Map<string, string>();
+  await Promise.all(
+    services.map(async (s) => {
+      // Skip vaults — they have their own loadManagementUrls path and no
+      // operator-facing user UI of their own (content browses via Notes).
+      if (isVaultEntry(s) || !s.installDir) return;
+      try {
+        const m = await read(s.installDir);
+        if (m?.uiUrl) uiUrls.set(s.name, m.uiUrl);
+        if (m?.displayName) displayNames.set(s.name, m.displayName);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`well-known: skipping uiUrl/displayName for ${s.name}: ${msg}`);
+      }
+    }),
+  );
+  return { uiUrls, displayNames };
+}
+
+/**
  * Resolve the SPA bundle dir. We anchor to this file's location so a
  * `bun src/hub-server.ts` from any cwd still finds `<repo>/web/ui/dist/`.
  * Tests / production override via `HubFetchDeps.spaDistDir`.
@@ -804,14 +848,17 @@ export function hubFetch(
       try {
         const manifest = readManifest(manifestPath);
         const canonicalOrigin = configuredIssuer ?? new URL(req.url).origin;
-        const managementUrlByName = await loadManagementUrls(
-          manifest.services,
-          deps?.readModuleManifest ?? defaultReadModuleManifest,
-        );
+        const readManifestFn = deps?.readModuleManifest ?? defaultReadModuleManifest;
+        const [managementUrlByName, serviceUiMeta] = await Promise.all([
+          loadManagementUrls(manifest.services, readManifestFn),
+          loadServiceUiMetadata(manifest.services, readManifestFn),
+        ]);
         const doc = buildWellKnown({
           services: manifest.services,
           canonicalOrigin,
           managementUrlFor: (entry) => managementUrlByName.get(entry.name),
+          uiUrlFor: (entry) => serviceUiMeta.uiUrls.get(entry.name),
+          displayNameFor: (entry) => serviceUiMeta.displayNames.get(entry.name),
         });
         return new Response(JSON.stringify(doc), {
           headers: { "content-type": "application/json", ...corsHeaders },

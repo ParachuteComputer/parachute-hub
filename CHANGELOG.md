@@ -2,6 +2,57 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.8-rc.16] - 2026-05-10
+
+Reviewer folds on PR #238.
+
+### Security fix
+
+- **Reject protocol-relative paths in `uiUrl` / `managementUrl`** (open-redirect regression). `asPathOrUrl` previously accepted any string starting with `/`, including `"//evil.com"`. `new URL("//evil.com", "https://hub.example.com/")` resolves to `https://evil.com/` — a malicious third-party module could plant `uiUrl: "//evil.com"` in its `module.json` and turn a discovery tile into an off-origin redirect. Tightened the path-shape check to require a single leading `/` followed by at least one non-`/`. Regression tests cover both `uiUrl` and `managementUrl` since they share the helper.
+
+### Doc cleanup
+
+- Tightened `WellKnownServicesEntry.displayName` doc-comment to describe the actual fallback behavior (`module.json` first, `services.json` second).
+- Filled in `hub#238` placeholder in the C-not-B trace comment in `well-known.ts`.
+
+## [0.5.8-rc.15] - 2026-05-10
+
+Hub consumer-side of Phase D (module.json `uiUrl` pattern). Discovery page Services tiles are now data-driven from each service's `module.json:uiUrl` rather than from a hardcoded `SERVICE_LABELS` map. Closes the consumer side of the cross-repo Phase D rollout (patterns#52, notes#109, paraclaw#152 / agent#…).
+
+### Approach: option C, not B
+
+The brief originally leaned option B (install-time copy of `uiUrl` into `services.json`) but `upsertService` replaces the whole entry — so the field would be clobbered the first time a service boots and writes its own row. The established `loadManagementUrls` pattern for vault uses option C (read at request time from `installDir/.parachute/module.json`), which sidesteps the overwrite gap and requires no per-service runtime change. Mirrored that pattern. Trace captured in `loadServiceUiMetadata` docstring + this changelog so the C-not-B reasoning doesn't have to be rediscovered.
+
+### Added
+
+- **`uiUrl` field on `ModuleManifest`.** Same shape as `managementUrl` — leading-slash path or full http(s) URL. Validation factored into a shared `asPathOrUrl(field)` helper so the next URL-shaped manifest field doesn't copy-paste.
+- **`loadServiceUiMetadata(services, read)` in `hub-server.ts`.** Mirrors `loadManagementUrls`: reads each non-vault `installDir/.parachute/module.json` once per `/.well-known/parachute.json` request, surfaces `uiUrl` + `displayName` into per-service maps. Vaults skip — they have their own `loadManagementUrls` path. Quiet on per-entry errors (one bad manifest doesn't 500 the well-known doc).
+- **`uiUrl`, `displayName`, `tagline` fields on `WellKnownServicesEntry`.** `uiUrl` resolves relative paths against the canonical hub origin (mirrors how `url` already does it); `displayName` falls back to `services.json:displayName` when the resolver returns undefined; `tagline` rides directly from `services.json:tagline` (no installDir round-trip).
+- **`uiUrlFor` and `displayNameFor` resolver opts on `BuildWellKnownOpts`.** Synchronous so `buildWellKnown` stays a pure transform; the caller (hub-server) loads manifests once per request and passes them in.
+
+### Changed
+
+- **Discovery page (`src/hub.ts`) Services rendering is data-driven.** `SERVICE_LABELS`, `SERVICE_ORDER`, and `isVaultName()` retired. Each `doc.services[]` row with `uiUrl` renders a tile (title from `displayName` or short name, desc from `tagline`, href from `uiUrl`). Rows without `uiUrl` are intentionally skipped — vault is the canonical example (its content is browsed via Notes, which has its own row with `uiUrl: "/notes"`). Ordering is alphabetical-by-displayName per the pattern doc.
+- **Empty-state copy** updated: from "No services installed yet" to "No services with a UI declared yet" with a hint pointing at the module-json-extensibility pattern. The previous copy was misleading post-Phase-D — installed services without `uiUrl` are silent rather than broken.
+
+### Migration / no-action-needed
+
+- **No re-install required** for Aaron's existing services. Because uiUrl is read from `installDir/.parachute/module.json` at every request, the moment notes / agent ship `module.json:uiUrl` (already done in notes#109 and paraclaw#152), the next discovery refresh picks up the new tiles.
+- **No services.json schema change.** The field is intentionally NOT persisted there — would just get overwritten on next service boot.
+
+### Test gate
+
+All test suites pass. New coverage in this PR:
+
+- `module-manifest.test.ts` — 4 new tests: `uiUrl` accepts leading-slash path, accepts absolute https URL, rejects empty / non-string / no-leading-slash / non-http(s) URL, absent stays absent.
+- `well-known.test.ts` — 6 new tests: uiUrl resolver result rides into doc.services as absolute URL; absolute URL passes through verbatim; absent when resolver returns undefined; displayName resolver overrides services.json; displayName fallback; tagline rides from services.json.
+- `hub-server.test.ts` — 3 new tests: well-known surfaces uiUrl + displayName from non-vault manifests; omits uiUrl when manifest has none; vault is skipped (has its own managementUrl path).
+- `hub.test.ts` — restructured for data-driven rendering: tile shape comes from `svc.uiUrl` + `svc.displayName`; skip rule emerges from `!svc.uiUrl` not `isVaultName`; alphabetical-by-displayName ordering; empty-state copy points at the pattern doc.
+
+Typecheck (both packages): clean. biome: clean.
+
+(Test-count numbers omitted per the hub#219 canonical-vs-combined ambiguity convention.)
+
 ## [0.5.8-rc.14] - 2026-05-10
 
 Token list grouping by source — F of the auth UX pathway. The `/admin/tokens` page now distinguishes OAuth refresh tokens, operator-token mints, and CLI mints at a glance via per-row chips and a second filter dimension.

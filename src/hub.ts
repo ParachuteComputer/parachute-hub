@@ -380,17 +380,17 @@ const HTML_TEMPLATE = `<!doctype html>
   const servicesGrid = document.getElementById('services-grid');
   const adminGrid = document.getElementById('admin-grid');
 
-  // Services entries: each service's primary surface. Hardcoded short→label
-  // map; path is derived from services.json so custom mounts still work.
-  // Vault deliberately omitted — its content is browsed via Notes (which
-  // is its own entry below). Operators provision/admin vaults from the
-  // /admin/vaults card in the Admin section.
-  const SERVICE_LABELS = {
-    notes:  { title: 'Notes', desc: 'Browse your vault content.' },
-    scribe: { title: 'Scribe', desc: 'Transcribe audio.' },
-    agent:  { title: 'Agent', desc: 'Run agents on this hub.' },
-  };
-  const SERVICE_ORDER = ['notes', 'scribe', 'agent'];
+  // Services entries are now data-driven from /.well-known/parachute.json.
+  // Each services[] row carries (since hub#... — Phase D consumer side):
+  //   - displayName: human label (sourced from module.json:displayName).
+  //   - uiUrl: where the user-facing UI lives (sourced from module.json:uiUrl).
+  //     A row WITHOUT uiUrl declines to render a tile — the module is
+  //     either API-only (vault, scribe-without-UI) or surfaces its UI
+  //     through a sibling (vault → Notes).
+  // The previous SERVICE_LABELS / SERVICE_ORDER / isVaultName hardcoding
+  // is retired: vault has no uiUrl, so the "skip vault" rule emerges
+  // from data rather than a name check; ordering is alphabetical-by-
+  // displayName per the module-json-extensibility pattern doc.
 
   // Admin entries: always visible. Even a fresh hub with zero vaults wants
   // the operator to find /admin/vaults. Hardcoded — they live in the
@@ -405,10 +405,6 @@ const HTML_TEMPLATE = `<!doctype html>
     return manifestName.replace(/^parachute-/, '');
   }
 
-  function isVaultName(name) {
-    return name === 'parachute-vault' || name.startsWith('parachute-vault-');
-  }
-
   function renderTile({ title, desc, href }) {
     const a = document.createElement('a');
     a.className = 'card';
@@ -419,10 +415,12 @@ const HTML_TEMPLATE = `<!doctype html>
     t.textContent = title;
     a.appendChild(t);
 
-    const d = document.createElement('p');
-    d.className = 'card-desc';
-    d.textContent = desc;
-    a.appendChild(d);
+    if (desc) {
+      const d = document.createElement('p');
+      d.className = 'card-desc';
+      d.textContent = desc;
+      a.appendChild(d);
+    }
 
     const meta = document.createElement('div');
     meta.className = 'card-meta';
@@ -447,30 +445,38 @@ const HTML_TEMPLATE = `<!doctype html>
   }
 
   function renderServices(services) {
-    // Group services by short type. Multiple instances of the same type
-    // (e.g. two scribes) collapse into one entry pointing at the first
-    // — operators with that posture will know which one they meant.
-    // Vault entries are skipped per the comment above.
-    const byType = new Map();
+    // Render one tile per service that declares a uiUrl. Entries without
+    // uiUrl are intentionally omitted — vault is the canonical example
+    // (its content is browsed via Notes, which has its own uiUrl row).
+    // Multiple entries with the same shortName collapse into one tile;
+    // operators with two scribe instances pick the first arbitrarily,
+    // and they'd know which they meant.
+    const byShort = new Map();
     for (const svc of services) {
-      if (isVaultName(svc.name)) continue;
-      const t = shortName(svc.name);
-      if (!byType.has(t)) byType.set(t, svc.path);
+      if (!svc || !svc.uiUrl) continue;
+      const key = shortName(svc.name);
+      if (byShort.has(key)) continue;
+      byShort.set(key, {
+        title: svc.displayName || key,
+        desc: svc.tagline || '',
+        href: svc.uiUrl,
+      });
     }
 
-    const tiles = [];
-    for (const t of SERVICE_ORDER) {
-      const path = byType.get(t);
-      if (!path) continue;
-      const labels = SERVICE_LABELS[t];
-      tiles.push({ title: labels.title, desc: labels.desc, href: path });
-    }
+    // Alphabetical-by-displayName per the module-json-extensibility pattern.
+    // Stable for shared-prefix labels (Notes, Notes-Lite would sort that way).
+    const tiles = Array.from(byShort.values()).sort((a, b) =>
+      a.title.localeCompare(b.title),
+    );
 
     servicesGrid.innerHTML = '';
     if (tiles.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'empty';
-      empty.innerHTML = 'No services installed yet. Try <code>parachute install vault</code>.';
+      empty.innerHTML =
+        'No services with a UI declared yet. Modules surface their UIs by ' +
+        'declaring <code>uiUrl</code> in <code>module.json</code> ' +
+        '(see the module-json-extensibility pattern).';
       servicesGrid.appendChild(empty);
       return;
     }
