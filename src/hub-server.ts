@@ -9,17 +9,58 @@
  * `tailscale serve … --set-path=/ http://127.0.0.1:<port>`. This shim is
  * that localhost backing.
  *
- * Routes (all bound to 127.0.0.1):
- *   /                                         → hub.html
- *   /hub.html                                 → hub.html
- *   /.well-known/parachute.json               → built dynamically from services.json
- *   /.well-known/jwks.json                    → JWKS from hub.db
- *   /.well-known/oauth-authorization-server   → RFC 8414 metadata (issuer, endpoints)
- *   /oauth/authorize  (GET + POST)            → login → consent → auth code
- *   /oauth/authorize/approve (POST)           → inline DCR approve form (#208)
- *   /oauth/token      (POST)                  → authorization_code + refresh_token grants
- *   /oauth/register   (POST)                  → RFC 7591 dynamic client registration
- *   anything else                             → 404
+ * Routes (all bound to 127.0.0.1) — listed in dispatch order. Order is
+ * load-bearing: 301 redirects fire before the proxies and SPA mount they
+ * preempt; admin API endpoints fire before the /admin/* SPA catch-all.
+ *
+ *   # Pre-rename 301 back-compat (hub#231 — first so they preempt any
+ *   # remaining handlers under /vault or /hub).
+ *   /vault, /vault/, /vault/new                → 301 → /admin/vaults[/new]
+ *   /hub/vaults*                               → 301 → /admin/vaults*
+ *   /hub/permissions                           → 301 → /admin/permissions
+ *   /hub/tokens                                → 301 → /admin/tokens
+ *   /hub, /hub/                                → 301 → /admin/vaults
+ *
+ *   # Discovery + well-known.
+ *   /, /hub.html                               → hub.html (the discovery page)
+ *   /.well-known/parachute.json                → built dynamically from services.json
+ *   /.well-known/parachute-revocation.json     → revoked-jti list (hub#212 Phase 1)
+ *   /.well-known/jwks.json                     → JWKS from hub.db
+ *   /.well-known/oauth-authorization-server    → RFC 8414 metadata (issuer, endpoints)
+ *
+ *   # OAuth issuer.
+ *   /oauth/authorize  (GET + POST)             → login → consent → auth code
+ *   /oauth/authorize/approve (POST)            → inline DCR approve form (#208)
+ *   /oauth/token      (POST)                   → authorization_code + refresh_token grants
+ *   /oauth/register   (POST)                   → RFC 7591 dynamic client registration
+ *   /oauth/revoke     (POST)                   → RFC 7009 refresh-token revocation
+ *
+ *   # Admin API + bearer-mint surfaces (must precede /admin/* SPA mount).
+ *   /vaults                       (POST)       → create vault
+ *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
+ *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
+ *   /api/auth/mint-token          (POST)       → CLI/automation token mint (bearer)
+ *   /api/auth/revoke-token        (POST)       → revoke registry-row token by jti
+ *   /api/auth/tokens              (GET)        → paginated registry list
+ *   /api/grants                   (GET)        → OAuth consent grants list
+ *   /api/grants/<client_id>       (DELETE)     → revoke a single OAuth grant
+ *   /admin/login                  (GET + POST) → operator password login
+ *   /admin/logout                 (POST)       → end admin session
+ *   /admin/config                 (GET)        → operator config view
+ *   /admin/config/<key>           (POST)       → operator config write
+ *
+ *   # Per-vault content proxy (user-facing vault data: Notes PWA, MCP, etc.).
+ *   /vault/<name>/*                            → proxy to the vault backend
+ *
+ *   # Admin SPA mount (catch-all under /admin; runs after all admin API
+ *   # handlers above, so /admin/<known> reaches the right handler and
+ *   # /admin/<spa-route> serves the SPA shell).
+ *   /admin, /admin/, /admin/*                  → SPA shell (vaults / new / permissions / tokens)
+ *
+ *   # Generic services.json-driven proxy (non-vault modules: notes, scribe, agent).
+ *   /<service-mount>/*                         → proxy via services.json longest-prefix
+ *
+ *   anything else                              → 404
  *
  * Invoked as:
  *   bun <this-file> --port <n> --well-known-dir <path> [--db <path>] [--issuer <url>]

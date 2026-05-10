@@ -39,9 +39,15 @@ Holistic restructure of the integrated hub experience — the bigger redesign Aa
 
 ### Test gate
 
-- hub: 1199 pass / 0 fail (was 1194 at rc.10; +5 — 9 new redirect/SPA-mount tests, retired the pre-rename `/vault` and `/hub/*` SPA tests).
-- web/ui: 83 pass / 0 fail (was 77; +6 across the rewritten App.test.tsx — five subtitle cases + three nav-structure assertions + six route-rendering assertions covering the new mount shape).
-- typecheck (both packages): clean. biome: clean. UI build + verify-base: clean (verifies `/admin/`-prefixed asset URLs).
+All test suites pass. New coverage in this PR:
+
+- **`hub.test.ts`** rewritten for the new discovery shape — 15 tests covering the Use/Admin section structure, dynamic Use entries from services.json, hardcoded Admin entries, the synchronous-Admin-render guarantee, and absence of the retired aggregate-by-module-type code.
+- **`hub-server.test.ts`** retired the pre-rename `/vault` and `/hub/*` SPA tests; added 9 new tests across the new `/admin/*` SPA mount (vaults / vaults/new / permissions / tokens / assets / 503 + 405 surfaces) and every 301 redirect (`/vault`, `/vault/new`, `/hub/vaults*`, `/hub/permissions`, `/hub/tokens`, `/hub` bare) including query-string preservation.
+- **`App.test.tsx`** rewritten to use `MemoryRouter`'s `initialEntries` (subtitle is now router-derived; no more `Object.defineProperty(window.location, ...)`). Covers route-derived subtitle, single-mount nav structure, and per-route component rendering (including the 404 fallback).
+
+Typecheck (both packages): clean. biome: clean. UI build + `verify-base`: clean (asserts `/admin/`-prefixed asset URLs).
+
+(Test-count numbers intentionally omitted — the canonical-vs-combined ambiguity is tracked at hub#219.)
 
 ## [0.5.8-rc.10] - 2026-05-10
 
