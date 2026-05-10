@@ -8,7 +8,7 @@ Adds the operator-facing `parachute auth revoke-token <jti>` CLI — the missing
 
 ### Added
 
-- **`parachute auth revoke-token <jti>`** — flips `revoked_at` on the `tokens` row keyed by jti. Idempotent: re-revoking an already-revoked jti prints the existing `revoked_at` and exits 0. Not-found exits 1 with a clear "no token with jti X found in registry". On success, prints `revoked: jti=X, subject=..., scope=...` for operator audit trail.
+- **`parachute auth revoke-token <jti>`** — flips `revoked_at` on the `tokens` row keyed by jti. Idempotent: re-revoking an already-revoked jti prints the existing `revoked_at` and exits 0. Not-found exits 1 with a clear "no token with jti X found in registry". On success, prints `revoked: jti=X, identity=..., scope=...` for operator audit trail. The `identity=` field surfaces `tokenRowIdentity(row)` — `userId` for OAuth-issued rows, `subject` for CLI / operator / service mints — so operators grepping on `identity=` get the right value regardless of which mint path created the token.
   - Auth gate: requires `parachute:host:auth` scope on the local `~/.parachute/operator.token` (the `auth` or `admin` scope-set covers this; narrower sets like `install`/`start`/`expose`/`vault` do not). Same gate semantics as `POST /api/auth/mint-token`.
   - Auto-rotation banner (when the operator token is within 7d of expiry) goes to stderr; stdout stays focused on the revocation outcome.
   - End-to-end semantics: revoke happens immediately in the local DB; the revocation list endpoint (`/.well-known/parachute-revocation.json`) picks the change up on its next 60s poll cycle; resource servers running `@openparachute/scope-guard@^0.2.0` then reject the JWT on subsequent requests.

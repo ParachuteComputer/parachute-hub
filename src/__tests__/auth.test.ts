@@ -1597,7 +1597,7 @@ describe("parachute auth revoke-token", () => {
       expect(code).toBe(0);
       expect(stderr).toBe("");
       expect(stdout).toContain(`revoked: jti=${jti}`);
-      expect(stdout).toContain("subject=");
+      expect(stdout).toContain("identity=");
       expect(stdout).toContain("scope=scribe:transcribe");
 
       // Registry row really has revoked_at set now.

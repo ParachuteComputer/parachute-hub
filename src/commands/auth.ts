@@ -31,6 +31,7 @@ import {
   recordTokenMint,
   revokeTokenByJti,
   signAccessToken,
+  tokenRowIdentity,
 } from "../jwt-sign.ts";
 import {
   OPERATOR_TOKEN_CLIENT_ID,
@@ -1089,9 +1090,14 @@ async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<
       );
       return 1;
     }
-    const identity = row.userId ?? row.subject ?? "(unknown)";
+    // Use the canonical `tokenRowIdentity` helper rather than reading
+    // userId/subject inline. The label is `identity=` (not `subject=`)
+    // because for OAuth-issued rows `userId` is the user UUID and the
+    // `subject` column is NULL; calling that field "subject" in the
+    // output would mislabel the UUID for any operator grepping on it.
+    // `identity=` matches what the helper returns regardless of row type.
     console.log(
-      `revoked: jti=${jti}, subject=${identity}, scope=${row.scopes.join(" ") || "(none)"}`,
+      `revoked: jti=${jti}, identity=${tokenRowIdentity(row)}, scope=${row.scopes.join(" ") || "(none)"}`,
     );
     return 0;
   } finally {
