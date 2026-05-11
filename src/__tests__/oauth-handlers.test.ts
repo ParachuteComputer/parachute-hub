@@ -2125,6 +2125,13 @@ describe("DCR approval gate (#74)", () => {
       const body = (await res.json()) as Record<string, unknown>;
       expect(body.error).toBe("invalid_client");
       expect(body.error_description).toContain("not been approved");
+      // Surface the inline-approval affordances so consumers (Notes, future
+      // cross-origin SPAs) can deep-link the operator to a browser-based
+      // approve flow without dropping to a terminal.
+      expect(body.approve_url).toBe(
+        `${ISSUER}/admin/approve-client/${encodeURIComponent(reg.client.clientId)}`,
+      );
+      expect(body.cli_alternative).toBe(`parachute auth approve-client ${reg.client.clientId}`);
     } finally {
       cleanup();
     }
@@ -2154,6 +2161,13 @@ describe("DCR approval gate (#74)", () => {
       expect(res.status).toBe(401);
       const body = (await res.json()) as Record<string, unknown>;
       expect(body.error).toBe("invalid_client");
+      // Same pending-affordance shape on the refresh path: a long-lived
+      // OAuth client whose row was unapproved between issuance and refresh
+      // hits this branch and surfaces the same approve_url + cli_alternative.
+      expect(body.approve_url).toBe(
+        `${ISSUER}/admin/approve-client/${encodeURIComponent(reg.client.clientId)}`,
+      );
+      expect(body.cli_alternative).toBe(`parachute auth approve-client ${reg.client.clientId}`);
     } finally {
       cleanup();
     }

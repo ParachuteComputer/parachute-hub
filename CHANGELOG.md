@@ -2,6 +2,25 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.9-rc.1] - 2026-05-11
+
+Integration-debt cleanup after the SPA-rework chain that landed 2026-05-10 (#233 admin SPA mount, #234 `/login` rename, #235 signed-in indicator, #237 token UI). The rework migrated three admin surfaces (vaults/permissions/tokens) into the SPA but left two legacy server-rendered admin pages dangling; this PR closes the immediate friction.
+
+1. **Post-login default lands in the SPA, not the legacy portal.** `safeNext` in `admin-handlers.ts` now defaults to `/admin/vaults` (the SPA home). Previously the missing-/unsafe-`next=` fallback was `/admin/config`, which post-rework was a half-built page showing an empty state because no module declares a `configSchema`. The default is now named (`POST_LOGIN_DEFAULT`) so the meaning is explicit.
+
+2. **Legacy `/admin/config` server-rendered portal retired.** `src/admin-config.ts` (module discovery + JSON config read/write) deleted; `src/admin-config-ui.ts` trimmed to just the still-load-bearing login + error rendering; the corresponding GET/POST handlers in `src/admin-handlers.ts` dropped. The hub still listens at `/admin/config` and `/admin/config/<name>` but returns 301 → `/admin/vaults` so any bookmark or stale post-login redirect lands somewhere useful. The module-config surface as designed in #46 didn't gain a configSchema-declaring module before the SPA rework subsumed the page; the right shape going forward is a per-module SPA + module.json `uiUrl` (already implemented in agent, scribe to follow). The deletion frees ~760 LOC (220 admin-config.ts + 277 admin-config-ui.ts + 230 admin-handlers.ts + 281 admin-config tests) plus removes the dev-proxy entry in `web/ui/vite.config.ts`.
+
+3. **OAuth pending-approval inline UX.** Hub's `/oauth/token` response for pending DCR clients (`pendingClientJson`) now carries two new fields alongside the spec-shaped `error: "invalid_client"`:
+
+   - `approve_url` — hub-served SPA deep link to `/admin/approve-client/<client_id>` so the operator can approve from a browser without dropping to a terminal.
+   - `cli_alternative` — the `parachute auth approve-client <id>` shell command, retained for terminal-first operators.
+
+   New SPA route `/admin/approve-client/:clientId` (in `web/ui/src/routes/ApproveClient.tsx`) fetches client details, renders name + redirect_uris + requested scopes + a registered-at timestamp, and exposes a single Approve button. Two new bearer-gated admin endpoints back it: `GET /api/oauth/clients/:id` (details) and `POST /api/oauth/clients/:id/approve` (idempotent flip to approved, emits an audit log line `client approved: client_id=… approver_sub=…` on actual state change). The pre-existing `POST /oauth/authorize/approve` endpoint is untouched — it stays tightly coupled to the authorize-flow `return_to` shape and serves the inline same-origin approve form in `/oauth/authorize`'s HTML response; the new endpoints solve the deep-link case it couldn't.
+
+   The spec error class stays `invalid_client` per RFC 6749 §5.2 — that's the right semantic for "this client cannot use this endpoint right now"; `access_denied` is reserved for `/authorize` "user said no" flows.
+
+   Notes-side surfacing of `approve_url` (rendering it as a clickable link instead of the CLI message) is a separate follow-up dispatch.
+
 ## [0.5.8] - 2026-05-10
 
 Promotes the 0.5.8-rc cycle (rc.1 through rc.16, all landed 2026-05-09 / 2026-05-10) to stable. Hub#212 (the multi-phase migration toward hub-as-sole-AS) lands Phases 1, 2, and Phase 4's hub-side foundation; an end-to-end auth UX cleanup pathway (A through F) makes the resulting surface coherent for operators. Five themes:

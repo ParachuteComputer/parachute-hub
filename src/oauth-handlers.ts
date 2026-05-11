@@ -360,12 +360,32 @@ function pendingClientResponse(
   );
 }
 
-/** JSON response for pending clients hitting /oauth/token. */
-function pendingClientJson(): Response {
+/**
+ * JSON response for pending clients hitting /oauth/token. Carries two
+ * actionability hints alongside the OAuth error so consumers (Notes, future
+ * cross-origin SPAs) can surface an inline approval path instead of dead-
+ * ending on a CLI message:
+ *
+ *   - `approve_url` — hub-served SPA route the operator can open in a
+ *     browser to approve the client in one click. Same-origin to the hub.
+ *   - `cli_alternative` — the `parachute auth approve-client <id>` shell
+ *     command, retained for terminal-first operators or scripted flows.
+ *
+ * Spec note: the OAuth error class stays `invalid_client` per RFC 6749 §5.2
+ * — "this client cannot use this endpoint right now" is the semantic match.
+ * `access_denied` is reserved for /authorize "user said no" flows; using it
+ * here would conflate two distinct error families and break clients doing
+ * strict spec-shaped handling. The extra fields are spec-permitted
+ * extensions ("other parameters").
+ */
+function pendingClientJson(clientId: string, issuer: string): Response {
+  const base = issuer.replace(/\/$/, "");
   return jsonResponse(
     {
       error: "invalid_client",
       error_description: "client is registered but has not been approved by the hub operator (#74)",
+      approve_url: `${base}/admin/approve-client/${encodeURIComponent(clientId)}`,
+      cli_alternative: `parachute auth approve-client ${clientId}`,
     },
     401,
   );
@@ -931,7 +951,7 @@ async function handleTokenAuthorizationCode(
   if (!client) {
     return jsonResponse({ error: "invalid_client", error_description: "unknown client_id" }, 401);
   }
-  if (client.status !== "approved") return pendingClientJson();
+  if (client.status !== "approved") return pendingClientJson(client.clientId, deps.issuer);
   const authFailure = authenticateClient(client, req, form, clientId);
   if (authFailure) return authFailure;
   let redeemed: ReturnType<typeof redeemAuthCode>;
@@ -1013,7 +1033,7 @@ async function handleTokenRefresh(
   if (!client) {
     return jsonResponse({ error: "invalid_client", error_description: "unknown client_id" }, 401);
   }
-  if (client.status !== "approved") return pendingClientJson();
+  if (client.status !== "approved") return pendingClientJson(client.clientId, deps.issuer);
   const authFailure = authenticateClient(client, req, form, clientId);
   if (authFailure) return authFailure;
   const row = findRefreshToken(db, refreshToken);

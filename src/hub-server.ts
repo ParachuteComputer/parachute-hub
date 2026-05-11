@@ -46,10 +46,12 @@
  *   /api/auth/tokens              (GET)        → paginated registry list
  *   /api/grants                   (GET)        → OAuth consent grants list
  *   /api/grants/<client_id>       (DELETE)     → revoke a single OAuth grant
+ *   /api/oauth/clients/<id>       (GET)        → OAuth client details
+ *   /api/oauth/clients/<id>/approve (POST)     → flip a pending client to approved
  *   /login                        (GET + POST) → operator password login
  *   /logout                       (POST)       → end admin session
- *   /admin/config                 (GET)        → operator config view
- *   /admin/config/<key>           (POST)       → operator config write
+ *   /admin/config*                             → 301 → /admin/vaults (legacy
+ *                                                portal retired post-SPA-rework)
  *
  *   # Per-vault content proxy (user-facing vault data: Notes PWA, MCP, etc.).
  *   /vault/<name>/*                            → proxy to the vault backend
@@ -83,10 +85,9 @@ import type { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
 import { handleListGrants, handleRevokeGrant } from "./admin-grants.ts";
 import {
-  handleAdminConfigGet,
-  handleAdminConfigPost,
   handleAdminLoginGet,
   handleAdminLoginPost,
   handleAdminLogoutPost,
@@ -1106,6 +1107,37 @@ export function hubFetch(
       });
     }
 
+    // OAuth client lookup + approval. Both bearer-gated under host:admin.
+    // Two paths: `/api/oauth/clients/<id>` (GET, details) and
+    // `/api/oauth/clients/<id>/approve` (POST, flip to approved). The
+    // SPA approve-client deep link reads details from the first and
+    // submits approval to the second — keeps the surface easy to test
+    // and audit without overloading a single verb.
+    if (pathname.startsWith("/api/oauth/clients/")) {
+      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      const tail = pathname.slice("/api/oauth/clients/".length);
+      if (!tail) return new Response("not found", { status: 404 });
+      const approveSuffix = "/approve";
+      if (tail.endsWith(approveSuffix)) {
+        const clientId = decodeURIComponent(tail.slice(0, -approveSuffix.length));
+        if (!clientId || clientId.includes("/")) {
+          return new Response("not found", { status: 404 });
+        }
+        return handleApproveClient(req, clientId, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+      const clientId = decodeURIComponent(tail);
+      if (!clientId || clientId.includes("/")) {
+        return new Response("not found", { status: 404 });
+      }
+      return handleGetClient(req, clientId, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+      });
+    }
+
     // Canonical login/logout. The handlers themselves are unchanged from
     // when they lived at /admin/login + /admin/logout; the rename surfaced
     // via #231-followup so the URL reflects the surface's actual scope
@@ -1125,20 +1157,16 @@ export function hubFetch(
       return handleAdminLogoutPost(getDb(), req);
     }
 
-    if (pathname === "/admin/config") {
-      if (!getDb) return new Response("hub db not configured", { status: 503 });
-      if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
-      return handleAdminConfigGet(getDb(), req);
-    }
-
-    if (pathname.startsWith("/admin/config/")) {
-      if (!getDb) return new Response("hub db not configured", { status: 503 });
-      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-      const name = decodeURIComponent(pathname.slice("/admin/config/".length));
-      if (!name || name.includes("/")) {
-        return new Response("not found", { status: 404 });
-      }
-      return handleAdminConfigPost(getDb(), req, name);
+    // Legacy `/admin/config` (server-rendered module-config portal, #46)
+    // retired post-SPA-rework. 301 → the SPA home so any bookmark or stale
+    // post-login redirect lands somewhere useful. The route stays here in
+    // dispatch order (above the /admin/* SPA catch-all) so the redirect
+    // wins over a SPA shell render.
+    if (pathname === "/admin/config" || pathname.startsWith("/admin/config/")) {
+      return new Response(null, {
+        status: 301,
+        headers: { location: "/admin/vaults" },
+      });
     }
 
     // /vault/<name>/* — per-vault content proxy. Stays as user-facing

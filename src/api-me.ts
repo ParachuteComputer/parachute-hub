@@ -26,11 +26,10 @@
  * the unsigned-in case would just bloat the response and prime a cookie
  * the consumer has no use for.
  *
- * Why a dedicated endpoint rather than reusing `/admin/config`:
- * `/admin/config` redirects to /login when unauthenticated, which is
- * exactly the wrong UX for an unconditionally-fetched "show sign-in
- * affordance" call. `/api/me` cleanly returns either state without a
- * bounce.
+ * Why a dedicated endpoint rather than probing a session-gated SPA page:
+ * those redirect to /login when unauthenticated, which is exactly the
+ * wrong UX for an unconditionally-fetched "show sign-in affordance" call.
+ * `/api/me` cleanly returns either state without a bounce.
  *
  * The CSRF token returned here is the same token any same-session
  * `<form>` would carry — the consumer (SPA fetch POST or

@@ -24,6 +24,7 @@
 import { type ReactNode, useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import { type MeResponse, getMe, signOut } from "./lib/api.ts";
+import { ApproveClient } from "./routes/ApproveClient.tsx";
 import { NewVault } from "./routes/NewVault.tsx";
 import { Permissions } from "./routes/Permissions.tsx";
 import { Tokens } from "./routes/Tokens.tsx";
@@ -40,6 +41,9 @@ function subtitleFor(pathname: string): string {
   }
   if (pathname === "/tokens" || pathname.startsWith("/tokens/")) {
     return "tokens";
+  }
+  if (pathname.startsWith("/approve-client/")) {
+    return "approve app";
   }
   return "vaults";
 }
@@ -109,6 +113,7 @@ export function App() {
         <Route path="/vaults/new" element={<NewVault />} />
         <Route path="/permissions" element={<Permissions />} />
         <Route path="/tokens" element={<Tokens />} />
+        <Route path="/approve-client/:clientId" element={<ApproveClient />} />
         <Route
           path="*"
           element={

@@ -1,66 +1,21 @@
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  handleAdminConfigGet,
-  handleAdminConfigPost,
   handleAdminLoginGet,
   handleAdminLoginPost,
   handleAdminLogoutPost,
 } from "../admin-handlers.ts";
 import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import type { ConfigSchema, ModuleManifest } from "../module-manifest.ts";
 import { __resetForTests as resetRateLimit } from "../rate-limit.ts";
-import type { ServicesManifest } from "../services-manifest.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession, findSession } from "../sessions.ts";
 import { createUser } from "../users.ts";
 
 const TEST_CSRF = "csrf-handlers-test-token";
 const CSRF_COOKIE = `${CSRF_COOKIE_NAME}=${TEST_CSRF}`;
-
-const VAULT_SCHEMA: ConfigSchema = {
-  type: "object",
-  required: ["transcribe_provider"],
-  properties: {
-    transcribe_provider: {
-      type: "string",
-      description: "Speech-to-text backend.",
-      enum: ["openai", "deepgram", "groq"],
-      default: "openai",
-    },
-    max_tags_per_note: { type: "integer", default: 10 },
-    public: { type: "boolean", default: false },
-  },
-};
-
-const VAULT_MANIFEST: ModuleManifest = {
-  name: "vault",
-  manifestName: "parachute-vault",
-  displayName: "Vault",
-  kind: "api",
-  port: 1940,
-  paths: ["/vault"],
-  health: "/health",
-  configSchema: VAULT_SCHEMA,
-};
-
-function vaultServices(): ServicesManifest {
-  return {
-    services: [
-      {
-        name: "vault",
-        port: 1940,
-        paths: ["/vault"],
-        health: "/health",
-        version: "0.0.0",
-        installDir: "/fake/vault",
-      },
-    ],
-  };
-}
 
 interface Harness {
   db: Database;
@@ -99,11 +54,6 @@ function formBody(values: Record<string, string>): {
   };
 }
 
-function fakeReadManifest(installDir: string): Promise<ModuleManifest | null> {
-  if (installDir === "/fake/vault") return Promise.resolve(VAULT_MANIFEST);
-  return Promise.resolve(null);
-}
-
 let harness: Harness;
 beforeEach(() => {
   harness = makeHarness();
@@ -125,18 +75,27 @@ describe("handleAdminLoginGet", () => {
   });
 
   test("echoes the next= query param into the form", async () => {
-    const req = new Request("http://hub.test/admin/login?next=/admin/config");
+    const req = new Request("http://hub.test/admin/login?next=/admin/permissions");
     const res = handleAdminLoginGet(harness.db, req);
     const html = await res.text();
-    expect(html).toContain('value="/admin/config"');
+    expect(html).toContain('value="/admin/permissions"');
   });
 
-  test("rewrites unsafe next= to /admin/config", async () => {
+  test("rewrites unsafe next= to /admin/vaults", async () => {
     const req = new Request("http://hub.test/admin/login?next=https%3A%2F%2Fevil.example%2Fpwn");
     const res = handleAdminLoginGet(harness.db, req);
     const html = await res.text();
-    expect(html).toContain('value="/admin/config"');
+    expect(html).toContain('value="/admin/vaults"');
     expect(html).not.toContain("evil.example");
+  });
+
+  test("missing next= falls back to /admin/vaults (SPA home)", async () => {
+    // Post-SPA-rework default: the legacy `/admin/config` portal was retired,
+    // so the login form's hidden `next` defaults to the SPA's vault list.
+    const req = new Request("http://hub.test/admin/login");
+    const res = handleAdminLoginGet(harness.db, req);
+    const html = await res.text();
+    expect(html).toContain('value="/admin/vaults"');
   });
 
   test("hidden __csrf input value matches the freshly-minted cookie value (#113)", async () => {
@@ -161,7 +120,7 @@ describe("handleAdminLoginPost", () => {
       [CSRF_FIELD_NAME]: "wrong",
       username: "admin",
       password: "pw",
-      next: "/admin/config",
+      next: "/admin/vaults",
     });
     const req = new Request("http://hub.test/admin/login", {
       method: "POST",
@@ -179,7 +138,7 @@ describe("handleAdminLoginPost", () => {
       [CSRF_FIELD_NAME]: TEST_CSRF,
       username: "admin",
       password: "wrong",
-      next: "/admin/config",
+      next: "/admin/vaults",
     });
     const req = new Request("http://hub.test/admin/login", {
       method: "POST",
@@ -197,7 +156,7 @@ describe("handleAdminLoginPost", () => {
       [CSRF_FIELD_NAME]: TEST_CSRF,
       username: "admin",
       password: "pw",
-      next: "/admin/config",
+      next: "/admin/permissions",
     });
     const req = new Request("http://hub.test/admin/login", {
       method: "POST",
@@ -206,7 +165,7 @@ describe("handleAdminLoginPost", () => {
     });
     const res = await handleAdminLoginPost(harness.db, req);
     expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/admin/config");
+    expect(res.headers.get("location")).toBe("/admin/permissions");
     expect(res.headers.get("set-cookie") ?? "").toContain("parachute_hub_session=");
   });
 
@@ -225,7 +184,50 @@ describe("handleAdminLoginPost", () => {
     });
     const res = await handleAdminLoginPost(harness.db, req);
     expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/admin/config");
+    expect(res.headers.get("location")).toBe("/admin/vaults");
+  });
+
+  test("ignores a protocol-relative next= from the form (open-redirect defense)", async () => {
+    // Scheme-relative `//host/path` URLs would otherwise resolve to a
+    // different origin when followed by the browser. `safeNext` rejects them
+    // alongside scheme-absolute URLs; this test pins the POST path
+    // explicitly so future refactors of the redirect builder don't quietly
+    // re-open the open-redirect.
+    await createUser(harness.db, "admin", "pw");
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "admin",
+      password: "pw",
+      next: "//evil.example/pwn",
+    });
+    const req = new Request("http://hub.test/admin/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/admin/vaults");
+  });
+
+  test("missing next= lands the operator on /admin/vaults (SPA home)", async () => {
+    // Post-SPA-rework default: when the form omits `next`, login lands on
+    // the SPA's vault list. Previously the legacy `/admin/config` portal
+    // was the default; that page is retired and 301s to /admin/vaults.
+    await createUser(harness.db, "admin", "pw");
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "admin",
+      password: "pw",
+    });
+    const req = new Request("http://hub.test/admin/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/admin/vaults");
   });
 
   // hub#185 — per-IP rate-limit (5 attempts / 15 min) on POST /admin/login.
@@ -236,7 +238,7 @@ describe("handleAdminLoginPost", () => {
         [CSRF_FIELD_NAME]: TEST_CSRF,
         username: "admin",
         password,
-        next: "/admin/config",
+        next: "/admin/vaults",
       });
       return new Request("http://hub.test/admin/login", {
         method: "POST",
@@ -270,7 +272,7 @@ describe("handleAdminLoginPost", () => {
         [CSRF_FIELD_NAME]: TEST_CSRF,
         username: "admin",
         password,
-        next: "/admin/config",
+        next: "/admin/vaults",
       });
       return new Request("http://hub.test/admin/login", {
         method: "POST",
@@ -298,7 +300,7 @@ describe("handleAdminLoginPost", () => {
         [CSRF_FIELD_NAME]: TEST_CSRF,
         username: "ghost",
         password: "x",
-        next: "/admin/config",
+        next: "/admin/vaults",
       });
       return new Request("http://hub.test/admin/login", {
         method: "POST",
@@ -363,260 +365,5 @@ describe("handleAdminLogoutPost (#113)", () => {
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/login");
     expect(res.headers.get("set-cookie") ?? "").toContain("parachute_hub_session=;");
-  });
-});
-
-describe("handleAdminConfigGet", () => {
-  test("redirects unauthenticated requests to /login", async () => {
-    const req = new Request("http://hub.test/admin/config");
-    const res = await handleAdminConfigGet(harness.db, req);
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/login?next=%2Fadmin%2Fconfig");
-  });
-
-  test("renders the empty-state when no module declares a configSchema", async () => {
-    const cookie = await cookieForUser(harness.db, "admin", "pw");
-    const req = new Request("http://hub.test/admin/config", {
-      headers: { cookie },
-    });
-    const res = await handleAdminConfigGet(harness.db, req, {
-      loadServicesManifest: () => ({ services: [] }),
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-    });
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    expect(html).toContain("No installed module declares");
-  });
-
-  test("renders one section per configurable module", async () => {
-    const cookie = await cookieForUser(harness.db, "admin", "pw");
-    const req = new Request("http://hub.test/admin/config", {
-      headers: { cookie },
-    });
-    const res = await handleAdminConfigGet(harness.db, req, {
-      loadServicesManifest: vaultServices,
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-    });
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    expect(html).toContain('id="module-vault"');
-    expect(html).toContain("transcribe_provider");
-    expect(html).toContain('action="/admin/config/vault"');
-  });
-
-  test("surfaces flash success message after a saved redirect", async () => {
-    const cookie = await cookieForUser(harness.db, "admin", "pw");
-    const req = new Request("http://hub.test/admin/config?_status=saved&_module=vault", {
-      headers: { cookie },
-    });
-    const res = await handleAdminConfigGet(harness.db, req, {
-      loadServicesManifest: vaultServices,
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-    });
-    const html = await res.text();
-    expect(html).toContain("Saved and restarted Vault");
-  });
-});
-
-describe("handleAdminConfigPost", () => {
-  function postBody(values: Record<string, string>) {
-    return formBody({ [CSRF_FIELD_NAME]: TEST_CSRF, ...values });
-  }
-
-  test("redirects unauthenticated requests to /login", async () => {
-    const { body, headers } = postBody({ transcribe_provider: "openai" });
-    const req = new Request("http://hub.test/admin/config/vault", {
-      method: "POST",
-      headers: { ...headers, cookie: CSRF_COOKIE },
-      body,
-    });
-    const res = await handleAdminConfigPost(harness.db, req, "vault", {
-      loadServicesManifest: vaultServices,
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-    });
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toContain("/login");
-  });
-
-  test("returns 400 when the CSRF token is wrong", async () => {
-    const cookie = await cookieForUser(harness.db, "admin", "pw");
-    const { body, headers } = formBody({
-      [CSRF_FIELD_NAME]: "wrong",
-      transcribe_provider: "openai",
-    });
-    const req = new Request("http://hub.test/admin/config/vault", {
-      method: "POST",
-      headers: { ...headers, cookie },
-      body,
-    });
-    const res = await handleAdminConfigPost(harness.db, req, "vault", {
-      loadServicesManifest: vaultServices,
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-    });
-    expect(res.status).toBe(400);
-  });
-
-  test("returns 404 for unknown module names", async () => {
-    const cookie = await cookieForUser(harness.db, "admin", "pw");
-    const { body, headers } = postBody({});
-    const req = new Request("http://hub.test/admin/config/nope", {
-      method: "POST",
-      headers: { ...headers, cookie },
-      body,
-    });
-    const res = await handleAdminConfigPost(harness.db, req, "nope", {
-      loadServicesManifest: vaultServices,
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-    });
-    expect(res.status).toBe(404);
-  });
-
-  test("re-renders with field errors (422) when validation fails", async () => {
-    const cookie = await cookieForUser(harness.db, "admin", "pw");
-    const restarts: string[] = [];
-    const { body, headers } = postBody({
-      transcribe_provider: "whisper", // not in enum
-      max_tags_per_note: "10",
-    });
-    const req = new Request("http://hub.test/admin/config/vault", {
-      method: "POST",
-      headers: { ...headers, cookie },
-      body,
-    });
-    const res = await handleAdminConfigPost(harness.db, req, "vault", {
-      loadServicesManifest: vaultServices,
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-      restartService: async (name) => {
-        restarts.push(name);
-        return 0;
-      },
-    });
-    expect(res.status).toBe(422);
-    const html = await res.text();
-    expect(html).toContain("must be one of");
-    expect(restarts).toEqual([]); // restart never called
-    // The on-disk config must not have been written.
-    expect(existsSync(join(harness.configDir, "vault", "config.json"))).toBe(false);
-  });
-
-  test("writes config + triggers restart + redirects with saved flash", async () => {
-    const cookie = await cookieForUser(harness.db, "admin", "pw");
-    const restarts: string[] = [];
-    const { body, headers } = postBody({
-      transcribe_provider: "deepgram",
-      max_tags_per_note: "25",
-      // checkbox absent → public stays false
-    });
-    const req = new Request("http://hub.test/admin/config/vault", {
-      method: "POST",
-      headers: { ...headers, cookie },
-      body,
-    });
-    const res = await handleAdminConfigPost(harness.db, req, "vault", {
-      loadServicesManifest: vaultServices,
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-      restartService: async (name) => {
-        restarts.push(name);
-        return 0;
-      },
-    });
-    expect(res.status).toBe(302);
-    const location = res.headers.get("location") ?? "";
-    expect(location).toContain("/admin/config?");
-    expect(location).toContain("_status=saved");
-    expect(location).toContain("_module=vault");
-    expect(location).toContain("#module-vault");
-    expect(restarts).toEqual(["vault"]);
-    const written = JSON.parse(
-      readFileSync(join(harness.configDir, "vault", "config.json"), "utf8"),
-    );
-    expect(written).toEqual({
-      transcribe_provider: "deepgram",
-      max_tags_per_note: 25,
-      public: false,
-    });
-  });
-
-  test("flashes saved-restart-failed when the restart returns non-zero", async () => {
-    const cookie = await cookieForUser(harness.db, "admin", "pw");
-    const { body, headers } = postBody({
-      transcribe_provider: "openai",
-      max_tags_per_note: "5",
-    });
-    const req = new Request("http://hub.test/admin/config/vault", {
-      method: "POST",
-      headers: { ...headers, cookie },
-      body,
-    });
-    const res = await handleAdminConfigPost(harness.db, req, "vault", {
-      loadServicesManifest: vaultServices,
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-      restartService: async () => 1,
-    });
-    expect(res.status).toBe(302);
-    const location = res.headers.get("location") ?? "";
-    expect(location).toContain("_status=saved-restart-failed");
-    // Config was still written before the restart attempt.
-    expect(existsSync(join(harness.configDir, "vault", "config.json"))).toBe(true);
-  });
-
-  test("flashes saved-restart-failed with err detail when restart throws", async () => {
-    const cookie = await cookieForUser(harness.db, "admin", "pw");
-    const { body, headers } = postBody({
-      transcribe_provider: "openai",
-      max_tags_per_note: "5",
-    });
-    const req = new Request("http://hub.test/admin/config/vault", {
-      method: "POST",
-      headers: { ...headers, cookie },
-      body,
-    });
-    const res = await handleAdminConfigPost(harness.db, req, "vault", {
-      loadServicesManifest: vaultServices,
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-      restartService: async () => {
-        throw new Error("launchctl unavailable");
-      },
-    });
-    expect(res.status).toBe(302);
-    const location = res.headers.get("location") ?? "";
-    expect(location).toContain("_status=saved-restart-failed");
-    const errParam = new URL(location, "http://hub.test").searchParams.get("_err") ?? "";
-    expect(errParam).toContain("launchctl unavailable");
-  });
-
-  test("checkbox-on translates to `public: true` in the written config", async () => {
-    const cookie = await cookieForUser(harness.db, "admin", "pw");
-    const { body, headers } = postBody({
-      transcribe_provider: "openai",
-      max_tags_per_note: "5",
-      public: "true",
-    });
-    const req = new Request("http://hub.test/admin/config/vault", {
-      method: "POST",
-      headers: { ...headers, cookie },
-      body,
-    });
-    const res = await handleAdminConfigPost(harness.db, req, "vault", {
-      loadServicesManifest: vaultServices,
-      configDir: harness.configDir,
-      readManifest: fakeReadManifest,
-      restartService: async () => 0,
-    });
-    expect(res.status).toBe(302);
-    const written = JSON.parse(
-      readFileSync(join(harness.configDir, "vault", "config.json"), "utf8"),
-    );
-    expect(written.public).toBe(true);
   });
 });

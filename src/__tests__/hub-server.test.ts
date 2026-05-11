@@ -792,9 +792,31 @@ describe("hubFetch routing", () => {
   test("301: /admin/login preserves the next= query param", async () => {
     const h = makeHarness();
     try {
-      const res = await hubFetch(h.dir)(req("/admin/login?next=/admin/config"));
+      const res = await hubFetch(h.dir)(req("/admin/login?next=/admin/permissions"));
       expect(res.status).toBe(301);
-      expect(res.headers.get("location")).toBe("/login?next=/admin/config");
+      expect(res.headers.get("location")).toBe("/login?next=/admin/permissions");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("301: /admin/config → /admin/vaults (legacy server-rendered portal retired)", async () => {
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/admin/config"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/admin/vaults");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("301: /admin/config/<name> → /admin/vaults", async () => {
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/admin/config/vault"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/admin/vaults");
     } finally {
       h.cleanup();
     }
@@ -848,8 +870,6 @@ describe("hubFetch routing", () => {
         // tests pin the redirects themselves).
         ["/login", { method: "POST" }],
         ["/logout", { method: "POST" }],
-        ["/admin/config", { method: "GET" }],
-        ["/admin/config/example", { method: "POST" }],
         ["/admin/host-admin-token", { method: "GET" }],
       ];
       for (const [path, init] of cases) {

@@ -44,10 +44,6 @@ export default defineConfig({
         target: process.env.HUB_ORIGIN ?? "http://127.0.0.1:1939",
         changeOrigin: true,
       },
-      "/admin/config": {
-        target: process.env.HUB_ORIGIN ?? "http://127.0.0.1:1939",
-        changeOrigin: true,
-      },
       "/api": {
         target: process.env.HUB_ORIGIN ?? "http://127.0.0.1:1939",
         changeOrigin: true,

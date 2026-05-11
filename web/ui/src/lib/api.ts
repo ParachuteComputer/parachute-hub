@@ -458,6 +458,77 @@ export async function revokeToken(jti: string): Promise<{ jti: string; revoked_a
   return (await res.json()) as { jti: string; revoked_at: string };
 }
 
+/**
+ * `GET /api/oauth/clients/<id>` response. Snake-case to mirror the
+ * wire shape (and the underlying `clients` table columns). The SPA's
+ * approve-client page renders these fields directly.
+ */
+export interface AdminClientView {
+  client_id: string;
+  client_name: string | null;
+  redirect_uris: string[];
+  scopes: string[];
+  status: "pending" | "approved";
+  registered_at: string;
+}
+
+/**
+ * GET /api/oauth/clients/<client_id> — fetch details for the
+ * approve-client deep link. Bearer pattern matches other admin endpoints
+ * (mint cached host-admin JWT, drop on 401/403). 404 surfaces verbatim so
+ * the page can render "unknown client" instead of looping.
+ */
+export async function getOauthClient(clientId: string): Promise<AdminClientView> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/oauth/clients/${encodeURIComponent(clientId)}`, {
+    method: "GET",
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  return (await res.json()) as AdminClientView;
+}
+
+/** Response shape from `POST /api/oauth/clients/<id>/approve`. */
+export interface ApproveClientResult {
+  client_id: string;
+  status: "approved";
+  /** True when the row was already approved before this call. Idempotent re-approve. */
+  already_approved: boolean;
+}
+
+/**
+ * POST /api/oauth/clients/<client_id>/approve — flip a pending client to
+ * approved. Idempotent: a second call after the row is already approved
+ * returns `already_approved: true` with no audit-log line.
+ */
+export async function approveOauthClient(clientId: string): Promise<ApproveClientResult> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/oauth/clients/${encodeURIComponent(clientId)}/approve`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  return (await res.json()) as ApproveClientResult;
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const text = await res.text();
