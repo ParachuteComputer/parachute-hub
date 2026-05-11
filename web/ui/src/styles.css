@@ -1,5 +1,5 @@
 /*
- * Brand tokens lifted from src/oauth-ui.ts + src/admin-config-ui.ts so the
+ * Brand tokens lifted from src/oauth-ui.ts + src/admin-login-ui.ts so the
  * SPA stays visually continuous with the password-login → consent flow the
  * operator will have just walked through. Don't drift these without
  * updating both server-rendered surfaces.

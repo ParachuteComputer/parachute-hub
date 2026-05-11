@@ -2,6 +2,14 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.9-rc.2] - 2026-05-11
+
+Post-Pass-1 cleanup (#240 follow-up). Two cohesive changes:
+
+1. **`admin-config-ui.ts` → `admin-login-ui.ts` rename (closes #241).** #240 retired the legacy `/admin/config` server-rendered portal and trimmed this file from 534 → 257 LOC; what's left is `renderAdminLogin` + `renderAdminError` + shared chrome. The filename now matches the content. Mechanical rename: single importer (`src/admin-handlers.ts`) updated; cross-file docstring references in `web/ui/CLAUDE.md` and `web/ui/src/styles.css` refreshed; the file's own preamble rewritten to drop the stale "config portal lived here" history (kept a one-line note pointing at #240 + #241 for archeology).
+
+2. **`## Architecture surfaces` table added to `parachute-hub/CLAUDE.md`.** Pass 2 audit confirmed the hub's HTTP surface area is structurally coherent post-#240 — six distinct layers (discovery / login / SPA / OAuth / API / well-known), each matched to its audience's constraints. The table is the at-a-glance reference; the route-by-route detail stays in `src/hub-server.ts`'s header docstring (the executable source of truth). Lets future tentacles + reviewers orient without reverse-engineering the dispatcher.
+
 ## [0.5.9-rc.1] - 2026-05-11
 
 Integration-debt cleanup after the SPA-rework chain that landed 2026-05-10 (#233 admin SPA mount, #234 `/login` rename, #235 signed-in indicator, #237 token UI). The rework migrated three admin surfaces (vaults/permissions/tokens) into the SPA but left two legacy server-rendered admin pages dangling; this PR closes the immediate friction.

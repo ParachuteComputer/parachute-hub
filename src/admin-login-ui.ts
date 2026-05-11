@@ -1,9 +1,14 @@
 /**
- * Branded HTML for the hub admin login + generic error pages. Same privacy
- * posture as `oauth-ui.ts` (no third-party fonts, inline CSS, no JS). The
- * legacy server-rendered `/admin/config` portal lived here too; it was
- * retired post-SPA-rework (hub#231) — the admin SPA is the operator surface
- * now, and module config is a follow-up driven by per-module SPAs.
+ * Branded HTML for the hub's pre-auth surfaces: the `/login` form and the
+ * generic admin error page surfaced when CSRF or rate-limit gates fire on
+ * `/login` and `/logout`. Same privacy posture as `oauth-ui.ts` (no third-
+ * party fonts, inline CSS, no JS) — these pages are pre-auth and have to
+ * stand alone without the SPA shell.
+ *
+ * History: this file was `admin-config-ui.ts` and held the server-rendered
+ * `/admin/config` module-config portal (hub#46). #240 retired the portal
+ * post-SPA-rework; the file shed everything except the two renderers below.
+ * Renamed to `admin-login-ui.ts` in #241 so the filename matches the content.
  *
  * Pure functions — DB, sessions live in `admin-handlers.ts`.
  */

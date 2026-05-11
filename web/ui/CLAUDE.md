@@ -118,7 +118,7 @@ usually means the postinstall hasn't run yet, or fired with
 
 `src/styles.css` is the single source of truth for the SPA's palette,
 typography, and components. The tokens (`--accent`, `--bg`, etc.) are
-lifted from `src/oauth-ui.ts` and `src/admin-config-ui.ts` so the SPA
+lifted from `src/oauth-ui.ts` and `src/admin-login-ui.ts` so the SPA
 stays visually continuous with the password-login → consent flow the
 operator just walked through. Don't drift them without updating both
 server-rendered surfaces.

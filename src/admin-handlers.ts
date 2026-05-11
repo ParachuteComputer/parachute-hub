@@ -11,7 +11,7 @@
  * (`parachute_hub_csrf` cookie + `__csrf` form field, constant-time compare).
  */
 import type { Database } from "bun:sqlite";
-import { renderAdminError, renderAdminLogin } from "./admin-config-ui.ts";
+import { renderAdminError, renderAdminLogin } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { checkAndRecord, clientIpFromRequest } from "./rate-limit.ts";
 import {

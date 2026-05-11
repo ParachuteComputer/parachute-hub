@@ -19,6 +19,24 @@ parachute vault <args>    →  exec parachute-vault (transparent)        (src/co
 
 The flat shape matters: each command is a self-contained module in `src/commands/`, wired through `src/cli.ts`'s argv parser. No framework, no plugin system, no global state beyond a handful of pure module constants.
 
+### Architecture surfaces
+
+The hub serves six distinct kinds of operator-facing HTTP surface. Each is the shape it is because of its audience's constraints (JS availability, auth posture, cross-origin behavior). Content-routing surfaces (per-vault + generic services-proxy paths) sit outside the table; they're listed below it. The full route table is the header docstring in [`src/hub-server.ts`](./src/hub-server.ts); this is the layered summary.
+
+| Layer | Shape | Audience | Why this shape |
+|---|---|---|---|
+| Discovery (`/`, `/hub.html`) | server-rendered HTML | unauthenticated visitors | Pre-auth entry; session-aware "Signed in as X" hydrates from cookie. Must work without JS so a brand-new operator can hit the box and see the discovery page. |
+| `/login`, `/logout` | server-rendered HTML | pre-auth | The form on `/login` posts to itself, redirects on success. SPA-rendering would force a JS load just to show two text inputs, and gate first-visit auth on bundle delivery. |
+| `/admin/*` | SPA (`web/ui`) | post-auth admin | Vaults, permissions, tokens, approve-client. Mounted at `/admin` so the SPA's react-router basename + service worker boundary are clean. Per-route Bearer minted from the session cookie at `/admin/host-admin-token`. |
+| `/oauth/*` | server-rendered HTML + JSON | third-party OAuth clients | `/oauth/authorize` is a cross-origin redirect target — must stand alone without the SPA shell. `/oauth/token`, `/oauth/register`, `/oauth/revoke` are spec-shaped JSON per RFCs 6749 / 7591 / 7009. |
+| `/api/*` | JSON, Bearer-gated (except `/api/me`) | SPA + cross-cutting consumers | Internal API for the admin SPA. Snake-case wire shape mirrors DB columns; host-admin Bearer comes from `/admin/host-admin-token`, mint-and-cache pattern in `web/ui/src/lib/auth.ts`. |
+| `/.well-known/*` | JSON + wildcard CORS | public discovery | RFC 8414 metadata, JWKS, services catalog, revocation list. Wildcard CORS because cross-origin browser fetches (Notes, future SPAs, resource servers polling revocation) need to read them. |
+
+Three surface types sit outside the operator-facing table:
+- 301 back-compat redirects from legacy admin URLs (`/hub/*`, `/vault`, `/admin/login`, `/admin/config`) to the canonical `/admin/*` or `/login` surfaces. Listed at the top of `hub-server.ts`'s dispatch order so they preempt anything below.
+- Per-vault content proxy (`/vault/<name>/*`) — routes to the vault backend on its services.json port. User-facing vault data (Notes PWA, MCP endpoints, etc.), not admin-scoped; vaults own their own user surfaces, the hub just stitches the path prefix.
+- Generic services.json-driven proxy (`/<service-mount>/*`) — the last fallthrough, longest-prefix match against services.json. Used for non-vault modules like notes / scribe / agent.
+
 ### Shared surfaces
 
 - **`src/service-spec.ts`** — `SERVICE_SPECS` is the registry: which npm package backs each short name, what to run on install/start, the canonical seed entry. Adding a new service = one entry here.
