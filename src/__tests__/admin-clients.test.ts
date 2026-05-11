@@ -186,33 +186,72 @@ describe("handleApproveClient", () => {
     expect(getClient(harness.db, id)?.status).toBe("pending");
   });
 
-  test("200 flips a pending row to approved", async () => {
-    const { bearer } = await makeOperatorBearer();
+  test("200 flips a pending row to approved + emits an audit log line", async () => {
+    const { bearer, userId } = await makeOperatorBearer();
     const id = regPending("Notes");
-    const res = await handleApproveClient(approveReq(id, bearer), id, {
-      db: harness.db,
-      issuer: ISSUER,
-    });
+
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    let res: Response;
+    try {
+      res = await handleApproveClient(approveReq(id, bearer), id, {
+        db: harness.db,
+        issuer: ISSUER,
+      });
+    } finally {
+      console.log = originalLog;
+    }
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.client_id).toBe(id);
     expect(body.status).toBe("approved");
     expect(body.already_approved).toBe(false);
     expect(getClient(harness.db, id)?.status).toBe("approved");
+
+    const line = logs.find((l) => l.startsWith("client approved:"));
+    expect(line).toBeDefined();
+    expect(line).toContain(`client_id=${id}`);
+    expect(line).toContain("client_name=Notes");
+    expect(line).toContain(`approver_sub=${userId}`);
   });
 
-  test("idempotent: re-approving returns already_approved: true", async () => {
+  test("idempotent: re-approving returns already_approved: true + NO audit line", async () => {
+    // Pin the audit-log idempotency contract explicitly: a no-op approve
+    // (the row was already approved) must NOT emit the "client approved:"
+    // line. Without this gate a UI tab re-submitting Approve, or a deep-
+    // linked operator approving an already-approved client, would
+    // pollute the log with confusing "approved a thing that was already
+    // approved" noise. The handler captures `wasPending` BEFORE calling
+    // approveClient so this property holds even if a future refactor
+    // splits the read / write across statements.
     const { bearer } = await makeOperatorBearer();
     const id = regPending();
     approveClient(harness.db, id);
-    const res = await handleApproveClient(approveReq(id, bearer), id, {
-      db: harness.db,
-      issuer: ISSUER,
-    });
+
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    let res: Response;
+    try {
+      res = await handleApproveClient(approveReq(id, bearer), id, {
+        db: harness.db,
+        issuer: ISSUER,
+      });
+    } finally {
+      console.log = originalLog;
+    }
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.already_approved).toBe(true);
     expect(body.status).toBe("approved");
+
+    const approvedLine = logs.find((l) => l.startsWith("client approved:"));
+    expect(approvedLine).toBeUndefined();
   });
 
   test("404 for unknown client_id", async () => {

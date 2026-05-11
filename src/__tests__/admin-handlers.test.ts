@@ -187,6 +187,29 @@ describe("handleAdminLoginPost", () => {
     expect(res.headers.get("location")).toBe("/admin/vaults");
   });
 
+  test("ignores a protocol-relative next= from the form (open-redirect defense)", async () => {
+    // Scheme-relative `//host/path` URLs would otherwise resolve to a
+    // different origin when followed by the browser. `safeNext` rejects them
+    // alongside scheme-absolute URLs; this test pins the POST path
+    // explicitly so future refactors of the redirect builder don't quietly
+    // re-open the open-redirect.
+    await createUser(harness.db, "admin", "pw");
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "admin",
+      password: "pw",
+      next: "//evil.example/pwn",
+    });
+    const req = new Request("http://hub.test/admin/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/admin/vaults");
+  });
+
   test("missing next= lands the operator on /admin/vaults (SPA home)", async () => {
     // Post-SPA-rework default: when the form omits `next`, login lands on
     // the SPA's vault list. Previously the legacy `/admin/config` portal
