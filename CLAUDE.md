@@ -21,7 +21,7 @@ The flat shape matters: each command is a self-contained module in `src/commands
 
 ### Architecture surfaces
 
-The hub serves six distinct kinds of HTTP surface. Each is the shape it is because of its audience's constraints (JS availability, auth posture, cross-origin behavior). The full route table is the header docstring in [`src/hub-server.ts`](./src/hub-server.ts); this is the layered summary.
+The hub serves six distinct kinds of operator-facing HTTP surface. Each is the shape it is because of its audience's constraints (JS availability, auth posture, cross-origin behavior). Content-routing surfaces (per-vault + generic services-proxy paths) sit outside the table; they're listed below it. The full route table is the header docstring in [`src/hub-server.ts`](./src/hub-server.ts); this is the layered summary.
 
 | Layer | Shape | Audience | Why this shape |
 |---|---|---|---|
@@ -32,9 +32,10 @@ The hub serves six distinct kinds of HTTP surface. Each is the shape it is becau
 | `/api/*` | JSON, Bearer-gated (except `/api/me`) | SPA + cross-cutting consumers | Internal API for the admin SPA. Snake-case wire shape mirrors DB columns; host-admin Bearer comes from `/admin/host-admin-token`, mint-and-cache pattern in `web/ui/src/lib/auth.ts`. |
 | `/.well-known/*` | JSON + wildcard CORS | public discovery | RFC 8414 metadata, JWKS, services catalog, revocation list. Wildcard CORS because cross-origin browser fetches (Notes, future SPAs, resource servers polling revocation) need to read them. |
 
-Two cross-cutting back-compat surfaces sit above this table:
-- 301 redirects from legacy admin URLs (`/hub/*`, `/vault`, `/admin/login`, `/admin/config`) to the canonical `/admin/*` or `/login` surfaces. Listed at the top of `hub-server.ts`'s dispatch order so they preempt anything below.
-- Generic services.json-driven proxy (`/<service-mount>/*`) — the last fallthrough, used for non-vault modules like notes/scribe/agent.
+Three surface types sit outside the operator-facing table:
+- 301 back-compat redirects from legacy admin URLs (`/hub/*`, `/vault`, `/admin/login`, `/admin/config`) to the canonical `/admin/*` or `/login` surfaces. Listed at the top of `hub-server.ts`'s dispatch order so they preempt anything below.
+- Per-vault content proxy (`/vault/<name>/*`) — routes to the vault backend on its services.json port. User-facing vault data (Notes PWA, MCP endpoints, etc.), not admin-scoped; vaults own their own user surfaces, the hub just stitches the path prefix.
+- Generic services.json-driven proxy (`/<service-mount>/*`) — the last fallthrough, longest-prefix match against services.json. Used for non-vault modules like notes / scribe / agent.
 
 ### Shared surfaces
 
