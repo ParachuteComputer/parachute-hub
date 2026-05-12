@@ -191,22 +191,20 @@ export function detectInstallSource(
   const livePackageVersion = readVersion(resolvedPath, readJson);
 
   if (underGlobals) {
-    const result: InstallSource = { kind: "npm", path: resolvedPath };
-    if (livePackageVersion !== undefined) {
-      (result as { livePackageVersion?: string }).livePackageVersion = livePackageVersion;
-    }
-    return result;
+    return {
+      kind: "npm",
+      path: resolvedPath,
+      ...(livePackageVersion !== undefined && { livePackageVersion }),
+    };
   }
 
   const gitHead = readGitHead(resolvedPath);
-  const result: InstallSource = { kind: "bun-linked", path: resolvedPath };
-  if (livePackageVersion !== undefined) {
-    (result as { livePackageVersion?: string }).livePackageVersion = livePackageVersion;
-  }
-  if (gitHead !== undefined) {
-    (result as { gitHead?: string }).gitHead = gitHead;
-  }
-  return result;
+  return {
+    kind: "bun-linked",
+    path: resolvedPath,
+    ...(livePackageVersion !== undefined && { livePackageVersion }),
+    ...(gitHead !== undefined && { gitHead }),
+  };
 }
 
 /**

@@ -224,12 +224,15 @@ describe("formatInstallSourceLabel", () => {
 
 describe("detectHubInstallSource", () => {
   test("classifies the hub based on its source location", () => {
-    // We exercise the happy path via the real hub's `src/` dir. The result
+    // Exercise the happy path via the real hub's `src/` dir. The result
     // depends on the test environment (CI vs. bun-linked checkout), so we
     // only assert the kind is one of the known classifications — not the
-    // exact value. Pins the contract: never throws, always returns a known
-    // kind, never crashes on a missing git repo or globals layout.
-    const source = detectHubInstallSource(import.meta.dir);
+    // exact value. `readGitHead` is stubbed so the test never forks a real
+    // git process; the contract under test is "climb to package.json,
+    // classify by location against bun globals" — git is incidental.
+    const source = detectHubInstallSource(import.meta.dir, {
+      readGitHead: () => "deadbeef",
+    });
     expect(["bun-linked", "npm", "unknown"]).toContain(source.kind);
   });
 

@@ -12,7 +12,7 @@ Implementation: new pure helper module `src/install-source.ts` with full test-se
 
 Out of scope (separate follow-up): fixing `parachute upgrade` so it refreshes the cached `services.json.version` on bun-linked rebuild. The STALE indicator surfaces the drift; the upgrade path that creates it is a separate issue.
 
-Gate: `bun test ./src` 1245 pass / 1 fail (pre-existing env-dependent flake in `status > all-healthy returns 0 and prints table` — the test reads the real `~/.parachute/` configDir and breaks when a stale operator PID file makes `processState` return `stopped`, present on both main and this branch) / 30242 expects across 69 files. typecheck clean. biome clean.
+Gate: `bun test ./src` ran 1246 tests across 69 files / 30242 expects. Pass/fail varies by environment because the existing `status > all-healthy returns 0 and prints table` test reads the real `~/.parachute/` configDir rather than isolating to its temp dir (pre-existing, present on `main` — reproduced via `git stash`). Clean envs see 1246 pass / 0 fail; envs with a stale `~/.parachute/scribe/run/scribe.pid` (operator PID file pointing at a no-longer-running process) see 1245 pass / 1 fail because `processState` returns `stopped` and skips the scribe probe. Worth a follow-up to isolate the test's configDir, but unrelated to this change. typecheck clean. biome clean.
 
 ## [0.5.9-rc.2] - 2026-05-11
 
