@@ -2,6 +2,36 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.9-rc.4] - 2026-05-12
+
+`buildServicesCatalog` (the helper that populates the `services` map in `/oauth/token` responses) now emits **per-vault `vault:<name>` keys** alongside the legacy collapsed `vault` key when there are multiple vaults to disambiguate (closes #247).
+
+**Motivation.** Notes' multi-vault popover (notes#115) shipped, and the deferred Phase 2 work from `buildServicesCatalog`'s docstring is now blocking real use. On Aaron's 4-vault hub (default + boulder + gitcoin + techne), every connect-vault flow in Notes was getting the same `services.vault.url = /vault/default` regardless of which vault the OAuth grant actually narrowed to — so multiple VaultRecords collided in Notes' store (vaultId is URL-derived) and only one entry showed in Manage Vaults despite multiple OAuth grants.
+
+**What changed.** When the token's scopes admit a single vault on a single-vault hub, the catalog is unchanged — `services.vault.url` only. When the token's scopes narrow to a specific vault (`vault:boulder:write`) or when multiple vaults are admitted on a multi-vault hub, per-vault keys are added:
+
+```json
+{
+  "services": {
+    "vault": { "url": "https://hub.example/vault/default", "version": "0.4.4" },
+    "vault:default": { "url": "https://hub.example/vault/default", "version": "0.4.4" },
+    "vault:boulder": { "url": "https://hub.example/vault/boulder", "version": "0.4.4" },
+    "vault:gitcoin": { "url": "https://hub.example/vault/gitcoin", "version": "0.4.4" },
+    "vault:techne":  { "url": "https://hub.example/vault/techne",  "version": "0.4.4" }
+  }
+}
+```
+
+**Backwards compat.** The collapsed `vault` key is never removed — pre-popover clients keep working without changes. Per-vault keys are purely additive. On a per-vault-narrowed token (e.g. `vault:boulder:write`), the collapsed `vault` key points at the only admitted vault (boulder), so legacy single-vault clients on a multi-vault hub happen to land on the correctly-scoped URL too.
+
+**Emit rule.** Per-vault keys fire when (a) there are >1 admitted vault paths to disambiguate, OR (b) the token carries any per-vault-narrowed scope (`vault:<name>:<verb>`). The latter is an explicit consumer signal that the per-vault key matters even on single-vault hubs — so a Notes consumer reading `services["vault:default"]` works uniformly regardless of hub vault count.
+
+Both manifest shapes for multi-vault are handled: the modern single-row-multi-path layout (`parachute-vault` with `paths: ["/vault/default", "/vault/boulder", ...]` — what Aaron's hub uses) and the legacy per-vault-row layout (`parachute-vault-<name>` rows).
+
+**Notes-side follow-up (separate PR).** `OAuthCallback` in `parachute-notes` will be updated to prefer `token.services?.["vault:<name>"]?.url` over `token.services?.vault?.url` when the token's `vault` claim is set. That change lands after this PR merges and the next `@openparachute/hub` is on npm; tracked as a Notes-side issue.
+
+Gate: `bun test ./src` 1253 pass / 1 fail (pre-existing env flake — same as rc.3) / 30250 expects across 69 files. +8 tests over rc.3 (multi-vault catalog coverage). typecheck clean. biome clean.
+
 ## [0.5.9-rc.3] - 2026-05-12
 
 `parachute status` now reveals **where each service is running from** alongside the version/health columns (closes #243). The new `SOURCE` column classifies each row as either `bun-linked → <basename> @ <git-short-sha>` (the operator has a local checkout `bun link`'d in) or `npm (<version>)` (installed from a published package under bun globals). For bun-linked rows where `services.json`'s cached `version` lags the live `package.json` at the checkout, a `STALE: services.json cached <X>; live package.json <Y>` continuation line surfaces beneath the row.

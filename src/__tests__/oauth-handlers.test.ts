@@ -1034,9 +1034,14 @@ describe("handleToken — full OAuth dance", () => {
 
       // closes #81 — services catalog tells the client where vault lives so
       // notes doesn't have to re-probe /.well-known/parachute.json. A
-      // vault:read token only sees the vault entry.
+      // `vault:default:read` token sees both the collapsed `vault` key
+      // (backwards compat) AND the per-vault `vault:default` key (closes
+      // #247 — pre-#247 only the collapsed key was emitted; consumers on
+      // multi-vault hubs were forced to assume `/vault/default` and
+      // collided).
       expect(tokenBody.services).toEqual({
         vault: { url: `${ISSUER}/vault/default`, version: "0.3.0" },
+        "vault:default": { url: `${ISSUER}/vault/default`, version: "0.3.0" },
       });
 
       // closes #215 reviewer F2 — Phase 1 code-grant access-token registry
@@ -1543,6 +1548,156 @@ describe("handleToken — full OAuth dance", () => {
     };
     expect(buildServicesCatalog(customManifest, ISSUER, ["vault:read"])).toEqual({
       vault: { url: `${ISSUER}/vault/work`, version: "0.3.0" },
+    });
+  });
+
+  // closes #247 — multi-vault correctness. Pre-#247 every vault collapsed
+  // under the single `vault` key, so Notes' OAuthCallback always wrote
+  // VaultRecord URL = paths[0] of the first vault row regardless of which
+  // vault the token actually granted. Per-vault `vault:<name>` keys let
+  // consumers route each grant to the correct vault URL.
+  describe("services catalog — multi-vault per-vault keys (#247)", () => {
+    // Real shape from a multi-vault hub: one `parachute-vault` row with N
+    // paths, each path naming an instance. Aaron's setup verbatim (4
+    // vaults: default, boulder, gitcoin, techne).
+    const multiVaultManifest: ServicesManifest = {
+      services: [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default", "/vault/boulder", "/vault/gitcoin", "/vault/techne"],
+          health: "/health",
+          version: "0.4.4",
+        },
+      ],
+    };
+
+    test("single-vault hub with broad scope: only collapsed `vault` key (unchanged)", () => {
+      // Per-vault keys are noise on single-vault hubs — no disambiguation
+      // is needed. Backwards compat for pre-popover clients matters here.
+      expect(buildServicesCatalog(FIXTURE_MANIFEST, ISSUER, ["vault:read"])).toEqual({
+        vault: { url: `${ISSUER}/vault/default`, version: "0.3.0" },
+      });
+    });
+
+    test("single-vault hub with per-vault-narrowed scope: emits per-vault key too", () => {
+      // A `vault:default:read` token is an explicit consumer signal that
+      // the per-vault key matters — emit it even on a single-vault hub so
+      // the consumer's `services["vault:default"]` lookup works uniformly
+      // regardless of how many vaults the hub has.
+      expect(buildServicesCatalog(FIXTURE_MANIFEST, ISSUER, ["vault:default:read"])).toEqual({
+        vault: { url: `${ISSUER}/vault/default`, version: "0.3.0" },
+        "vault:default": { url: `${ISSUER}/vault/default`, version: "0.3.0" },
+      });
+    });
+
+    test("multi-vault hub with broad scope: emits every per-vault key + collapsed `vault`", () => {
+      // Broad `vault:read` admits every vault on the hub. Per-#247
+      // guidance: emit per-vault keys for all admitted vaults so the
+      // consumer (Notes popover) can pick its target by name without
+      // re-probing /.well-known/parachute.json.
+      expect(buildServicesCatalog(multiVaultManifest, ISSUER, ["vault:read"])).toEqual({
+        // Collapsed key still emitted (first admitted path); backwards compat.
+        vault: { url: `${ISSUER}/vault/default`, version: "0.4.4" },
+        "vault:default": { url: `${ISSUER}/vault/default`, version: "0.4.4" },
+        "vault:boulder": { url: `${ISSUER}/vault/boulder`, version: "0.4.4" },
+        "vault:gitcoin": { url: `${ISSUER}/vault/gitcoin`, version: "0.4.4" },
+        "vault:techne": { url: `${ISSUER}/vault/techne`, version: "0.4.4" },
+      });
+    });
+
+    test("multi-vault hub with per-vault scope: only that vault's per-vault key", () => {
+      // Aaron's "Connect boulder" flow: token has `vault:boulder:write`,
+      // scope admits only boulder. Pre-#247 the catalog said `vault.url =
+      // /vault/default` (WRONG), so Notes stored a /vault/default record
+      // with scope `vault:boulder:write` — collision city as more vaults
+      // got connected. Post-#247 the consumer reads
+      // `services["vault:boulder"].url` which correctly says /vault/boulder.
+      expect(buildServicesCatalog(multiVaultManifest, ISSUER, ["vault:boulder:write"])).toEqual({
+        // Collapsed `vault` points at boulder too — the only admitted
+        // vault — so legacy consumers happen to land on the right URL even
+        // though they have no per-vault awareness.
+        vault: { url: `${ISSUER}/vault/boulder`, version: "0.4.4" },
+        "vault:boulder": { url: `${ISSUER}/vault/boulder`, version: "0.4.4" },
+      });
+    });
+
+    test("multi-vault hub with mixed scopes: per-vault keys for each narrowed vault", () => {
+      // A token granting both `vault:boulder:read` and `vault:gitcoin:write`
+      // admits exactly those two vaults; default and techne aren't reachable.
+      expect(
+        buildServicesCatalog(multiVaultManifest, ISSUER, [
+          "vault:boulder:read",
+          "vault:gitcoin:write",
+        ]),
+      ).toEqual({
+        vault: { url: `${ISSUER}/vault/boulder`, version: "0.4.4" },
+        "vault:boulder": { url: `${ISSUER}/vault/boulder`, version: "0.4.4" },
+        "vault:gitcoin": { url: `${ISSUER}/vault/gitcoin`, version: "0.4.4" },
+      });
+    });
+
+    test("multi-vault hub: broad + per-vault scopes coexist; broad opens all vaults", () => {
+      // A token that carries BOTH `vault:read` (broad) AND
+      // `vault:boulder:write` (narrow) should land in the broad bucket
+      // because the broad scope is more permissive — narrowing one verb
+      // can't take away access the unnamed scope already granted.
+      expect(
+        buildServicesCatalog(multiVaultManifest, ISSUER, ["vault:read", "vault:boulder:write"]),
+      ).toEqual({
+        vault: { url: `${ISSUER}/vault/default`, version: "0.4.4" },
+        "vault:default": { url: `${ISSUER}/vault/default`, version: "0.4.4" },
+        "vault:boulder": { url: `${ISSUER}/vault/boulder`, version: "0.4.4" },
+        "vault:gitcoin": { url: `${ISSUER}/vault/gitcoin`, version: "0.4.4" },
+        "vault:techne": { url: `${ISSUER}/vault/techne`, version: "0.4.4" },
+      });
+    });
+
+    test("legacy per-vault rows (parachute-vault-<name>) also produce per-vault keys", () => {
+      // Older multi-vault layout — one row per vault — should produce the
+      // same catalog shape as the single-row-multi-path layout. The
+      // `vaultInstanceNameFor` helper handles both via its
+      // manifest-suffix fallback.
+      const legacyManifest: ServicesManifest = {
+        services: [
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/health",
+            version: "0.4.4",
+          },
+          {
+            name: "parachute-vault-work",
+            port: 1941,
+            paths: ["/vault/work"],
+            health: "/health",
+            version: "0.4.4",
+          },
+        ],
+      };
+      expect(buildServicesCatalog(legacyManifest, ISSUER, ["vault:read"])).toEqual({
+        vault: { url: `${ISSUER}/vault/default`, version: "0.4.4" },
+        "vault:default": { url: `${ISSUER}/vault/default`, version: "0.4.4" },
+        "vault:work": { url: `${ISSUER}/vault/work`, version: "0.4.4" },
+      });
+    });
+
+    test("non-vault services unaffected — only one key per service, no per-instance variant", () => {
+      // The per-vault-key expansion is vault-specific. scribe / notes /
+      // third-party rows still emit one key per service.
+      expect(
+        buildServicesCatalog(FIXTURE_MANIFEST, ISSUER, [
+          "vault:default:read",
+          "scribe:transcribe",
+          "notes:read",
+        ]),
+      ).toEqual({
+        vault: { url: `${ISSUER}/vault/default`, version: "0.3.0" },
+        "vault:default": { url: `${ISSUER}/vault/default`, version: "0.3.0" },
+        scribe: { url: `${ISSUER}/scribe`, version: "0.3.0-rc.1" },
+        notes: { url: `${ISSUER}/notes`, version: "0.3.0" },
+      });
     });
   });
 });

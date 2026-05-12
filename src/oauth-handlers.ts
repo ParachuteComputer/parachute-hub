@@ -158,41 +158,129 @@ export type ServicesCatalog = Record<string, ServicesCatalogEntry>;
  * version, so OAuth clients don't have to re-probe `/.well-known/parachute.json`
  * to know where vault lives.
  *
- * URL source: `entry.paths[0]` from services.json verbatim — never hardcode
+ * URL source: `entry.paths[*]` from services.json verbatim — never hardcode
  * `/vault/default`. Users who installed with `parachute install vault
  * --vault-name work` have `paths: ["/vault/work"]` in their manifest, and the
  * catalog URL must follow that. The custom-vault-name regression test in
- * oauth-handlers.test.ts pins this.
+ * oauth-handlers.test.ts pins this for single-vault.
  *
  * Filtering: only services for which the token has at least one scope are
  * included. A scope `vault:read` admits the `vault` service; a token with only
  * `scribe:transcribe` gets a catalog with no vault entry. The check is on the
  * audience prefix (`<aud>:<verb>`) — same shape `inferAudience` uses.
  *
- * Multi-vault: Phase 1 collapses every vault entry under the single key
- * `vault`, first matching `parachute-vault*` row wins. Per-vault keys
- * (`services.vault.work.url` or `services["vault:work"].url`) are deferred
- * to a future design once notes ships its vault picker; multi-vault clients
- * need to probe `/.well-known/parachute.json` for the full vaults array
- * until then.
+ * Multi-vault (closes #247): emits per-vault keys `vault:<name>` alongside
+ * the collapsed `vault` key. A scope `vault:boulder:write` admits only
+ * boulder → emits `vault:boulder` (and the legacy `vault` key, pointing at
+ * boulder so it resolves consistently). A broad scope `vault:read` admits
+ * every vault on the hub → emits `vault:<name>` for each vault path plus
+ * the legacy `vault` key (pointing at `entry.paths[0]` of the first vault,
+ * unchanged from Phase 1). Notes' OAuthCallback (notes#115 ships the
+ * picker; per-vault consumer change is the post-#247 Notes-side PR) reads
+ * `services["vault:<name>"]` so it stops collapsing multi-vault grants
+ * onto a single VaultRecord URL.
+ *
+ * Pre-popover clients still see `services.vault` and behave unchanged —
+ * that key never goes away. Per-vault keys are additive.
  */
 export function buildServicesCatalog(
   manifest: ServicesManifest,
   issuer: string,
   scopes: readonly string[],
 ): ServicesCatalog {
+  // Two scope-derived sets:
+  //   - audiences: bare service prefix (`vault`, `scribe`) → admits the
+  //     collapsed key + every per-vault key.
+  //   - namedVaults: per-vault narrowed scopes (`vault:<name>:<verb>`) →
+  //     admits only `vault:<name>` and the collapsed `vault`.
+  //
+  // A token with both `vault:read` and `vault:boulder:write` should land in
+  // the "any vault" bucket — the bare scope is permissive, the named one
+  // is informational. Detect this via the bare-prefix presence; the named
+  // scope's per-vault narrowing still works for clients that prefer it.
   const audiences = new Set<string>();
+  const namedVaults = new Set<string>();
   for (const s of scopes) {
+    const parts = s.split(":");
+    if (
+      parts.length === 3 &&
+      parts[0] === "vault" &&
+      parts[1] &&
+      parts[2] &&
+      VAULT_VERBS.has(parts[2])
+    ) {
+      namedVaults.add(parts[1]);
+      audiences.add("vault");
+      continue;
+    }
     const colon = s.indexOf(":");
     if (colon > 0) audiences.add(s.slice(0, colon));
   }
+  const broadVaultScope =
+    audiences.has("vault") &&
+    scopes.some((s) => {
+      const parts = s.split(":");
+      return (
+        parts.length === 2 &&
+        parts[0] === "vault" &&
+        parts[1] !== undefined &&
+        VAULT_VERBS.has(parts[1])
+      );
+    });
+
+  // Count total admitted vault paths across the manifest. Per-vault keys
+  // are only worth emitting when there are >1 admitted vaults to
+  // disambiguate (or when the token's own scopes are per-vault narrowed —
+  // a per-vault scope is an explicit consumer signal that the per-vault
+  // key matters even on a single-vault hub). The check is on admitted
+  // paths, not raw vault rows: a broad token on a multi-path vault row
+  // sees N paths; a per-vault token sees only its own.
+  let admittedVaultPathCount = 0;
+  if (audiences.has("vault")) {
+    for (const entry of manifest.services) {
+      if (!isVaultEntry(entry)) continue;
+      const paths = entry.paths.length > 0 ? entry.paths : ["/"];
+      for (const path of paths) {
+        const instance = vaultInstanceNameFor(entry.name, path);
+        if (broadVaultScope || namedVaults.has(instance)) admittedVaultPathCount++;
+      }
+    }
+  }
+  const emitPerVaultKeys = admittedVaultPathCount > 1 || namedVaults.size > 0;
+
   const base = issuer.replace(/\/$/, "");
   const catalog: ServicesCatalog = {};
   for (const entry of manifest.services) {
-    const path = entry.paths[0] ?? "/";
-    const key = isVaultEntry(entry) ? "vault" : shortName(entry.name);
+    if (isVaultEntry(entry)) {
+      if (!audiences.has("vault")) continue;
+      // Walk every path the row exposes. Real multi-vault on the hub is a
+      // single `parachute-vault` row with N paths (one per vault instance);
+      // legacy per-vault rows (`parachute-vault-<name>`) are handled by the
+      // same loop because each contributes one path.
+      const paths = entry.paths.length > 0 ? entry.paths : ["/"];
+      for (const path of paths) {
+        const instance = vaultInstanceNameFor(entry.name, path);
+        const admit = broadVaultScope || namedVaults.has(instance);
+        if (!admit) continue;
+        if (emitPerVaultKeys) {
+          const perVaultKey = `vault:${instance}`;
+          if (!catalog[perVaultKey]) {
+            catalog[perVaultKey] = { url: `${base}${path}`, version: entry.version };
+          }
+        }
+        // Collapsed `vault` key stays for backwards compat. First admitted
+        // vault wins (deterministic — `entry.paths[0]` for a broad scope,
+        // or the only admitted instance for a per-vault scope).
+        if (!catalog.vault) {
+          catalog.vault = { url: `${base}${path}`, version: entry.version };
+        }
+      }
+      continue;
+    }
+    const key = shortName(entry.name);
     if (!audiences.has(key)) continue;
-    if (catalog[key]) continue; // first vault wins; deterministic for clients
+    if (catalog[key]) continue;
+    const path = entry.paths[0] ?? "/";
     catalog[key] = { url: `${base}${path}`, version: entry.version };
   }
   return catalog;
