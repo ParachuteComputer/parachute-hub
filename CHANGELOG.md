@@ -2,6 +2,28 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.9-rc.5] - 2026-05-12
+
+Cookie-based POST endpoints (`/oauth/authorize/approve`, `/oauth/register` auto-approve, the DCR auto-approve path) now accept requests from any **hub-bound origin**, not just the configured `issuer` URL (closes #245). Previously, an operator hitting hub admin at `http://localhost:1939/login` then submitting the approve form got "Cross-origin request rejected" because Origin (loopback) didn't match issuer (tailnet). Same failure mode for tailnet→tailnet flows where Tailscale Serve stripped the Origin/Referer headers — the strict check returned false and 403'd a legitimate operator path.
+
+**Bound-origin set.** Hub now considers itself bound to:
+
+1. The configured `issuer` URL (current behavior; always included).
+2. Loopback aliases on hub's listen port (`http://localhost:<port>`, `http://127.0.0.1:<port>`).
+3. The `hubOrigin` from `expose-state.json` if set (typically the tailnet/funnel hostname after `parachute expose`; read per-request so a post-start expose is reflected without restart).
+
+Any Origin/Referer matching one of these is accepted; everything else rejected. URL.origin comparison preserves scheme + host + port strictness — a request from `http://localhost:1940` (different port) still rejects, as does `https://localhost:1939` (scheme mismatch).
+
+**Header-stripped fallback.** When both Origin AND Referer are absent (Tailscale Serve / reverse-proxy edge case), the check falls back to the request's `Host` header against the host:port of each bound origin. Host is browser-controlled but reflects "what the browser thought it was talking to"; matching it against a bound origin preserves the same-origin signal in legitimate proxy-stripped flows without weakening the gate for actual third-party attackers (the CSRF token + SameSite=Lax session cookie remain the real auth defense — the Origin check is a belt-on-suspenders layer).
+
+**Surface.** New module `src/origin-check.ts` exporting `buildHubBoundOrigins({issuer, loopbackPort?, exposeHubOrigin?})` and `isSameOriginRequest(req, boundOrigins)`. `OAuthDeps` gets a new optional `hubBoundOrigins?: () => readonly string[]` field; production threads it from `hub-server.ts` `hubFetch`. Three call sites updated (`handleAuthorizeGet`, `handleApproveClientPost`, `handleRegister`); all retain previous behavior when `hubBoundOrigins` isn't provided (fallback to `[issuer]`) so tests + downstream consumers stay correct on single-origin hubs.
+
+**Rename.** Internal helper `originMatchesIssuer` → `isSameOriginRequest` — the name now matches what it does (matches against a bound-origin set, not just the issuer). Two doc-comment references in `oauth-handlers.ts` and two test comments in `oauth-handlers.test.ts` updated.
+
+**Defense semantics preserved.** Real third-party origins still reject. Pre-#245 callers without the new dep stay on issuer-only behavior. Empty bound-origin set fails closed (rejects everything).
+
+Gate: `bun test ./src` 1277 pass / 1 fail (pre-existing env flake — same as previous rcs) / 30280 expects across 70 files. +24 tests over rc.4 (origin-check coverage). typecheck clean. biome clean.
+
 ## [0.5.9-rc.4] - 2026-05-12
 
 `buildServicesCatalog` (the helper that populates the `services` map in `/oauth/token` responses) now emits **per-vault `vault:<name>` keys** alongside the legacy collapsed `vault` key when there are multiple vaults to disambiguate (closes #247).

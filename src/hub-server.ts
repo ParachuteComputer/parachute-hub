@@ -102,6 +102,7 @@ import { handleApiRevokeToken } from "./api-revoke-token.ts";
 import { handleApiTokens } from "./api-tokens.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { ensureCsrfToken } from "./csrf.ts";
+import { readExposeState } from "./expose-state.ts";
 import { HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
 import { type RenderHubOpts, renderHub } from "./hub.ts";
@@ -119,6 +120,7 @@ import {
   handleRevoke,
   handleToken,
 } from "./oauth-handlers.ts";
+import { buildHubBoundOrigins } from "./origin-check.ts";
 import { clearPid, writePid } from "./process-state.ts";
 import {
   FIRST_PARTY_FALLBACKS,
@@ -511,6 +513,23 @@ export interface HubFetchDeps {
    * fixture installDirs.
    */
   readModuleManifest?: (installDir: string) => Promise<ModuleManifest | null>;
+  /**
+   * Hub's listening port. Threaded into the OAuth `hubBoundOrigins` set so
+   * the same-origin defense accepts loopback access (`http://localhost:<port>`,
+   * `http://127.0.0.1:<port>`) alongside the configured issuer. Closes #245
+   * Case A (operator on `localhost:1939` getting "Cross-origin request
+   * rejected" because Origin ≠ tailnet issuer).
+   */
+  loopbackPort?: number;
+  /**
+   * Test seam for reading `expose-state.json`. Production reads the operator's
+   * `~/.parachute/expose-state.json` via `readExposeState`; tests inject a
+   * fake to drive tailnet/funnel origins into the bound set without standing
+   * up real exposes. Returns `undefined` when no state file is present
+   * (pre-`parachute expose` state — fine, the issuer + loopback still cover
+   * legitimate access).
+   */
+  loadExposeHubOrigin?: () => string | undefined;
 }
 
 /**
@@ -715,10 +734,36 @@ export function hubFetch(
   const configuredIssuer = deps?.issuer;
   const manifestPath = deps?.manifestPath ?? SERVICES_MANIFEST_PATH;
   const spaDistDir = deps?.spaDistDir ?? defaultSpaDistDir();
+  const loopbackPort = deps?.loopbackPort;
+  const loadExposeHubOrigin =
+    deps?.loadExposeHubOrigin ??
+    (() => {
+      try {
+        return readExposeState()?.hubOrigin;
+      } catch {
+        // Malformed expose-state.json shouldn't 500 hub on every same-origin
+        // check — the issuer + loopback already cover legitimate access.
+        return undefined;
+      }
+    });
 
-  const oauthDeps = (req: Request) => ({
-    issuer: configuredIssuer ?? new URL(req.url).origin,
-  });
+  const oauthDeps = (req: Request) => {
+    const issuer = configuredIssuer ?? new URL(req.url).origin;
+    return {
+      issuer,
+      // Per-request resolution (closes #245): expose-state.json can change
+      // mid-session (operator runs `parachute expose tailnet` while hub is
+      // up), so we re-read the bound origins on each call rather than
+      // capturing at hub start. Cheap — a single small JSON parse per OAuth
+      // request, only on the cookie-POST paths that consult it.
+      hubBoundOrigins: () =>
+        buildHubBoundOrigins({
+          issuer,
+          loopbackPort,
+          exposeHubOrigin: loadExposeHubOrigin(),
+        }),
+    };
+  };
 
   return async (req) => {
     const url = new URL(req.url);
@@ -1222,7 +1267,7 @@ if (import.meta.main) {
   Bun.serve({
     port,
     hostname: "127.0.0.1",
-    fetch: hubFetch(wellKnownDir, { getDb, issuer }),
+    fetch: hubFetch(wellKnownDir, { getDb, issuer, loopbackPort: port }),
   });
   // Register PID + port from the running hub itself so any startup path
   // (spawn-via-`ensureHubRunning` or a direct `bun src/hub-server.ts` from

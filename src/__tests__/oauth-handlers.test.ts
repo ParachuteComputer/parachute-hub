@@ -2500,7 +2500,7 @@ describe("DCR auto-approve via session cookie (#199)", () => {
     // Sandbox iframes (`<iframe sandbox>` without `allow-same-origin`),
     // `data:`/`file:` documents, and some privacy contexts send the literal
     // string `Origin: null` rather than omitting the header. `new URL("null")`
-    // throws → originMatchesIssuer's try/catch returns false → DCR stays
+    // throws → isSameOriginRequest's try/catch returns false → DCR stays
     // pending. This test pins that invariant: an opaque-origin caller does
     // NOT ride the cookie path even with a valid session, because we can't
     // prove the request came from the issuer's own origin.
@@ -3747,7 +3747,7 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
     // Opaque-origin contexts (sandboxed iframes, some `data:` and `file:`
     // pages) send the literal string "null" as the Origin header. The DCR
     // /register path covers this; the inline-approve endpoint must reject it
-    // too. originMatchesIssuer() handles this correctly because new URL("null")
+    // too. isSameOriginRequest() handles this correctly because new URL("null")
     // throws → returns false; this test pins that contract.
     const { db, cleanup } = await makeDb();
     try {

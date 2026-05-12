@@ -62,6 +62,7 @@ import {
   renderError,
   renderLogin,
 } from "./oauth-ui.ts";
+import { isSameOriginRequest } from "./origin-check.ts";
 import { isNonRequestableScope, isRequestableScope } from "./scope-explanations.ts";
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
 import {
@@ -143,6 +144,18 @@ export interface OAuthDeps {
    * `~/.parachute/services.json`; tests inject a fixture.
    */
   loadServicesManifest?: () => ServicesManifest;
+  /**
+   * Set of origins (`scheme://host:port`) the hub considers itself bound to.
+   * Drives the same-origin defense on cookie-based POST endpoints: a request
+   * whose Origin/Referer matches any bound origin is accepted; everything
+   * else is rejected as cross-origin. Production wires this from
+   * `buildHubBoundOrigins` with the hub's port + expose-state hostname so
+   * loopback + tailnet + funnel access all work without restarting hub
+   * after `parachute expose`. Tests inject deterministic sets. When absent,
+   * the gate falls back to `[issuer]` — pre-#245 behavior — so callers that
+   * don't yet thread this through stay correct on a single-origin hub.
+   */
+  hubBoundOrigins?: () => readonly string[];
 }
 
 export interface ServicesCatalogEntry {
@@ -419,7 +432,7 @@ function pendingClientResponse(
     .split(" ")
     .filter((s) => s.length > 0);
   const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
-  const sameOrigin = originMatchesIssuer(req, deps.issuer);
+  const sameOrigin = isSameOriginRequest(req, resolveBoundOrigins(deps));
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
   if (session && sameOrigin) {
@@ -800,9 +813,12 @@ async function handleConsentSubmit(
  *   2. Active operator session (`findActiveSession`). The operator must be
  *      logged into this hub from the browser submitting the form — no
  *      session means no operator authority to approve anything.
- *   3. Origin/Referer matches the issuer (`originMatchesIssuer`). Same
- *      shape as the DCR auto-approve gate (#199, #200): a same-origin POST
- *      proves the form was rendered by *this hub*, not a forged page.
+ *   3. Origin/Referer matches a hub-bound origin (`isSameOriginRequest`).
+ *      Same shape as the DCR auto-approve gate (#199, #200, #245): a same-
+ *      origin POST proves the form was rendered by *this hub*, not a forged
+ *      page. Bound origins include issuer + loopback + tailnet hostname
+ *      (#245); pre-#245 was issuer-only and rejected legitimate operator
+ *      paths from loopback / tailnet.
  *
  * `return_to` validation: the form embeds the original authorize URL so
  * the post-approve redirect lands the operator back on `/oauth/authorize`
@@ -833,7 +849,7 @@ export async function handleApproveClientPost(
       401,
     );
   }
-  if (!originMatchesIssuer(req, deps.issuer)) {
+  if (!isSameOriginRequest(req, resolveBoundOrigins(deps))) {
     return htmlError(
       "Cross-origin request rejected",
       "The approve form must be submitted from this hub's own origin.",
@@ -1363,37 +1379,15 @@ interface RegisterRequestBody {
 }
 
 /**
- * CSRF defense for the cookie-based DCR auto-approve path (closes #199).
- *
- * Compares the request's `Origin` (or `Referer` as fallback) against the
- * configured issuer origin. URL.origin compares scheme + host + port —
- * port-only mismatches reject. A request with neither header is treated as
- * suspicious and rejected: cookie-bearing POSTs from same-origin browsers
- * always send Origin (per Fetch standard) and almost always send Referer,
- * so a header-stripped request is more likely a curl probe or a privacy
- * extension on a third-party site than a legitimate same-origin caller.
- *
- * SameSite=Lax on the session cookie (sessions.ts:buildSessionCookie) is the
- * browser-side defense layer; this function is the server-side belt.
+ * Resolve the hub-bound origin set for a given `OAuthDeps`. Pre-#245 this
+ * was implicit (just `deps.issuer`); post-#245 callers can thread a richer
+ * set through `deps.hubBoundOrigins` so loopback + tailnet + funnel access
+ * all match. Fallback to `[issuer]` keeps callers that haven't migrated
+ * correct on single-origin hubs.
  */
-function originMatchesIssuer(req: Request, issuer: string): boolean {
-  const origin = req.headers.get("origin");
-  if (origin) {
-    try {
-      return new URL(origin).origin === new URL(issuer).origin;
-    } catch {
-      return false;
-    }
-  }
-  const referer = req.headers.get("referer");
-  if (referer) {
-    try {
-      return new URL(referer).origin === new URL(issuer).origin;
-    } catch {
-      return false;
-    }
-  }
-  return false;
+function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
+  if (deps.hubBoundOrigins) return deps.hubBoundOrigins();
+  return [deps.issuer];
 }
 
 /**
@@ -1411,7 +1405,7 @@ function originMatchesIssuer(req: Request, issuer: string): boolean {
  *    plus a same-origin `Origin`/`Referer` header. The browser path: an
  *    operator hitting their own SPA from their own browser is by definition
  *    operator-authenticated, so re-requiring approval is friction without
- *    benefit. CSRF defense is `originMatchesIssuer` + the cookie's
+ *    benefit. CSRF defense is `isSameOriginRequest` + the cookie's
  *    `SameSite=Lax` attribute.
  *
  * If a bearer is presented but invalid or insufficient, we reject with the
@@ -1484,7 +1478,7 @@ export async function handleRegister(
   // public-DCR shape.
   if (status === "pending") {
     const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
-    if (session && originMatchesIssuer(req, deps.issuer)) {
+    if (session && isSameOriginRequest(req, resolveBoundOrigins(deps))) {
       status = "approved";
     }
   }
