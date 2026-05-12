@@ -2,6 +2,18 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.9-rc.3] - 2026-05-12
+
+`parachute status` now reveals **where each service is running from** alongside the version/health columns (closes #243). The new `SOURCE` column classifies each row as either `bun-linked → <basename> @ <git-short-sha>` (the operator has a local checkout `bun link`'d in) or `npm (<version>)` (installed from a published package under bun globals). For bun-linked rows where `services.json`'s cached `version` lags the live `package.json` at the checkout, a `STALE: services.json cached <X>; live package.json <Y>` continuation line surfaces beneath the row.
+
+Motivation: 2026-05-11 the operator spent ~30 minutes chasing a stale `parachute-notes 0.3.11-rc.1` in `parachute status` while the actual served bundle was the freshly-built 0.3.15-rc.1. Three separate steps were needed to diagnose: check `parachute status`, check the local `package.json`, check `~/.parachute/services.json`. Now the drift is visible at a glance.
+
+Implementation: new pure helper module `src/install-source.ts` with full test-seam coverage (`bunGlobalPrefixes`, `resolveBunGlobal`, `readJson`, `readGitHead` all injectable). `src/commands/status.ts` calls `detectInstallSource` per row and `detectHubInstallSource` for the internal hub row, and renders the new column + STALE continuation line. No network. Single optional `git rev-parse --short HEAD` shell-out per bun-linked row, with a 1.5s timeout — failures degrade silently to "no SHA" rather than blocking status. The hub itself is classified the same way as the services it manages, by climbing from `import.meta.dir` to the nearest `package.json`.
+
+Out of scope (separate follow-up): fixing `parachute upgrade` so it refreshes the cached `services.json.version` on bun-linked rebuild. The STALE indicator surfaces the drift; the upgrade path that creates it is a separate issue.
+
+Gate: `bun test ./src` ran 1246 tests across 69 files / 30242 expects. Pass/fail varies by environment because the existing `status > all-healthy returns 0 and prints table` test reads the real `~/.parachute/` configDir rather than isolating to its temp dir (pre-existing, present on `main` — reproduced via `git stash`). Clean envs see 1246 pass / 0 fail; envs with a stale `~/.parachute/scribe/run/scribe.pid` (operator PID file pointing at a no-longer-running process) see 1245 pass / 1 fail because `processState` returns `stopped` and skips the scribe probe. Worth a follow-up to isolate the test's configDir, but unrelated to this change. typecheck clean. biome clean.
+
 ## [0.5.9-rc.2] - 2026-05-11
 
 Post-Pass-1 cleanup (#240 follow-up). Two cohesive changes:

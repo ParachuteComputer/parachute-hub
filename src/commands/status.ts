@@ -1,5 +1,12 @@
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { HUB_SVC, readHubPort } from "../hub-control.ts";
+import {
+  type DetectInstallSourceDeps,
+  detectHubInstallSource,
+  detectInstallSource,
+  formatInstallSourceLabel,
+  isStale,
+} from "../install-source.ts";
 import { type AliveFn, defaultAlive, formatUptime, processState } from "../process-state.ts";
 import { canonicalPortForManifest, getSpec, shortNameForManifest } from "../service-spec.ts";
 import { type ServiceEntry, readManifest } from "../services-manifest.ts";
@@ -14,6 +21,19 @@ export interface StatusOpts {
   configDir?: string;
   alive?: AliveFn;
   now?: () => Date;
+  /**
+   * Test seam for install-source detection. Production reads the filesystem
+   * + shells out to git; tests inject stubs so each case (npm / bun-linked /
+   * unknown / stale) is exercised deterministically without depending on
+   * the operator's actual bun globals.
+   */
+  installSourceDeps?: DetectInstallSourceDeps;
+  /**
+   * Directory containing the running hub source. Defaults to `import.meta.dir`
+   * (the directory of this file). Tests override so the hub row's install
+   * source classification doesn't depend on the test runner's location.
+   */
+  hubSrcDir?: string;
 }
 
 export interface ProbeResult {
@@ -71,6 +91,7 @@ interface StatusRow {
   uptimeLabel: string;
   healthLabel: string;
   latencyLabel: string;
+  sourceLabel: string;
   url: string | undefined;
   healthy: boolean;
   skipped: boolean;
@@ -82,6 +103,13 @@ interface StatusRow {
    * hard-erroring on a deliberate operator port change.
    */
   driftWarning?: string;
+  /**
+   * Version-drift indicator (hub#243). Set when a bun-linked service's
+   * `services.json.version` lags the live `package.json` version at its
+   * checkout. Surfaced as a continuation line so operators can spot a
+   * stale-after-rebuild row without comparing columns by eye.
+   */
+  staleNote?: string;
 }
 
 /**
@@ -98,7 +126,13 @@ function urlForEntry(entry: ServiceEntry, short: string | undefined): string | u
   return `http://127.0.0.1:${entry.port}${first}`;
 }
 
-function hubRow(configDir: string, alive: AliveFn, nowDate: Date): StatusRow | undefined {
+function hubRow(
+  configDir: string,
+  alive: AliveFn,
+  nowDate: Date,
+  hubSrcDir: string,
+  installSourceDeps: DetectInstallSourceDeps,
+): StatusRow | undefined {
   const proc = processState(HUB_SVC, configDir, alive);
   if (proc.status === "unknown") return undefined;
   const port = readHubPort(configDir);
@@ -107,15 +141,17 @@ function hubRow(configDir: string, alive: AliveFn, nowDate: Date): StatusRow | u
   const pidLabel = proc.status === "running" && proc.pid !== undefined ? String(proc.pid) : "-";
   const uptimeLabel =
     proc.status === "running" && proc.startedAt ? formatUptime(proc.startedAt, nowDate) : "-";
+  const source = detectHubInstallSource(hubSrcDir, installSourceDeps);
   return {
     service: "parachute-hub (internal)",
     port: portLabel,
-    version: "-",
+    version: source.livePackageVersion ?? "-",
     processLabel,
     pidLabel,
     uptimeLabel,
     healthLabel: "-",
     latencyLabel: "-",
+    sourceLabel: formatInstallSourceLabel(source),
     url: port !== undefined ? `http://127.0.0.1:${port}` : undefined,
     healthy: true,
     skipped: true,
@@ -130,6 +166,8 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
   const configDir = opts.configDir ?? CONFIG_DIR;
   const alive = opts.alive ?? defaultAlive;
   const now = opts.now ?? (() => new Date());
+  const installSourceDeps = opts.installSourceDeps ?? {};
+  const hubSrcDir = opts.hubSrcDir ?? import.meta.dir;
 
   const manifest = readManifest(manifestPath);
   if (manifest.services.length === 0) {
@@ -178,6 +216,17 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
           ? `canonical port is ${canonical}`
           : undefined;
 
+      // Install-source detection (hub#243). One filesystem walk + maybe one
+      // `git rev-parse` per row. Failures degrade silently to `unknown` —
+      // status output should never error out on a missing checkout dir.
+      const detectArgs: { entryName: string; installDir?: string } = { entryName: entry.name };
+      if (entry.installDir !== undefined) detectArgs.installDir = entry.installDir;
+      const source = detectInstallSource(detectArgs, installSourceDeps);
+      const sourceLabel = formatInstallSourceLabel(source);
+      const staleNote = isStale(entry.version, source)
+        ? `STALE: services.json cached ${entry.version}; live package.json ${source.livePackageVersion}`
+        : undefined;
+
       // Only skip probe when we know the process is dead (PID file was
       // present but kill(pid, 0) failed). "unknown" status (no PID file)
       // still probes — externally-managed services should report health.
@@ -191,10 +240,12 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
           uptimeLabel,
           healthLabel: "-",
           latencyLabel: "-",
+          sourceLabel,
           url,
           healthy: false,
           skipped: true,
           driftWarning,
+          staleNote,
         };
       }
 
@@ -213,20 +264,32 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
         uptimeLabel,
         healthLabel,
         latencyLabel: `${p.latencyMs}ms`,
+        sourceLabel,
         url,
         healthy: p.healthy,
         skipped: false,
         driftWarning,
+        staleNote,
       };
     }),
   );
 
   // Hub is an internal service — not in services.json, but users notice
   // when it's dead. Only show it if we've seen it run.
-  const hub = hubRow(configDir, alive, nowDate);
+  const hub = hubRow(configDir, alive, nowDate, hubSrcDir, installSourceDeps);
   if (hub) rows.push(hub);
 
-  const header = ["SERVICE", "PORT", "VERSION", "PROCESS", "PID", "UPTIME", "HEALTH", "LATENCY"];
+  const header = [
+    "SERVICE",
+    "PORT",
+    "VERSION",
+    "PROCESS",
+    "PID",
+    "UPTIME",
+    "HEALTH",
+    "LATENCY",
+    "SOURCE",
+  ];
   const textRows = rows.map((r) => [
     r.service,
     r.port,
@@ -236,14 +299,17 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
     r.uptimeLabel,
     r.healthLabel,
     r.latencyLabel,
+    r.sourceLabel,
   ]);
   const widths = header.map((_, i) =>
     Math.max(header[i]?.length ?? 0, ...textRows.map((r) => r[i]?.length ?? 0)),
   );
   print(formatRow(header, widths));
-  // URL stays on a continuation line rather than a column. URLs are long
-  // (vault's MCP path runs ~40 chars), and a ninth column would push the
-  // table past 80 cols on every install. The "  → " prefix groups visually
+  // URL, drift, and stale notes stay on continuation lines rather than
+  // columns. URLs are long (vault's MCP path runs ~40 chars); SOURCE labels
+  // can be long for bun-linked rows. Spreading them across columns would
+  // push the table well past 80 cols on every install — continuation lines
+  // keep the table scannable. The "  → " / "  ! " prefixes group visually
   // with the row above without misleading the table widths.
   for (let i = 0; i < textRows.length; i++) {
     const cells = textRows[i];
@@ -251,10 +317,8 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
     if (!cells || !row) continue;
     print(formatRow(cells, widths));
     if (row.url) print(`  → ${row.url}`);
-    // Drift warning rides as its own continuation line. Plain ASCII (no
-    // emoji / unicode glyphs) for terminal compatibility — the same
-    // surface that prints to scripts piping `parachute status`.
     if (row.driftWarning) print(`  ! ${row.driftWarning}`);
+    if (row.staleNote) print(`  ! ${row.staleNote}`);
   }
 
   /**

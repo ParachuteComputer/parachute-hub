@@ -124,7 +124,7 @@ Examples:
 }
 
 export function statusHelp(): string {
-  return `parachute status — show installed services, process state, and health
+  return `parachute status — show installed services, process state, health, install source
 
 Usage:
   parachute status
@@ -133,11 +133,17 @@ What it does:
   Reads ~/.parachute/services.json. For each registered service:
     - checks PID file at ~/.parachute/<svc>/run/<svc>.pid → running/stopped
     - probes http://localhost:<port><health> (skipped for known-stopped processes)
+    - classifies the install source as bun-linked (local checkout) or npm
 
   Stopped services show "-" for health and don't count toward the exit
   code — they're an expected state after fresh install before \`parachute
   start\`. Running or externally-managed services that fail health checks
   do exit 1.
+
+  A "STALE: services.json cached … live package.json …" continuation line
+  appears under a row when a bun-linked service has been rebuilt but the
+  manifest's cached version hasn't caught up — re-install (\`parachute
+  install <pkg>\`) refreshes the row.
 
 Exit codes:
   0   all probed services healthy (or none running)
@@ -145,10 +151,10 @@ Exit codes:
 
 Example:
   $ parachute status
-  SERVICE          PORT  VERSION  PROCESS  PID    UPTIME  HEALTH  LATENCY
-  parachute-vault  1940  0.2.4    running  12345  2h 13m  ok      2ms
+  SERVICE          PORT  VERSION  PROCESS  PID    UPTIME  HEALTH  LATENCY  SOURCE
+  parachute-vault  1940  0.2.4    running  12345  2h 13m  ok      2ms      bun-linked → parachute-vault @ 8aa167b
     → http://127.0.0.1:1940/vault/default/mcp
-  parachute-notes  1942  0.0.1    stopped  -      -       -       -
+  parachute-notes  1942  0.0.1    stopped  -      -       -       -        npm (0.3.15-rc.1)
     → http://127.0.0.1:1942/notes
 `;
 }

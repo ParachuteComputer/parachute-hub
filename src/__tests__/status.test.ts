@@ -517,4 +517,203 @@ describe("status", () => {
       cleanup();
     }
   });
+
+  describe("install-source surface (hub#243)", () => {
+    test("renders SOURCE column header + per-row label", async () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/vault/default/health",
+            version: "0.4.4-rc.3",
+            installDir: "/Users/me/code/parachute-vault",
+          },
+          path,
+        );
+        const lines: string[] = [];
+        await status({
+          manifestPath: path,
+          fetchImpl: async () => new Response(null, { status: 200 }),
+          print: (l) => lines.push(l),
+          installSourceDeps: {
+            bunGlobalPrefixes: () => ["/home/test/.bun/install/global/node_modules"],
+            resolveBunGlobal: () => null,
+            readJson: (p) =>
+              p === "/Users/me/code/parachute-vault/package.json"
+                ? { name: "@openparachute/vault", version: "0.4.4-rc.3" }
+                : (() => {
+                    throw new Error("nope");
+                  })(),
+            readGitHead: () => "8aa167b",
+          },
+        });
+        expect(lines[0]).toMatch(/SOURCE/);
+        expect(lines.some((l) => l.includes("bun-linked → parachute-vault @ 8aa167b"))).toBe(true);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("STALE continuation line fires when bun-linked live version != cached version", async () => {
+      // Reproduces hub#243's motivating case: services.json says 0.3.11-rc.1
+      // but the live source has been rebuilt to 0.3.15-rc.1. Operator should
+      // see STALE in one glance from `parachute status` output.
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(
+          {
+            name: "parachute-notes",
+            port: 1942,
+            paths: ["/notes"],
+            health: "/notes/health",
+            version: "0.3.11-rc.1",
+            installDir: "/Users/me/code/parachute-notes",
+          },
+          path,
+        );
+        const lines: string[] = [];
+        await status({
+          manifestPath: path,
+          fetchImpl: async () => new Response(null, { status: 200 }),
+          print: (l) => lines.push(l),
+          installSourceDeps: {
+            bunGlobalPrefixes: () => ["/home/test/.bun/install/global/node_modules"],
+            resolveBunGlobal: () => null,
+            readJson: (p) =>
+              p === "/Users/me/code/parachute-notes/package.json"
+                ? { name: "@openparachute/notes", version: "0.3.15-rc.1" }
+                : (() => {
+                    throw new Error("nope");
+                  })(),
+            readGitHead: () => "051c404",
+          },
+        });
+        expect(
+          lines.some((l) =>
+            l.includes("STALE: services.json cached 0.3.11-rc.1; live package.json 0.3.15-rc.1"),
+          ),
+        ).toBe(true);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("npm-installed services render as `npm (<version>)` and never STALE", async () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(
+          {
+            name: "parachute-scribe",
+            port: 1943,
+            paths: ["/scribe"],
+            health: "/scribe/health",
+            version: "0.4.2-rc.1",
+            installDir: "/home/test/.bun/install/global/node_modules/@openparachute/scribe",
+          },
+          path,
+        );
+        const lines: string[] = [];
+        await status({
+          manifestPath: path,
+          fetchImpl: async () => new Response(null, { status: 200 }),
+          print: (l) => lines.push(l),
+          installSourceDeps: {
+            bunGlobalPrefixes: () => ["/home/test/.bun/install/global/node_modules"],
+            resolveBunGlobal: () => null,
+            readJson: (p) =>
+              p === "/home/test/.bun/install/global/node_modules/@openparachute/scribe/package.json"
+                ? { name: "@openparachute/scribe", version: "0.4.2-rc.1" }
+                : (() => {
+                    throw new Error("nope");
+                  })(),
+            readGitHead: () => undefined,
+          },
+        });
+        expect(lines.some((l) => l.includes("npm (0.4.2-rc.1)"))).toBe(true);
+        expect(lines.some((l) => l.includes("STALE:"))).toBe(false);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("entries without installDir fall back to bun-global symlink lookup", async () => {
+      // Some services.json entries (older first-party rows, or rows written
+      // by a service that doesn't echo installDir) leave the field absent.
+      // detectInstallSource maps the entry name → first-party package and
+      // probes bun globals for the symlink. Pins that fallback path.
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/vault/default/health",
+            version: "0.4.4-rc.3",
+            // No installDir.
+          },
+          path,
+        );
+        const lines: string[] = [];
+        await status({
+          manifestPath: path,
+          fetchImpl: async () => new Response(null, { status: 200 }),
+          print: (l) => lines.push(l),
+          installSourceDeps: {
+            bunGlobalPrefixes: () => ["/home/test/.bun/install/global/node_modules"],
+            resolveBunGlobal: (pkg) =>
+              pkg === "@openparachute/vault" ? "/Users/me/code/parachute-vault" : null,
+            readJson: (p) =>
+              p === "/Users/me/code/parachute-vault/package.json"
+                ? { name: "@openparachute/vault", version: "0.4.4-rc.3" }
+                : (() => {
+                    throw new Error("nope");
+                  })(),
+            readGitHead: () => "8aa167b",
+          },
+        });
+        expect(lines.some((l) => l.includes("bun-linked → parachute-vault @ 8aa167b"))).toBe(true);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("third-party row without installDir + no mapping renders as 'unknown'", async () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(
+          {
+            name: "agent",
+            port: 1946,
+            paths: ["/agent"],
+            health: "/agent/health",
+            version: "0.1.4-rc.1",
+            // No installDir; agent isn't in FIRST_PARTY_FALLBACKS by short name,
+            // and the fallback bun-global lookup needs a known package name.
+          },
+          path,
+        );
+        const lines: string[] = [];
+        await status({
+          manifestPath: path,
+          fetchImpl: async () => new Response(null, { status: 200 }),
+          print: (l) => lines.push(l),
+          installSourceDeps: {
+            bunGlobalPrefixes: () => ["/home/test/.bun/install/global/node_modules"],
+            resolveBunGlobal: () => null,
+            readJson: () => {
+              throw new Error("not reached");
+            },
+            readGitHead: () => undefined,
+          },
+        });
+        expect(lines.some((l) => l.includes("unknown"))).toBe(true);
+      } finally {
+        cleanup();
+      }
+    });
+  });
 });
