@@ -2,6 +2,14 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.9-rc.6] - 2026-05-12
+
+`/oauth/authorize`'s approve-pending UI (the page operators see when a DCR-registered client lands on the authorize endpoint before being approved) now surfaces the **vault hint** from the authorize URL (closes #244). Notes' VaultPopover (notes#115) passes `vault=<name>` on `/oauth/authorize` when kicking the OAuth flow for a specific vault; before this PR hub silently ignored it in the rendered page. On a multi-vault hub (4 vaults: boulder, default, gitcoin, techne) the operator had no way to tell which vault they were approving for. Single-vault hubs unaffected — the row omits when the hint is absent.
+
+Surface: `ApprovePendingViewProps` in `src/oauth-ui.ts` gets a new optional `requestedVault?: string` field. `renderApprovePending` renders a `vault: <name>` row in the existing `approve-meta` section, between `client_id` and `redirect_uris`, when the field is set. `handleAuthorizeGet` in `src/oauth-handlers.ts` reads the `vault` query param from the authorize URL and threads it through to both `renderApprovePending` call sites (with-session inline-form path + no-session CLI-only path). Empty-string `vault=` values normalize to undefined so the UI never renders a blank label.
+
+Gate: `bun test ./src` 1279 pass / 1 fail (same pre-existing env flake) / 30288 expects across 70 files. +2 tests over rc.5 (with-vault-hint render, empty-string-param normalize). typecheck clean. biome clean.
+
 ## [0.5.9-rc.5] - 2026-05-12
 
 Cookie-based POST endpoints (`/oauth/authorize/approve`, `/oauth/register` auto-approve, the DCR auto-approve path) now accept requests from any **hub-bound origin**, not just the configured `issuer` URL (closes #245). Previously, an operator hitting hub admin at `http://localhost:1939/login` then submitting the approve form got "Cross-origin request rejected" because Origin (loopback) didn't match issuer (tailnet). Same failure mode for tailnet→tailnet flows where Tailscale Serve stripped the Origin/Referer headers — the strict check returned false and 403'd a legitimate operator path.
