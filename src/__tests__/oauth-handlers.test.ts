@@ -2231,6 +2231,76 @@ describe("DCR approval gate (#74)", () => {
       const html = await res.text();
       expect(html).toContain("App not yet approved");
       expect(html).toContain("approve-client");
+      // No vault hint → no vault row in approve-meta. Single-vault hubs +
+      // pre-vault-popover clients leave the section omitted (#244).
+      expect(html).not.toContain('approve-meta-label">vault');
+    } finally {
+      cleanup();
+    }
+  });
+
+  // closes #244 — vault hint surfaced in approve-pending UI. Notes#115
+  // passes `vault=<name>` on `/oauth/authorize` for per-vault grants; hub's
+  // approve page now displays it alongside the other client metadata so a
+  // multi-vault operator can tell which vault they're approving for.
+  test("authorize: pending client with vault hint → approve UI renders 'vault: <name>'", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+          vault: "boulder",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(403);
+      const html = await res.text();
+      expect(html).toContain("App not yet approved");
+      // The vault hint surfaces as a labeled row in the approve-meta block.
+      expect(html).toContain('approve-meta-label">vault');
+      expect(html).toContain("boulder");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("authorize: pending client with empty vault param → no vault row", async () => {
+    // Defensive: `vault=` with empty value normalizes to undefined so the
+    // UI doesn't render a blank vault label. Easy to hit if a client builds
+    // the URL via URLSearchParams.set("vault", someMaybeEmptyVar).
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+          vault: "",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(403);
+      const html = await res.text();
+      expect(html).toContain("App not yet approved");
+      expect(html).not.toContain('approve-meta-label">vault');
     } finally {
       cleanup();
     }

@@ -431,6 +431,12 @@ function pendingClientResponse(
   const requestedScopes = (authorizeUrl.searchParams.get("scope") ?? "")
     .split(" ")
     .filter((s) => s.length > 0);
+  // Vault hint (closes #244): Notes' VaultPopover (notes#115) sets this on
+  // the authorize URL when kicking OAuth for a specific vault. Empty-string
+  // values normalize to undefined so the approve UI omits the row rather
+  // than rendering a blank vault label.
+  const vaultParam = authorizeUrl.searchParams.get("vault");
+  const requestedVault = vaultParam && vaultParam.length > 0 ? vaultParam : undefined;
   const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
   const sameOrigin = isSameOriginRequest(req, resolveBoundOrigins(deps));
   const csrf = ensureCsrfToken(req);
@@ -443,6 +449,7 @@ function pendingClientResponse(
         clientId: client.clientId,
         redirectUris: client.redirectUris,
         requestedScopes,
+        ...(requestedVault !== undefined && { requestedVault }),
         approveForm: { csrfToken: csrf.token, returnTo },
       }),
       403,
@@ -455,6 +462,7 @@ function pendingClientResponse(
       clientId: client.clientId,
       redirectUris: client.redirectUris,
       requestedScopes,
+      ...(requestedVault !== undefined && { requestedVault }),
     }),
     403,
     extra,

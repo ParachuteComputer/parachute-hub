@@ -112,6 +112,14 @@ export interface ApprovePendingViewProps {
   /** Scopes parsed from the original `/oauth/authorize?scope=` query param. */
   requestedScopes: string[];
   /**
+   * Vault hint from the original `/oauth/authorize?vault=<name>` query param,
+   * passed by Notes' VaultPopover (notes#115) when kicking the OAuth flow for
+   * a specific vault. Rendered alongside scopes so the operator can tell
+   * which vault they're approving access for on a multi-vault hub (closes
+   * #244). Single-vault hubs leave this absent and the section omits.
+   */
+  requestedVault?: string;
+  /**
    * When set, render the inline approve form. The form posts to
    * `/oauth/authorize/approve` with the CSRF token + a `return_to` URL the
    * server will redirect to after the approve commits — the original
@@ -245,12 +253,25 @@ function renderVaultPicker(picker: VaultPicker): string {
  * context). The button is the easy path; the CLI is always-available.
  */
 export function renderApprovePending(props: ApprovePendingViewProps): string {
-  const { clientName, clientId, redirectUris, requestedScopes, approveForm } = props;
+  const { clientName, clientId, redirectUris, requestedScopes, requestedVault, approveForm } =
+    props;
   const redirectList = redirectUris.map((u) => `<li><code>${escapeHtml(u)}</code></li>`).join("");
   const scopeRows =
     requestedScopes.length === 0
       ? `<li class="scope scope-empty">No scopes requested — the app gets a session token only.</li>`
       : requestedScopes.map(renderScopeRow).join("\n");
+  // Vault hint (closes #244): Notes' VaultPopover (notes#115) passes
+  // `vault=<name>` on `/oauth/authorize` for per-vault grants. Surface it
+  // alongside scopes so a multi-vault operator can tell which vault they're
+  // approving for. Missing on single-vault hubs / pre-vault-popover clients —
+  // section omits when absent.
+  const vaultRow = requestedVault
+    ? `
+        <p class="approve-meta-row">
+          <span class="approve-meta-label">vault</span>
+          <code class="approve-meta-value">${escapeHtml(requestedVault)}</code>
+        </p>`
+    : "";
   const formSection = approveForm
     ? `
       <form method="POST" action="/oauth/authorize/approve" class="auth-form approve-form">
@@ -289,7 +310,7 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
         <p class="approve-meta-row">
           <span class="approve-meta-label">client_id</span>
           <code class="approve-meta-value">${escapeHtml(clientId)}</code>
-        </p>
+        </p>${vaultRow}
         <div class="approve-meta-row approve-meta-row-block">
           <span class="approve-meta-label">redirect_uris</span>
           <ul class="approve-redirect-list">${redirectList}</ul>
