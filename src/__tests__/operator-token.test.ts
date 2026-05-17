@@ -297,7 +297,7 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
           issuer: TEST_ISSUER,
         });
         expect(used).not.toBeNull();
-        expect(used?.refreshed).toBe(false);
+        expect(used?.status.kind).toBe("fresh");
         expect(used?.rotated).toBeUndefined();
         expect(used?.token).toBe(issued.token);
       } finally {
@@ -328,7 +328,7 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
           issuer: TEST_ISSUER,
         });
         expect(used).not.toBeNull();
-        expect(used?.refreshed).toBe(true);
+        expect(used?.status.kind).toBe("rotated");
         expect(used?.rotated?.scopeSet).toBe("start");
         // The on-disk token is now the rotated one.
         const onDisk = await readOperatorTokenFile(h.dir);
@@ -370,7 +370,10 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
           issuer: TEST_ISSUER,
         });
         expect(used).not.toBeNull();
-        expect(used?.refreshed).toBe(false);
+        expect(used?.status.kind).toBe("skipped");
+        if (used?.status.kind === "skipped") {
+          expect(used.status.reason).toBe("aud-mismatch");
+        }
         expect(used?.rotated).toBeUndefined();
         expect(used?.token).toBe(signed.token);
         // On-disk file unchanged.
@@ -488,7 +491,7 @@ describe("mintOperatorToken registry write (#212)", () => {
           configDir: h.dir,
           issuer: TEST_ISSUER,
         });
-        expect(used?.refreshed).toBe(true);
+        expect(used?.status.kind).toBe("rotated");
         // The rotated token has a new jti.
         const newJti = used!.payload.jti as string;
         expect(newJti).not.toBe(original.jti);

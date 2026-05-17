@@ -285,6 +285,35 @@ export interface UseOperatorTokenOpts {
   now?: () => Date;
 }
 
+/**
+ * Disambiguated outcome of `useOperatorTokenWithAutoRotate`. The prior
+ * surface (boolean `refreshed`) conflated three operationally distinct
+ * cases under a single `false` value: (a) token is fresh, no rotation
+ * needed; (b) within rotation window but rotation skipped due to
+ * privilege guard; (c) within rotation window but rotation skipped due
+ * to missing sub claim. This shape surfaces each case so future
+ * rotation telemetry / admin UI can branch on them. See hub#216 for the
+ * motivation; hub#212 Phase 2 is the natural consumer.
+ *
+ * - `fresh` — remaining lifetime above the auto-rotation threshold;
+ *   the token on disk was returned as-is. The healthy steady state.
+ * - `rotated` — rotation fired; the on-disk token was overwritten.
+ *   `rotated` companion field on `UsedOperatorToken` carries the new
+ *   path / scopeSet / expiry.
+ * - `skipped` — within rotation window, but rotation was deliberately
+ *   not performed. `reason` distinguishes:
+ *     - `aud-mismatch`: the on-disk JWT carries a non-operator audience.
+ *       This is the privilege-escalation guard (a hand-stashed scope-narrow
+ *       JWT must not be silently upgraded). See operator-token.ts line ~360.
+ *     - `no-sub`: the on-disk JWT lacks a `sub` claim, so the helper can't
+ *       safely re-mint (don't know who the token belongs to). Surfaced via
+ *       the caller's downstream invalid-token error path.
+ */
+export type RotationStatus =
+  | { kind: "fresh" }
+  | { kind: "rotated" }
+  | { kind: "skipped"; reason: "aud-mismatch" | "no-sub" };
+
 export interface UsedOperatorToken {
   /** The operator token plaintext to present as bearer. After auto-rotation, this is the freshly-minted token. */
   token: string;
@@ -292,8 +321,14 @@ export interface UsedOperatorToken {
   payload: Awaited<ReturnType<typeof validateAccessToken>>["payload"];
   /** Set when this call rotated the on-disk token. The new path on disk. */
   rotated?: { path: string; scopeSet: OperatorScopeSet; expiresAt: string };
-  /** True if the on-disk token was within the auto-rotation threshold (informational). */
-  refreshed: boolean;
+  /**
+   * Disambiguated rotation outcome. See {@link RotationStatus}. Callers that
+   * only need "did the token rotate?" can check `status.kind === "rotated"`
+   * or the presence of the `rotated` companion field (equivalent). Future
+   * telemetry / admin UI can branch on `skipped.reason` to surface why a
+   * rotation didn't fire.
+   */
+  status: RotationStatus;
 }
 
 /**
@@ -342,7 +377,7 @@ export async function useOperatorTokenWithAutoRotate(
   }
 
   if (remaining > OPERATOR_TOKEN_AUTO_ROTATE_THRESHOLD_SECONDS) {
-    return { token, payload, refreshed: false };
+    return { token, payload, status: { kind: "fresh" } };
   }
 
   // Within rotation window — but only auto-rotate if this is genuinely an
@@ -352,7 +387,7 @@ export async function useOperatorTokenWithAutoRotate(
   // operator token by the hub. Legitimate operator-tokens minted via
   // `set-password` / `rotate-operator` carry `aud: "operator"`.
   if (payload.aud !== OPERATOR_TOKEN_AUDIENCE) {
-    return { token, payload, refreshed: false };
+    return { token, payload, status: { kind: "skipped", reason: "aud-mismatch" } };
   }
 
   // Re-mint preserving scope-set.
@@ -361,7 +396,7 @@ export async function useOperatorTokenWithAutoRotate(
     // No sub claim — can't safely auto-rotate (don't know who the token
     // belongs to). Return as-is; the caller will likely surface this as an
     // invalid-token error downstream.
-    return { token, payload, refreshed: false };
+    return { token, payload, status: { kind: "skipped", reason: "no-sub" } };
   }
   const claimedSet = payload[OPERATOR_TOKEN_SCOPE_SET_CLAIM];
   const scopeSet: OperatorScopeSet = isOperatorScopeSet(claimedSet)
@@ -378,6 +413,6 @@ export async function useOperatorTokenWithAutoRotate(
     token: issued.token,
     payload: reValidated.payload,
     rotated: { path: issued.path, scopeSet: issued.scopeSet, expiresAt: issued.expiresAt },
-    refreshed: true,
+    status: { kind: "rotated" },
   };
 }
