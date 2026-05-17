@@ -846,21 +846,31 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/oauth/authorize without configured db returns 503", async () => {
+  test("/oauth/authorize without configured db returns 503 JSON", async () => {
     const h = makeHarness();
     try {
       const res = await hubFetch(h.dir)(req("/oauth/authorize?client_id=x"));
       expect(res.status).toBe(503);
+      const body = (await res.json()) as { error: string; error_description: string };
+      expect(body.error).toBe("service_unavailable");
+      expect(body.error_description).toBe("hub db not configured");
     } finally {
       h.cleanup();
     }
   });
 
-  test("every DB-dependent route returns 503 when getDb is absent (closes #139)", async () => {
+  test("every DB-dependent route returns 503 when getDb is absent (closes #139, JSON shape closes #227)", async () => {
     const h = makeHarness();
     try {
       const fetch = hubFetch(h.dir);
+      // Every DB-dependent guard returns the same JSON 503 shape
+      // (`service_unavailable`) so consumers don't branch on content-type to
+      // extract the message. The pattern was already canonical on
+      // /api/auth/* (hub#215, #226) and was extended to all guards in
+      // hub#227.
       const cases: Array<[string, RequestInit]> = [
+        ["/oauth/authorize?client_id=x", { method: "GET" }],
+        ["/oauth/authorize/approve", { method: "POST" }],
         ["/oauth/token", { method: "POST" }],
         ["/oauth/register", { method: "POST" }],
         ["/oauth/revoke", { method: "POST" }],
@@ -871,10 +881,23 @@ describe("hubFetch routing", () => {
         ["/login", { method: "POST" }],
         ["/logout", { method: "POST" }],
         ["/admin/host-admin-token", { method: "GET" }],
+        ["/admin/vault-admin-token/demo", { method: "GET" }],
+        ["/api/me", { method: "GET" }],
+        ["/api/auth/mint-token", { method: "POST" }],
+        ["/api/auth/revoke-token", { method: "POST" }],
+        ["/api/auth/tokens", { method: "GET" }],
+        ["/api/grants", { method: "GET" }],
+        ["/api/grants/client-x", { method: "DELETE" }],
+        ["/api/oauth/clients/client-x", { method: "GET" }],
+        ["/api/oauth/clients/client-x/approve", { method: "POST" }],
       ];
       for (const [path, init] of cases) {
         const res = await fetch(req(path, init));
         expect(res.status).toBe(503);
+        expect(res.headers.get("content-type")?.toLowerCase()).toContain("application/json");
+        const body = (await res.json()) as { error: string; error_description: string };
+        expect(body.error).toBe("service_unavailable");
+        expect(body.error_description).toBe("hub db not configured");
       }
     } finally {
       h.cleanup();

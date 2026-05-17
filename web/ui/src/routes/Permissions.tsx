@@ -15,6 +15,11 @@
  * The confirm modal exists because revoking is destructive (consent flow
  * comes back; the user re-approves from scratch); a stray click should
  * not erase a grant silently.
+ *
+ * Pagination: currently unpaginated — the grants table is small in
+ * practice. When this grows pagination, mirror the canonical pattern in
+ * Tokens.tsx `loadMore` (loadingMore boolean + disabled attr + early
+ * return). See web/ui/CLAUDE.md § Pagination convention. (hub#229)
  */
 import { type FormEvent, useEffect, useState } from "react";
 import { type AdminGrantListing, HttpError, listGrants, revokeGrant } from "../lib/api.ts";

@@ -114,6 +114,45 @@ works. `src/hub-server.ts` handles a missing `dist/` by 503ing the
 usually means the postinstall hasn't run yet, or fired with
 `--ignore-scripts` (which suppresses lifecycle hooks).
 
+## Pagination convention
+
+Paginated admin surfaces use a "Load more" cursor button (not infinite
+scroll). Canonical pattern is in `src/routes/Tokens.tsx`'s `loadMore`:
+
+```tsx
+const [loadingMore, setLoadingMore] = useState(false);
+
+async function loadMore() {
+  if (loadingMore) return;            // 3. early return — fast-finger keyboard
+  setLoadingMore(true);
+  try {
+    const page = await listX({ cursor });
+    setList((prev) => ({ ...prev, items: [...prev.items, ...page.items], cursor: page.next_cursor }));
+  } finally {
+    setLoadingMore(false);
+  }
+}
+
+<button disabled={loadingMore} onClick={() => void loadMore()}>
+  {loadingMore ? "Loading…" : "Load more"}
+</button>
+```
+
+Three ingredients: (1) `loadingMore` boolean, (2) `disabled={loadingMore}`
+on the button (the primary defense), (3) `if (loadingMore) return` inside
+the handler (belt-and-suspenders for keyboard activation, since `disabled`
+only blocks pointer events).
+
+Why all three: a double-click during a slow fetch closes over the same
+list state in both invocations; the second `setState` wins and overwrites
+the first's appended page. Operator sees a partial list until refresh, no
+error surfaces. Caught in the hub#228 Tokens.tsx review; pinned by F1
+test in `Tokens.test.tsx`.
+
+Today's only paginated surface is `/admin/tokens`. When `/admin/permissions`
+or a future view gains pagination, mirror this shape; if a third paginated
+view lands, lift to a `useLoadMore` hook (hub#229's deferred option B).
+
 ## Brand tokens
 
 `src/styles.css` is the single source of truth for the SPA's palette,

@@ -126,6 +126,17 @@ export function Tokens() {
     };
   }, [reload, filter, sourceFilter]);
 
+  // Canonical "Load more" pattern for paginated admin surfaces. Future
+  // paginated views (Permissions if it grows pagination, any next-chunk
+  // admin route) should mirror this shape — see web/ui/CLAUDE.md §
+  // Pagination convention. The pattern's three ingredients:
+  //   1. `loadingMore` boolean state (useState) flipped true before fetch.
+  //   2. `disabled={loadingMore}` on the button (primary double-click defense).
+  //   3. Early `if (loadingMore) return` inside the handler
+  //      (belt-and-suspenders for fast-finger keyboard activation, since
+  //      `disabled` only blocks pointer events).
+  // The button text also flips to "Loading…" so the state is visible to
+  // the operator, not just enforced behind the disabled attribute.
   async function loadMore(): Promise<void> {
     if (list.kind !== "ok" || !list.nextCursor) return;
     // Guard against double-clicks: a second invocation while the first

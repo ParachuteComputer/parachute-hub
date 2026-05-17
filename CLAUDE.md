@@ -77,7 +77,22 @@ For end-to-end against a real install, `bun link` this repo; the linked `parachu
 
 ### Test gate counts in commit messages and PR descriptions
 
-Test gate counts in commit messages and PR descriptions are produced by `bun test ./src` (the `package.json` `"test"` script), not `bun test src/__tests__/`. The latter pulls in `packages/scope-guard/` tests and produces an inflated count that's not what CI runs. When quoting numbers ("358 pass / 1 known flake"), use the literal output of `bun test ./src` — it's what the reviewer's run will produce.
+Three invocations produce three different numbers. Which to cite depends on what the PR actually touches.
+
+| Command | What it runs | When to cite |
+|---|---|---|
+| `bun test ./src` | hub's own tests only (`src/__tests__/`) | PRs that touch only `src/` — most hub work. This is the `package.json` `"test"` script. |
+| `bun test packages/scope-guard/src` | scope-guard package tests only | scope-guard-only PRs (rare standalone) |
+| Both, cited as a pair | hub + scope-guard, separately | PRs whose substance lives in `packages/scope-guard/` and reaches into `src/` — cite "hub: <hub-count>, scope-guard: <sg-count>" |
+
+What **not** to use:
+
+- `bun test src/__tests__/` — same coverage as `bun test ./src` but with a non-canonical path. Use the script form.
+- `bun test src` (no `./`) — Bun's path resolver picks up *both* `src/` and `packages/scope-guard/src/` in one run, producing a single inflated number that doesn't match what CI's per-package split runs. Two suites sharing a process can also exhibit cross-suite interference (errors that don't reproduce in either suite alone). Don't cite this number; if both suites are relevant, run them separately and report both.
+
+The reviewer's run uses `bun run test` (= `bun test ./src`) plus a separate scope-guard invocation when relevant. Mirror that shape in commit messages so the numbers line up.
+
+Pinned during hub#217 — reviewer cited a combined number; tentacle cited a hub-only number. Both were defensible under the prior wording. Resolution per hub#219: cite hub-only by default; cite as a pair when scope-guard is load-bearing in the PR.
 
 ## Post-merge hygiene
 

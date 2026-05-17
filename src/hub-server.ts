@@ -725,6 +725,17 @@ async function serveSpa(spaDistDir: string, pathname: string, mount: SpaMount): 
   });
 }
 
+// Canonical 503 body for "getDb is unset, hub is unconfigured." Shape matches
+// the OAuth error vocabulary used by /api/auth/* (`service_unavailable`) so a
+// consumer never has to branch on content-type to extract a message. See
+// hub#227 for the migration from plain-text bodies.
+function dbNotConfigured(): Response {
+  return Response.json(
+    { error: "service_unavailable", error_description: "hub db not configured" },
+    { status: 503 },
+  );
+}
+
 export function hubFetch(
   wellKnownDir: string,
   deps?: HubFetchDeps,
@@ -996,9 +1007,7 @@ export function hubFetch(
     }
 
     if (pathname === "/oauth/authorize") {
-      if (!getDb) {
-        return new Response("hub db not configured", { status: 503 });
-      }
+      if (!getDb) return dbNotConfigured();
       if (req.method === "GET") return handleAuthorizeGet(getDb(), req, oauthDeps(req));
       if (req.method === "POST") return handleAuthorizePost(getDb(), req, oauthDeps(req));
       return new Response("method not allowed", { status: 405 });
@@ -1009,41 +1018,31 @@ export function hubFetch(
     // by handleAuthorizeGet when the operator hits a pending client. Three
     // gates inside the handler: CSRF, active session, same-origin Origin.
     if (pathname === "/oauth/authorize/approve") {
-      if (!getDb) {
-        return new Response("hub db not configured", { status: 503 });
-      }
+      if (!getDb) return dbNotConfigured();
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
       return handleApproveClientPost(getDb(), req, oauthDeps(req));
     }
 
     if (pathname === "/oauth/token") {
-      if (!getDb) {
-        return new Response("hub db not configured", { status: 503 });
-      }
+      if (!getDb) return dbNotConfigured();
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
       return handleToken(getDb(), req, oauthDeps(req));
     }
 
     if (pathname === "/oauth/register") {
-      if (!getDb) {
-        return new Response("hub db not configured", { status: 503 });
-      }
+      if (!getDb) return dbNotConfigured();
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
       return handleRegister(getDb(), req, oauthDeps(req));
     }
 
     if (pathname === "/oauth/revoke") {
-      if (!getDb) {
-        return new Response("hub db not configured", { status: 503 });
-      }
+      if (!getDb) return dbNotConfigured();
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
       return handleRevoke(getDb(), req, oauthDeps(req));
     }
 
     if (pathname === "/vaults") {
-      if (!getDb) {
-        return new Response("hub db not configured", { status: 503 });
-      }
+      if (!getDb) return dbNotConfigured();
       return handleCreateVault(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
@@ -1056,7 +1055,7 @@ export function hubFetch(
     // through to the catch-all 404 — there's no admin surface left there.
 
     if (pathname === "/admin/host-admin-token") {
-      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      if (!getDb) return dbNotConfigured();
       return handleHostAdminToken(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
@@ -1064,7 +1063,7 @@ export function hubFetch(
     }
 
     if (pathname.startsWith("/admin/vault-admin-token/")) {
-      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      if (!getDb) return dbNotConfigured();
       const vaultName = decodeURIComponent(pathname.slice("/admin/vault-admin-token/".length));
       // The vault name must correspond to an actual vault instance — same
       // shape the well-known doc derives. Source from services.json so a
@@ -1084,22 +1083,12 @@ export function hubFetch(
     }
 
     if (pathname === "/api/me") {
-      if (!getDb) {
-        return Response.json(
-          { error: "service_unavailable", error_description: "hub db not configured" },
-          { status: 503 },
-        );
-      }
+      if (!getDb) return dbNotConfigured();
       return handleApiMe(req, { db: getDb() });
     }
 
     if (pathname === "/api/auth/mint-token") {
-      if (!getDb) {
-        return Response.json(
-          { error: "service_unavailable", error_description: "hub db not configured" },
-          { status: 503 },
-        );
-      }
+      if (!getDb) return dbNotConfigured();
       return handleApiMintToken(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
@@ -1107,12 +1096,7 @@ export function hubFetch(
     }
 
     if (pathname === "/api/auth/revoke-token") {
-      if (!getDb) {
-        return Response.json(
-          { error: "service_unavailable", error_description: "hub db not configured" },
-          { status: 503 },
-        );
-      }
+      if (!getDb) return dbNotConfigured();
       return handleApiRevokeToken(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
@@ -1120,12 +1104,7 @@ export function hubFetch(
     }
 
     if (pathname === "/api/auth/tokens") {
-      if (!getDb) {
-        return Response.json(
-          { error: "service_unavailable", error_description: "hub db not configured" },
-          { status: 503 },
-        );
-      }
+      if (!getDb) return dbNotConfigured();
       return handleApiTokens(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
@@ -1133,7 +1112,7 @@ export function hubFetch(
     }
 
     if (pathname === "/api/grants") {
-      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      if (!getDb) return dbNotConfigured();
       return handleListGrants(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
@@ -1141,7 +1120,7 @@ export function hubFetch(
     }
 
     if (pathname.startsWith("/api/grants/")) {
-      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      if (!getDb) return dbNotConfigured();
       const clientId = decodeURIComponent(pathname.slice("/api/grants/".length));
       if (!clientId || clientId.includes("/")) {
         return new Response("not found", { status: 404 });
@@ -1159,7 +1138,7 @@ export function hubFetch(
     // submits approval to the second — keeps the surface easy to test
     // and audit without overloading a single verb.
     if (pathname.startsWith("/api/oauth/clients/")) {
-      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      if (!getDb) return dbNotConfigured();
       const tail = pathname.slice("/api/oauth/clients/".length);
       if (!tail) return new Response("not found", { status: 404 });
       const approveSuffix = "/approve";
@@ -1190,14 +1169,14 @@ export function hubFetch(
     // /admin/login and /admin/logout paths 301 to here, dispatched at the
     // top of this fn alongside the other back-compat redirects.
     if (pathname === "/login") {
-      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      if (!getDb) return dbNotConfigured();
       if (req.method === "GET") return handleAdminLoginGet(getDb(), req);
       if (req.method === "POST") return handleAdminLoginPost(getDb(), req);
       return new Response("method not allowed", { status: 405 });
     }
 
     if (pathname === "/logout") {
-      if (!getDb) return new Response("hub db not configured", { status: 503 });
+      if (!getDb) return dbNotConfigured();
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
       return handleAdminLogoutPost(getDb(), req);
     }
