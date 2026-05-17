@@ -505,6 +505,61 @@ function pendingClientJson(clientId: string, issuer: string): Response {
  * either renders the login form (no session) or the consent screen (session
  * present). All authorize-time params are echoed back via hidden inputs so
  * the form POST keeps the binding intact.
+ *
+ * ## Silent-approve flow (skip-consent gate, hub#75, hub#236)
+ *
+ * Cross-surface session smoothness ("first Notes use prompts for consent;
+ * subsequent uses are seamless") rides on a single gate further down in
+ * this function. The end-to-end flow:
+ *
+ *   1. **First use.** A client lands on `/oauth/authorize` with scope `S`.
+ *      The user has a session but no prior `grants` row for this
+ *      (user, client) pair. `isCoveredByGrant` returns false; the gate
+ *      falls through; the consent screen renders. User clicks approve →
+ *      `handleAuthorizePost` records a `grants` row keyed on
+ *      (user_id, client_id) with the approved scopes, then mints the
+ *      auth code.
+ *   2. **Subsequent use, same scopes.** Same client lands on
+ *      `/oauth/authorize` with scope `S` again. `isCoveredByGrant` finds
+ *      the row and returns true. The gate fires: auth code minted
+ *      directly via `issueAuthCodeRedirect`; no consent screen renders;
+ *      operator sees a silent redirect. This is the seamless second-use
+ *      experience.
+ *   3. **Subsequent use, subset.** Client asks for scope `S' ⊂ S`. The
+ *      grant covers every requested scope; gate fires.
+ *   4. **Subsequent use, novel scope.** Client asks for scope `S''`
+ *      where `S'' ⊄ S` (a strict superset, or any new scope). The grant
+ *      doesn't cover the new ask; gate falls through; consent re-renders
+ *      with the new scope explicit. User must approve to extend the grant.
+ *   5. **Grant revoked.** Operator revokes via `/admin/permissions` or
+ *      `parachute auth revoke-grant`. The next /authorize re-renders
+ *      consent — already-minted refresh tokens keep working until they
+ *      expire (or are revoked separately via `/oauth/revoke`).
+ *
+ * Two important constraints on the gate itself:
+ *
+ *   - **Unnamed vault verbs (`vault:read`) always render consent.** The
+ *     vault-picker UI is the only path that binds an unnamed scope to a
+ *     specific vault (grants store narrowed `vault:<name>:<verb>`, so
+ *     `vault:read` never matches a stored grant literally). Re-flowing
+ *     with `vault:read` must always show the picker even if any prior
+ *     grant exists.
+ *   - **Client re-registration breaks the grant link.** Dynamic Client
+ *     Registration mints a fresh `client_id` each time; grants are keyed
+ *     on `(user_id, client_id)` so a re-registered client looks brand-
+ *     new and re-prompts for consent. (Intentional: the operator should
+ *     re-consent to an app whose registration was destroyed and re-made
+ *     — that's a stronger signal of "this is the same app I trusted"
+ *     than the redirect URI alone.)
+ *
+ * The full grant-scope subset semantics live in `grants.ts`
+ * `isCoveredByGrant`; the gate itself is the if-block below the
+ * "Skip-consent gate" comment in this function.
+ *
+ * Pinned by the regression test "first-use consent → silent-approve →
+ * novel scope re-prompts" in `oauth-handlers.test.ts` (hub#236), plus
+ * the per-branch tests in the same describe block (subset / superset /
+ * revoke / unnamed-vault / re-registered-client).
  */
 export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps): Response {
   const url = new URL(req.url);

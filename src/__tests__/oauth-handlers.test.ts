@@ -3205,6 +3205,115 @@ describe("refresh-token rotation + /oauth/revoke (#73)", () => {
 // to the auth-code redirect. Strict superset (incremental scope) and
 // revoked grants still show consent.
 describe("handleAuthorizeGet — skip consent when scope already granted (#75)", () => {
+  // hub#236 — pin the full silent-approve flow end-to-end in one test.
+  // The per-branch tests below this one cover individual branches (subset,
+  // superset, revoke, unnamed-vault, re-registered-client); this test
+  // walks the operator-visible state machine in a single body so a
+  // regression at any step surfaces immediately, and the JSDoc on
+  // handleAuthorizeGet's silent-approve flow (1-5) has a single load-
+  // bearing test to point at.
+  test("first-use consent → silent-approve → novel-scope re-prompts (full silent-approve flow, #236)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const sessionCookie = buildSessionCookie(session.id, 86400);
+
+      // Step 1: first use — no grant exists; consent screen renders.
+      const firstReq = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "step1",
+        }),
+        { headers: { cookie: sessionCookie } },
+      );
+      const firstRes = handleAuthorizeGet(db, firstReq, { issuer: ISSUER });
+      expect(firstRes.status).toBe(200);
+      expect(firstRes.headers.get("content-type")).toContain("text/html");
+
+      // Step 1b: user approves via the consent form — grant gets recorded.
+      const consentRes = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: new URLSearchParams({
+            __action: "consent",
+            __csrf: TEST_CSRF,
+            approve: "yes",
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            scope: "vault:default:read",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+          }),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${sessionCookie}`,
+          },
+        }),
+        { issuer: ISSUER },
+      );
+      expect(consentRes.status).toBe(302);
+
+      // Step 2: subsequent use, same scopes — silent-approve fires.
+      // Authoritative assertion: 302 redirect with auth code, NOT a 200
+      // HTML consent screen. This is the operator-visible payoff.
+      const secondReq = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "step2",
+        }),
+        { headers: { cookie: sessionCookie } },
+      );
+      const secondRes = handleAuthorizeGet(db, secondReq, { issuer: ISSUER });
+      expect(secondRes.status).toBe(302);
+      const secondLoc = new URL(secondRes.headers.get("location") ?? "");
+      expect(secondLoc.origin + secondLoc.pathname).toBe("https://app.example/cb");
+      expect(secondLoc.searchParams.get("code")?.length).toBeGreaterThan(20);
+      expect(secondLoc.searchParams.get("state")).toBe("step2");
+
+      // Step 3: subsequent use, novel scope NOT in the grant — gate must
+      // NOT fire; consent re-renders with the new scope explicit. This is
+      // the load-bearing security property: silent-approve must not
+      // silently approve scopes the user never consented to.
+      const novelReq = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          // Adds scribe:transcribe to the original vault:default:read.
+          scope: "vault:default:read scribe:transcribe",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "step3",
+        }),
+        { headers: { cookie: sessionCookie } },
+      );
+      const novelRes = handleAuthorizeGet(db, novelReq, { issuer: ISSUER });
+      expect(novelRes.status).toBe(200);
+      expect(novelRes.headers.get("content-type")).toContain("text/html");
+      const novelBody = await novelRes.text();
+      // The new scope appears on the consent page — the user must approve
+      // it explicitly.
+      expect(novelBody).toContain("scribe:transcribe");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("first approval records grant; second flow with same scopes skips consent", async () => {
     const { db, cleanup } = await makeDb();
     try {

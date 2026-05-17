@@ -297,7 +297,7 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
           issuer: TEST_ISSUER,
         });
         expect(used).not.toBeNull();
-        expect(used?.refreshed).toBe(false);
+        expect(used?.status.kind).toBe("fresh");
         expect(used?.rotated).toBeUndefined();
         expect(used?.token).toBe(issued.token);
       } finally {
@@ -328,7 +328,7 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
           issuer: TEST_ISSUER,
         });
         expect(used).not.toBeNull();
-        expect(used?.refreshed).toBe(true);
+        expect(used?.status.kind).toBe("rotated");
         expect(used?.rotated?.scopeSet).toBe("start");
         // The on-disk token is now the rotated one.
         const onDisk = await readOperatorTokenFile(h.dir);
@@ -370,10 +370,58 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
           issuer: TEST_ISSUER,
         });
         expect(used).not.toBeNull();
-        expect(used?.refreshed).toBe(false);
+        expect(used?.status.kind).toBe("skipped");
+        if (used?.status.kind === "skipped") {
+          expect(used.status.reason).toBe("aud-mismatch");
+        }
         expect(used?.rotated).toBeUndefined();
         expect(used?.token).toBe(signed.token);
         // On-disk file unchanged.
+        const onDisk = await readOperatorTokenFile(h.dir);
+        expect(onDisk).toBe(signed.token);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // hub#224 — when a JWT carries the operator audience + short TTL but
+  // lacks a recognized `pa_scope_set` claim, the helper now refuses to
+  // auto-rotate. Pre-hardening the fallback widened to admin; the test
+  // pins the new "skipped, no-scope-set" outcome.
+  test("does NOT auto-rotate an aud=operator token that lacks pa_scope_set (no silent widening)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        // aud=operator + 1h TTL + NO pa_scope_set claim. Pre-#224 this would
+        // fall back to OPERATOR_TOKEN_DEFAULT_SCOPE_SET (admin) on rotation
+        // — a silent widening of a token of unknown provenance.
+        const signed = await signAccessToken(db, {
+          sub: "user-abc",
+          scopes: ["scribe:transcribe"],
+          audience: OPERATOR_TOKEN_AUDIENCE,
+          clientId: OPERATOR_TOKEN_CLIENT_ID,
+          issuer: TEST_ISSUER,
+          ttlSeconds: 3600,
+        });
+        await writeOperatorTokenFile(signed.token, h.dir);
+
+        const used = await useOperatorTokenWithAutoRotate(db, {
+          configDir: h.dir,
+          issuer: TEST_ISSUER,
+        });
+        expect(used).not.toBeNull();
+        expect(used?.status.kind).toBe("skipped");
+        if (used?.status.kind === "skipped") {
+          expect(used.status.reason).toBe("no-scope-set");
+        }
+        expect(used?.rotated).toBeUndefined();
+        expect(used?.token).toBe(signed.token);
+        // On-disk file unchanged — no widening occurred.
         const onDisk = await readOperatorTokenFile(h.dir);
         expect(onDisk).toBe(signed.token);
       } finally {
@@ -488,7 +536,7 @@ describe("mintOperatorToken registry write (#212)", () => {
           configDir: h.dir,
           issuer: TEST_ISSUER,
         });
-        expect(used?.refreshed).toBe(true);
+        expect(used?.status.kind).toBe("rotated");
         // The rotated token has a new jti.
         const newJti = used!.payload.jti as string;
         expect(newJti).not.toBe(original.jti);
