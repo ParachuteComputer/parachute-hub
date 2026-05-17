@@ -308,11 +308,20 @@ export interface UseOperatorTokenOpts {
  *     - `no-sub`: the on-disk JWT lacks a `sub` claim, so the helper can't
  *       safely re-mint (don't know who the token belongs to). Surfaced via
  *       the caller's downstream invalid-token error path.
+ *     - `no-scope-set`: the on-disk JWT carries `aud: operator` but lacks
+ *       (or has an unrecognized) `pa_scope_set` claim. Refusing to rotate
+ *       here is hub#224's hardening: the prior behaviour fell back to the
+ *       default scope-set (admin) on rotation, which silently widened a
+ *       narrow-scope token of unknown provenance. Legitimately-issued
+ *       operator tokens always carry a recognized `pa_scope_set` (set by
+ *       `issueOperatorToken`); a token without it is either a hand-crafted
+ *       JWT (don't widen) or a pre-#213 legacy token (operator should
+ *       explicitly `parachute auth rotate-operator` to recover).
  */
 export type RotationStatus =
   | { kind: "fresh" }
   | { kind: "rotated" }
-  | { kind: "skipped"; reason: "aud-mismatch" | "no-sub" };
+  | { kind: "skipped"; reason: "aud-mismatch" | "no-sub" | "no-scope-set" };
 
 export interface UsedOperatorToken {
   /** The operator token plaintext to present as bearer. After auto-rotation, this is the freshly-minted token. */
@@ -346,8 +355,33 @@ export interface UsedOperatorToken {
  *
  * Callers receive the (possibly fresh) token to present onward. The
  * scope-set is preserved across rotations via the `pa_scope_set` claim;
- * tokens minted before #213 don't carry the claim and are treated as
- * `admin` (back-compat).
+ * tokens that lack a recognized `pa_scope_set` claim are NOT auto-rotated
+ * (hub#224 hardening — the prior fallback to the default scope-set
+ * silently widened narrow-scope tokens of unknown provenance). Operators
+ * holding a legacy token without the claim should `parachute auth
+ * rotate-operator` to recover.
+ *
+ * ## Test-author note (hub#224)
+ *
+ * Tests that stash a JWT at `~/.parachute/operator.token` to exercise
+ * downstream gate-check behaviour need to side-step auto-rotation, or
+ * the helper will silently swap the test's narrow token for a fresh
+ * admin one before the gate runs. Two safe shapes:
+ *
+ *   1. **Long TTL.** Mint with `ttlSeconds: 30 * 24 * 60 * 60` (30d) so
+ *      `remaining > OPERATOR_TOKEN_AUTO_ROTATE_THRESHOLD_SECONDS` and the
+ *      helper returns the token as-is (`status.kind === "fresh"`). This
+ *      is the pattern in `bootstrapWithOperatorScopes` (hub#222 tests).
+ *   2. **Non-operator audience.** Sign with `audience: "scribe"` (or any
+ *      non-`"operator"` value) so the line ~398 guard fires
+ *      (`status.kind === "skipped"`, `reason: "aud-mismatch"`). This is
+ *      the pattern in the pre-#222 narrow-rejection test.
+ *
+ * `aud: "operator"` + short TTL + recognized `pa_scope_set` is the
+ * auto-rotation path. `aud: "operator"` + short TTL + missing/invalid
+ * `pa_scope_set` lands on the no-scope-set skip (hub#224). Either way,
+ * if you're seeing a "narrow token magically became admin," check
+ * the test's `audience` + TTL first.
  */
 export async function useOperatorTokenWithAutoRotate(
   db: Database,
@@ -398,10 +432,18 @@ export async function useOperatorTokenWithAutoRotate(
     // invalid-token error downstream.
     return { token, payload, status: { kind: "skipped", reason: "no-sub" } };
   }
+  // Refuse to auto-rotate without a recognized scope-set claim. The prior
+  // behaviour fell back to OPERATOR_TOKEN_DEFAULT_SCOPE_SET (admin), which
+  // silently widened a narrow `aud: "operator"` token of unknown provenance
+  // — hand-crafted or pre-#213 legacy. hub#224's hardening: a missing or
+  // invalid `pa_scope_set` means "I don't know what scope to re-mint under,"
+  // so don't re-mint at all. The operator can recover via an explicit
+  // `parachute auth rotate-operator` (which always sets the claim).
   const claimedSet = payload[OPERATOR_TOKEN_SCOPE_SET_CLAIM];
-  const scopeSet: OperatorScopeSet = isOperatorScopeSet(claimedSet)
-    ? claimedSet
-    : OPERATOR_TOKEN_DEFAULT_SCOPE_SET;
+  if (!isOperatorScopeSet(claimedSet)) {
+    return { token, payload, status: { kind: "skipped", reason: "no-scope-set" } };
+  }
+  const scopeSet: OperatorScopeSet = claimedSet;
   const issued = await issueOperatorToken(db, sub, {
     dir,
     issuer: opts.issuer,
