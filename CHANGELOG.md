@@ -2,6 +2,18 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.9-rc.9] - 2026-05-16
+
+Pre-stable auth hygiene bundle (closes #216, #224, #236).
+
+**#216 — Disambiguate `UsedOperatorToken.refreshed` semantics.** The prior `refreshed: boolean` field on `useOperatorTokenWithAutoRotate`'s return value conflated three operationally distinct outcomes under a single `false` value: token is fresh, token is within window but rotation skipped by the audience guard, or token is within window but rotation skipped by a missing `sub` claim. Replace with a tagged union `status: RotationStatus = { kind: "fresh" } | { kind: "rotated" } | { kind: "skipped"; reason: "aud-mismatch" | "no-sub" | "no-scope-set" }`. No production caller read `.refreshed` (audited via grep — only test sites); the `rotated` companion field that callers actually branch on is unchanged. Future telemetry / admin UI (hub#212 Phase 2 territory) can branch on `skipped.reason`.
+
+**#224 — Refuse to auto-rotate without a recognized `pa_scope_set` claim.** The audit traced a "test paradox" to its root: when a JWT carries `aud: operator` + short TTL but lacks (or has an unrecognized) `pa_scope_set` claim, the prior auto-rotation path silently widened it to the default scope-set (admin). No live operational risk — legitimately-issued operator tokens always carry the claim — but the widening surface was a defense-in-depth gap and a test-author footgun. Now returns `status: { kind: "skipped", reason: "no-scope-set" }` instead of widening; operators with a legacy or hand-crafted token without the claim must `parachute auth rotate-operator` to recover. A new "Test-author note" section in `useOperatorTokenWithAutoRotate`'s docstring spells out the two safe shapes for tests that stash JWTs at the operator path (long TTL or non-operator audience) so the pre-#222 + #222 trace doesn't re-surface.
+
+**#236 — Pin OAuth silent-approve gate end-to-end + document flow.** The skip-consent gate in `handleAuthorizeGet` (the load-bearing piece of "first Notes use prompts for consent; subsequent uses are seamless") had per-branch tests but no single end-to-end test walking the operator-visible state machine. Add a "first-use consent → silent-approve → novel-scope re-prompts" regression test that exercises the full flow in one body: fresh state, consent screen, approve, second-use silent-approve, third-use with novel scope re-prompts. The novel-scope assertion is the security-critical leg — silent-approve must not silently approve scopes the user never consented to. Plus a JSDoc block on `handleAuthorizeGet` spelling out the five-step flow (first → silent → subset → novel → revoke), the two gate constraints (unnamed-vault verbs, client re-registration), and pointing at the regression test. Operator-facing prose (parachute.computer blog) is the site tentacle's territory.
+
+Gate: `bun test ./src` 1286 pass / 1 fail (same pre-existing `status > all-healthy returns 0` env flake) / 30386 expects across 70 files. +2 tests over rc.8 (no-scope-set skip regression in operator-token; end-to-end silent-approve flow in oauth-handlers). typecheck clean. biome clean.
+
 ## [0.5.9-rc.8] - 2026-05-16
 
 Pre-stable polish bundle (closes #227, #229, #219).
