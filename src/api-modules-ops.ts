@@ -23,21 +23,34 @@
  * the source of truth post-restart. The UI re-polls /api/modules to
  * re-derive what's actually installed.
  *
- * Bearer-gated on `parachute:host:auth` like the rest of the
- * /api/modules surface.
+ * Bearer-gated on `parachute:host:admin` (destructive ops). Diverges
+ * from the read-only `/api/modules` GET which sits on the broader
+ * `:host:auth` scope: reading the catalog is part of the auth
+ * surface, mutating it is admin-only. A `:auth`-only automation token
+ * gets 403 here; the SPA's host-admin mint
+ * (`/admin/host-admin-token`) carries both scopes so the UI path is
+ * unaffected.
  */
 
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import { FIRST_PARTY_FALLBACKS, type ServiceSpec, composeServiceSpec } from "./service-spec.ts";
 import { findService, readManifest, removeService } from "./services-manifest.ts";
 import type { ModuleState, SpawnRequest, Supervisor } from "./supervisor.ts";
 
-/** Scope required for every POST + operation-poll endpoint here. */
-export const API_MODULES_OPS_REQUIRED_SCOPE = "parachute:host:auth";
+/**
+ * Scope required for every POST + operation-poll endpoint here.
+ *
+ * `:host:admin` (not `:host:auth`) because install / upgrade /
+ * uninstall change the running set of system components — destructive
+ * by definition. The SPA mints both scopes through
+ * `/admin/host-admin-token` so its bearer carries this; an automation
+ * caller minted with `--scope-set auth` gets 403 from these endpoints,
+ * which is the intended security boundary.
+ */
+export const API_MODULES_OPS_REQUIRED_SCOPE = "parachute:host:admin";
 
 export type OperationKind = "install" | "upgrade" | "restart" | "uninstall";
 export type OperationStatus = "pending" | "running" | "succeeded" | "failed";
@@ -517,8 +530,3 @@ function acceptedOp(opId: string): Response {
     headers: { "content-type": "application/json" },
   });
 }
-
-// Suppress unused-import warning — kept around for the future
-// install-dir surface where we'll need to existsSync the bun globals
-// prefix before reporting "installed."
-void existsSync;

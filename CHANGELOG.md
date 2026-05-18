@@ -2,6 +2,10 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.4] - 2026-05-18
+
+Fold reviewer security nit on hub#262: destructive POST endpoints (`install` / `restart` / `upgrade` / `uninstall`) now require `parachute:host:admin` (was `parachute:host:auth`). The `:auth` scope reads the catalog; `:admin` mutates it. SPA path unaffected (host-admin token carries both scopes); narrow `--scope-set auth` automation tokens now correctly get 403 on destructive operations. Also drops dead `existsSync` import. +1 test asserting the 403 path.
+
 ## [0.5.10-rc.3] - 2026-05-18
 
 Admin module management for v0.6 Render self-host (closes #260, Phase 1A). The cloud-deployed hub starts empty; this PR makes vault / notes / scribe installable from the SPA so a friend who clicks Deploy can stand up the full stack without leaving the browser.

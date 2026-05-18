@@ -165,7 +165,7 @@ describe("POST /api/modules/:short/install", () => {
     expect(res.status).toBe(401);
   });
 
-  test("returns 403 on bearer without parachute:host:auth scope", async () => {
+  test("returns 403 on bearer without parachute:host:admin scope", async () => {
     const { supervisor } = makeIdleSupervisor();
     const bearer = await mintBearer(h, ["scribe:transcribe"]);
     const res = await handleInstall(
@@ -181,6 +181,31 @@ describe("POST /api/modules/:short/install", () => {
       },
     );
     expect(res.status).toBe(403);
+  });
+
+  test("returns 403 on bearer with only :host:auth (not :host:admin) — destructive ops elevated", async () => {
+    // `:host:auth` is the read-only catalog scope (`GET /api/modules`).
+    // Destructive POSTs are admin-only. Mint a token that carries
+    // *only* `:auth` and confirm install is refused — the boundary
+    // that keeps automation callers from uninstalling vault.
+    const { supervisor } = makeIdleSupervisor();
+    const bearer = await mintBearer(h, ["parachute:host:auth"]);
+    const res = await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run: async () => 0,
+      },
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("insufficient_scope");
+    expect(body.error_description).toContain("parachute:host:admin");
   });
 
   test("202 + operation_id, runs bun add + seeds services.json + spawns", async () => {
