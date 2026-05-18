@@ -131,6 +131,7 @@ import {
 import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 import { findActiveSession } from "./sessions.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
+import type { Supervisor } from "./supervisor.ts";
 import { getUserById, userCount } from "./users.ts";
 import {
   WELL_KNOWN_DIR,
@@ -563,6 +564,15 @@ export interface HubFetchDeps {
    * legitimate access).
    */
   loadExposeHubOrigin?: () => string | undefined;
+  /**
+   * Container-mode child supervisor. When present (under `parachute serve`),
+   * `/api/modules/*` handlers drive install/restart/upgrade/uninstall through
+   * it. Absent under the on-box CLI path (`parachute expose`) where
+   * `commands/lifecycle.ts` owns the detached-pidfile lifecycle instead —
+   * the module-mgmt API in that mode returns 503 with a hint to use the
+   * CLI commands directly.
+   */
+  supervisor?: Supervisor;
 }
 
 /**
