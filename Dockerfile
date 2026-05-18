@@ -76,6 +76,15 @@ ENV PARACHUTE_HOME=/parachute \
     PARACHUTE_BIND_HOST=0.0.0.0 \
     NODE_ENV=production
 
+# Pre-create the persistent-disk mount point and hand it to the non-root
+# `bun` user (uid 1000). Docker creates a VOLUME mount with root:root
+# permissions inheriting the image layer's owner; without this chown the
+# first `mkdirSync('/parachute/well-known')` from `parachute serve` fails
+# with EACCES. Render's disks come up pre-owned per Render's docs but
+# anonymous-volume `docker run` and bind-mount paths both need this seed
+# directory to exist with the right uid.
+RUN mkdir -p /parachute && chown -R bun:bun /parachute
+
 # Render mounts the persistent disk at $PARACHUTE_HOME; declare the volume
 # so a `docker run` without a bind mount still gets an anonymous volume
 # rather than writing under the image layer.
