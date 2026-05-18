@@ -54,6 +54,18 @@ services:
       - key: PARACHUTE_BIND_HOST
         value: 0.0.0.0
 
+      # Pin Bun's global-install root to the persistent disk so modules
+      # installed at runtime via /admin/modules (hub#260) survive
+      # container restarts. `bun add @openparachute/<svc>` resolves the
+      # package to `$BUN_INSTALL/install/global/node_modules/<pkg>`;
+      # module discovery in src/install-source.ts honors this env var,
+      # so the supervisor finds installed children at the new path.
+      # Without this, bun installs to its per-user prefix on the
+      # ephemeral image layer and every redeploy nukes user-installed
+      # modules.
+      - key: BUN_INSTALL
+        value: /parachute/modules
+
       # Canonical public origin baked into the OAuth issuer claim and
       # token aud claims. MUST match the custom domain you attach to
       # this service — issued tokens become invalid if the value drifts

@@ -26,14 +26,18 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-// NOTE: CONFIG_DIR/WELL_KNOWN_DIR are evaluated at import time from process.env.PARACHUTE_HOME.
-// The `env` parameter on `serve()` cannot reroute them — set PARACHUTE_HOME before importing for path isolation.
-import { CONFIG_DIR } from "../config.ts";
+// NOTE: CONFIG_DIR/WELL_KNOWN_DIR/SERVICES_MANIFEST_PATH are evaluated at
+// import time from process.env.PARACHUTE_HOME. The `env` parameter on
+// `serve()` cannot reroute them — set PARACHUTE_HOME before importing for
+// path isolation.
+import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
 import { writeHubFile } from "../hub.ts";
+import { Supervisor } from "../supervisor.ts";
 import { createUser, userCount } from "../users.ts";
 import { WELL_KNOWN_DIR } from "../well-known.ts";
+import { bootSupervisedModules } from "./serve-boot.ts";
 
 export interface ServeOpts {
   /** Override PORT (test-only). Real callers thread env via process.env. */
@@ -44,6 +48,15 @@ export interface ServeOpts {
   env?: NodeJS.ProcessEnv;
   /** Logger seam (test-only). */
   log?: (line: string) => void;
+  /**
+   * Inject a pre-built Supervisor (test-only). Production constructs
+   * one internally with default options; tests pass in a Supervisor
+   * with stubbed spawn/sleep/now so the boot path doesn't try to
+   * `Bun.spawn` real children.
+   */
+  supervisor?: Supervisor;
+  /** Skip the services.json boot pass (test-only). */
+  skipModuleBoot?: boolean;
 }
 
 export interface ServeResult {
@@ -56,6 +69,8 @@ export interface ServeResult {
    * setup-placeholder redirect in hub-server.ts takes over).
    */
   adminBootstrap: "seeded" | "exists" | "needs-setup";
+  /** The supervisor instance — exposed so callers (tests) can introspect / drive it. */
+  supervisor: Supervisor;
 }
 
 const DEFAULT_PORT = 1939;
@@ -133,6 +148,36 @@ export async function serve(opts: ServeOpts = {}): Promise<{
     );
   }
 
+  const supervisor = opts.supervisor ?? new Supervisor();
+
+  // Boot already-installed modules from services.json. In a container,
+  // this is the path that re-spawns vault / notes / scribe after a
+  // restart — the persistent disk preserved both the install (in
+  // `$BUN_INSTALL/install/global/node_modules`) and the row that says
+  // "this module is registered + active." Idempotent: the supervisor
+  // skips modules that are already running.
+  if (!opts.skipModuleBoot) {
+    try {
+      const booted = await bootSupervisedModules(supervisor, {
+        manifestPath: SERVICES_MANIFEST_PATH,
+        configDir: CONFIG_DIR,
+        ...(issuer !== undefined ? { hubOrigin: issuer } : {}),
+        log,
+      });
+      const startedCount = booted.filter((b) => b.status === "started").length;
+      if (startedCount > 0) {
+        log(`parachute serve: supervisor booted ${startedCount} module(s) from services.json.`);
+      }
+    } catch (err) {
+      // A malformed services.json or a single module-spec read failure
+      // shouldn't keep the hub HTTP server from coming up — the
+      // operator can still hit /admin/modules to remediate.
+      log(
+        `parachute serve: module boot failed (${err instanceof Error ? err.message : String(err)}). The hub HTTP server is still starting; visit /admin/modules to remediate.`,
+      );
+    }
+  }
+
   const server = Bun.serve({
     port,
     hostname,
@@ -140,6 +185,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       getDb: () => db,
       issuer,
       loopbackPort: port,
+      supervisor,
     }),
   });
 
@@ -148,8 +194,19 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   );
 
   return {
-    result: { port, ...(issuer !== undefined ? { issuer } : {}), adminBootstrap },
+    result: {
+      port,
+      ...(issuer !== undefined ? { issuer } : {}),
+      adminBootstrap,
+      supervisor,
+    },
     stop: async () => {
+      // Stop supervised children first so they get a clean SIGTERM
+      // before the HTTP server (which they may depend on for hub-issued
+      // tokens) goes away.
+      for (const state of supervisor.list()) {
+        await supervisor.stop(state.short);
+      }
       await server.stop();
       db.close();
     },

@@ -28,6 +28,7 @@ vi.mock("./lib/api.ts", async (orig) => {
     listVaults: vi.fn().mockResolvedValue([]),
     listGrants: vi.fn().mockResolvedValue([]),
     listTokens: vi.fn().mockResolvedValue({ tokens: [], next_cursor: null }),
+    listModules: vi.fn().mockResolvedValue({ modules: [], supervisor_available: false }),
     // App's useEffect hits getMe() on mount. Default mock = signed-out so
     // the AuthIndicator renders the deterministic "Sign in" link rather
     // than racing on a real fetch. Per-test overrides via mockResolvedValue.
@@ -69,6 +70,11 @@ describe("App — brand subtitle (route-derived)", () => {
     expect(screen.getByText(/tokens/i, { selector: ".sub" })).toBeInTheDocument();
   });
 
+  it("/modules renders 'modules'", () => {
+    renderAt("/modules");
+    expect(screen.getByText(/modules/i, { selector: ".sub" })).toBeInTheDocument();
+  });
+
   it("origin root (/) falls back to 'vaults' (the SPA's home)", () => {
     renderAt("/");
     expect(screen.getByText(/vaults/i, { selector: ".sub" })).toBeInTheDocument();
@@ -76,7 +82,7 @@ describe("App — brand subtitle (route-derived)", () => {
 });
 
 describe("App — nav structure", () => {
-  it("renders all nav links in order: brand, Vaults, Permissions, Tokens, Discovery (signed-out)", async () => {
+  it("renders all nav links in order: brand, Vaults, Modules, Permissions, Tokens, Discovery (signed-out)", async () => {
     renderAt("/vaults");
     // Wait for /api/me to resolve so AuthIndicator's "Sign in" link
     // appears in the nav before we snapshot the link order.
@@ -90,6 +96,7 @@ describe("App — nav structure", () => {
       expect.stringMatching(/parachute admin/i),
       "Sign in", // AuthIndicator slot, sits between brand and Vaults
       "Vaults",
+      "Modules",
       "Permissions",
       "Tokens",
       "Discovery",
@@ -221,6 +228,11 @@ describe("App — route rendering", () => {
   it("/tokens renders Tokens (heading 'Tokens')", () => {
     renderAt("/tokens");
     expect(screen.getByRole("heading", { name: /^tokens$/i })).toBeInTheDocument();
+  });
+
+  it("/modules renders Modules (heading 'Modules')", async () => {
+    renderAt("/modules");
+    expect(await screen.findByRole("heading", { name: /^modules$/i })).toBeInTheDocument();
   });
 
   it("origin root (/) renders VaultsList (the SPA's home)", async () => {

@@ -2,6 +2,43 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.4] - 2026-05-18
+
+Fold reviewer security nit on hub#262: destructive POST endpoints (`install` / `restart` / `upgrade` / `uninstall`) now require `parachute:host:admin` (was `parachute:host:auth`). The `:auth` scope reads the catalog; `:admin` mutates it. SPA path unaffected (host-admin token carries both scopes); narrow `--scope-set auth` automation tokens now correctly get 403 on destructive operations. Also drops dead `existsSync` import. +1 test asserting the 403 path.
+
+## [0.5.10-rc.3] - 2026-05-18
+
+Admin module management for v0.6 Render self-host (closes #260, Phase 1A). The cloud-deployed hub starts empty; this PR makes vault / notes / scribe installable from the SPA so a friend who clicks Deploy can stand up the full stack without leaving the browser.
+
+**Per-module child supervisor.** New `src/supervisor.ts` attaches each module as a Bun.spawn child, line-prefixes their stdout/stderr into hub's own (so Render's log viewer shows `[vault] …` alongside `[scribe] …`), and restarts on crash with a sliding-window budget (3 in 60s by default; then `crashed`). Idempotent `start()`, explicit `restart()`, `list()`/`get()` for the API surface. The on-box `parachute start <svc>` path stays on `commands/lifecycle.ts` — different ownership.
+
+**Boot-time auto-start.** `parachute serve` reads services.json after admin-seed and hands each registered module to the supervisor. Empty services.json (fresh container) is a no-op — hub HTTP server still comes up so the operator can install via UI. Per-module `.env` is layered under `PARACHUTE_HUB_ORIGIN` (live env wins on collision).
+
+**Module management API.** Six endpoints under `/api/modules/*`, all bearer-gated on `parachute:host:auth`:
+
+- `GET /api/modules` — curated catalog (vault/notes/scribe) joined with services.json + supervisor state + npm `@latest` probe (3s timeout, 5min cache). Returns `supervisor_available: false` under CLI mode so the SPA disables actions cleanly.
+- `POST /api/modules/:short/install` — async. `bun add -g @openparachute/<svc>@latest` → seed services.json → supervisor.start. Returns 202 + `{operation_id}`. Idempotent: already-running short-circuits to `succeeded`.
+- `POST /api/modules/:short/restart` — sync. supervisor.restart. Returns the new state.
+- `POST /api/modules/:short/upgrade` — async. `bun add @latest` → supervisor.restart.
+- `POST /api/modules/:short/uninstall` — sync. Stop child → remove services.json row → `bun remove -g`. Each step idempotent.
+- `GET /api/modules/operations/:id` — poll an async op (`pending` → `running` → `succeeded`|`failed`). The SPA polls every 1s.
+
+Curated-only for v0.6 — `parseModulesPath` refuses non-vault/notes/scribe shorts. Channel is exploration, not committed-core; marketplace is Phase 2.
+
+**`/admin/modules` SPA page.** New `web/ui/src/routes/Modules.tsx`. Lists every curated module with status badge (`running` / `stopped` / `crashed` / `starting` / `restarting` / not-installed), version pair (installed → latest), and per-row action buttons. Async ops show inline progress + the operation log; sync errors stay on the row banner until the next action.
+
+**Container plumbing.** Dockerfile sets `BUN_INSTALL=/parachute/modules` so modules installed via `bun add` land on the persistent disk and survive container restarts. The runtime stage chowns `/parachute` to uid 1000 (the non-root `bun` user) so the volume is writable on first boot. render.yaml carries the env defaults Render injects on Deploy.
+
+Surface summary:
+- 6 new modules: `src/supervisor.ts`, `src/commands/serve-boot.ts`, `src/api-modules.ts`, `src/api-modules-ops.ts`, `web/ui/src/routes/Modules.tsx`, `web/ui/src/routes/Modules.test.tsx`.
+- 6 modules edited: `src/commands/serve.ts` (boot-spawn wiring), `src/hub-server.ts` (HubFetchDeps.supervisor + 6 route additions), `web/ui/src/lib/api.ts` (6 new client helpers), `web/ui/src/App.tsx` (nav + route), `Dockerfile` (BUN_INSTALL + chown), `render.yaml` (env defaults).
+
+Gate: `bun test ./src` 1347 pass / 1 fail (pre-existing `status > all-healthy returns 0` env flake) / 30555 expects across 76 files. +40 over rc.2 (12 supervisor + 6 serve-boot + 8 api-modules + 14 api-modules-ops). `cd web/ui && bun run test` 115 pass / 0 fail (+10 Modules.test.tsx). typecheck clean. biome clean.
+
+Container smoke deferred to the operator's Render dashboard verification — local docker build was not exercised in this PR (no docker daemon available). The supervisor + boot-spawn + module-mgmt-API layers are unit-tested against stubbed spawn/run seams; the Render-side smoke (build image → install vault via UI → restart container → verify persistence) is the final v0.6 gate before promotion to stable.
+
+Phase 1B (real-time module status updates, per-module log streaming in the SPA) is deferred to a follow-up PR — this one is already ~1300 LOC across both server + SPA.
+
 ## [0.5.10-rc.2] - 2026-05-18
 
 Reviewer nits folded — render.yaml comments + DB close on stop + CONFIG_DIR note.
