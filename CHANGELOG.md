@@ -2,6 +2,59 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.1] - 2026-05-18
+
+Render self-host foundation (closes #258). Three sub-changes ship together so
+the container-deploy path arrives in one revert-able PR:
+
+- **`Dockerfile`** — multi-stage `oven/bun:1.3-alpine` build. Stage 1 installs
+  with `--frozen-lockfile --ignore-scripts`, then runs `bun run build:spa`
+  explicitly so the install layer stays source-independent. Stage 2 copies the
+  built SPA + `node_modules` + source, declares `PARACHUTE_HOME=/parachute` as
+  the persistent-disk mount, exposes 1939, runs as non-root `bun` user under
+  `tini` for clean signal handling, and entrypoints `bun src/cli.ts serve`.
+  `.dockerignore` prunes the build context (node_modules, .git, dist, OS
+  junk, CHANGELOG, etc.) so layer caches stay tight.
+- **`render.yaml`** — Render Blueprint. One web service backed by the
+  Dockerfile, persistent 1 GB disk mounted at `/parachute` (`PARACHUTE_HOME`),
+  `/health` health check, and `sync: false` placeholders for the public
+  origin + admin seed env vars so a fresh deploy prompts the operator for
+  each via the dashboard rather than baking secrets into the repo.
+- **`parachute serve` foreground entrypoint** — new subcommand for the
+  container-supervisor shape. Reads `PORT` (default 1939), `PARACHUTE_HUB_ORIGIN`,
+  and `PARACHUTE_BIND_HOST` from env; binds the hub HTTP listener on
+  `0.0.0.0` by default; auto-writes the static `hub.html` on a fresh disk
+  so `/` serves a discovery page without `parachute expose` having to run
+  first.
+- **Env-driven first-boot seed + `/admin/setup` placeholder + pre-admin
+  503 gate.** `parachute serve` reads `PARACHUTE_INITIAL_ADMIN_USERNAME` +
+  `PARACHUTE_INITIAL_ADMIN_PASSWORD` on first boot; when no admin row
+  exists and both are set, seeds the admin via `createUser`, logs
+  `seeded initial admin "<name>" from PARACHUTE_INITIAL_ADMIN_*` to stdout,
+  and proceeds. Boot-time idempotent — once an admin exists the env vars
+  are ignored, so leaving them set across restarts is safe. When no admin
+  and no seed, the hub still comes up and a placeholder page lives at
+  `/admin/setup` pointing at the env-var path; admin-onboarding-coupled
+  surfaces (`/login`, `/logout`, `/admin/*` except `/admin/setup`,
+  `/api/*`) return `{error: "setup_required", setup_url: "/admin/setup"}`
+  until an admin is configured. `/health`, `/`, `/.well-known/*`,
+  `/oauth/*`, and content proxies (`/vault/*`, generic `/<service>/*`)
+  pass through the gate untouched — third-party OAuth and JWKS-driven
+  verification don't depend on admin onboarding. Once any admin exists,
+  the gate is a no-op. The real wizard ships in hub#259.
+
+`hub-server.ts` also gains a `/health` route (200 JSON with status +
+service + version) that's been advertised in the issue but wasn't
+actually wired before, plus env-aware `parseArgs` so `bun src/hub-server.ts`
+works without any flags when `PORT` / `PARACHUTE_HUB_ORIGIN` /
+`PARACHUTE_BIND_HOST` are set (the container path).
+
+Gate: `bun test ./src` 1307 pass / 1 fail (same pre-existing
+`status > all-healthy returns 0` env flake carried since 0.5.9-rc.8) /
+30443 expects across 72 files. +19 over 0.5.9 (5 in `serve.test.ts`,
+9 in `setup-gate.test.ts`, 5 incremental coverage in `hub-server.test.ts`).
+typecheck clean. biome clean.
+
 ## [0.5.9] - 2026-05-17
 
 Stable release. Promotes from `0.5.9-rc.9` after pre-stable polish + auth-hygiene
