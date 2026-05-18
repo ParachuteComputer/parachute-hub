@@ -1,0 +1,80 @@
+# Render Blueprint for self-hosting @openparachute/hub.
+#
+# Layout: one `web` service (the hub HTTP server) backed by a persistent
+# disk at /parachute. Notes is served by hub via the `notes-serve.ts`
+# shim once installed — no separate Render service for it. Vault gets its
+# own Render Blueprint (separate repo).
+#
+# To use: connect a fresh Render account to a fork of this repo and click
+# "New Blueprint" → point at this file. Render will provision the
+# service + disk and start the build. Set the admin-seed env vars in the
+# Render dashboard (marked `sync: false`) or use the web wizard at
+# `/admin/setup` after the first deploy.
+#
+# Custom domains: add the domain on the Render service page, then set
+# PARACHUTE_HUB_ORIGIN to `https://<your-domain>`. The OAuth issuer claim
+# is baked from this value, so issued tokens are only valid against the
+# canonical origin.
+
+services:
+  - type: web
+    name: parachute-hub
+    runtime: docker
+    plan: starter
+    # Health check at /health — implemented at the very top of hub's
+    # request dispatch so a wedged DB or busted services.json can't
+    # cascade into a Render restart loop.
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: parachute-home
+      mountPath: /parachute
+      # 1 GiB covers the hub.db + per-vault data for a single operator.
+      # Bump in the Render dashboard if you're hosting multiple
+      # high-traffic vaults; Render resizes online (no redeploy).
+      sizeGB: 1
+    envVars:
+      # The persistent disk mount. Hub honors this for `~/.parachute/`,
+      # so hub.db, services.json, well-known/, and per-service dirs all
+      # land on the persistent volume rather than the ephemeral
+      # container filesystem.
+      - key: PARACHUTE_HOME
+        value: /parachute
+
+      # Container listens on whatever port Render injects via $PORT.
+      # Render's HTTP forwarder maps the public 443 → this port.
+      - key: PORT
+        value: 1939
+
+      # Bind to all interfaces inside the container so Render's HTTP
+      # forwarder can reach us — the on-box `parachute expose` default
+      # of 127.0.0.1 only works behind a same-host reverse proxy.
+      - key: PARACHUTE_BIND_HOST
+        value: 0.0.0.0
+
+      # Canonical public origin baked into the OAuth issuer claim and
+      # token aud claims. MUST match the custom domain you attach to
+      # this service — issued tokens become invalid if the value drifts
+      # from the actual request origin.
+      #
+      # `sync: false` because each operator's Render deploy has a
+      # different hostname; the dashboard prompts on first deploy.
+      - key: PARACHUTE_HUB_ORIGIN
+        sync: false
+
+      # First-boot admin seed. Optional — if unset, the hub still comes
+      # up and routes non-/.well-known requests to /admin/setup so the
+      # operator can bootstrap via the web wizard.
+      #
+      # `sync: false` so secrets never land in source control. Setting
+      # these is a one-time act; once an admin exists in hub.db, the
+      # seed code path is a no-op even if the env vars stay set.
+      - key: PARACHUTE_INITIAL_ADMIN_USERNAME
+        sync: false
+      - key: PARACHUTE_INITIAL_ADMIN_PASSWORD
+        sync: false
+
+      # Run with a sensible Node-style production hint. Bun honors this
+      # for any libraries that branch on NODE_ENV.
+      - key: NODE_ENV
+        value: production
