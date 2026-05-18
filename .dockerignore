@@ -1,0 +1,50 @@
+# Keep the build context small — Docker uploads everything not listed here
+# to the daemon on every build.
+
+# VCS + editor noise
+.git
+.gitignore
+.github
+.vscode
+.idea
+*.swp
+*.swo
+
+# Install artifacts (re-installed inside the builder stage)
+node_modules
+**/node_modules
+.bun
+
+# Build artifacts (the builder stage rebuilds the SPA)
+web/ui/dist
+web/ui/tsconfig.tsbuildinfo
+**/dist
+**/*.tsbuildinfo
+coverage
+
+# Local runtime state — never want this baked into an image
+.parachute
+parachute-home
+*.db
+*.db-journal
+*.log
+
+# Docs / launch artifacts — not needed at runtime
+docs
+LAUNCH_SMOKE.md
+RELEASE-NOTES-*.md
+WAKE-UP-*.md
+BETA-EMAIL-*.md
+CHANGELOG.md
+
+# Test snapshots / fixtures that aren't needed in the image
+**/__snapshots__
+**/*.test.ts.snap
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Don't ship the Dockerfile itself into the image
+Dockerfile
+.dockerignore

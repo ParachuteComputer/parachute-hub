@@ -17,6 +17,7 @@ Usage:
   parachute logs <service> [-f]     print service logs; -f to tail
   parachute expose tailnet [off]    HTTPS across your tailnet (supported)
   parachute expose public  [off]    HTTPS on the public internet (exploratory)
+  parachute serve                   run hub HTTP server foregrounded (for containers)
   parachute migrate [--dry-run]     archive legacy files at ecosystem root
   parachute auth <cmd>              identity (set password, manage 2FA)
   parachute vault <args...>         vault-specific ops (tokens, 2fa, config, init,
@@ -367,6 +368,47 @@ Log file:
   ~/.parachute/<service>/logs/<service>.log
 
 If no log file exists yet, prints a hint to \`parachute start <service>\`.
+`;
+}
+
+export function serveHelp(): string {
+  return `parachute serve — run the hub HTTP server foregrounded
+
+Usage:
+  parachute serve
+
+The container shape. The on-box CLI flow (\`parachute expose\`) spawns the
+hub-server detached and tracks it via pidfile; \`parachute serve\` is the
+inverse — the hub IS the foreground process, lives as long as its
+supervisor wants it to, and exits on signal. Built for Docker / Render /
+systemd, but works fine for a foregrounded local debug too.
+
+Environment:
+  PORT                              bind port (default 1939). Render injects
+                                    this; honor it so the platform's HTTP
+                                    forwarder lands on the right socket.
+  PARACHUTE_HOME                    config root (default ~/.parachute).
+                                    Point at a persistent disk in containers.
+  PARACHUTE_HUB_ORIGIN              canonical https://… origin baked into
+                                    OAuth issuer + token aud claims. Set to
+                                    the public hostname Render / Cloudflare
+                                    serves.
+  PARACHUTE_INITIAL_ADMIN_USERNAME  on first boot when no admin row exists,
+  PARACHUTE_INITIAL_ADMIN_PASSWORD  seed an admin from these. Boot-time
+                                    idempotent — ignored once an admin
+                                    exists, so leaving them set across
+                                    restarts is safe.
+
+If no admin exists and the seed env vars aren't set, the hub still comes
+up — visit \`/admin/setup\` to bootstrap via the placeholder wizard.
+
+Examples:
+  parachute serve                          # foreground, defaults
+  PORT=8080 PARACHUTE_HOME=/parachute parachute serve
+  docker run -e PARACHUTE_INITIAL_ADMIN_USERNAME=ops \\
+             -e PARACHUTE_INITIAL_ADMIN_PASSWORD=… \\
+             -v parachute-data:/parachute \\
+             parachute-hub:0.5.10 serve
 `;
 }
 

@@ -9,6 +9,7 @@ import { findServiceUpstream, findVaultUpstream, hubFetch, layerOf } from "../hu
 import { pidPath } from "../process-state.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
+import { createUser } from "../users.ts";
 
 interface Harness {
   dir: string;
@@ -909,6 +910,11 @@ describe("hubFetch routing", () => {
     try {
       const db = openHubDb(hubDbPath(h.dir));
       try {
+        // Seed an admin so the pre-admin setup gate (hub#258) doesn't
+        // 503 the request before the OAuth method-allow check runs.
+        // OAuth routing semantics are what this test pins; the setup
+        // gate has its own coverage in src/__tests__/setup-gate.test.ts.
+        await createUser(db, "owner", "pw");
         const res = await hubFetch(h.dir, { getDb: () => db })(
           req("/oauth/token", { method: "GET" }),
         );
@@ -926,6 +932,7 @@ describe("hubFetch routing", () => {
     try {
       const db = openHubDb(hubDbPath(h.dir));
       try {
+        await createUser(db, "owner", "pw");
         const res = await hubFetch(h.dir, {
           getDb: () => db,
           issuer: "https://hub.example",
@@ -939,6 +946,162 @@ describe("hubFetch routing", () => {
         expect(res.status).toBe(201);
         const body = (await res.json()) as Record<string, unknown>;
         expect(typeof body.client_id).toBe("string");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // Platform health check (hub#258). Returns 200 JSON regardless of DB
+  // state — Render et al. poll this every few seconds and a transient DB
+  // open shouldn't cascade into a restart loop. The body advertises the
+  // running version so a deploy verifier can confirm the rolled-out
+  // image is the one it expected.
+  test("/health returns 200 JSON without invoking the db", async () => {
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir, {
+        getDb: () => {
+          throw new Error("getDb must not be called by /health");
+        },
+      })(req("/health"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("ok");
+      expect(body.service).toBe("parachute-hub");
+      expect(typeof body.version).toBe("string");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // First-boot setup placeholder (hub#258). When no admin exists the page
+  // is the bootstrap onboarding surface; once an admin exists it 301s to
+  // /login so a stale bookmark still lands somewhere useful.
+  test("/admin/setup renders placeholder HTML when no admin exists", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const res = await hubFetch(h.dir, { getDb: () => db })(req("/admin/setup"));
+        expect(res.status).toBe(200);
+        expect(res.headers.get("content-type")).toContain("text/html");
+        const body = await res.text();
+        expect(body).toContain("first-boot setup");
+        expect(body).toContain("PARACHUTE_INITIAL_ADMIN_USERNAME");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/admin/setup 301s to /login when an admin already exists", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        await createUser(db, "owner", "pw");
+        const res = await hubFetch(h.dir, { getDb: () => db })(req("/admin/setup"));
+        expect(res.status).toBe(301);
+        expect(res.headers.get("location")).toBe("/login");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // Pre-admin lockout (hub#258). When no admin row exists, operator-
+  // facing surfaces (admin/api/login) 503 with a JSON body pointing at
+  // /admin/setup. Public surfaces (health, well-known, /, oauth, vault,
+  // /admin/setup itself) stay open so the container is reachable and
+  // OAuth third parties aren't held hostage by admin onboarding.
+  test("pre-admin lockout: /admin/vaults returns 503 setup_required", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const res = await hubFetch(h.dir, { getDb: () => db })(req("/admin/vaults"));
+        expect(res.status).toBe(503);
+        const body = (await res.json()) as Record<string, unknown>;
+        expect(body.error).toBe("setup_required");
+        expect(body.setup_url).toBe("/admin/setup");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("pre-admin lockout: /api/me returns 503 setup_required", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const res = await hubFetch(h.dir, { getDb: () => db })(req("/api/me"));
+        expect(res.status).toBe(503);
+        const body = (await res.json()) as Record<string, unknown>;
+        expect(body.error).toBe("setup_required");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("pre-admin lockout: /login is gated, /admin/setup + /health + well-known stay open", async () => {
+    const h = makeHarness();
+    try {
+      writeFileSync(join(h.dir, "hub.html"), "<html>discovery</html>");
+      writeManifest({ services: [] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const handler = hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath });
+        // /login gated
+        const loginRes = await handler(req("/login"));
+        expect(loginRes.status).toBe(503);
+        // /admin/setup open
+        const setupRes = await handler(req("/admin/setup"));
+        expect(setupRes.status).toBe(200);
+        // /health open
+        const healthRes = await handler(req("/health"));
+        expect(healthRes.status).toBe(200);
+        // / open
+        const rootRes = await handler(req("/"));
+        expect(rootRes.status).toBe(200);
+        // /.well-known/parachute.json open
+        const wkRes = await handler(req("/.well-known/parachute.json"));
+        expect(wkRes.status).toBe(200);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("pre-admin lockout falls away once an admin exists", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        // Before: /api/me 503s under the lockout.
+        const before = await hubFetch(h.dir, { getDb: () => db })(req("/api/me"));
+        expect(before.status).toBe(503);
+        // After seeding an admin: dispatch resumes normal handling.
+        await createUser(db, "owner", "pw");
+        const after = await hubFetch(h.dir, { getDb: () => db })(req("/api/me"));
+        // /api/me with no session returns `hasSession: false` 200, not 503.
+        expect(after.status).toBe(200);
       } finally {
         db.close();
       }

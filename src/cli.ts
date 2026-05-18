@@ -13,6 +13,7 @@ import { exposePublic, exposeTailnet } from "./commands/expose.ts";
 import { install } from "./commands/install.ts";
 import { logs, restart, start, stop } from "./commands/lifecycle.ts";
 import { migrate } from "./commands/migrate.ts";
+import { serve } from "./commands/serve.ts";
 import { setup } from "./commands/setup.ts";
 import { status } from "./commands/status.ts";
 import { upgrade } from "./commands/upgrade.ts";
@@ -24,6 +25,7 @@ import {
   logsHelp,
   migrateHelp,
   restartHelp,
+  serveHelp,
   setupHelp,
   startHelp,
   statusHelp,
@@ -587,6 +589,32 @@ async function main(argv: string[]): Promise<number> {
         return 1;
       }
       return await migrate({ dryRun, yes });
+    }
+
+    case "serve": {
+      if (isHelpFlag(rest[0])) {
+        console.log(serveHelp());
+        return 0;
+      }
+      if (rest.length > 0) {
+        console.error(`parachute serve: unexpected argument "${rest[0]}"`);
+        console.error("usage: parachute serve");
+        return 1;
+      }
+      // `serve` returns once Bun.serve is bound; the listener keeps the
+      // event loop alive until SIGINT/SIGTERM, at which point we stop the
+      // server cleanly and exit. Container supervisor (tini, Render, Docker)
+      // reaps us once the event loop drains.
+      const { stop: stopServer } = await serve();
+      await new Promise<void>((resolve) => {
+        const handler = async () => {
+          await stopServer();
+          resolve();
+        };
+        process.on("SIGINT", handler);
+        process.on("SIGTERM", handler);
+      });
+      return 0;
     }
 
     case "auth":
