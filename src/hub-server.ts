@@ -42,6 +42,11 @@
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
  *   /api/modules                  (GET)        → curated + installed module catalog (host:auth)
+ *   /api/modules/:short/install   (POST)       → bun add + spawn (async op)
+ *   /api/modules/:short/restart   (POST)       → supervisor restart (sync)
+ *   /api/modules/:short/upgrade   (POST)       → bun add @latest + restart (async op)
+ *   /api/modules/:short/uninstall (POST)       → stop child + bun remove + drop row (sync)
+ *   /api/modules/operations/:id   (GET)        → poll async op status
  *   /api/auth/mint-token          (POST)       → CLI/automation token mint (bearer)
  *   /api/auth/revoke-token        (POST)       → revoke registry-row token by jti
  *   /api/auth/tokens              (GET)        → paginated registry list
@@ -99,11 +104,19 @@ import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
 import { handleApiMe } from "./api-me.ts";
 import { handleApiMintToken } from "./api-mint-token.ts";
+import {
+  handleInstall,
+  handleOperationGet,
+  handleRestart,
+  handleUninstall,
+  handleUpgrade,
+  parseModulesPath,
+} from "./api-modules-ops.ts";
 import { handleApiModules } from "./api-modules.ts";
 import { REVOCATION_LIST_MOUNT, handleRevocationList } from "./api-revocation-list.ts";
 import { handleApiRevokeToken } from "./api-revoke-token.ts";
 import { handleApiTokens } from "./api-tokens.ts";
-import { SERVICES_MANIFEST_PATH } from "./config.ts";
+import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
 import { ensureCsrfToken } from "./csrf.ts";
 import { readExposeState } from "./expose-state.ts";
 import { HUB_DEFAULT_PORT, HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
@@ -1295,6 +1308,68 @@ export function hubFetch(
       };
       if (deps?.supervisor !== undefined) modulesDeps.supervisor = deps.supervisor;
       return handleApiModules(req, modulesDeps);
+    }
+
+    // Module operation poll surface — pre-empts the /api/modules/:short/*
+    // routes below so `/api/modules/operations/<uuid>` doesn't accidentally
+    // match a parseModulesPath("/operations") and fall through.
+    if (pathname.startsWith("/api/modules/operations/")) {
+      if (!getDb) return dbNotConfigured();
+      if (!deps?.supervisor) {
+        return new Response(
+          JSON.stringify({
+            error: "supervisor_unavailable",
+            error_description:
+              "module operations require `parachute serve` (supervisor mode); on-box CLI uses `parachute install/upgrade/restart`",
+          }),
+          { status: 503, headers: { "content-type": "application/json" } },
+        );
+      }
+      const opId = decodeURIComponent(pathname.slice("/api/modules/operations/".length));
+      if (!opId || opId.includes("/")) return new Response("not found", { status: 404 });
+      return handleOperationGet(req, opId, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
+        configDir: CONFIG_DIR,
+        supervisor: deps.supervisor,
+      });
+    }
+
+    // Per-module action endpoints: /api/modules/:short/{install,restart,upgrade,uninstall}.
+    if (pathname.startsWith("/api/modules/")) {
+      if (!getDb) return dbNotConfigured();
+      if (!deps?.supervisor) {
+        return new Response(
+          JSON.stringify({
+            error: "supervisor_unavailable",
+            error_description:
+              "module operations require `parachute serve` (supervisor mode); on-box CLI uses `parachute install/upgrade/restart`",
+          }),
+          { status: 503, headers: { "content-type": "application/json" } },
+        );
+      }
+      const match = parseModulesPath(pathname);
+      if (!match) return new Response("not found", { status: 404 });
+      const opsDeps = {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
+        configDir: CONFIG_DIR,
+        supervisor: deps.supervisor,
+      };
+      switch (match.rest) {
+        case "install":
+          return handleInstall(req, match.short, opsDeps);
+        case "restart":
+          return handleRestart(req, match.short, opsDeps);
+        case "upgrade":
+          return handleUpgrade(req, match.short, opsDeps);
+        case "uninstall":
+          return handleUninstall(req, match.short, opsDeps);
+        default:
+          return new Response("not found", { status: 404 });
+      }
     }
 
     if (pathname === "/api/auth/mint-token") {
