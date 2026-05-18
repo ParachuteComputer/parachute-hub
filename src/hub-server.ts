@@ -41,6 +41,7 @@
  *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
+ *   /api/modules                  (GET)        → curated + installed module catalog (host:auth)
  *   /api/auth/mint-token          (POST)       → CLI/automation token mint (bearer)
  *   /api/auth/revoke-token        (POST)       → revoke registry-row token by jti
  *   /api/auth/tokens              (GET)        → paginated registry list
@@ -98,6 +99,7 @@ import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
 import { handleApiMe } from "./api-me.ts";
 import { handleApiMintToken } from "./api-mint-token.ts";
+import { handleApiModules } from "./api-modules.ts";
 import { REVOCATION_LIST_MOUNT, handleRevocationList } from "./api-revocation-list.ts";
 import { handleApiRevokeToken } from "./api-revoke-token.ts";
 import { handleApiTokens } from "./api-tokens.ts";
@@ -1282,6 +1284,17 @@ export function hubFetch(
     if (pathname === "/api/me") {
       if (!getDb) return dbNotConfigured();
       return handleApiMe(req, { db: getDb() });
+    }
+
+    if (pathname === "/api/modules") {
+      if (!getDb) return dbNotConfigured();
+      const modulesDeps: Parameters<typeof handleApiModules>[1] = {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
+      };
+      if (deps?.supervisor !== undefined) modulesDeps.supervisor = deps.supervisor;
+      return handleApiModules(req, modulesDeps);
     }
 
     if (pathname === "/api/auth/mint-token") {
