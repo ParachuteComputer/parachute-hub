@@ -25,6 +25,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import { type MeResponse, getMe, signOut } from "./lib/api.ts";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
+import { Modules } from "./routes/Modules.tsx";
 import { NewVault } from "./routes/NewVault.tsx";
 import { Permissions } from "./routes/Permissions.tsx";
 import { Tokens } from "./routes/Tokens.tsx";
@@ -41,6 +42,9 @@ function subtitleFor(pathname: string): string {
   }
   if (pathname === "/tokens" || pathname.startsWith("/tokens/")) {
     return "tokens";
+  }
+  if (pathname === "/modules" || pathname.startsWith("/modules/")) {
+    return "modules";
   }
   if (pathname.startsWith("/approve-client/")) {
     return "approve app";
@@ -99,6 +103,7 @@ export function App() {
         </Link>
         <AuthIndicator me={me} signingOut={signingOut} onSignOut={onSignOut} />
         <Link to="/vaults">Vaults</Link>
+        <Link to="/modules">Modules</Link>
         <Link to="/permissions">Permissions</Link>
         <Link to="/tokens">Tokens</Link>
         <span className="nav-divider" aria-hidden="true" />
@@ -111,6 +116,7 @@ export function App() {
         <Route path="/" element={<VaultsList />} />
         <Route path="/vaults" element={<VaultsList />} />
         <Route path="/vaults/new" element={<NewVault />} />
+        <Route path="/modules" element={<Modules />} />
         <Route path="/permissions" element={<Permissions />} />
         <Route path="/tokens" element={<Tokens />} />
         <Route path="/approve-client/:clientId" element={<ApproveClient />} />

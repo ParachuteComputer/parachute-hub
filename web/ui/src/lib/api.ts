@@ -529,6 +529,152 @@ export async function approveOauthClient(clientId: string): Promise<ApproveClien
   return (await res.json()) as ApproveClientResult;
 }
 
+/**
+ * One row from `GET /api/modules`. Mirrors the snake_case wire shape
+ * from `src/api-modules.ts`.
+ */
+export interface ModuleListing {
+  short: string;
+  package: string;
+  display_name: string;
+  tagline: string;
+  available: boolean;
+  installed: boolean;
+  installed_version: string | null;
+  latest_version: string | null;
+  supervisor_status: "starting" | "running" | "stopped" | "crashed" | "restarting" | null;
+  pid: number | null;
+  install_dir: string | null;
+}
+
+/** Top-level shape from `GET /api/modules`. */
+export interface ModulesCatalog {
+  modules: ModuleListing[];
+  /**
+   * When false, install/restart/upgrade/uninstall actions are disabled
+   * — the hub is in CLI mode (no supervisor wired) and the operator
+   * should use `parachute install/upgrade/restart` from a shell.
+   */
+  supervisor_available: boolean;
+}
+
+/**
+ * GET /api/modules — read-side module catalog. Combines availability +
+ * installed-version + supervisor state + npm @latest. Same Bearer
+ * pattern as `listGrants` / `listTokens`.
+ */
+export async function listModules(): Promise<ModulesCatalog> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/modules", {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as ModulesCatalog;
+}
+
+/** Operation kinds returned by `POST /api/modules/:short/*`. */
+export type ModuleOperationKind = "install" | "upgrade" | "restart" | "uninstall";
+export type ModuleOperationStatus = "pending" | "running" | "succeeded" | "failed";
+
+export interface ModuleOperation {
+  id: string;
+  kind: ModuleOperationKind;
+  short: string;
+  status: ModuleOperationStatus;
+  log: string[];
+  error?: string;
+  startedAt: string;
+  finishedAt?: string;
+}
+
+/** Sync action response shape (restart, uninstall). */
+export interface ModuleActionResult {
+  short: string;
+  state?: { status: string; pid?: number };
+  log?: string[];
+}
+
+async function postModuleAction(short: string, action: ModuleOperationKind): Promise<Response> {
+  const bearer = await getHostAdminToken();
+  return await fetch(`/api/modules/${encodeURIComponent(short)}/${action}`, {
+    method: "POST",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+}
+
+/**
+ * POST /api/modules/:short/install — async. Returns the operation_id;
+ * caller polls `getModuleOperation` until status is terminal.
+ */
+export async function installModule(short: string): Promise<string> {
+  const res = await postModuleAction(short, "install");
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { operation_id: string };
+  return body.operation_id;
+}
+
+/** POST /api/modules/:short/upgrade — async. Same shape as install. */
+export async function upgradeModule(short: string): Promise<string> {
+  const res = await postModuleAction(short, "upgrade");
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { operation_id: string };
+  return body.operation_id;
+}
+
+/** POST /api/modules/:short/restart — synchronous. */
+export async function restartModule(short: string): Promise<ModuleActionResult> {
+  const res = await postModuleAction(short, "restart");
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as ModuleActionResult;
+}
+
+/** POST /api/modules/:short/uninstall — synchronous. */
+export async function uninstallModule(short: string): Promise<ModuleActionResult> {
+  const res = await postModuleAction(short, "uninstall");
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as ModuleActionResult;
+}
+
+/**
+ * GET /api/modules/operations/:id — poll for a long-running operation
+ * kicked off by install or upgrade. Returns 404 (HttpError) when the
+ * id is unknown / expired.
+ */
+export async function getModuleOperation(opId: string): Promise<ModuleOperation> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/modules/operations/${encodeURIComponent(opId)}`, {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as ModuleOperation;
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const text = await res.text();
