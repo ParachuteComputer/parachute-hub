@@ -83,26 +83,38 @@ export function deleteSession(db: Database, id: string): void {
 
 /**
  * Build a `Set-Cookie` header value for the given session id. HttpOnly +
- * SameSite=Lax + Secure (we always assume a TLS terminator; localhost dev
- * still sets Secure because Tailscale serves with HTTPS even on the tailnet
- * mount). Path=/ covers the whole hub origin: the operator's session is "logged
- * into this hub", and admin pages outside /oauth/ (config portal, etc.) ride
- * the same session. State-changing admin POSTs require a CSRF token (see
- * src/csrf.ts) since SameSite=Lax alone doesn't prevent same-site CSRF.
+ * SameSite=Lax + Secure (conditional) + Path=/.
+ *
+ * Path=/ covers the whole hub origin: the operator's session is "logged
+ * into this hub", and admin pages outside /oauth/ (config portal, etc.)
+ * ride the same session. State-changing admin POSTs require a CSRF token
+ * (see src/csrf.ts) since SameSite=Lax alone doesn't prevent same-site
+ * CSRF.
+ *
+ * `Secure` defaults to true (production behind a TLS terminator).
+ * Callers minting the cookie for a known-HTTP request — `/login` POST
+ * over `http://localhost:1939`, the wizard's account POST same — pass
+ * `secure: false` (computed from `isHttpsRequest(req)`) so the
+ * browser actually keeps the cookie. Setting `Secure` unconditionally
+ * over plain HTTP silently drops the cookie and breaks the very next
+ * authenticated request.
  */
-export function buildSessionCookie(sessionId: string, maxAgeSeconds: number): string {
-  return [
-    `${SESSION_COOKIE_NAME}=${sessionId}`,
-    "HttpOnly",
-    "Secure",
-    "SameSite=Lax",
-    "Path=/",
-    `Max-Age=${maxAgeSeconds}`,
-  ].join("; ");
+export function buildSessionCookie(
+  sessionId: string,
+  maxAgeSeconds: number,
+  opts: { secure?: boolean } = {},
+): string {
+  const parts = [`${SESSION_COOKIE_NAME}=${sessionId}`, "HttpOnly"];
+  if (opts.secure !== false) parts.push("Secure");
+  parts.push("SameSite=Lax", "Path=/", `Max-Age=${maxAgeSeconds}`);
+  return parts.join("; ");
 }
 
-export function buildSessionClearCookie(): string {
-  return `${SESSION_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
+export function buildSessionClearCookie(opts: { secure?: boolean } = {}): string {
+  const parts = [`${SESSION_COOKIE_NAME}=`, "HttpOnly"];
+  if (opts.secure !== false) parts.push("Secure");
+  parts.push("SameSite=Lax", "Path=/", "Max-Age=0");
+  return parts.join("; ");
 }
 
 export function parseSessionCookie(cookieHeader: string | null): string | null {

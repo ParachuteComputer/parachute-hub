@@ -47,6 +47,7 @@ import {
   verifyCsrfToken,
 } from "./csrf.ts";
 import { escapeHtml } from "./oauth-ui.ts";
+import { isHttpsRequest } from "./request-protocol.ts";
 import { findService, readManifest } from "./services-manifest.ts";
 import {
   SESSION_TTL_MS,
@@ -551,7 +552,9 @@ export async function handleSetupAccountPost(
   try {
     const user = await createUser(deps.db, username, password);
     const session = createSession(deps.db, { userId: user.id });
-    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
+      secure: isHttpsRequest(req),
+    });
     return redirect("/admin/setup", { "set-cookie": cookie });
   } catch (err) {
     // Log the raw error server-side for the operator's debugging, but
