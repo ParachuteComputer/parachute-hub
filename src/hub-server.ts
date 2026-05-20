@@ -60,6 +60,10 @@
  *   /api/users/<id>               (DELETE)     → hard-delete user + revoke tokens (host:admin)
  *   /login                        (GET + POST) → operator password login
  *   /logout                       (POST)       → end admin session
+ *   /account/change-password      (GET + POST) → user self-service change-password
+ *                                                 (force-redirect target for users
+ *                                                 with password_changed=false; also
+ *                                                 reachable directly to rotate)
  *   /admin/config*                             → 301 → /admin/vaults (legacy
  *                                                portal retired post-SPA-rework)
  *
@@ -106,6 +110,7 @@ import {
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
+import { handleAccountChangePasswordGet, handleAccountChangePasswordPost } from "./api-account.ts";
 import { handleApiMe } from "./api-me.ts";
 import { handleApiMintToken } from "./api-mint-token.ts";
 import {
@@ -1550,6 +1555,24 @@ export function hubFetch(
       if (!getDb) return dbNotConfigured();
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
       return handleAdminLogoutPost(getDb(), req);
+    }
+
+    // Multi-user Phase 1 PR 3 — user self-service change-password surface
+    // (hub#252, design §sign-in flow change). Both GET (render form) and
+    // POST (apply change) require a session cookie. The handler itself
+    // does the session check + 302 to /login when missing — same posture
+    // as the rest of /account/* will use as Phase 2 broadens this prefix.
+    //
+    // This route is intentionally NOT gated by `password_changed === false`
+    // — that's only the *redirect* path from /login. A signed-in user with
+    // `password_changed: true` can still navigate here to rotate their
+    // password (design §"Direct navigation").
+    if (pathname === "/account/change-password") {
+      if (!getDb) return dbNotConfigured();
+      const accountDeps = { db: getDb() };
+      if (req.method === "GET") return handleAccountChangePasswordGet(req, accountDeps);
+      if (req.method === "POST") return handleAccountChangePasswordPost(req, accountDeps);
+      return new Response("method not allowed", { status: 405 });
     }
 
     // Legacy `/admin/config` (server-rendered module-config portal, #46)

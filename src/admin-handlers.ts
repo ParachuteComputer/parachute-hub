@@ -23,7 +23,7 @@ import {
   deleteSession,
   parseSessionCookie,
 } from "./sessions.ts";
-import { getUserByUsername, verifyPassword } from "./users.ts";
+import { PASSWORD_MAX_LEN, type User, getUserByUsername, verifyPassword } from "./users.ts";
 
 function htmlResponse(body: string, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(body, {
@@ -44,11 +44,53 @@ function redirect(location: string, extra: Record<string, string> = {}): Respons
  */
 const POST_LOGIN_DEFAULT = "/admin/vaults";
 
+/**
+ * Force-change-password landing. Multi-user Phase 1 PR 3: when a user
+ * signs in with `password_changed === false` (admin-created account
+ * with the admin's default password), the login POST 302s here instead
+ * of `next`. The original `next` rides along as a query param so the
+ * change-password POST can land them at their intended destination
+ * after they pick a new password.
+ *
+ * Session-level redirect, not token-level — the cookie is minted as
+ * normal; only the redirect target changes. The user IS signed in,
+ * they're just expected to change their password before doing anything
+ * else (the `/account/change-password` page is reachable, the SPA
+ * isn't gated). Design §sign-in flow change.
+ */
+const FORCE_CHANGE_PASSWORD_PATH = "/account/change-password";
+
 function safeNext(raw: string | null): string {
   if (!raw) return POST_LOGIN_DEFAULT;
   // Only allow same-origin paths — never honor an absolute URL or scheme.
   if (!raw.startsWith("/") || raw.startsWith("//")) return POST_LOGIN_DEFAULT;
   return raw;
+}
+
+/**
+ * Pick the post-login redirect target for a freshly-authenticated user.
+ *
+ * **The only place `password_changed` gates a flow.** Per design §sign-
+ * in flow change, force-change is a session-level redirect at the login
+ * boundary — once changed, no per-request scope check is needed and
+ * no token claim carries the bit forward.
+ *
+ * When `password_changed === false`:
+ *   - redirect to `/account/change-password`
+ *   - preserve the user's intended `next` as a query param so the
+ *     change-password POST can finish the trip
+ *
+ * When `password_changed === true`: return `next` (today's behavior).
+ */
+export function loginRedirectTarget(user: User, next: string): string {
+  if (user.passwordChanged) return next;
+  // Preserve the operator's intended destination; the change-password
+  // POST will read this and 302 there after the change lands.
+  // Only encode `next` if it isn't already the post-change default —
+  // keeps the URL clean for the common case (no `next` param specified
+  // at login time → no `?next=` on the change-password URL).
+  if (next === POST_LOGIN_DEFAULT) return FORCE_CHANGE_PASSWORD_PATH;
+  return `${FORCE_CHANGE_PASSWORD_PATH}?next=${encodeURIComponent(next)}`;
 }
 
 // --- /login ---------------------------------------------------------------
@@ -110,6 +152,22 @@ export async function handleAdminLoginPost(
       400,
     );
   }
+  // Cap incoming password length BEFORE getUserByUsername / argon2id
+  // verify touches it. An unauthenticated POST submitting a megabyte
+  // password would otherwise force a full argon2id hash on arbitrary
+  // input — CPU-DoS shape. 413 fires before any DB or hash work; same
+  // `PASSWORD_MAX_LEN` constant `/api/users` and `/account/change-
+  // password` use (PR-3 fold N1: applied uniformly across the auth
+  // surface family).
+  if (password.length > PASSWORD_MAX_LEN) {
+    return htmlResponse(
+      renderAdminError({
+        title: "Password too long",
+        message: `Password must be ≤ ${PASSWORD_MAX_LEN} characters.`,
+      }),
+      413,
+    );
+  }
   const user = getUserByUsername(db, username);
   if (!user) {
     return htmlResponse(
@@ -128,7 +186,15 @@ export async function handleAdminLoginPost(
   const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
     secure: isHttpsRequest(req),
   });
-  return redirect(next, { "set-cookie": cookie });
+  // Multi-user Phase 1 PR 3 — `password_changed === false` (admin-created
+  // user, hasn't picked their own password yet) lands at
+  // `/account/change-password` instead of `next`. The session cookie is
+  // minted as normal — the user IS authenticated, they're just expected
+  // to change the admin-typed default before continuing. Their original
+  // `next` rides along on the change-password URL so the post-change
+  // POST can land them at their intended destination.
+  const target = loginRedirectTarget(user, next);
+  return redirect(target, { "set-cookie": cookie });
 }
 
 /**

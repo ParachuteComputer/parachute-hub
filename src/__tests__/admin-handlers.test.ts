@@ -151,7 +151,7 @@ describe("handleAdminLoginPost", () => {
   });
 
   test("redirects to next= and sets session cookie on success", async () => {
-    await createUser(harness.db, "admin", "pw");
+    await createUser(harness.db, "admin", "pw", { passwordChanged: true });
     const { body, headers } = formBody({
       [CSRF_FIELD_NAME]: TEST_CSRF,
       username: "admin",
@@ -170,7 +170,7 @@ describe("handleAdminLoginPost", () => {
   });
 
   test("ignores an absolute-URL next= from the form", async () => {
-    await createUser(harness.db, "admin", "pw");
+    await createUser(harness.db, "admin", "pw", { passwordChanged: true });
     const { body, headers } = formBody({
       [CSRF_FIELD_NAME]: TEST_CSRF,
       username: "admin",
@@ -193,7 +193,7 @@ describe("handleAdminLoginPost", () => {
     // alongside scheme-absolute URLs; this test pins the POST path
     // explicitly so future refactors of the redirect builder don't quietly
     // re-open the open-redirect.
-    await createUser(harness.db, "admin", "pw");
+    await createUser(harness.db, "admin", "pw", { passwordChanged: true });
     const { body, headers } = formBody({
       [CSRF_FIELD_NAME]: TEST_CSRF,
       username: "admin",
@@ -214,7 +214,7 @@ describe("handleAdminLoginPost", () => {
     // Post-SPA-rework default: when the form omits `next`, login lands on
     // the SPA's vault list. Previously the legacy `/admin/config` portal
     // was the default; that page is retired and 301s to /admin/vaults.
-    await createUser(harness.db, "admin", "pw");
+    await createUser(harness.db, "admin", "pw", { passwordChanged: true });
     const { body, headers } = formBody({
       [CSRF_FIELD_NAME]: TEST_CSRF,
       username: "admin",
@@ -232,7 +232,7 @@ describe("handleAdminLoginPost", () => {
 
   // hub#185 — per-IP rate-limit (5 attempts / 15 min) on POST /admin/login.
   test("6 rapid POSTs from same IP get 200/401×4/429 and the 429 carries Retry-After", async () => {
-    await createUser(harness.db, "admin", "correct-pw");
+    await createUser(harness.db, "admin", "correct-pw", { passwordChanged: true });
     const buildReq = (password: string) => {
       const { body, headers } = formBody({
         [CSRF_FIELD_NAME]: TEST_CSRF,
@@ -266,7 +266,7 @@ describe("handleAdminLoginPost", () => {
   });
 
   test("rate-limit is per-IP: a different IP can still log in after another's bucket fills", async () => {
-    await createUser(harness.db, "admin", "pw");
+    await createUser(harness.db, "admin", "pw", { passwordChanged: true });
     const buildReq = (ip: string, password: string) => {
       const { body, headers } = formBody({
         [CSRF_FIELD_NAME]: TEST_CSRF,
@@ -315,6 +315,141 @@ describe("handleAdminLoginPost", () => {
     const denied = await handleAdminLoginPost(harness.db, buildReq());
     expect(denied.status).toBe(429);
     expect(await denied.text()).toContain("Too many login attempts");
+  });
+
+  test("password too long (> PASSWORD_MAX_LEN) → 413, fires before argonVerify (PR-3 fold N1)", async () => {
+    // Fold N1: an unauthenticated POST submitting a megabyte password
+    // would otherwise burn a full argon2id verify on arbitrary input.
+    // The cap fires before getUserByUsername / verifyPassword — pin with
+    // an elapsed-time floor of 200ms.
+    await createUser(harness.db, "admin", "correct-pw", { passwordChanged: true });
+    const huge = "z".repeat(5000);
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "admin",
+      password: huge,
+      next: "/admin/vaults",
+    });
+    const req = new Request("http://hub.test/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const t0 = Date.now();
+    const res = await handleAdminLoginPost(harness.db, req);
+    const elapsed = Date.now() - t0;
+    expect(res.status).toBe(413);
+    expect(elapsed).toBeLessThan(200);
+  });
+});
+
+describe("loginRedirectTarget — force-change-password (multi-user PR 3)", () => {
+  // Multi-user Phase 1 PR 3: when a user's `password_changed === false`, the
+  // login POST redirects to `/account/change-password` instead of `next`.
+  // Session cookie is still minted (the user IS authenticated). When the
+  // user has `password_changed === true`, today's behavior is unchanged.
+  //
+  // We exercise the live POST handler rather than the helper directly so
+  // the test pins the wire-shape behavior — the helper is an
+  // implementation detail.
+
+  test("password_changed=false redirects to /account/change-password (admin-created user)", async () => {
+    // Admin-created users land with passwordChanged=false. PR 2's
+    // /api/users POST is the canonical entry; here we just exercise the
+    // helper directly to stay focused on the login redirect.
+    await createUser(harness.db, "admin", "admin-original-pw", {
+      passwordChanged: true, // wizard admin
+    });
+    await createUser(harness.db, "newbie", "default-pw", {
+      allowMulti: true,
+      passwordChanged: false, // PR-2 admin-created shape
+    });
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "newbie",
+      password: "default-pw",
+      next: "/admin/permissions",
+    });
+    const req = new Request("http://hub.test/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    const location = res.headers.get("location") ?? "";
+    // The change-password target preserves the original `next` so the
+    // user lands where they intended after picking a new password.
+    expect(location.startsWith("/account/change-password")).toBe(true);
+    expect(location).toContain(encodeURIComponent("/admin/permissions"));
+    // Session cookie IS minted — the user is signed in. The redirect is
+    // session-level, not "block sign-in entirely."
+    expect(res.headers.get("set-cookie") ?? "").toContain("parachute_hub_session=");
+  });
+
+  test("password_changed=false with no next= redirects to bare /account/change-password", async () => {
+    await createUser(harness.db, "newbie", "default-pw", { passwordChanged: false });
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "newbie",
+      password: "default-pw",
+    });
+    const req = new Request("http://hub.test/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    // No `?next=` suffix when the user's intended destination was the
+    // post-login default — keeps the URL clean.
+    expect(res.headers.get("location")).toBe("/account/change-password");
+  });
+
+  test("password_changed=true honors the original next= (existing behavior unchanged)", async () => {
+    // Wizard admins and env-seeded admins land passwordChanged=true; the
+    // pre-PR-3 redirect shape must keep working.
+    await createUser(harness.db, "admin", "pw", { passwordChanged: true });
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "admin",
+      password: "pw",
+      next: "/admin/tokens",
+    });
+    const req = new Request("http://hub.test/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/admin/tokens");
+  });
+
+  test("password_changed=false defense-in-depth: unsafe next= is sanitized before encoding", async () => {
+    // safeNext rewrites unsafe next values to /admin/vaults BEFORE the
+    // redirect-target helper runs. The change-password URL should never
+    // carry an attacker-shaped redirect — even on the force-change path.
+    await createUser(harness.db, "newbie", "default-pw", { passwordChanged: false });
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "newbie",
+      password: "default-pw",
+      next: "https://evil.example/pwn",
+    });
+    const req = new Request("http://hub.test/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    // safeNext rewrote next to /admin/vaults (the post-login default),
+    // and loginRedirectTarget treats that as "no specific next" → bare
+    // /account/change-password. Either way, evil.example never appears.
+    const location = res.headers.get("location") ?? "";
+    expect(location.startsWith("/account/change-password")).toBe(true);
+    expect(location).not.toContain("evil.example");
   });
 });
 
