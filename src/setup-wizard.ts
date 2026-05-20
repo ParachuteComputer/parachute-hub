@@ -692,6 +692,9 @@ function renderMcpTile(
     // a forgotten reveal doesn't leak the token into a subsequent
     // recording.
     const fullCmd = `${bareCmd} --header "Authorization: Bearer ${mintedToken}"`;
+    // Clamp the dot count to a 8–40 range so very-short or very-long
+    // tokens don't render comically — token format is fixed-width
+    // (JTI-derived), so this is purely visual.
     const maskedToken = "•".repeat(Math.max(8, Math.min(40, mintedToken.length)));
     const maskedCmd = `${bareCmd} --header "Authorization: Bearer ${maskedToken}"`;
     // The real command rides in a hidden <script type="application/json">
@@ -747,7 +750,7 @@ function renderMcpTile(
             // Auto-hide after 10s so a stray reveal doesn't leak the
             // token into a screencast capture that started after the
             // click.
-            if (revealTimer) clearTimeout(revealTimer);
+            if (revealTimer) { clearTimeout(revealTimer); revealTimer = null; }
             revealTimer = setTimeout(setMasked, 10000);
           }
           showBtn.addEventListener('click', function () {

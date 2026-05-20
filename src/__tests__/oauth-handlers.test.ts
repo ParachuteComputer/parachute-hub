@@ -1097,6 +1097,57 @@ describe("handleAuthorizePost — consent submit", () => {
       cleanup();
     }
   });
+
+  test("consent POST with unknown client_id + self-origin redirect_uri renders recovery affordance", async () => {
+    // Symmetry with the GET-path coverage of the same hub#277 recovery
+    // affordance. handleAuthorizePost's consent submit routes the
+    // `getClient = null` branch through the same `unknownClientResponse`
+    // helper as the GET path; pin it explicitly so a future refactor
+    // can't silently drop the recovery path here. Reaching this branch
+    // on the consent POST means the client_id was deleted between
+    // render and submit (vanishingly rare in practice — exercised here
+    // by registering nothing for the carried `client_id`).
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const { challenge } = makePkce();
+      const form = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: "stale-dangling-id",
+        redirect_uri: `${ISSUER}/notes/oauth/callback`,
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        state: "abc",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, {
+        issuer: ISSUER,
+        hubBoundOrigins: () => [ISSUER],
+      });
+      expect(res.status).toBe(400);
+      const body = await res.text();
+      expect(body).toContain("Unknown application");
+      expect(body).toContain("stale-dangling-id");
+      // Recovery affordance — same shape as the GET-path tests above.
+      expect(body).toContain("unknown-client-reset");
+      expect(body).toContain('data-target="/notes/oauth/callback"');
+      expect(body).toContain("lens:dcr:");
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("handleToken — full OAuth dance", () => {
