@@ -20,8 +20,19 @@ vi.mock("../lib/api.ts", async (orig) => {
     upgradeModule: vi.fn(),
     uninstallModule: vi.fn(),
     getModuleOperation: vi.fn(),
+    setModuleChannel: vi.fn(),
   };
 });
+
+/** Build a catalog with the channel field defaulted; tests override. */
+function makeCatalog(overrides: Partial<api.ModulesCatalog> = {}): api.ModulesCatalog {
+  return {
+    modules: [],
+    supervisor_available: true,
+    module_install_channel: "latest",
+    ...overrides,
+  };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -68,6 +79,7 @@ describe("Modules — catalog rendering", () => {
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [moduleRow("vault"), moduleRow("notes"), moduleRow("scribe")],
       supervisor_available: true,
+      module_install_channel: "latest",
     });
     renderRoute();
     await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
@@ -81,6 +93,7 @@ describe("Modules — catalog rendering", () => {
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [moduleRow("vault")],
       supervisor_available: true,
+      module_install_channel: "latest",
     });
     renderRoute();
     await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
@@ -99,6 +112,7 @@ describe("Modules — catalog rendering", () => {
         }),
       ],
       supervisor_available: true,
+      module_install_channel: "latest",
     });
     renderRoute();
     await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
@@ -118,6 +132,7 @@ describe("Modules — supervisor unavailable", () => {
         }),
       ],
       supervisor_available: false,
+      module_install_channel: "latest",
     });
     renderRoute();
     await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
@@ -138,6 +153,7 @@ describe("Modules — install flow", () => {
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [moduleRow("vault")],
       supervisor_available: true,
+      module_install_channel: "latest",
     });
     vi.mocked(api.installModule).mockResolvedValue("op-abc");
     vi.mocked(api.getModuleOperation).mockResolvedValue({
@@ -174,6 +190,7 @@ describe("Modules — restart sync flow", () => {
         }),
       ],
       supervisor_available: true,
+      module_install_channel: "latest",
     });
     vi.mocked(api.restartModule).mockResolvedValue({ short: "vault" });
 
@@ -196,6 +213,7 @@ describe("Modules — restart sync flow", () => {
         }),
       ],
       supervisor_available: true,
+      module_install_channel: "latest",
     });
     vi.mocked(api.restartModule).mockRejectedValue(
       new api.HttpError(503, "supervisor_unavailable"),
@@ -220,6 +238,7 @@ describe("Modules — uninstall sync flow", () => {
         }),
       ],
       supervisor_available: true,
+      module_install_channel: "latest",
     });
     vi.mocked(api.uninstallModule).mockResolvedValue({ short: "vault" });
     // Auto-confirm the window.confirm dialog so the uninstall fires.
@@ -243,6 +262,7 @@ describe("Modules — uninstall sync flow", () => {
         }),
       ],
       supervisor_available: true,
+      module_install_channel: "latest",
     });
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
     renderRoute();
@@ -252,5 +272,72 @@ describe("Modules — uninstall sync flow", () => {
     await Promise.resolve();
     expect(api.uninstallModule).not.toHaveBeenCalled();
     confirmSpy.mockRestore();
+  });
+});
+
+describe("Modules — install channel toggle (hub#275)", () => {
+  it("renders 'Stable' selected when channel = latest", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({ modules: [moduleRow("vault")], module_install_channel: "latest" }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+    const stable = screen.getByRole("radio", { name: /stable/i }) as HTMLInputElement;
+    const rc = screen.getByRole("radio", { name: /release candidates/i }) as HTMLInputElement;
+    expect(stable.checked).toBe(true);
+    expect(rc.checked).toBe(false);
+  });
+
+  it("renders 'Release candidates' selected when channel = rc", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({ modules: [moduleRow("vault")], module_install_channel: "rc" }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+    const stable = screen.getByRole("radio", { name: /stable/i }) as HTMLInputElement;
+    const rc = screen.getByRole("radio", { name: /release candidates/i }) as HTMLInputElement;
+    expect(stable.checked).toBe(false);
+    expect(rc.checked).toBe(true);
+  });
+
+  it("posts to setModuleChannel and updates the UI on toggle to rc", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({ modules: [moduleRow("vault")], module_install_channel: "latest" }),
+    );
+    vi.mocked(api.setModuleChannel).mockResolvedValue("rc");
+
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("radio", { name: /release candidates/i }));
+    await waitFor(() => expect(api.setModuleChannel).toHaveBeenCalledWith("rc"));
+    // After the round-trip, rc stays selected (server echoed rc).
+    const rc = screen.getByRole("radio", { name: /release candidates/i }) as HTMLInputElement;
+    await waitFor(() => expect(rc.checked).toBe(true));
+  });
+
+  it("rolls back to an error state when setModuleChannel fails", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({ modules: [moduleRow("vault")], module_install_channel: "latest" }),
+    );
+    vi.mocked(api.setModuleChannel).mockRejectedValue(
+      new api.HttpError(500, "internal_server_error"),
+    );
+
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("radio", { name: /release candidates/i }));
+    await waitFor(() => expect(screen.getByText(/Failed to update channel/i)).toBeInTheDocument());
+  });
+
+  it("does not POST when clicking the already-selected channel (no-op)", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({ modules: [moduleRow("vault")], module_install_channel: "latest" }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+    // Click the already-selected Stable radio.
+    fireEvent.click(screen.getByRole("radio", { name: /stable/i }));
+    await Promise.resolve();
+    expect(api.setModuleChannel).not.toHaveBeenCalled();
   });
 });

@@ -18,6 +18,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  type ModuleInstallChannel,
   type ModuleListing,
   type ModuleOperation,
   type ModulesCatalog,
@@ -25,6 +26,7 @@ import {
   installModule,
   listModules,
   restartModule,
+  setModuleChannel,
   uninstallModule,
   upgradeModule,
 } from "../lib/api.ts";
@@ -221,7 +223,35 @@ export function Modules() {
     );
   }
 
-  const { modules, supervisor_available } = catalog.catalog;
+  // Narrow snapshot for the synchronous render path. `setCatalog` calls
+  // inside `onChangeChannel` use the functional form (`prev =>`) to avoid
+  // re-narrowing the outer `catalog` ref across the await boundary.
+  const okCatalog = catalog.catalog;
+  const { modules, supervisor_available, module_install_channel } = okCatalog;
+
+  async function onChangeChannel(next: ModuleInstallChannel) {
+    if (next === module_install_channel) return;
+    // Optimistic update so the radio reflects the click before the
+    // round-trip lands; on failure we surface an error state.
+    setCatalog({
+      kind: "ok",
+      catalog: { ...okCatalog, module_install_channel: next },
+    });
+    try {
+      const written = await setModuleChannel(next);
+      // Trust the server's echo (it's the source of truth).
+      setCatalog((prev) =>
+        prev.kind === "ok"
+          ? { kind: "ok", catalog: { ...prev.catalog, module_install_channel: written } }
+          : prev,
+      );
+    } catch (err) {
+      // Surface the failure inline at the top of the page. The existing
+      // error-state retry button drives the reload.
+      const msg = err instanceof Error ? err.message : String(err);
+      setCatalog({ kind: "error", message: `Failed to update channel — ${msg}` });
+    }
+  }
 
   return (
     <section className="modules">
@@ -230,6 +260,12 @@ export function Modules() {
         Install, upgrade, and manage Parachute modules. Available modules are pinned for the v0.6
         release; the marketplace is on the roadmap.
       </p>
+
+      <ChannelToggle
+        channel={module_install_channel}
+        disabled={!supervisor_available}
+        onChange={(c) => void onChangeChannel(c)}
+      />
 
       {!supervisor_available && (
         <div className="banner banner-info">
@@ -373,4 +409,52 @@ function statusLabel(mod: ModuleListing): string {
   if (!mod.installed) return "not installed";
   if (!mod.supervisor_status) return "not supervised";
   return mod.supervisor_status;
+}
+
+interface ChannelToggleProps {
+  channel: ModuleInstallChannel;
+  disabled: boolean;
+  onChange: (next: ModuleInstallChannel) => void;
+}
+
+/**
+ * Hub-wide install-channel toggle (hub#275). Radio group with two
+ * options: Stable (`latest`) or Release candidates (`rc`). Driving
+ * choice — Aaron specifically called out NOT adding per-install dropdowns
+ * to keep the surface narrow. All future installs + upgrades pull from
+ * the selected channel; already-installed modules don't move until the
+ * operator clicks Upgrade.
+ */
+function ChannelToggle({ channel, disabled, onChange }: ChannelToggleProps) {
+  return (
+    <fieldset className="channel-toggle" data-testid="channel-toggle">
+      <legend>Install channel</legend>
+      <label>
+        <input
+          type="radio"
+          name="module-install-channel"
+          value="latest"
+          checked={channel === "latest"}
+          disabled={disabled}
+          onChange={() => onChange("latest")}
+        />
+        Stable (<code>latest</code>)
+      </label>
+      <label>
+        <input
+          type="radio"
+          name="module-install-channel"
+          value="rc"
+          checked={channel === "rc"}
+          disabled={disabled}
+          onChange={() => onChange("rc")}
+        />
+        Release candidates (<code>rc</code>)
+      </label>
+      <p className="muted">
+        All future module installs and upgrades use this channel. Existing installed modules are
+        unaffected — use <strong>Upgrade</strong> to pull a newer version.
+      </p>
+    </fieldset>
+  );
 }
