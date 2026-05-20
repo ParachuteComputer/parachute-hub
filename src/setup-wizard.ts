@@ -665,21 +665,108 @@ function renderMcpTile(
   const bareCmd = `claude mcp add --transport http parachute-${vaultName} ${hubOrigin}/vault/${vaultName}/mcp`;
   if (mintedToken) {
     // The token contents are surfaced once + then forgotten by the
-    // server (single-use hub_setting). Render the full command with
-    // the Bearer header pre-filled. The `--header` value is shell-
-    // quoted (double quotes) — bash + zsh both consume it as one arg.
+    // server (single-use hub_setting). Two visible variants of the
+    // command live in the DOM:
+    //
+    //   * `pre#mcp-cmd` — what the operator sees. The Bearer token is
+    //     replaced with a fixed-width row of • so shoulder-surfers,
+    //     screencasts, and over-the-shoulder photos don't capture
+    //     credentials by default. This is the "discoverable but not
+    //     shoulder-surf-able" framing Aaron asked for.
+    //   * `script#mcp-cmd-real` (type=text/plain) — the real command
+    //     with the live token, stashed in a non-rendering script tag.
+    //     The Copy + Show handlers read from this so the operator's
+    //     terminal paste still gets the real header without the page
+    //     ever painting the token.
+    //
+    // The view-source threat model is unchanged from rc.9 — the token
+    // is part of the response body either way. The improvement is
+    // *visibly hidden by default*, which is what an over-the-shoulder
+    // observer needs (and what existing screencasts of the wizard
+    // currently leak).
+    //
+    // Show toggles textContent between masked + real and flips a
+    // data-state attribute so a screencast / pair-programming session
+    // can briefly reveal-and-rehide without the operator losing the
+    // line of sight on which mode they're in. Auto-hide after 10s so
+    // a forgotten reveal doesn't leak the token into a subsequent
+    // recording.
     const fullCmd = `${bareCmd} --header "Authorization: Bearer ${mintedToken}"`;
+    const maskedToken = "•".repeat(Math.max(8, Math.min(40, mintedToken.length)));
+    const maskedCmd = `${bareCmd} --header "Authorization: Bearer ${maskedToken}"`;
+    // The real command rides in a hidden <script type="application/json">
+    // block as a JSON-encoded string. <script> element content is parsed
+    // as raw text (no entity references), so HTML escaping would put
+    // literal `&quot;` into the string — and Copy would paste that into
+    // the operator's terminal. JSON encoding (with `</` escaped so the
+    // sequence can't prematurely close the tag) round-trips safely:
+    // textContent returns the JSON, JSON.parse decodes back to the
+    // exact bytes of the original command. Caught while smoke-testing
+    // the rc.11 reveal/copy UX — pre-fix, the copied command included
+    // `&quot;` placeholders that broke shell parsing.
+    const fullCmdJson = JSON.stringify(fullCmd).replace(/<\//g, "<\\/");
     return `<div class="done-tile">
       <h2>Connect Claude Code (MCP)</h2>
       <p>Wire <code>vault:${safeVault}</code> into Claude Code as an MCP server:</p>
-      <div class="mcp-cmd-wrap">
-        <pre id="mcp-cmd">${escapeHtml(fullCmd)}</pre>
-        <button type="button" class="btn btn-copy" data-target="mcp-cmd"
-          onclick="(function(b){var el=document.getElementById(b.dataset.target);if(!el)return;navigator.clipboard.writeText(el.textContent||'').then(function(){b.textContent='Copied ✓';setTimeout(function(){b.textContent='Copy';},2000);});})(this)">Copy</button>
+      <div class="mcp-cmd-wrap" data-state="masked">
+        <pre id="mcp-cmd">${escapeHtml(maskedCmd)}</pre>
+        <script type="application/json" id="mcp-cmd-real">${fullCmdJson}</script>
+        <div class="mcp-cmd-actions">
+          <button type="button" class="btn btn-mcp-aux" id="mcp-cmd-show">Show token</button>
+          <button type="button" class="btn btn-copy" id="mcp-cmd-copy">Copy</button>
+        </div>
       </div>
       <p class="fine">We minted this token for your first MCP connection.
-        It's a full-scope operator token tied to your admin account; manage
-        and revoke tokens at <a href="/admin/tokens"><code>/admin/tokens</code></a>.</p>
+        It's masked above so it's safe to leave open on screen; Copy
+        copies the real command. It's a full-scope operator token tied
+        to your admin account; manage and revoke tokens at
+        <a href="/admin/tokens"><code>/admin/tokens</code></a>.</p>
+      <script>
+        (function () {
+          var wrap = document.querySelector('.mcp-cmd-wrap[data-state]');
+          var pre = document.getElementById('mcp-cmd');
+          var real = document.getElementById('mcp-cmd-real');
+          var copyBtn = document.getElementById('mcp-cmd-copy');
+          var showBtn = document.getElementById('mcp-cmd-show');
+          if (!wrap || !pre || !real || !copyBtn || !showBtn) return;
+          var realCmd;
+          try { realCmd = JSON.parse(real.textContent || '""'); }
+          catch (e) { realCmd = ''; }
+          var maskedCmd = pre.textContent || '';
+          var revealTimer = null;
+          function setMasked() {
+            pre.textContent = maskedCmd;
+            wrap.setAttribute('data-state', 'masked');
+            showBtn.textContent = 'Show token';
+            if (revealTimer) { clearTimeout(revealTimer); revealTimer = null; }
+          }
+          function setRevealed() {
+            pre.textContent = realCmd;
+            wrap.setAttribute('data-state', 'revealed');
+            showBtn.textContent = 'Hide token';
+            // Auto-hide after 10s so a stray reveal doesn't leak the
+            // token into a screencast capture that started after the
+            // click.
+            if (revealTimer) clearTimeout(revealTimer);
+            revealTimer = setTimeout(setMasked, 10000);
+          }
+          showBtn.addEventListener('click', function () {
+            if (wrap.getAttribute('data-state') === 'masked') setRevealed();
+            else setMasked();
+          });
+          copyBtn.addEventListener('click', function () {
+            // Copy ALWAYS pulls from the real command — the operator's
+            // terminal needs the live token regardless of whether the
+            // page is currently masked. This is the load-bearing path:
+            // the visible mask is a UX nicety; the clipboard must
+            // carry the real header.
+            navigator.clipboard.writeText(realCmd).then(function () {
+              copyBtn.textContent = 'Copied ✓';
+              setTimeout(function () { copyBtn.textContent = 'Copy'; }, 2000);
+            });
+          });
+        })();
+      </script>
     </div>`;
   }
   return `<div class="done-tile">
@@ -1701,9 +1788,15 @@ const STYLES = `
   .btn-secondary:hover {
     background: ${PALETTE.accentSoft};
   }
-  /* Copy button rides at the right edge of the MCP command pre. Compact
-     vertical sizing so it doesn't dwarf the snippet on narrow widths;
-     full text wrap on the pre keeps the snippet readable behind it. */
+  /* Copy + Show buttons ride the right edge of the MCP command pre.
+     Compact vertical sizing so they don't dwarf the snippet on narrow
+     widths; full text wrap on the pre keeps the snippet readable
+     behind them. The Show button toggles the visible mask on the
+     auto-minted Bearer token (rc.11 — discoverable
+     but not shoulder-surf-able). Both buttons share a small flex
+     container so they stack predictably on the wrap; layout-wise we
+     keep the right-edge padding on .mcp-cmd-wrap pre so the buttons
+     never overlap the command text. */
   .mcp-cmd-wrap {
     position: relative;
     margin: 0.5rem 0;
@@ -1712,17 +1805,21 @@ const STYLES = `
     background: ${PALETTE.bg};
     border: 1px solid ${PALETTE.borderLight};
     border-radius: 6px;
-    padding: 0.5rem 5.5rem 0.5rem 0.75rem;
+    padding: 0.5rem 8.5rem 0.5rem 0.75rem;
     overflow-x: auto;
     font-size: 0.82rem;
     margin: 0;
     white-space: pre-wrap;
     word-break: break-all;
   }
-  .btn-copy {
+  .mcp-cmd-actions {
     position: absolute;
     top: 0.35rem;
     right: 0.35rem;
+    display: flex;
+    gap: 0.3rem;
+  }
+  .btn-copy, .btn-mcp-aux {
     padding: 0.25rem 0.6rem;
     font-size: 0.78rem;
     min-height: auto;
@@ -1731,10 +1828,23 @@ const STYLES = `
     border: 1px solid ${PALETTE.border};
     border-radius: 4px;
     cursor: pointer;
+    font: inherit;
+    font-size: 0.78rem;
   }
-  .btn-copy:hover {
+  .btn-copy:hover, .btn-mcp-aux:hover {
     border-color: ${PALETTE.accent};
     color: ${PALETTE.accent};
+  }
+  .mcp-cmd-wrap[data-state="revealed"] pre {
+    /* Subtle visual cue that the token is currently visible — a warm
+       border so the operator notices on a screencast even at low
+       resolution. */
+    border-color: #d4a017;
+    background: rgba(212, 160, 23, 0.04);
+  }
+  .mcp-cmd-wrap[data-state="revealed"] .btn-mcp-aux {
+    border-color: #d4a017;
+    color: #6b4a00;
   }
   /* Install-tile section (hub#272 Item B). Lives above the .done-grid;
      primary "what's next?" surface. Tiles render in a responsive grid

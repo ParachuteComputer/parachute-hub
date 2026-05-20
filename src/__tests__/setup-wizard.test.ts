@@ -1335,9 +1335,28 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
       );
       expect(res.status).toBe(200);
       const html = await res.text();
-      expect(html).toContain("--header &quot;Authorization: Bearer test-jwt-token-abc&quot;");
-      expect(html).toContain('data-target="mcp-cmd"');
+      // Real token rides in the hidden script-tag stash as JSON-encoded
+      // text — script element content is raw-text per the HTML spec
+      // (entities aren't parsed), so JSON encoding round-trips through
+      // textContent + JSON.parse without `&quot;` polluting the copied
+      // command. Verify the JSON-encoded form appears in the document.
+      expect(html).toContain(
+        '"claude mcp add --transport http parachute-default https://hub.example/vault/default/mcp --header \\"Authorization: Bearer test-jwt-token-abc\\""',
+      );
       expect(html).toContain('id="mcp-cmd"');
+      expect(html).toContain('id="mcp-cmd-real"');
+      // The hidden stash is `<script type="application/json">` so the
+      // browser doesn't execute it but textContent is still readable.
+      expect(html).toContain('<script type="application/json" id="mcp-cmd-real">');
+      // The visible default state is masked: the <pre> body is wrapped
+      // with data-state="masked" and renders • placeholder characters
+      // rather than the live token. Verified by the masked Bearer
+      // header substring (• repeated).
+      expect(html).toContain('data-state="masked"');
+      expect(html).toMatch(/Bearer •+/);
+      // Show button + Copy button both present.
+      expect(html).toContain('id="mcp-cmd-show"');
+      expect(html).toContain('id="mcp-cmd-copy"');
       expect(html).toContain("/admin/tokens");
       // The token is single-use — consumed on first render.
       expect(getSetting(db, "setup_minted_token")).toBeUndefined();
@@ -1434,6 +1453,193 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
       expect(secondHtml).not.toContain("test-token-xyz");
       // The MCP command tile has no Copy button on the fallback shape.
       expect(secondHtml).not.toContain('id="mcp-cmd"');
+    } finally {
+      db.close();
+    }
+  });
+
+  // rc.11 — token visible by default on the done screen was a
+  // shoulder-surf hazard. The fix: render the visible command with
+  // a masked Bearer token, stash the real command in a
+  // hidden script tag, and surface a Show button + Copy button. Copy
+  // ALWAYS pulls the real command from the script tag so the
+  // operator's terminal paste never breaks regardless of mask state.
+  test("done screen masks the Bearer token in the visible <pre> by default", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      setSetting(db, "setup_minted_token", "pvt_super_secret_token_payload");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?just_finished=1", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      const html = await res.text();
+      // Extract the visible <pre id="mcp-cmd"> text only — the masked
+      // shape must live there, with no occurrence of the literal token
+      // string. The real token still appears elsewhere (the hidden
+      // script tag) so a plain `toContain` would miss the leak.
+      const preMatch = html.match(/<pre id="mcp-cmd">([^<]*)<\/pre>/);
+      expect(preMatch).not.toBeNull();
+      const preBody = preMatch?.[1] ?? "";
+      expect(preBody).not.toContain("pvt_super_secret_token_payload");
+      // Masked Bearer header is present in the <pre> text.
+      expect(preBody).toMatch(/Bearer •+/);
+      // Real command still in the document (hidden JSON stash) so the
+      // Copy handler can read it.
+      expect(html).toContain('<script type="application/json" id="mcp-cmd-real">');
+      expect(html).toContain("pvt_super_secret_token_payload");
+      // Default state is masked.
+      expect(html).toContain('data-state="masked"');
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done screen JSON-encodes the stashed command so `</script>` in a token can't break out", async () => {
+    // Defense-in-depth: an attacker-shaped token containing `</script>`
+    // would prematurely close the stash tag if we just dropped it into
+    // the HTML. The renderer JSON-encodes the command AND replaces
+    // `</` with `<\/` inside the encoded string so the sequence can't
+    // appear in the document. Decode round-trips via JSON.parse.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      // Token contains characters that would be load-bearing in the
+      // HTML/JS layer if mis-encoded: a quote (would close the JSON
+      // string) and `</script>` (would close the stash tag).
+      const hostileToken = `weird-token-with-"-and-</script>-inside`;
+      setSetting(db, "setup_minted_token", hostileToken);
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?just_finished=1", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      const html = await res.text();
+      // `</script>` must NOT appear inside the stash element. We
+      // verify by extracting the stash text via the literal HTML
+      // boundaries and asserting no close-tag escape escaped the
+      // encoder.
+      const stashMatch = html.match(
+        /<script type="application\/json" id="mcp-cmd-real">([\s\S]*?)<\/script>/,
+      );
+      expect(stashMatch).not.toBeNull();
+      const stashBody = stashMatch?.[1] ?? "";
+      // The encoder replaces `</` with `<\/` inside the JSON, so the
+      // raw bytes between the opening and the first `</script>` should
+      // not contain `</`.
+      expect(stashBody).not.toContain("</");
+      // Round-trips: `<\/` decodes back to `</` after JSON.parse +
+      // the script-end-sequence escape — the operator's clipboard
+      // gets the original bytes.
+      const decoded = JSON.parse(stashBody) as string;
+      expect(decoded).toContain(hostileToken);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done screen wires Show + Copy buttons that read from the hidden real-command stash", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      setSetting(db, "setup_minted_token", "live-token-AAA");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?just_finished=1", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      const html = await res.text();
+      // Both buttons present, both wired via addEventListener (no
+      // inline onclick — the script runs in a single IIFE).
+      expect(html).toContain('id="mcp-cmd-show"');
+      expect(html).toContain('id="mcp-cmd-copy"');
+      expect(html).toContain("'click'");
+      // The Copy handler reads from the hidden script tag, not from
+      // the visible <pre>. Regression: this was the load-bearing
+      // contract Aaron called out ("Copy still works without reveal").
+      expect(html).toContain("getElementById('mcp-cmd-real')");
+      // The stash holds JSON-encoded text and the handler decodes via
+      // JSON.parse so the clipboard receives the exact byte sequence of
+      // the command — `&quot;`-style HTML entities can't survive into
+      // the operator's shell because script-element content is raw text
+      // (the HTML parser doesn't decode entities inside <script>).
+      expect(html).toContain("JSON.parse(real.textContent");
+      // Auto-hide timer present so a stray reveal doesn't leak into a
+      // subsequent screencast capture.
+      expect(html).toContain("setTimeout(setMasked, 10000)");
     } finally {
       db.close();
     }
