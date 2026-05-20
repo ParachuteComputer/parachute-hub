@@ -195,10 +195,19 @@ function renderBody({ loadState, action, onApprove, onRetry }: RenderBodyProps) 
               <span className="muted">requested scopes: </span>
               {client.scopes.map((s, i) => (
                 <span key={s}>
-                  <code>{s}</code>
+                  <code>{resolveScopeForDisplay(s)}</code>
                   {i < client.scopes.length - 1 ? " " : null}
                 </span>
               ))}
+              {client.scopes.some(isUnnamedVaultScope) ? (
+                <p
+                  className="muted"
+                  style={{ marginTop: "0.4rem", fontStyle: "italic", fontSize: "0.85rem" }}
+                >
+                  <code>*</code> — a specific vault is selected during sign-in via the consent
+                  picker (or the user's assigned vault for multi-user setups).
+                </p>
+              ) : null}
             </div>
           ) : null}
           <div className="dim" style={{ marginTop: "0.25rem" }}>
@@ -228,4 +237,30 @@ function renderBody({ loadState, action, onApprove, onRetry }: RenderBodyProps) 
       </div>
     </div>
   );
+}
+
+/**
+ * Render the scope's *resolved* shape so the operator sees what'll actually
+ * appear in minted tokens, not the raw OAuth request. The hub narrows
+ * unnamed `vault:<verb>` to `vault:<name>:<verb>` at token-mint via the
+ * consent picker (or the user's assigned vault for multi-user hubs). At
+ * approve time the vault isn't bound yet, so we render the wildcard
+ * `vault:*:<verb>` form with the asterisk explained inline below the
+ * scope list — clearer than showing the unnamed form which implied
+ * vault-wide unrestricted access.
+ *
+ * Non-vault scopes (`scribe:transcribe`, `channel:send`, …) and
+ * already-named vault scopes (`vault:work:read`) pass through unchanged.
+ */
+function resolveScopeForDisplay(scope: string): string {
+  if (!isUnnamedVaultScope(scope)) return scope;
+  const verb = scope.split(":")[1];
+  return `vault:*:${verb}`;
+}
+
+function isUnnamedVaultScope(scope: string): boolean {
+  const parts = scope.split(":");
+  if (parts.length !== 2 || parts[0] !== "vault") return false;
+  const verb = parts[1];
+  return verb === "read" || verb === "write";
 }

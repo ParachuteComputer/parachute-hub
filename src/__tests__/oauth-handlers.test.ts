@@ -2423,7 +2423,9 @@ describe("DCR approval gate (#74)", () => {
       expect(res.status).toBe(403);
       const html = await res.text();
       expect(html).toContain("App not yet approved");
-      expect(html).toContain("approve-client");
+      // /admin/approve-client/<id> deep link is the canonical recovery now
+      // (the pre-rc.19 CLI message was retired in favor of the web path).
+      expect(html).toContain(`/admin/approve-client/${encodeURIComponent(reg.client.clientId)}`);
       // No vault hint → no vault row in approve-meta. Single-vault hubs +
       // pre-vault-popover clients leave the section omitted (#244).
       expect(html).not.toContain('approve-meta-label">vault');
@@ -3916,10 +3918,13 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
     });
   }
 
-  test("session absent → page renders WITHOUT approve form (CLI-only fallback)", async () => {
-    // Regression: pre-#208 behavior preserved when no session cookie is
-    // present. The CLI-fallback message must still be visible so an operator
-    // who arrived from a fresh browser knows what to do.
+  test("session absent → page renders Sign-in CTA + shareable deep link (no CLI message)", async () => {
+    // Approval-UX rc.19: the unauthenticated viewer no longer sees a
+    // "Ask the operator to run `parachute auth approve-client <id>`"
+    // message. The web approval path (#277) is the canonical recovery
+    // now — render a primary Sign-in CTA wired to /login?next=/admin/...
+    // and a shareable deep link the operator can send to whoever runs
+    // the hub.
     const { db, cleanup } = await makeDb();
     try {
       const reg = registerClient(db, {
@@ -3932,9 +3937,23 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       expect(res.status).toBe(403);
       const html = await res.text();
       expect(html).toContain("App not yet approved");
-      // CLI-fallback message present — the only way to recover without a session.
-      expect(html).toContain("approve-client");
-      // No form element pointing at the approve endpoint.
+      // Primary CTA: Sign-in link wired to land the admin directly on
+      // the approval page after authenticating.
+      expect(html).toContain("Sign in as admin to approve");
+      const expectedLoginHref = `/login?next=${encodeURIComponent(
+        `/admin/approve-client/${encodeURIComponent(reg.client.clientId)}`,
+      )}`;
+      expect(html).toContain(`href="${expectedLoginHref}"`);
+      // Secondary CTA: shareable, fully-qualified deep link + Copy button.
+      expect(html).toContain(
+        `${ISSUER}/admin/approve-client/${encodeURIComponent(reg.client.clientId)}`,
+      );
+      expect(html).toContain('id="approve-share-copy"');
+      expect(html).toContain("navigator.clipboard");
+      // Retired CLI hint must not appear anywhere in the body.
+      expect(html).not.toContain("parachute auth approve-client");
+      expect(html).not.toContain("from a terminal");
+      // No form element pointing at the approve endpoint (un-authed branch).
       expect(html).not.toContain('action="/oauth/authorize/approve"');
     } finally {
       cleanup();
@@ -3976,8 +3995,12 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       expect(html).toContain("MyApp");
       expect(html).toContain(reg.client.clientId);
       expect(html).toContain("https://app.example/cb");
-      // CLI fallback still visible.
-      expect(html).toContain("approve-client");
+      // Authed branch shows only the one-click Approve form — the unauth
+      // Sign-in CTA and shareable-link block do NOT render here.
+      expect(html).not.toContain("Sign in as admin to approve");
+      expect(html).not.toContain("Or send this link to your hub admin");
+      // CLI hint also gone in this branch (approval-UX rc.19).
+      expect(html).not.toContain("parachute auth approve-client");
     } finally {
       cleanup();
     }
@@ -4633,6 +4656,88 @@ describe("handleAuthorizeGet — multi-user assigned vault picker lock (PR 4)", 
       expect(html).toContain('<input type="hidden" name="vault_pick" value="default"');
       // No free-choice radio inputs.
       expect(html).not.toContain('type="radio" name="vault_pick"');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Approval-UX rc.19 (Issue 2 in Aaron's bundle): the consent screen now
+// renders the *resolved* scope shape — `vault:<name>:<verb>` — instead of
+// the raw OAuth request `vault:<verb>`. The raw form was confusing because
+// it implied vault-wide unrestricted access, when hub actually narrows to
+// a specific vault at token-mint via the picker (or the user's
+// assigned_vault for multi-user setups).
+describe("handleAuthorizeGet — resolved scope display (approval-UX rc.19)", () => {
+  test("non-admin user (assigned_vault set) sees vault:<assigned>:read on consent, not raw vault:read", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Resolved form rendered in the scope-row code block.
+      expect(html).toContain('<code class="scope-name">vault:default:read</code>');
+      // Raw unnamed form must NOT appear inside a scope row (it still
+      // appears in the hidden form-roundtrip inputs as `name="scope" value="vault:read"`).
+      expect(html).not.toContain('<code class="scope-name">vault:read</code>');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("admin user with picker — single-vault hub pre-checks and consent shows that vault", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin-aaron", "pw");
+      const session = createSession(db, { userId: admin.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // The fixture services manifest has a single vault named "default" — the
+      // picker pre-checks it and the consent screen renders the resolved form.
+      expect(html).toContain('<code class="scope-name">vault:default:read</code>');
     } finally {
       cleanup();
     }

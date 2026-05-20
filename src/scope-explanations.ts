@@ -159,8 +159,33 @@ export function isRequestableScope(scope: string): boolean {
   return !isNonRequestableScope(scope);
 }
 
+/**
+ * Recognize narrowed vault scopes (`vault:<name>:<verb>`) and the wildcard
+ * display form (`vault:*:<verb>`) — both render with the same explanation as
+ * the corresponding unnamed `vault:<verb>` row, since they describe the same
+ * permission scoped to a specific (or unspecified-at-mint-time) vault.
+ *
+ * The hub narrows unnamed `vault:read` → `vault:<name>:read` at consent /
+ * token-mint via the picker (Q1 of the vault-config-and-scopes design); the
+ * consent screen now surfaces that narrowed form so the user sees the scope
+ * shape that will appear in the token. `vault:*:read` is the display-only
+ * shape we use on the operator approval page where no per-user vault has
+ * been selected yet (a specific vault is chosen during sign-in).
+ *
+ * Verb-only — admin verbs on a per-vault basis (`vault:<name>:admin`) are
+ * `NON_REQUESTABLE_SCOPES` by policy and never reach the consent screen, so
+ * we don't substitute for them here. Read / write get the matching label.
+ */
+const VAULT_VERB_RE = /^vault:[a-zA-Z0-9_*-]+:(read|write)$/;
+
 export function explainScope(scope: string): ScopeExplanation | null {
-  return SCOPE_EXPLANATIONS[scope] ?? null;
+  const direct = SCOPE_EXPLANATIONS[scope];
+  if (direct) return direct;
+  if (VAULT_VERB_RE.test(scope)) {
+    const verb = scope.split(":")[2] as "read" | "write";
+    return SCOPE_EXPLANATIONS[`vault:${verb}`] ?? null;
+  }
+  return null;
 }
 
 export function scopeIsAdmin(scope: string): boolean {

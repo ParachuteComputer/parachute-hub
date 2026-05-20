@@ -41,6 +41,29 @@ describe("explainScope", () => {
   test("returns null for an unknown scope", () => {
     expect(explainScope("notes:weird-thing")).toBeNull();
   });
+
+  // Approval-UX rc.19: the consent screen renders the *resolved* scope
+  // shape (`vault:<name>:read`) rather than the raw OAuth request
+  // (`vault:read`) so the operator sees the form the token will carry.
+  // explainScope falls back to the unnamed verb's entry for both the
+  // narrowed (`vault:work:read`) and wildcard-display (`vault:*:read`)
+  // forms so the consent UI keeps the same label + level styling.
+  test("named vault scopes (vault:<name>:<verb>) reuse the unnamed-verb explanation", () => {
+    expect(explainScope("vault:work:read")?.label).toBe(SCOPE_EXPLANATIONS["vault:read"]?.label);
+    expect(explainScope("vault:work:read")?.level).toBe("read");
+    expect(explainScope("vault:my-techne_2:write")?.level).toBe("write");
+  });
+
+  test("wildcard vault display form (vault:*:<verb>) explains via the unnamed verb", () => {
+    expect(explainScope("vault:*:read")?.level).toBe("read");
+    expect(explainScope("vault:*:write")?.level).toBe("write");
+  });
+
+  test("doesn't promote a per-vault admin (vault:<name>:admin) into an explained scope", () => {
+    // vault:<name>:admin is NON_REQUESTABLE — never appears on the consent
+    // screen. Explicitly not in the verb-pattern, so explainScope returns null.
+    expect(explainScope("vault:default:admin")).toBeNull();
+  });
 });
 
 describe("scopeIsAdmin", () => {

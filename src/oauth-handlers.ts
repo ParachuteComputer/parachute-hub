@@ -462,6 +462,7 @@ function pendingClientResponse(
         redirectUris: client.redirectUris,
         requestedScopes,
         ...(requestedVault !== undefined && { requestedVault }),
+        hubOrigin: deps.issuer,
         approveForm: { csrfToken: csrf.token, returnTo },
       }),
       403,
@@ -475,6 +476,7 @@ function pendingClientResponse(
       redirectUris: client.redirectUris,
       requestedScopes,
       ...(requestedVault !== undefined && { requestedVault }),
+      hubOrigin: deps.issuer,
     }),
     403,
     extra,
@@ -1786,6 +1788,23 @@ function consentProps(
         ? { unnamedVerbs, availableVaults: vaultNames, lockedVault }
         : { unnamedVerbs, availableVaults: vaultNames };
   }
+  // Named-scope display: substitute unnamed `vault:<verb>` rows with the
+  // resolved form the operator will actually consent to.
+  //   - Non-admin (lockedVault set) → render `vault:<lockedVault>:<verb>`.
+  //   - Admin with exactly one vault available → render that vault's name;
+  //     the picker pre-checks it and a default-Approve mints scope against
+  //     it, so the displayed scope matches the next state of the form.
+  //   - Admin with multiple vaults / no vaults → null sentinel; render with
+  //     a `<TBD>` placeholder + a hint pointing at the picker. Once the
+  //     operator clicks a radio the JS-free form still posts the chosen
+  //     name; the displayed scope only changes after the next page render.
+  let displayVault: string | null = null;
+  if (lockedVault !== null) {
+    displayVault = lockedVault;
+  } else if (unnamedVerbs.length > 0 && vaultNames.length === 1) {
+    const only = vaultNames[0];
+    if (only) displayVault = only;
+  }
   return {
     params,
     clientId: client.clientId,
@@ -1793,6 +1812,7 @@ function consentProps(
     scopes,
     csrfToken,
     vaultPicker,
+    displayVault,
   };
 }
 

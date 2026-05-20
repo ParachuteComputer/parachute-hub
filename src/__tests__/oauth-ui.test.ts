@@ -2,11 +2,13 @@ import { describe, expect, test } from "bun:test";
 import {
   type AuthorizeFormParams,
   escapeHtml,
+  renderApprovePending,
   renderConsent,
   renderError,
   renderHiddenInputs,
   renderLogin,
   renderUnknownClient,
+  substituteVaultDisplay,
 } from "../oauth-ui.ts";
 
 const PARAMS: AuthorizeFormParams = {
@@ -272,6 +274,171 @@ describe("renderUnknownClient", () => {
     expect(html).not.toContain("'lens:dcr:'");
     // Static fallback help text still surfaces.
     expect(html).toContain("close this window");
+  });
+});
+
+describe("substituteVaultDisplay", () => {
+  test("undefined → leaves the scope untouched", () => {
+    expect(substituteVaultDisplay("vault:read", undefined)).toBe("vault:read");
+  });
+
+  test("named vault → substitutes vault:<name>:<verb>", () => {
+    expect(substituteVaultDisplay("vault:read", "work")).toBe("vault:work:read");
+    expect(substituteVaultDisplay("vault:write", "default")).toBe("vault:default:write");
+  });
+
+  test("null → renders a <TBD> placeholder for the consent picker", () => {
+    expect(substituteVaultDisplay("vault:read", null)).toBe("vault:<TBD>:read");
+  });
+
+  test("non-vault scope passes through regardless of displayVault", () => {
+    expect(substituteVaultDisplay("scribe:transcribe", "work")).toBe("scribe:transcribe");
+    expect(substituteVaultDisplay("channel:send", null)).toBe("channel:send");
+  });
+
+  test("already-named vault scope passes through (caller specified the vault)", () => {
+    expect(substituteVaultDisplay("vault:other:read", "work")).toBe("vault:other:read");
+  });
+
+  test("vault admin (vault:admin) doesn't get narrowed — admin verb stays unnamed", () => {
+    // vault:admin is a full-vault scope; we don't narrow it the same way
+    // because per-vault admin is `vault:<name>:admin` (non-requestable) and
+    // the unnamed vault:admin form is the legacy full-vault grant. Keep the
+    // displayed shape as-is so the operator sees the scope they're
+    // consenting to literally.
+    expect(substituteVaultDisplay("vault:admin", "work")).toBe("vault:admin");
+  });
+});
+
+describe("renderConsent displayVault substitution", () => {
+  test("non-admin user (lockedVault) → consent shows vault:<assigned>:<verb>", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read", "vault:write"],
+      vaultPicker: {
+        unnamedVerbs: ["read", "write"],
+        availableVaults: ["my-vault"],
+        lockedVault: "my-vault",
+      },
+      displayVault: "my-vault",
+    });
+    expect(html).toContain("vault:my-vault:read");
+    expect(html).toContain("vault:my-vault:write");
+    // Raw unnamed form (the thing this PR fixes) must NOT appear in the
+    // rendered scope-row code blocks. Scope name shows up inside
+    // `<code class="scope-name">…</code>` so check the row substring.
+    expect(html).not.toMatch(/<code class="scope-name">vault:read<\/code>/);
+    expect(html).not.toMatch(/<code class="scope-name">vault:write<\/code>/);
+  });
+
+  test("admin user, single-vault hub → picker pre-checks the only vault, consent shows it", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["default"] },
+      displayVault: "default",
+    });
+    expect(html).toContain("vault:default:read");
+    expect(html).not.toMatch(/<code class="scope-name">vault:read<\/code>/);
+  });
+
+  test("admin user, multi-vault hub → displayVault=null renders <TBD> + picker hint", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work", "personal"] },
+      displayVault: null,
+    });
+    expect(html).toContain("vault:&lt;TBD&gt;:read");
+    expect(html).toContain("scope-pending-note");
+    expect(html).toContain("A specific vault is picked below");
+    // explainScope label still resolves via the verb-form lookup.
+    expect(html).toContain("Read your notes");
+  });
+
+  test("displayVault undefined preserves the legacy raw form (no substitution)", () => {
+    // The existing oauth-ui.test.ts cases call renderConsent without
+    // displayVault — confirming the back-compat shape stays.
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+    });
+    expect(html).toContain("vault:read");
+  });
+});
+
+describe("renderApprovePending unauthenticated CTAs", () => {
+  const COMMON = {
+    clientName: "MyApp",
+    clientId: "client-xyz",
+    redirectUris: ["https://app.example/cb"],
+    requestedScopes: ["vault:read"],
+    hubOrigin: "https://hub.example.com",
+  };
+
+  test("renders Sign in CTA wired to /login?next=/admin/approve-client/<id>", () => {
+    const html = renderApprovePending(COMMON);
+    expect(html).toContain("Sign in as admin to approve");
+    const expectedHref = `/login?next=${encodeURIComponent("/admin/approve-client/client-xyz")}`;
+    expect(html).toContain(`href="${expectedHref}"`);
+  });
+
+  test("renders fully-qualified shareable deep link + Copy button + clipboard JS", () => {
+    const html = renderApprovePending(COMMON);
+    expect(html).toContain("https://hub.example.com/admin/approve-client/client-xyz");
+    expect(html).toContain('id="approve-share-copy"');
+    expect(html).toContain('data-link="https://hub.example.com/admin/approve-client/client-xyz"');
+    // Inline JS uses navigator.clipboard.writeText with visual feedback.
+    expect(html).toContain("navigator.clipboard");
+    expect(html).toContain("writeText");
+    expect(html).toContain("Copied!");
+  });
+
+  test("trims a trailing slash on hubOrigin so the deep link doesn't double-slash", () => {
+    const html = renderApprovePending({ ...COMMON, hubOrigin: "https://hub.example.com/" });
+    expect(html).toContain("https://hub.example.com/admin/approve-client/client-xyz");
+    expect(html).not.toContain("https://hub.example.com//admin/");
+  });
+
+  test("retired CLI hint does NOT appear in the unauthenticated branch", () => {
+    const html = renderApprovePending(COMMON);
+    expect(html).not.toContain("parachute auth approve-client");
+    expect(html).not.toContain("from a terminal");
+  });
+
+  test("escapes hostile client_id into href, data-link, and the visible deep link", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      clientId: "<img src=x onerror=alert(1)>",
+    });
+    expect(html).not.toContain("<img src=x");
+    // encodeURIComponent in both the href and the deep-link URL produces
+    // %3Cimg…; that lives inside escapeHtml-wrapped attribute values.
+    expect(html).toContain("%3Cimg");
+  });
+
+  test("admin-authenticated branch hides the unauth CTAs and renders the inline approve form", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      approveForm: { csrfToken: CSRF, returnTo: "/oauth/authorize?client_id=client-xyz" },
+    });
+    expect(html).toContain('action="/oauth/authorize/approve"');
+    expect(html).toContain("Approve and continue");
+    expect(html).not.toContain("Sign in as admin to approve");
+    expect(html).not.toContain("Or send this link to your hub admin");
+    expect(html).not.toContain("parachute auth approve-client");
   });
 });
 

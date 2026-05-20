@@ -104,4 +104,33 @@ describe("ApproveClient", () => {
     expect(screen.getByText("network down")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
   });
+
+  // Approval-UX rc.19 (Issue 2): unnamed vault scopes get rendered as
+  // `vault:*:<verb>` on the operator approval page, with an inline
+  // explanation about how a specific vault is selected during sign-in.
+  // The pre-rc.19 shape rendered raw `vault:read`, which implied
+  // vault-wide unrestricted access — silent narrowing at mint surprised
+  // operators.
+  it("renders unnamed vault scopes as vault:*:<verb> with a wildcard explanation", async () => {
+    vi.mocked(api.getOauthClient).mockResolvedValue(
+      pendingClient({ scopes: ["vault:read", "vault:write"] }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("vault:*:read")).toBeInTheDocument());
+    expect(screen.getByText("vault:*:write")).toBeInTheDocument();
+    // Wildcard explanation present.
+    expect(screen.getByText(/a specific vault is selected during sign-in/i)).toBeInTheDocument();
+    // The raw unnamed form should NOT appear as a scope code element.
+    expect(screen.queryByText(/^vault:read$/)).toBeNull();
+    expect(screen.queryByText(/^vault:write$/)).toBeNull();
+  });
+
+  it("leaves named vault scopes (vault:<name>:<verb>) untouched", async () => {
+    vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient({ scopes: ["vault:work:read"] }));
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("vault:work:read")).toBeInTheDocument());
+    // Already-named scopes don't carry the wildcard, so the explanation
+    // hint doesn't render.
+    expect(screen.queryByText(/a specific vault is selected during sign-in/i)).toBeNull();
+  });
 });

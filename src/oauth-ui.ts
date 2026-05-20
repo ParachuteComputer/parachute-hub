@@ -82,6 +82,28 @@ export interface ConsentViewProps {
    * vault-config-and-scopes design — force the picker, don't default).
    */
   vaultPicker?: VaultPicker;
+  /**
+   * Named-vault display: substitute unnamed `vault:<verb>` rows with
+   * `vault:<displayVault>:<verb>` in the rendered scope list so the user
+   * sees the scope shape that will actually be minted into the token. The
+   * raw `scopes` value still drives the form-roundtrip; this only changes
+   * what the operator reads.
+   *
+   * - Non-admin user (assigned_vault set): pass the assigned vault name so
+   *   the row reads `vault:my-vault:read`.
+   * - Admin user with a single vault available + the picker pre-checks the
+   *   first option: pass that name so the displayed scope matches what the
+   *   default-Approve will mint.
+   * - Admin user with multiple vaults / no obvious default: pass `null` (or
+   *   omit) and the row renders as `vault:<TBD>:read` with a tooltip
+   *   pointing at the picker. Same explanation either way.
+   *
+   * Closes the "raw scope display" leg of the approval-UX bug — silent
+   * narrowing at mint surprised operators who thought they were granting
+   * vault-wide access. Now they see the named form on the consent screen
+   * itself.
+   */
+  displayVault?: string | null;
 }
 
 export interface VaultPicker {
@@ -113,10 +135,22 @@ export interface ErrorViewProps {
 
 /**
  * Props for the "App not yet approved" view rendered when an unapproved
- * client lands on `/oauth/authorize`. When `session` is true the operator is
- * authenticated to this hub from the browser making the request, so we render
- * an inline approve form (closes #208). When false we fall back to the
- * pre-#208 CLI-only message.
+ * client lands on `/oauth/authorize`. Two-branch UI:
+ *
+ *   - Authenticated admin (operator session present + same-origin) — render
+ *     the inline approve form (closes #208). One click flips the client to
+ *     `approved` and re-enters the OAuth flow at consent.
+ *   - Unauthenticated viewer — render TWO CTAs (no terminal mention):
+ *       1. Primary: "Sign in as admin to approve" → links to
+ *          `/login?next=/admin/approve-client/<client_id>` so the admin
+ *          lands directly on the approval page after sign-in.
+ *       2. Secondary: a fully-qualified shareable deep link to
+ *          `<hub_origin>/admin/approve-client/<client_id>` with a copy
+ *          button — the operator can send it to whoever runs the hub.
+ *
+ *   The CLI fallback (`parachute auth approve-client <id>`) was retired —
+ *   the web path is the path now. Operators who want the CLI still have it
+ *   in the shell; we no longer point new users there from the browser.
  */
 export interface ApprovePendingViewProps {
   /** Display name to show — falls back to client_id when no name was supplied at DCR. */
@@ -133,6 +167,13 @@ export interface ApprovePendingViewProps {
    * #244). Single-vault hubs leave this absent and the section omits.
    */
   requestedVault?: string;
+  /**
+   * Fully-qualified hub origin used to build the shareable approval
+   * deep-link in the unauthenticated branch. Required because the link
+   * the operator copies needs to work when opened in a different browser
+   * session — only the absolute URL gets that.
+   */
+  hubOrigin: string;
   /**
    * When set, render the inline approve form. The form posts to
    * `/oauth/authorize/approve` with the CSRF token + a `return_to` URL the
@@ -179,11 +220,16 @@ export function renderLogin(props: LoginViewProps): string {
 }
 
 export function renderConsent(props: ConsentViewProps): string {
-  const { params, clientName, clientId, scopes, vaultPicker, csrfToken } = props;
+  const { params, clientName, clientId, scopes, vaultPicker, csrfToken, displayVault } = props;
+  // Substitute unnamed `vault:<verb>` rows with the resolved named form so
+  // the operator sees the scope shape that will appear in the token. Raw
+  // `scopes` keeps the wire form for the hidden form fields; only what's
+  // rendered changes. See `ConsentViewProps.displayVault`.
+  const displayedScopes = scopes.map((s) => substituteVaultDisplay(s, displayVault));
   const scopeRows =
-    scopes.length === 0
+    displayedScopes.length === 0
       ? `<li class="scope scope-empty">No scopes requested — the app gets a session token only.</li>`
-      : scopes.map(renderScopeRow).join("\n");
+      : displayedScopes.map(renderScopeRow).join("\n");
   const pickerSection = vaultPicker ? renderVaultPicker(vaultPicker) : "";
   // Approve is disabled when the picker can't yield a valid vault. The
   // empty-vault branch (no vaults registered) is the original case. A
@@ -286,21 +332,32 @@ function renderVaultPicker(picker: VaultPicker): string {
 }
 
 /**
- * "App not yet approved" page (#74). When the request carries a valid
- * operator session (#208), render the inline approve form so one click lands
- * the client as `approved` and re-enters the OAuth flow at consent. Without
- * a session, fall back to the original CLI-only message — anyone hitting
- * /oauth/authorize unauthenticated to the hub itself can't be trusted to
- * approve a DCR client from the browser, so they need to drop to a terminal
- * and run `parachute auth approve-client <id>`.
+ * "App not yet approved" page (#74). Two branches:
  *
- * The CLI fallback hint is shown in BOTH branches: a button-equipped operator
- * may still want the CLI invocation handy (different machine, scriptable
- * context). The button is the easy path; the CLI is always-available.
+ *   - **Authenticated operator with same-origin posture** (#208): render the
+ *     inline approve form so one click flips the client to `approved` and
+ *     re-enters the OAuth flow at consent.
+ *   - **Unauthenticated viewer** (Issue 1 in the approval-UX PR): render a
+ *     primary "Sign in as admin to approve" CTA wired to
+ *     `/login?next=/admin/approve-client/<id>` so the admin lands directly
+ *     on the approval page after sign-in, plus a secondary shareable
+ *     deep-link section (fully-qualified `<hub_origin>/admin/approve-client/<id>`
+ *     in a code block + Copy-to-clipboard button). The pre-rc.19 CLI hint
+ *     ("ask the operator to run `parachute auth approve-client <id>`") was
+ *     retired — the web path is the path now. CLI is still available for
+ *     terminal-first operators who already know it; we just stop pointing
+ *     new users there from a browser they're already in.
  */
 export function renderApprovePending(props: ApprovePendingViewProps): string {
-  const { clientName, clientId, redirectUris, requestedScopes, requestedVault, approveForm } =
-    props;
+  const {
+    clientName,
+    clientId,
+    redirectUris,
+    requestedScopes,
+    requestedVault,
+    hubOrigin,
+    approveForm,
+  } = props;
   const redirectList = redirectUris.map((u) => `<li><code>${escapeHtml(u)}</code></li>`).join("");
   const scopeRows =
     requestedScopes.length === 0
@@ -325,15 +382,8 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
         <input type="hidden" name="client_id" value="${escapeHtml(clientId)}" />
         <input type="hidden" name="return_to" value="${escapeHtml(approveForm.returnTo)}" />
         <button type="submit" class="btn btn-primary">Approve and continue</button>
-      </form>
-      <p class="approve-cli-hint">
-        Or run <code>parachute auth approve-client ${escapeHtml(clientId)}</code> from a terminal.
-      </p>`
-    : `
-      <p class="approve-cli-hint">
-        Ask the operator to run <code>parachute auth approve-client ${escapeHtml(clientId)}</code>
-        from a terminal, then try again.
-      </p>`;
+      </form>`
+    : renderUnauthenticatedApproveCtas(hubOrigin, clientId);
   const body = `
     <div class="card">
       <div class="card-header">
@@ -369,6 +419,111 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
       ${formSection}
     </div>`;
   return baseDocument("App not yet approved", body);
+}
+
+/**
+ * Unauthenticated branch of `renderApprovePending`. Two CTAs:
+ *
+ *   1. Primary: "Sign in as admin to approve" → links to
+ *      `/login?next=/admin/approve-client/<client_id>` so the admin lands
+ *      on the approval page after sign-in.
+ *   2. Secondary: a fully-qualified shareable deep-link to
+ *      `<hub_origin>/admin/approve-client/<client_id>` with a Copy button
+ *      so the operator can send it to whoever runs the hub.
+ *
+ * Inline JS is scoped to the Copy button only — `navigator.clipboard.writeText`
+ * with a brief "Copied!" affordance. The button degrades gracefully when
+ * scripting is unavailable (the URL is still selectable + copyable from the
+ * `<code>` block via the OS clipboard).
+ */
+function renderUnauthenticatedApproveCtas(hubOrigin: string, clientId: string): string {
+  const approvalPath = `/admin/approve-client/${encodeURIComponent(clientId)}`;
+  const loginHref = `/login?next=${encodeURIComponent(approvalPath)}`;
+  const trimmedOrigin = hubOrigin.replace(/\/+$/, "");
+  const deepLink = `${trimmedOrigin}${approvalPath}`;
+  return `
+      <div class="approve-actions">
+        <a href="${escapeHtml(loginHref)}" class="btn btn-primary approve-signin-cta">
+          Sign in as admin to approve
+        </a>
+      </div>
+      <section class="approve-share">
+        <h2 class="scopes-title">Or send this link to your hub admin</h2>
+        <p class="approve-share-help">
+          Anyone with admin access on this hub can open the link below to approve the app.
+        </p>
+        <div class="approve-share-row">
+          <code class="approve-share-link" id="approve-share-link">${escapeHtml(deepLink)}</code>
+          <button
+            type="button"
+            class="btn btn-secondary approve-share-copy"
+            id="approve-share-copy"
+            data-link="${escapeHtml(deepLink)}"
+          >Copy link</button>
+        </div>
+      </section>
+      <script>
+        (function () {
+          var btn = document.getElementById('approve-share-copy');
+          if (!btn) return;
+          var defaultLabel = btn.textContent;
+          btn.addEventListener('click', function () {
+            var link = btn.dataset.link || '';
+            var done = function (ok) {
+              btn.textContent = ok ? 'Copied!' : 'Copy failed';
+              setTimeout(function () { btn.textContent = defaultLabel; }, 1600);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(link).then(function () { done(true); }, function () { done(false); });
+            } else {
+              // Fallback for browsers without async clipboard (older Safari,
+              // sandboxed iframes). Select the code block so the user can
+              // hit cmd/ctrl-C to copy manually.
+              try {
+                var range = document.createRange();
+                range.selectNode(document.getElementById('approve-share-link'));
+                var sel = window.getSelection();
+                if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+                done(true);
+              } catch (e) {
+                done(false);
+              }
+            }
+          });
+        })();
+      </script>`;
+}
+
+/**
+ * Substitute an unnamed `vault:<verb>` scope with the resolved named form
+ * (`vault:<displayVault>:<verb>`) so consent / approval screens render
+ * what'll actually appear in the token rather than the raw OAuth request.
+ *
+ *   - `displayVault === undefined` → no substitution (keep input as-is).
+ *     Use this when the caller doesn't know what vault will be picked yet
+ *     and prefers the raw OAuth form. (Currently unused; reserved for the
+ *     pre-narrowing approve flow where the vault isn't known until consent.)
+ *   - `displayVault === null` → render with a `<TBD>` placeholder. Used on
+ *     the admin consent screen when the picker hasn't been touched yet, and
+ *     on the operator approval page where the vault is selected at the
+ *     per-user sign-in step, not at approve time.
+ *   - `displayVault === "name"` → render as `vault:name:verb` literally.
+ *
+ * Non-vault scopes pass through untouched. Already-named `vault:<x>:<verb>`
+ * scopes also pass through — the OAuth request already specified a vault,
+ * so there's nothing to resolve.
+ */
+export function substituteVaultDisplay(
+  scope: string,
+  displayVault: string | null | undefined,
+): string {
+  if (displayVault === undefined) return scope;
+  const parts = scope.split(":");
+  if (parts.length !== 2 || parts[0] !== "vault") return scope;
+  const verb = parts[1];
+  if (verb !== "read" && verb !== "write") return scope;
+  const vaultLabel = displayVault === null ? "<TBD>" : displayVault;
+  return `vault:${vaultLabel}:${verb}`;
 }
 
 export function renderError(props: ErrorViewProps): string {
@@ -503,7 +658,14 @@ export function renderUnknownClient(props: UnknownClientViewProps): string {
 }
 
 function renderScopeRow(scope: string): string {
-  const explanation = explainScope(scope);
+  // Special-case the `<TBD>` placeholder substituted by `substituteVaultDisplay`
+  // when the consent picker hasn't bound a vault yet — `explainScope` doesn't
+  // match it because `<` / `>` aren't in the vault-name charset, but the
+  // canonical verb-form does. Look up by the unnamed verb form so the
+  // explanation + level styling are still correct.
+  const tbdMatch = scope.match(/^vault:<TBD>:(read|write)$/);
+  const lookup = tbdMatch ? `vault:${tbdMatch[1]}` : scope;
+  const explanation = explainScope(lookup);
   if (!explanation) {
     return `<li class="scope scope-unknown">
       <code class="scope-name">${escapeHtml(scope)}</code>
@@ -512,12 +674,21 @@ function renderScopeRow(scope: string): string {
   }
   const cls = `scope scope-${explanation.level}`;
   const badge = badgeForLevel(explanation);
+  // Pending-vault hint surfaces the silent-narrowing semantics for admin
+  // operators who land on the consent screen before touching the picker.
+  // Once they pick, the form submission narrows the scope to the chosen
+  // vault — the rendered placeholder reflects that the vault is still
+  // open at this moment in the flow.
+  const pendingNote = tbdMatch
+    ? `<span class="scope-pending-note">A specific vault is picked below before approving.</span>`
+    : "";
   return `<li class="${cls}">
       <div class="scope-head">
         <code class="scope-name">${escapeHtml(scope)}</code>
         ${badge}
       </div>
       <span class="scope-label">${escapeHtml(explanation.label)}</span>
+      ${pendingNote}
     </li>`;
 }
 
@@ -915,6 +1086,63 @@ const STYLES = `
     word-break: break-all;
   }
   .approve-form { gap: 0; }
+  .approve-actions {
+    margin-top: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .approve-signin-cta {
+    display: inline-block;
+    text-align: center;
+    text-decoration: none;
+    line-height: 1.4;
+  }
+  .approve-signin-cta:hover {
+    background: ${PALETTE.accentHover};
+    color: ${PALETTE.cardBg};
+  }
+  .approve-share {
+    margin-top: 1.5rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+  }
+  .approve-share-help {
+    margin: 0 0 0.6rem;
+    color: ${PALETTE.fgMuted};
+    font-size: 0.88rem;
+  }
+  .approve-share-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+  .approve-share-link {
+    flex: 1;
+    min-width: 0;
+    font-family: ${FONT_MONO};
+    font-size: 0.82rem;
+    background: ${PALETTE.bgSoft};
+    padding: 0.55rem 0.65rem;
+    border-radius: 6px;
+    color: ${PALETTE.fg};
+    word-break: break-all;
+    border: 1px solid ${PALETTE.border};
+  }
+  .approve-share-copy {
+    flex-shrink: 0;
+    min-height: 0;
+    padding: 0.5rem 0.9rem;
+    font-size: 0.85rem;
+  }
+  .scope-pending-note {
+    display: block;
+    margin-top: 0.25rem;
+    font-size: 0.78rem;
+    color: ${PALETTE.fgDim};
+    font-style: italic;
+  }
   .approve-cli-hint {
     margin-top: 1rem;
     padding-top: 0.85rem;
