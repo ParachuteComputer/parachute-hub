@@ -80,7 +80,8 @@ import {
   findSession,
   parseSessionCookie,
 } from "./sessions.ts";
-import { getUserByUsername, verifyPassword } from "./users.ts";
+import { getUserById, getUserByUsername, verifyPassword } from "./users.ts";
+import { listVaultNames } from "./vault-names.ts";
 import { isVaultEntry, shortName, vaultInstanceNameFor } from "./well-known.ts";
 
 /** Verbs whose unnamed `vault:<verb>` form needs picker disambiguation. */
@@ -96,26 +97,6 @@ function unnamedVaultVerbs(scopes: string[]): string[] {
   return verbs;
 }
 
-/**
- * Vault instance names registered on this host, derived from services.json.
- * Walks both manifest shapes — single-entry-multi-path (`paths: ["/vault/work",
- * "/vault/personal"]`) and per-vault entries (`parachute-vault-work`) — by
- * delegating each (name, path) pair to the canonical `vaultInstanceNameFor`
- * helper. Entries with no paths still resolve to a name via the helper's
- * manifest-suffix fallback (#143).
- */
-function listVaultNames(manifest: ServicesManifest): string[] {
-  const names = new Set<string>();
-  for (const svc of manifest.services) {
-    if (!isVaultEntry(svc)) continue;
-    const paths = svc.paths.length > 0 ? svc.paths : [undefined];
-    for (const path of paths) {
-      names.add(vaultInstanceNameFor(svc.name, path));
-    }
-  }
-  return Array.from(names).sort();
-}
-
 /** Rewrite each unnamed `vault:<verb>` to `vault:<picked>:<verb>`. */
 function narrowVaultScopes(scopes: string[], pickedVault: string): string[] {
   return scopes.map((s) => {
@@ -126,6 +107,34 @@ function narrowVaultScopes(scopes: string[], pickedVault: string): string[] {
     }
     return s;
   });
+}
+
+/**
+ * Derive the `vault_scope` claim value for a given hub user. Multi-user
+ * Phase 1 (design
+ * [`2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/),
+ * §oauth-claim-shape).
+ *
+ *   - `userId` resolves to no row → `[]`. Defensive: the caller already
+ *     validated the user existed (auth-code redemption / refresh row's
+ *     user_id), but a delete-between-mint-and-now race shouldn't 500. Empty
+ *     is the safe sentinel — the scope-bearing `scope` claim is still the
+ *     gate.
+ *   - User exists with `assignedVault === null` → `[]`. Admin / unpinned
+ *     posture; the consent picker is the source of truth.
+ *   - User exists with `assignedVault === "name"` → `["name"]`. The Phase 1
+ *     single-vault pin; PR 5's scope-guard at vault/notes/scribe consumes
+ *     this to enforce that an assigned user can't request scope against any
+ *     vault other than their assigned one.
+ *
+ * Always returns an array (never undefined) so the JWT carries the claim
+ * unconditionally — readers don't have to distinguish "absent" from "empty."
+ */
+export function vaultScopeForUser(db: Database, userId: string): string[] {
+  const user = getUserById(db, userId);
+  if (!user) return [];
+  if (user.assignedVault === null) return [];
+  return [user.assignedVault];
 }
 
 export interface OAuthDeps {
@@ -714,10 +723,19 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
   }
 
+  // Multi-user Phase 1: non-admin users (with `assigned_vault !== null`) see
+  // the picker locked to their assigned vault — they can't pick a different
+  // one. Admin users (assigned_vault === null) see the full dropdown.
+  // Defensive null-coalesce: the session points at a deleted user shouldn't
+  // 500; treat as admin posture (the broader scope-validation gate will
+  // catch any actual privilege issue).
+  const user = getUserById(db, session.userId);
+  const lockedVault = user?.assignedVault ?? null;
+
   const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
   const vaultNames = listVaultNames(manifest);
   return htmlResponse(
-    renderConsent(consentProps(client, parsed, vaultNames, csrf.token)),
+    renderConsent(consentProps(client, parsed, vaultNames, csrf.token, lockedVault)),
     200,
     extra,
   );
@@ -902,6 +920,19 @@ async function handleConsentSubmit(
       params.state,
     );
   }
+  // Multi-user Phase 1 (design 2026-05-20-multi-user-phase-1.md): non-admin
+  // users (`assigned_vault !== null`) are pinned to a single vault. The
+  // consent screen renders the picker locked to that vault and any named
+  // scopes (`vault:<name>:<verb>`) requested by the client must match. The
+  // server-side defense here refuses any mint where the user's submission
+  // disagrees — Aaron pinned this as "server-side defense refuses mints
+  // whose picked vault disagrees with assigned_vault" rather than silent
+  // overwrite, so a hand-crafted POST or a misbehaving SPA can't bypass the
+  // lock. Admin users (`assigned_vault === null`) keep the existing picker-
+  // as-source-of-truth behavior.
+  const sessionUser = getUserById(db, session.userId);
+  const assignedVault = sessionUser?.assignedVault ?? null;
+
   // Vault picker (Q1 of the vault-config-and-scopes design): an unnamed
   // `vault:<verb>` scope is ambiguous about which vault it grants access to.
   // Force the operator to pick before the JWT is minted, then rewrite the
@@ -926,8 +957,52 @@ async function handleConsentSubmit(
         400,
       );
     }
+    // Server-side defense: non-admin user submitted a vault that disagrees
+    // with their `assigned_vault`. The picker rendered as locked, so a UI-
+    // path user couldn't reach this — but a hand-crafted form bypassing the
+    // locked input lands here. Refuse the mint instead of silently
+    // overwriting; the explicit error tells the operator the assignment is
+    // load-bearing.
+    if (assignedVault !== null && pickedVault !== assignedVault) {
+      return htmlError(
+        "Vault assignment mismatch",
+        `vault_scope_mismatch: the picked vault "${pickedVault}" does not match your assigned vault "${assignedVault}". Ask the hub admin to update your assignment, or pick "${assignedVault}".`,
+        400,
+      );
+    }
     scopes = narrowVaultScopes(scopes, pickedVault);
   }
+
+  // Server-side defense for named-vault scopes (`vault:<name>:<verb>`) too.
+  // A non-admin user can't request scope against any vault other than their
+  // assigned one — same invariant as the picker check above, applied to
+  // scopes that arrived already-named (e.g. a client that knows the user's
+  // vault and asked for `vault:bob:read` directly). Admins (assigned_vault
+  // null) skip this check.
+  if (assignedVault !== null) {
+    const mismatched: string[] = [];
+    for (const s of scopes) {
+      const parts = s.split(":");
+      if (
+        parts.length === 3 &&
+        parts[0] === "vault" &&
+        parts[1] &&
+        parts[2] &&
+        VAULT_VERBS.has(parts[2]) &&
+        parts[1] !== assignedVault
+      ) {
+        mismatched.push(s);
+      }
+    }
+    if (mismatched.length > 0) {
+      return htmlError(
+        "Vault assignment mismatch",
+        `vault_scope_mismatch: requested scopes ${mismatched.join(", ")} target a vault other than your assigned vault "${assignedVault}".`,
+        400,
+      );
+    }
+  }
+
   // Record (or extend) the grant so the next /oauth/authorize for this
   // (user, client) with these scopes — or any subset — can skip the consent
   // screen (#75). UNION semantics: if the user previously granted [a, b, c]
@@ -1229,6 +1304,13 @@ async function handleTokenAuthorizationCode(
     audience,
     clientId: redeemed.clientId,
     issuer: deps.issuer,
+    // vault_scope claim — Phase 1 per-user vault pin. Non-empty list for
+    // non-admin users with `assigned_vault` set; empty for admin / unpinned.
+    // The narrowing in `handleConsentSubmit` already rewrote `vault:<verb>` →
+    // `vault:<assigned_vault>:<verb>` for non-admin users, so the auth code's
+    // scopes are pre-aligned; this claim is the explicit "owned vault"
+    // signal PR 5 consumes downstream.
+    vaultScope: vaultScopeForUser(db, redeemed.userId),
     now: deps.now,
   });
   // Phase 1 (#212) registry exemption: code-grant access tokens piggyback
@@ -1342,6 +1424,14 @@ async function handleTokenRefresh(
     audience,
     clientId: row.clientId,
     issuer: deps.issuer,
+    // vault_scope claim — re-derived from the user's *current*
+    // `assigned_vault` at refresh time (not snapshotted onto the refresh-
+    // token row). An admin who changes a user's `assigned_vault` between
+    // mint and refresh sees the new value on the next refresh; existing
+    // access tokens carry their original claim until their 15-minute TTL
+    // elapses. Same posture as the design's "OAuth issuer reads
+    // `assigned_vault` at mint time, not at session-creation time" pin.
+    vaultScope: vaultScopeForUser(db, refreshUserId),
     now: deps.now,
   });
   let refresh: ReturnType<typeof signRefreshToken>;
@@ -1677,16 +1767,37 @@ function consentProps(
   params: AuthorizeFormParams,
   vaultNames: string[],
   csrfToken: string,
+  lockedVault: string | null,
 ) {
   const scopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(scopes);
+  // Multi-user Phase 1 (design 2026-05-20-multi-user-phase-1.md, decision-pin
+  // "consent picker for non-admin users"): non-admin users (assigned_vault
+  // non-null) see the picker locked to their `assigned_vault` rather than a
+  // free dropdown. Phase 2 will hide other vaults entirely; Phase 1 ships
+  // lock-the-picker (the smallest diff that satisfies "user can't pick a
+  // vault they don't own"). Server-side defense in `handleConsentSubmit`
+  // refuses mints whose POST disagrees regardless of how the picker is
+  // rendered.
+  let vaultPicker: VaultPickerProps | undefined;
+  if (unnamedVerbs.length > 0) {
+    vaultPicker =
+      lockedVault !== null
+        ? { unnamedVerbs, availableVaults: vaultNames, lockedVault }
+        : { unnamedVerbs, availableVaults: vaultNames };
+  }
   return {
     params,
     clientId: client.clientId,
     clientName: client.clientName ?? client.clientId,
     scopes,
     csrfToken,
-    vaultPicker:
-      unnamedVerbs.length > 0 ? { unnamedVerbs, availableVaults: vaultNames } : undefined,
+    vaultPicker,
   };
+}
+
+interface VaultPickerProps {
+  unnamedVerbs: string[];
+  availableVaults: string[];
+  lockedVault?: string;
 }

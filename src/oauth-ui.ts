@@ -89,6 +89,20 @@ export interface VaultPicker {
   unnamedVerbs: string[];
   /** Vault names registered on this host. Empty → caller can't approve. */
   availableVaults: string[];
+  /**
+   * Multi-user Phase 1 (design 2026-05-20-multi-user-phase-1.md, decision-pin
+   * "consent picker for non-admin users"): set when the signed-in user has a
+   * non-null `assigned_vault`. The picker renders the vault name as a
+   * read-only label with an admin-managed note instead of the free dropdown
+   * — the user can't choose a different vault. The form still POSTs the
+   * locked value via `vault_pick` so the server-side defense in
+   * `handleConsentSubmit` (which refuses mints whose picked vault disagrees
+   * with the user's `assigned_vault`) sees an unambiguous value.
+   *
+   * Admin users (assigned_vault === null) leave this undefined and see the
+   * full dropdown — existing behavior.
+   */
+  lockedVault?: string;
 }
 
 export interface ErrorViewProps {
@@ -171,8 +185,14 @@ export function renderConsent(props: ConsentViewProps): string {
       ? `<li class="scope scope-empty">No scopes requested — the app gets a session token only.</li>`
       : scopes.map(renderScopeRow).join("\n");
   const pickerSection = vaultPicker ? renderVaultPicker(vaultPicker) : "";
+  // Approve is disabled when the picker can't yield a valid vault. The
+  // empty-vault branch (no vaults registered) is the original case. A
+  // locked-vault picker (multi-user Phase 1) always has a valid value via
+  // the hidden input, so Approve stays enabled.
   const approveDisabled =
-    vaultPicker && vaultPicker.availableVaults.length === 0 ? " disabled" : "";
+    vaultPicker && vaultPicker.lockedVault === undefined && vaultPicker.availableVaults.length === 0
+      ? " disabled"
+      : "";
   const body = `
     <div class="card">
       <div class="card-header">
@@ -209,6 +229,32 @@ export function renderConsent(props: ConsentViewProps): string {
 
 function renderVaultPicker(picker: VaultPicker): string {
   const verbList = picker.unnamedVerbs.map((v) => `<code>vault:${escapeHtml(v)}</code>`).join(", ");
+
+  // Multi-user Phase 1: non-admin users see the picker locked to their
+  // `assigned_vault`. The form still posts via `vault_pick` so the
+  // server-side defense in `handleConsentSubmit` sees the value — but the
+  // user can't change it through the UI. A small `<input type=hidden>` and
+  // a read-only label is the smallest diff that ships the lock without
+  // disabling the broader form flow (Approve / Deny still work).
+  if (picker.lockedVault !== undefined) {
+    const locked = escapeHtml(picker.lockedVault);
+    return `
+        <section class="vault-picker vault-picker-locked">
+          <h2 class="scopes-title">Vault</h2>
+          <p class="picker-help">
+            ${verbList} apply to your assigned vault.
+          </p>
+          <div class="vault-locked-row">
+            <code class="vault-locked-name">${locked}</code>
+            <span class="vault-locked-badge">Assigned</span>
+          </div>
+          <p class="vault-locked-note">
+            Assigned vault — admin-managed; you can't change this here.
+          </p>
+          <input type="hidden" name="vault_pick" value="${locked}" />
+        </section>`;
+  }
+
   if (picker.availableVaults.length === 0) {
     return `
         <section class="vault-picker vault-picker-empty">
@@ -784,6 +830,40 @@ const STYLES = `
   }
   .vault-picker-empty .picker-help { color: ${PALETTE.danger}; }
   .vault-picker-empty .picker-help code { color: ${PALETTE.fg}; }
+  .vault-picker-locked .picker-help { color: ${PALETTE.fgMuted}; }
+  .vault-locked-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid ${PALETTE.border};
+    border-radius: 6px;
+    background: ${PALETTE.cardBg};
+    margin: 0.25rem 0 0.5rem;
+  }
+  .vault-locked-name {
+    font-family: ${FONT_MONO};
+    font-size: 0.9rem;
+    color: ${PALETTE.fg};
+    flex: 1;
+  }
+  .vault-locked-badge {
+    display: inline-block;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    background: ${PALETTE.accentSoft};
+    color: ${PALETTE.accent};
+  }
+  .vault-locked-note {
+    margin: 0;
+    font-size: 0.82rem;
+    color: ${PALETTE.fgDim};
+    font-style: italic;
+  }
 
   .approve-meta {
     margin: 0 0 1.25rem;
