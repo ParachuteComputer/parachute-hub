@@ -55,6 +55,9 @@
  *   /api/grants/<client_id>       (DELETE)     → revoke a single OAuth grant
  *   /api/oauth/clients/<id>       (GET)        → OAuth client details
  *   /api/oauth/clients/<id>/approve (POST)     → flip a pending client to approved
+ *   /api/users                    (GET + POST) → list / create user (host:admin)
+ *   /api/users/vaults             (GET)        → vault-name list for assigned-vault picker (host:admin)
+ *   /api/users/<id>               (DELETE)     → hard-delete user + revoke tokens (host:admin)
  *   /login                        (GET + POST) → operator password login
  *   /logout                       (POST)       → end admin session
  *   /admin/config*                             → 301 → /admin/vaults (legacy
@@ -118,6 +121,12 @@ import { handleApiModules, handleApiModulesChannel } from "./api-modules.ts";
 import { REVOCATION_LIST_MOUNT, handleRevocationList } from "./api-revocation-list.ts";
 import { handleApiRevokeToken } from "./api-revoke-token.ts";
 import { handleApiTokens } from "./api-tokens.ts";
+import {
+  handleCreateUser,
+  handleDeleteUser,
+  handleListUsers,
+  handleListVaults,
+} from "./api-users.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
 import { ensureCsrfToken } from "./csrf.ts";
 import { readExposeState } from "./expose-state.ts";
@@ -1482,6 +1491,45 @@ export function hubFetch(
       return handleGetClient(req, clientId, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
+      });
+    }
+
+    // Multi-user Phase 1 admin endpoints (hub#252, design 2026-05-20).
+    // `/api/users` collection (GET list / POST create) and
+    // `/api/users/vaults` for the assigned-vault picker. Per-id route
+    // `/api/users/:id` (DELETE only — Phase 1 doesn't ship edit) is
+    // handled by the `startsWith("/api/users/")` branch below, with the
+    // `/api/users/vaults` sub-path pre-empted *before* the catch-all so
+    // a literal `vaults` segment can't be mistaken for a user id.
+    if (pathname === "/api/users") {
+      if (!getDb) return dbNotConfigured();
+      const usersDeps = {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        manifestPath,
+      };
+      if (req.method === "GET") return handleListUsers(req, usersDeps);
+      if (req.method === "POST") return handleCreateUser(req, usersDeps);
+      return new Response("method not allowed", { status: 405 });
+    }
+    if (pathname === "/api/users/vaults") {
+      if (!getDb) return dbNotConfigured();
+      return handleListVaults(req, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        manifestPath,
+      });
+    }
+    if (pathname.startsWith("/api/users/")) {
+      if (!getDb) return dbNotConfigured();
+      const id = decodeURIComponent(pathname.slice("/api/users/".length));
+      if (!id || id.includes("/")) {
+        return new Response("not found", { status: 404 });
+      }
+      return handleDeleteUser(req, id, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        manifestPath,
       });
     }
 

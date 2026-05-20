@@ -711,6 +711,124 @@ export async function getModuleOperation(opId: string): Promise<ModuleOperation>
   return (await res.json()) as ModuleOperation;
 }
 
+/**
+ * Wire shape from `GET /api/users` — multi-user Phase 1.
+ *
+ * `password_hash` is intentionally absent — the hub never returns it
+ * over the wire. `password_changed: false` means the user was created
+ * via the admin path and hasn't yet completed the force-change-password
+ * flow on first sign-in (PR 3 of the multi-user chain).
+ * `assigned_vault: null` means "no per-vault restriction" — the admin
+ * posture; non-null pins the user to that vault.
+ */
+export interface UserListing {
+  id: string;
+  username: string;
+  password_changed: boolean;
+  assigned_vault: string | null;
+  created_at: string;
+}
+
+/** Body shape for `POST /api/users`. */
+export interface CreateUserInput {
+  username: string;
+  password: string;
+  /** Vault to pin the user to. `null` = no restriction (admin-level). */
+  assignedVault: string | null;
+}
+
+/**
+ * GET /api/users — list every user account on the hub. `host:admin`
+ * Bearer gate; same pattern as `listGrants` / `listTokens`. Sorted by
+ * `created_at` ASC so the wizard-admin / env-seeded first admin lands
+ * first — the SPA pins that row's "Delete" button disabled.
+ */
+export async function listUsers(): Promise<UserListing[]> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/users", {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { users: UserListing[] };
+  return body.users ?? [];
+}
+
+/**
+ * POST /api/users — admin creates a user with a default password +
+ * optional vault assignment. Server runs the password through
+ * argon2id; the plaintext lives only in this request body (TLS-
+ * protected on the wire, never persisted). New users land with
+ * `password_changed: false` and the force-change-password redirect at
+ * `/login` (PR 3) re-routes them on first sign-in.
+ */
+export async function createUser(input: CreateUserInput): Promise<UserListing> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/users", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify(input),
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { user: UserListing };
+  return body.user;
+}
+
+/**
+ * DELETE /api/users/:id — hard-delete + token revocation. Refuses to
+ * delete the first-created admin (403 `first_admin_undeletable`) so the
+ * hub can't be self-locked. The SPA also disables the row-level button
+ * for that user as a UX hint, but the server check is authoritative.
+ */
+export async function deleteUser(id: string): Promise<void> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/users/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    // 403 from this endpoint is *not* always an auth failure — it also
+    // surfaces the first-admin-undeletable rail. Don't clear the cached
+    // bearer in that case (a fresh mint won't help). The handler-level
+    // 401/403 cache-clear stays only for the auth shapes.
+    if (res.status === 401) clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+/**
+ * GET /api/users/vaults — vault-name list for the assigned-vault
+ * dropdown. Same `host:admin` gate. Sorted server-side; the SPA renders
+ * options in that order plus a synthetic "No restriction" entry.
+ */
+export async function listUserVaults(): Promise<string[]> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/users/vaults", {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { vaults: string[] };
+  return body.vaults ?? [];
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const text = await res.text();

@@ -457,3 +457,23 @@ form .field-error {
   margin: 0.4rem 0 0;
   font-size: 0.85rem;
 }
+
+/*
+ * Visually-hidden utility for screen-reader-only text. Used by the
+ * first-admin disabled-Delete button on /admin/users to wire
+ * `aria-describedby` to an explanation that's invisible to sighted
+ * users but exposed to assistive tech (where `title` on a disabled
+ * button is unreliable). Standard WAI-ARIA shape — clip path keeps
+ * the element off-screen but in the accessibility tree.
+ */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

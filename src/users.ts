@@ -158,6 +158,22 @@ export function getUserByUsername(db: Database, username: string): User | null {
   return row ? rowToUser(row) : null;
 }
 
+/**
+ * Case-insensitive username lookup. Username validation already pins
+ * the canonical form to lowercase (`[a-z0-9_-]`), so the only way a
+ * mixed-case lookup ever fires is a defense-in-depth check at the
+ * admin-create-user boundary — a future loosening of the validator
+ * (or a hand-edited row) wouldn't accidentally allow `Bob` to land
+ * alongside an existing `bob`. SQLite's `COLLATE NOCASE` does the work
+ * with no schema change.
+ */
+export function getUserByUsernameCI(db: Database, username: string): User | null {
+  const row = db
+    .query<Row, [string]>("SELECT * FROM users WHERE username = ? COLLATE NOCASE")
+    .get(username);
+  return row ? rowToUser(row) : null;
+}
+
 export function getUserById(db: Database, id: string): User | null {
   const row = db.query<Row, [string]>("SELECT * FROM users WHERE id = ?").get(id);
   return row ? rowToUser(row) : null;
@@ -193,6 +209,54 @@ export async function setPassword(
     .prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
     .run(passwordHash, stamp, userId);
   if (result.changes === 0) throw new UserNotFoundError(userId);
+}
+
+/**
+ * Hard-delete a user row and clean up FK-dependent rows.
+ *
+ * Schema reality at v8:
+ *   - `tokens.user_id` is nullable (made nullable in migration v6). The
+ *     plan from the design doc is "tokens stay with `revoked_at` set so
+ *     the audit trail of 'this user existed and held these tokens'
+ *     survives." But the FK is RESTRICT-on-delete, so we need to null
+ *     out `tokens.user_id` after revoking to actually delete the
+ *     parent users row. The audit trail survives via the `subject`
+ *     column we backfill from the username plus the existing
+ *     `created_at`, `scopes`, `client_id`, `revoked_at` fields.
+ *   - `sessions.user_id` and `grants.user_id` are NOT NULL with a
+ *     non-cascading FK. Both are deleted before the users row drops.
+ *
+ * Returns false when no user matches the id (idempotent — the API
+ * layer translates that to 404). Returns true on a successful delete.
+ *
+ * Caller is responsible for the first-admin-undeletable check; this
+ * helper enforces no policy beyond the schema hygiene.
+ */
+export function deleteUser(db: Database, userId: string): boolean {
+  const row = db.query<Row, [string]>("SELECT * FROM users WHERE id = ?").get(userId);
+  if (!row) return false;
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    // 1. Revoke + retain tokens for audit. Mark every un-revoked token
+    //    revoked, then null out user_id on every token (revoked or
+    //    not) so the FK doesn't block the users delete. Backfill
+    //    `subject` with the username so the audit trail isn't anchored
+    //    to a primary key that just vanished.
+    db.prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").run(
+      now,
+      userId,
+    );
+    db.prepare(
+      "UPDATE tokens SET subject = COALESCE(subject, ?), user_id = NULL WHERE user_id = ?",
+    ).run(row.username, userId);
+    // 2. Drop sessions + grants. Both have non-cascading FKs on user_id;
+    //    leaving rows behind would RESTRICT the users delete below.
+    db.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
+    db.prepare("DELETE FROM grants WHERE user_id = ?").run(userId);
+    // 3. Drop the user row itself.
+    db.prepare("DELETE FROM users WHERE id = ?").run(userId);
+  })();
+  return true;
 }
 
 /**

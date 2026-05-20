@@ -10,8 +10,10 @@ import {
   UserNotFoundError,
   UsernameTakenError,
   createUser,
+  deleteUser,
   getUserById,
   getUserByUsername,
+  getUserByUsernameCI,
   listUsers,
   setPassword,
   userCount,
@@ -200,6 +202,61 @@ describe("listUsers / getUserByUsername", () => {
       expect(getUserByUsername(db, "nobody")).toBeNull();
       await createUser(db, "owner", "pw");
       expect(getUserByUsername(db, "owner")?.username).toBe("owner");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("getUserByUsernameCI", () => {
+  test("matches exact lowercase username", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      await createUser(db, "alice", "alice-strong-passphrase");
+      expect(getUserByUsernameCI(db, "alice")?.username).toBe("alice");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("matches case-insensitively (defense in depth for legacy mixed-case rows)", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      await createUser(db, "alice", "alice-strong-passphrase");
+      expect(getUserByUsernameCI(db, "Alice")?.username).toBe("alice");
+      expect(getUserByUsernameCI(db, "ALICE")?.username).toBe("alice");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("returns null when no row matches", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      expect(getUserByUsernameCI(db, "ghost")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("deleteUser", () => {
+  test("returns false when user does not exist", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      expect(deleteUser(db, "no-such-id")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("returns true and drops the row", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase");
+      expect(deleteUser(db, u.id)).toBe(true);
+      expect(getUserById(db, u.id)).toBeNull();
+      expect(userCount(db)).toBe(0);
     } finally {
       cleanup();
     }

@@ -2,6 +2,45 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.13] - 2026-05-20
+
+Multi-user Phase 1 — PR 2 of 5: admin `/admin/users` page + API (hub#252, design [`parachute.computer/design/2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)). Builds on PR 1's `users` table foundation (rc.12): wires the `validateUsername` / `validatePassword` validators into a four-endpoint admin surface, adds the SPA route, and adds the FK-aware delete-user helper that keeps token audit rows intact while letting the parent users row drop.
+
+Backend surface:
+
+- `src/api-users.ts` (new) — four endpoints, all `parachute:host:admin`-gated (same gate as `/api/grants`, `/vaults`, destructive `/api/modules/:short/*`). Snake-case wire shape; `password_hash` is **never** returned.
+  - **`GET /api/users`** — list users sorted by `created_at ASC` (consistent with first-admin selector). Returns `{ users: [{ id, username, password_changed, assigned_vault, created_at }, …] }`.
+  - **`POST /api/users`** — body `{ username, password, assignedVault?: string | null }`. Order of checks: 413 `password_too_long` if `password.length > PASSWORD_MAX_LEN` (256) — fires **before** argon2id touches the body, mitigating the CPU-DoS shape; 400 `invalid_username` (length / format / reserved); 400 `invalid_password` (< 12 chars); 400 `assigned_vault_not_found` if the vault isn't in services.json; 409 `username_taken` case-insensitive; 201 with `{ user: {…} }` on success. Admin-created users land with `password_changed: false` so PR 3's `/login` force-redirect catches them on first sign-in.
+  - **`DELETE /api/users/:id`** — 404 unknown id; 403 `first_admin_undeletable` when the target row is the earliest `created_at` (safety rail to prevent self-locking the hub); 204 on success. Delete flow: revoke all the user's tokens (`tokens.revoked_at = now`), null out `tokens.user_id` (and backfill `subject` with the username so the audit trail isn't anchored to a vanished PK), drop their `sessions` + `grants` (non-cascading FKs), then drop the users row. All wrapped in a single transaction.
+  - **`GET /api/users/vaults`** — sorted vault-instance-name list from services.json (`vaultInstanceNameFor` + `isVaultEntry`). Feeds the SPA's assigned-vault dropdown. Mirrors the (private) `listVaultNames` in `oauth-handlers.ts` so PR 4's issuer-side validation reads from the same source.
+- `src/users.ts` — adds `getUserByUsernameCI(db, username)` (case-insensitive lookup; `COLLATE NOCASE` — defense in depth against legacy mixed-case rows shadowing the validator-pinned lowercase form) and `deleteUser(db, userId)` (the FK-aware sweep above; returns `false` for unknown ids so the API layer can 404-or-204 by race).
+- `src/hub-server.ts` — route table extended (`/api/users`, `/api/users/vaults`, `/api/users/<id>`); per-id route falls through after the literal `vaults` segment is pre-empted so `vaults` can't be mistaken for an id.
+
+Frontend surface:
+
+- `web/ui/src/routes/Users.tsx` (new) — three-section page. (1) Users table with columns Username · Assigned vault · Password set · Created · Actions; `assigned_vault: null` renders as `—` (tooltip explains "no per-vault restriction (admin-level access)"); `password_changed: false` renders as "pending first login"; first row carries a "first admin" badge and a disabled Delete button with tooltip "First admin can't be deleted (would self-lock the hub)". (2) Collapsible Create-user form below the table — username + password + assigned-vault dropdown (`"No restriction (admin-level access)"` is the first option mapping to `null`; subsequent options are vault names from `/api/users/vaults`); client-side validates username regex + length and password ≥ 12 chars before posting (server is authoritative — the client check is fast feedback). On success the form clears and a banner says "User &lt;name&gt; created. They'll be prompted to change their password on first sign-in." (3) Delete confirmation inline dialog mirroring `Permissions.tsx`'s revoke pattern — click → confirm → DELETE → table refresh.
+- `web/ui/src/lib/api.ts` — `listUsers()`, `createUser(input)`, `deleteUser(id)`, `listUserVaults()`. `deleteUser`'s 403 path deliberately does **not** clear the cached bearer (403 here is "first_admin_undeletable" policy, not auth failure — clearing the token wouldn't help).
+- `web/ui/src/App.tsx` — `/users` route mounted; `Users` link added to the nav between Modules and Permissions; subtitle helper recognises `/users`.
+
+Tests + gates:
+
+- `src/__tests__/api-users.test.ts` (new) — 28 tests covering: auth boundary (401 / 403) on every endpoint, GET happy path (no hash leakage, snake-case shape, created_at order), POST happy paths (with and without `assigned_vault`), every POST validation branch (username length / format / reserved, password too short, 413 with elapsed-time floor ≤ 200ms to assert the cap fires before argon2id), 409 conflict case-insensitive, 400 `assigned_vault_not_found`, DELETE 404 unknown id, DELETE 403 first-admin-undeletable, DELETE 204 with token revocation + user_id NULL + subject backfilled with username, GET `/api/users/vaults` with empty and populated services.json.
+- `src/__tests__/users.test.ts` — `getUserByUsernameCI` + `deleteUser` unit coverage (3 + 2 tests).
+- `web/ui/src/routes/Users.test.tsx` (new) — 13 tests covering: loading state, empty state, list with sample data, listUsers failure, first-admin Delete disabled + tooltip, delete confirm dialog (cancel + confirm + error), create form hidden by default, vault dropdown options include the synthetic No-restriction entry, create happy path posts the right body and refreshes the list, client-side rejects 11-char password, 409 conflict surface.
+- `src/App.test.tsx` — nav-link-order assertion updated to include the new Users link.
+
+Gate: `bun test ./src` — **1530 pass / 0 fail / 31120 expects across 81 files** (+33 over rc.12 baseline 1497). SPA: `cd web/ui && bun run test` — **133 pass / 0 fail across 10 files** (+13 over rc.12 baseline 120). typecheck + biome clean (root + web/ui). SPA build clean (`vite build` + `verify-base.mjs` green).
+
+Smoke: spun up a hub against `PARACHUTE_HOME=/tmp/hub-mu-pr2`, walked the wizard, opened `/admin/users` — first admin in the list with Delete disabled. Created `testuser` with `verylongpassword123` and assigned vault → user appeared with "pending first login" status. `curl -X DELETE` against the first admin returned 403 `first_admin_undeletable`. UI-deleted `testuser` → row removed, no errors. `curl -X POST` with a 300-char password returned 413 `password_too_long`.
+
+What's NOT in PR 2 (deferred to later PRs in the chain):
+
+- `/login` force-change-password redirect + `/account/change-password` form — PR 3.
+- OAuth issuer `vault_scope` claim + per-user scope narrowing — PR 4.
+- End-to-end verification + scope-guard reach-through — PR 5.
+- Edit-existing-user (reassign vault, reset password) — Phase 2 (Phase 1's admin recovery shape is "delete + re-create").
+- 2FA enrollment inline on first sign-in — Phase 1.5 PR 6 (optional, design §2FA-orientation).
+
 ## [0.5.10-rc.12] - 2026-05-20
 
 Multi-user Phase 1 — PR 1 of 5: users table foundation (hub#252, design [`parachute.computer/design/2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)). Schema-only foundation that the admin-creates-user surface (PR 2), force-change-password flow (PR 3), and OAuth issuer integration (PR 4) build on. No UI surface, no API endpoints — just migration v8 + `User`-type extensions + reusable username/password validators wired through the wizard's and env-seed paths.
