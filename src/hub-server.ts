@@ -993,7 +993,7 @@ export function hubFetch(
     // `/vault/*`, generic service proxy) fall through and OPTIONS reaches
     // whatever default the downstream handler enforces (typically 405).
     if (req.method === "OPTIONS" && isCorsAllowedRoute(pathname)) {
-      return corsPreflightResponse();
+      return corsPreflightResponse(req);
     }
 
     // Platform health check (Render, Fly, Kubernetes, etc.). Plain JSON,
@@ -1281,16 +1281,16 @@ export function hubFetch(
     // tokens). Preflight OPTIONS already returned at the top of dispatch.
     // See `src/cors.ts` for the wildcard-origin rationale.
     if (pathname === "/oauth/authorize") {
-      if (!getDb) return applyCorsHeaders(dbNotConfigured());
+      if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
       if (req.method === "GET") {
         // handleAuthorizeGet is sync (returns Response, not Promise<Response>).
         // handleAuthorizePost is async — keep the await on POST only.
-        return applyCorsHeaders(handleAuthorizeGet(getDb(), req, oauthDeps(req)));
+        return applyCorsHeaders(req, handleAuthorizeGet(getDb(), req, oauthDeps(req)));
       }
       if (req.method === "POST") {
-        return applyCorsHeaders(await handleAuthorizePost(getDb(), req, oauthDeps(req)));
+        return applyCorsHeaders(req, await handleAuthorizePost(getDb(), req, oauthDeps(req)));
       }
-      return applyCorsHeaders(new Response("method not allowed", { status: 405 }));
+      return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
     }
 
     // Inline approve form for the operator-driven pending-client flow (#208).
@@ -1298,35 +1298,35 @@ export function hubFetch(
     // by handleAuthorizeGet when the operator hits a pending client. Three
     // gates inside the handler: CSRF, active session, same-origin Origin.
     if (pathname === "/oauth/authorize/approve") {
-      if (!getDb) return applyCorsHeaders(dbNotConfigured());
+      if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
       if (req.method !== "POST") {
-        return applyCorsHeaders(new Response("method not allowed", { status: 405 }));
+        return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
       }
-      return applyCorsHeaders(await handleApproveClientPost(getDb(), req, oauthDeps(req)));
+      return applyCorsHeaders(req, await handleApproveClientPost(getDb(), req, oauthDeps(req)));
     }
 
     if (pathname === "/oauth/token") {
-      if (!getDb) return applyCorsHeaders(dbNotConfigured());
+      if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
       if (req.method !== "POST") {
-        return applyCorsHeaders(new Response("method not allowed", { status: 405 }));
+        return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
       }
-      return applyCorsHeaders(await handleToken(getDb(), req, oauthDeps(req)));
+      return applyCorsHeaders(req, await handleToken(getDb(), req, oauthDeps(req)));
     }
 
     if (pathname === "/oauth/register") {
-      if (!getDb) return applyCorsHeaders(dbNotConfigured());
+      if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
       if (req.method !== "POST") {
-        return applyCorsHeaders(new Response("method not allowed", { status: 405 }));
+        return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
       }
-      return applyCorsHeaders(await handleRegister(getDb(), req, oauthDeps(req)));
+      return applyCorsHeaders(req, await handleRegister(getDb(), req, oauthDeps(req)));
     }
 
     if (pathname === "/oauth/revoke") {
-      if (!getDb) return applyCorsHeaders(dbNotConfigured());
+      if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
       if (req.method !== "POST") {
-        return applyCorsHeaders(new Response("method not allowed", { status: 405 }));
+        return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
       }
-      return applyCorsHeaders(await handleRevoke(getDb(), req, oauthDeps(req)));
+      return applyCorsHeaders(req, await handleRevoke(getDb(), req, oauthDeps(req)));
     }
 
     if (pathname === "/vaults") {

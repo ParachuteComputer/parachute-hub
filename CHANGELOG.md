@@ -2,6 +2,30 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.18] - 2026-05-20
+
+Follow-up to rc.17's CORS work: switch the `/oauth/*` posture from static `Access-Control-Allow-Origin: *` + `Allow-Credentials: false` to echo-origin + `Allow-Credentials: true` + `Vary: Origin`. The rc.17 shape worked for SPAs fetching with `credentials: 'omit'`, but Aaron's Gitcoin Brain UI on `https://unforced-dev.github.io` (and most SPA frameworks by default) fetches with `credentials: 'include'`, which browsers refuse to combine with a wildcard ACAO. The browser console error was:
+
+> Response to preflight request doesn't pass access control check: The value of the 'Access-Control-Allow-Origin' header in the response must not be the wildcard '*' when the request's credentials mode is 'include'.
+
+The fix matches the canonical OAuth-authz-server posture (Auth0, Okta, Keycloak): echo the request's `Origin` header verbatim and set `Allow-Credentials: true`, with `Vary: Origin` for cache correctness (without it a browser/CDN can cache a response for one origin and reuse it for a different origin, breaking CORS in unpredictable ways). When the request arrives with no `Origin` header (non-browser caller like a `curl` probe without `-H Origin: …`), fall back to the rc.17 shape — wildcard `*` + `Allow-Credentials: false` — since non-browser callers don't enforce CORS but the response should still be well-formed.
+
+Why this isn't a security regression vs `*`: browsers already restrict response readability by Origin under SOP — an attacker page issuing a `fetch(hub, {credentials: 'include'})` only gets to read the response if the server echoes that origin back in ACAO. Echoing back the origin the browser already sent reveals nothing the attacker couldn't reach by standing up their own server. The protocol-level gates (PKCE + `redirect_uri` matching + the operator-driven approval flow in #74/#199) still bound what a malicious cross-origin caller can *do*. For OAuth endpoints specifically — bearer-token-based, not cookie-based, designed for cross-origin SPA access by RFC 7591 DCR + RFC 6749 — echo-anything is the canonical posture. (For the broader `/api/*` admin surface, an allowlist is the right shape; that surface stays same-origin-only and isn't touched here.)
+
+Code shape:
+
+- **`src/cors.ts`** — `applyCorsHeaders` and `corsPreflightResponse` now take the `Request` as their first arg so they can read the `Origin` header per-call. The static-headers constants (`CORS_RESPONSE_HEADERS`, `CORS_PREFLIGHT_HEADERS`) keep only the request-independent pieces (Expose-Headers, Methods, Allow-Headers, Max-Age); the Origin / Credentials / Vary triple is computed per-request by a new `corsOriginHeaders(req)` helper that branches on Origin presence. File-level docstring expanded with the rc.17→rc.18 rationale and the why-this-isn't-an-allowlist note.
+- **`src/hub-server.ts`** — every `applyCorsHeaders(...)` and `corsPreflightResponse(...)` call site now threads `req` through. Six `/oauth/*` route blocks plus the pre-dispatch OPTIONS handler.
+- **`src/__tests__/cors.test.ts`** — existing tests reshaped from `expect(ACAO).toBe("*")` to `expect(ACAO).toBe(<origin>)` + `expect(Credentials).toBe("true")`. New cases pin: the no-Origin fallback (`*` + credentials:false), the Aaron-shaped request (`Origin: https://unforced-dev.github.io` → echoed verbatim), `Vary: Origin` presence on every echo-origin branch (regression guard against losing it).
+
+Gate: `bun test ./src` — **1600 pass / 0 fail / 31331 expects across 84 files** (+5 over rc.17 baseline 1595). typecheck + biome clean.
+
+Smoke (against `bun src/hub-server.ts --port 11939 --issuer https://parachute.taildf9ce2.ts.net`):
+
+- `OPTIONS /oauth/register` with `Origin: https://unforced-dev.github.io` → `HTTP/1.1 204 No Content` + `Access-Control-Allow-Origin: https://unforced-dev.github.io` + `Access-Control-Allow-Credentials: true` + `Vary: Origin` + the unchanged Methods/Allow-Headers/Max-Age preamble. (Was on rc.17: `Access-Control-Allow-Origin: *` + `Allow-Credentials: false` — which the browser then rejected on the credentials:'include' fetch.)
+- `OPTIONS /oauth/register` with no Origin header → `204` + `Access-Control-Allow-Origin: *` + `Access-Control-Allow-Credentials: false` (the non-browser-caller fallback).
+- `OPTIONS /api/me` from a third-party origin → still no `Access-Control-Allow-Origin` echo (scope discipline preserved).
+
 ## [0.5.10-rc.17] - 2026-05-20
 
 CORS support on the public OAuth surface so third-party SPAs can talk to a self-hosted hub from a foreign origin. Caught when Aaron's Gitcoin Brain UI at `https://unforced-dev.github.io` tried to OAuth-register with his hub at `https://parachute.taildf9ce2.ts.net`: the browser's preflight on `POST /oauth/register` got back a 405 without CORS headers and blocked the actual request, breaking the entire third-party-SPA story. OAuth Dynamic Client Registration (RFC 7591) is *designed* for cross-origin use — arbitrary SPAs register → authorize → exchange tokens — so wildcard CORS on the OAuth endpoints is the correct posture, not a workaround.
