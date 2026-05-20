@@ -2,6 +2,22 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10] - 2026-05-20
+
+Stable release covering the v0.6 multi-user foundation + Gitcoin Brain UI compatibility. Cumulative changes since `0.5.9`:
+
+- **Multi-user Phase 1** (PRs 1-5): users table + admin SPA + force-change-password + OAuth vault_scope claim + scope-guard enforcement. Admins can create per-user accounts with assigned vaults; users are scoped to their vault; cross-vault access returns 403.
+- **First-boot wizard** (#262, #266, #271, #274): web-based setup at `/admin/setup` — admin account, vault provisioning, expose-mode configuration, auto-mint operator token, install Notes/Scribe inline. Eliminates CLI-only onboarding for cloud deploys.
+- **Module install channel** (#276): operator-selectable `latest` / `rc` channel via env var or admin SPA toggle. Determines which channel module installs pull from.
+- **Supervisor lifecycle hardening** (#273): `stop()` awaits child exit; SIGKILL fallback after configurable timeout; better test coverage.
+- **CORS support** (#286, #288): `/oauth/*` cross-origin support with echo-origin + credentials for SPA OAuth flows (DCR, token exchange).
+- **Approval UX** (#289): web-based approval replaces CLI `parachute auth approve-client` message; shareable admin link; resolved (named) scopes shown on consent.
+- **Notes-connect recovery** (#277): "Unknown application" page now offers a one-click "Reset connection" button when SPA's cached client_id is stale.
+- **Token visibility on done screen** (#277): MCP install command's Bearer token is masked by default + reveal-on-click + always-working copy.
+- **Discovery refresh** (#271): module install through `/admin/modules` reflects in the discovery page without manual refresh.
+
+See individual rc entries below for full detail.
+
 ## [0.5.10-rc.19] - 2026-05-20
 
 Three approval / consent UX fixes Aaron hit while testing the Gitcoin Brain UI OAuth flow against his self-hosted hub. Same session as the rc.17 / rc.18 CORS work — different layer, same posture (third-party SPA → self-hosted hub).
