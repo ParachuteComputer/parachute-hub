@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { hasScope } from "../scope";
+import { enforceVaultScope, hasScope } from "../scope";
 
 describe("hasScope — exact match", () => {
   test("exact string match → true", () => {
@@ -123,5 +123,49 @@ describe("hasScope — multiple grants, mixed shapes", () => {
 
   test("narrowed alongside broad — narrowed satisfies broad query", () => {
     expect(hasScope(["vault:work:write", "vault:home:read"], "vault:read")).toBe(true);
+  });
+});
+
+describe("enforceVaultScope — admin / unrestricted (empty vaultScope)", () => {
+  test("empty vaultScope passes any vault check", () => {
+    // Admin tokens and pre-PR-4 tokens both surface as `vaultScope: []`.
+    // The helper treats `[]` as "no per-user restriction" — every vault
+    // name is accepted. The scope-string check upstream remains the
+    // primary gate.
+    expect(enforceVaultScope({ vaultScope: [] }, "aaron")).toBe(true);
+    expect(enforceVaultScope({ vaultScope: [] }, "work")).toBe(true);
+    expect(enforceVaultScope({ vaultScope: [] }, "anything")).toBe(true);
+  });
+});
+
+describe("enforceVaultScope — non-admin (pinned)", () => {
+  test("vaultScope contains target → true", () => {
+    expect(enforceVaultScope({ vaultScope: ["aaron"] }, "aaron")).toBe(true);
+  });
+
+  test("vaultScope excludes target → false (the defense-in-depth case)", () => {
+    // A non-admin user with vaultScope=["aaron"] tries to reach vault
+    // "bob". Even if the token's scope string somehow named bob (token-
+    // mint bug, manual edit), this check refuses the cross-vault access.
+    expect(enforceVaultScope({ vaultScope: ["aaron"] }, "bob")).toBe(false);
+    expect(enforceVaultScope({ vaultScope: ["aaron"] }, "")).toBe(false);
+  });
+
+  test("multi-vault pin (Phase 2-shape) — any match accepts", () => {
+    // The wire shape is `string[]` so Phase 2's multi-vault membership
+    // works without a shape change. Phase 1 always has length ≤1; this
+    // test pins the forward-compat behavior.
+    expect(enforceVaultScope({ vaultScope: ["aaron", "work"] }, "aaron")).toBe(true);
+    expect(enforceVaultScope({ vaultScope: ["aaron", "work"] }, "work")).toBe(true);
+    expect(enforceVaultScope({ vaultScope: ["aaron", "work"] }, "personal")).toBe(false);
+  });
+});
+
+describe("enforceVaultScope — exact-match (no inheritance)", () => {
+  test("vault name match is case-sensitive exact-string", () => {
+    // Vault instance names are case-sensitive in services.json. The
+    // helper mirrors that — no normalization, no fuzzy match.
+    expect(enforceVaultScope({ vaultScope: ["aaron"] }, "Aaron")).toBe(false);
+    expect(enforceVaultScope({ vaultScope: ["aaron"] }, "aaron ")).toBe(false);
   });
 });

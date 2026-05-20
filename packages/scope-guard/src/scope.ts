@@ -60,6 +60,48 @@ function decompose(scope: string): Decomposed | null {
 }
 
 /**
+ * Enforce the `vault_scope` claim: does this token authorize a request
+ * targeting `requestVaultName`?
+ *
+ * The claim is the multi-user Phase 1 per-user vault pin — see
+ * [`2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/).
+ * Hub mints `vault_scope: [<assigned_vault>]` for non-admin users and
+ * `vault_scope: []` for admin / unpinned users. Pre-PR-4 tokens lack the
+ * claim entirely; the validate path surfaces those as `[]`.
+ *
+ * Decision matrix:
+ *   - `vaultScope === []` → returns `true`. No per-user restriction —
+ *     admin tokens, pre-PR-4 tokens, and any explicit "no pin" mint.
+ *     This is the unrestricted sentinel; the upstream scope-string check
+ *     (which always names the resource for hub-issued tokens) remains the
+ *     primary gate, and `vault_scope` adds nothing here.
+ *   - `vaultScope` contains `requestVaultName` → returns `true`. The user
+ *     is pinned to a list that includes the target vault.
+ *   - `vaultScope` is non-empty and excludes `requestVaultName` → returns
+ *     `false`. The user is pinned to a different vault; the request must
+ *     be refused with 403. This is the defense-in-depth case the claim
+ *     exists for — even if a scope string somehow names the wrong vault
+ *     (token-mint bug, manual edit, third-party RS not enforcing the
+ *     scope-string vocabulary correctly), this check stops cross-vault
+ *     access at the consumer.
+ *
+ * Phase 1 always has length ≤1; the list shape carries Phase 2 multi-vault
+ * forward without a wire-shape change. The check is the same either way.
+ *
+ * Consumers use this from inside their hub-JWT auth path, *after*
+ * `validateHubJwt` returns claims, *before* dispatching to the per-vault
+ * handler. See `parachute-vault/src/auth.ts`'s `authenticateHubJwt` for
+ * the canonical wire-up.
+ */
+export function enforceVaultScope(
+  claims: { vaultScope: string[] },
+  requestVaultName: string,
+): boolean {
+  if (claims.vaultScope.length === 0) return true;
+  return claims.vaultScope.includes(requestVaultName);
+}
+
+/**
  * Does `granted` satisfy `required`?
  *
  *   - Exact string match → true

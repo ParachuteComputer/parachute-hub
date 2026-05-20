@@ -41,6 +41,26 @@ export interface HubJwtClaims {
   jti: string | undefined;
   /** Client id from the `client_id` claim, if present. */
   clientId: string | undefined;
+  /**
+   * Parsed `vault_scope` claim (the multi-user Phase 1 per-user vault pin —
+   * see [`2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)).
+   *
+   * Semantics:
+   *   - **Non-empty list** (e.g. `["aaron"]`) — the user is pinned to these
+   *     vault instances. Resource servers (vault, notes, scribe) refuse
+   *     requests against any other vault.
+   *   - **Empty list `[]`** — no per-user vault restriction. Admin tokens
+   *     and any pre-PR-4 hub-issued token surface as `[]`.
+   *
+   * Always present (defaults to `[]` when the claim is absent or malformed)
+   * so consumers can call `enforceVaultScope(claims, name)` without
+   * distinguishing "absent" from "empty." Hub mints non-array values
+   * never — but malformed input is treated as `[]` (no restriction)
+   * rather than throwing, since the upstream scope strings still pin
+   * the resource. The defense-in-depth check via `vault_scope` is
+   * additive, not the sole gate.
+   */
+  vaultScope: string[];
 }
 
 /** Reasons a hub JWT may fail validation. Each maps to a `HubJwtError.code`. */
@@ -250,6 +270,19 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
       const clientIdRaw = (payload as { client_id?: unknown }).client_id;
       const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;
 
+      // vault_scope: multi-user Phase 1 per-user vault pin (see HubJwtClaims
+      // jsdoc for full semantics). Non-array / missing / malformed values
+      // collapse to `[]` — the "no per-user restriction" sentinel. Pre-PR-4
+      // tokens lack the claim entirely; they're treated as admin-equivalent
+      // for vault-pin purposes (the upstream scope strings still pin the
+      // resource). This is the "fail-open at THIS layer, fail-closed at the
+      // scope-string layer" choice: vault_scope is defense-in-depth, not
+      // the primary gate.
+      const vaultScopeRaw = (payload as { vault_scope?: unknown }).vault_scope;
+      const vaultScope: string[] = Array.isArray(vaultScopeRaw)
+        ? vaultScopeRaw.filter((s): s is string => typeof s === "string")
+        : [];
+
       // Revocation enforcement runs LAST — only consulted if the JWT is
       // otherwise valid. Cheaper checks (signature, iss, aud, expiry) reject
       // first, so a bad signature never costs a network roundtrip. A token
@@ -277,7 +310,7 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
         }
       }
 
-      return { sub: payload.sub, scopes, aud, jti, clientId };
+      return { sub: payload.sub, scopes, aud, jti, clientId, vaultScope };
     },
 
     resetJwksCache() {

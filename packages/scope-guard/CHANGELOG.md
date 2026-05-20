@@ -4,6 +4,32 @@ All notable changes to `@openparachute/scope-guard` are documented here. The for
 
 The library's RC cadence is independent of `@openparachute/hub`'s — they ship from the same repo but aren't coupled in version.
 
+## 0.3.0-rc.1 — 2026-05-20
+
+Adds `vault_scope` claim surfacing + the `enforceVaultScope` defense-in-depth check (hub multi-user Phase 1 PR 5 — see [`2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)). **Additive — no behavior change for existing adopters.** A bump from `0.2.x` to `0.3.0` does NOT start rejecting any token that `0.2.x` accepted; the new helper is opt-in and the new claim is surfaced as `[]` (unrestricted) when absent.
+
+### Added
+
+- **`HubJwtClaims.vaultScope: string[]`** — parsed from the JWT's `vault_scope` claim. Non-empty for non-admin users (a single-element list naming their `assigned_vault` per Phase 1; Phase 2 widens to multi-vault without a wire-shape change). Empty `[]` for admin users, pre-PR-4 tokens, and any token where the claim is absent or malformed. The lib normalizes all three "no pin" cases to `[]` so consumers don't need to distinguish.
+- **`enforceVaultScope(claims, requestVaultName) → boolean`** — opt-in helper for resource servers. Returns `true` if `claims.vaultScope` is `[]` OR contains `requestVaultName`; returns `false` if `vaultScope` is non-empty and excludes the target. Consumers call it from inside their hub-JWT auth path (after `validateHubJwt`, before dispatching to the per-vault handler) and translate `false` to a 403 with `error: "vault_scope_mismatch"`. See `parachute-vault/src/auth.ts`'s `authenticateHubJwt` for the canonical wire-up.
+
+### Why it's a minor bump, not a patch
+
+The claim surface (`HubJwtClaims.vaultScope`) is a new required field on a public interface — adopters who structurally type the claims object (e.g. TypeScript callers that destructure `{ sub, scopes, aud, jti, clientId }`) keep working, but any caller that *constructs* a `HubJwtClaims` value (test fakes, mocks) now needs to provide `vaultScope` or it won't typecheck. That's the breaking-shape ripple that earns a minor over a patch. The runtime behavior is purely additive — the lib reads a new claim if present and surfaces `[]` if absent.
+
+### Adoption notes
+
+- **Vault**: adopt the helper inside `authenticateHubJwt` — derive the target vault from the request path, call `enforceVaultScope(claims, vaultName)`, return 403 with `vault_scope_mismatch` on false. See vault PR for the canonical pattern.
+- **Scribe**: no-touch. Scribe's surface is per-vault-orthogonal (`scribe:transcribe` / `scribe:admin` aren't vault-named); a token's `vault_scope` is informational only at scribe. If a future scribe route accepts tokens that *do* name a vault (e.g. a per-vault transcription audit log), wire in `enforceVaultScope` at that route.
+- **Notes**: no-touch. Notes is a frontend SPA; it holds the user's token and proxies through vault. The defense-in-depth check fires at vault, not at notes.
+- **Parachute-agent**: not yet adopted. Agent's `parachute:agent:*` scopes don't carry a vault pin; `vault_scope` is informational. If an agent route ever dispatches to a vault on behalf of the user, that route should call `enforceVaultScope` before forwarding.
+
+### Compatibility
+
+- **No behavior change** for any existing adopter that doesn't call `enforceVaultScope`. The lib still validates JWTs identically — the new field is additive.
+- **bundler-resolution consumers (vault, scribe, hub workspace):** unaffected.
+- **NodeNext-strict consumers (agent's tsc + vitest):** unaffected. The `.js`-extension convention from 0.2.1 carries forward.
+
 ## 0.2.1 — 2026-05-10
 
 Packaging fix. **0.2.0 is non-functional under NodeNext-strict consumers** — every non-bun adopter on `tsc + Node ESM + "moduleResolution": "nodenext"` should upgrade to 0.2.1 immediately.

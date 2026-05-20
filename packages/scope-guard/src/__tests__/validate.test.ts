@@ -92,15 +92,34 @@ interface SignOpts {
   expiresAtSeconds?: number;
   omitKid?: boolean;
   kid?: string;
+  /**
+   * When provided, sets the `vault_scope` claim. Empty array, undefined
+   * "absent claim entirely" (the value the option lookup uses to decide
+   * whether to include the claim), and explicit `null` are all distinct —
+   * tests need each shape to exercise the absent / empty / malformed
+   * paths the validate code handles.
+   */
+  vaultScope?: string[] | null | "OMIT_CLAIM";
+  /** Force a malformed (non-array) `vault_scope` claim for the malformed path test. */
+  vaultScopeRaw?: unknown;
 }
 
 async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
   const iat = Math.floor(Date.now() / 1000);
   const exp = opts.expiresAtSeconds ?? iat + (opts.ttlSeconds ?? 60);
-  const builder = new SignJWT({
+  const payload: Record<string, unknown> = {
     scope: opts.scope ?? "vault:read",
     client_id: opts.clientId ?? "test-client",
-  })
+  };
+  if (opts.vaultScopeRaw !== undefined) {
+    payload.vault_scope = opts.vaultScopeRaw;
+  } else if (opts.vaultScope !== "OMIT_CLAIM") {
+    // Default: include `vault_scope: []` (hub's PR-4 behavior — always
+    // emit, even for admins). "OMIT_CLAIM" is the test seam for pre-PR-4
+    // tokens that lack the claim entirely.
+    payload.vault_scope = opts.vaultScope ?? [];
+  }
+  const builder = new SignJWT(payload)
     .setProtectedHeader(opts.omitKid ? { alg: "RS256" } : { alg: "RS256", kid: opts.kid ?? kp.kid })
     .setIssuer(opts.iss ?? "http://issuer.invalid")
     .setSubject(opts.sub ?? "user-1")
@@ -568,5 +587,108 @@ describe("createScopeGuard — revocation enforcement", () => {
     expect(revocationCalls).toBe(0);
     guard.resetJwksCache();
     guard.resetRevocationCache();
+  });
+});
+
+describe("createScopeGuard — vault_scope claim surfacing", () => {
+  // The vault_scope claim is hub multi-user Phase 1 PR 4's per-user vault
+  // pin. The validate-side contract is: surface what's there, normalize
+  // every "no pin" shape to `[]`, never throw on malformed input. The
+  // defense-in-depth check happens at the consumer via `enforceVaultScope`
+  // — these tests pin the claim parsing only.
+
+  test("hub-minted non-admin token (single-element array) → surfaces array", async () => {
+    const guard = makeGuard();
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      vaultScope: ["aaron"],
+      scope: "vault:aaron:read vault:aaron:write",
+    });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.vaultScope).toEqual(["aaron"]);
+    guard.resetJwksCache();
+  });
+
+  test("hub-minted admin token (explicit []) → surfaces []", async () => {
+    const guard = makeGuard();
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      vaultScope: [],
+      scope: "vault:read vault:write",
+    });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.vaultScope).toEqual([]);
+    guard.resetJwksCache();
+  });
+
+  test("pre-PR-4 token (claim absent) → surfaces [] (back-compat)", async () => {
+    // Tokens minted before PR 4 lack the claim entirely. The validate
+    // path treats that as `[]` (unrestricted) — the upstream scope-string
+    // check remains the primary gate. Without this back-compat, every
+    // operator-token and CLI-mint produced before the PR-4 cut would
+    // start 403-ing the moment a consumer wired in `enforceVaultScope`,
+    // which is the wrong tradeoff for a defense-in-depth check.
+    const guard = makeGuard();
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      vaultScope: "OMIT_CLAIM",
+      scope: "vault:read",
+    });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.vaultScope).toEqual([]);
+    guard.resetJwksCache();
+  });
+
+  test("malformed vault_scope (non-array) → surfaces [] (fail-open)", async () => {
+    // A hand-crafted or buggy token with `vault_scope: "aaron"` (string
+    // instead of array) is normalized to `[]`. The lib chooses fail-open
+    // for malformed input at this layer because (a) it's the value the
+    // hub never mints, (b) the scope-string check upstream is the
+    // primary gate anyway. Throwing here would translate a typo into a
+    // 401 instead of a clean 403 from the scope-string layer.
+    const guard = makeGuard();
+    const tokenStr = await signJwt(kp, {
+      iss: fixture.origin,
+      vaultScopeRaw: "aaron",
+    });
+    const claimsStr = await guard.validateHubJwt(tokenStr);
+    expect(claimsStr.vaultScope).toEqual([]);
+
+    const tokenNum = await signJwt(kp, {
+      iss: fixture.origin,
+      vaultScopeRaw: 42,
+    });
+    const claimsNum = await guard.validateHubJwt(tokenNum);
+    expect(claimsNum.vaultScope).toEqual([]);
+
+    guard.resetJwksCache();
+  });
+
+  test("array with non-string entries → those entries are filtered out", async () => {
+    // Mixed array: keep the strings, drop the rest. Defends against a
+    // buggy upstream that emits `["aaron", null]` from a partial lookup.
+    const guard = makeGuard();
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      vaultScopeRaw: ["aaron", null, 42, "work"],
+    });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.vaultScope).toEqual(["aaron", "work"]);
+    guard.resetJwksCache();
+  });
+
+  test("multi-vault Phase 2-shape pin → surfaces full array", async () => {
+    // Forward-compat: when Phase 2 lets a user belong to multiple vaults,
+    // the wire shape is the same `string[]`. The validate layer doesn't
+    // care about length — it surfaces what's there, the consumer's
+    // `enforceVaultScope` does the membership check.
+    const guard = makeGuard();
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      vaultScope: ["aaron", "work", "personal"],
+    });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.vaultScope).toEqual(["aaron", "work", "personal"]);
+    guard.resetJwksCache();
   });
 });

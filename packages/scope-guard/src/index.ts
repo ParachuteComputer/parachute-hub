@@ -16,7 +16,7 @@
 // transparently. Dropping the extension breaks NodeNext silently — see #225
 // for the bug that motivated 0.2.1.
 export { extractBearer, looksLikeJwt, parseScopes } from "./parse.js";
-export { hasScope } from "./scope.js";
+export { enforceVaultScope, hasScope } from "./scope.js";
 export type { JwksGetter, JwksOptions } from "./jwks.js";
 // Revocation-cache surface: the cache itself is internal — `ScopeGuard` owns
 // the lifecycle so downstream RSes don't accidentally instantiate parallel
