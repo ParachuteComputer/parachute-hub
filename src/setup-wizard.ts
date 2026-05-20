@@ -1089,7 +1089,12 @@ export async function handleSetupAccountPost(
     return htmlResponse(renderAccountStep({ csrfToken, username, errorMessage: fieldErr }), 400);
   }
   try {
-    const user = await createUser(deps.db, username, password);
+    // Wizard-admin chose their password through this very form; skip the
+    // multi-user-Phase-1 force-change-password redirect by landing
+    // `password_changed=true`. `assignedVault` stays null — admin posture
+    // (the wizard never asks the first admin to pin themselves to a
+    // single vault; that's a non-admin user pattern).
+    const user = await createUser(deps.db, username, password, { passwordChanged: true });
     const session = createSession(deps.db, { userId: user.id });
     const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
       secure: isHttpsRequest(req),

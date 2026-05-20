@@ -37,7 +37,7 @@ import {
   handleSetupVaultPost,
 } from "../setup-wizard.ts";
 import { Supervisor } from "../supervisor.ts";
-import { createUser, userCount } from "../users.ts";
+import { createUser, getUserByUsername, userCount } from "../users.ts";
 
 interface Harness {
   dir: string;
@@ -577,6 +577,13 @@ describe("handleSetupAccountPost", () => {
       const sessionCookie = setCookie(post, SESSION_COOKIE_NAME);
       expect(sessionCookie).toBeDefined();
       expect(userCount(db)).toBe(1);
+      // Multi-user Phase 1: the wizard's first admin chose their password
+      // via this very form, so skip the force-change-password redirect on
+      // first sign-in (`password_changed=1`). `assigned_vault` stays NULL
+      // — admin posture (no per-vault restriction).
+      const created = getUserByUsername(db, "ops");
+      expect(created?.passwordChanged).toBe(true);
+      expect(created?.assignedVault).toBeNull();
     } finally {
       db.close();
     }

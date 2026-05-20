@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { hubDbPath, migrate, openHubDb } from "../hub-db.ts";
 
 interface Harness {
   configDir: string;
@@ -143,6 +143,131 @@ describe("openHubDb + migrate", () => {
             )
             .run("t1", "no-such-user", "c", "s", "2030-01-01", "2026-01-01"),
         ).toThrow();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("v8 adds password_changed + assigned_vault columns on a fresh DB", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        const versions = (
+          db.query<{ version: number }, []>("SELECT version FROM schema_version").all() ?? []
+        ).map((r) => r.version);
+        expect(versions).toContain(8);
+        // PRAGMA table_info returns the column shape; we want both new
+        // columns present with the right defaults / nullability.
+        interface ColInfo {
+          name: string;
+          type: string;
+          notnull: number;
+          dflt_value: string | null;
+        }
+        const cols = db
+          .query<ColInfo, []>(
+            "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('users')",
+          )
+          .all();
+        const byName = new Map(cols.map((c) => [c.name, c]));
+        const pc = byName.get("password_changed");
+        expect(pc).toBeDefined();
+        expect(pc?.type).toBe("INTEGER");
+        expect(pc?.notnull).toBe(1);
+        // Default literal — SQLite returns it as a string "0".
+        expect(pc?.dflt_value).toBe("0");
+        const av = byName.get("assigned_vault");
+        expect(av).toBeDefined();
+        expect(av?.type).toBe("TEXT");
+        expect(av?.notnull).toBe(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("v8 backfills password_changed=1 for users that pre-date the migration", () => {
+    const h = makeHarness();
+    try {
+      // Stand up a DB at the v7 state by partially-applying migrations:
+      // open Database directly, call migrate after stripping the v8 entry
+      // would be invasive. Instead, drive the same migration shape by hand
+      // for v1-v7 then insert a row, then call migrate() to apply v8.
+      // Cleanest path: openHubDb runs everything, but we want a v7 snapshot.
+      // Approach: open with openHubDb (runs all migrations), drop the v8
+      // changes, mark v8 unapplied, insert a user with password_changed=0
+      // (simulating a row from before the backfill), then re-run migrate.
+      // SQLite doesn't have DROP COLUMN pre-3.35 universally, so we do the
+      // recreate-and-rename: drop v8's columns by recreating users without
+      // them, then delete the v8 schema_version row, then call migrate().
+      const db = openHubDb(h.dbPath);
+      try {
+        // Build a v7-shape users table and copy the v8-shape rows.
+        db.exec(`
+          CREATE TABLE users_v7 (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          INSERT INTO users_v7 (id, username, password_hash, created_at, updated_at)
+          SELECT id, username, password_hash, created_at, updated_at FROM users;
+          DROP TABLE users;
+          ALTER TABLE users_v7 RENAME TO users;
+        `);
+        db.exec("DELETE FROM schema_version WHERE version = 8");
+        // Insert a row that pre-dates v8 (no password_changed column yet).
+        db.prepare(
+          `INSERT INTO users (id, username, password_hash, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        ).run("legacy-user", "owner", "h", "2026-01-01", "2026-01-01");
+        // Now re-run migrations — v8 should ALTER the table and backfill.
+        migrate(db);
+        const row = db
+          .query<{ password_changed: number; assigned_vault: string | null }, [string]>(
+            "SELECT password_changed, assigned_vault FROM users WHERE id = ?",
+          )
+          .get("legacy-user");
+        expect(row).not.toBeNull();
+        expect(row?.password_changed).toBe(1);
+        expect(row?.assigned_vault).toBeNull();
+        const versions = (
+          db.query<{ version: number }, []>("SELECT version FROM schema_version").all() ?? []
+        ).map((r) => r.version);
+        expect(versions).toContain(8);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("v8 — fresh inserts default password_changed=0 and assigned_vault NULL", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        // Insert via the bare-columns SQL (mirrors what a pre-v8 caller
+        // would emit) to confirm the column DEFAULTs work.
+        db.prepare(
+          `INSERT INTO users (id, username, password_hash, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        ).run("u-default", "owner", "h", "2026-01-01", "2026-01-01");
+        const row = db
+          .query<{ password_changed: number; assigned_vault: string | null }, [string]>(
+            "SELECT password_changed, assigned_vault FROM users WHERE id = ?",
+          )
+          .get("u-default");
+        expect(row?.password_changed).toBe(0);
+        expect(row?.assigned_vault).toBeNull();
       } finally {
         db.close();
       }

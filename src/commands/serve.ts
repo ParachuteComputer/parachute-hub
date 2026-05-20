@@ -102,7 +102,11 @@ export async function seedInitialAdminIfNeeded(
   const username = env.PARACHUTE_INITIAL_ADMIN_USERNAME?.trim();
   const password = env.PARACHUTE_INITIAL_ADMIN_PASSWORD;
   if (!username || !password) return "needs-setup";
-  await createUser(db, username, password);
+  // Env-seeded admins chose their password via the env var; skip the
+  // multi-user-Phase-1 force-change-password redirect by landing
+  // `password_changed=true`. Same treatment as the wizard's first admin.
+  // `assignedVault` stays null — admin posture (no per-vault restriction).
+  await createUser(db, username, password, { passwordChanged: true });
   log(`parachute serve: seeded initial admin "${username}" from PARACHUTE_INITIAL_ADMIN_*`);
   return "seeded";
 }

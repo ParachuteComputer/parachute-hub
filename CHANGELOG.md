@@ -2,6 +2,24 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.12] - 2026-05-20
+
+Multi-user Phase 1 — PR 1 of 5: users table foundation (hub#252, design [`parachute.computer/design/2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)). Schema-only foundation that the admin-creates-user surface (PR 2), force-change-password flow (PR 3), and OAuth issuer integration (PR 4) build on. No UI surface, no API endpoints — just migration v8 + `User`-type extensions + reusable username/password validators wired through the wizard's and env-seed paths.
+
+Surface summary:
+- `src/hub-db.ts` — migration v8. Two `ALTER TABLE` on `users` (`password_changed INTEGER NOT NULL DEFAULT 0` + `assigned_vault TEXT` nullable) plus a `UPDATE users SET password_changed = 1` backfill so existing rows (wizard admin, env-seeded admin) don't get spurious force-change redirects on first sign-in.
+- `src/users.ts` — `User` gains `passwordChanged: boolean` + `assignedVault: string | null`. `CreateUserOpts` gains optional `passwordChanged` (default `false`) and `assignedVault` (default `null`); `createUser` persists both. `rowToUser` translates the 0/1 INTEGER to TS `boolean`. New `validateUsername(name)` helper (charset `[a-z0-9_-]`, length 2-32, case-insensitive reserved list `admin`/`root`/`system`/`setup`/`parachute`/`hub`, returns discriminated union with `format`/`length`/`reserved` reasons). New `validatePassword(password)` helper (12-char minimum, no complexity rules, returns discriminated union with `too_short` reason). Neither validator is wired into a caller yet — PR 2's `POST /api/users` and PR 3's `POST /account/change-password` consume them.
+- `src/commands/serve.ts` — `seedInitialAdminIfNeeded` now passes `{ passwordChanged: true }` so env-seeded admins skip the force-change-password redirect on first sign-in (they chose their password via `PARACHUTE_INITIAL_ADMIN_PASSWORD`).
+- `src/setup-wizard.ts` — `handleSetupAccountPost` now passes `{ passwordChanged: true }` to `createUser` so the wizard's first-admin (who picked their own password through the form) doesn't get the force-change-password redirect.
+
+What's NOT in PR 1 (deferred to later PRs in the chain):
+- Admin SPA `/admin/users` page + API endpoints (`GET`/`POST`/`PATCH`/`DELETE /api/users`) — PR 2.
+- `/login` force-change-password redirect + `/account/change-password` form — PR 3.
+- OAuth issuer `vault_scope` claim + per-user scope narrowing — PR 4.
+- End-to-end verification + scope-guard reach-through — PR 5.
+
+Gate: `bun test ./src` — **1497 pass / 0 fail / 31038 expects across 80 files** (+15 over rc.11 baseline 1482). SPA: `cd web/ui && bun run test` — **120 pass / 0 fail across 9 files** (unchanged — no SPA surface touched). typecheck + biome clean (root + web/ui).
+
 ## [0.5.10-rc.11] - 2026-05-20
 
 Fresh-machine connect bug + done-screen token-reveal UX. Two issues surfaced on Aaron's fresh-machine wizard testing pass, folded together.

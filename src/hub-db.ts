@@ -217,6 +217,36 @@ const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 8,
+    sql: `
+      -- Multi-user Phase 1 (hub#252, design 2026-05-20-multi-user-phase-1.md).
+      -- Two columns on \`users\`:
+      --
+      --   * password_changed (INTEGER 0/1) — tracks whether a user has
+      --     changed their password since account creation. The admin-creates-
+      --     user flow (PR 2) lands new accounts with 0; the user's forced
+      --     change-password flow (PR 3) flips it to 1. SQLite has no native
+      --     BOOL, so 0/1 + a TS helper in users.ts handles the translation.
+      --   * assigned_vault (TEXT, nullable) — the vault instance name the
+      --     user is pinned to (Phase 1 is single-vault-per-user). NULL means
+      --     "no per-vault restriction" — the wizard's first admin and any
+      --     other admin-role user. The OAuth issuer (PR 4) reads this at
+      --     mint time to narrow the token's vault scope. No FK: vault names
+      --     resolve through services.json, not a DB row.
+      --
+      -- Backfill: every existing user pre-dates this migration. The only
+      -- accounts that could exist are the wizard's first admin (chose their
+      -- own password via the wizard form) or env-seeded admins (operator
+      -- baked the password into PARACHUTE_INITIAL_ADMIN_PASSWORD). Both
+      -- already-chosen-by-the-account-holder paths, so flip every existing
+      -- row to password_changed=1 — no spurious force-change on first sign-
+      -- in for already-bootstrapped hubs.
+      ALTER TABLE users ADD COLUMN password_changed INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE users ADD COLUMN assigned_vault TEXT;
+      UPDATE users SET password_changed = 1;
+    `,
+  },
 ];
 
 export function openHubDb(path: string = hubDbPath()): Database {

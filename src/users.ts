@@ -25,6 +25,25 @@ export interface User {
   passwordHash: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Whether the user has changed their password since account creation.
+   * `false` means the user signed up with an admin-typed default password
+   * and the force-change-password flow at sign-in time should redirect
+   * them to `/account/change-password`. The wizard's first admin and env-
+   * seeded admins land as `true` (they chose their own password). Stored
+   * as `users.password_changed INTEGER 0|1` (added in migration v8).
+   */
+  passwordChanged: boolean;
+  /**
+   * The vault instance name this user is pinned to (Phase 1 multi-user is
+   * single-vault-per-user). `null` means "no per-vault restriction" — the
+   * default for admin accounts, where the OAuth issuer mints tokens for
+   * any requested vault. Non-null pins the issuer to narrow scopes to
+   * `vault:<assigned_vault>:<verb>`. No FK; vault names resolve through
+   * `services.json` at mint time. Stored as `users.assigned_vault TEXT`
+   * (added in migration v8).
+   */
+  assignedVault: string | null;
 }
 
 export class SingleUserModeError extends Error {
@@ -56,6 +75,8 @@ interface Row {
   password_hash: string;
   created_at: string;
   updated_at: string;
+  password_changed: number;
+  assigned_vault: string | null;
 }
 
 function rowToUser(r: Row): User {
@@ -65,6 +86,8 @@ function rowToUser(r: Row): User {
     passwordHash: r.password_hash,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    passwordChanged: r.password_changed === 1,
+    assignedVault: r.assigned_vault,
   };
 }
 
@@ -72,6 +95,23 @@ export interface CreateUserOpts {
   /** Allow creating an additional user when one already exists. Off by default. */
   allowMulti?: boolean;
   now?: () => Date;
+  /**
+   * Whether the new user has already chosen their password. Default `false`
+   * — the admin-creates-user path (PR 2) lands new accounts with the bit
+   * unset so the user is force-redirected to change it on first sign-in
+   * (PR 3). The wizard's first-admin path and env-seeded admin path pass
+   * `true` (they chose their own password through the wizard form / env
+   * vars; no force-change needed).
+   */
+  passwordChanged?: boolean;
+  /**
+   * Vault instance name to pin the user to (Phase 1 single-vault). `null`
+   * (default) means "no restriction" — admin posture. The OAuth issuer
+   * (PR 4) reads this at mint time to narrow scopes. No validation here:
+   * the API endpoint (PR 2) is responsible for checking against
+   * `services.json` before passing through.
+   */
+  assignedVault?: string | null;
 }
 
 export async function createUser(
@@ -87,10 +127,14 @@ export async function createUser(
   const id = randomUUID();
   const passwordHash = await argonHash(password);
   const stamp = (opts.now?.() ?? new Date()).toISOString();
+  const passwordChanged = opts.passwordChanged === true ? 1 : 0;
+  const assignedVault = opts.assignedVault ?? null;
   try {
     db.prepare(
-      "INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-    ).run(id, username, passwordHash, stamp, stamp);
+      `INSERT INTO users
+         (id, username, password_hash, created_at, updated_at, password_changed, assigned_vault)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, username, passwordHash, stamp, stamp, passwordChanged, assignedVault);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("UNIQUE") && msg.includes("users.username")) {
@@ -98,7 +142,15 @@ export async function createUser(
     }
     throw err;
   }
-  return { id, username, passwordHash, createdAt: stamp, updatedAt: stamp };
+  return {
+    id,
+    username,
+    passwordHash,
+    createdAt: stamp,
+    updatedAt: stamp,
+    passwordChanged: passwordChanged === 1,
+    assignedVault,
+  };
 }
 
 export function getUserByUsername(db: Database, username: string): User | null {
@@ -141,4 +193,95 @@ export async function setPassword(
     .prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
     .run(passwordHash, stamp, userId);
   if (result.changes === 0) throw new UserNotFoundError(userId);
+}
+
+/**
+ * Username validation (multi-user Phase 1, design 2026-05-20-multi-user-phase-1.md §4).
+ *
+ * Rules — settled with Aaron pre-PR-1:
+ *   * Charset: `[a-z0-9_-]` (lowercase letters, digits, underscore, hyphen).
+ *     Lowercase-only sidesteps "Bob vs bob" case-folding bugs across every
+ *     downstream surface (URLs, log lines, the admin SPA's row keys).
+ *   * Length: 2-32 chars inclusive. Hard floor on 1-char names (no `a`,
+ *     `b`, …) because those are too easy to typo into someone else's
+ *     account; hard ceiling on 32 because URL paths and log lines stay
+ *     scannable. (Same shape vault-side scope verbs use.)
+ *   * Reserved list (case-insensitive): admin, root, system, setup,
+ *     parachute, hub. Keeps URL-shaped surfaces safe (Phase 2 may add
+ *     `/users/<username>` paths; reserving the namespace now is cheap).
+ *     Regex already pins lowercase, but the case-folded check is defense
+ *     in depth: if a future loosening lets capitals through, the reserved
+ *     check still triggers on `Admin`, `ROOT`, etc.
+ *
+ * Discriminated-union return: callers branch on `valid` rather than
+ * throwing. PR 2's `POST /api/users` returns a 400 with the `reason`
+ * surfaced in the response body.
+ */
+export const USERNAME_RESERVED = ["admin", "root", "system", "setup", "parachute", "hub"] as const;
+
+const USERNAME_REGEX = /^[a-z0-9_-]+$/;
+const USERNAME_MIN_LEN = 2;
+const USERNAME_MAX_LEN = 32;
+
+export type ValidateUsernameResult =
+  | { valid: true; name: string }
+  | { valid: false; reason: "format" | "length" | "reserved" };
+
+export function validateUsername(name: string): ValidateUsernameResult {
+  // Length check first — a 0-char string fails the regex on emptiness but
+  // "length" is the more honest diagnostic.
+  if (name.length < USERNAME_MIN_LEN || name.length > USERNAME_MAX_LEN) {
+    return { valid: false, reason: "length" };
+  }
+  // The regex deliberately allows leading/trailing `_` and `-` (so
+  // `_-_`, `--alice`, `-foo`, `bar_` all pass the format gate). Stricter
+  // rules can land later if real-world users hit confusion. Vault's
+  // parallel username validator has the same shape — cross-repo parity
+  // matters more than aesthetic edge-case rejection here.
+  if (!USERNAME_REGEX.test(name)) {
+    return { valid: false, reason: "format" };
+  }
+  // Reserved-words check is case-insensitive even though the regex already
+  // pins lowercase — see comment above.
+  const lower = name.toLowerCase();
+  if (USERNAME_RESERVED.some((r) => r === lower)) {
+    return { valid: false, reason: "reserved" };
+  }
+  return { valid: true, name };
+}
+
+/**
+ * Password validation (multi-user Phase 1, design §5).
+ *
+ * Single rule: minimum 12 characters. No complexity classes — modern
+ * guidance (NIST 800-63B) prefers passphrase length over forced-symbol
+ * mixes, and Aaron settled on 12 as the floor pre-PR-1. No max length
+ * (argon2id absorbs whatever the user submits).
+ *
+ * Same discriminated-union shape as `validateUsername` — PR 2's create-
+ * user / reset-password endpoints (and PR 3's `/account/change-password`
+ * form) wire the `reason` into the response.
+ */
+export const PASSWORD_MIN_LEN = 12;
+
+/**
+ * Upper bound for incoming password bodies. Not enforced inside
+ * `validatePassword` itself — the validator's contract is "length floor,
+ * no complexity rules" and adding a ceiling would muddy it. Exposed as
+ * a constant so PR 2's `POST /api/users` (and PR 3's change-password
+ * form) can cap incoming bodies before argon2id touches them. Defense
+ * against a CPU-DoS shape where an unauthenticated POST submits a
+ * megabyte password and forces a long argon2id hash. 256 chars is
+ * comfortably above any human-chosen passphrase (Diceware 8-word
+ * passphrases run ~55 chars).
+ */
+export const PASSWORD_MAX_LEN = 256;
+
+export type ValidatePasswordResult = { valid: true } | { valid: false; reason: "too_short" };
+
+export function validatePassword(password: string): ValidatePasswordResult {
+  if (password.length < PASSWORD_MIN_LEN) {
+    return { valid: false, reason: "too_short" };
+  }
+  return { valid: true };
 }

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { seedInitialAdminIfNeeded } from "../commands/serve.ts";
 import { openHubDb } from "../hub-db.ts";
-import { userCount } from "../users.ts";
+import { getUserByUsername, userCount } from "../users.ts";
 
 describe("seedInitialAdminIfNeeded", () => {
   let dir: string;
@@ -44,6 +44,13 @@ describe("seedInitialAdminIfNeeded", () => {
     expect(log).toHaveBeenCalledTimes(1);
     expect(log.mock.calls[0]?.[0] ?? "").toContain("seeded initial admin");
     expect(log.mock.calls[0]?.[0] ?? "").toContain("ops");
+    // Multi-user Phase 1 (design 2026-05-20-multi-user-phase-1.md §wizard
+    // interaction): env-seeded admin chose their password via env vars, so
+    // skip the force-change-password redirect. `assignedVault` stays null
+    // — admin posture.
+    const seeded = getUserByUsername(db, "ops");
+    expect(seeded?.passwordChanged).toBe(true);
+    expect(seeded?.assignedVault).toBeNull();
   });
 
   test("returns 'exists' when an admin already exists, even with env vars set", async () => {
