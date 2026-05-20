@@ -171,6 +171,20 @@ export interface ApiModulesOpsDeps {
    * null when not found.
    */
   findGlobalInstall?: (pkg: string) => string | null;
+  /**
+   * Extra env vars merged onto the supervised child at spawn time (hub#267).
+   *
+   * The first-boot wizard uses this to pass `PARACHUTE_VAULT_NAME=<typed>`
+   * through to vault's first-boot path so the operator-typed name flows
+   * end-to-end (vault's `server.ts` reads the env var on its first-boot
+   * branch and creates the vault under that name instead of the hard-coded
+   * `default`). Generic enough that future env-driven config (e.g.
+   * `SCRIBE_MODEL`) can ride the same seam without growing a new field.
+   *
+   * Threaded to the supervisor's `SpawnRequest.env` — the merge happens
+   * inside `Bun.spawn` at child spawn time; we don't mutate `process.env`.
+   */
+  spawnEnv?: Record<string, string>;
 }
 
 interface PathMatch {
@@ -270,6 +284,7 @@ async function spawnSupervised(
     short,
     cmd,
     ...(entry.installDir ? { cwd: entry.installDir } : {}),
+    ...(deps.spawnEnv && Object.keys(deps.spawnEnv).length > 0 ? { env: deps.spawnEnv } : {}),
   };
   return deps.supervisor.start(req);
 }
