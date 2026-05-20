@@ -2,6 +2,23 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.8] - 2026-05-20
+
+Supervisor lifecycle hardening bundle (closes hub#263, #264, #265). Three follow-up items from the hub#262 reviewer pass, all on the supervisor's stop/upgrade code path. One PR, two logical commits + the rc.8 bump.
+
+**Item 1 (#263) + Item 2 (#264) — `Supervisor.stop()` now awaits child exit with SIGKILL escalation.** Previously `stop()` sent SIGTERM and returned synchronously. No correctness bug on Render (the OS reaps children when hub exits as PID 1), but children's final log lines never made it through hub's stdout pipe before the platform tore the container down — the last 100ms of vault's logs (often the most diagnostic) vanished from Render's log viewer. And a wedged module that ignored SIGTERM would leak until the container itself was recycled. Same code path, one fix: send SIGTERM, `await Promise.race([proc.exited, setTimeout(killTimeoutMs)])`, escalate to SIGKILL if the timeout wins, then await exit either way. Default 5s timeout (configurable via `SupervisorOpts.killTimeoutMs` so tests can use a small value). `restart()` is simplified — `stop()` already awaits exit, so the post-stop `await entry.proc.exited` block is now redundant.
+
+**Item 3 (#265) — test for upgrade-on-unsupervised-module path.** The upgrade endpoint in `api-modules-ops.ts` has a branch where `bun add -g` succeeds but `supervisor.restart(short)` returns undefined (module is in services.json but never spawned — e.g. seeded by a pre-supervisor `parachute install`). The branch correctly marks the operation `failed` with a "try install first" log line, but it had no test. Added one: writes a services.json row, skips `supervisor.start()`, POSTs `/api/modules/vault/upgrade`, polls the operation, asserts `status: "failed"` + the canonical message.
+
+Surface summary:
+- `src/supervisor.ts` — new `killTimeoutMs` opt (default 5000); `stop()` awaits race(exited, timeout) with SIGKILL escalation; `restart()` simplified.
+- `src/__tests__/supervisor.test.ts` — existing operator-stop test rewritten to await the new async stop; +2 new tests (SIGKILL escalation, well-behaved await-before-return).
+- `src/__tests__/api-modules-ops.test.ts` — +1 new test (upgrade on installed-but-not-supervised).
+
+Gate: `bun test ./src` — **1418 pass / 0 fail / 30746 expects across 79 files**. +3 over rc.7 (1415 → 1418). typecheck + biome clean.
+
+No smoke — these are correctness fixes provable by tests. The SIGKILL escalation is exercised end-to-end in the test by feeding a fake child whose `kill()` only resolves `exited` on SIGKILL.
+
 ## [0.5.10-rc.7] - 2026-05-19
 
 Post-wizard polish bundle (hub#268). Three related items caught while walking the rc.6 wizard on a fresh machine. One PR, three logical commits + the rc.7 bump.
