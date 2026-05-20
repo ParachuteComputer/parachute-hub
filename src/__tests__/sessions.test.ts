@@ -81,7 +81,7 @@ describe("deleteSession", () => {
 });
 
 describe("buildSessionCookie", () => {
-  test("emits the expected attributes", () => {
+  test("emits the expected attributes (default secure)", () => {
     const v = buildSessionCookie("abc", 86400);
     expect(v).toContain(`${SESSION_COOKIE_NAME}=abc`);
     expect(v).toContain("HttpOnly");
@@ -91,15 +91,38 @@ describe("buildSessionCookie", () => {
     expect(v).not.toContain("Path=/oauth");
     expect(v).toContain("Max-Age=86400");
   });
+
+  // Bug 1 (rc.5 → rc.6) regression: session cookies minted over plain
+  // HTTP must NOT carry Secure or browsers drop them, leaving the
+  // operator un-signed-in on the very next request.
+  test("omits Secure when secure: false (HTTP localhost)", () => {
+    const v = buildSessionCookie("abc", 86400, { secure: false });
+    expect(v).toContain(`${SESSION_COOKIE_NAME}=abc`);
+    expect(v).toContain("HttpOnly");
+    expect(v).not.toContain("Secure");
+    expect(v).toContain("SameSite=Lax");
+  });
+
+  test("keeps Secure when secure: true (explicit)", () => {
+    const v = buildSessionCookie("abc", 86400, { secure: true });
+    expect(v).toContain("Secure");
+  });
 });
 
 describe("buildSessionClearCookie", () => {
-  test("emits Max-Age=0", () => {
+  test("emits Max-Age=0 (default secure)", () => {
     const v = buildSessionClearCookie();
     expect(v).toContain(`${SESSION_COOKIE_NAME}=`);
     expect(v).toContain("Max-Age=0");
+    expect(v).toContain("Secure");
     expect(v).toContain("Path=/");
     expect(v).not.toContain("Path=/oauth");
+  });
+
+  test("omits Secure when secure: false (HTTP localhost)", () => {
+    const v = buildSessionClearCookie({ secure: false });
+    expect(v).not.toContain("Secure");
+    expect(v).toContain("Max-Age=0");
   });
 });
 

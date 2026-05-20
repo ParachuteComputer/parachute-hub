@@ -2,6 +2,61 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.6] - 2026-05-19
+
+Two blocking bugs caught by fresh-machine testing on rc.5 (neither caught by the unit suite or reviewer because both only manifest over `http://localhost`).
+
+**Bug 1 — CSRF + session cookies dropped over HTTP.** `buildCsrfCookie`, `buildSessionCookie`, and `buildSessionClearCookie` unconditionally included the `Secure` attribute. Browsers silently drop `Secure` cookies on plain HTTP, so on `http://localhost:1939`:
+
+- GET `/admin/setup` Set-Cookie with CSRF token T1 + Secure → browser drops it
+- POST `/admin/setup/account` carries `__csrf=T1` in form body but no cookie in headers
+- `verifyCsrfToken` finds no cookie token → returns false
+- Wizard returns 400 "Invalid form submission. Reload and try again."
+
+Fix: new `src/request-protocol.ts` exports an `isHttpsRequest(req)` helper that checks (1) `new URL(req.url).protocol === "https:"`, (2) `X-Forwarded-Proto: https` (reverse-proxy deployments), (3) defaults false. Each cookie-mint helper now accepts `{ secure?: boolean }` (default true). `ensureCsrfToken` reads `isHttpsRequest(req)` automatically; the four session-cookie callsites (`admin-handlers.ts` login/logout, `oauth-handlers.ts` login, `setup-wizard.ts` account POST) each pass the bit through explicitly. Posture stays secure-by-default — every callsite has to *prove* the request is plain HTTP to omit `Secure`. Audit confirmed no other Set-Cookie strings exist outside these three helpers.
+
+**Bug 2 — `/` doesn't funnel to /admin/setup on a fresh hub.** Pre-rc.6, GET `/` on a hub with no admin rendered the static discovery portal — which carries no usable signal on a fresh hub. Aaron had to manually navigate to `/admin/setup` to escape.
+
+Fix: when `userCount(db) === 0`, GET `/` and `/hub.html` 302 to `/admin/setup`. The redirect sits between the `/admin/setup*` dispatch block (passes through unaffected) and the JSON-shaped 503 lockout gate. 302 (not 301) so the redirect disappears the moment the wizard finishes. HTML routes get HTML responses; the JSON 503 stays correct for API + SPA + OAuth callers that branch on the structured body.
+
+Surface summary:
+- 1 new module: `src/request-protocol.ts` — single `isHttpsRequest` helper, no deps.
+- 1 new test file: `src/__tests__/request-protocol.test.ts` — 5 tests covering https://, http://, X-Forwarded-Proto in both directions, and proxy header normalization.
+- 5 modules edited: `src/csrf.ts` + `src/sessions.ts` (helper signatures + protocol-aware ensureCsrfToken), `src/admin-handlers.ts` + `src/oauth-handlers.ts` + `src/setup-wizard.ts` (thread `isHttpsRequest(req)` through cookie-mint callsites), `src/hub-server.ts` (fresh-hub `/` redirect block).
+- 4 test files edited: `src/__tests__/csrf.test.ts` (+3 assertions), `src/__tests__/sessions.test.ts` (+3 assertions), `src/__tests__/setup-gate.test.ts` (replace stale `/` assertion with two 302 assertions), `src/__tests__/hub-server.test.ts` (update pre-admin-lockout test for new `/` spec; seed admin in signed-out-indicator test).
+
+Gate: `bun test ./src` — **1383 pass / 0 fail / 30653 expects across 78 files**. +15 over rc.5 (1368 → 1383). The pre-existing `status > all-healthy returns 0 and prints table` env-flake passed this run too. typecheck + biome clean.
+
+Local smoke (`http://localhost:11942`, fresh `PARACHUTE_HOME`):
+- `GET /` → 302 `/admin/setup` (Bug 2 fixed)
+- `GET /hub.html` → 302 `/admin/setup` (Bug 2 same)
+- CSRF cookie Set-Cookie on HTTP: `HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000` — NO `Secure` (Bug 1 fixed)
+- Full wizard chain with `curl --cookie-jar` (the actual browser-equivalent test): GET wizard → POST account → cookies persist with `secure: false` flag in jar → resumed wizard renders vault step → POST vault enqueues op → done-state branches work.
+- Vault `bun add` still fails in Aaron's dev env from the stale workspace lockfile (paraclaw→parachute-agent rename) — wizard correctly surfaces `status: failed` to the operator. Not on this PR's critical path.
+
+## [0.5.10-rc.5] - 2026-05-18
+
+First-boot web wizard at `/admin/setup` (closes #259, Phase 1B). Replaces the static placeholder that hub#258 shipped with a three-step server-rendered flow that walks a fresh operator through admin-account creation + first-vault provisioning without leaving the browser. Pairs with the Phase 1A module-management API + supervisor (hub#262) — Phase 1B is the wizard that drives the same install path from the operator's first visit instead of the SPA's `/admin/modules` page.
+
+**The wizard.** New `src/setup-wizard.ts`. Server-rendered HTML (no SPA bundle, no JS) so a fresh container with no admin yet stays reachable through any browser. Step progression is derived from DB + services.json on every GET, so a re-visit after a partial setup resumes at the right step — no client-side state to lose. The three steps:
+
+- **Welcome + account** (POST `/admin/setup/account`). Username + password + confirm, with server-side validation (2–64 chars, password ≥ 8, confirm matches). On success: `createUser` → session cookie → 303 to `/admin/setup` (which re-derives state and renders step 3). The env-var seed path (`PARACHUTE_INITIAL_ADMIN_USERNAME` / `PARACHUTE_INITIAL_ADMIN_PASSWORD`) still works and is documented as an "alt-path" disclosure on the welcome screen.
+- **Vault** (POST `/admin/setup/vault`). Vault-name field (default `default`), gated by the just-minted admin session cookie. Drives the same internal `runInstall` helper the `/api/modules/:short/install` API uses — newly exported from `api-modules-ops.ts` so non-API callers can reach the install pipeline without re-fabricating an HTTP request + bearer-mint dance. Returns a 303 to `/admin/setup?op=<id>` so the wizard's poll-page renders next.
+- **Done**. Side-by-side tiles: "Open the admin UI" + "Connect Claude Code (MCP)" with the copy-pasteable `claude mcp add` line carrying the vault name + hub origin the operator just chose. Renders one-shot via `?just_finished=1`; once the setup state is "complete" without that query, the route 301s to `/login` so a stale bookmark lands somewhere useful.
+
+**Pre-admin gate threading.** `shouldGateForSetup` in `hub-server.ts` now opens through the wizard's three sub-paths (`/admin/setup`, `/admin/setup/account`, `/admin/setup/vault`) — every other `/admin/*` and `/api/*` route still 503s with `setup_required` until the admin row exists. The 301 from `/admin/setup` to `/login` now fires only when BOTH admin and vault are in place (the wizard's "done" state); admin-only states resume at step 3.
+
+**Shared install seam.** `api-modules-ops.ts` now exports `runInstall`, `specFor`, and `getDefaultOperationsRegistry` so the wizard can drive the same install → services.json-seed → supervisor-spawn sequence the SPA's `/admin/modules` page uses. The operation registry is the process-singleton both code paths share, so a stale `/api/modules/operations/:id` poll from a SPA tab can pick up an op the wizard created (and vice versa). The `OperationsRegistry` interface is now exported for the same reason.
+
+Surface summary:
+- 1 new module: `src/setup-wizard.ts`.
+- 1 new test file: `src/__tests__/setup-wizard.test.ts` — 19 tests covering pure state derivation, GET-render branches, account-step POST (happy path + validation errors + CSRF rejection + idempotent re-post), vault-step POST (supervisor-required, session-required, install-op-enqueued, name-validation), and end-to-end through `hubFetch`.
+- 3 modules edited: `src/hub-server.ts` (route the three wizard surfaces, remove the static placeholder), `src/api-modules-ops.ts` (export internal helpers), `src/__tests__/setup-gate.test.ts` (update two assertions to reflect the wizard's new shape — placeholder→form, admin-only state resumes at step 3 instead of 301-ing to login).
+
+Gate: `bun test ./src` 1367 pass / 1 fail (pre-existing `status > all-healthy returns 0` env flake, same as rc.4) / 30614 expects across 77 files. +19 over rc.4 (all in `setup-wizard.test.ts`). typecheck clean. biome clean. SPA build clean.
+
+Local smoke documented in the PR body. Verified `parachute serve` against a fresh `PARACHUTE_HOME`: pre-admin `/api/me` 503s with `setup_required`; `/admin/setup` renders the account form; POST creates the admin row + sets session cookie + 303s back; resumed wizard renders the vault form; vault POST enqueues an install op + 303s to `?op=<id>`; op-poll page renders status + log + auto-refresh meta; with admin + vault both present, `/admin/setup` 301s to `/login` and `?just_finished=1` renders the success screen with the correct MCP install command (`claude mcp add --transport http parachute-<name> <origin>/vault/<name>/mcp`). The real `bun add -g @openparachute/vault@latest` step is environmental — Aaron's dev box has a broken global lockfile from the paraclaw→parachute-agent rename so the install errors; the wizard correctly surfaces the failure to the operator and the path is wired end-to-end. A clean container won't hit that.
+
 ## [0.5.10-rc.4] - 2026-05-18
 
 Fold reviewer security nit on hub#262: destructive POST endpoints (`install` / `restart` / `upgrade` / `uninstall`) now require `parachute:host:admin` (was `parachute:host:auth`). The `:auth` scope reads the catalog; `:admin` mutates it. SPA path unaffected (host-admin token carries both scopes); narrow `--scope-set auth` automation tokens now correctly get 403 on destructive operations. Also drops dead `existsSync` import. +1 test asserting the 403 path.

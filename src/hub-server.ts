@@ -105,6 +105,7 @@ import { handleCreateVault } from "./admin-vaults.ts";
 import { handleApiMe } from "./api-me.ts";
 import { handleApiMintToken } from "./api-mint-token.ts";
 import {
+  getDefaultOperationsRegistry,
   handleInstall,
   handleOperationGet,
   handleRestart,
@@ -145,6 +146,12 @@ import {
 } from "./service-spec.ts";
 import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 import { findActiveSession } from "./sessions.ts";
+import {
+  type SetupWizardDeps,
+  handleSetupAccountPost,
+  handleSetupGet,
+  handleSetupVaultPost,
+} from "./setup-wizard.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
 import type { Supervisor } from "./supervisor.ts";
 import { getUserById, userCount } from "./users.ts";
@@ -787,7 +794,7 @@ async function serveSpa(spaDistDir: string, pathname: string, mount: SpaMount): 
  * Routes that fall through the pre-admin lockout (503 → /admin/setup).
  *
  * Gated (operator-facing) when no admin row exists:
- *   - `/admin/*` (except `/admin/setup`) — vault admin, permissions, tokens
+ *   - `/admin/*` (except `/admin/setup*`) — vault admin, permissions, tokens
  *   - `/api/*`                            — host-admin API surface
  *   - `/login`, `/logout`                 — pointless without an account
  *
@@ -795,7 +802,10 @@ async function serveSpa(spaDistDir: string, pathname: string, mount: SpaMount): 
  * the moment it boots, even before an admin is seeded):
  *   - `/health`                           — platform liveness check
  *   - `/.well-known/*`                    — public discovery + JWKS
- *   - `/admin/setup`                      — the setup placeholder itself
+ *   - `/admin/setup`, `/admin/setup/*`    — the first-boot wizard (hub#259)
+ *                                            and its POST endpoints; the
+ *                                            wizard is the *only* browser
+ *                                            path to exit the lockout
  *   - `/` and `/hub.html`                 — static discovery page
  *   - `/oauth/*`                          — third-party OAuth surface; clients
  *                                            can register/refresh independent
@@ -809,66 +819,23 @@ async function serveSpa(spaDistDir: string, pathname: string, mount: SpaMount): 
  */
 function shouldGateForSetup(pathname: string): boolean {
   if (pathname === "/login" || pathname === "/logout") return true;
-  if (pathname === "/admin/setup") return false;
+  // The wizard itself + its POST endpoints are the *only* way to exit
+  // the pre-admin lockout from a browser — they must pass through. Any
+  // path under `/admin/setup` (including `/admin/setup/account` and
+  // `/admin/setup/vault`) is fair game for an un-authed operator on a
+  // fresh hub.
+  if (pathname === "/admin/setup" || pathname.startsWith("/admin/setup/")) return false;
   if (pathname === "/admin" || pathname.startsWith("/admin/")) return true;
   if (pathname.startsWith("/api/")) return true;
   return false;
 }
 
-/**
- * Minimal first-boot setup page. The real wizard (form + submit + admin
- * row create) ships in hub#259. For now this is a static, single-screen
- * HTML doc that tells the operator how to seed an admin via env vars and
- * restart. No external assets — the body sits inline so a fresh container
- * with no SPA bundle still serves something coherent.
- */
-function renderSetupPlaceholder(): string {
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Parachute Hub — first-boot setup</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-           max-width: 36rem; margin: 4rem auto; padding: 0 1.5rem; line-height: 1.55;
-           color: #1a1a1a; background: #fafafa; }
-    h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
-    p.lede { color: #555; margin-top: 0; }
-    code, pre { background: #f0eee7; border-radius: 4px; padding: 0.1rem 0.35rem;
-                font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.95em; }
-    pre { padding: 0.75rem 1rem; overflow-x: auto; }
-    .note { background: #fff8e1; border-left: 3px solid #d4a017; padding: 0.75rem 1rem;
-            margin: 1.5rem 0; font-size: 0.92em; }
-  </style>
-</head>
-<body>
-  <h1>Parachute Hub — first-boot setup</h1>
-  <p class="lede">No admin account exists yet on this hub. Set the seed env
-  vars below and restart the container to bootstrap the first operator.</p>
-
-  <h2>Option 1 — env-var seed (recommended for containers)</h2>
-  <p>Set these on the container and restart:</p>
-  <pre>PARACHUTE_INITIAL_ADMIN_USERNAME=ops
-PARACHUTE_INITIAL_ADMIN_PASSWORD=&lt;a strong password&gt;</pre>
-  <p>On boot the hub will create the admin row, then ignore the env vars
-  on every subsequent restart — they're a first-boot seed, not a reset
-  switch. Rotate the password later via <code>parachute auth set-password</code>
-  inside the container, or via the admin UI.</p>
-
-  <h2>Option 2 — CLI from inside the container</h2>
-  <pre>docker exec -it &lt;container&gt; parachute auth set-password \\
-  --username ops --password '&lt;…&gt;'</pre>
-
-  <div class="note">
-    The full web-based setup wizard (browser form, no env vars or shell
-    needed) is tracked in <code>hub#259</code> and will replace this
-    placeholder when it ships.
-  </div>
-</body>
-</html>
-`;
-}
+// hub#259 replaced the static placeholder with a real three-step wizard.
+// The handlers (account creation + vault provisioning) live in
+// `src/setup-wizard.ts` so the dispatch in this file stays a one-liner per
+// route. The env-var seed path (PARACHUTE_INITIAL_ADMIN_*) still works on
+// first boot — see `src/commands/serve.ts` — and is surfaced as the
+// "alt-path" disclosure on the wizard's welcome screen.
 
 // Canonical 503 body for "getDb is unset, hub is unconfigured." Shape matches
 // the OAuth error vocabulary used by /api/auth/* (`service_unavailable`) so a
@@ -1012,23 +979,56 @@ export function hubFetch(
       );
     }
 
-    // First-boot setup placeholder. Real wizard ships in hub#259. When no
-    // admin exists, render a minimal HTML page pointing operators at the
-    // env-var seed path. When an admin already exists, 301 to /login —
-    // the route doesn't disappear after setup so a stale bookmark still
-    // lands somewhere useful.
-    if (pathname === "/admin/setup") {
-      if (getDb) {
-        const db = getDb();
-        if (userCount(db) > 0) {
-          return new Response("", {
-            status: 301,
-            headers: { location: "/login" },
-          });
-        }
+    // First-boot setup wizard (hub#259). Three steps server-rendered:
+    //   GET  /admin/setup            — derive state, render the right step
+    //   POST /admin/setup/account    — create the admin row, set session
+    //   POST /admin/setup/vault      — provision the first vault
+    //
+    // The wizard owns the "should I 301 to /login now?" decision: setup is
+    // complete only when admin AND a vault entry both exist. A re-visit
+    // after partial setup picks up at the next step. See
+    // src/setup-wizard.ts for the renderer + handler internals.
+    if (pathname === "/admin/setup" || pathname.startsWith("/admin/setup/")) {
+      if (!getDb) return dbNotConfigured();
+      const wizardDeps: SetupWizardDeps = {
+        db: getDb(),
+        manifestPath,
+        configDir: CONFIG_DIR,
+        issuer: oauthDeps(req).issuer,
+        registry: getDefaultOperationsRegistry(),
+      };
+      if (deps?.supervisor !== undefined) wizardDeps.supervisor = deps.supervisor;
+      if (pathname === "/admin/setup") {
+        if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+        return handleSetupGet(req, wizardDeps);
       }
-      return new Response(renderSetupPlaceholder(), {
-        headers: { "content-type": "text/html; charset=utf-8" },
+      if (pathname === "/admin/setup/account") {
+        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+        return handleSetupAccountPost(req, wizardDeps);
+      }
+      if (pathname === "/admin/setup/vault") {
+        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+        return handleSetupVaultPost(req, wizardDeps);
+      }
+      return new Response("not found", { status: 404 });
+    }
+
+    // Fresh-hub redirect: on a hub with no admin row yet, the discovery
+    // page (`/`, `/hub.html`) funnels straight to the wizard. The static
+    // portal isn't useful pre-setup — nothing's installed, the
+    // "Signed in" affordance has no session to surface — and the
+    // operator landing on `/` in a browser otherwise has to manually
+    // type `/admin/setup` to escape. 302 (not 301) so the redirect
+    // disappears the moment the wizard finishes.
+    //
+    // Sits before the JSON-shaped 503 gate below because `/` is an
+    // HTML surface — a JSON 503 there would render as raw text in the
+    // operator's browser tab. The 503 gate handles API + admin SPA +
+    // OAuth callers that branch on the structured body.
+    if (getDb && (pathname === "/" || pathname === "/hub.html") && userCount(getDb()) === 0) {
+      return new Response(null, {
+        status: 302,
+        headers: { location: "/admin/setup" },
       });
     }
 
@@ -1038,8 +1038,9 @@ export function hubFetch(
     // identity is meaningless — auth flows can't validate, the SPA can't
     // mint a host-admin token, OAuth can't issue codes. Route those to a
     // 503 that points at /admin/setup. Health, well-known, /admin/setup
-    // itself, and the static discovery page (/) ran above and are
-    // unaffected; OAuth + admin + api endpoints fall here.
+    // itself, OAuth third-party endpoints, and content proxies pass
+    // through; the fresh-hub `/` and `/hub.html` redirect above handled
+    // the discovery-page case.
     //
     // `shouldGateForSetup` runs first so non-gated paths (well-known, /,
     // /health, /admin/setup) never touch getDb — keeping the

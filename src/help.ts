@@ -400,7 +400,8 @@ Environment:
                                     restarts is safe.
 
 If no admin exists and the seed env vars aren't set, the hub still comes
-up — visit \`/admin/setup\` to bootstrap via the placeholder wizard.
+up — visit \`/admin/setup\` to bootstrap via the first-boot web wizard
+(admin account + first vault, all from the browser).
 
 Examples:
   parachute serve                          # foreground, defaults

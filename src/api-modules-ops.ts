@@ -68,7 +68,7 @@ export interface Operation {
   finishedAt?: string;
 }
 
-interface OperationsRegistry {
+export interface OperationsRegistry {
   create(kind: OperationKind, short: string): Operation;
   get(id: string): Operation | undefined;
   /** Append a log line + (optionally) advance status. */
@@ -118,6 +118,18 @@ class InMemoryOperationsRegistry implements OperationsRegistry {
 }
 
 const defaultRegistry = new InMemoryOperationsRegistry();
+
+/**
+ * Access the process-singleton operations registry. Non-API callers
+ * (the first-boot wizard, hub#259) hand this to `runInstall` so the
+ * resulting op is poll-able through the same
+ * `/api/modules/operations/:id` surface the SPA uses — a stale tab
+ * watching the wizard's poll-cookie URL can still hand off mid-flight
+ * to the admin UI's module-management page after setup completes.
+ */
+export function getDefaultOperationsRegistry(): OperationsRegistry {
+  return defaultRegistry;
+}
 
 /** Reset the singleton operations registry — tests call between cases. */
 export function _resetOperationsRegistryForTests(): void {
@@ -214,7 +226,14 @@ async function authorize(req: Request, deps: ApiModulesOpsDeps): Promise<Respons
   return undefined;
 }
 
-function specFor(short: CuratedModuleShort): ServiceSpec {
+/**
+ * Resolve the canonical `ServiceSpec` for a curated module short — the
+ * pair of (package, manifest) the supervisor + install runner act on.
+ * Exported so non-API callers (the first-boot wizard, hub#259) can
+ * reach the same spec the API handlers use without duplicating the
+ * FIRST_PARTY_FALLBACKS lookup.
+ */
+export function specFor(short: CuratedModuleShort): ServiceSpec {
   const fb = FIRST_PARTY_FALLBACKS[short];
   // Curated set is a const; every entry has a fallback. The non-null
   // assertion is safe because CURATED_MODULES is a tuple-literal
@@ -301,7 +320,17 @@ export async function handleInstall(
   return acceptedOp(op.id);
 }
 
-async function runInstall(
+/**
+ * Internal install runner. Exported so non-API callers (the first-boot
+ * wizard at `/admin/setup`, hub#259) can drive the same install →
+ * services.json-seed → supervisor-spawn sequence without re-fabricating
+ * an HTTP request + bearer token just to hit `handleInstall`.
+ *
+ * The op-id + registry threading is identical to the API path; the
+ * wizard creates its own op, awaits this function, and surfaces the
+ * resulting state to the operator.
+ */
+export async function runInstall(
   opId: string,
   short: CuratedModuleShort,
   spec: ServiceSpec,

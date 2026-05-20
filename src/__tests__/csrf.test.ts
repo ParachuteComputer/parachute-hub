@@ -29,7 +29,7 @@ describe("generateCsrfToken", () => {
 });
 
 describe("buildCsrfCookie", () => {
-  test("emits the expected attributes", () => {
+  test("emits the expected attributes (default secure)", () => {
     const v = buildCsrfCookie("abc");
     expect(v).toContain(`${CSRF_COOKIE_NAME}=abc`);
     expect(v).toContain("HttpOnly");
@@ -37,6 +37,19 @@ describe("buildCsrfCookie", () => {
     expect(v).toContain("SameSite=Lax");
     expect(v).toContain("Path=/");
     expect(v).toContain("Max-Age=");
+  });
+
+  test("omits Secure when secure: false (HTTP localhost)", () => {
+    const v = buildCsrfCookie("abc", { secure: false });
+    expect(v).toContain(`${CSRF_COOKIE_NAME}=abc`);
+    expect(v).toContain("HttpOnly");
+    expect(v).not.toContain("Secure");
+    expect(v).toContain("SameSite=Lax");
+  });
+
+  test("keeps Secure when secure: true (explicit)", () => {
+    const v = buildCsrfCookie("abc", { secure: true });
+    expect(v).toContain("Secure");
   });
 });
 
@@ -70,6 +83,32 @@ describe("ensureCsrfToken", () => {
     const result = ensureCsrfToken(reqWith(`${CSRF_COOKIE_NAME}=`));
     expect(result.token.length).toBeGreaterThan(0);
     expect(result.setCookie).toBeDefined();
+  });
+
+  // Bug 1 (rc.5 → rc.6) regression: cookies minted over plain HTTP must
+  // NOT carry the Secure attribute or browsers silently drop them on
+  // http://localhost:1939, breaking the very next double-submit POST.
+  test("sets Secure when the request URL is https://", () => {
+    const req = new Request("https://hub.example/admin/setup");
+    const result = ensureCsrfToken(req);
+    expect(result.setCookie).toContain("Secure");
+  });
+
+  test("omits Secure when the request URL is http://localhost", () => {
+    const req = new Request("http://localhost:1939/admin/setup");
+    const result = ensureCsrfToken(req);
+    expect(result.setCookie).not.toContain("Secure");
+    // The rest of the cookie shape stays intact — only Secure flips.
+    expect(result.setCookie).toContain("HttpOnly");
+    expect(result.setCookie).toContain("SameSite=Lax");
+  });
+
+  test("sets Secure when http:// request carries X-Forwarded-Proto: https", () => {
+    const req = new Request("http://hub.internal/admin/setup", {
+      headers: { "x-forwarded-proto": "https" },
+    });
+    const result = ensureCsrfToken(req);
+    expect(result.setCookie).toContain("Secure");
   });
 });
 

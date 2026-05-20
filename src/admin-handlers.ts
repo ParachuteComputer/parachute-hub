@@ -14,6 +14,7 @@ import type { Database } from "bun:sqlite";
 import { renderAdminError, renderAdminLogin } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { checkAndRecord, clientIpFromRequest } from "./rate-limit.ts";
+import { isHttpsRequest } from "./request-protocol.ts";
 import {
   SESSION_TTL_MS,
   buildSessionClearCookie,
@@ -124,7 +125,9 @@ export async function handleAdminLoginPost(
     );
   }
   const session = createSession(db, { userId: user.id });
-  const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+  const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
+    secure: isHttpsRequest(req),
+  });
   return redirect(next, { "set-cookie": cookie });
 }
 
@@ -164,5 +167,7 @@ export async function handleAdminLogoutPost(db: Database, req: Request): Promise
   }
   const sid = parseSessionCookie(req.headers.get("cookie"));
   if (sid) deleteSession(db, sid);
-  return redirect("/login", { "set-cookie": buildSessionClearCookie() });
+  return redirect("/login", {
+    "set-cookie": buildSessionClearCookie({ secure: isHttpsRequest(req) }),
+  });
 }

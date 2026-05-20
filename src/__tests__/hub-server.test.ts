@@ -74,10 +74,16 @@ describe("hubFetch routing", () => {
     // The dynamic path takes over from the static disk file the moment a
     // DB is configured. With no session cookie, we still render — just
     // with the "Sign in" affordance.
+    //
+    // hub#259 rc.6: requires an admin row to bypass the fresh-hub
+    // funnel redirect to /admin/setup (Bug 2 fix). Seed one so this
+    // test continues to exercise the signed-out-but-setup-done branch.
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
       try {
+        const { createUser } = await import("../users.ts");
+        await createUser(db, "owner", "pw");
         const res = await hubFetch(h.dir, { getDb: () => db })(req("/"));
         expect(res.status).toBe(200);
         expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
@@ -979,10 +985,12 @@ describe("hubFetch routing", () => {
     }
   });
 
-  // First-boot setup placeholder (hub#258). When no admin exists the page
-  // is the bootstrap onboarding surface; once an admin exists it 301s to
-  // /login so a stale bookmark still lands somewhere useful.
-  test("/admin/setup renders placeholder HTML when no admin exists", async () => {
+  // First-boot setup wizard (hub#259, expanding hub#258's static
+  // placeholder). When no admin exists, GET /admin/setup renders the
+  // wizard's account-step form. Once admin + vault both exist, it 301s
+  // to /login so a stale bookmark still lands somewhere useful. With
+  // admin but no vault, the wizard resumes at the vault step.
+  test("/admin/setup renders the wizard's account form when no admin exists", async () => {
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
@@ -991,7 +999,8 @@ describe("hubFetch routing", () => {
         expect(res.status).toBe(200);
         expect(res.headers.get("content-type")).toContain("text/html");
         const body = await res.text();
-        expect(body).toContain("first-boot setup");
+        expect(body).toContain('action="/admin/setup/account"');
+        // Env-var seed path is still surfaced as the alt-path disclosure.
         expect(body).toContain("PARACHUTE_INITIAL_ADMIN_USERNAME");
       } finally {
         db.close();
@@ -1001,13 +1010,35 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/admin/setup 301s to /login when an admin already exists", async () => {
+  test("/admin/setup 301s to /login once admin + vault both exist (hub#259)", async () => {
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         await createUser(db, "owner", "pw");
-        const res = await hubFetch(h.dir, { getDb: () => db })(req("/admin/setup"));
+        // Seed the vault entry so the wizard's state derives as "done"
+        // and the GET 301s. Without this the wizard would still resume
+        // at the vault step.
+        const { writeManifest } = await import("../services-manifest.ts");
+        const { join } = await import("node:path");
+        writeManifest(
+          {
+            services: [
+              {
+                name: "parachute-vault",
+                version: "0.1.0",
+                port: 1940,
+                paths: ["/vault/default"],
+                health: "/health",
+              },
+            ],
+          },
+          join(h.dir, "services.json"),
+        );
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          manifestPath: join(h.dir, "services.json"),
+        })(req("/admin/setup"));
         expect(res.status).toBe(301);
         expect(res.headers.get("location")).toBe("/login");
       } finally {
@@ -1058,7 +1089,7 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("pre-admin lockout: /login is gated, /admin/setup + /health + well-known stay open", async () => {
+  test("pre-admin lockout: /login is gated, /admin/setup + /health + well-known stay open, / funnels to /admin/setup", async () => {
     const h = makeHarness();
     try {
       writeFileSync(join(h.dir, "hub.html"), "<html>discovery</html>");
@@ -1075,9 +1106,11 @@ describe("hubFetch routing", () => {
         // /health open
         const healthRes = await handler(req("/health"));
         expect(healthRes.status).toBe(200);
-        // / open
+        // / funnels to the wizard (hub#259 rc.6 fix for Bug 2 — the
+        // static portal pre-setup is useless; redirect to setup).
         const rootRes = await handler(req("/"));
-        expect(rootRes.status).toBe(200);
+        expect(rootRes.status).toBe(302);
+        expect(rootRes.headers.get("location")).toBe("/admin/setup");
         // /.well-known/parachute.json open
         const wkRes = await handler(req("/.well-known/parachute.json"));
         expect(wkRes.status).toBe(200);

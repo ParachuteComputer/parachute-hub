@@ -130,27 +130,44 @@ describe("setup gate (no admin yet)", () => {
     }
   });
 
-  test("/ passes through the gate (renders discovery page)", async () => {
+  // Bug 2 (rc.5 → rc.6) regression: on a fresh hub, GET `/` should
+  // funnel straight to the wizard rather than render the static
+  // portal — the operator otherwise has to manually navigate to
+  // `/admin/setup`. The portal pre-setup carries no usable signal
+  // (no installed services to discover, no admin to sign in as).
+  test("/ 302s to /admin/setup when no admin exists (fresh-hub funnel)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const res = await hubFetch(h.dir, { getDb: () => db })(req("/"));
-      expect(res.status).toBe(200);
-      expect(res.headers.get("content-type")).toContain("text/html");
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin/setup");
     } finally {
       db.close();
     }
   });
 
-  test("/admin/setup renders the placeholder HTML", async () => {
+  test("/hub.html 302s to /admin/setup when no admin exists", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = await hubFetch(h.dir, { getDb: () => db })(req("/hub.html"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin/setup");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("/admin/setup renders the wizard (account step) when no admin exists", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const res = await hubFetch(h.dir, { getDb: () => db })(req("/admin/setup"));
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/html");
       const html = await res.text();
-      // Spot-check the env-var seed is documented — it's the canonical
-      // bootstrap path for containers and we don't want a future
-      // refactor to silently strip it.
+      // Spot-check the wizard is rendering its account-step form (hub#259
+      // replaced the env-var-only placeholder with a real wizard, but the
+      // env-var path is still surfaced as the "alt-path" disclosure).
+      expect(html).toContain('action="/admin/setup/account"');
       expect(html).toContain("PARACHUTE_INITIAL_ADMIN_USERNAME");
       expect(html).toContain("PARACHUTE_INITIAL_ADMIN_PASSWORD");
     } finally {
@@ -182,13 +199,22 @@ describe("setup gate (admin exists)", () => {
     }
   });
 
-  test("/admin/setup 301s to /login once an admin exists", async () => {
+  test("/admin/setup resumes at the vault step when admin exists but vault doesn't (hub#259)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       await createUser(db, "owner", "pw");
-      const res = await hubFetch(h.dir, { getDb: () => db })(req("/admin/setup"));
-      expect(res.status).toBe(301);
-      expect(res.headers.get("location")).toBe("/login");
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: join(h.dir, "services.json"),
+      })(req("/admin/setup"));
+      // With admin in place but no vault entry in services.json, the
+      // wizard's GET resumes at step 3 — the vault-name form — rather
+      // than 301-ing to /login. The 301-to-/login fires only once BOTH
+      // admin and vault are in place; that case is exercised in the
+      // setup-wizard suite where the manifest is seeded.
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('action="/admin/setup/vault"');
     } finally {
       db.close();
     }

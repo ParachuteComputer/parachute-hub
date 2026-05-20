@@ -63,6 +63,7 @@ import {
   renderLogin,
 } from "./oauth-ui.ts";
 import { isSameOriginRequest } from "./origin-check.ts";
+import { isHttpsRequest } from "./request-protocol.ts";
 import { isNonRequestableScope, isRequestableScope } from "./scope-explanations.ts";
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
 import {
@@ -717,7 +718,7 @@ export async function handleAuthorizePost(
 
 async function handleLoginSubmit(
   db: Database,
-  _req: Request,
+  req: Request,
   form: Awaited<ReturnType<Request["formData"]>>,
   _deps: OAuthDeps,
   csrfToken: string,
@@ -746,7 +747,9 @@ async function handleLoginSubmit(
     );
   }
   const session = createSession(db, { userId: user.id });
-  const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+  const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
+    secure: isHttpsRequest(req),
+  });
   // Redirect back to GET /oauth/authorize with the original query string so
   // the user lands on the consent screen with full params re-validated.
   const u = new URL("/oauth/authorize", "http://placeholder");

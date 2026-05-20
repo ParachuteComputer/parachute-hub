@@ -23,14 +23,24 @@
  * server-rendered HTML form (cookie + embedded value, classic double-submit)
  * or via the JSON body of `/api/me` (cookie alongside body — same pattern,
  * just JSON instead of HTML). Neither path needs JS to read the cookie
- * directly. SameSite=Lax (matches the session cookie), Secure, and Path=/
- * (covers every admin form, OAuth flow, and `/api/me` consumer).
+ * directly. SameSite=Lax (matches the session cookie), Secure conditional
+ * on the request protocol (see below), and Path=/ (covers every admin
+ * form, OAuth flow, and `/api/me` consumer).
+ *
+ * `Secure` is set when the request arrived over HTTPS (direct or behind a
+ * reverse proxy that set `X-Forwarded-Proto: https`) — `isHttpsRequest` in
+ * `request-protocol.ts` is the single source of truth. On
+ * `http://localhost:1939` the attribute is omitted so the browser actually
+ * keeps the cookie; setting `Secure` unconditionally silently drops it on
+ * HTTP and breaks the double-submit handshake on the very next POST
+ * ("Invalid form submission" page on the wizard, etc.).
  *
  * Token entropy: 32 random bytes, base64url-encoded — same shape as session
  * IDs. No HMAC needed: the value is opaque to the client and only ever
  * compared to itself across the cookie/form boundary.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { isHttpsRequest } from "./request-protocol.ts";
 
 export const CSRF_COOKIE_NAME = "parachute_hub_csrf";
 export const CSRF_FIELD_NAME = "__csrf";
@@ -42,15 +52,18 @@ export function generateCsrfToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
-export function buildCsrfCookie(token: string): string {
-  return [
-    `${CSRF_COOKIE_NAME}=${token}`,
-    "HttpOnly",
-    "Secure",
-    "SameSite=Lax",
-    "Path=/",
-    `Max-Age=${CSRF_TTL_SECONDS}`,
-  ].join("; ");
+/**
+ * Build a Set-Cookie header value for a CSRF token. `secure` defaults to
+ * true (the production posture behind a TLS terminator); callers that
+ * mint the cookie for a known-HTTP request — `ensureCsrfToken` does
+ * this via `isHttpsRequest` — pass `secure: false` to omit the
+ * attribute so the browser keeps the cookie on plain HTTP.
+ */
+export function buildCsrfCookie(token: string, opts: { secure?: boolean } = {}): string {
+  const parts = [`${CSRF_COOKIE_NAME}=${token}`, "HttpOnly"];
+  if (opts.secure !== false) parts.push("Secure");
+  parts.push("SameSite=Lax", "Path=/", `Max-Age=${CSRF_TTL_SECONDS}`);
+  return parts.join("; ");
 }
 
 export function parseCsrfCookie(cookieHeader: string | null): string | null {
@@ -72,12 +85,17 @@ export interface EnsuredCsrf {
  * Ensure the request carries a CSRF token cookie; mint and return one if not.
  * Callers embed `result.token` in the rendered form and attach
  * `result.setCookie` (if defined) to the response.
+ *
+ * Protocol-aware: when the request is plain HTTP (`http://localhost:1939`
+ * during local dev / on-box CLI), the minted cookie omits the `Secure`
+ * attribute so the browser keeps it. When the request is HTTPS (or
+ * forwarded via `X-Forwarded-Proto: https`), `Secure` is set.
  */
 export function ensureCsrfToken(req: Request): EnsuredCsrf {
   const existing = parseCsrfCookie(req.headers.get("cookie"));
   if (existing && existing.length > 0) return { token: existing };
   const token = generateCsrfToken();
-  return { token, setCookie: buildCsrfCookie(token) };
+  return { token, setCookie: buildCsrfCookie(token, { secure: isHttpsRequest(req) }) };
 }
 
 /**
