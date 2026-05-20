@@ -133,6 +133,7 @@ import {
   handleListVaults,
 } from "./api-users.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
+import { applyCorsHeaders, corsPreflightResponse, isCorsAllowedRoute } from "./cors.ts";
 import { ensureCsrfToken } from "./csrf.ts";
 import { readExposeState } from "./expose-state.ts";
 import { HUB_DEFAULT_PORT, HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
@@ -979,6 +980,22 @@ export function hubFetch(
       });
     }
 
+    // CORS preflight for the public OAuth + discovery surface. Browsers
+    // issue OPTIONS before any non-simple cross-origin request — third-party
+    // SPAs hitting `/oauth/register` (RFC 7591 DCR), `/oauth/token`,
+    // `/.well-known/oauth-authorization-server`, etc. Handling this above
+    // the route table means an OPTIONS to e.g. `/oauth/register` doesn't
+    // hit the method-not-allowed branch in the handler — the preflight is a
+    // CORS-protocol artifact, not a "real" request to the endpoint. The
+    // single `isCorsAllowedRoute` predicate is the source of truth for
+    // which paths carry wildcard-CORS; see `src/cors.ts` for the rationale.
+    // Out-of-scope paths (`/api/*`, `/admin/*`, `/login`, `/account/*`,
+    // `/vault/*`, generic service proxy) fall through and OPTIONS reaches
+    // whatever default the downstream handler enforces (typically 405).
+    if (req.method === "OPTIONS" && isCorsAllowedRoute(pathname)) {
+      return corsPreflightResponse();
+    }
+
     // Platform health check (Render, Fly, Kubernetes, etc.). Plain JSON,
     // no DB required — the route reports liveness, not readiness. Anything
     // more invasive (DB ping, schema check) would let a transient lock turn
@@ -1258,11 +1275,22 @@ export function hubFetch(
       return new Response(res.body, { status: res.status, headers: merged });
     }
 
+    // OAuth surface — every handler return is wrapped in `applyCorsHeaders`
+    // so third-party SPAs can fetch these endpoints cross-origin (the entire
+    // point of OAuth DCR: arbitrary SPAs register → authorize → exchange
+    // tokens). Preflight OPTIONS already returned at the top of dispatch.
+    // See `src/cors.ts` for the wildcard-origin rationale.
     if (pathname === "/oauth/authorize") {
-      if (!getDb) return dbNotConfigured();
-      if (req.method === "GET") return handleAuthorizeGet(getDb(), req, oauthDeps(req));
-      if (req.method === "POST") return handleAuthorizePost(getDb(), req, oauthDeps(req));
-      return new Response("method not allowed", { status: 405 });
+      if (!getDb) return applyCorsHeaders(dbNotConfigured());
+      if (req.method === "GET") {
+        // handleAuthorizeGet is sync (returns Response, not Promise<Response>).
+        // handleAuthorizePost is async — keep the await on POST only.
+        return applyCorsHeaders(handleAuthorizeGet(getDb(), req, oauthDeps(req)));
+      }
+      if (req.method === "POST") {
+        return applyCorsHeaders(await handleAuthorizePost(getDb(), req, oauthDeps(req)));
+      }
+      return applyCorsHeaders(new Response("method not allowed", { status: 405 }));
     }
 
     // Inline approve form for the operator-driven pending-client flow (#208).
@@ -1270,27 +1298,35 @@ export function hubFetch(
     // by handleAuthorizeGet when the operator hits a pending client. Three
     // gates inside the handler: CSRF, active session, same-origin Origin.
     if (pathname === "/oauth/authorize/approve") {
-      if (!getDb) return dbNotConfigured();
-      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-      return handleApproveClientPost(getDb(), req, oauthDeps(req));
+      if (!getDb) return applyCorsHeaders(dbNotConfigured());
+      if (req.method !== "POST") {
+        return applyCorsHeaders(new Response("method not allowed", { status: 405 }));
+      }
+      return applyCorsHeaders(await handleApproveClientPost(getDb(), req, oauthDeps(req)));
     }
 
     if (pathname === "/oauth/token") {
-      if (!getDb) return dbNotConfigured();
-      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-      return handleToken(getDb(), req, oauthDeps(req));
+      if (!getDb) return applyCorsHeaders(dbNotConfigured());
+      if (req.method !== "POST") {
+        return applyCorsHeaders(new Response("method not allowed", { status: 405 }));
+      }
+      return applyCorsHeaders(await handleToken(getDb(), req, oauthDeps(req)));
     }
 
     if (pathname === "/oauth/register") {
-      if (!getDb) return dbNotConfigured();
-      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-      return handleRegister(getDb(), req, oauthDeps(req));
+      if (!getDb) return applyCorsHeaders(dbNotConfigured());
+      if (req.method !== "POST") {
+        return applyCorsHeaders(new Response("method not allowed", { status: 405 }));
+      }
+      return applyCorsHeaders(await handleRegister(getDb(), req, oauthDeps(req)));
     }
 
     if (pathname === "/oauth/revoke") {
-      if (!getDb) return dbNotConfigured();
-      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-      return handleRevoke(getDb(), req, oauthDeps(req));
+      if (!getDb) return applyCorsHeaders(dbNotConfigured());
+      if (req.method !== "POST") {
+        return applyCorsHeaders(new Response("method not allowed", { status: 405 }));
+      }
+      return applyCorsHeaders(await handleRevoke(getDb(), req, oauthDeps(req)));
     }
 
     if (pathname === "/vaults") {
