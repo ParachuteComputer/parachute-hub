@@ -1143,23 +1143,6 @@ const STYLES = `
     color: ${PALETTE.fgDim};
     font-style: italic;
   }
-  .approve-cli-hint {
-    margin-top: 1rem;
-    padding-top: 0.85rem;
-    border-top: 1px solid ${PALETTE.borderLight};
-    color: ${PALETTE.fgMuted};
-    font-size: 0.85rem;
-  }
-  .approve-cli-hint code {
-    font-family: ${FONT_MONO};
-    font-size: 0.8rem;
-    background: ${PALETTE.bgSoft};
-    padding: 0.1rem 0.4rem;
-    border-radius: 4px;
-    color: ${PALETTE.fg};
-    word-break: break-all;
-  }
-
   .badge {
     display: inline-block;
     font-size: 0.7rem;

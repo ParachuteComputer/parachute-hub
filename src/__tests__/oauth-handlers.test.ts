@@ -1022,6 +1022,58 @@ describe("handleAuthorizePost — consent submit", () => {
     }
   });
 
+  test("race-condition branch (client un-approved between GET and POST) — error points at web approval path, no CLI mention", async () => {
+    // Defensive branch in handleConsentSubmit: consent only renders for
+    // approved clients, but a row can flip back to pending between GET and
+    // POST (operator revoke / hand-crafted POST). Pre-rc.19 follow-up the
+    // error said "Run `parachute auth approve-client <id>` from a terminal";
+    // rc.19 retired every browser-visible CLI mention, so this branch now
+    // surfaces the same /admin/approve-client/<id> path the unauth GET-on-
+    // pending page advertises.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const form = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        scope: "vault:default:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        state: "race",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(403);
+      const html = await res.text();
+      expect(html).toContain("App not yet approved");
+      // Web path advertised, with the client_id rendered inline.
+      expect(html).toContain(`/admin/approve-client/${reg.client.clientId}`);
+      expect(html).toContain("Sign in as admin");
+      // CLI mention retired from every browser-visible surface in rc.19.
+      expect(html).not.toContain("parachute auth approve-client");
+      expect(html).not.toContain("from a terminal");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("rejects parachute:host:admin in form scope (defense-in-depth, #96)", async () => {
     // GET-time gate already rejects, but a hand-crafted POST could carry
     // an operator-only scope. Consent submit must independently reject.

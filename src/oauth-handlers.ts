@@ -885,10 +885,13 @@ async function handleConsentSubmit(
     // status here means the row was unapproved between render and submit (or
     // the form was hand-crafted). The approve UI requires a known authorize
     // URL to round-trip via `return_to`, which we don't reconstruct here —
-    // surface the static error and let the operator restart from the SPA.
+    // surface the static error pointing at the web approval path (the
+    // canonical recovery post-#277; rc.19 retired the CLI mention from
+    // every browser-visible surface so the path advertised here matches
+    // what the unauth GET-on-pending page now shows).
     return htmlError(
       "App not yet approved",
-      `This client_id is registered but has not been approved. Run \`parachute auth approve-client ${client.clientId}\` from a terminal, then try again.`,
+      `This client_id is registered but has not been approved. Sign in as admin and approve at /admin/approve-client/${client.clientId}, or send the link to your hub operator.`,
       403,
     );
   }
