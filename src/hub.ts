@@ -487,16 +487,41 @@ const HTML_TEMPLATE = `<!doctype html>
   // even if the well-known fetch is slow or fails.
   renderAdmin();
 
-  try {
-    const wk = await fetch('/.well-known/parachute.json', { credentials: 'omit' });
-    if (!wk.ok) throw new Error('well-known fetch failed: ' + wk.status);
-    const doc = await wk.json();
-    const services = Array.isArray(doc.services) ? doc.services : [];
-    renderServices(services);
-  } catch (err) {
-    servicesGrid.innerHTML = '<div class="error">Could not load services: ' +
-      (err && err.message ? err.message : String(err)) + '</div>';
+  // Fetch services and render. cache 'no-store' on the fetch matters
+  // here: without it, the browser's HTTP cache returns the stale
+  // services list the next time the operator clicks back to / after
+  // installing a module via /admin/modules. Server-side also sets
+  // cache-control no-store on the well-known doc; belt-and-suspenders
+  // since older browsers (and some intermediaries) ignore one or the
+  // other (hub#268 Item 1).
+  async function loadServices() {
+    try {
+      const wk = await fetch('/.well-known/parachute.json', {
+        credentials: 'omit',
+        cache: 'no-store',
+      });
+      if (!wk.ok) throw new Error('well-known fetch failed: ' + wk.status);
+      const doc = await wk.json();
+      const services = Array.isArray(doc.services) ? doc.services : [];
+      renderServices(services);
+    } catch (err) {
+      servicesGrid.innerHTML = '<div class="error">Could not load services: ' +
+        (err && err.message ? err.message : String(err)) + '</div>';
+    }
   }
+
+  // Re-fetch on pageshow (covers the bfcache-restore path: when an
+  // operator clicks back from /admin/modules to / the browser may
+  // restore the prior DOM without re-running the IIFE, leaving stale
+  // tiles). The event's persisted flag is the bfcache discriminator —
+  // true when the page was rehydrated from cache, false on a fresh
+  // load. On fresh load the initial loadServices() below already ran,
+  // so we only re-fetch when persisted is true.
+  window.addEventListener('pageshow', (e) => {
+    if (e.persisted) void loadServices();
+  });
+
+  void loadServices();
 })();
 </script>
 </body>

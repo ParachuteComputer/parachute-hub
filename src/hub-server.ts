@@ -149,6 +149,7 @@ import { findActiveSession } from "./sessions.ts";
 import {
   type SetupWizardDeps,
   handleSetupAccountPost,
+  handleSetupExposePost,
   handleSetupGet,
   handleSetupVaultPost,
 } from "./setup-wizard.ts";
@@ -1010,6 +1011,10 @@ export function hubFetch(
         if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
         return handleSetupVaultPost(req, wizardDeps);
       }
+      if (pathname === "/admin/setup/expose") {
+        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+        return handleSetupExposePost(req, wizardDeps);
+      }
       return new Response("not found", { status: 404 });
     }
 
@@ -1103,9 +1108,17 @@ export function hubFetch(
       // cross-origin from their own loopback port. Wildcard CORS is the
       // shape it needs. Browsers send an OPTIONS preflight when the request
       // adds non-simple headers; answer it with 204 + the same allow-list.
+      //
+      // `cache-control: no-store` matters here: the discovery page (`/`)
+      // fetches this doc and renders Service tiles from it; without
+      // no-store, the browser's HTTP cache returns the stale services list
+      // the next time the operator navigates back to `/` after installing
+      // a module via the admin SPA. The doc is small and built per-request
+      // anyway, so giving up cacheability has no real cost (hub#268 Item 1).
       const corsHeaders = {
         "access-control-allow-origin": "*",
         "access-control-allow-methods": "GET, OPTIONS",
+        "cache-control": "no-store",
       };
       if (req.method === "OPTIONS") {
         return new Response(null, { status: 204, headers: corsHeaders });

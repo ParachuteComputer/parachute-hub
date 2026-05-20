@@ -46,6 +46,14 @@ import {
   renderCsrfHiddenInput,
   verifyCsrfToken,
 } from "./csrf.ts";
+import {
+  SETUP_EXPOSE_MODES,
+  type SetupExposeMode,
+  getSetting,
+  isSetupExposeMode,
+  openFirstClientAutoApproveWindow,
+  setSetting,
+} from "./hub-settings.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { findService, readManifest } from "./services-manifest.ts";
@@ -88,7 +96,15 @@ function escapeAttr(s: string): string {
 
 // --- state derivation ----------------------------------------------------
 
-export type WizardStep = "welcome" | "account" | "vault" | "done";
+/**
+ * Wizard steps. `"account"` is a visual-only entry in the progress
+ * header — it shares a screen with `"welcome"` (the combined welcome +
+ * account form), and `deriveWizardState` never returns it: a welcome
+ * POST creates the admin and advances directly to `"vault"`. Kept in
+ * the union so the progress bar can render it as a distinct dot for
+ * display continuity.
+ */
+export type WizardStep = "welcome" | "account" | "vault" | "expose" | "done";
 
 export interface DerivedWizardState {
   /** Current step the wizard should render. */
@@ -97,6 +113,13 @@ export interface DerivedWizardState {
   hasAdmin: boolean;
   /** Whether the first vault (curated) has been provisioned in services.json. */
   hasVault: boolean;
+  /**
+   * Whether the operator has answered the "how will this hub be reached?"
+   * question (the expose step, hub#268 Item 2). When admin + vault both
+   * exist but the operator hasn't picked an expose mode yet, the wizard
+   * renders the expose step rather than the done screen.
+   */
+  hasExposeMode: boolean;
 }
 
 /**
@@ -121,11 +144,19 @@ export function deriveWizardState(deps: {
   const vaultSpec = specFor(FIRST_VAULT_SHORT);
   const vaultEntry = findService(vaultSpec.manifestName, deps.manifestPath);
   const hasVault = vaultEntry !== undefined;
+  // Expose-mode is the operator's "how will this hub be reached?" answer
+  // (hub#268 Item 2). Stored as a hub_setting; the wizard's expose step
+  // sets it; absence means we should still ask.
+  const hasExposeMode = getSetting(deps.db, "setup_expose_mode") !== undefined;
   let step: WizardStep;
+  // Note: `"account"` is a visual-only step in the progress header —
+  // welcome's POST creates the admin and advances directly to `"vault"`,
+  // so we never return `"account"` here.
   if (!hasAdmin) step = "welcome";
   else if (!hasVault) step = "vault";
+  else if (!hasExposeMode) step = "expose";
   else step = "done";
-  return { step, hasAdmin, hasVault };
+  return { step, hasAdmin, hasVault, hasExposeMode };
 }
 
 // --- handler types -------------------------------------------------------
@@ -184,7 +215,7 @@ ${body}
 }
 
 function header(currentStep: WizardStep): string {
-  const stepOrder: WizardStep[] = ["welcome", "account", "vault", "done"];
+  const stepOrder: WizardStep[] = ["welcome", "account", "vault", "expose", "done"];
   // Step 1 (welcome) + step 2 (account) collapse on the rendered page —
   // we show them as a single combined form. The progress bar still names
   // them separately so the operator sees the shape.
@@ -192,6 +223,7 @@ function header(currentStep: WizardStep): string {
     welcome: "Welcome",
     account: "Account",
     vault: "Vault",
+    expose: "Expose",
     done: "Done",
   };
   const items = stepOrder
@@ -397,17 +429,111 @@ function renderVaultOpStep(props: {
   return baseDocument("Set up your Parachute hub — vault", body, refresh);
 }
 
-// --- step 4: done --------------------------------------------------------
+// --- step 4: expose ------------------------------------------------------
+
+export interface RenderExposeStepProps {
+  csrfToken: string;
+  errorMessage?: string;
+  /** Pre-select a radio when re-rendering after a validation error. */
+  selectedMode?: SetupExposeMode;
+}
+
+/**
+ * The expose step asks the operator how this hub will be reached. The
+ * wizard doesn't configure tailscale or DNS itself — the operator owns
+ * the actual networking step; the wizard's role is to ask the question,
+ * surface the right next-step instructions, and persist the choice so
+ * the done page (and the admin SPA later) shows the right URL shape.
+ *
+ * Three modes (hub#268 Item 2):
+ *   * localhost — just this machine. No further action; the loopback
+ *     URL is the canonical entry.
+ *   * tailnet   — Tailscale network. Show the `tailscale serve` command
+ *     the operator runs themselves.
+ *   * public    — custom domain / reverse proxy. Show a brief explainer
+ *     + link to the deploy docs.
+ */
+export function renderExposeStep(props: RenderExposeStepProps): string {
+  const { csrfToken, errorMessage, selectedMode } = props;
+  const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
+  // The default selection (localhost) is the most common case + the
+  // safest fallback — picking it changes nothing operational. Tailnet +
+  // public require the operator to actually run something; surfacing
+  // them as alternatives is the whole point of this step.
+  const sel = (m: SetupExposeMode) => (selectedMode === m ? " checked" : "");
+  const defaultChecked = selectedMode === undefined ? " checked" : "";
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        ${header("expose")}
+        <h1>How will this hub be reached?</h1>
+        <p class="subtitle">Pick the network shape that matches your setup.
+          You can revisit this later from the admin UI — it just shapes the
+          URLs we surface on the next screen.</p>
+      </div>
+      ${error}
+      <form method="POST" action="/admin/setup/expose" class="auth-form expose-form">
+        ${renderCsrfHiddenInput(csrfToken)}
+        <label class="expose-option">
+          <input type="radio" name="expose_mode" value="localhost"${selectedMode ? sel("localhost") : defaultChecked} />
+          <div class="expose-option-body">
+            <span class="expose-option-title">Just this machine (localhost)</span>
+            <span class="expose-option-desc">Reach the hub at
+              <code>http://localhost:1939</code>. No further configuration
+              needed. This is the right answer for "I'm just trying it out"
+              and for "this machine is the only client."</span>
+          </div>
+        </label>
+        <label class="expose-option">
+          <input type="radio" name="expose_mode" value="tailnet"${sel("tailnet")} />
+          <div class="expose-option-body">
+            <span class="expose-option-title">My Tailscale network</span>
+            <span class="expose-option-desc">Share with your own devices over
+              a private tailnet. After finishing setup, run:</span>
+            <pre class="expose-option-cmd">tailscale serve --bg --https=1939 http://localhost:1939</pre>
+            <span class="expose-option-desc">The hub is then reachable at
+              your tailnet hostname (e.g.
+              <code>https://my-mac.tailnet-name.ts.net</code>) from any of
+              your logged-in devices.</span>
+          </div>
+        </label>
+        <label class="expose-option">
+          <input type="radio" name="expose_mode" value="public"${sel("public")} />
+          <div class="expose-option-body">
+            <span class="expose-option-title">Public URL (custom domain)</span>
+            <span class="expose-option-desc">Run the hub behind a reverse
+              proxy on a domain you own. See the
+              <a href="https://parachute.computer/docs/deploy" target="_blank" rel="noopener">deploy guide</a>
+              for nginx / Caddy / Cloudflare Tunnel examples + the env
+              vars (<code>PARACHUTE_HUB_ORIGIN</code>) the hub reads for
+              its own canonical URL.</span>
+          </div>
+        </label>
+        <button type="submit" class="btn btn-primary">Continue</button>
+      </form>
+    </div>`;
+  return baseDocument("Set up your Parachute hub — expose", body);
+}
+
+// --- step 5: done --------------------------------------------------------
 
 export interface RenderDoneStepProps {
   vaultName: string;
   /** Hub origin used in copy-pastable MCP install commands. */
   hubOrigin: string;
+  /**
+   * Operator's expose-mode choice from step 4. Shapes the "Your hub is
+   * reachable at:" line + next-step instructions. Optional for back-compat
+   * with callers that render the done step without going through expose
+   * (e.g. tests of the wizard's older two-step flow).
+   */
+  exposeMode?: SetupExposeMode;
 }
 
 export function renderDoneStep(props: RenderDoneStepProps): string {
-  const { vaultName, hubOrigin } = props;
+  const { vaultName, hubOrigin, exposeMode } = props;
   const mcpCmd = `claude mcp add --transport http parachute-${vaultName} ${hubOrigin}/vault/${vaultName}/mcp`;
+  const reachable = exposeMode ? renderReachableTile(exposeMode, hubOrigin) : "";
   const body = `
     <div class="card">
       <div class="card-header">
@@ -415,6 +541,7 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
         <h1>You're set up</h1>
         <p class="subtitle">Your hub is ready. Here's what to do next.</p>
       </div>
+      ${reachable}
       <section class="done-grid">
         <div class="done-tile">
           <h2>Open the admin UI</h2>
@@ -446,6 +573,47 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
   return baseDocument("Parachute hub — setup complete", body);
 }
 
+/**
+ * Render the "Your hub is reachable at" tile on the done step, shaped by
+ * the operator's expose-mode choice. Always surfaces the loopback URL as
+ * an anchor (the operator's own browser hits the wizard on it); the
+ * tail-end instructions reframe based on what they picked.
+ */
+function renderReachableTile(mode: SetupExposeMode, hubOrigin: string): string {
+  const safeOrigin = escapeHtml(hubOrigin);
+  if (mode === "localhost") {
+    return `<section class="reachable">
+      <h2>Your hub is reachable at</h2>
+      <p class="reachable-url"><code>${safeOrigin}</code></p>
+      <p class="fine">Local to this machine only. Want to share it with your
+        other devices? Re-visit setup later from the admin UI or run
+        <code>tailscale serve --bg --https=1939 http://localhost:1939</code>
+        from a terminal.</p>
+    </section>`;
+  }
+  if (mode === "tailnet") {
+    return `<section class="reachable">
+      <h2>Your hub is reachable at</h2>
+      <p class="reachable-url"><code>${safeOrigin}</code> (loopback, this machine)</p>
+      <p class="reachable-url">Plus your tailnet URL once you run:</p>
+      <pre>tailscale serve --bg --https=1939 http://localhost:1939</pre>
+      <p class="fine">The Tailscale CLI prints the public hostname (e.g.
+        <code>my-mac.tailnet-name.ts.net</code>); use that on your phone /
+        other devices.</p>
+    </section>`;
+  }
+  // public
+  return `<section class="reachable">
+      <h2>Your hub is reachable at</h2>
+      <p class="reachable-url"><code>${safeOrigin}</code> (loopback, this machine)</p>
+      <p class="fine">Wire a reverse proxy on your domain to
+        <code>${safeOrigin}</code>, then set <code>PARACHUTE_HUB_ORIGIN</code>
+        to your public URL and restart the hub. See the
+        <a href="https://parachute.computer/docs/deploy">deploy guide</a>
+        for nginx / Caddy / Cloudflare Tunnel examples.</p>
+    </section>`;
+}
+
 // --- handler entry points ------------------------------------------------
 
 /**
@@ -467,20 +635,37 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
   };
   if (csrf.setCookie) extraHeaders["set-cookie"] = csrf.setCookie;
 
-  // Setup fully complete — redirect to /login unless we're rendering the
-  // success page once. The success page sets `?just_finished=1` and the
-  // session cookie is on the request from step 2.
-  if (state.hasAdmin && state.hasVault) {
+  // Setup fully complete (including expose-mode choice) — redirect to
+  // /login unless we're rendering the success page once. The success
+  // page sets `?just_finished=1` and the session cookie is on the
+  // request from step 2.
+  if (state.hasAdmin && state.hasVault && state.hasExposeMode) {
     if (url.searchParams.get("just_finished") === "1") {
-      return new Response(
-        renderDoneStep({
-          vaultName: firstVaultName(deps.manifestPath),
-          hubOrigin: deps.issuer,
-        }),
-        { status: 200, headers: extraHeaders },
-      );
+      const stored = getSetting(deps.db, "setup_expose_mode");
+      const exposeMode = isSetupExposeMode(stored) ? stored : undefined;
+      const doneProps: RenderDoneStepProps = {
+        vaultName: firstVaultName(deps.manifestPath),
+        hubOrigin: deps.issuer,
+      };
+      if (exposeMode !== undefined) doneProps.exposeMode = exposeMode;
+      return new Response(renderDoneStep(doneProps), {
+        status: 200,
+        headers: extraHeaders,
+      });
     }
     return new Response(null, { status: 301, headers: { location: "/login" } });
+  }
+
+  // Expose step (hub#268 Item 2). Admin + vault exist, but the operator
+  // hasn't picked an expose mode yet. The wizard form posts to
+  // /admin/setup/expose. Gated on having an admin session (the session
+  // cookie was minted on step 2); on a stale tab without it, the post
+  // handler shows the no-session error.
+  if (state.hasAdmin && state.hasVault && !state.hasExposeMode) {
+    return new Response(renderExposeStep({ csrfToken: csrf.token }), {
+      status: 200,
+      headers: extraHeaders,
+    });
   }
 
   // Step 3 (vault) with an op in flight — render the poll page.
@@ -689,6 +874,66 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
     );
   }
   return redirect(`/admin/setup?op=${encodeURIComponent(op.id)}`);
+}
+
+/**
+ * POST `/admin/setup/expose`. Form-encoded.
+ *
+ * Persists the operator's "how will this hub be reached?" answer to
+ * `hub_settings.setup_expose_mode` (hub#268 Item 2). Three valid values:
+ * `localhost`, `tailnet`, `public`.
+ *
+ * This is also the transition where the wizard considers itself "done"
+ * for the auto-approve-first-client feature (hub#268 Item 3): we open a
+ * 60-minute window where the next OAuth client registration is
+ * auto-approved. Reasoning lives in `hub-settings.ts`; the wizard just
+ * fires it on the only event that means "operator just finished the
+ * canonical onboarding."
+ *
+ * Gated on an admin session cookie like the vault POST is — same shape,
+ * same reason.
+ */
+export async function handleSetupExposePost(
+  req: Request,
+  deps: SetupWizardDeps,
+): Promise<Response> {
+  const form = await req.formData();
+  const formCsrf = form.get(CSRF_FIELD_NAME);
+  if (!verifyCsrfToken(req, typeof formCsrf === "string" ? formCsrf : null)) {
+    return badRequestPage("Invalid form submission", "Reload and try again.");
+  }
+  const session = findActiveSession(deps.db, req);
+  if (!session) {
+    return badRequestPage(
+      "No admin session",
+      "Sign in to continue setup. (The wizard sets a session cookie on step 2; clearing cookies between steps will land you here.)",
+    );
+  }
+  // Already done — short-circuit to the success screen. Belt-and-braces:
+  // the wizard's GET shape catches this case too, but a direct POST
+  // (curl, tab race) shouldn't double-fire the auto-approve window.
+  if (getSetting(deps.db, "setup_expose_mode") !== undefined) {
+    return redirect("/admin/setup?just_finished=1");
+  }
+  const rawMode = form.get("expose_mode");
+  if (!isSetupExposeMode(rawMode)) {
+    return htmlResponse(
+      renderExposeStep({
+        csrfToken: typeof formCsrf === "string" ? formCsrf : "",
+        errorMessage: `Pick one of: ${SETUP_EXPOSE_MODES.join(", ")}.`,
+      }),
+      400,
+    );
+  }
+  setSetting(deps.db, "setup_expose_mode", rawMode);
+  // hub#268 Item 3: open the 60-minute auto-approve window for the first
+  // OAuth client registration. Logged so an operator chasing odd behavior
+  // can see it fired.
+  openFirstClientAutoApproveWindow(deps.db);
+  console.log(
+    `[setup-wizard] opened first-client auto-approve window (60min) after expose-mode=${rawMode}`,
+  );
+  return redirect("/admin/setup?just_finished=1");
 }
 
 // --- helpers ------------------------------------------------------------
@@ -1044,6 +1289,90 @@ const STYLES = `
     margin: 0.5rem 0;
   }
   .done-tile .fine { font-size: 0.85rem; color: ${PALETTE.fgMuted}; }
+
+  /* expose step (hub#268 Item 2). Vertical stack of radio cards;
+     each label is the full clickable hit target. */
+  .expose-form { gap: 0.65rem; }
+  .expose-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.65rem;
+    padding: 0.85rem 1rem;
+    border: 1px solid ${PALETTE.border};
+    border-radius: 8px;
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+    background: ${PALETTE.cardBg};
+  }
+  .expose-option:hover { border-color: ${PALETTE.accent}; }
+  .expose-option input[type=radio] {
+    margin-top: 0.25rem;
+    accent-color: ${PALETTE.accent};
+    flex-shrink: 0;
+  }
+  .expose-option-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    min-width: 0;
+  }
+  .expose-option-title {
+    font-weight: 600;
+    color: ${PALETTE.fg};
+    font-size: 0.95rem;
+  }
+  .expose-option-desc {
+    color: ${PALETTE.fgMuted};
+    font-size: 0.88rem;
+    line-height: 1.45;
+  }
+  .expose-option-cmd {
+    background: ${PALETTE.bg};
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    font-family: ${FONT_MONO};
+    font-size: 0.82rem;
+    margin: 0.25rem 0;
+    overflow-x: auto;
+  }
+
+  /* reachable tile on the done step. Lives outside the .done-grid so it
+     spans the full width — the URL itself is the headline. */
+  .reachable {
+    background: ${PALETTE.accentSoft};
+    border-left: 3px solid ${PALETTE.accent};
+    border-radius: 0 8px 8px 0;
+    padding: 0.75rem 1rem;
+    margin: 0 0 1rem;
+  }
+  .reachable h2 {
+    margin: 0 0 0.4rem;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 0.9rem;
+    color: ${PALETTE.accent};
+  }
+  .reachable-url {
+    margin: 0.2rem 0;
+    font-size: 0.95rem;
+  }
+  .reachable-url code {
+    background: ${PALETTE.cardBg};
+    border: 1px solid ${PALETTE.borderLight};
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+  }
+  .reachable pre {
+    background: ${PALETTE.cardBg};
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    overflow-x: auto;
+    font-size: 0.82rem;
+    margin: 0.4rem 0;
+  }
+  .reachable .fine { font-size: 0.85rem; color: ${PALETTE.fgMuted}; margin: 0.4rem 0 0; }
 
   code {
     background: ${PALETTE.borderLight};

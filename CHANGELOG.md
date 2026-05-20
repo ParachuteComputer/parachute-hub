@@ -2,6 +2,31 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.7] - 2026-05-19
+
+Post-wizard polish bundle (hub#268). Three related items caught while walking the rc.6 wizard on a fresh machine. One PR, three logical commits + the rc.7 bump.
+
+**Item 1 — Discovery page doesn't refresh after module install.** Install Notes via `/admin/modules`, click home (`/`), and the new Notes tile didn't appear without a manual reload. The `/.well-known/parachute.json` doc is already built per-request, but the doc response had no `cache-control` header and the client-side fetch ran without `cache: 'no-store'` — so the browser's HTTP cache returned the previous (stale) services list. Belt-and-suspenders fix: `cache-control: no-store` on the well-known JSON response (server) + `cache: 'no-store'` on the client fetch + a `pageshow` listener that re-runs `loadServices()` when the page is restored from bfcache (`event.persisted === true`). Now a fresh GET, a bfcache restore, and a Cmd-R all see the current services list.
+
+**Item 2 — First-boot wizard asks how the hub will be reached.** New "expose" step (between vault and done) presents three radio options: localhost (default), Tailscale tailnet (with the `tailscale serve --bg --https=1939 http://localhost:1939` snippet), or public URL (with a link to the deploy docs + a hint that `PARACHUTE_HUB_ORIGIN` is the env var to set). The answer persists in a new `hub_settings` key/value table (migration v7, key `setup_expose_mode`); the done page reshapes its "Your hub is reachable at:" tile based on the choice. The wizard's job here is to ask + inform — the operator runs the actual networking step themselves. The new step pushes `done` to step 5 in the progress header.
+
+**Item 3 — Auto-approve the first OAuth client after wizard.** On the canonical onboarding (install hub → wizard → install Notes → authorize), the manual approve-client step between Notes-registers and OAuth-flow-completes is friction without value — the operator literally just set up the hub for that purpose. The wizard's expose-step POST opens a 60-minute window (stored as `pending_first_client_auto_approve_until` in `hub_settings`). The next `/oauth/register` within the window is auto-approved + the window cleared (single-use). Subsequent clients fall through to the standard pending-approval flow. Logged as `[oauth] auto-approved first client clientId=… within wizard window` so operators can see what happened. The bearer + same-origin-session auto-approve paths still take precedence — they never reach the window-consume code, so the window stays available for the canonical first un-authenticated client.
+
+Surface summary:
+- 2 new modules: `src/hub-settings.ts` (KV accessor + auto-approve window helpers) + the v7 migration in `src/hub-db.ts` (`hub_settings` table).
+- 1 new test file: `src/__tests__/hub-settings.test.ts` — 14 tests covering the KV API, `isSetupExposeMode` validation, and the open/check/consume/clear lifecycle of the auto-approve window (including malformed timestamps, expiry, and re-open after consume).
+- 5 modules edited: `src/hub-server.ts` (cache-control on well-known + `/admin/setup/expose` route), `src/hub.ts` (no-store fetch + pageshow listener), `src/setup-wizard.ts` (new expose step + reachable tile + `handleSetupExposePost` + auto-approve window open + done-page expose-mode awareness), `src/oauth-handlers.ts` (consume-window check in `handleRegister`).
+- 3 test files edited: `src/__tests__/setup-wizard.test.ts` (+11 tests: deriveWizardState shape, expose step rendering, done-page expose-mode variants, `handleSetupExposePost` shape — valid/invalid mode, missing session, missing CSRF, idempotent), `src/__tests__/oauth-handlers.test.ts` (+6 tests: auto-approve within window, after expiry, single-use, no-window default, precedence over session-cookie path, malformed timestamp), `src/__tests__/hub-server.test.ts` (+1 test: cache-control on well-known) + 2 existing tests updated for the new expose gate, `src/__tests__/hub.test.ts` (+2 tests: client-side `cache: 'no-store'` + `pageshow` re-fetch).
+
+Gate: `bun test ./src` — **1415 pass / 0 fail / 30734 expects across 79 files**. +32 over rc.6 (1383 → 1415). The pre-existing `status > all-healthy returns 0 and prints table` env-flake passed this run too. typecheck + biome clean.
+
+Local smoke (`http://localhost:11949`, fresh `PARACHUTE_HOME=/tmp/hub-bundle-smoke-1`):
+- Walked the wizard end-to-end three times (localhost / tailnet / public). Each chose its radio, hit Continue, landed on the done page with the right reachable tile.
+- After each walk, `getSetting(hub.db, 'setup_expose_mode')` reflected the answer and `getSetting(hub.db, 'pending_first_client_auto_approve_until')` was set ~60min in the future.
+- Verified `/.well-known/parachute.json` response carries `cache-control: no-store` (curl `-I`); discovery page bundle contains `cache: 'no-store'` + the `pageshow` listener.
+- Auto-approve smoke: registered an OAuth client via curl POST to `/oauth/register` within the window → response showed `"status": "approved"`. Second registration within the same window → `"status": "pending"`. Setting expires correctly; consume clears it.
+- The `bun add` install path still fails in Aaron's dev env (stale paraclaw→parachute-agent lockfile from the rename); the wizard correctly surfaces `status: failed` for the vault step. Not on this PR's critical path — same issue rc.6 documented.
+
 ## [0.5.10-rc.6] - 2026-05-19
 
 Two blocking bugs caught by fresh-machine testing on rc.5 (neither caught by the unit suite or reviewer because both only manifest over `http://localhost`).

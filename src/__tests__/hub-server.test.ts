@@ -165,6 +165,29 @@ describe("hubFetch routing", () => {
     }
   });
 
+  test("/.well-known/parachute.json sets cache-control: no-store (hub#268 Item 1)", async () => {
+    // The discovery page (/) fetches this doc and renders Service tiles
+    // from it. Without no-store, the browser HTTP cache returns the
+    // stale services list the next time the operator clicks back to /
+    // after installing a module via /admin/modules. The doc is built
+    // per-request anyway, so giving up cacheability has no real cost.
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const getRes = await hubFetch(h.dir, { manifestPath: h.manifestPath })(
+        req("/.well-known/parachute.json"),
+      );
+      expect(getRes.headers.get("cache-control")).toBe("no-store");
+      // Preflight gets the same header (same corsHeaders object).
+      const optRes = await hubFetch(h.dir, { manifestPath: h.manifestPath })(
+        req("/.well-known/parachute.json", { method: "OPTIONS" }),
+      );
+      expect(optRes.headers.get("cache-control")).toBe("no-store");
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("OPTIONS preflight on /.well-known/parachute.json returns 204 + CORS", async () => {
     const h = makeHarness();
     try {
@@ -1010,16 +1033,17 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/admin/setup 301s to /login once admin + vault both exist (hub#259)", async () => {
+  test("/admin/setup 301s to /login once admin + vault + expose mode all exist (hub#259, hub#268)", async () => {
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         await createUser(db, "owner", "pw");
-        // Seed the vault entry so the wizard's state derives as "done"
-        // and the GET 301s. Without this the wizard would still resume
-        // at the vault step.
+        // Seed the vault entry + expose-mode answer so the wizard's
+        // state derives as "done" and the GET 301s. Without expose
+        // (hub#268 Item 2) the wizard would resume on the expose step.
         const { writeManifest } = await import("../services-manifest.ts");
+        const { setSetting } = await import("../hub-settings.ts");
         const { join } = await import("node:path");
         writeManifest(
           {
@@ -1035,6 +1059,7 @@ describe("hubFetch routing", () => {
           },
           join(h.dir, "services.json"),
         );
+        setSetting(db, "setup_expose_mode", "localhost");
         const res = await hubFetch(h.dir, {
           getDb: () => db,
           manifestPath: join(h.dir, "services.json"),

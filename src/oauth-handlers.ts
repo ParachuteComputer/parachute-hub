@@ -45,6 +45,7 @@ import {
 } from "./clients.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { isCoveredByGrant, recordGrant } from "./grants.ts";
+import { consumeFirstClientAutoApproveWindow } from "./hub-settings.ts";
 import { VAULT_VERBS, inferAudience } from "./jwt-audience.ts";
 import {
   ACCESS_TOKEN_TTL_SECONDS,
@@ -1548,6 +1549,19 @@ export async function handleRegister(
       status = "approved";
     }
   }
+  // First-client auto-approve window (hub#268 Item 3). The wizard's expose
+  // step opens a 60-minute window where the very next registration is
+  // auto-approved. Single-use — the consume call clears the row on
+  // success, so client #2 falls through to the standard pending-approval
+  // flow. Logged so an operator chasing odd behavior can see it fired
+  // and which client got the free pass.
+  let autoApprovedByWizardWindow = false;
+  if (status === "pending") {
+    if (consumeFirstClientAutoApproveWindow(db, deps.now ?? (() => new Date()))) {
+      status = "approved";
+      autoApprovedByWizardWindow = true;
+    }
+  }
   const confidential = body.token_endpoint_auth_method === "client_secret_post";
   const scopes = (body.scope ?? "").split(" ").filter((s) => s.length > 0);
   let registered: RegisteredClient;
@@ -1563,6 +1577,11 @@ export async function handleRegister(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return jsonResponse({ error: "invalid_client_metadata", error_description: msg }, 400);
+  }
+  if (autoApprovedByWizardWindow) {
+    console.log(
+      `[oauth] auto-approved first client clientId=${registered.client.clientId} within wizard window (hub#268 Item 3)`,
+    );
   }
   const respBody: Record<string, unknown> = {
     client_id: registered.client.clientId,

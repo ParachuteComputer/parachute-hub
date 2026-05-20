@@ -6,6 +6,12 @@ import { join } from "node:path";
 import { getClient, registerClient } from "../clients.ts";
 import { CSRF_COOKIE_NAME } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import {
+  FIRST_CLIENT_AUTO_APPROVE_WINDOW_MS,
+  getSetting,
+  openFirstClientAutoApproveWindow,
+  setSetting,
+} from "../hub-settings.ts";
 import { findTokenRowByJti, validateAccessToken } from "../jwt-sign.ts";
 import {
   authorizationServerMetadata,
@@ -4211,6 +4217,147 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       expect(consentHtml).toContain('name="__action" value="consent"');
       expect(consentHtml).toContain("Authorize");
       expect(consentHtml).toContain("RoundTrip");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// DCR first-client auto-approve window (hub#268 Item 3). The wizard's
+// expose-step POST opens a 60-minute window where the very next
+// `/oauth/register` registration is auto-approved + the window cleared.
+// Single-use: client #2 within the same window falls through to the
+// standard pending-approval flow.
+describe("DCR first-client auto-approve window (hub#268 Item 3)", () => {
+  function registerRequest(): Request {
+    return new Request(`${ISSUER}/oauth/register`, {
+      method: "POST",
+      body: JSON.stringify({
+        redirect_uris: ["https://app.example/cb"],
+        client_name: "first-client",
+      }),
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  test("client registered within the open window → status approved + window cleared", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const t0 = new Date("2026-05-19T00:00:00.000Z");
+      openFirstClientAutoApproveWindow(db, () => t0);
+      const res = await handleRegister(db, registerRequest(), {
+        issuer: ISSUER,
+        now: () => t0,
+      });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("approved");
+      // Persisted, not just response-shaped.
+      const row = getClient(db, body.client_id as string);
+      expect(row?.status).toBe("approved");
+      // Window cleared on consume (single-use).
+      expect(getSetting(db, "pending_first_client_auto_approve_until")).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("client registered AFTER the window has expired → status pending", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const t0 = new Date("2026-05-19T00:00:00.000Z");
+      openFirstClientAutoApproveWindow(db, () => t0);
+      const past = new Date(t0.getTime() + FIRST_CLIENT_AUTO_APPROVE_WINDOW_MS + 1);
+      const res = await handleRegister(db, registerRequest(), {
+        issuer: ISSUER,
+        now: () => past,
+      });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("second client within window after first auto-approved → status pending (single-use)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const t0 = new Date("2026-05-19T00:00:00.000Z");
+      openFirstClientAutoApproveWindow(db, () => t0);
+      // Client #1: approved.
+      const res1 = await handleRegister(db, registerRequest(), {
+        issuer: ISSUER,
+        now: () => t0,
+      });
+      const body1 = (await res1.json()) as Record<string, unknown>;
+      expect(body1.status).toBe("approved");
+      // Client #2 within the (still-not-expired) window: pending.
+      const stillWithinWindow = new Date(t0.getTime() + 30 * 60 * 1000);
+      const res2 = await handleRegister(db, registerRequest(), {
+        issuer: ISSUER,
+        now: () => stillWithinWindow,
+      });
+      const body2 = (await res2.json()) as Record<string, unknown>;
+      expect(body2.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("no window set → status pending (default public-DCR flow)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const res = await handleRegister(db, registerRequest(), { issuer: ISSUER });
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("pending");
+      // Settings row untouched.
+      expect(getSetting(db, "pending_first_client_auto_approve_until")).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("operator-bearer auto-approve still takes precedence over the window (no double-consume)", async () => {
+    // Bearer-authenticated registration approves directly; the
+    // auto-approve window should NOT be consumed in that case — it's
+    // still available for the first un-authenticated client.
+    const { db, cleanup } = await makeDb();
+    try {
+      const t0 = new Date("2026-05-19T00:00:00.000Z");
+      openFirstClientAutoApproveWindow(db, () => t0);
+      // We can't easily mint an operator bearer in this test layer, so
+      // simulate by using the session-cookie path (issuer-trusted) which
+      // also auto-approves before falling through to the window check.
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const req = new Request(`${ISSUER}/oauth/register`, {
+        method: "POST",
+        body: JSON.stringify({ redirect_uris: ["https://app.example/cb"] }),
+        headers: {
+          "content-type": "application/json",
+          cookie: buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000)),
+          origin: ISSUER,
+        },
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER, now: () => t0 });
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("approved");
+      // Window NOT consumed — still set, still open. The session-cookie
+      // path approved first, never reaching the window-consume code.
+      expect(getSetting(db, "pending_first_client_auto_approve_until")).toBeDefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("malformed timestamp in the setting → treated as no-window, status pending", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      setSetting(db, "pending_first_client_auto_approve_until", "not-a-real-iso-string");
+      const res = await handleRegister(db, registerRequest(), { issuer: ISSUER });
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("pending");
     } finally {
       cleanup();
     }

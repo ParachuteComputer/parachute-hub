@@ -25,11 +25,13 @@ import {
 import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
+import { getSetting, setSetting } from "../hub-settings.ts";
 import { writeManifest } from "../services-manifest.ts";
 import { SESSION_COOKIE_NAME } from "../sessions.ts";
 import {
   deriveWizardState,
   handleSetupAccountPost,
+  handleSetupExposePost,
   handleSetupGet,
   handleSetupVaultPost,
 } from "../setup-wizard.ts";
@@ -141,7 +143,7 @@ describe("deriveWizardState", () => {
     }
   });
 
-  test("done step when both admin and vault exist", async () => {
+  test("expose step when admin + vault exist but expose mode not set yet (hub#268 Item 2)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       await createUser(db, "owner", "pw");
@@ -160,9 +162,39 @@ describe("deriveWizardState", () => {
         h.manifestPath,
       );
       const s = deriveWizardState({ db, manifestPath: h.manifestPath });
+      expect(s.step).toBe("expose");
+      expect(s.hasAdmin).toBe(true);
+      expect(s.hasVault).toBe(true);
+      expect(s.hasExposeMode).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done step once admin + vault + expose mode all exist", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const s = deriveWizardState({ db, manifestPath: h.manifestPath });
       expect(s.step).toBe("done");
       expect(s.hasAdmin).toBe(true);
       expect(s.hasVault).toBe(true);
+      expect(s.hasExposeMode).toBe(true);
     } finally {
       db.close();
     }
@@ -224,7 +256,43 @@ describe("handleSetupGet", () => {
     }
   });
 
-  test("301s to /login once both admin and vault exist", async () => {
+  test("301s to /login once admin + vault + expose mode all exist", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      // hub#268 Item 2: the expose-mode answer is the third gate of
+      // "wizard is fully done." Without it the GET renders the expose
+      // step rather than 301-ing.
+      setSetting(db, "setup_expose_mode", "localhost");
+      const res = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/login");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("renders the expose step when admin + vault exist but no expose mode (hub#268 Item 2)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       await createUser(db, "owner", "pw");
@@ -249,8 +317,16 @@ describe("handleSetupGet", () => {
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
-      expect(res.status).toBe(301);
-      expect(res.headers.get("location")).toBe("/login");
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Three radio options + the form action are the load-bearing
+      // surface; everything else is presentational.
+      expect(html).toContain('action="/admin/setup/expose"');
+      expect(html).toContain('value="localhost"');
+      expect(html).toContain('value="tailnet"');
+      expect(html).toContain('value="public"');
+      // localhost is the safe default selection.
+      expect(html).toContain('value="localhost" checked');
     } finally {
       db.close();
     }
@@ -274,6 +350,7 @@ describe("handleSetupGet", () => {
         },
         h.manifestPath,
       );
+      setSetting(db, "setup_expose_mode", "localhost");
       const res = handleSetupGet(req("/admin/setup?just_finished=1"), {
         db,
         manifestPath: h.manifestPath,
@@ -287,6 +364,80 @@ describe("handleSetupGet", () => {
       // The success page surfaces the vault name from services.json so
       // the MCP install line carries the operator's actual choice.
       expect(html).toContain("myvault");
+      // hub#268 Item 2: the reachable tile reflects the operator's
+      // expose-mode choice. Localhost mode mentions the loopback URL
+      // and the upgrade path to tailnet.
+      expect(html).toContain("Your hub is reachable at");
+      expect(html).toContain("Local to this machine only");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("success page reachable tile reflects the tailnet expose mode (hub#268 Item 2)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "tailnet");
+      const res = handleSetupGet(req("/admin/setup?just_finished=1"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("tailscale serve --bg --https=1939");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("success page reachable tile reflects the public expose mode (hub#268 Item 2)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "public");
+      const res = handleSetupGet(req("/admin/setup?just_finished=1"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("PARACHUTE_HUB_ORIGIN");
+      expect(html).toContain("parachute.computer/docs/deploy");
     } finally {
       db.close();
     }
@@ -734,7 +885,7 @@ describe("setup wizard end-to-end via hubFetch", () => {
   });
   afterEach(() => h.cleanup());
 
-  test("redirects to /login once admin + vault are both present", async () => {
+  test("redirects to /login once admin + vault + expose mode are all set", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       await createUser(db, "owner", "pw");
@@ -752,6 +903,7 @@ describe("setup wizard end-to-end via hubFetch", () => {
         },
         h.manifestPath,
       );
+      setSetting(db, "setup_expose_mode", "localhost");
       const res = await hubFetch(h.dir, {
         getDb: () => db,
         manifestPath: h.manifestPath,
@@ -808,6 +960,233 @@ describe("setup wizard end-to-end via hubFetch", () => {
         manifestPath: h.manifestPath,
       })(req("/admin/setup/account"));
       expect(res.status).toBe(405);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// --- POST /admin/setup/expose (hub#268 Item 2 + Item 3) ------------------
+
+describe("handleSetupExposePost", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  /**
+   * Helper: bring the wizard to step 4 (expose). Creates an admin row,
+   * seeds the vault entry, mints a session cookie + CSRF token. Returns
+   * everything callers need to drive the POST.
+   */
+  async function bringWizardToExposeStep(db: ReturnType<typeof openHubDb>) {
+    const user = await createUser(db, "owner", "pw");
+    writeManifest(
+      {
+        services: [
+          {
+            name: "parachute-vault",
+            version: "0.1.0",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/health",
+          },
+        ],
+      },
+      h.manifestPath,
+    );
+    const { createSession } = await import("../sessions.ts");
+    const session = createSession(db, { userId: user.id });
+    // Get the wizard's expose step to mint the CSRF cookie.
+    const get = handleSetupGet(req("/admin/setup"), {
+      db,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      issuer: "https://hub.example",
+      registry: getDefaultOperationsRegistry(),
+    });
+    const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+    return { user, session, csrf };
+  }
+
+  test("persists a valid expose_mode + opens the auto-approve window + redirects to ?just_finished=1", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const { session, csrf } = await bringWizardToExposeStep(db);
+      const form = new URLSearchParams({
+        expose_mode: "tailnet",
+        [CSRF_FIELD_NAME]: csrf,
+      }).toString();
+      const res = await handleSetupExposePost(
+        req("/admin/setup/expose", {
+          method: "POST",
+          body: form,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe("/admin/setup?just_finished=1");
+      expect(getSetting(db, "setup_expose_mode")).toBe("tailnet");
+      // hub#268 Item 3: the auto-approve window is opened on this transition.
+      expect(getSetting(db, "pending_first_client_auto_approve_until")).toBeDefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("rejects an invalid expose_mode (renders the form with an error banner)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const { session, csrf } = await bringWizardToExposeStep(db);
+      const form = new URLSearchParams({
+        expose_mode: "garbage",
+        [CSRF_FIELD_NAME]: csrf,
+      }).toString();
+      const res = await handleSetupExposePost(
+        req("/admin/setup/expose", {
+          method: "POST",
+          body: form,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(res.status).toBe(400);
+      const html = await res.text();
+      expect(html).toContain("Pick one of");
+      // No expose-mode persisted on rejection.
+      expect(getSetting(db, "setup_expose_mode")).toBeUndefined();
+      // No auto-approve window opened on rejection.
+      expect(getSetting(db, "pending_first_client_auto_approve_until")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("rejects without an admin session cookie", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const { csrf } = await bringWizardToExposeStep(db);
+      const form = new URLSearchParams({
+        expose_mode: "localhost",
+        [CSRF_FIELD_NAME]: csrf,
+      }).toString();
+      // Note: no session cookie sent.
+      const res = await handleSetupExposePost(
+        req("/admin/setup/expose", {
+          method: "POST",
+          body: form,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(res.status).toBe(400);
+      const html = await res.text();
+      expect(html).toContain("No admin session");
+      expect(getSetting(db, "setup_expose_mode")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("rejects missing or wrong CSRF token", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const { session, csrf } = await bringWizardToExposeStep(db);
+      const form = new URLSearchParams({
+        expose_mode: "localhost",
+        [CSRF_FIELD_NAME]: "wrong-token",
+      }).toString();
+      const res = await handleSetupExposePost(
+        req("/admin/setup/expose", {
+          method: "POST",
+          body: form,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(res.status).toBe(400);
+      expect(getSetting(db, "setup_expose_mode")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("idempotent: second POST after already done short-circuits without re-opening the window", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const { session, csrf } = await bringWizardToExposeStep(db);
+      // Pre-seed expose_mode + an OLD window timestamp so we can verify
+      // the second POST doesn't bump it.
+      setSetting(db, "setup_expose_mode", "localhost");
+      setSetting(db, "pending_first_client_auto_approve_until", "2020-01-01T00:00:00.000Z");
+      const form = new URLSearchParams({
+        expose_mode: "tailnet",
+        [CSRF_FIELD_NAME]: csrf,
+      }).toString();
+      const res = await handleSetupExposePost(
+        req("/admin/setup/expose", {
+          method: "POST",
+          body: form,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe("/admin/setup?just_finished=1");
+      // expose_mode is NOT overwritten (the wizard considers itself done).
+      expect(getSetting(db, "setup_expose_mode")).toBe("localhost");
+      // auto-approve window NOT re-opened — still the old stale stamp.
+      expect(getSetting(db, "pending_first_client_auto_approve_until")).toBe(
+        "2020-01-01T00:00:00.000Z",
+      );
     } finally {
       db.close();
     }

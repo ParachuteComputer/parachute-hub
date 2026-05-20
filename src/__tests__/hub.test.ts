@@ -103,6 +103,23 @@ describe("renderHub", () => {
     expect(html).toContain("Could not load services");
   });
 
+  test("discovery page fetches with cache: 'no-store' (hub#268 Item 1)", () => {
+    // Without `cache: 'no-store'` the browser's HTTP cache can return
+    // a stale services list when the operator clicks back to / after
+    // installing a module via /admin/modules. Server-side also sets
+    // cache-control: no-store on the well-known doc.
+    expect(html).toContain("cache: 'no-store'");
+  });
+
+  test("discovery page re-fetches on bfcache restore via pageshow (hub#268 Item 1)", () => {
+    // When the operator clicks back from /admin/modules to / the
+    // browser may restore the prior DOM without re-running the IIFE.
+    // The pageshow handler re-runs loadServices() when the page was
+    // restored from cache (`e.persisted === true`).
+    expect(html).toContain("addEventListener('pageshow'");
+    expect(html).toContain("e.persisted");
+  });
+
   test("does not retain the old aggregate-by-module-type code", () => {
     // The Vault collapse + per-module aggregation pattern is gone — Use
     // entries are direct service-path → label lookups; Admin is hardcoded.

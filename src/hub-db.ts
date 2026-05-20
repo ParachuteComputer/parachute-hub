@@ -193,6 +193,30 @@ const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX tokens_subject ON tokens (subject) WHERE subject IS NOT NULL;
     `,
   },
+  {
+    version: 7,
+    sql: `
+      -- Hub-level key/value settings (hub#268). Used by:
+      --   * setup_expose_mode — operator's "how will this hub be reached?"
+      --     choice from the first-boot wizard expose step. Values:
+      --     'localhost' | 'tailnet' | 'public'.
+      --   * pending_first_client_auto_approve_until — ISO-8601 timestamp
+      --     set when the wizard finishes; first OAuth client registration
+      --     within the window is auto-approved + the row cleared (single
+      --     use). Absent / past-due means the standard pending-approval
+      --     flow applies.
+      --
+      -- Single-row-per-key schema. updated_at lets us age out stale
+      -- entries if a future pattern needs it; nothing currently relies on
+      -- it. Bare KV — no audit log, no history — these are hub-local
+      -- operator preferences, not user-facing data.
+      CREATE TABLE hub_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
 ];
 
 export function openHubDb(path: string = hubDbPath()): Database {
