@@ -4,6 +4,16 @@ All notable changes to `@openparachute/scope-guard` are documented here. The for
 
 The library's RC cadence is independent of `@openparachute/hub`'s — they ship from the same repo but aren't coupled in version.
 
+## [0.3.0] - 2026-05-20
+
+Stable release. Multi-user Phase 1 vault scope enforcement.
+
+- **`vault_scope` claim required field** on `HubJwtClaims` (#285): tokens now carry a `vault_scope: string[]` claim. `[]` = unrestricted (admin); `["vault-name"]` = pinned to that vault. Back-compat: absent claim → `[]` (pre-PR-4 tokens still work).
+- **`enforceVaultScope(claims, requestVaultName)` helper** (#285): resource servers (vault, notes, scribe) call this to refuse cross-vault access when a token's `vault_scope` doesn't include the requested vault. Returns `true` if `vault_scope` is empty OR `requestVaultName` is in it.
+- **Defensive parsing** (#285): malformed `vault_scope` (non-array, null, mixed types) → fallback to `[]`. Primary security gate is the scope-string check; `vault_scope` is defense-in-depth.
+
+Adopters: vault@0.4.6 consumes this version. Notes and scribe pass through unchanged (no vault-bound tokens at the consumer side).
+
 ## 0.3.0-rc.1 — 2026-05-20
 
 Adds `vault_scope` claim surfacing + the `enforceVaultScope` defense-in-depth check (hub multi-user Phase 1 PR 5 — see [`2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)). **Additive — no behavior change for existing adopters.** A bump from `0.2.x` to `0.3.0` does NOT start rejecting any token that `0.2.x` accepted; the new helper is opt-in and the new claim is surfaced as `[]` (unrestricted) when absent.
