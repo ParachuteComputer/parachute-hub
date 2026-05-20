@@ -2,6 +2,58 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.19] - 2026-05-20
+
+Three approval / consent UX fixes Aaron hit while testing the Gitcoin Brain UI OAuth flow against his self-hosted hub. Same session as the rc.17 / rc.18 CORS work — different layer, same posture (third-party SPA → self-hosted hub).
+
+**Issue 1 — Stale "ask the operator to run CLI" message on the unapproved-client page.** When a user lands on `/oauth/authorize` for a client that isn't yet approved AND they don't have an operator session, hub used to render:
+
+> Ask the operator to run `parachute auth approve-client <id>` from a terminal, then try again.
+
+This predated the web approval path that shipped in #277 (`/admin/approve-client/<id>` SPA route). The CLI mention is now retired in the browser path; the surface points operators at the web flow instead:
+
+  1. **Primary CTA**: "Sign in as admin to approve" → links to `/login?next=/admin/approve-client/<client_id>` so the admin lands directly on the approval page after sign-in.
+  2. **Secondary section**: "Or send this link to your hub admin" with the fully-qualified deep link `<hub_origin>/admin/approve-client/<client_id>` in a `<code>` block + a Copy-to-clipboard button (with "Copied!" feedback). The link works in any browser session — the admin opens it, hits the sign-in flow if not authed, lands on the approval page.
+
+  The authenticated-admin branch (#208's one-click approve form) is unchanged — that's the easy path when the operator is already signed in to this hub from this browser. The CLI is still available for terminal-first operators who already know `parachute auth approve-client`; we just stop pointing new users there from a browser they're already in.
+
+**Issue 2 — Consent / approval screens showed raw `vault:read` instead of the resolved `vault:<name>:read` form.** Hub narrows unnamed `vault:<verb>` scopes to `vault:<picked>:<verb>` at token-mint via the picker (or the user's `assigned_vault` for multi-user setups). But the consent screen rendered the raw OAuth request, which:
+
+  - Implied vault-wide unrestricted access (when hub *always* pins a specific vault).
+  - Surprised operators when the actual token carried a different shape than what they consented to.
+
+  Display logic now substitutes:
+
+  - **Non-admin user** (`assigned_vault` set) → `vault:<assigned>:read` on the consent row.
+  - **Admin user, single-vault hub** → `vault:<only-vault>:read` on the consent row (the picker pre-checks the only available vault, so the displayed scope matches what default-Approve will mint).
+  - **Admin user, multi-vault hub** → `vault:<TBD>:read` placeholder + an inline italic hint pointing at the picker below ("A specific vault is picked below before approving"). When the operator clicks a radio and reloads, the next render shows the chosen vault.
+  - **Operator approval page (SPA)** — pending-client admin landing: `vault:read` → `vault:*:read` with an explanation that "a specific vault is selected during sign-in via the consent picker (or the user's assigned vault for multi-user setups)." Different from the consent screen because no per-user binding has happened at this point in the flow.
+
+  `explainScope` now recognizes `vault:<name>:<verb>` and `vault:*:<verb>` via a pattern fallback so the styling + label come through. Per-vault admin (`vault:<name>:admin`) is intentionally excluded — that scope is `NON_REQUESTABLE`.
+
+**Issue 3 — Shareable admin approval link.** Covered by Issue 1's deep-link section: fully-qualified URL + Copy button (`navigator.clipboard.writeText` with a graceful fallback to range-select for older browsers / sandboxed iframes that lack the async clipboard API). Visual feedback flips the button label to "Copied!" for 1.6s.
+
+Code shape:
+
+- **`src/oauth-ui.ts`** — `ApprovePendingViewProps` gains `hubOrigin` (required, to build the fully-qualified deep link) and drops the conditional CLI hint from both branches. New `renderUnauthenticatedApproveCtas(hubOrigin, clientId)` helper renders the Sign-in CTA + shareable-link block + inline clipboard JS. `ConsentViewProps` gains optional `displayVault: string | null | undefined` (undefined → no substitution / back-compat; null → `<TBD>` placeholder; string → named substitution). New exported `substituteVaultDisplay(scope, displayVault)` does the mapping. New CSS for `.approve-actions`, `.approve-signin-cta`, `.approve-share`, `.approve-share-row`, `.approve-share-link`, `.approve-share-copy`, `.scope-pending-note`.
+- **`src/oauth-handlers.ts`** — `pendingClientResponse` threads `deps.issuer` through as `hubOrigin`. `consentProps` computes `displayVault` from `lockedVault` (non-admin → assigned vault) / `vaultNames` (admin + single-vault → that vault) / falls back to `null` (admin + multi-vault → `<TBD>` placeholder).
+- **`src/scope-explanations.ts`** — `explainScope` matches `^vault:[a-zA-Z0-9_*-]+:(read|write)$` and returns the unnamed-verb entry, so the consent UI keeps the same explanation + level styling for `vault:work:read`, `vault:*:read`, etc.
+- **`web/ui/src/routes/ApproveClient.tsx`** — `resolveScopeForDisplay(scope)` rewrites unnamed `vault:<verb>` → `vault:*:<verb>` for display; `isUnnamedVaultScope(scope)` gates whether to render the inline wildcard explanation.
+
+Gate: `bun test ./src` — **1621 pass / 0 fail / 31388 expects across 84 files** (+21 over rc.18 baseline 1600). Hub typecheck + biome clean. SPA: 135 vitest tests pass, `bun run build` ships a fresh `dist/`.
+
+Smoke (against `PARACHUTE_HOME=/tmp/hub-approval-ux` local hub):
+
+- `GET /oauth/authorize?client_id=<pending>...` in a private window (no session): page renders "Sign in as admin to approve" button (linking to `/login?next=/admin/approve-client/<id>`), a shareable code block with the fully-qualified `https://hub.../admin/approve-client/<id>` URL, and a "Copy link" button. No CLI message.
+- Clicking the Sign-in CTA hits `/login?next=...`; entering credentials lands on `/admin/approve-client/<id>` (the SPA route).
+- Consent screen for a non-admin user with `assigned_vault: "default"` requesting `vault:read` renders `<code class="scope-name">vault:default:read</code>` (not `vault:read`).
+- ApproveClient SPA for a fresh DCR with `scopes: ["vault:read", "vault:write"]` renders `vault:*:read` and `vault:*:write` with the wildcard-explanation hint.
+
+Cross-references:
+
+- #277 — web-based approval (`/admin/approve-client/<id>` SPA route) shipped earlier in the rc.18 chain. This PR points the unapproved-client surface at it.
+- #284 — related stale-`assigned_vault` followup (multi-user Phase 1 PR 4 fanout).
+
 ## [0.5.10-rc.18] - 2026-05-20
 
 Follow-up to rc.17's CORS work: switch the `/oauth/*` posture from static `Access-Control-Allow-Origin: *` + `Allow-Credentials: false` to echo-origin + `Allow-Credentials: true` + `Vary: Origin`. The rc.17 shape worked for SPAs fetching with `credentials: 'omit'`, but Aaron's Gitcoin Brain UI on `https://unforced-dev.github.io` (and most SPA frameworks by default) fetches with `credentials: 'include'`, which browsers refuse to combine with a wildcard ACAO. The browser console error was:
