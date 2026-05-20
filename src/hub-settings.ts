@@ -24,6 +24,7 @@
  */
 import type { Database } from "bun:sqlite";
 
+// Adding a setting: extend this union + write a typed accessor. The table itself is generic KV.
 export type HubSettingKey = "setup_expose_mode" | "pending_first_client_auto_approve_until";
 
 export type SetupExposeMode = "localhost" | "tailnet" | "public";

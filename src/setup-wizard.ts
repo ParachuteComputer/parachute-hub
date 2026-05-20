@@ -96,6 +96,14 @@ function escapeAttr(s: string): string {
 
 // --- state derivation ----------------------------------------------------
 
+/**
+ * Wizard steps. `"account"` is a visual-only entry in the progress
+ * header — it shares a screen with `"welcome"` (the combined welcome +
+ * account form), and `deriveWizardState` never returns it: a welcome
+ * POST creates the admin and advances directly to `"vault"`. Kept in
+ * the union so the progress bar can render it as a distinct dot for
+ * display continuity.
+ */
 export type WizardStep = "welcome" | "account" | "vault" | "expose" | "done";
 
 export interface DerivedWizardState {
@@ -141,6 +149,9 @@ export function deriveWizardState(deps: {
   // sets it; absence means we should still ask.
   const hasExposeMode = getSetting(deps.db, "setup_expose_mode") !== undefined;
   let step: WizardStep;
+  // Note: `"account"` is a visual-only step in the progress header —
+  // welcome's POST creates the admin and advances directly to `"vault"`,
+  // so we never return `"account"` here.
   if (!hasAdmin) step = "welcome";
   else if (!hasVault) step = "vault";
   else if (!hasExposeMode) step = "expose";
@@ -479,7 +490,7 @@ export function renderExposeStep(props: RenderExposeStepProps): string {
             <span class="expose-option-title">My Tailscale network</span>
             <span class="expose-option-desc">Share with your own devices over
               a private tailnet. After finishing setup, run:</span>
-            <pre class="expose-option-cmd">tailscale serve --bg --https 1939 http://localhost:1939</pre>
+            <pre class="expose-option-cmd">tailscale serve --bg --https=1939 http://localhost:1939</pre>
             <span class="expose-option-desc">The hub is then reachable at
               your tailnet hostname (e.g.
               <code>https://my-mac.tailnet-name.ts.net</code>) from any of
@@ -576,7 +587,7 @@ function renderReachableTile(mode: SetupExposeMode, hubOrigin: string): string {
       <p class="reachable-url"><code>${safeOrigin}</code></p>
       <p class="fine">Local to this machine only. Want to share it with your
         other devices? Re-visit setup later from the admin UI or run
-        <code>tailscale serve --bg --https 1939 http://localhost:1939</code>
+        <code>tailscale serve --bg --https=1939 http://localhost:1939</code>
         from a terminal.</p>
     </section>`;
   }
@@ -585,7 +596,7 @@ function renderReachableTile(mode: SetupExposeMode, hubOrigin: string): string {
       <h2>Your hub is reachable at</h2>
       <p class="reachable-url"><code>${safeOrigin}</code> (loopback, this machine)</p>
       <p class="reachable-url">Plus your tailnet URL once you run:</p>
-      <pre>tailscale serve --bg --https 1939 http://localhost:1939</pre>
+      <pre>tailscale serve --bg --https=1939 http://localhost:1939</pre>
       <p class="fine">The Tailscale CLI prints the public hostname (e.g.
         <code>my-mac.tailnet-name.ts.net</code>); use that on your phone /
         other devices.</p>

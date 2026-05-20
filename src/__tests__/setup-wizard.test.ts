@@ -402,7 +402,7 @@ describe("handleSetupGet", () => {
       });
       expect(res.status).toBe(200);
       const html = await res.text();
-      expect(html).toContain("tailscale serve --bg --https 1939");
+      expect(html).toContain("tailscale serve --bg --https=1939");
     } finally {
       db.close();
     }
