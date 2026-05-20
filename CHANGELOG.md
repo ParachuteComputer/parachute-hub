@@ -2,6 +2,37 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.14] - 2026-05-20
+
+Multi-user Phase 1 — PR 3 of 5: force-change-password flow (hub#252, design [`parachute.computer/design/2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)). Builds on PR 2 (rc.13) which shipped the admin `/api/users` surface for creating accounts with `password_changed: false`. This release wires the *user* side: a session-level redirect at the login boundary that lands admin-created users on a server-rendered change-password form before they can reach the rest of the hub.
+
+Backend surface:
+
+- `src/admin-handlers.ts` — `loginRedirectTarget(user, next)` helper: when `user.passwordChanged === false`, return `/account/change-password?next=<encoded original-next>` (or the bare path when next is the post-login default); otherwise return `next` (today's behavior). The `/login` POST mints the session cookie as normal and 302s to the helper's target. **Session-level redirect, not token-level** — the user IS authenticated, they're just expected to change their admin-typed default before continuing. Per design §sign-in flow change.
+- `src/api-account.ts` (new) — `/account/*` user-self-service surface.
+  - **`GET /account/change-password`** — server-rendered HTML form. Requires an active session (otherwise 302 → `/login?next=/account/change-password`). Renders the "first-time login" heading when `password_changed === false`; renders the "Change your password" heading when `true` (direct-nav path: any signed-in user can rotate their password — the redirect at `/login` is the *only* flag-gated behavior). Falls back to `/login` if the session points at a deleted user.
+  - **`POST /account/change-password`** — `application/x-www-form-urlencoded` body with `current_password`, `new_password`, `new_password_confirm`, `next`. Order of checks: 401 (no session) → 400 (CSRF) → 400 (missing field) → 413 (new > `PASSWORD_MAX_LEN`, **before** argon2id touches it; same CPU-DoS defense as `/api/users` POST) → 400 `invalid_password` (PR 1's 12-char validator) → 400 `password_mismatch` (new ≠ confirm) → 401 `invalid_credentials` (verifyPassword) → 400 `password_unchanged` (new === current, *after* verify so we don't leak that a guessed new matches an unverified current) → 302 to `next` with `password_changed = 1`. On error the page re-renders with an inline error banner; the session cookie is untouched (the user stays signed in). Session cookies on other devices stay valid through their natural 24h expiry — Phase 2 adds explicit "sign out everywhere" per the design's trade-off discussion.
+  - **`markPasswordChanged(db, userId, now?)`** — idempotent UPDATE that flips the flag and bumps `updated_at`. Lives next to the POST handler for now; lift into `users.ts` when PR 4 (or a Phase 2 admin-reset path) adds a second call site.
+- `src/account-change-password-ui.ts` (new) — pure renderer for the two-mode form. Same chrome family as `admin-login-ui.ts` (`/login`): inline CSS, no third-party fonts, no SPA bundle. Form works without JS; an inline `<script>` adds fast-feedback validation (mirroring the three server checks: min length, confirm match, current ≠ new).
+- `src/hub-server.ts` — route table extended (`/account/change-password` GET + POST). Dispatch placed adjacent to `/login` and `/logout` since the three surfaces share the session-cookie posture.
+
+Tests + gates:
+
+- `src/__tests__/api-account.test.ts` (new) — 18 tests covering: GET no-session 302 (with `next` preservation through `/login`), GET first-time vs rotate mode by flag, GET against stale-user session, POST happy path (hash updates, flag flips, 302 to next, default lands on `/admin/vaults`), every POST validation branch (no session, CSRF mismatch, wrong current, too short, too long with elapsed-time floor < 200ms asserting cap fires before argon2id, mismatch confirm, unchanged after verify), failure-re-render keeps session cookie. `markPasswordChanged` unit tests for the happy path + idempotent re-call.
+- `src/__tests__/admin-handlers.test.ts` — 4 new `loginRedirectTarget` tests: passwordChanged=false with next= encodes the original destination into the change-password URL, no-next= → bare `/account/change-password`, passwordChanged=true → existing behavior unchanged, unsafe next= can't leak through the encoder. Updated 6 existing login-POST tests to pass `passwordChanged: true` on `createUser` (matches wizard-admin posture; old tests pre-dated the force-change behavior and would otherwise land on the change-password URL).
+
+Gate: `bun test ./src` — **1553 pass / 0 fail / 31176 expects across 82 files** (+23 over rc.13 baseline 1530). SPA: `cd web/ui && bun run test` — **133 pass / 0 fail across 10 files** (unchanged — no SPA changes this PR). typecheck + biome clean (root + web/ui). SPA build clean.
+
+Smoke: see PR description.
+
+What's NOT in PR 3:
+
+- OAuth issuer `vault_scope` claim + per-user scope narrowing — PR 4.
+- End-to-end verification + scope-guard reach-through — PR 5.
+- 2FA enrollment inline on first sign-in — Phase 1.5 PR 6 (optional, design §2FA-orientation).
+- Admin-reset-another-user's-password — Phase 2 (design §6: Phase 1's recovery shape is delete + re-create).
+- "Sign out everywhere" / cross-session invalidation on password change — Phase 2 self-service profile page.
+
 ## [0.5.10-rc.13] - 2026-05-20
 
 Multi-user Phase 1 — PR 2 of 5: admin `/admin/users` page + API (hub#252, design [`parachute.computer/design/2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)). Builds on PR 1's `users` table foundation (rc.12): wires the `validateUsername` / `validatePassword` validators into a four-endpoint admin surface, adds the SPA route, and adds the FK-aware delete-user helper that keeps token audit rows intact while letting the parent users row drop.
