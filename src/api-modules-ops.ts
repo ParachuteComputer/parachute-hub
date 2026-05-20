@@ -35,6 +35,7 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
+import { getModuleInstallChannel } from "./hub-settings.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import { FIRST_PARTY_FALLBACKS, type ServiceSpec, composeServiceSpec } from "./service-spec.ts";
 import { findService, readManifest, removeService } from "./services-manifest.ts";
@@ -353,8 +354,14 @@ export async function runInstall(
 ): Promise<void> {
   const registry = deps.registry ?? defaultRegistry;
   const run = deps.run ?? defaultRun;
-  registry.update(opId, { status: "running" }, `running bun add -g ${spec.package}@latest`);
-  const code = await run(["bun", "add", "-g", `${spec.package}@latest`]);
+  // hub#275: operator-settable channel (`latest` | `rc`). Read on every
+  // op so a toggle change applies to the next install without a hub
+  // restart. The hub-settings layer seeds from PARACHUTE_MODULE_CHANNEL
+  // on first read; after that the row is source of truth.
+  const channel = getModuleInstallChannel(deps.db);
+  const spec_str = `${spec.package}@${channel}`;
+  registry.update(opId, { status: "running" }, `running bun add -g ${spec_str}`);
+  const code = await run(["bun", "add", "-g", spec_str]);
   if (code !== 0) {
     // Bun 1.2.x lockfile-recovery noise: probe the global prefix
     // before treating non-zero as fatal. Mirrors the same defense in
@@ -365,7 +372,7 @@ export async function runInstall(
       registry.update(
         opId,
         { status: "failed", error: `bun add -g exited ${code}` },
-        `bun add -g ${spec.package}@latest failed (exit ${code})`,
+        `bun add -g ${spec_str} failed (exit ${code})`,
       );
       return;
     }
@@ -460,8 +467,10 @@ async function runUpgrade(
 ): Promise<void> {
   const registry = deps.registry ?? defaultRegistry;
   const run = deps.run ?? defaultRun;
-  registry.update(opId, { status: "running" }, `running bun add -g ${spec.package}@latest`);
-  const code = await run(["bun", "add", "-g", `${spec.package}@latest`]);
+  const channel = getModuleInstallChannel(deps.db);
+  const spec_str = `${spec.package}@${channel}`;
+  registry.update(opId, { status: "running" }, `running bun add -g ${spec_str}`);
+  const code = await run(["bun", "add", "-g", spec_str]);
   if (code !== 0) {
     const findGlobalInstall = deps.findGlobalInstall;
     const probed = findGlobalInstall?.(spec.package) ?? null;
@@ -469,7 +478,7 @@ async function runUpgrade(
       registry.update(
         opId,
         { status: "failed", error: `bun add -g exited ${code}` },
-        `bun add -g ${spec.package}@latest failed (exit ${code})`,
+        `bun add -g ${spec_str} failed (exit ${code})`,
       );
       return;
     }

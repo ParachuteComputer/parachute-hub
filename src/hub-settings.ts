@@ -41,7 +41,18 @@ export type HubSettingKey =
   // install-command snippet without re-deriving from services.json
   // (vault's first-boot may write its own paths shape that the wizard
   // can't trust to match `<name>` exactly until the spawn settles).
-  | "setup_vault_name";
+  | "setup_vault_name"
+  // hub#275: which dist-tag the runtime module installer uses
+  // (`bun add -g <pkg>@<channel>`). `"latest"` (default) tracks the
+  // stable channel; `"rc"` follows the release-candidate chain so
+  // operators on the rc cadence can pull pre-release builds without
+  // hand-editing the install command. Seeded from
+  // `PARACHUTE_MODULE_CHANNEL` on first read (operator can ship a fresh
+  // box with the env var set and have the row land with their preferred
+  // channel); after the first seed the row is source of truth and the
+  // env var is ignored — admin must use the SPA toggle (or
+  // `PUT /api/modules/channel`) to change channel.
+  | "module_install_channel";
 
 export type SetupExposeMode = "localhost" | "tailnet" | "public";
 
@@ -159,4 +170,90 @@ export function consumeFirstClientAutoApproveWindow(
   if (!isFirstClientAutoApproveWindowOpen(db, now)) return false;
   deleteSetting(db, "pending_first_client_auto_approve_until");
   return true;
+}
+
+// --- domain helpers: module install channel ------------------------------
+
+/**
+ * Which dist-tag `bun add -g <pkg>@<channel>` should use. `"latest"`
+ * tracks the stable channel; `"rc"` tracks pre-release builds. Exposed
+ * here (not buried in api-modules-ops) because the admin SPA reads it
+ * via `/api/modules` and writes it via `/api/modules/channel` — the
+ * setting is the cross-cutting source of truth, the install path is
+ * one consumer.
+ */
+export type ModuleInstallChannel = "latest" | "rc";
+
+/** Exported so the API handler + the SPA toggle can share validation. */
+export const MODULE_INSTALL_CHANNELS: readonly ModuleInstallChannel[] = ["latest", "rc"];
+
+export function isModuleInstallChannel(s: unknown): s is ModuleInstallChannel {
+  return typeof s === "string" && MODULE_INSTALL_CHANNELS.includes(s as ModuleInstallChannel);
+}
+
+/**
+ * Env var that seeds `module_install_channel` on first read. Read only
+ * when the hub_settings row is absent — once the row exists, the env
+ * var is ignored on subsequent boots (admin must use the SPA toggle or
+ * the API to change channel). Lets Aaron's fresh-machine deploys ship
+ * with `PARACHUTE_MODULE_CHANNEL=rc` baked into the platform's env
+ * config without baking the channel into the binary or first-boot.
+ */
+export const PARACHUTE_MODULE_CHANNEL_ENV = "PARACHUTE_MODULE_CHANNEL";
+
+/** Fallback when nothing else is set — the stable channel. */
+export const DEFAULT_MODULE_INSTALL_CHANNEL: ModuleInstallChannel = "latest";
+
+/**
+ * Read the configured module install channel. On first call (no row in
+ * hub_settings), seeds from `process.env.PARACHUTE_MODULE_CHANNEL` if
+ * valid, otherwise defaults to `"latest"` (an invalid env value warns
+ * + still falls back to "latest"). After that first seed, the
+ * hub_settings row is source of truth.
+ *
+ * The `env` + `warn` knobs are test seams — production uses
+ * `process.env` + `console.warn`. Tests inject a deterministic shape so
+ * the warn-on-invalid branch can be asserted without console-capture.
+ */
+export function getModuleInstallChannel(
+  db: Database,
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    warn?: (msg: string) => void;
+  } = {},
+): ModuleInstallChannel {
+  const existing = getSetting(db, "module_install_channel");
+  if (existing !== undefined) {
+    // Row already seeded — trust it. If somehow corrupted (manual sqlite
+    // edit, schema drift), fall back to "latest" silently rather than
+    // crashing the install path. Re-seeding the row is left to the
+    // admin's explicit setModuleInstallChannel call.
+    if (isModuleInstallChannel(existing)) return existing;
+    return DEFAULT_MODULE_INSTALL_CHANNEL;
+  }
+  const env = opts.env ?? process.env;
+  const warn = opts.warn ?? ((msg: string) => console.warn(msg));
+  const fromEnv = env[PARACHUTE_MODULE_CHANNEL_ENV];
+  let seed: ModuleInstallChannel = DEFAULT_MODULE_INSTALL_CHANNEL;
+  if (typeof fromEnv === "string" && fromEnv.length > 0) {
+    if (isModuleInstallChannel(fromEnv)) {
+      seed = fromEnv;
+    } else {
+      warn(
+        `[hub-settings] ${PARACHUTE_MODULE_CHANNEL_ENV}="${fromEnv}" is not a valid channel — expected one of ${MODULE_INSTALL_CHANNELS.join(", ")}. Falling back to "${DEFAULT_MODULE_INSTALL_CHANNEL}".`,
+      );
+    }
+  }
+  setSetting(db, "module_install_channel", seed);
+  return seed;
+}
+
+/**
+ * Write the module install channel. Validated by the caller (the API
+ * handler + the SPA already constrain to the union); the function
+ * itself only accepts the typed shape, so a TypeScript-clean callsite
+ * can't write a malformed value.
+ */
+export function setModuleInstallChannel(db: Database, channel: ModuleInstallChannel): void {
+  setSetting(db, "module_install_channel", channel);
 }

@@ -11,14 +11,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
+  DEFAULT_MODULE_INSTALL_CHANNEL,
   FIRST_CLIENT_AUTO_APPROVE_WINDOW_MS,
+  MODULE_INSTALL_CHANNELS,
+  PARACHUTE_MODULE_CHANNEL_ENV,
   SETUP_EXPOSE_MODES,
   consumeFirstClientAutoApproveWindow,
   deleteSetting,
+  getModuleInstallChannel,
   getSetting,
   isFirstClientAutoApproveWindowOpen,
+  isModuleInstallChannel,
   isSetupExposeMode,
   openFirstClientAutoApproveWindow,
+  setModuleInstallChannel,
   setSetting,
 } from "../hub-settings.ts";
 
@@ -218,6 +224,152 @@ describe("hub-settings — first-client auto-approve window", () => {
       const stored = getSetting(db, "pending_first_client_auto_approve_until");
       const parsed = new Date(stored ?? "");
       expect(parsed.getTime()).toBe(t1.getTime() + FIRST_CLIENT_AUTO_APPROVE_WINDOW_MS);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("hub-settings — isModuleInstallChannel", () => {
+  test("accepts the two canonical values", () => {
+    for (const c of MODULE_INSTALL_CHANNELS) {
+      expect(isModuleInstallChannel(c)).toBe(true);
+    }
+    expect(isModuleInstallChannel("latest")).toBe(true);
+    expect(isModuleInstallChannel("rc")).toBe(true);
+  });
+
+  test("rejects anything else (typos, empty, non-string, case-mismatch)", () => {
+    expect(isModuleInstallChannel("LATEST")).toBe(false);
+    expect(isModuleInstallChannel("Latest")).toBe(false);
+    expect(isModuleInstallChannel("stable")).toBe(false);
+    expect(isModuleInstallChannel("beta")).toBe(false);
+    expect(isModuleInstallChannel("")).toBe(false);
+    expect(isModuleInstallChannel(null)).toBe(false);
+    expect(isModuleInstallChannel(undefined)).toBe(false);
+    expect(isModuleInstallChannel(42)).toBe(false);
+  });
+});
+
+describe("hub-settings — module install channel bootstrap", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hub-settings-channel-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("first read with no env + no row seeds + returns the default (latest)", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      // Empty env — no PARACHUTE_MODULE_CHANNEL.
+      const channel = getModuleInstallChannel(db, { env: {} });
+      expect(channel).toBe(DEFAULT_MODULE_INSTALL_CHANNEL);
+      expect(channel).toBe("latest");
+      // The row is now seeded.
+      expect(getSetting(db, "module_install_channel")).toBe("latest");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("first read with PARACHUTE_MODULE_CHANNEL=rc seeds with rc", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      const channel = getModuleInstallChannel(db, {
+        env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "rc" },
+      });
+      expect(channel).toBe("rc");
+      expect(getSetting(db, "module_install_channel")).toBe("rc");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("first read with PARACHUTE_MODULE_CHANNEL=latest seeds with latest", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      const channel = getModuleInstallChannel(db, {
+        env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "latest" },
+      });
+      expect(channel).toBe("latest");
+      expect(getSetting(db, "module_install_channel")).toBe("latest");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("invalid PARACHUTE_MODULE_CHANNEL warns + falls back to latest", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      const warns: string[] = [];
+      const channel = getModuleInstallChannel(db, {
+        env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "stable" },
+        warn: (msg) => warns.push(msg),
+      });
+      expect(channel).toBe("latest");
+      expect(getSetting(db, "module_install_channel")).toBe("latest");
+      expect(warns.length).toBe(1);
+      expect(warns[0]).toMatch(/PARACHUTE_MODULE_CHANNEL="stable"/);
+      expect(warns[0]).toMatch(/not a valid channel/);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("empty PARACHUTE_MODULE_CHANNEL is treated as unset (no warn)", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      const warns: string[] = [];
+      const channel = getModuleInstallChannel(db, {
+        env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "" },
+        warn: (msg) => warns.push(msg),
+      });
+      expect(channel).toBe("latest");
+      expect(warns).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("once seeded, env var is ignored on subsequent reads", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      // First read seeds with rc.
+      getModuleInstallChannel(db, { env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "rc" } });
+      // Second read with a different env value still returns the seeded value.
+      const channel = getModuleInstallChannel(db, {
+        env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "latest" },
+      });
+      expect(channel).toBe("rc");
+      // And with no env at all.
+      expect(getModuleInstallChannel(db, { env: {} })).toBe("rc");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("setModuleInstallChannel persists the new value, subsequent reads return it", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      // Seed with rc via env.
+      getModuleInstallChannel(db, { env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "rc" } });
+      // Admin toggles to latest.
+      setModuleInstallChannel(db, "latest");
+      expect(getModuleInstallChannel(db, { env: {} })).toBe("latest");
+      // And back to rc — no env needed.
+      setModuleInstallChannel(db, "rc");
+      expect(getModuleInstallChannel(db, { env: {} })).toBe("rc");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("corrupted row falls back to latest silently (no throw)", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      // Simulate a manual sqlite edit / schema drift / external write.
+      setSetting(db, "module_install_channel", "bogus");
+      expect(getModuleInstallChannel(db, { env: {} })).toBe("latest");
     } finally {
       db.close();
     }

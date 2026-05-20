@@ -13,6 +13,7 @@ import {
   parseModulesPath,
 } from "../api-modules-ops.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { setModuleInstallChannel } from "../hub-settings.ts";
 import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { type SpawnRequest, type SupervisedProc, Supervisor } from "../supervisor.ts";
@@ -298,6 +299,54 @@ describe("POST /api/modules/:short/install", () => {
     expect(op.status).toBe("succeeded");
   });
 
+  test("uses the rc channel when hub_settings.module_install_channel = rc (hub#275)", async () => {
+    // Operator's set the channel via the SPA toggle / env var bootstrap;
+    // the next install must construct `<pkg>@rc` rather than `<pkg>@latest`.
+    setModuleInstallChannel(h.db, "rc");
+    const { supervisor } = makeIdleSupervisor();
+    const { run, calls } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+      },
+    );
+    expect(res.status).toBe(202);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+    expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+  });
+
+  test("toggling channel back to latest takes effect on next install (no restart)", async () => {
+    setModuleInstallChannel(h.db, "rc");
+    setModuleInstallChannel(h.db, "latest");
+    const { supervisor } = makeIdleSupervisor();
+    const { run, calls } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+      },
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+    expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+  });
+
   test("failed bun-add surfaces failed status on the operation", async () => {
     const { supervisor } = makeIdleSupervisor();
     // Run returns 1 + findGlobalInstall returns null = real failure.
@@ -414,6 +463,31 @@ describe("POST /api/modules/:short/upgrade", () => {
     expect(res.status).toBe(202);
     await new Promise((r) => setTimeout(r, 10));
     expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+  });
+
+  test("uses the rc channel when hub_settings.module_install_channel = rc (hub#275)", async () => {
+    setModuleInstallChannel(h.db, "rc");
+    const { supervisor } = makeIdleSupervisor();
+    await supervisor.start({ short: "vault", cmd: ["parachute-vault", "serve"] });
+
+    const { run, calls } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleUpgrade(
+      postReq("/api/modules/vault/upgrade", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+      },
+    );
+    expect(res.status).toBe(202);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+    expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
   });
 
   test("fails with 'try install first' when module is installed but never supervised", async () => {

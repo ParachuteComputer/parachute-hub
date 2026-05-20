@@ -42,9 +42,10 @@
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
  *   /api/modules                  (GET)        → curated + installed module catalog (host:auth)
+ *   /api/modules/channel          (PUT)        → operator channel toggle (host:admin)
  *   /api/modules/:short/install   (POST)       → bun add + spawn (async op)
  *   /api/modules/:short/restart   (POST)       → supervisor restart (sync)
- *   /api/modules/:short/upgrade   (POST)       → bun add @latest + restart (async op)
+ *   /api/modules/:short/upgrade   (POST)       → bun add @<channel> + restart (async op)
  *   /api/modules/:short/uninstall (POST)       → stop child + bun remove + drop row (sync)
  *   /api/modules/operations/:id   (GET)        → poll async op status
  *   /api/auth/mint-token          (POST)       → CLI/automation token mint (bearer)
@@ -113,7 +114,7 @@ import {
   handleUpgrade,
   parseModulesPath,
 } from "./api-modules-ops.ts";
-import { handleApiModules } from "./api-modules.ts";
+import { handleApiModules, handleApiModulesChannel } from "./api-modules.ts";
 import { REVOCATION_LIST_MOUNT, handleRevocationList } from "./api-revocation-list.ts";
 import { handleApiRevokeToken } from "./api-revoke-token.ts";
 import { handleApiTokens } from "./api-tokens.ts";
@@ -1333,6 +1334,18 @@ export function hubFetch(
       };
       if (deps?.supervisor !== undefined) modulesDeps.supervisor = deps.supervisor;
       return handleApiModules(req, modulesDeps);
+    }
+
+    // Channel toggle (hub#275) — pre-empts the /api/modules/:short/*
+    // routes below so `/api/modules/channel` doesn't accidentally match
+    // `parseModulesPath` (which would reject it as a non-curated short
+    // anyway, but precedence makes the intent explicit).
+    if (pathname === "/api/modules/channel") {
+      if (!getDb) return dbNotConfigured();
+      return handleApiModulesChannel(req, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+      });
     }
 
     // Module operation poll surface — pre-empts the /api/modules/:short/*

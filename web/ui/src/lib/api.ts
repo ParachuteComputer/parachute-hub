@@ -547,6 +547,9 @@ export interface ModuleListing {
   install_dir: string | null;
 }
 
+/** Module install channel — `latest` (stable) or `rc` (release candidates). */
+export type ModuleInstallChannel = "latest" | "rc";
+
 /** Top-level shape from `GET /api/modules`. */
 export interface ModulesCatalog {
   modules: ModuleListing[];
@@ -556,6 +559,12 @@ export interface ModulesCatalog {
    * should use `parachute install/upgrade/restart` from a shell.
    */
   supervisor_available: boolean;
+  /**
+   * Current module install channel (`latest` | `rc`). Drives the channel
+   * toggle at the top of the page (hub#275). The SPA PUTs back to
+   * `PUT /api/modules/channel` to change it.
+   */
+  module_install_channel: ModuleInstallChannel;
 }
 
 /**
@@ -654,6 +663,33 @@ export async function uninstallModule(short: string): Promise<ModuleActionResult
   }
   if (!res.ok) throw new HttpError(res.status, await readError(res));
   return (await res.json()) as ModuleActionResult;
+}
+
+/**
+ * PUT /api/modules/channel — flip the operator-settable module install
+ * channel (hub#275). Same Bearer + admin-scope pattern as the per-module
+ * actions; returns the new channel verbatim.
+ */
+export async function setModuleChannel(
+  channel: ModuleInstallChannel,
+): Promise<ModuleInstallChannel> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/modules/channel", {
+    method: "PUT",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify({ channel }),
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { channel: ModuleInstallChannel };
+  return body.channel;
 }
 
 /**

@@ -23,6 +23,12 @@
  */
 
 import type { Database } from "bun:sqlite";
+import {
+  type ModuleInstallChannel,
+  getModuleInstallChannel,
+  isModuleInstallChannel,
+  setModuleInstallChannel,
+} from "./hub-settings.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import { FIRST_PARTY_FALLBACKS } from "./service-spec.ts";
 import { readManifest } from "./services-manifest.ts";
@@ -90,6 +96,14 @@ interface ModulesResponse {
    * (the on-box `parachute start <svc>` flow lives outside hub).
    */
   supervisor_available: boolean;
+  /**
+   * Current module install channel (`latest` | `rc`). Surfaced here so
+   * the SPA can render the toggle without a second roundtrip. Read on
+   * each request — the hub-settings layer is the source of truth, and
+   * a toggle change is visible to the next GET without a hub restart
+   * (hub#275).
+   */
+  module_install_channel: ModuleInstallChannel;
 }
 
 interface CachedVersion {
@@ -241,9 +255,96 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   const body: ModulesResponse = {
     modules,
     supervisor_available: supervisor !== undefined,
+    module_install_channel: getModuleInstallChannel(deps.db),
   };
 
   return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * `PUT /api/modules/channel` — operator-settable module install channel.
+ *
+ * Bearer-gated on `parachute:host:admin` (same scope as install/upgrade
+ * — destructive-ish operator-only). Body: `{ "channel": "latest" | "rc" }`.
+ * Writes through to `hub_settings.module_install_channel`; the next
+ * runInstall / runUpgrade reads the new value (no hub restart needed).
+ *
+ * Why `:host:admin` rather than `:host:auth` (the GET scope): changing
+ * the channel is an upstream-state change that affects every subsequent
+ * module install + upgrade. Same boundary as a `bun add -g` itself.
+ */
+export const API_MODULES_CHANNEL_REQUIRED_SCOPE = "parachute:host:admin";
+
+export interface ApiModulesChannelDeps {
+  db: Database;
+  issuer: string;
+}
+
+export async function handleApiModulesChannel(
+  req: Request,
+  deps: ApiModulesChannelDeps,
+): Promise<Response> {
+  if (req.method !== "PUT") {
+    return jsonError(405, "method_not_allowed", "use PUT");
+  }
+
+  // Bearer presence + parsing.
+  const auth = req.headers.get("authorization");
+  if (!auth || !auth.startsWith("Bearer ")) {
+    return jsonError(401, "unauthenticated", "Authorization: Bearer <token> required");
+  }
+  const bearer = auth.slice("Bearer ".length).trim();
+  if (!bearer) {
+    return jsonError(401, "unauthenticated", "empty bearer token");
+  }
+
+  // Bearer validation + scope check.
+  try {
+    const validated = await validateAccessToken(deps.db, bearer, deps.issuer);
+    if (typeof validated.payload.sub !== "string" || validated.payload.sub.length === 0) {
+      return jsonError(401, "unauthenticated", "bearer token has no sub claim");
+    }
+    const scopes =
+      typeof validated.payload.scope === "string"
+        ? validated.payload.scope.split(/\s+/).filter((s) => s.length > 0)
+        : [];
+    if (!scopes.includes(API_MODULES_CHANNEL_REQUIRED_SCOPE)) {
+      return jsonError(
+        403,
+        "insufficient_scope",
+        `bearer token lacks ${API_MODULES_CHANNEL_REQUIRED_SCOPE}`,
+      );
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return jsonError(401, "unauthenticated", `bearer token invalid — ${msg}`);
+  }
+
+  // Parse + validate body.
+  let parsed: unknown;
+  try {
+    parsed = await req.json();
+  } catch {
+    return jsonError(400, "invalid_request", "request body must be JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return jsonError(400, "invalid_request", "request body must be a JSON object");
+  }
+  const channel = (parsed as { channel?: unknown }).channel;
+  if (!isModuleInstallChannel(channel)) {
+    return jsonError(
+      400,
+      "invalid_channel",
+      `channel must be one of: latest, rc (got ${JSON.stringify(channel)})`,
+    );
+  }
+
+  setModuleInstallChannel(deps.db, channel);
+
+  return new Response(JSON.stringify({ channel }), {
     status: 200,
     headers: { "content-type": "application/json" },
   });

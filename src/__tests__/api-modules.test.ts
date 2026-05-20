@@ -3,11 +3,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  API_MODULES_CHANNEL_REQUIRED_SCOPE,
   API_MODULES_REQUIRED_SCOPE,
   _clearLatestVersionCacheForTests,
   handleApiModules,
+  handleApiModulesChannel,
 } from "../api-modules.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { getSetting, setModuleInstallChannel } from "../hub-settings.ts";
 import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { type SpawnRequest, type SupervisedProc, Supervisor } from "../supervisor.ts";
@@ -288,5 +291,136 @@ describe("GET /api/modules", () => {
     await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), deps);
     expect(callsAfterFirst).toBeGreaterThan(0);
     expect(calls).toBe(callsAfterFirst);
+  });
+
+  test("surfaces module_install_channel in the response (hub#275)", async () => {
+    // Default — first read seeds with `latest`.
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { module_install_channel: string };
+    expect(body.module_install_channel).toBe("latest");
+  });
+
+  test("module_install_channel reflects toggled value on next GET", async () => {
+    setModuleInstallChannel(h.db, "rc");
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+    });
+    const body = (await res.json()) as { module_install_channel: string };
+    expect(body.module_install_channel).toBe("rc");
+  });
+});
+
+describe("PUT /api/modules/channel — hub#275 channel toggle", () => {
+  let h: Harness;
+
+  beforeEach(async () => {
+    h = await makeHarness();
+  });
+  afterEach(() => h.cleanup());
+
+  function putReq(body: unknown, headers: Record<string, string> = {}): Request {
+    return new Request("http://localhost/api/modules/channel", {
+      method: "PUT",
+      headers: { "content-type": "application/json", ...headers },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    });
+  }
+
+  test("405 on non-PUT", async () => {
+    const bearer = await mintBearer(h, [API_MODULES_CHANNEL_REQUIRED_SCOPE]);
+    const res = await handleApiModulesChannel(
+      new Request("http://localhost/api/modules/channel", {
+        method: "POST",
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { db: h.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(405);
+  });
+
+  test("401 on missing bearer", async () => {
+    const res = await handleApiModulesChannel(putReq({ channel: "rc" }), {
+      db: h.db,
+      issuer: ISSUER,
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("403 on bearer without parachute:host:admin", async () => {
+    // `:host:auth` reads the GET catalog — it must NOT be allowed to
+    // flip the install channel. Boundary matches install/upgrade/uninstall.
+    const bearer = await mintBearer(h, ["parachute:host:auth"]);
+    const res = await handleApiModulesChannel(
+      putReq({ channel: "rc" }, { authorization: `Bearer ${bearer}` }),
+      { db: h.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("insufficient_scope");
+    expect(body.error_description).toContain("parachute:host:admin");
+  });
+
+  test("400 on malformed body (not JSON)", async () => {
+    const bearer = await mintBearer(h, [API_MODULES_CHANNEL_REQUIRED_SCOPE]);
+    const res = await handleApiModulesChannel(
+      putReq("not-json", { authorization: `Bearer ${bearer}` }),
+      { db: h.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  test("400 on invalid channel value", async () => {
+    const bearer = await mintBearer(h, [API_MODULES_CHANNEL_REQUIRED_SCOPE]);
+    const res = await handleApiModulesChannel(
+      putReq({ channel: "stable" }, { authorization: `Bearer ${bearer}` }),
+      { db: h.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("invalid_channel");
+    expect(body.error_description).toMatch(/latest, rc/);
+  });
+
+  test("400 on missing channel field", async () => {
+    const bearer = await mintBearer(h, [API_MODULES_CHANNEL_REQUIRED_SCOPE]);
+    const res = await handleApiModulesChannel(
+      putReq({ foo: "bar" }, { authorization: `Bearer ${bearer}` }),
+      { db: h.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  test("200 + writes the new channel to hub_settings", async () => {
+    const bearer = await mintBearer(h, [API_MODULES_CHANNEL_REQUIRED_SCOPE]);
+    const res = await handleApiModulesChannel(
+      putReq({ channel: "rc" }, { authorization: `Bearer ${bearer}` }),
+      { db: h.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { channel: string };
+    expect(body.channel).toBe("rc");
+    expect(getSetting(h.db, "module_install_channel")).toBe("rc");
+  });
+
+  test("200 + can toggle back to latest", async () => {
+    setModuleInstallChannel(h.db, "rc");
+    const bearer = await mintBearer(h, [API_MODULES_CHANNEL_REQUIRED_SCOPE]);
+    const res = await handleApiModulesChannel(
+      putReq({ channel: "latest" }, { authorization: `Bearer ${bearer}` }),
+      { db: h.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(200);
+    expect(getSetting(h.db, "module_install_channel")).toBe("latest");
   });
 });
