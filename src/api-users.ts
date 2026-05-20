@@ -39,7 +39,6 @@ import type { Database } from "bun:sqlite";
 import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
-import { readManifest } from "./services-manifest.ts";
 import {
   PASSWORD_MAX_LEN,
   type User,
@@ -52,7 +51,7 @@ import {
   validatePassword,
   validateUsername,
 } from "./users.ts";
-import { isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
+import { listVaultNamesFromPath } from "./vault-names.ts";
 
 export interface ApiUsersDeps {
   db: Database;
@@ -84,36 +83,6 @@ function toWire(u: User): UserWireShape {
     assigned_vault: u.assignedVault,
     created_at: u.createdAt,
   };
-}
-
-/**
- * Walk services.json and emit each vault instance's name (`/vault/<name>`
- * path segment or `parachute-vault-<name>` manifest suffix; see
- * `vaultInstanceNameFor`).
- *
- * Mirrors the private `listVaultNames` in `oauth-handlers.ts`. Exposed
- * here as the single source for the `/api/users/vaults` endpoint —
- * both code paths must agree on which vault names a user could be
- * pinned to so the OAuth issuer (PR 4) can validate stored
- * `assigned_vault` values against the same set.
- *
- * TODO(hub PR4): consolidate with oauth-handlers.ts:listVaultNames
- * when PR 4 lands. PR 4 already touches oauth-handlers.ts to wire the
- * `vault_scope` claim, which is the natural seam to lift this helper
- * to a shared module (well-known.ts is the likely landing site since
- * it already owns `isVaultEntry` + `vaultInstanceNameFor`).
- */
-function listVaultNames(manifestPath: string): string[] {
-  const manifest = readManifest(manifestPath);
-  const names = new Set<string>();
-  for (const svc of manifest.services) {
-    if (!isVaultEntry(svc)) continue;
-    const paths = svc.paths.length > 0 ? svc.paths : [undefined];
-    for (const path of paths) {
-      names.add(vaultInstanceNameFor(svc.name, path));
-    }
-  }
-  return Array.from(names).sort();
 }
 
 function jsonError(status: number, error: string, description: string): Response {
@@ -289,7 +258,7 @@ export async function handleCreateUser(req: Request, deps: ApiUsersDeps): Promis
   // restriction" and skips the check.
   if (assignedVault !== null) {
     const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
-    const known = new Set(listVaultNames(manifestPath));
+    const known = new Set(listVaultNamesFromPath(manifestPath));
     if (!known.has(assignedVault)) {
       return jsonError(
         400,
@@ -405,7 +374,7 @@ export async function handleListVaults(req: Request, deps: ApiUsersDeps): Promis
     return adminAuthErrorResponse(err as AdminAuthError);
   }
   const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
-  const vaults = listVaultNames(manifestPath);
+  const vaults = listVaultNamesFromPath(manifestPath);
   return new Response(JSON.stringify({ vaults }), {
     status: 200,
     headers: { "content-type": "application/json", "cache-control": "no-store" },

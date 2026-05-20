@@ -71,6 +71,11 @@ export async function handleHostAdminToken(
     clientId: HOST_ADMIN_CLIENT_ID,
     issuer: deps.issuer,
     ttlSeconds: HOST_ADMIN_TOKEN_TTL_SECONDS,
+    // Host-admin tokens carry no per-user vault pin — the SPA Bearer talks
+    // to hub-scoped admin endpoints (vaults, grants, users, tokens), not to
+    // a single vault. Empty `vault_scope` is the "no per-user restriction"
+    // sentinel matching admin OAuth tokens.
+    vaultScope: [],
   });
   return new Response(
     JSON.stringify({

@@ -4550,3 +4550,561 @@ describe("DCR first-client auto-approve window (hub#268 Item 3)", () => {
     }
   });
 });
+
+// Multi-user Phase 1, PR 4 (design 2026-05-20-multi-user-phase-1.md, hub#252):
+// non-admin users (with `assigned_vault` non-null) see the consent picker
+// locked, and the OAuth issuer mints tokens carrying `vault_scope: [<assigned>]`.
+// Server-side defense refuses any mint whose picked vault disagrees.
+describe("handleAuthorizeGet — multi-user assigned vault picker lock (PR 4)", () => {
+  test("admin user (assigned_vault null) sees the free dropdown", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin-aaron", "pw");
+      const session = createSession(db, { userId: admin.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Free dropdown for admin: radio inputs present, no "Assigned vault" lock.
+      expect(html).toContain('name="vault_pick" value="default"');
+      expect(html).not.toContain("Assigned vault");
+      expect(html).not.toContain("admin-managed");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin user (assigned_vault set) sees the locked picker with admin-managed note", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVault: "default",
+      });
+      void admin;
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("vault-picker-locked");
+      expect(html).toContain("Assigned vault");
+      expect(html).toContain("admin-managed");
+      // Hidden input carries the assigned vault as the picker value.
+      expect(html).toContain('<input type="hidden" name="vault_pick" value="default"');
+      // No free-choice radio inputs.
+      expect(html).not.toContain('type="radio" name="vault_pick"');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () => {
+  test("non-admin happy path: token carries vault_scope=[assigned] and narrowed scope", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { verifier, challenge } = makePkce();
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        vault_pick: "default",
+      });
+      const consentRes = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const tokenRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code: code ?? "",
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: verifier,
+          }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      expect(tokenRes.status).toBe(200);
+      const body = (await tokenRes.json()) as { access_token: string; scope: string };
+      expect(body.scope).toBe("vault:default:read");
+      const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+      expect(payload.scope).toBe("vault:default:read");
+      expect(payload.vault_scope).toEqual(["default"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("admin user (assigned_vault null) mints with vault_scope=[]", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin-aaron", "pw");
+      const session = createSession(db, { userId: admin.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { verifier, challenge } = makePkce();
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        vault_pick: "default",
+      });
+      const consentRes = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const tokenRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code: code ?? "",
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: verifier,
+          }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      const body = (await tokenRes.json()) as { access_token: string };
+      const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+      expect(payload.vault_scope).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin with disagreeing vault_pick → 400 vault_scope_mismatch", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      // The fixture also has a vault "default"; build a manifest that has
+      // two valid vault names so the mismatch isn't conflated with
+      // "unknown vault."
+      const twoVaultManifest: ServicesManifest = {
+        services: [
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/default", "/vault/other"],
+            health: "/health",
+            version: "0.3.0",
+          },
+        ],
+      };
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        vault_pick: "other",
+      });
+      const res = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: () => twoVaultManifest },
+      );
+      expect(res.status).toBe(400);
+      const html = await res.text();
+      expect(html).toContain("vault_scope_mismatch");
+      // Echo back the picked-but-rejected vault (HTML-escaped), but DON'T
+      // leak the assigned one (post-N1 nit-fold). "your vault assignment"
+      // is the soft phrase replacing the prior `your assigned vault "..."`.
+      expect(html).toContain("&quot;other&quot;");
+      expect(html).toContain("your vault assignment");
+      expect(html).not.toContain("&quot;default&quot;");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin requesting named scope for the wrong vault → 400 vault_scope_mismatch", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        // Explicit named scope targeting a vault other than bob's assigned one.
+        scope: "vault:other:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+      });
+      const res = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      expect(res.status).toBe(400);
+      const html = await res.text();
+      expect(html).toContain("vault_scope_mismatch");
+      expect(html).toContain("vault:other:read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin requesting named scope for the assigned vault → happy path", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { verifier, challenge } = makePkce();
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        // Named scope matching bob's assigned vault — should pass.
+        scope: "vault:default:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+      });
+      const consentRes = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const tokenRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code: code ?? "",
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: verifier,
+          }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      const body = (await tokenRes.json()) as { access_token: string };
+      const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+      expect(payload.scope).toBe("vault:default:read");
+      expect(payload.vault_scope).toEqual(["default"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("refresh flow re-derives vault_scope from current assigned_vault", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { verifier, challenge } = makePkce();
+
+      // Step 1: complete the OAuth dance to obtain a refresh token.
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        vault_pick: "default",
+      });
+      const consentRes = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const tokenRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code: code ?? "",
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: verifier,
+          }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      const tokenBody = (await tokenRes.json()) as {
+        access_token: string;
+        refresh_token: string;
+      };
+      const firstValidated = await validateAccessToken(db, tokenBody.access_token, ISSUER);
+      expect(firstValidated.payload.vault_scope).toEqual(["default"]);
+
+      // Step 2: refresh the token; vault_scope should still be ["default"].
+      const refreshRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: tokenBody.refresh_token,
+            client_id: reg.client.clientId,
+          }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
+      );
+      const refreshBody = (await refreshRes.json()) as { access_token: string };
+      const refreshedValidated = await validateAccessToken(db, refreshBody.access_token, ISSUER);
+      expect(refreshedValidated.payload.vault_scope).toEqual(["default"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Reviewer nit N3 (PR #283): the previous test only verified that
+  // `vault_scope` SURVIVES refresh — it didn't prove the claim is re-derived
+  // mid-session if an admin changes the user's `assigned_vault`. This test
+  // pins the actual "re-derived at refresh time" invariant by mutating the
+  // assignment between mint and refresh, then asserting the new token
+  // carries the post-mutation value. The `scope` claim itself stays
+  // narrowed to the original vault (it was set at consent time and stored
+  // on the refresh-token row); only the informational `vault_scope` claim
+  // tracks the live row.
+  test("refresh flow picks up a mid-session assigned_vault change", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "vault-a" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { verifier, challenge } = makePkce();
+
+      // Manifest fixture: both vault-a (initial assignment) and vault-b
+      // (post-admin-update assignment) are registered. PR 4 doesn't ship
+      // a PATCH endpoint, so we use the same direct UPDATE the design
+      // anticipates an admin path would call.
+      const twoVaultManifest: ServicesManifest = {
+        services: [
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/vault-a", "/vault/vault-b"],
+            health: "/health",
+            version: "0.3.0",
+          },
+        ],
+      };
+
+      // Step 1: initial OAuth dance + token mint. Asserts vault_scope=["vault-a"].
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        vault_pick: "vault-a",
+      });
+      const consentRes = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: () => twoVaultManifest },
+      );
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const tokenRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code: code ?? "",
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            code_verifier: verifier,
+          }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER, loadServicesManifest: () => twoVaultManifest },
+      );
+      const tokenBody = (await tokenRes.json()) as {
+        access_token: string;
+        refresh_token: string;
+      };
+      const initial = await validateAccessToken(db, tokenBody.access_token, ISSUER);
+      expect(initial.payload.vault_scope).toEqual(["vault-a"]);
+      expect(initial.payload.scope).toBe("vault:vault-a:read");
+
+      // Step 2: admin updates bob's assigned_vault to vault-b. Direct UPDATE
+      // because Phase 1 has no PATCH endpoint; same effect a future admin
+      // path would have. The refresh path reads the live row at mint time
+      // (`vaultScopeForUser`), so the next refresh should pick up the new
+      // value.
+      db.prepare("UPDATE users SET assigned_vault = ? WHERE id = ?").run("vault-b", bob.id);
+
+      // Step 3: refresh the token. vault_scope should be ["vault-b"] (the
+      // new live value); the `scope` claim stays narrowed to the original
+      // vault (auth-code grant snapshotted it onto the refresh-token row).
+      const refreshRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: tokenBody.refresh_token,
+            client_id: reg.client.clientId,
+          }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER, loadServicesManifest: () => twoVaultManifest },
+      );
+      expect(refreshRes.status).toBe(200);
+      const refreshBody = (await refreshRes.json()) as { access_token: string };
+      const refreshed = await validateAccessToken(db, refreshBody.access_token, ISSUER);
+      expect(refreshed.payload.vault_scope).toEqual(["vault-b"]);
+      // The `scope` claim is still bound to the original consent — the
+      // refresh-token row carries `vault:vault-a:read` and the rotation
+      // preserves it. PR 5 will be the side that enforces "your access
+      // tokens for the old vault stop working when the assignment moves";
+      // PR 4 just emits the informational claim correctly.
+      expect(refreshed.payload.scope).toBe("vault:vault-a:read");
+    } finally {
+      cleanup();
+    }
+  });
+});

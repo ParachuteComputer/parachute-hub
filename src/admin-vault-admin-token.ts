@@ -73,6 +73,13 @@ export async function handleVaultAdminToken(
     clientId: VAULT_ADMIN_CLIENT_ID,
     issuer: deps.issuer,
     ttlSeconds: VAULT_ADMIN_TOKEN_TTL_SECONDS,
+    // The session-cookie path mints a per-vault admin Bearer for an operator
+    // who is already authenticated as an admin (post-#199 SPA path). The
+    // token names exactly one vault in its `scope`; the `vault_scope` claim
+    // mirrors that so PR 5's scope-guard side sees the same explicit pin
+    // (rather than the empty-admin sentinel that would otherwise undermine
+    // the per-vault narrowing).
+    vaultScope: [vaultName],
   });
   return new Response(
     JSON.stringify({

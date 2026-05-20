@@ -121,6 +121,65 @@ describe("signAccessToken", () => {
       cleanup();
     }
   });
+
+  // Multi-user Phase 1, PR 4 (design 2026-05-20-multi-user-phase-1.md):
+  // the `vault_scope` claim is emitted unconditionally so a downstream
+  // consumer (PR 5's scope-guard) doesn't have to distinguish "absent" from
+  // "empty." Callers pass `[]` for admin / unpinned, `[<assigned_vault>]`
+  // for non-admin pinned users.
+  test("vault_scope=[] is emitted as the empty-array claim", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const { token } = await signAccessToken(db, {
+        sub: "admin-aaron",
+        scopes: ["vault:default:read"],
+        audience: "vault.default",
+        clientId: "c",
+        issuer: "https://hub.example",
+        vaultScope: [],
+      });
+      const payload = decodeJwt(token);
+      expect(payload.vault_scope).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("vault_scope=['bob'] is emitted as the single-element claim", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const { token } = await signAccessToken(db, {
+        sub: "bob",
+        scopes: ["vault:bob:read"],
+        audience: "vault.bob",
+        clientId: "c",
+        issuer: "https://hub.example",
+        vaultScope: ["bob"],
+      });
+      const payload = decodeJwt(token);
+      expect(payload.vault_scope).toEqual(["bob"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("vault_scope defaults to [] when caller omits the field (back-compat sentinel)", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const { token } = await signAccessToken(db, {
+        sub: "operator",
+        scopes: ["parachute:host:admin"],
+        audience: "hub",
+        clientId: "c",
+        issuer: "https://hub.example",
+      });
+      const payload = decodeJwt(token);
+      // Claim is present (not undefined), set to the empty-array sentinel.
+      expect(payload.vault_scope).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("signRefreshToken", () => {

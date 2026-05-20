@@ -191,6 +191,12 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     clientId: API_MINT_TOKEN_CLIENT_ID,
     issuer: deps.issuer,
     ttlSeconds,
+    // Operator-driven CLI/API mint — the bearer already cleared the
+    // `parachute:host:auth` privilege gate, so there's no per-user vault
+    // pin to enforce. Empty `vault_scope` is the "no restriction"
+    // sentinel; the `scopes` themselves remain authorization-bearing as
+    // before.
+    vaultScope: [],
     ...(permissionsClaim !== undefined ? { extraClaims: { permissions: permissionsClaim } } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });

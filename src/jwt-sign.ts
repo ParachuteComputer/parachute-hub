@@ -47,6 +47,20 @@ export interface SignAccessTokenOpts {
    * or thread it from `OAuthDeps.issuer`.
    */
   issuer: string;
+  /**
+   * Per-user vault pin — the multi-user Phase 1 (design
+   * [`2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/))
+   * vault_scope claim. Non-empty for non-admin users (a single-element list
+   * naming their `assigned_vault`); empty `[]` for admin users (the "no
+   * per-user vault restriction" sentinel — admins can request any vault on
+   * the hub via the consent picker). Always emitted as a claim — defaults
+   * to `[]` when callers omit — so a downstream consumer (PR 5's
+   * scope-guard at vault / notes / scribe) can unambiguously read it
+   * without distinguishing "absent" from "empty." Phase 1 always has
+   * length ≤1; the list shape carries Phase 2 multi-vault forward without
+   * a wire-shape change.
+   */
+  vaultScope?: string[];
   /** Override the jti (defaults to random base64url(16)). Used by tests. */
   jti?: string;
   /**
@@ -60,7 +74,8 @@ export interface SignAccessTokenOpts {
    * `pa_scope_set` (which scope-set the token was minted under) so an
    * auto-rotation can preserve the operator's chosen narrowing across mints.
    * Reserved claims (`scope`, `client_id`, `sub`, `iss`, `iat`, `exp`, `aud`,
-   * `jti`) are owned by this function and overwritten if passed here.
+   * `jti`, `vault_scope`) are owned by this function and overwritten if
+   * passed here.
    */
   extraClaims?: Record<string, unknown>;
 }
@@ -85,6 +100,7 @@ export async function signAccessToken(
     ...(opts.extraClaims ?? {}),
     scope: opts.scopes.join(" "),
     client_id: opts.clientId,
+    vault_scope: opts.vaultScope ?? [],
   })
     .setProtectedHeader({ alg: SIGNING_ALGORITHM, kid: key.kid })
     .setSubject(opts.sub)

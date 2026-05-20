@@ -979,6 +979,7 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
       clientId: OPERATOR_TOKEN_CLIENT_ID,
       issuer,
       ttlSeconds,
+      vaultScope: [], // CLI-mint tokens are operator-scoped; no per-user vault pin
       ...(permissionsClaim !== undefined ? { extraClaims: { permissions: permissionsClaim } } : {}),
     });
 

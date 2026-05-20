@@ -2,6 +2,39 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.10-rc.15] - 2026-05-20
+
+Multi-user Phase 1 — PR 4 of 5: OAuth vault_scope claim + consent-picker lock (hub#252, design [`parachute.computer/design/2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)). Builds on PR 3 (rc.14) which shipped the force-change-password flow. This release wires the *OAuth issuer* side: hub-minted tokens now carry a `vault_scope` claim derived from the user's `assigned_vault`, the consent picker is locked-and-displayed for non-admin users, and the server-side defense refuses mints whose picked vault disagrees with the user's assignment.
+
+Backend surface:
+
+- `src/jwt-sign.ts` — `SignAccessTokenOpts` gains an optional `vaultScope: string[]` field. Every minted JWT carries a `vault_scope` claim (defaults to `[]` when omitted — admins / unpinned mints; non-empty single-element list for assigned users). The claim is load-bearing for PR 5's scope-guard at vault / notes / scribe, which will consume it to enforce per-user vault narrowing downstream. Empty `[]` is the explicit "no per-user restriction" sentinel (rather than absent) so consumers never have to distinguish absent-vs-empty.
+- `src/oauth-handlers.ts`:
+  - **New `vaultScopeForUser(db, userId)` helper** — derives the claim value from `users.assigned_vault`. Null assignment (admin posture) → `[]`. Non-null → `[name]`. Read at JWT mint time on both the auth-code grant + refresh-token grant paths, so an admin-side `assigned_vault` change picks up on the user's next refresh.
+  - **`handleAuthorizeGet`** — looks up the signed-in user and threads their `assigned_vault` into `consentProps` as `lockedVault`. The consent picker renders the assigned-vault name as a read-only label with an "Assigned vault — admin-managed; you can't change this here" note, plus a hidden `vault_pick` input carrying the locked value. Admin users (assigned_vault null) keep the existing free dropdown unchanged.
+  - **`handleConsentSubmit`** — server-side defense per Aaron's pin "refuses mints whose picked vault disagrees with assigned_vault" rather than silent overwrite. Two checks for non-admin users: (1) when an unnamed `vault:<verb>` scope was disambiguated via `vault_pick`, refuse 400 if the picked vault ≠ `assigned_vault`; (2) when a named `vault:<other>:<verb>` arrived directly in the request scope, refuse 400. Wire error body is HTML with title "Vault assignment mismatch" and the description `vault_scope_mismatch: …` followed by the assigned-vault name. Admins (assigned_vault null) bypass both checks.
+  - **`signAccessToken` call sites** — both the auth-code grant (`handleTokenAuthorizationCode`) and refresh grant (`handleTokenRefresh`) now pass `vaultScope: vaultScopeForUser(db, userId)`. Re-derived at every mint (not snapshotted onto the refresh-token row) so admin-side `assigned_vault` changes take effect on the user's next refresh.
+- `src/vault-names.ts` (new) — consolidates the two pre-PR-4 private copies of the "walk services.json, emit vault instance names" helper. `oauth-handlers.ts` and `api-users.ts` both used to carry a private `listVaultNames` reading the same source; PR 4 lifts them into one place + adds `handleConsentSubmit`'s server-side defense as a third caller. Exports `listVaultNames(manifest)` for the in-memory shape (consent picker, server-side defense) and `listVaultNamesFromPath(manifestPath)` for the reads-from-disk shape (`/api/users/vaults` + `POST /api/users` validation).
+- `src/oauth-ui.ts` — `VaultPicker` interface gains optional `lockedVault: string`. New `renderVaultPicker` branch renders the locked-vault row + admin-managed note + hidden `vault_pick` input when set; CSS styles for `.vault-picker-locked` / `.vault-locked-row` / `.vault-locked-badge` / `.vault-locked-note` follow the existing chrome palette. The "approve disabled" gate is now scoped to the empty-and-not-locked case so locked-vault forms keep their Approve button enabled.
+- `src/admin-host-admin-token.ts`, `src/admin-vault-admin-token.ts`, `src/api-mint-token.ts`, `src/operator-token.ts` — every other `signAccessToken` caller updated to pass `vaultScope` explicitly. Host-admin / api-mint / operator → `[]` (no per-user pin; these are operator-driven paths). Vault-admin-token → `[vaultName]` (mirrors the per-vault scope already in the token).
+- `src/api-users.ts` — switched off the local `listVaultNames` and now imports `listVaultNamesFromPath` from the shared module. No behavior change.
+
+Tests + gates:
+
+- `src/__tests__/jwt-sign.test.ts` — 3 new tests covering `vault_scope=[]`, `vault_scope=["bob"]`, and the back-compat default (omitting `vaultScope` still emits `[]`).
+- `src/__tests__/oauth-handlers.test.ts` — 7 new tests covering: admin user sees the free dropdown; non-admin user sees the locked picker with the admin-managed note; non-admin happy path mints with `vault_scope=["default"]` and narrowed scope; admin path mints with `vault_scope=[]`; disagreeing `vault_pick` returns 400 `vault_scope_mismatch`; disagreeing named scope (e.g. `vault:other:read` for a user assigned to `default`) returns 400 `vault_scope_mismatch`; named scope matching the assigned vault passes happy path; refresh flow re-derives `vault_scope` from current `assigned_vault`.
+- `src/__tests__/vault-names.test.ts` (new) — 9 tests for the shared helper: empty manifest, single-entry-multi-path shape, per-vault-entry shape, manifest-suffix fallback for missing paths, dedup across mixed shapes, sorted output (deterministic order), `listVaultNamesFromPath` reads disk, and a cross-caller parity check pinning `listVaultNamesFromPath` ≡ `listVaultNames(readManifest(...))`.
+
+Gate: `bun test ./src` — **1574 pass / 0 fail / 31219 expects across 83 files** (+19 over rc.14 baseline 1555). SPA: `cd web/ui && bun run test` — **133 pass / 0 fail across 10 files** (unchanged — no SPA changes this PR). typecheck + biome clean (root + web/ui). SPA build clean.
+
+Smoke: see PR description.
+
+What's NOT in PR 4:
+
+- Consumer-side enforcement at vault / notes / scribe — PR 5 (scope-guard verification). The claim is *emitted* in rc.15; the *consumption* lands in rc.16 alongside the resource-server scope-guard surface.
+- Multi-vault per user (`assigned_vaults: string[]`) — Phase 2.
+- Don't-show-other-vaults UI (the Phase 2 hardening of the picker) — Phase 2. Phase 1 ships lock-the-picker per the design's decision-pin.
+
 ## [0.5.10-rc.14] - 2026-05-20
 
 Multi-user Phase 1 — PR 3 of 5: force-change-password flow (hub#252, design [`parachute.computer/design/2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/)). Builds on PR 2 (rc.13) which shipped the admin `/api/users` surface for creating accounts with `password_changed: false`. This release wires the *user* side: a session-level redirect at the login boundary that lands admin-created users on a server-rendered change-password form before they can reach the rest of the hub.

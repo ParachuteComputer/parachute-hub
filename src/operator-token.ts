@@ -160,6 +160,10 @@ export async function mintOperatorToken(
     clientId: OPERATOR_TOKEN_CLIENT_ID,
     issuer: opts.issuer,
     ttlSeconds: opts.ttlSeconds ?? OPERATOR_TOKEN_TTL_SECONDS,
+    // Operator token — the hub-operator bearer. No per-user vault pin; the
+    // operator can act against any vault in this hub. Empty `vault_scope`
+    // is the "no restriction" sentinel (matches the admin OAuth shape).
+    vaultScope: [],
     extraClaims: { [OPERATOR_TOKEN_SCOPE_SET_CLAIM]: scopeSet },
     ...(opts.jti !== undefined ? { jti: opts.jti } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
