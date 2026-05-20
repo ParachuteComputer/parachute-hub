@@ -39,7 +39,7 @@
 
 import type { Database } from "bun:sqlite";
 import { type OperationsRegistry, runInstall, specFor } from "./api-modules-ops.ts";
-import type { CuratedModuleShort } from "./api-modules.ts";
+import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import {
   CSRF_FIELD_NAME,
   ensureCsrfToken,
@@ -49,12 +49,14 @@ import {
 import {
   SETUP_EXPOSE_MODES,
   type SetupExposeMode,
+  deleteSetting,
   getSetting,
   isSetupExposeMode,
   openFirstClientAutoApproveWindow,
   setSetting,
 } from "./hub-settings.ts";
 import { escapeHtml } from "./oauth-ui.ts";
+import { mintOperatorToken } from "./operator-token.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { findService, readManifest } from "./services-manifest.ts";
 import {
@@ -65,6 +67,7 @@ import {
 } from "./sessions.ts";
 import type { Supervisor } from "./supervisor.ts";
 import { createUser, userCount } from "./users.ts";
+import { DEFAULT_VAULT_NAME, validateVaultName } from "./vault-name.ts";
 
 // --- shared chrome --------------------------------------------------------
 
@@ -315,6 +318,8 @@ export function renderAccountStep(props: RenderAccountStepProps): string {
 export interface RenderVaultStepProps {
   csrfToken: string;
   errorMessage?: string;
+  /** Pre-fill the vault name input after a validation failure. */
+  vaultName?: string;
   /**
    * When an install op is in progress, render the polling shape: no
    * form, just the op log + auto-refresh.
@@ -328,19 +333,21 @@ export interface RenderVaultStepProps {
 }
 
 export function renderVaultStep(props: RenderVaultStepProps): string {
-  const { csrfToken, errorMessage, operation } = props;
+  const { csrfToken, errorMessage, operation, vaultName } = props;
   if (operation) return renderVaultOpStep({ operation });
   const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
-  // hub#259 / hub#267: the first vault is hard-named "default" for now.
-  // The CLI threads `--vault-name` through `parachute-vault init`, which
-  // the wizard's container-mode `runInstall` doesn't run. Wiring the
-  // operator's typed name end-to-end requires either a new `init` step
-  // in `runInstall` or upstream changes in @openparachute/vault so it
-  // reads `PARACHUTE_VAULT_NAME` (or services.json paths) on first
-  // boot. Both are bigger than fits in this PR — tracked in hub#267.
-  // For now: show what's actually being created, no form field, no
-  // UX lie. The operator renames via the admin UI once the wizard
-  // hands them off.
+  // hub#267: the typed name now flows end-to-end via
+  // `PARACHUTE_VAULT_NAME`. Vault#342 added the env var read on
+  // first-boot — hub spawns vault with the env var set and vault's
+  // `resolveFirstBootVaultName` picks it up. The wizard's job here is
+  // to ask + validate + persist the choice; the supervised vault child
+  // does the rest.
+  //
+  // Leaving the field blank falls back to `default` server-side —
+  // matches the prior shape so no-input + Submit still works for the
+  // "I don't care, just give me a vault" path.
+  const nameAttr = vaultName !== undefined ? ` value="${escapeAttr(vaultName)}"` : "";
+  const previewName = vaultName?.trim() ? escapeHtml(vaultName.trim()) : DEFAULT_VAULT_NAME;
   const body = `
     <div class="card">
       <div class="card-header">
@@ -353,7 +360,7 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
       <section class="explainer">
         <h2>Why this step</h2>
         <p>The wizard provisions a vault module at the path
-          <code>/vault/default</code> and issues you an operator token —
+          <code>/vault/&lt;name&gt;</code> and issues you an operator token —
           the same shape <code>parachute install vault</code> produces from
           the CLI. We're doing both in one click.</p>
         <h2>What's next</h2>
@@ -365,20 +372,29 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
         <p class="preview-label">About to create</p>
         <div class="preview-card">
           <span class="preview-key">vault:</span>
-          <span class="preview-val" id="preview-vault-name">default</span>
+          <span class="preview-val" id="preview-vault-name">${previewName}</span>
           <span class="preview-fine">— admin: you, MCP-ready for Claude Code</span>
         </div>
         <p class="preview-fine">
-          The vault is named <code>default</code> on first boot. Custom
-          names on the wizard are tracked in
-          <a href="https://github.com/ParachuteComputer/parachute-hub/issues/267">hub#267</a> —
-          for now, rename or add vaults from the admin UI after setup.
+          The name shows up in the MCP URL (<code>/vault/&lt;name&gt;/mcp</code>)
+          and on the admin UI. You can rename or add vaults later from
+          <code>/admin/vaults</code>.
         </p>
       </section>
       ${error}
       <form method="POST" action="/admin/setup/vault" class="auth-form">
         ${renderCsrfHiddenInput(csrfToken)}
-        <button type="submit" class="btn btn-primary" autofocus>Create vault & finish</button>
+        <label class="field">
+          <span class="field-label">Vault name</span>
+          <input type="text" name="vault_name"
+            autofocus minlength="2" maxlength="32"
+            pattern="[a-z0-9_-]+"
+            title="lowercase letters, digits, hyphens, underscores (2–32 chars)"
+            placeholder="${DEFAULT_VAULT_NAME}"${nameAttr} />
+          <span class="field-hint">lowercase letters, digits, <code>-</code>, <code>_</code>;
+            2–32 chars. Leave blank for <code>${DEFAULT_VAULT_NAME}</code>.</span>
+        </label>
+        <button type="submit" class="btn btn-primary">Create vault & finish</button>
       </form>
     </div>`;
   return baseDocument("Set up your Parachute hub — vault", body);
@@ -517,6 +533,33 @@ export function renderExposeStep(props: RenderExposeStepProps): string {
 
 // --- step 5: done --------------------------------------------------------
 
+/**
+ * Per-module install state surfaced on the done screen (hub#272 Item B).
+ * The renderer reads this to choose tile shape:
+ *   * `idle` — no op yet, show the Install button + form
+ *   * `running` / `pending` — op-poll panel + auto-refresh
+ *   * `succeeded` — green check + "View in admin" link
+ *   * `failed` — red banner + log + retry button
+ *
+ * Same op-id flows through the admin SPA's operation poll, so an
+ * operator can hop to `/admin/modules` mid-flight and watch from there
+ * without losing the op.
+ */
+export interface ModuleInstallTileState {
+  short: CuratedModuleShort;
+  displayName: string;
+  tagline: string;
+  /** True when a services.json entry already exists for this module (already installed). */
+  alreadyInstalled: boolean;
+  /** Live op snapshot from the registry, if `?op_<short>=<id>` was set. */
+  operation?: {
+    id: string;
+    status: "pending" | "running" | "succeeded" | "failed";
+    log: readonly string[];
+    error?: string;
+  };
+}
+
 export interface RenderDoneStepProps {
   vaultName: string;
   /** Hub origin used in copy-pastable MCP install commands. */
@@ -528,12 +571,40 @@ export interface RenderDoneStepProps {
    * (e.g. tests of the wizard's older two-step flow).
    */
   exposeMode?: SetupExposeMode;
+  /**
+   * Auto-minted operator token surfaced once on the done screen
+   * (hub#272 Item A). When present, the MCP install command renders
+   * with `--header "Authorization: Bearer <token>"` pre-filled and a
+   * one-click Copy button. Absent means the mint either failed or
+   * the operator already consumed the single-use surface — the tile
+   * falls back to the un-headered command + a "mint at /admin/tokens"
+   * hint.
+   */
+  mintedToken?: string;
+  /**
+   * Optional per-module install tiles to render alongside the MCP
+   * command (hub#272 Item B). When omitted, the done step renders
+   * only the MCP tile + the admin-UI fallback link. Production wires
+   * Notes + Scribe; tests can omit this to assert the back-compat
+   * shape.
+   */
+  installTiles?: readonly ModuleInstallTileState[];
 }
 
 export function renderDoneStep(props: RenderDoneStepProps): string {
-  const { vaultName, hubOrigin, exposeMode } = props;
-  const mcpCmd = `claude mcp add --transport http parachute-${vaultName} ${hubOrigin}/vault/${vaultName}/mcp`;
+  const { vaultName, hubOrigin, exposeMode, mintedToken, installTiles } = props;
   const reachable = exposeMode ? renderReachableTile(exposeMode, hubOrigin) : "";
+  const mcpTile = renderMcpTile(vaultName, hubOrigin, mintedToken);
+  const tiles = installTiles && installTiles.length > 0 ? installTiles : [];
+  const installSection = tiles.length > 0 ? renderInstallTiles(tiles) : "";
+  // The done-grid hosts the MCP-connect tile + the admin-UI fallback.
+  // The install tiles sit above it as a primary "what's next?" surface —
+  // they're the highest-friction next-step for most operators (operator
+  // just provisioned a vault, the obvious next action is installing the
+  // PWA / transcription module on top of it). Reachable tile leads
+  // everything because it answers "where's my hub?" before anything
+  // else — the question every operator hits before MCP / module
+  // installs even matter.
   const body = `
     <div class="card">
       <div class="card-header">
@@ -542,19 +613,13 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
         <p class="subtitle">Your hub is ready. Here's what to do next.</p>
       </div>
       ${reachable}
+      ${installSection}
       <section class="done-grid">
+        ${mcpTile}
         <div class="done-tile">
           <h2>Open the admin UI</h2>
           <p>Manage vaults, tokens, OAuth grants, and module updates.</p>
-          <p><a class="btn btn-primary" href="/admin/vaults">Go to admin</a></p>
-        </div>
-        <div class="done-tile">
-          <h2>Connect Claude Code (MCP)</h2>
-          <p>Wire <code>vault:${escapeHtml(vaultName)}</code> into Claude Code as an MCP server:</p>
-          <pre>${escapeHtml(mcpCmd)}</pre>
-          <p class="fine">You'll be prompted to mint an operator token from
-            the admin UI on first use. See
-            <code>/admin/tokens</code> for the canonical mint surface.</p>
+          <p><a class="btn btn-secondary" href="/admin/modules">Go to admin</a></p>
         </div>
       </section>
       <section class="explainer">
@@ -570,8 +635,146 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
           to <code>/login</code>.</p>
       </section>
     </div>`;
-  return baseDocument("Parachute hub — setup complete", body);
+  // Auto-refresh while any install op is in flight so the operator sees
+  // progress without manually reloading. Done step is the canonical
+  // poll surface for both the MCP-connect tile (static) and the
+  // module-install tiles (dynamic). Refresh interval matches the
+  // vault-op-poll page's 2s cadence so the wizard's two long-running
+  // surfaces (vault, post-vault notes/scribe) feel consistent.
+  const anyOpInFlight = tiles.some(
+    (t) => t.operation && (t.operation.status === "pending" || t.operation.status === "running"),
+  );
+  const refresh = anyOpInFlight ? 2 : undefined;
+  return baseDocument("Parachute hub — setup complete", body, refresh);
 }
+
+/**
+ * The MCP-connect tile. With a freshly-minted token the command renders
+ * fully formed with a `--header "Authorization: Bearer <token>"` flag +
+ * a Copy button. Without one, we fall back to the bare command + a
+ * pointer to `/admin/tokens` (the canonical mint surface). The Copy
+ * button is a tiny inline `<script>` — no SPA bundle, no module deps,
+ * the wizard stays server-rendered.
+ */
+function renderMcpTile(
+  vaultName: string,
+  hubOrigin: string,
+  mintedToken: string | undefined,
+): string {
+  const safeVault = escapeHtml(vaultName);
+  const bareCmd = `claude mcp add --transport http parachute-${vaultName} ${hubOrigin}/vault/${vaultName}/mcp`;
+  if (mintedToken) {
+    // The token contents are surfaced once + then forgotten by the
+    // server (single-use hub_setting). Render the full command with
+    // the Bearer header pre-filled. The `--header` value is shell-
+    // quoted (double quotes) — bash + zsh both consume it as one arg.
+    const fullCmd = `${bareCmd} --header "Authorization: Bearer ${mintedToken}"`;
+    return `<div class="done-tile">
+      <h2>Connect Claude Code (MCP)</h2>
+      <p>Wire <code>vault:${safeVault}</code> into Claude Code as an MCP server:</p>
+      <div class="mcp-cmd-wrap">
+        <pre id="mcp-cmd">${escapeHtml(fullCmd)}</pre>
+        <button type="button" class="btn btn-copy" data-target="mcp-cmd"
+          onclick="(function(b){var el=document.getElementById(b.dataset.target);if(!el)return;navigator.clipboard.writeText(el.textContent||'').then(function(){b.textContent='Copied ✓';setTimeout(function(){b.textContent='Copy';},2000);});})(this)">Copy</button>
+      </div>
+      <p class="fine">We minted this token for your first MCP connection.
+        It's a full-scope operator token tied to your admin account; manage
+        and revoke tokens at <a href="/admin/tokens"><code>/admin/tokens</code></a>.</p>
+    </div>`;
+  }
+  return `<div class="done-tile">
+    <h2>Connect Claude Code (MCP)</h2>
+    <p>Wire <code>vault:${safeVault}</code> into Claude Code as an MCP server:</p>
+    <pre>${escapeHtml(bareCmd)}</pre>
+    <p class="fine">Mint an operator token at
+      <a href="/admin/tokens"><code>/admin/tokens</code></a> and append
+      <code>--header "Authorization: Bearer pvt_..."</code> on first use.</p>
+  </div>`;
+}
+
+/**
+ * The "What's next?" install-tiles row (hub#272 Item B). One tile per
+ * curated module the operator might want next (Notes, Scribe). Each
+ * tile is either an install form (POST → /admin/setup/install/<short>
+ * → 303 to /admin/setup?op_<short>=<id>) or an op-poll panel mirroring
+ * the vault-step's op-poll shape.
+ */
+function renderInstallTiles(tiles: readonly ModuleInstallTileState[]): string {
+  const items = tiles.map((t) => renderInstallTile(t)).join("");
+  return `<section class="install-tiles">
+    <h2 class="install-tiles-heading">What's next?</h2>
+    <p class="install-tiles-subtitle">Install another module — these run alongside your vault on the same hub.</p>
+    <div class="install-grid">${items}</div>
+  </section>`;
+}
+
+function renderInstallTile(tile: ModuleInstallTileState): string {
+  const safeShort = escapeHtml(tile.short);
+  const safeName = escapeHtml(tile.displayName);
+  const safeTagline = escapeHtml(tile.tagline);
+  if (tile.operation) {
+    const op = tile.operation;
+    const logLines = op.log.map((l) => `<li>${escapeHtml(l)}</li>`).join("");
+    const errBanner = op.error ? `<p class="error-banner">${escapeHtml(op.error)}</p>` : "";
+    // Terminal state (succeeded / failed) gets either a confirmation
+    // link or a retry form. Pending / running renders the live log
+    // panel and relies on the parent `<meta http-equiv="refresh">` for
+    // the next tick — no per-tile refresh needed (one full-page reload
+    // catches every in-flight op at once).
+    let actions = "";
+    if (op.status === "succeeded") {
+      actions = `<p><a class="btn btn-secondary" href="/admin/modules">Manage modules</a></p>`;
+    } else if (op.status === "failed") {
+      actions = `<form method="POST" action="/admin/setup/install/${safeShort}" class="install-retry">
+        ${renderInstallTileCsrfPlaceholder()}
+        <button type="submit" class="btn btn-secondary">Retry install</button>
+      </form>`;
+    }
+    return `<div class="install-tile install-tile-${op.status}">
+      <h3>${safeName}</h3>
+      <p class="install-tile-tagline">${safeTagline}</p>
+      ${errBanner}
+      <section class="op-log install-tile-log">
+        <p class="op-status op-${op.status}">status: ${op.status}</p>
+        <ol class="log-lines">${logLines}</ol>
+      </section>
+      ${actions}
+    </div>`;
+  }
+  if (tile.alreadyInstalled) {
+    return `<div class="install-tile install-tile-installed">
+      <h3>${safeName}</h3>
+      <p class="install-tile-tagline">${safeTagline}</p>
+      <p class="install-tile-status">Already installed.</p>
+      <p><a class="btn btn-secondary" href="/admin/modules">Manage in admin</a></p>
+    </div>`;
+  }
+  return `<div class="install-tile">
+    <h3>${safeName}</h3>
+    <p class="install-tile-tagline">${safeTagline}</p>
+    <form method="POST" action="/admin/setup/install/${safeShort}" class="install-tile-form">
+      ${renderInstallTileCsrfPlaceholder()}
+      <button type="submit" class="btn btn-primary">Install ${safeName}</button>
+    </form>
+  </div>`;
+}
+
+/**
+ * CSRF token placeholder for install-tile forms. The token comes from
+ * the wizard's per-request CSRF cookie; rendered by the parent step's
+ * `csrfToken` plumbing. Threaded through `renderDoneStep` props rather
+ * than read here directly because the tile renderer is a pure function
+ * the test surface can exercise without a request object.
+ *
+ * Currently rendered as a marker that the parent renderer rewrites
+ * before serving — keeps the per-tile shape pure but avoids dragging
+ * a CSRF token argument into every tile-shape function.
+ */
+function renderInstallTileCsrfPlaceholder(): string {
+  return INSTALL_TILE_CSRF_PLACEHOLDER;
+}
+
+const INSTALL_TILE_CSRF_PLACEHOLDER = "__INSTALL_TILE_CSRF__";
 
 /**
  * Render the "Your hub is reachable at" tile on the done step, shaped by
@@ -643,12 +846,40 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
     if (url.searchParams.get("just_finished") === "1") {
       const stored = getSetting(deps.db, "setup_expose_mode");
       const exposeMode = isSetupExposeMode(stored) ? stored : undefined;
+      // hub#272 Item A: read + consume the single-use minted-token row.
+      // Render-and-forget keeps the secret from re-appearing on
+      // refresh / back-button. The mint is non-fatal (see expose POST);
+      // its absence renders the bare MCP command + a hint at
+      // /admin/tokens.
+      const mintedToken = getSetting(deps.db, "setup_minted_token");
+      if (mintedToken) deleteSetting(deps.db, "setup_minted_token");
+      // hub#267: the operator-typed vault name lives in hub_settings
+      // (persisted by handleSetupVaultPost). Fall back to scanning
+      // services.json — covers wizard runs from before this PR where
+      // setup_vault_name wasn't written. The services.json read
+      // returns the path-tail; vault's own first-boot write produces
+      // the canonical name so the two should agree once the vault
+      // boots authoritatively.
+      const storedName = getSetting(deps.db, "setup_vault_name");
+      const vaultName = storedName ?? firstVaultName(deps.manifestPath);
+      // Module install tiles (hub#272 Item B). One per curated module
+      // other than vault (which the wizard already provisioned).
+      const installTiles = buildInstallTiles(url, deps);
       const doneProps: RenderDoneStepProps = {
-        vaultName: firstVaultName(deps.manifestPath),
+        vaultName,
         hubOrigin: deps.issuer,
+        installTiles,
       };
       if (exposeMode !== undefined) doneProps.exposeMode = exposeMode;
-      return new Response(renderDoneStep(doneProps), {
+      if (mintedToken) doneProps.mintedToken = mintedToken;
+      // Substitute CSRF placeholder for the install-tile forms with
+      // the current CSRF token. Keeping the per-tile renderer pure
+      // means the substitution lives here (one rewrite per render).
+      const html = renderDoneStep(doneProps).replaceAll(
+        INSTALL_TILE_CSRF_PLACEHOLDER,
+        renderCsrfHiddenInput(csrf.token),
+      );
+      return new Response(html, {
         status: 200,
         headers: extraHeaders,
       });
@@ -807,16 +1038,35 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
   const state = deriveWizardState(deps);
   if (state.hasVault) return redirect("/admin/setup?just_finished=1");
 
-  // The first vault is hard-named "default" for now (hub#267). The CLI
-  // threads `--vault-name` through `parachute-vault init`; the wizard's
-  // container-mode `runInstall` doesn't run `init` (just `bun add` +
-  // seed services.json + supervisor.start), and the upstream vault
-  // module's `server.ts` auto-creates a "default" vault on first boot
-  // regardless of the seeded services.json paths. Wiring an
-  // operator-typed name end-to-end requires either a new init step or
-  // upstream changes in @openparachute/vault — both bigger than fit
-  // here. Form has no name field now; the operator renames via the
-  // admin UI post-setup.
+  // hub#267: the operator-typed vault name is now threaded all the way
+  // through to vault's first-boot via `PARACHUTE_VAULT_NAME` (vault#342
+  // shipped the env-var read in vault's `server.ts`). Empty input
+  // falls back to the canonical `DEFAULT_VAULT_NAME` so the "just give
+  // me a vault" path still works without typing anything.
+  const csrfTokenStr = typeof formCsrf === "string" ? formCsrf : "";
+  const rawName = String(form.get("vault_name") ?? "").trim();
+  let vaultName: string;
+  if (rawName === "") {
+    vaultName = DEFAULT_VAULT_NAME;
+  } else {
+    const v = validateVaultName(rawName);
+    if (!v.ok) {
+      return htmlResponse(
+        renderVaultStep({
+          csrfToken: csrfTokenStr,
+          vaultName: rawName,
+          errorMessage: v.error,
+        }),
+        400,
+      );
+    }
+    vaultName = v.name;
+  }
+  // Persist for the done-step renderer. Vault overwrites services.json
+  // on its first authoritative boot, but until that completes the wizard
+  // needs a stable source of truth for the typed name — both for the
+  // op-poll page subtitle and the post-redirect done step.
+  setSetting(deps.db, "setup_vault_name", vaultName);
   const registry = deps.registry;
   const vaultSpec = specFor(FIRST_VAULT_SHORT);
 
@@ -853,6 +1103,16 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
     ? registry.create("install", FIRST_VAULT_SHORT)
     : { id: cryptoRandomId(), status: "pending" as const, log: [] as string[] };
   if (registry) {
+    // hub#267: thread the typed name through `PARACHUTE_VAULT_NAME` so
+    // vault's first-boot path (vault#342) names the created vault
+    // accordingly. Skip the env override when the operator left the
+    // field blank — vault's `resolveFirstBootVaultName` defaults to
+    // `default` on absent env vars, so this preserves the prior
+    // behaviour for the empty-input case.
+    const spawnEnv: Record<string, string> = {};
+    if (vaultName !== DEFAULT_VAULT_NAME) {
+      spawnEnv.PARACHUTE_VAULT_NAME = vaultName;
+    }
     void runInstall(op.id, FIRST_VAULT_SHORT, vaultSpec, {
       db: deps.db,
       issuer: deps.issuer,
@@ -861,6 +1121,7 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
       supervisor: deps.supervisor,
       registry,
       ...(deps.run ? { run: deps.run } : {}),
+      ...(Object.keys(spawnEnv).length > 0 ? { spawnEnv } : {}),
     }).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       registry.update(op.id, { status: "failed", error: msg }, `install failed: ${msg}`);
@@ -933,7 +1194,187 @@ export async function handleSetupExposePost(
   console.log(
     `[setup-wizard] opened first-client auto-approve window (60min) after expose-mode=${rawMode}`,
   );
+  // hub#272 Item A: auto-mint an operator token under the broad `admin`
+  // scope-set + persist it once so the done-step renderer can pre-fill
+  // the MCP install command with a Bearer header. The token is single-
+  // use surface on the done page — the renderer deletes it from
+  // hub_settings after one read so a stale tab refresh / back button
+  // doesn't re-disclose the secret. The jti is still in the `tokens`
+  // registry so revocation via the admin UI works as usual. Failures
+  // are non-fatal: the done page falls back to the un-headered MCP
+  // command + a "mint manually at /admin/tokens" hint.
+  try {
+    const minted = await mintOperatorToken(deps.db, session.userId, {
+      issuer: deps.issuer,
+      scopeSet: "admin",
+    });
+    setSetting(deps.db, "setup_minted_token", minted.token);
+    console.log(
+      `[setup-wizard] auto-minted operator token (jti=${minted.jti}, scope-set=admin) for done-screen MCP command`,
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[setup-wizard] failed to auto-mint operator token: ${msg}`);
+  }
   return redirect("/admin/setup?just_finished=1");
+}
+
+// --- step 5 helpers: install tiles --------------------------------------
+
+/**
+ * Curated module short → display props rendered on the done-screen
+ * install tiles. Order matters — list order is render order. Vault is
+ * intentionally excluded (the wizard already provisioned it).
+ *
+ * `tagline` mirrors each module's `displayName + tagline` from
+ * `FIRST_PARTY_FALLBACKS` (`src/service-spec.ts`); kept verbatim here
+ * so the wizard isn't coupled to service-spec internals.
+ */
+const INSTALL_TILE_PROPS: ReadonlyArray<{
+  short: CuratedModuleShort;
+  displayName: string;
+  tagline: string;
+}> = [
+  { short: "notes", displayName: "Notes", tagline: "Notes PWA backed by your vault." },
+  {
+    short: "scribe",
+    displayName: "Scribe",
+    tagline: "Local audio transcription for vault recordings.",
+  },
+];
+
+/**
+ * Construct the install-tile state array for the done step. Reads the
+ * URL's `?op_<short>=<id>` query (per-module op-poll), the services.json
+ * manifest (already-installed detection), and the operations registry
+ * (op status snapshot). Pure-ish — only the registry call is impure.
+ */
+function buildInstallTiles(url: URL, deps: SetupWizardDeps): ModuleInstallTileState[] {
+  const manifest = readManifest(deps.manifestPath);
+  return INSTALL_TILE_PROPS.filter((p) =>
+    (CURATED_MODULES as readonly string[]).includes(p.short),
+  ).map((p) => {
+    const spec = specFor(p.short);
+    const alreadyInstalled = manifest.services.some((s) => s.name === spec.manifestName);
+    const tile: ModuleInstallTileState = {
+      short: p.short,
+      displayName: p.displayName,
+      tagline: p.tagline,
+      alreadyInstalled,
+    };
+    const opId = url.searchParams.get(`op_${p.short}`);
+    if (opId && deps.registry) {
+      const op = deps.registry.get(opId);
+      if (op) {
+        tile.operation = {
+          id: op.id,
+          status: op.status,
+          log: op.log,
+          ...(op.error !== undefined ? { error: op.error } : {}),
+        };
+      }
+    }
+    return tile;
+  });
+}
+
+/**
+ * POST `/admin/setup/install/<short>`. Form-encoded, session-gated.
+ *
+ * Kicks off the same `runInstall` pipeline `/api/modules/<short>/install`
+ * uses (hub#260) but from the wizard's session-cookie surface — no
+ * separate bearer mint dance for the operator who just finished the
+ * wizard.
+ *
+ * Returns 303 to `/admin/setup?just_finished=1&op_<short>=<opId>` so
+ * the done-screen renderer picks up the op via `buildInstallTiles`.
+ * Multiple in-flight installs are supported (query keeps `op_<short>`
+ * per module); the auto-refresh meta keeps polling while any module
+ * is pending/running.
+ *
+ * Rejects when:
+ *   * `short` isn't a curated module short
+ *   * `short === "vault"` — the wizard's vault step owns that
+ *   * session cookie missing
+ *   * CSRF token missing or wrong
+ *   * supervisor isn't wired (CLI-mode hub)
+ */
+export async function handleSetupInstallPost(
+  req: Request,
+  short: string,
+  deps: SetupWizardDeps,
+): Promise<Response> {
+  if (!deps.supervisor) {
+    return badRequestPage(
+      "Module supervisor unavailable",
+      `Module installs from the wizard require container-mode \`parachute serve\`. On the on-box CLI surface, run \`parachute install ${short}\` directly.`,
+    );
+  }
+  if (!(CURATED_MODULES as readonly string[]).includes(short) || short === "vault") {
+    return badRequestPage(
+      "Unknown module",
+      `"${short}" is not an installable wizard module. Pick from the done-screen tiles.`,
+    );
+  }
+  const form = await req.formData();
+  const formCsrf = form.get(CSRF_FIELD_NAME);
+  if (!verifyCsrfToken(req, typeof formCsrf === "string" ? formCsrf : null)) {
+    return badRequestPage("Invalid form submission", "Reload and try again.");
+  }
+  const session = findActiveSession(deps.db, req);
+  if (!session) {
+    return badRequestPage(
+      "No admin session",
+      "Sign in to continue. The wizard's session cookie was set at step 2; clearing cookies between steps lands you here.",
+    );
+  }
+  const moduleShort = short as CuratedModuleShort;
+  const spec = specFor(moduleShort);
+  const registry = deps.registry;
+  // Idempotent short-circuit: if already supervised + running, return a
+  // synthesized succeeded op rather than firing a second `bun add`.
+  // Mirrors `handleSetupVaultPost` + `handleInstall`.
+  const supervisorState = deps.supervisor.get(moduleShort);
+  if (
+    supervisorState?.status === "running" ||
+    supervisorState?.status === "starting" ||
+    supervisorState?.status === "restarting"
+  ) {
+    if (registry) {
+      const op = registry.create("install", moduleShort);
+      registry.update(
+        op.id,
+        { status: "succeeded" },
+        `${moduleShort} already supervised (status=${supervisorState.status})`,
+      );
+      return redirect(
+        `/admin/setup?just_finished=1&op_${moduleShort}=${encodeURIComponent(op.id)}`,
+      );
+    }
+    return redirect("/admin/setup?just_finished=1");
+  }
+  const op = registry
+    ? registry.create("install", moduleShort)
+    : { id: cryptoRandomId(), status: "pending" as const, log: [] as string[] };
+  if (registry) {
+    void runInstall(op.id, moduleShort, spec, {
+      db: deps.db,
+      issuer: deps.issuer,
+      manifestPath: deps.manifestPath,
+      configDir: deps.configDir,
+      supervisor: deps.supervisor,
+      registry,
+      ...(deps.run ? { run: deps.run } : {}),
+    }).catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      registry.update(op.id, { status: "failed", error: msg }, `install failed: ${msg}`);
+    });
+  } else {
+    console.warn(
+      "[setup-wizard] handleSetupInstallPost called with no operations registry — install will NOT run. Wire deps.registry in the dispatcher.",
+    );
+  }
+  return redirect(`/admin/setup?just_finished=1&op_${moduleShort}=${encodeURIComponent(op.id)}`);
 }
 
 // --- helpers ------------------------------------------------------------
@@ -1214,6 +1655,124 @@ const STYLES = `
     margin-top: 0.4rem;
   }
   .btn-primary:hover { background: ${PALETTE.accentHover}; }
+  .btn-secondary {
+    background: transparent;
+    color: ${PALETTE.accent};
+    border-color: ${PALETTE.accent};
+  }
+  .btn-secondary:hover {
+    background: ${PALETTE.accentSoft};
+  }
+  /* Copy button rides at the right edge of the MCP command pre. Compact
+     vertical sizing so it doesn't dwarf the snippet on narrow widths;
+     full text wrap on the pre keeps the snippet readable behind it. */
+  .mcp-cmd-wrap {
+    position: relative;
+    margin: 0.5rem 0;
+  }
+  .mcp-cmd-wrap pre {
+    background: ${PALETTE.bg};
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    padding: 0.5rem 5.5rem 0.5rem 0.75rem;
+    overflow-x: auto;
+    font-size: 0.82rem;
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .btn-copy {
+    position: absolute;
+    top: 0.35rem;
+    right: 0.35rem;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.78rem;
+    min-height: auto;
+    background: ${PALETTE.cardBg};
+    color: ${PALETTE.fg};
+    border: 1px solid ${PALETTE.border};
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .btn-copy:hover {
+    border-color: ${PALETTE.accent};
+    color: ${PALETTE.accent};
+  }
+  /* Install-tile section (hub#272 Item B). Lives above the .done-grid;
+     primary "what's next?" surface. Tiles render in a responsive grid
+     that collapses to one column on narrow viewports. */
+  .install-tiles {
+    margin: 1rem 0 1.25rem;
+  }
+  .install-tiles-heading {
+    margin: 0 0 0.25rem;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 1.05rem;
+    color: ${PALETTE.fg};
+  }
+  .install-tiles-subtitle {
+    margin: 0 0 0.75rem;
+    color: ${PALETTE.fgMuted};
+    font-size: 0.9rem;
+  }
+  .install-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.75rem;
+  }
+  @media (min-width: 30rem) {
+    .install-grid { grid-template-columns: 1fr 1fr; }
+  }
+  .install-tile {
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 8px;
+    padding: 0.75rem 0.9rem;
+    background: ${PALETTE.cardBg};
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .install-tile h3 {
+    margin: 0;
+    font-family: ${FONT_SERIF};
+    font-weight: 400;
+    font-size: 1.1rem;
+    color: ${PALETTE.fg};
+  }
+  .install-tile-tagline {
+    margin: 0;
+    color: ${PALETTE.fgMuted};
+    font-size: 0.85rem;
+  }
+  .install-tile-form {
+    margin: 0;
+  }
+  .install-tile-installed {
+    background: ${PALETTE.accentSoft};
+    border-color: ${PALETTE.accent};
+  }
+  .install-tile-status {
+    margin: 0;
+    color: ${PALETTE.success};
+    font-weight: 500;
+    font-size: 0.85rem;
+  }
+  .install-tile-running, .install-tile-pending {
+    border-color: ${PALETTE.warn};
+  }
+  .install-tile-succeeded {
+    background: ${PALETTE.accentSoft};
+    border-color: ${PALETTE.accent};
+  }
+  .install-tile-failed {
+    border-color: ${PALETTE.danger};
+    background: ${PALETTE.dangerSoft};
+  }
+  .install-tile-log {
+    margin: 0;
+    font-size: 0.78rem;
+  }
   .alt-path {
     margin-top: 1.25rem;
     border-top: 1px solid ${PALETTE.borderLight};

@@ -33,6 +33,7 @@ import {
   handleSetupAccountPost,
   handleSetupExposePost,
   handleSetupGet,
+  handleSetupInstallPost,
   handleSetupVaultPost,
 } from "../setup-wizard.ts";
 import { Supervisor } from "../supervisor.ts";
@@ -231,7 +232,7 @@ describe("handleSetupGet", () => {
     }
   });
 
-  test("renders the vault form once admin exists (fold B: shows 'default' as static)", async () => {
+  test("renders the vault form with a vault-name input once admin exists (hub#267)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       await createUser(db, "owner", "pw");
@@ -245,12 +246,19 @@ describe("handleSetupGet", () => {
       expect(res.status).toBe(200);
       const html = await res.text();
       expect(html).toContain('action="/admin/setup/vault"');
-      // The vault name is hard-bound to "default" pending hub#267 — the
-      // form has no name input, just a submit button + a preview card
-      // showing the canonical name + the follow-up issue link.
+      // hub#267: the vault-name text input is back. Default placeholder
+      // is "default" + the preview card mirrors the placeholder; the
+      // operator can leave the field blank and still get a working
+      // vault.
+      expect(html).toContain('name="vault_name"');
+      expect(html).toContain('placeholder="default"');
       expect(html).toContain('id="preview-vault-name">default<');
-      expect(html).not.toContain('name="vault_name"');
-      expect(html).toContain("hub#267");
+      // The input enforces vault's contract (lowercase alphanumeric +
+      // -/_, 2-32 chars) at the HTML5 layer too so an over-eager
+      // browser surfaces the error before POST.
+      expect(html).toContain('pattern="[a-z0-9_-]+"');
+      expect(html).toContain('minlength="2"');
+      expect(html).toContain('maxlength="32"');
     } finally {
       db.close();
     }
@@ -1190,5 +1198,773 @@ describe("handleSetupExposePost", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+// --- hub#272 Item A: auto-mint operator token + MCP command rendering ---
+
+describe("done screen auto-minted token (hub#272 Item A)", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  async function bringWizardToExposeStep(db: ReturnType<typeof openHubDb>) {
+    const user = await createUser(db, "owner", "pw");
+    writeManifest(
+      {
+        services: [
+          {
+            name: "parachute-vault",
+            version: "0.1.0",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/health",
+          },
+        ],
+      },
+      h.manifestPath,
+    );
+    const { createSession } = await import("../sessions.ts");
+    const session = createSession(db, { userId: user.id });
+    const get = handleSetupGet(req("/admin/setup"), {
+      db,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      issuer: "https://hub.example",
+      registry: getDefaultOperationsRegistry(),
+    });
+    const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+    return { user, session, csrf };
+  }
+
+  test("expose POST mints + stores an operator token in hub_settings (setup_minted_token)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const { session, csrf } = await bringWizardToExposeStep(db);
+      const form = new URLSearchParams({
+        expose_mode: "localhost",
+        [CSRF_FIELD_NAME]: csrf,
+      }).toString();
+      const res = await handleSetupExposePost(
+        req("/admin/setup/expose", {
+          method: "POST",
+          body: form,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(res.status).toBe(303);
+      // Token is a JWT (three base64url segments). We don't assert the
+      // exact value — the load-bearing surface is "a non-empty token
+      // exists" so the done-step renderer has something to inject.
+      const stored = getSetting(db, "setup_minted_token");
+      expect(stored).toBeDefined();
+      expect(stored?.split(".").length).toBe(3);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done screen renders the MCP command with a Bearer header when a minted token exists", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      setSetting(db, "setup_minted_token", "test-jwt-token-abc");
+      const res = handleSetupGet(req("/admin/setup?just_finished=1"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("--header &quot;Authorization: Bearer test-jwt-token-abc&quot;");
+      expect(html).toContain('data-target="mcp-cmd"');
+      expect(html).toContain('id="mcp-cmd"');
+      expect(html).toContain("/admin/tokens");
+      // The token is single-use — consumed on first render.
+      expect(getSetting(db, "setup_minted_token")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done screen falls back to bare MCP command + admin/tokens hint when no minted token", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const res = handleSetupGet(req("/admin/setup?just_finished=1"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const html = await res.text();
+      expect(html).toContain("claude mcp add --transport http parachute-default");
+      // The fallback explanatory text mentions `pvt_...` as a placeholder
+      // but the actual `--header` flag must NOT be appended to the
+      // command line itself.
+      expect(html).toContain("Bearer pvt_");
+      expect(html).toContain("/admin/tokens");
+      // Specifically no Copy button — that's a token-present surface.
+      expect(html).not.toContain('id="mcp-cmd"');
+    } finally {
+      db.close();
+    }
+  });
+
+  test("minted token is consumed after first render — refresh shows the fallback shape", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      setSetting(db, "setup_minted_token", "test-token-xyz");
+      const deps = {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      };
+      const first = handleSetupGet(req("/admin/setup?just_finished=1"), deps);
+      const firstHtml = await first.text();
+      expect(firstHtml).toContain("test-token-xyz");
+      const second = handleSetupGet(req("/admin/setup?just_finished=1"), deps);
+      const secondHtml = await second.text();
+      expect(secondHtml).not.toContain("test-token-xyz");
+      // The MCP command tile has no Copy button on the fallback shape.
+      expect(secondHtml).not.toContain('id="mcp-cmd"');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// --- hub#272 Item B: install-tile rendering + install POST --------------
+
+describe("done screen install tiles (hub#272 Item B)", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  test("done screen renders Install Notes + Install Scribe tiles when neither is installed", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const res = handleSetupGet(req("/admin/setup?just_finished=1"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const html = await res.text();
+      expect(html).toContain("What's next?");
+      expect(html).toContain("Install Notes");
+      expect(html).toContain("Install Scribe");
+      expect(html).toContain('action="/admin/setup/install/notes"');
+      expect(html).toContain('action="/admin/setup/install/scribe"');
+    } finally {
+      db.close();
+    }
+  });
+
+  test("tile shows 'Already installed' when a curated module is in services.json", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+            {
+              name: "parachute-notes",
+              version: "0.1.0",
+              port: 1942,
+              paths: ["/notes"],
+              health: "/notes/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const res = handleSetupGet(req("/admin/setup?just_finished=1"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const html = await res.text();
+      expect(html).toContain("Already installed");
+      expect(html).toContain('action="/admin/setup/install/scribe"');
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done screen renders op-poll panel when ?op_notes=<id> matches a registry op", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const reg = getDefaultOperationsRegistry();
+      const op = reg.create("install", "notes");
+      reg.update(op.id, { status: "running" }, "running bun add -g @openparachute/notes@latest");
+      const res = handleSetupGet(req(`/admin/setup?just_finished=1&op_notes=${op.id}`), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: reg,
+      });
+      const html = await res.text();
+      expect(html).toContain("status: running");
+      expect(html).toContain("running bun add");
+      // Auto-refresh wired so the next tick re-fetches.
+      expect(html).toContain('http-equiv="refresh"');
+    } finally {
+      db.close();
+    }
+  });
+
+  test("install POST enqueues an op + redirects to ?op_<short>=<id>", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const get = handleSetupGet(req("/admin/setup?just_finished=1"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const runCalls: string[][] = [];
+      const stubbedRun = async (cmd: readonly string[]) => {
+        runCalls.push([...cmd]);
+        return 0;
+      };
+      const post = await handleSetupInstallPost(
+        req("/admin/setup/install/notes", {
+          method: "POST",
+          body: new URLSearchParams({ [CSRF_FIELD_NAME]: csrf }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        "notes",
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          supervisor: makeSupervisor(),
+          registry: getDefaultOperationsRegistry(),
+          run: stubbedRun,
+        },
+      );
+      expect(post.status).toBe(303);
+      const location = post.headers.get("location") ?? "";
+      expect(location).toMatch(/^\/admin\/setup\?just_finished=1&op_notes=/);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(runCalls.length).toBeGreaterThan(0);
+      expect(runCalls[0]?.join(" ")).toContain("bun add -g @openparachute/notes@latest");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("install POST rejects 'vault' short (the wizard's own step owns that)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const post = await handleSetupInstallPost(
+        req("/admin/setup/install/vault", {
+          method: "POST",
+          body: new URLSearchParams({ [CSRF_FIELD_NAME]: csrf }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        "vault",
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          supervisor: makeSupervisor(),
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(post.status).toBe(400);
+      const html = await post.text();
+      expect(html).toContain("not an installable wizard module");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("install POST rejects unknown short", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const post = await handleSetupInstallPost(
+        req("/admin/setup/install/bogus", {
+          method: "POST",
+          body: new URLSearchParams({}).toString(),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        "bogus",
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          supervisor: makeSupervisor(),
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(post.status).toBe(400);
+      const html = await post.text();
+      expect(html).toContain("not an installable wizard module");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("install POST without admin session is rejected", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const post = await handleSetupInstallPost(
+        req("/admin/setup/install/notes", {
+          method: "POST",
+          body: new URLSearchParams({ [CSRF_FIELD_NAME]: csrf }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}`,
+          },
+        }),
+        "notes",
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          supervisor: makeSupervisor(),
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(post.status).toBe(400);
+      const html = await post.text();
+      expect(html).toContain("No admin session");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("install POST without supervisor (CLI mode) is rejected", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      const post = await handleSetupInstallPost(
+        req("/admin/setup/install/notes", {
+          method: "POST",
+          body: new URLSearchParams({}).toString(),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        "notes",
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(post.status).toBe(400);
+      const html = await post.text();
+      expect(html).toContain("supervisor unavailable");
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// --- hub#267: typed vault name threading --------------------------------
+
+describe("typed vault name (hub#267)", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  test("vault POST accepts a valid typed name + passes PARACHUTE_VAULT_NAME via env to supervisor", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      // Capture supervisor spawn requests so we can assert env passthrough.
+      const spawnRequests: Array<{
+        short: string;
+        env?: Record<string, string>;
+      }> = [];
+      const supervisor = new Supervisor({
+        output: () => {},
+        spawnFn: (sreq) => {
+          spawnRequests.push({
+            short: sreq.short,
+            ...(sreq.env ? { env: sreq.env } : {}),
+          });
+          return {
+            pid: 22222,
+            exited: new Promise<number | null>(() => {}),
+            stdout: null,
+            stderr: null,
+            kill: () => {},
+          };
+        },
+      });
+      const stubbedRun = async (_cmd: readonly string[]) => 0;
+      const post = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          body: new URLSearchParams({
+            [CSRF_FIELD_NAME]: csrf,
+            vault_name: "smoke-1940",
+          }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          supervisor,
+          registry: getDefaultOperationsRegistry(),
+          run: stubbedRun,
+        },
+      );
+      expect(post.status).toBe(303);
+      expect(getSetting(db, "setup_vault_name")).toBe("smoke-1940");
+      // Yield long enough for runInstall → spawnSupervised → supervisor.start
+      await new Promise((r) => setTimeout(r, 50));
+      expect(spawnRequests.length).toBeGreaterThan(0);
+      const vaultSpawn = spawnRequests.find((s) => s.short === "vault");
+      expect(vaultSpawn).toBeDefined();
+      expect(vaultSpawn?.env?.PARACHUTE_VAULT_NAME).toBe("smoke-1940");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("vault POST rejects an invalid name (uppercase) with a 400 + error banner + preserved input", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const post = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          body: new URLSearchParams({
+            [CSRF_FIELD_NAME]: csrf,
+            vault_name: "BAD-NAME",
+          }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          supervisor: makeSupervisor(),
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(post.status).toBe(400);
+      const html = await post.text();
+      expect(html).toContain("lowercase alphanumeric");
+      expect(html).toContain('value="BAD-NAME"');
+      expect(getSetting(db, "setup_vault_name")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("vault POST with empty name falls back to 'default' + omits the env override", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const spawnRequests: Array<{
+        short: string;
+        env?: Record<string, string>;
+      }> = [];
+      const supervisor = new Supervisor({
+        output: () => {},
+        spawnFn: (sreq) => {
+          spawnRequests.push({
+            short: sreq.short,
+            ...(sreq.env ? { env: sreq.env } : {}),
+          });
+          return {
+            pid: 33333,
+            exited: new Promise<number | null>(() => {}),
+            stdout: null,
+            stderr: null,
+            kill: () => {},
+          };
+        },
+      });
+      const post = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          body: new URLSearchParams({
+            [CSRF_FIELD_NAME]: csrf,
+            vault_name: "",
+          }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          supervisor,
+          registry: getDefaultOperationsRegistry(),
+          run: async () => 0,
+        },
+      );
+      expect(post.status).toBe(303);
+      expect(getSetting(db, "setup_vault_name")).toBe("default");
+      await new Promise((r) => setTimeout(r, 50));
+      const vaultSpawn = spawnRequests.find((s) => s.short === "vault");
+      expect(vaultSpawn).toBeDefined();
+      // No env override on the default-name path (vault's
+      // resolveFirstBootVaultName already defaults to "default" when the
+      // env var is absent, so the override would be redundant).
+      expect(vaultSpawn?.env).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done screen surfaces the typed name in the MCP command", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      setSetting(db, "setup_vault_name", "my-personal-vault");
+      const res = handleSetupGet(req("/admin/setup?just_finished=1"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const html = await res.text();
+      expect(html).toContain("parachute-my-personal-vault");
+      expect(html).toContain("/vault/my-personal-vault/mcp");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("vault step pre-fills the prior typed value after a validation error", async () => {
+    const { renderVaultStep } = await import("../setup-wizard.ts");
+    const html = renderVaultStep({
+      csrfToken: "csrf-test",
+      vaultName: "BAD",
+      errorMessage: "vault names must be lowercase alphanumeric with hyphens or underscores.",
+    });
+    expect(html).toContain('value="BAD"');
+    expect(html).toContain("lowercase alphanumeric");
+    expect(html).toContain('id="preview-vault-name">BAD<');
   });
 });

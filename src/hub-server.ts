@@ -151,6 +151,7 @@ import {
   handleSetupAccountPost,
   handleSetupExposePost,
   handleSetupGet,
+  handleSetupInstallPost,
   handleSetupVaultPost,
 } from "./setup-wizard.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
@@ -1014,6 +1015,16 @@ export function hubFetch(
       if (pathname === "/admin/setup/expose") {
         if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
         return handleSetupExposePost(req, wizardDeps);
+      }
+      // hub#272 Item B: post-wizard direct module-install POSTs from
+      // the done-screen "What's next?" tiles. Path shape is
+      // `/admin/setup/install/<short>`; the handler rejects on
+      // unknown shorts, on `vault` (the wizard's own step owns that),
+      // and on missing session/CSRF — same gates as the vault POST.
+      if (pathname.startsWith("/admin/setup/install/")) {
+        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+        const short = pathname.slice("/admin/setup/install/".length);
+        return handleSetupInstallPost(req, short, wizardDeps);
       }
       return new Response("not found", { status: 404 });
     }

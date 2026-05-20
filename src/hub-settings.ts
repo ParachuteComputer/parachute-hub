@@ -25,7 +25,23 @@
 import type { Database } from "bun:sqlite";
 
 // Adding a setting: extend this union + write a typed accessor. The table itself is generic KV.
-export type HubSettingKey = "setup_expose_mode" | "pending_first_client_auto_approve_until";
+export type HubSettingKey =
+  | "setup_expose_mode"
+  | "pending_first_client_auto_approve_until"
+  // hub#272: auto-minted operator token surfaced once on the wizard's
+  // done screen. Single-use — the done-step renderer reads + deletes the
+  // row so a subsequent GET (page refresh, back button) doesn't re-show
+  // the secret. Lives in hub_settings rather than tokens because it's a
+  // wizard-flow ephemeral, not a persistent issued credential — the
+  // mintOperatorToken call still records the jti in the `tokens`
+  // registry, so revocation works as usual.
+  | "setup_minted_token"
+  // hub#267: the typed vault name. Persisted at vault POST time so the
+  // done step can render the operator's choice in the MCP URL +
+  // install-command snippet without re-deriving from services.json
+  // (vault's first-boot may write its own paths shape that the wizard
+  // can't trust to match `<name>` exactly until the spawn settles).
+  | "setup_vault_name";
 
 export type SetupExposeMode = "localhost" | "tailnet" | "public";
 
