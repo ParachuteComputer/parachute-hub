@@ -33,6 +33,11 @@ function makeDb() {
 }
 
 describe("createUser", () => {
+  // Note: createUser doesn't call validatePassword directly (PR 2 wires
+  // it at the endpoint layer). These short passwords ("hunter2", "pw1",
+  // etc.) are deliberate for testing the argon2id round-trip + the
+  // INSERT shape in isolation; PR 2's endpoint tests will use full-
+  // length (12+ char) passwords against the validator-gated path.
   test("creates a user and stores an argon2id hash", async () => {
     const { db, cleanup } = makeDb();
     try {

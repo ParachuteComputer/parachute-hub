@@ -433,7 +433,15 @@ async function runSetPassword(args: readonly string[], deps: AuthDeps): Promise<
     }
 
     try {
-      const u = await createUser(db, targetUsername, password, { allowMulti: flags.allowMulti });
+      // `passwordChanged: true` matches the wizard + env-seed paths: the
+      // CLI user typed their password at the prompt above (or supplied
+      // it via --password), so they don't need PR 3's force-change-on-
+      // first-sign-in redirect. Same reasoning as
+      // `seedInitialAdminIfNeeded` and `handleSetupAccountPost`.
+      const u = await createUser(db, targetUsername, password, {
+        allowMulti: flags.allowMulti,
+        passwordChanged: true,
+      });
       console.log(`Created hub user "${u.username}" (id=${u.id}).`);
       const issued = await issueOperatorToken(db, u.id, {
         dir: deps.configDir,

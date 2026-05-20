@@ -233,6 +233,11 @@ export function validateUsername(name: string): ValidateUsernameResult {
   if (name.length < USERNAME_MIN_LEN || name.length > USERNAME_MAX_LEN) {
     return { valid: false, reason: "length" };
   }
+  // The regex deliberately allows leading/trailing `_` and `-` (so
+  // `_-_`, `--alice`, `-foo`, `bar_` all pass the format gate). Stricter
+  // rules can land later if real-world users hit confusion. Vault's
+  // parallel username validator has the same shape — cross-repo parity
+  // matters more than aesthetic edge-case rejection here.
   if (!USERNAME_REGEX.test(name)) {
     return { valid: false, reason: "format" };
   }
@@ -258,6 +263,19 @@ export function validateUsername(name: string): ValidateUsernameResult {
  * form) wire the `reason` into the response.
  */
 export const PASSWORD_MIN_LEN = 12;
+
+/**
+ * Upper bound for incoming password bodies. Not enforced inside
+ * `validatePassword` itself — the validator's contract is "length floor,
+ * no complexity rules" and adding a ceiling would muddy it. Exposed as
+ * a constant so PR 2's `POST /api/users` (and PR 3's change-password
+ * form) can cap incoming bodies before argon2id touches them. Defense
+ * against a CPU-DoS shape where an unauthenticated POST submits a
+ * megabyte password and forces a long argon2id hash. 256 chars is
+ * comfortably above any human-chosen passphrase (Diceware 8-word
+ * passphrases run ~55 chars).
+ */
+export const PASSWORD_MAX_LEN = 256;
 
 export type ValidatePasswordResult = { valid: true } | { valid: false; reason: "too_short" };
 
