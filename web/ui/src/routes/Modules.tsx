@@ -12,6 +12,16 @@
  *     and we poll GET /api/modules/operations/:id every second until
  *     terminal. The op's `log` array drives a small progress banner.
  *
+ * Layout (hub#260 closeout): two clear sections, **Installed modules**
+ * on top + **Install a module** below. The split makes the "what's
+ * available to add?" affordance discoverable — pre-hub#260 the install
+ * + upgrade actions were wired but every module rendered as one row in
+ * a single list, so a fresh-deploy operator had to scan past three
+ * tagline+meta blocks to find the Install buttons. With the split, an
+ * empty hub lands on a near-empty Installed section + a clear "Install
+ * a module" catalog underneath; a populated hub lands on its modules
+ * up top + a smaller "available to add" list underneath.
+ *
  * `supervisor_available: false` is the on-box CLI path (no `parachute
  * serve`). Actions get disabled and a small banner tells the operator
  * to use `parachute install/upgrade/restart` from their shell instead.
@@ -125,6 +135,13 @@ export function Modules() {
   }, [pendingOps, refreshCatalog]);
 
   async function onInstall(short: string) {
+    // Clear any previous error on this module so a retry isn't shadowed
+    // by stale text — same shape as onRestart / onUninstall below.
+    setSyncError((prev) => {
+      const next = { ...prev };
+      delete next[short];
+      return next;
+    });
     try {
       const operationId = await installModule(short);
       setPendingOps((prev) => [
@@ -140,6 +157,11 @@ export function Modules() {
   }
 
   async function onUpgrade(short: string) {
+    setSyncError((prev) => {
+      const next = { ...prev };
+      delete next[short];
+      return next;
+    });
     try {
       const operationId = await upgradeModule(short);
       setPendingOps((prev) => [
@@ -230,6 +252,23 @@ export function Modules() {
   const okCatalog = catalog.catalog;
   const { modules, supervisor_available, module_install_channel } = okCatalog;
 
+  // Two visual buckets driven entirely off the wire shape — no client
+  // re-derivation of "is this available". Modules with `installed: true`
+  // go on top (operator's running set); modules with `available: true`
+  // and `!installed` go below as the install catalog.
+  const installedModules = modules.filter((m) => m.installed);
+  const installableModules = modules.filter((m) => !m.installed && m.available);
+
+  // While an install op is in flight for a given short, the catalog
+  // hasn't refreshed yet (we wait for the terminal poll) so the module
+  // still appears under "Install a module". Track shorts with an
+  // in-flight install op so we can suppress the duplicate render until
+  // the catalog refresh moves the row to the Installed section.
+  const installingShorts = new Set(
+    pendingOps.filter((p) => p.kind === "install").map((p) => p.short),
+  );
+  const visibleInstallable = installableModules.filter((m) => !installingShorts.has(m.short));
+
   async function onChangeChannel(next: ModuleInstallChannel) {
     if (next === module_install_channel) return;
     // Optimistic update so the radio reflects the click before the
@@ -278,7 +317,7 @@ export function Modules() {
       )}
 
       {pendingOps.length > 0 && (
-        <div className="banner">
+        <div className="banner" data-testid="pending-ops-banner">
           <strong>In progress:</strong>
           <ul>
             {pendingOps.map((p) => (
@@ -297,21 +336,54 @@ export function Modules() {
         </div>
       )}
 
-      <ul className="module-list">
-        {modules.map((mod) => (
-          <ModuleRow
-            key={mod.short}
-            module={mod}
-            supervisorAvailable={supervisor_available}
-            syncBusy={Boolean(syncBusy[mod.short])}
-            errorMessage={syncError[mod.short]}
-            onInstall={() => void onInstall(mod.short)}
-            onUpgrade={() => void onUpgrade(mod.short)}
-            onRestart={() => void onRestart(mod.short)}
-            onUninstall={() => void onUninstall(mod.short)}
-          />
-        ))}
-      </ul>
+      <section className="modules-installed" data-testid="installed-section">
+        <h2>Installed modules</h2>
+        {installedModules.length === 0 ? (
+          <p className="muted" data-testid="installed-empty">
+            No modules installed yet. Pick one from <strong>Install a module</strong> below to get
+            started.
+          </p>
+        ) : (
+          <ul className="module-list">
+            {installedModules.map((mod) => (
+              <ModuleRow
+                key={mod.short}
+                module={mod}
+                supervisorAvailable={supervisor_available}
+                syncBusy={Boolean(syncBusy[mod.short])}
+                errorMessage={syncError[mod.short]}
+                onUpgrade={() => void onUpgrade(mod.short)}
+                onRestart={() => void onRestart(mod.short)}
+                onUninstall={() => void onUninstall(mod.short)}
+              />
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="modules-installable" data-testid="installable-section">
+        <h2>Install a module</h2>
+        {visibleInstallable.length === 0 ? (
+          <p className="muted" data-testid="installable-empty">
+            {installingShorts.size > 0
+              ? "Install in progress — see In progress above."
+              : "All available modules are installed."}
+          </p>
+        ) : (
+          <ul className="install-list">
+            {visibleInstallable.map((mod) => (
+              <InstallableCard
+                key={mod.short}
+                module={mod}
+                supervisorAvailable={supervisor_available}
+                installing={installingShorts.has(mod.short)}
+                errorMessage={syncError[mod.short]}
+                onInstall={() => void onInstall(mod.short)}
+              />
+            ))}
+          </ul>
+        )}
+      </section>
     </section>
   );
 }
@@ -321,25 +393,29 @@ interface ModuleRowProps {
   supervisorAvailable: boolean;
   syncBusy: boolean;
   errorMessage: string | undefined;
-  onInstall: () => void;
   onUpgrade: () => void;
   onRestart: () => void;
   onUninstall: () => void;
 }
 
+/**
+ * Row for an installed module — shows version + supervisor status +
+ * Configure / Restart / Upgrade / Uninstall affordances. The "install"
+ * action lives on `InstallableCard` instead; this row is only rendered
+ * for `installed: true` modules.
+ */
 function ModuleRow({
   module: mod,
   supervisorAvailable,
   syncBusy,
   errorMessage,
-  onInstall,
   onUpgrade,
   onRestart,
   onUninstall,
 }: ModuleRowProps) {
   const canAct = supervisorAvailable && !syncBusy;
   const upgradeAvailable =
-    mod.installed && mod.installed_version !== mod.latest_version && mod.latest_version !== null;
+    mod.installed_version !== mod.latest_version && mod.latest_version !== null;
 
   return (
     <li className="module-row" data-short={mod.short}>
@@ -358,21 +434,11 @@ function ModuleRow({
         <dd>
           <code>{mod.package}</code>
         </dd>
-        {mod.installed && (
-          <>
-            <dt>Installed</dt>
-            <dd>
-              v{mod.installed_version ?? "unknown"}
-              {upgradeAvailable && <span className="badge">v{mod.latest_version} available</span>}
-            </dd>
-          </>
-        )}
-        {!mod.installed && mod.latest_version && (
-          <>
-            <dt>Latest on npm</dt>
-            <dd>v{mod.latest_version}</dd>
-          </>
-        )}
+        <dt>Installed</dt>
+        <dd>
+          v{mod.installed_version ?? "unknown"}
+          {upgradeAvailable && <span className="badge">v{mod.latest_version} available</span>}
+        </dd>
         {mod.pid && (
           <>
             <dt>PID</dt>
@@ -382,36 +448,82 @@ function ModuleRow({
       </dl>
 
       <div className="actions">
-        {!mod.installed && (
-          <button type="button" disabled={!canAct} onClick={onInstall}>
-            Install
-          </button>
-        )}
-        {mod.installed && (
-          <>
-            {/* Configure link routes to the generic per-module config
-                form (hub#260). Rendered as a Link rather than a button
-                because it's pure navigation — no async action attached,
-                no supervisor requirement. Stays clickable even when the
-                supervisor is offline so an operator on a hub-only CLI
-                install can still edit config (the config endpoints are
-                served by the module itself, not the supervisor). */}
-            <Link className="btn" to={`/modules/${encodeURIComponent(mod.short)}/config`}>
-              Configure
-            </Link>
-            <button type="button" disabled={!canAct} onClick={onRestart}>
-              Restart
-            </button>
-            <button type="button" disabled={!canAct || !upgradeAvailable} onClick={onUpgrade}>
-              {upgradeAvailable ? `Upgrade to v${mod.latest_version}` : "Up to date"}
-            </button>
-            <button type="button" className="destructive" disabled={!canAct} onClick={onUninstall}>
-              Uninstall
-            </button>
-          </>
-        )}
+        {/* Configure link routes to the generic per-module config form
+            (hub#260). Rendered as a Link rather than a button because
+            it's pure navigation — no async action attached, no
+            supervisor requirement. Stays clickable even when the
+            supervisor is offline so an operator on a hub-only CLI
+            install can still edit config (the config endpoints are
+            served by the module itself, not the supervisor). */}
+        <Link className="btn" to={`/modules/${encodeURIComponent(mod.short)}/config`}>
+          Configure
+        </Link>
+        <button type="button" disabled={!canAct} onClick={onRestart}>
+          Restart
+        </button>
+        <button type="button" disabled={!canAct || !upgradeAvailable} onClick={onUpgrade}>
+          {upgradeAvailable ? `Upgrade to v${mod.latest_version}` : "Up to date"}
+        </button>
+        <button type="button" className="destructive" disabled={!canAct} onClick={onUninstall}>
+          Uninstall
+        </button>
       </div>
 
+      {errorMessage && <div className="error">{errorMessage}</div>}
+    </li>
+  );
+}
+
+interface InstallableCardProps {
+  module: ModuleListing;
+  supervisorAvailable: boolean;
+  installing: boolean;
+  errorMessage: string | undefined;
+  onInstall: () => void;
+}
+
+/**
+ * Card for an available-but-not-installed module. Lives in the
+ * "Install a module" section and renders a name + tagline + npm
+ * version + a single Install button. Distinct from the installed
+ * ModuleRow because there's nothing to configure / restart / upgrade
+ * yet — the affordance is exactly one action ("get me this module").
+ *
+ * `installing` short-circuits to a spinner-ish label even before the
+ * row drops out of the visible list (which it does as soon as the
+ * pendingOps tracker picks up the kick-off). Belt-and-suspenders
+ * against a fast-finger double-click in the ~50ms gap before the op
+ * lands in `pendingOps`.
+ */
+function InstallableCard({
+  module: mod,
+  supervisorAvailable,
+  installing,
+  errorMessage,
+  onInstall,
+}: InstallableCardProps) {
+  const canInstall = supervisorAvailable && !installing;
+  return (
+    <li className="install-card" data-short={mod.short}>
+      <div className="install-card-body">
+        <h3>
+          {mod.display_name} <span className="muted">({mod.short})</span>
+        </h3>
+        {mod.tagline ? <p className="tagline">{mod.tagline}</p> : null}
+        <p className="muted install-card-meta">
+          <code>{mod.package}</code>
+          {mod.latest_version ? (
+            <>
+              {" · "}latest <code>v{mod.latest_version}</code>
+            </>
+          ) : null}
+        </p>
+      </div>
+      <div className="install-card-actions">
+        <button type="button" disabled={!canInstall} onClick={onInstall}>
+          {installing ? "Installing…" : "Install"}
+        </button>
+      </div>
       {errorMessage && <div className="error">{errorMessage}</div>}
     </li>
   );
