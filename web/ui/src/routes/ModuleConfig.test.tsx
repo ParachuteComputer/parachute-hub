@@ -208,6 +208,31 @@ describe("ModuleConfig — scribe golden fixture", () => {
     expect(screen.getByTestId("save-success")).toHaveTextContent(/transcribeProvider/);
   });
 
+  it("typing a field back to its original value un-dirties it (revert)", async () => {
+    vi.mocked(api.putModuleConfigValues).mockResolvedValue({ restart_required: [] });
+    renderRoute();
+    await waitFor(() => expect(screen.getByTestId("config-form")).toBeInTheDocument());
+
+    // Original transcribeProvider is "parakeet-mlx". Change to "groq",
+    // then back to "parakeet-mlx". The PUT must NOT include the field.
+    const provider = screen.getByLabelText(/transcription provider/i) as HTMLSelectElement;
+    fireEvent.change(provider, { target: { value: "groq" } });
+    fireEvent.change(provider, { target: { value: "parakeet-mlx" } });
+
+    // Also touch the cleanup-default checkbox so the submit has *something*
+    // dirty — otherwise the "no changes" early-exit short-circuits the PUT.
+    const cleanupDefault = screen.getByLabelText(/run cleanup by default/i) as HTMLInputElement;
+    fireEvent.click(cleanupDefault);
+
+    fireEvent.submit(screen.getByTestId("config-form"));
+
+    await waitFor(() => expect(api.putModuleConfigValues).toHaveBeenCalledTimes(1));
+    const [, payload] = vi.mocked(api.putModuleConfigValues).mock.calls[0] ?? [];
+    // Only the actually-changed field survives the revert.
+    expect(payload).toEqual({ cleanupDefault: false });
+    expect(payload).not.toHaveProperty("transcribeProvider");
+  });
+
   it("4xx response surfaces field-level errors inline", async () => {
     vi.mocked(api.putModuleConfigValues).mockRejectedValue(
       new api.HttpError(

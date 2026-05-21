@@ -81,9 +81,13 @@ export function ModuleConfig() {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   // `draft` mirrors the user's typed values per field. `dirty` is the
   // per-field "did the user touch this?" gate that drives the changed-
-  // fields-only PUT shape.
+  // fields-only PUT shape. `originalValues` is a frozen snapshot of the
+  // GET response so the dirty-tracker can un-dirty a field when the
+  // user types a value back to its original — without this, typing
+  // 'baz' then back to 'bar' would still include 'foo' in the PUT.
   const [draft, setDraft] = useState<ModuleConfigValues>({});
   const [dirty, setDirty] = useState<Record<string, boolean>>({});
+  const [originalValues, setOriginalValues] = useState<ModuleConfigValues>({});
   const [saving, setSaving] = useState(false);
   const [saveBanner, setSaveBanner] = useState<
     | { kind: "success"; message: string; restartRequired: readonly string[] }
@@ -96,6 +100,7 @@ export function ModuleConfig() {
     setState({ kind: "loading" });
     setDraft({});
     setDirty({});
+    setOriginalValues({});
     setSaveBanner(null);
     setFieldErrors({});
     try {
@@ -111,6 +116,9 @@ export function ModuleConfig() {
       // (the module omits them from GET responses) — the draft entry
       // stays undefined and the input renders empty with placeholder.
       setDraft({ ...values });
+      // Snapshot the same values for dirty-tracker comparison. Frozen
+      // here, refreshed only on next load / save-refresh.
+      setOriginalValues({ ...values });
     } catch (err) {
       if (err instanceof HttpError && err.status === 404) {
         // 404 with no `no_config_schema` code = module not installed.
@@ -129,7 +137,19 @@ export function ModuleConfig() {
 
   function onChangeField(name: string, value: unknown) {
     setDraft((prev) => ({ ...prev, [name]: value }));
-    setDirty((prev) => ({ ...prev, [name]: true }));
+    // Un-dirty on revert: if the user types a value back to what the
+    // server returned, drop it from the PUT payload. writeOnly fields
+    // are special — the server omits them from GET responses, so there's
+    // no "original" to compare against; any non-empty user input counts
+    // as dirty.
+    const schema = state.kind === "ok" ? state.schema.properties?.[name] : undefined;
+    const isWriteOnly = schema?.writeOnly === true;
+    if (isWriteOnly) {
+      const typed = value !== "" && value !== undefined && value !== null;
+      setDirty((prev) => ({ ...prev, [name]: typed }));
+    } else {
+      setDirty((prev) => ({ ...prev, [name]: value !== originalValues[name] }));
+    }
     // Clear any prior field error as the user edits — keeps the banner
     // honest about which fields are still in error.
     setFieldErrors((prev) => {
@@ -304,7 +324,10 @@ export function ModuleConfig() {
               property={prop}
               value={draft[name]}
               required={requiredSet.has(name)}
-              writeOnlyStored={prop.writeOnly === true && !state.values[name]}
+              // `name in values` distinguishes "GET omitted this key"
+              // (= stored writeOnly secret) from "GET included it with
+              // a falsy value." Falsy-coercion would conflate the two.
+              writeOnlyStored={prop.writeOnly === true && !(name in state.values)}
               error={fieldErrors[name]}
               dirty={Boolean(dirty[name])}
               onChange={(v) => onChangeField(name, v)}
