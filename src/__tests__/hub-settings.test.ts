@@ -18,12 +18,14 @@ import {
   SETUP_EXPOSE_MODES,
   consumeFirstClientAutoApproveWindow,
   deleteSetting,
+  getHubOrigin,
   getModuleInstallChannel,
   getSetting,
   isFirstClientAutoApproveWindowOpen,
   isModuleInstallChannel,
   isSetupExposeMode,
   openFirstClientAutoApproveWindow,
+  setHubOrigin,
   setModuleInstallChannel,
   setSetting,
 } from "../hub-settings.ts";
@@ -372,6 +374,93 @@ describe("hub-settings — module install channel bootstrap", () => {
       expect(getModuleInstallChannel(db, { env: {} })).toBe("latest");
     } finally {
       db.close();
+    }
+  });
+});
+
+describe("hub-settings — hub_origin (hub#298)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hub-settings-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("getHubOrigin returns null when no row is present", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      expect(getHubOrigin(db)).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("setHubOrigin then getHubOrigin round-trips the value", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setHubOrigin(db, "https://hub.example.com");
+      expect(getHubOrigin(db)).toBe("https://hub.example.com");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("setHubOrigin overwrites an existing value", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setHubOrigin(db, "https://hub.example.com");
+      setHubOrigin(db, "https://hub.other.example");
+      expect(getHubOrigin(db)).toBe("https://hub.other.example");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("setHubOrigin(null) clears the row → getHubOrigin returns null", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setHubOrigin(db, "https://hub.example.com");
+      setHubOrigin(db, null);
+      expect(getHubOrigin(db)).toBeNull();
+      // Idempotent — a second clear on an already-absent row is a no-op.
+      setHubOrigin(db, null);
+      expect(getHubOrigin(db)).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("setHubOrigin(\"\") is treated as null (no falsy-row footgun)", () => {
+    // An empty string would be a useless issuer + would cause source
+    // attribution to lie ("from settings" while no real value).
+    // Normalize at the write layer.
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setHubOrigin(db, "https://hub.example.com");
+      setHubOrigin(db, "");
+      expect(getHubOrigin(db)).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("does not auto-seed from env (unlike module_install_channel)", () => {
+    // The env var (PARACHUTE_HUB_ORIGIN) is a separate precedence layer
+    // in resolveIssuer (env wins when no settings row). Auto-seeding
+    // would collapse env → settings and lose the source attribution
+    // the SPA exposes ("from env" vs "from settings"). Verify no row
+    // appears just from reading.
+    const prior = process.env.PARACHUTE_HUB_ORIGIN;
+    process.env.PARACHUTE_HUB_ORIGIN = "https://hub.from-env.example";
+    try {
+      const db = openHubDb(hubDbPath(dir));
+      try {
+        expect(getHubOrigin(db)).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      if (prior === undefined) delete process.env.PARACHUTE_HUB_ORIGIN;
+      else process.env.PARACHUTE_HUB_ORIGIN = prior;
     }
   });
 });

@@ -52,7 +52,21 @@ export type HubSettingKey =
   // channel); after the first seed the row is source of truth and the
   // env var is ignored — admin must use the SPA toggle (or
   // `PUT /api/modules/channel`) to change channel.
-  | "module_install_channel";
+  | "module_install_channel"
+  // hub#298: operator-settable canonical hub URL. The value (when set)
+  // is the OAuth issuer claim stamped into every JWT minted by hub.
+  // Precedence on each request: this row, then `PARACHUTE_HUB_ORIGIN`
+  // env, then `new URL(req.url).origin` as the local-dev fallback.
+  //
+  // Storing the canonical origin in hub_settings (rather than relying
+  // solely on the env var) lets a Render operator attach a custom
+  // domain after first boot + flip the issuer URL from the admin SPA
+  // without restarting the container. Tokens minted before the change
+  // carry the old `iss` claim; tokens minted after carry the new one.
+  // Operators must accept that flipping the canonical hub URL
+  // invalidates any tokens already in circulation (issuer mismatch on
+  // verification) — surfaced in the admin SPA's helper copy.
+  | "hub_origin";
 
 export type SetupExposeMode = "localhost" | "tailnet" | "public";
 
@@ -256,4 +270,42 @@ export function getModuleInstallChannel(
  */
 export function setModuleInstallChannel(db: Database, channel: ModuleInstallChannel): void {
   setSetting(db, "module_install_channel", channel);
+}
+
+// --- domain helpers: canonical hub origin --------------------------------
+
+/**
+ * Read the operator-set canonical hub origin from hub_settings. Returns
+ * `null` when no row is present — callers fall through to env / request-
+ * origin precedence in that case (see `resolveIssuer` in hub-server).
+ *
+ * Unlike `module_install_channel` this helper does NOT seed from env on
+ * first read. The env var (`PARACHUTE_HUB_ORIGIN`) remains a separate
+ * precedence layer below this one — operators who set the env var still
+ * see "from env" attribution in the admin SPA. Auto-seeding would
+ * collapse that layer into the row + lose the source attribution.
+ */
+export function getHubOrigin(db: Database): string | null {
+  const value = getSetting(db, "hub_origin");
+  return value ?? null;
+}
+
+/**
+ * Write or clear the canonical hub origin. Passing `null` deletes the
+ * row, reverting to env / request-origin precedence on subsequent
+ * requests. The caller must have validated the URL shape — the
+ * function trusts the input and writes verbatim (mirrors
+ * `setModuleInstallChannel`'s "typed-callsite is the contract" stance).
+ *
+ * Empty-string is treated as null (the value would never be a useful
+ * issuer) to avoid storing a row that no codepath would honor — the
+ * resolveIssuer fallback chain would skip it as falsy and the source
+ * label would lie about where the value came from.
+ */
+export function setHubOrigin(db: Database, value: string | null): void {
+  if (value === null || value === "") {
+    deleteSetting(db, "hub_origin");
+    return;
+  }
+  setSetting(db, "hub_origin", value);
 }
