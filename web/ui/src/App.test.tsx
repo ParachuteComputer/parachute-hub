@@ -25,7 +25,7 @@ vi.mock("./lib/api.ts", async (orig) => {
   const actual = (await orig()) as typeof api;
   return {
     ...actual,
-    listVaults: vi.fn().mockResolvedValue([]),
+    listVaults: vi.fn().mockResolvedValue({ vaults: [], moduleInstalled: false }),
     listGrants: vi.fn().mockResolvedValue([]),
     listTokens: vi.fn().mockResolvedValue({ tokens: [], next_cursor: null }),
     listModules: vi.fn().mockResolvedValue({ modules: [], supervisor_available: false }),

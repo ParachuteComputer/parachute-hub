@@ -290,6 +290,27 @@ export function findVaultUpstream(
 }
 
 /**
+ * True iff at least one vault module is registered in services.json. Drives
+ * the wizard-resume redirect on `/` and `/hub.html` (Issue 2 of the
+ * first-boot-path hardening bundle): an env-seeded admin with no vault
+ * still needs the wizard, so `/` should funnel them there rather than
+ * render the empty discovery portal.
+ *
+ * Reads services.json on every check (cheap — single ~KB parse) so a
+ * vault provisioned seconds ago un-gates the discovery page without a
+ * hub restart. Returns `false` on a malformed services.json — safer to
+ * surface the wizard than to 500 the operator's first page load.
+ */
+function hasVaultInstalled(manifestPath: string): boolean {
+  try {
+    const services = readManifest(manifestPath).services;
+    return services.some((s) => isVaultEntry(s));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The trust layer a request arrived through. Hub binds `127.0.0.1:1939`, so
  * every request reaches it via one of three trusted forwarders (or directly
  * over loopback). The forwarder injects characteristic headers that we use to
@@ -1061,23 +1082,43 @@ export function hubFetch(
       return new Response("not found", { status: 404 });
     }
 
-    // Fresh-hub redirect: on a hub with no admin row yet, the discovery
-    // page (`/`, `/hub.html`) funnels straight to the wizard. The static
-    // portal isn't useful pre-setup — nothing's installed, the
-    // "Signed in" affordance has no session to surface — and the
-    // operator landing on `/` in a browser otherwise has to manually
-    // type `/admin/setup` to escape. 302 (not 301) so the redirect
-    // disappears the moment the wizard finishes.
+    // Fresh-hub redirect: when the wizard still has work to do, the
+    // discovery page (`/`, `/hub.html`) funnels straight to it. Two
+    // wizard-mode conditions trigger the redirect:
     //
-    // Sits before the JSON-shaped 503 gate below because `/` is an
-    // HTML surface — a JSON 503 there would render as raw text in the
-    // operator's browser tab. The 503 gate handles API + admin SPA +
-    // OAuth callers that branch on the structured body.
-    if (getDb && (pathname === "/" || pathname === "/hub.html") && userCount(getDb()) === 0) {
-      return new Response(null, {
-        status: 302,
-        headers: { location: "/admin/setup" },
-      });
+    //   1. No admin row exists (the original fresh-deploy case). The
+    //      static portal carries no usable signal — no installed
+    //      services to discover, no admin to sign in as.
+    //   2. Admin exists but no vault is installed (env-seed deploys
+    //      where the operator baked admin into env vars but hasn't
+    //      walked the wizard's vault step). Pre-fix, env-seeded
+    //      operators bounced past the wizard entirely and had to
+    //      hand-find /admin/modules + /admin/vaults; surface
+    //      "let me finish the wizard" instead.
+    //
+    // The wizard's GET handler already picks the right step
+    // (`deriveWizardState` resumes at vault step when admin exists +
+    // no vault), so we just need the redirect to fire.
+    //
+    // 302 (not 301) so the redirect disappears the moment the wizard
+    // finishes. Sits before the JSON-shaped 503 gate below because `/`
+    // is an HTML surface — a JSON 503 there would render as raw text
+    // in the operator's browser tab. The 503 gate handles API + admin
+    // SPA + OAuth callers that branch on the structured body.
+    if (getDb && (pathname === "/" || pathname === "/hub.html")) {
+      const db = getDb();
+      // Either condition triggers the wizard funnel:
+      //   - no admin row (the fresh-deploy case)
+      //   - admin row exists but no vault installed (env-seed case)
+      // Short-circuit the manifest read when `noAdmin` is true; the
+      // wizard's first step is admin creation regardless of vault state.
+      const needsWizard = userCount(db) === 0 || !hasVaultInstalled(manifestPath);
+      if (needsWizard) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "/admin/setup" },
+        });
+      }
     }
 
     // Pre-admin lockout. When the hub has booted with no admin row (the

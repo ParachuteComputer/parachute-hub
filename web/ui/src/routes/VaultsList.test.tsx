@@ -53,8 +53,8 @@ function renderList() {
 }
 
 describe("VaultsList", () => {
-  it("renders empty state with a 'Create a vault' link when no vaults", async () => {
-    vi.mocked(api.listVaults).mockResolvedValue([]);
+  it("renders empty state with a 'Create a vault' link when module installed but no vaults", async () => {
+    vi.mocked(api.listVaults).mockResolvedValue({ vaults: [], moduleInstalled: true });
     renderList();
     await waitFor(() => expect(screen.getByText(/no vaults yet/i)).toBeInTheDocument());
     expect(screen.getByRole("link", { name: /create a vault/i })).toHaveAttribute(
@@ -63,21 +63,44 @@ describe("VaultsList", () => {
     );
   });
 
+  it("renders 'install vault module' empty state when no vault module is installed (hub#297)", async () => {
+    vi.mocked(api.listVaults).mockResolvedValue({ vaults: [], moduleInstalled: false });
+    renderList();
+    await waitFor(() => expect(screen.getByText(/no vault module installed/i)).toBeInTheDocument());
+    // Empty-state CTA points to /modules (under the /admin basename →
+    // /admin/modules in production).
+    expect(screen.getByRole("link", { name: /install vault module →/i })).toHaveAttribute(
+      "href",
+      "/modules",
+    );
+    // Header CTA also flips to "Install vault module" so the operator
+    // can't click their way into /vaults/new on a vault-less hub.
+    expect(screen.getByRole("link", { name: /install vault module$/i })).toHaveAttribute(
+      "href",
+      "/modules",
+    );
+    // The "New vault" CTA is replaced — not present at all.
+    expect(screen.queryByRole("button", { name: /^new vault$/i })).toBeNull();
+  });
+
   it("renders one row per vault with name + version + URL", async () => {
-    vi.mocked(api.listVaults).mockResolvedValue([
-      {
-        name: "work",
-        url: "http://hub.local/vault/work/",
-        version: "0.5.1",
-        path: "/vault/work",
-      },
-      {
-        name: "scratch",
-        url: "http://hub.local/vault/scratch/",
-        version: "0.5.1",
-        path: "/vault/scratch",
-      },
-    ]);
+    vi.mocked(api.listVaults).mockResolvedValue({
+      moduleInstalled: true,
+      vaults: [
+        {
+          name: "work",
+          url: "http://hub.local/vault/work/",
+          version: "0.5.1",
+          path: "/vault/work",
+        },
+        {
+          name: "scratch",
+          url: "http://hub.local/vault/scratch/",
+          version: "0.5.1",
+          path: "/vault/scratch",
+        },
+      ],
+    });
     renderList();
     await waitFor(() => expect(screen.getByText(/Vaults \(2\)/)).toBeInTheDocument());
     expect(screen.getByText("work")).toBeInTheDocument();
@@ -94,14 +117,17 @@ describe("VaultsList", () => {
   });
 
   it("renders a 'CLI only' marker when the vault has no managementUrl", async () => {
-    vi.mocked(api.listVaults).mockResolvedValue([
-      {
-        name: "legacy",
-        url: "http://hub.local/vault/legacy/",
-        version: "0.4.0",
-        path: "/vault/legacy",
-      },
-    ]);
+    vi.mocked(api.listVaults).mockResolvedValue({
+      moduleInstalled: true,
+      vaults: [
+        {
+          name: "legacy",
+          url: "http://hub.local/vault/legacy/",
+          version: "0.4.0",
+          path: "/vault/legacy",
+        },
+      ],
+    });
     renderList();
     await waitFor(() => expect(screen.getByText("legacy")).toBeInTheDocument());
     expect(screen.getByText(/cli only/i)).toBeInTheDocument();
@@ -109,15 +135,18 @@ describe("VaultsList", () => {
   });
 
   it("renders a Manage button when managementUrl is present and mints + redirects on click", async () => {
-    vi.mocked(api.listVaults).mockResolvedValue([
-      {
-        name: "work",
-        url: "http://hub.local/vault/work/",
-        version: "0.5.1",
-        path: "/vault/work",
-        managementUrl: "/admin",
-      },
-    ]);
+    vi.mocked(api.listVaults).mockResolvedValue({
+      moduleInstalled: true,
+      vaults: [
+        {
+          name: "work",
+          url: "http://hub.local/vault/work/",
+          version: "0.5.1",
+          path: "/vault/work",
+          managementUrl: "/admin",
+        },
+      ],
+    });
     vi.mocked(api.mintVaultAdminToken).mockResolvedValue({
       token: "jwt-abc",
       expiresAt: "2026-01-01T00:00:00.000Z",
@@ -133,15 +162,18 @@ describe("VaultsList", () => {
   });
 
   it("absolute managementUrl is used verbatim (not joined onto the vault URL)", async () => {
-    vi.mocked(api.listVaults).mockResolvedValue([
-      {
-        name: "work",
-        url: "http://hub.local/vault/work/",
-        version: "0.5.1",
-        path: "/vault/work",
-        managementUrl: "https://elsewhere.example/manage",
-      },
-    ]);
+    vi.mocked(api.listVaults).mockResolvedValue({
+      moduleInstalled: true,
+      vaults: [
+        {
+          name: "work",
+          url: "http://hub.local/vault/work/",
+          version: "0.5.1",
+          path: "/vault/work",
+          managementUrl: "https://elsewhere.example/manage",
+        },
+      ],
+    });
     vi.mocked(api.mintVaultAdminToken).mockResolvedValue({
       token: "jwt-xyz",
       expiresAt: "2026-01-01T00:00:00.000Z",
@@ -155,15 +187,18 @@ describe("VaultsList", () => {
   });
 
   it("surfaces a per-row error banner when the mint fails (no redirect)", async () => {
-    vi.mocked(api.listVaults).mockResolvedValue([
-      {
-        name: "work",
-        url: "http://hub.local/vault/work/",
-        version: "0.5.1",
-        path: "/vault/work",
-        managementUrl: "/admin",
-      },
-    ]);
+    vi.mocked(api.listVaults).mockResolvedValue({
+      moduleInstalled: true,
+      vaults: [
+        {
+          name: "work",
+          url: "http://hub.local/vault/work/",
+          version: "0.5.1",
+          path: "/vault/work",
+          managementUrl: "/admin",
+        },
+      ],
+    });
     vi.mocked(api.mintVaultAdminToken).mockRejectedValue(
       new api.HttpError(401, "no admin session"),
     );

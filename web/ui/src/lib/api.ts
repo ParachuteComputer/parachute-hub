@@ -62,11 +62,35 @@ export class HttpError extends Error {
 }
 
 /**
+ * Result shape from `listVaults`. Surfaces both the vault listings AND a
+ * "did we even find a vault MODULE in services?" signal so the empty
+ * state on `/admin/vaults` can distinguish:
+ *
+ *   - vault module installed, zero vaults yet → "Create your first vault" CTA
+ *   - vault module not installed at all       → "Install vault first" CTA
+ *     pointing at /admin/modules
+ *
+ * Pre-fix, both states rendered the same empty page and the operator
+ * could spin trying to "Create" a vault when the underlying module wasn't
+ * installed. Aaron hit this on the Render deploy walkthrough.
+ */
+export interface VaultsListResult {
+  vaults: VaultListing[];
+  /**
+   * True when at least one services-array entry is a vault backend
+   * (`parachute-vault` or `parachute-vault-<name>`). False on a hub
+   * where the vault module has never been installed via the wizard
+   * or `/admin/modules`.
+   */
+  moduleInstalled: boolean;
+}
+
+/**
  * Fetch the well-known discovery doc. Anonymous — no Bearer needed. The hub
  * serves this at the origin root with `Access-Control-Allow-Origin: *` so a
  * cross-origin SPA could read it too, but ours is same-origin.
  */
-export async function listVaults(): Promise<VaultListing[]> {
+export async function listVaults(): Promise<VaultsListResult> {
   const res = await fetch("/.well-known/parachute.json", {
     headers: { accept: "application/json" },
   });
@@ -79,16 +103,25 @@ export async function listVaults(): Promise<VaultListing[]> {
   };
   const vaults = body.vaults ?? [];
   const services = body.services ?? [];
-  return vaults.map((v) => {
-    const listing: VaultListing = {
-      name: v.name,
-      url: v.url,
-      version: v.version,
-      path: pathFor(v.name, v.url, services),
-    };
-    if (v.managementUrl) listing.managementUrl = v.managementUrl;
-    return listing;
-  });
+  // The vault module is "installed" iff at least one service entry's
+  // name matches the canonical `parachute-vault[-<instance>]` shape.
+  // Mirrors `isVaultEntry` server-side (src/well-known.ts).
+  const moduleInstalled = services.some(
+    (s) => s.name === "parachute-vault" || s.name.startsWith("parachute-vault-"),
+  );
+  return {
+    moduleInstalled,
+    vaults: vaults.map((v) => {
+      const listing: VaultListing = {
+        name: v.name,
+        url: v.url,
+        version: v.version,
+        path: pathFor(v.name, v.url, services),
+      };
+      if (v.managementUrl) listing.managementUrl = v.managementUrl;
+      return listing;
+    }),
+  };
 }
 
 function pathFor(

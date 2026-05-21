@@ -20,7 +20,7 @@ import {
 
 type State =
   | { kind: "loading" }
-  | { kind: "ok"; vaults: VaultListing[] }
+  | { kind: "ok"; vaults: VaultListing[]; moduleInstalled: boolean }
   | { kind: "error"; message: string };
 
 /**
@@ -68,9 +68,13 @@ export function VaultsList() {
     void reload;
     let cancelled = false;
     listVaults()
-      .then((vaults) => {
+      .then((result) => {
         if (cancelled) return;
-        setState({ kind: "ok", vaults });
+        setState({
+          kind: "ok",
+          vaults: result.vaults,
+          moduleInstalled: result.moduleInstalled,
+        });
       })
       .catch((err) => {
         if (cancelled) return;
@@ -112,13 +116,28 @@ export function VaultsList() {
     );
   }
 
+  // When the vault MODULE isn't installed at all, "New vault" can't
+  // succeed — the hub has no vault backend to provision against. Gate
+  // both the header CTA + the empty-state copy on `moduleInstalled` so
+  // the operator gets routed to /admin/modules first.
+  const moduleMissing = state.vaults.length === 0 && !state.moduleInstalled;
+
   return (
     <div>
       <div className="list-header">
         <h2>Vaults ({state.vaults.length})</h2>
-        <Link to="/vaults/new">
-          <button type="button">New vault</button>
-        </Link>
+        {moduleMissing ? (
+          // Cross-SPA-route navigation stays inside the SPA basename, so
+          // react-router's <Link> resolves to /admin/modules. Plain
+          // anchor would 301-bounce or fail under the /admin basename.
+          <Link to="/modules">
+            <button type="button">Install vault module</button>
+          </Link>
+        ) : (
+          <Link to="/vaults/new">
+            <button type="button">New vault</button>
+          </Link>
+        )}
       </div>
 
       <p className="muted">
@@ -126,15 +145,30 @@ export function VaultsList() {
       </p>
 
       {state.vaults.length === 0 ? (
-        <div className="empty empty-rich">
-          <p className="empty-headline">No vaults yet.</p>
-          <p className="muted">
-            Create your first vault to start storing tokens, secrets, and notes scoped to this hub.
-          </p>
-          <p style={{ marginTop: "0.75rem" }}>
-            <Link to="/vaults/new">Create a vault →</Link>
-          </p>
-        </div>
+        moduleMissing ? (
+          <div className="empty empty-rich">
+            <p className="empty-headline">No vault module installed.</p>
+            <p className="muted">
+              The vault backend isn't installed on this hub yet, so there's nothing to provision a
+              vault against. Install it from the Modules page first, then come back here to create
+              your first vault.
+            </p>
+            <p style={{ marginTop: "0.75rem" }}>
+              <Link to="/modules">Install vault module →</Link>
+            </p>
+          </div>
+        ) : (
+          <div className="empty empty-rich">
+            <p className="empty-headline">No vaults yet.</p>
+            <p className="muted">
+              Create your first vault to start storing tokens, secrets, and notes scoped to this
+              hub.
+            </p>
+            <p style={{ marginTop: "0.75rem" }}>
+              <Link to="/vaults/new">Create a vault →</Link>
+            </p>
+          </div>
+        )
       ) : (
         <div style={{ marginTop: "1rem" }}>
           {state.vaults.map((v) => {

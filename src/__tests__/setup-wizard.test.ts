@@ -2300,3 +2300,395 @@ describe("typed vault name (hub#267)", () => {
     expect(html).toContain('id="preview-vault-name">BAD<');
   });
 });
+
+// --- bootstrap token gate (first-boot-path hardening, Issue 1) -----------
+
+describe("bootstrap token gate (handleSetupAccountPost)", () => {
+  let h: Harness;
+  beforeEach(async () => {
+    h = makeHarness();
+    _resetOperationsRegistryForTests();
+    const { _resetBootstrapTokenForTests } = await import("../bootstrap-token.ts");
+    _resetBootstrapTokenForTests();
+  });
+  afterEach(async () => {
+    h.cleanup();
+    const { _resetBootstrapTokenForTests } = await import("../bootstrap-token.ts");
+    _resetBootstrapTokenForTests();
+  });
+
+  test("GET /admin/setup renders the bootstrap-token field when a token is active", async () => {
+    const { generateBootstrapToken } = await import("../bootstrap-token.ts");
+    generateBootstrapToken();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const html = await res.text();
+      expect(html).toContain('name="bootstrap_token"');
+      // The callout names what the field is + where to find the value.
+      expect(html).toContain("Bootstrap token");
+      expect(html).toContain("startup logs");
+      // Form action unchanged.
+      expect(html).toContain('action="/admin/setup/account"');
+    } finally {
+      db.close();
+    }
+  });
+
+  test("GET /admin/setup omits the bootstrap-token field when no token is active", () => {
+    // No `generateBootstrapToken` call this test — the in-memory slot is
+    // undefined, mirroring on-box CLI mode (no `parachute serve` wizard).
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const html = res.text() as unknown as Promise<string>;
+      return html.then((body) => {
+        expect(body).not.toContain('name="bootstrap_token"');
+        // Bootstrap callout is also absent — operator gets the
+        // pre-hardening shape on the on-box CLI surface.
+        expect(body).not.toContain("Bootstrap token");
+        expect(body).toContain('action="/admin/setup/account"');
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("POST /admin/setup/account with correct bootstrap_token creates admin + consumes token", async () => {
+    const { generateBootstrapToken, getBootstrapToken } = await import("../bootstrap-token.ts");
+    const token = generateBootstrapToken();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const form = formBody({
+        bootstrap_token: token,
+        username: "ops",
+        password: "correct horse battery",
+        password_confirm: "correct horse battery",
+        [CSRF_FIELD_NAME]: csrf,
+      });
+      const post = await handleSetupAccountPost(
+        req("/admin/setup/account", {
+          method: "POST",
+          body: form.body,
+          headers: { ...form.headers, cookie: `${CSRF_COOKIE_NAME}=${csrf}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(post.status).toBe(303);
+      expect(userCount(db)).toBe(1);
+      // Token consumed: in-memory slot is undefined.
+      expect(getBootstrapToken()).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("POST /admin/setup/account with wrong bootstrap_token returns 401 + no admin row", async () => {
+    const { generateBootstrapToken } = await import("../bootstrap-token.ts");
+    generateBootstrapToken();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const form = formBody({
+        bootstrap_token: "parachute-bootstrap-WRONG-WRONG-WRONG-WRONG-WRONG-WRONG-x",
+        username: "ops",
+        password: "correct horse battery",
+        password_confirm: "correct horse battery",
+        [CSRF_FIELD_NAME]: csrf,
+      });
+      const post = await handleSetupAccountPost(
+        req("/admin/setup/account", {
+          method: "POST",
+          body: form.body,
+          headers: { ...form.headers, cookie: `${CSRF_COOKIE_NAME}=${csrf}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(post.status).toBe(401);
+      // The form re-renders with the token field present + an error
+      // banner; the wrong token value is NOT echoed back.
+      const html = await post.text();
+      expect(html).toContain('name="bootstrap_token"');
+      expect(html).toContain("Wrong bootstrap token");
+      expect(html).not.toContain("WRONG-WRONG-WRONG");
+      // Username is preserved so the operator doesn't have to retype.
+      expect(html).toContain('value="ops"');
+      // No admin row was created.
+      expect(userCount(db)).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("POST /admin/setup/account with MISSING bootstrap_token returns 401", async () => {
+    const { generateBootstrapToken } = await import("../bootstrap-token.ts");
+    generateBootstrapToken();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const form = formBody({
+        // Deliberately omit `bootstrap_token`.
+        username: "ops",
+        password: "correct horse battery",
+        password_confirm: "correct horse battery",
+        [CSRF_FIELD_NAME]: csrf,
+      });
+      const post = await handleSetupAccountPost(
+        req("/admin/setup/account", {
+          method: "POST",
+          body: form.body,
+          headers: { ...form.headers, cookie: `${CSRF_COOKIE_NAME}=${csrf}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(post.status).toBe(401);
+      expect(userCount(db)).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("POST /admin/setup/account after admin already claimed returns 410 Gone", async () => {
+    const { generateBootstrapToken } = await import("../bootstrap-token.ts");
+    // First claim: generate token + create admin. Then a stale POST
+    // arrives — the token has been consumed AND an admin row exists.
+    generateBootstrapToken();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "first-admin", "strong-password", { passwordChanged: true });
+      // Re-mint a fresh bootstrap token to simulate the case where the
+      // operator restarts the hub after admin creation. (Normally the
+      // serve.ts gate prevents this — we test the defensive layer.)
+      generateBootstrapToken();
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const form = formBody({
+        bootstrap_token: "parachute-bootstrap-doesnt-matter-admin-already-exists-xxx",
+        username: "interloper",
+        password: "another password",
+        password_confirm: "another password",
+        [CSRF_FIELD_NAME]: csrf,
+      });
+      const post = await handleSetupAccountPost(
+        req("/admin/setup/account", {
+          method: "POST",
+          body: form.body,
+          headers: { ...form.headers, cookie: `${CSRF_COOKIE_NAME}=${csrf}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(post.status).toBe(410);
+      const html = await post.text();
+      expect(html).toContain("Admin already claimed");
+      // No second user row was created.
+      expect(userCount(db)).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("on-box CLI flow (no token) creates admin normally — historical shape preserved", async () => {
+    // Critical back-compat: when no token has been generated (the
+    // historical wizard path: `parachute expose` doesn't enter wizard
+    // mode), the account POST works exactly as before. This pins the
+    // existing behavior post-refactor.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const form = formBody({
+        username: "ops",
+        password: "correct horse battery",
+        password_confirm: "correct horse battery",
+        [CSRF_FIELD_NAME]: csrf,
+      });
+      const post = await handleSetupAccountPost(
+        req("/admin/setup/account", {
+          method: "POST",
+          body: form.body,
+          headers: { ...form.headers, cookie: `${CSRF_COOKIE_NAME}=${csrf}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(post.status).toBe(303);
+      expect(userCount(db)).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  // hub#297 reviewer-nit fold 3: pin the concurrent-claim race property.
+  //
+  // The wizard's account-claim POST has two layers of race-protection
+  // (chain documented inline below). The vault-POST analogue (idempotent
+  // short-circuit when supervisor.start is already running) has a test
+  // at setup-wizard.test.ts:N2 (`handleSetupVaultPost` — idempotent on
+  // concurrent POSTs); this is the missing partner pin for the account
+  // step.
+  //
+  // Race-protection chain:
+  //   1. First POST takes the token via verifyBootstrapToken (constant-
+  //      time check returns true), enters the createUser branch, and
+  //      consumes the token via consumeBootstrapToken AFTER the row
+  //      commits.
+  //   2. Second POST (if it arrives before the first finishes):
+  //      a. If the first POST hasn't consumed the token yet, both
+  //         POSTs pass verifyBootstrapToken. They race into createUser;
+  //         SQLite's UNIQUE constraint on `users.username` makes the
+  //         second `INSERT INTO users` throw. The handler's `catch`
+  //         block re-renders the form with a 400 + "username may
+  //         already be taken" banner — and crucially does NOT create
+  //         a second admin row.
+  //      b. If the first POST has already consumed the token, the
+  //         second POST's verifyBootstrapToken returns false (token
+  //         slot is undefined). 401 + form re-render.
+  //   3. Either way: exactly one admin row at rest, token consumed.
+  test("concurrent claim with the same token + username yields exactly one admin row (race property)", async () => {
+    const { generateBootstrapToken, getBootstrapToken } = await import("../bootstrap-token.ts");
+    const token = generateBootstrapToken();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const formA = formBody({
+        bootstrap_token: token,
+        username: "ops",
+        password: "correct horse battery",
+        password_confirm: "correct horse battery",
+        [CSRF_FIELD_NAME]: csrf,
+      });
+      // Two POSTs share the same body, same CSRF, same token, same
+      // username. Promise.all fires them as concurrently as the bun
+      // runtime allows; the deterministic interleaving covered here
+      // is: both pass CSRF (same cookie), both pass token verify (if
+      // they race before the first one's consume), both reach
+      // createUser, and exactly one INSERT wins.
+      const deps = {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      };
+      const post = (label: string) =>
+        handleSetupAccountPost(
+          req(`/admin/setup/account?race=${label}`, {
+            method: "POST",
+            body: formA.body,
+            headers: { ...formA.headers, cookie: `${CSRF_COOKIE_NAME}=${csrf}` },
+          }),
+          deps,
+        );
+
+      const [resA, resB] = await Promise.all([post("a"), post("b")]);
+
+      // Property 1: exactly one POST landed at the 303 success branch.
+      const successes = [resA, resB].filter((r) => r.status === 303);
+      const failures = [resA, resB].filter((r) => r.status !== 303);
+      expect(successes.length).toBe(1);
+      expect(failures.length).toBe(1);
+
+      // Property 2: the failure is either a 400 (UNIQUE collision via
+      // createUser → catch block) OR a 401 (token already consumed by
+      // the first POST → verifyBootstrapToken returned false on this
+      // one). Both are valid race outcomes; we don't pin which —
+      // the schedule is non-deterministic at the bun runtime layer.
+      const failStatus = failures[0]?.status;
+      expect(failStatus === 400 || failStatus === 401).toBe(true);
+
+      // Property 3: exactly one admin row exists in the users table.
+      expect(userCount(db)).toBe(1);
+
+      // Property 4: the bootstrap token is consumed (cannot be reused
+      // by a later POST). Even in the schedule where the second POST
+      // failed via UNIQUE (token wasn't consumed by the failing path —
+      // it was consumed by the succeeding path), the token slot is
+      // empty after both promises settle.
+      expect(getBootstrapToken()).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+});

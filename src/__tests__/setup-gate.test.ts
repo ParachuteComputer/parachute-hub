@@ -219,4 +219,97 @@ describe("setup gate (admin exists)", () => {
       db.close();
     }
   });
+
+  // Issue 2 (first-boot-path hardening): the auto-redirect on `/` and
+  // `/hub.html` fires whenever the wizard still has work to do — not just
+  // when the admin row is missing. Pre-fix, an env-seeded admin with no
+  // vault landed on the static discovery portal and had to hand-find
+  // `/admin/modules` + `/admin/vaults`. Post-fix, `/` funnels them
+  // straight to the wizard's vault step.
+  test("/ 302s to /admin/setup when env-seeded admin has no vault (Issue 2)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      // Simulate env-seed: admin row exists, services.json is empty.
+      await createUser(db, "env-seeded-admin", "pw");
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: join(h.dir, "services.json"),
+      })(req("/"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin/setup");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("/hub.html 302s to /admin/setup when env-seeded admin has no vault (Issue 2)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "env-seeded-admin", "pw");
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: join(h.dir, "services.json"),
+      })(req("/hub.html"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin/setup");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("/ renders the discovery page when admin + vault both exist", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        join(h.dir, "services.json"),
+      );
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: join(h.dir, "services.json"),
+      })(req("/"));
+      // 200 (the dynamic discovery page) — NOT 302 to /admin/setup. The
+      // wizard's work is done.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("wizard at /admin/setup with env-seeded admin + no vault renders vault step (Issue 2)", async () => {
+    // Mirror the wizard's resume-at-vault-step shape for the env-seed
+    // path. Same as the existing test above, but explicitly named to
+    // document the Issue 2 expectation: the wizard handles env-seeded
+    // admins correctly.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "env-seeded-admin", "pw");
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: join(h.dir, "services.json"),
+      })(req("/admin/setup"));
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Vault step is rendered (the form action gives it away).
+      expect(html).toContain('action="/admin/setup/vault"');
+      // Account step is NOT rendered — no username field, no bootstrap
+      // token field.
+      expect(html).not.toContain('name="bootstrap_token"');
+      expect(html).not.toContain('name="password_confirm"');
+    } finally {
+      db.close();
+    }
+  });
 });
