@@ -28,6 +28,7 @@ import { ApproveClient } from "./routes/ApproveClient.tsx";
 import { Modules } from "./routes/Modules.tsx";
 import { NewVault } from "./routes/NewVault.tsx";
 import { Permissions } from "./routes/Permissions.tsx";
+import { Settings } from "./routes/Settings.tsx";
 import { Tokens } from "./routes/Tokens.tsx";
 import { Users } from "./routes/Users.tsx";
 import { VaultsList } from "./routes/VaultsList.tsx";
@@ -49,6 +50,9 @@ function subtitleFor(pathname: string): string {
   }
   if (pathname === "/users" || pathname.startsWith("/users/")) {
     return "users";
+  }
+  if (pathname === "/settings" || pathname.startsWith("/settings/")) {
+    return "settings";
   }
   if (pathname.startsWith("/approve-client/")) {
     return "approve app";
@@ -111,6 +115,7 @@ export function App() {
         <Link to="/users">Users</Link>
         <Link to="/permissions">Permissions</Link>
         <Link to="/tokens">Tokens</Link>
+        <Link to="/settings">Settings</Link>
         <span className="nav-divider" aria-hidden="true" />
         <a href="/" title="Hub discovery page (top-level)">
           Discovery
@@ -125,6 +130,7 @@ export function App() {
         <Route path="/users" element={<Users />} />
         <Route path="/permissions" element={<Permissions />} />
         <Route path="/tokens" element={<Tokens />} />
+        <Route path="/settings" element={<Settings />} />
         <Route path="/approve-client/:clientId" element={<ApproveClient />} />
         <Route
           path="*"

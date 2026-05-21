@@ -82,7 +82,7 @@ describe("App — brand subtitle (route-derived)", () => {
 });
 
 describe("App — nav structure", () => {
-  it("renders all nav links in order: brand, Vaults, Modules, Users, Permissions, Tokens, Discovery (signed-out)", async () => {
+  it("renders all nav links in order: brand, Vaults, Modules, Users, Permissions, Tokens, Settings, Discovery (signed-out)", async () => {
     renderAt("/vaults");
     // Wait for /api/me to resolve so AuthIndicator's "Sign in" link
     // appears in the nav before we snapshot the link order.
@@ -100,6 +100,7 @@ describe("App — nav structure", () => {
       "Users",
       "Permissions",
       "Tokens",
+      "Settings",
       "Discovery",
     ]);
   });
