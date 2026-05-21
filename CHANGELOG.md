@@ -2,6 +2,29 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.1] - 2026-05-21
+
+**fix(hub): `parachute restart hub` detects orphan bun proc on bound port.**
+
+When the `hub.port` file is missing or stale but a bun process is still holding port 1939, `parachute restart hub` previously reported `hub wasn't running.` while the orphan continued occupying the port — the subsequent `parachute start hub` then failed with `hub: port 1939 unavailable.` The only recovery was a manual `lsof` + `kill`. Surfaced during fresh-machine CORS testing 2026-05-20 (hub#287).
+
+`stopHub` now falls back to probing the canonical hub port (1939) via `lsof -ti :<port> -sTCP:LISTEN` when the pidfile is absent or its PID is dead. If a process is bound, it's treated as an orphan hub: the operator sees `Detected orphan hub process holding port 1939 (PID 12345); stopping it.` and `stopHub` runs the standard SIGTERM → SIGKILL escalation against the adopted PID. `parachute restart hub` therefore now works end-to-end against the stale-pidfile case — the bug repro from hub#287 — without manual cleanup.
+
+`ensureHubRunning`'s port-unavailable error also now names the holder when `lsof` can resolve a PID, pointing the operator at `parachute restart hub` (the orphan-aware path) rather than the bare `lsof -iTCP:1939` hint.
+
+Implementation:
+
+- `src/hub-control.ts` — new `defaultPidOnPort` helper wrapping `lsof -ti :<port> -sTCP:LISTEN` (macOS + Linux; Windows out of scope for v0.6). New `PidOnPortFn` type + injectable `pidOnPort` seam on both `EnsureHubOpts` and `StopHubOpts` so tests don't shell out. `stopHub` now resolves its target PID in two stages: pidfile-first (existing behavior when the file is present + live), then port-probe fallback when the pidfile is missing or stale. Orphan adoption emits a clear stderr line before signalling. `ensureHubRunning`'s port-unavailable throw is enhanced to name the holder + recommend `parachute restart hub` when a PID is resolvable.
+- `src/__tests__/hub-control.test.ts` — pidOnPort stub added to existing stop/start tests (so the real `lsof` against the actually-running local hub on 1939 doesn't bleed into the test harness). Four new tests for hub#287: stale pidfile + orphan-on-port adoption; missing pidfile + orphan-on-port adoption; no orphan reported + no pidfile (genuine no-op); orphan PID reported but already dead (race-window cleanup).
+
+Cross-platform note: `lsof` is the de facto orphan-PID probe on macOS + Linux and ships by default on both. Windows is out of scope for the v0.6 cloud-deploy + owner-operated targets; if/when Windows lands, the seam is already injectable per the `PidOnPortFn` interface.
+
+Tests:
+
+- hub: 1728 pass (1723 before; +4 hub#287 stopHub orphan-adoption tests in `src/__tests__/hub-control.test.ts`, +1 hub#287 ensureHubRunning orphan-hint test).
+- web/ui: 148 pass (unchanged).
+- typecheck + biome: clean.
+
 ## [0.5.12-rc.2] - 2026-05-21
 
 **feat(hub): runtime-settable hub_origin via admin SPA.**
