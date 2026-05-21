@@ -2,6 +2,50 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.12-rc.2] - 2026-05-21
+
+**feat(hub): runtime-settable hub_origin via admin SPA.**
+
+Operators on Render (or anywhere with a custom domain) can now set the canonical hub URL from the admin SPA at `/admin/settings` without redeploying. The stored value is the OAuth issuer claim hub stamps into every JWT, so flipping the canonical URL takes effect on the very next request without a hub restart.
+
+Resolution precedence (per request, no caching):
+
+1. `hub_settings.hub_origin` — operator-set canonical URL from the admin SPA. New in this rc.
+2. `PARACHUTE_HUB_ORIGIN` env / `--issuer` flag — deploy-time setting (unchanged).
+3. `new URL(req.url).origin` — local-dev fallback (unchanged).
+
+The admin SPA's `/admin/settings` page surfaces three states distinctly: "from settings" / "from env var PARACHUTE_HUB_ORIGIN" / "from request origin", so an operator can tell which precedence rung is active without inspecting the DB or env. Helper text warns that changing the issuer invalidates any tokens already in circulation (the `iss` claim won't match the new issuer on verification).
+
+Implementation:
+
+- `src/hub-settings.ts` — `HubSettingKey` gains `hub_origin`; new helpers `getHubOrigin`, `setHubOrigin`. Unlike `module_install_channel` this helper does NOT auto-seed from env — the env var is its own precedence layer in `resolveIssuer` and auto-seeding would collapse the source attribution.
+- `src/hub-server.ts` — new `resolveIssuer(req, db, configuredIssuer)` + `resolveIssuerSource(...)` helpers. `oauthDeps(req)` and the `/.well-known/parachute.json` canonical-origin site now route through resolveIssuer. Per-request resolution so PUTs take effect on the next request without restart.
+- `src/api-settings-hub-origin.ts` — new module hosting `handleApiSettingsHubOrigin` (GET + PUT) and the pure `validateHubOrigin` validator (scheme http/https, hostname required, no trailing slash, no path/query/fragment). Bearer-gated on `parachute:host:admin` (same boundary as `/api/modules/channel`).
+- `src/hub-server.ts` — dispatcher routes `/api/settings/hub-origin` to the new handler with the precedence-resolved issuer + source threaded through.
+- `web/ui/src/routes/Settings.tsx` — new SPA page at `/admin/settings`. Current-value readout + source label, input field pre-filled from stored value, Save + Reset CTAs, server-error surfacing.
+- `web/ui/src/App.tsx` — nav link to `/settings` + route mounting.
+- `web/ui/src/routes/Modules.tsx` — "More hub settings at /settings" link added to the channel toggle for discoverability.
+- `web/ui/src/lib/api.ts` — `getHubOriginSetting` + `setHubOriginSetting` + `HubOriginSetting` / `IssuerSource` types.
+
+Tests:
+
+- `src/__tests__/hub-settings.test.ts` — appended `hub-settings — hub_origin` describe (6 tests): round-trip, overwrite, clear, empty-string normalization, no auto-seed from env.
+- `src/__tests__/hub-origin-resolution.test.ts` (new, 12 tests) — precedence chain + source attribution + mid-flight change-takes-effect.
+- `src/__tests__/api-settings-hub-origin.test.ts` (new, 30 tests) — validator unit tests, auth gating (405/401/403), GET shape across all three sources, PUT validation + write, change-takes-effect-on-next-request end-to-end.
+- `web/ui/src/routes/Settings.test.tsx` (new, 10 tests) — initial render across the three source states, save round-trip + refetch, server-error surfacing, empty-input clear, reset, reset-disabled-when-no-stored, load-failure retry.
+- `web/ui/src/App.test.tsx` — nav-order assertion bumped to include Settings.
+
+Smoke (local hub on `PARACHUTE_HOME=/tmp/hub-origin-smoke`):
+
+1. Fresh boot → `GET /api/settings/hub-origin` → `{"hub_origin":null,"resolved_issuer":"http://127.0.0.1:19390","source":"request"}` ✓
+2. `PUT {"hub_origin":"https://hub.example.com"}` → 200 + value echoed ✓
+3. `GET /.well-known/oauth-authorization-server` → `issuer: "https://hub.example.com"` (no restart) ✓
+4. Re-minted token's iss claim decodes to `https://hub.example.com` ✓
+5. `PUT {"hub_origin":null}` → 200, well-known issuer flips back to `http://127.0.0.1:19390` ✓
+6. PUT a fresh value, kill hub, restart with same `PARACHUTE_HOME` → well-known issuer still reflects the persisted value ✓
+
+Hub gate: 1721 pass (up from 1672, +49 new). SPA gate: 148 pass (up from 138, +10 new). Typecheck + biome clean across root + web/ui. SPA build clean.
+
 ## [0.5.12-rc.1] - 2026-05-21
 
 First-boot path hardening (from Aaron's real Render deploy testing):
