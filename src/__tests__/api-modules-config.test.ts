@@ -490,3 +490,252 @@ describe("handleApiModulesConfig — stripPrefix=false (notes-shape)", () => {
     expect(upstream.calls[0]?.url).toBe("http://127.0.0.1:1941/notes/.parachute/config/schema");
   });
 });
+
+/**
+ * hub#307: modules that declare `/.parachute` in their `paths[]` host the
+ * universal protocol endpoints at the bare URL — runner is the first
+ * example. Before this fix the proxy built `/runner/.parachute/config`
+ * (mount-prefixed because stripPrefix is false) and runner returned 404.
+ *
+ * The fix detects the `/.parachute` declaration in `paths[]` and routes
+ * to the bare URL regardless of `stripPrefix`. These tests pin that
+ * behavior + verify vault (mount-routed per-vault) keeps its prefixed
+ * path so the fix doesn't regress vault config.
+ */
+describe("handleApiModulesConfig — hostsBareParachute (hub#307)", () => {
+  let h: Harness;
+  beforeEach(async () => {
+    h = await makeHarness();
+  });
+  afterEach(() => h.cleanup());
+
+  test("runner (stripPrefix:false + /.parachute in paths) → bare /.parachute/config", async () => {
+    // Runner's FIRST_PARTY_FALLBACKS shape: paths includes `/.parachute`
+    // explicitly because runner serves the universal protocol at the bare
+    // URL. The services.json entry can carry either path first; we put
+    // `/runner` first to mirror what `parachute install runner` writes
+    // (matches the FIRST_PARTY_FALLBACKS manifest paths order).
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-runner",
+        port: 1945,
+        paths: ["/runner", "/.parachute"],
+        health: "/runner/healthz",
+        version: "0.1.0",
+        stripPrefix: false,
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const upstream = makeFakeUpstream(() =>
+      Response.json({ type: "object", properties: { intervalSeconds: { type: "number" } } }),
+    );
+    const res = await handleApiModulesConfig(
+      makeReq("/api/modules/runner/config/schema", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "runner", suffix: "schema" },
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        upstreamFetch: upstream.fetchFn,
+      },
+    );
+    expect(res.status).toBe(200);
+    // No /runner prefix — bare /.parachute/config/schema. This is the
+    // hub#307 fix: pre-fix the URL was http://127.0.0.1:1945/runner/.parachute/config/schema
+    // and runner returned 404.
+    expect(upstream.calls[0]?.url).toBe("http://127.0.0.1:1945/.parachute/config/schema");
+  });
+
+  test("runner GET /config (no schema) also routes bare", async () => {
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-runner",
+        port: 1945,
+        paths: ["/runner", "/.parachute"],
+        health: "/runner/healthz",
+        version: "0.1.0",
+        stripPrefix: false,
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const upstream = makeFakeUpstream(() => Response.json({ intervalSeconds: 60 }));
+    await handleApiModulesConfig(
+      makeReq("/api/modules/runner/config", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "runner", suffix: "" },
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        upstreamFetch: upstream.fetchFn,
+      },
+    );
+    expect(upstream.calls[0]?.url).toBe("http://127.0.0.1:1945/.parachute/config");
+  });
+
+  test("runner PUT /config also routes bare with body", async () => {
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-runner",
+        port: 1945,
+        paths: ["/runner", "/.parachute"],
+        health: "/runner/healthz",
+        version: "0.1.0",
+        stripPrefix: false,
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const upstream = makeFakeUpstream(() => Response.json({ restart_required: [] }));
+    await handleApiModulesConfig(
+      makeReq("/api/modules/runner/config", {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ intervalSeconds: 120 }),
+      }),
+      { short: "runner", suffix: "" },
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        upstreamFetch: upstream.fetchFn,
+      },
+    );
+    const call = upstream.calls[0];
+    if (!call) throw new Error("upstream not called");
+    expect(call.url).toBe("http://127.0.0.1:1945/.parachute/config");
+    expect(call.method).toBe("PUT");
+    expect(call.body).toBe(JSON.stringify({ intervalSeconds: 120 }));
+  });
+
+  test("runner fallback (no services.json entry) — picks up /.parachute from FIRST_PARTY_FALLBACKS paths", async () => {
+    // bun-link / fresh-install case: the runner row isn't in services.json
+    // yet but the fallback declares the shape. resolveUpstream returns
+    // not-installed when neither the row nor the fallback can prove the
+    // module is up — so this case actually 404s. Pinned as the expected
+    // shape: hub#307 only changes the upstream-URL math, not the
+    // installed-detection contract.
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const res = await handleApiModulesConfig(
+      makeReq("/api/modules/runner/config", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "runner", suffix: "" },
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+      },
+    );
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("module_not_installed");
+  });
+
+  test("vault (stripPrefix:false, no /.parachute in paths) — keeps /vault/<name> prefix (unchanged)", async () => {
+    // Vault's `.parachute/config` is per-vault, scoped under the
+    // `/vault/<name>` mount. Routing it bare would lose the vault-name
+    // context. This test pins that hub#307 doesn't regress vault.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.5.0",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const upstream = makeFakeUpstream(() => Response.json({ type: "object", properties: {} }));
+    await handleApiModulesConfig(
+      makeReq("/api/modules/vault/config/schema", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "vault", suffix: "schema" },
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        upstreamFetch: upstream.fetchFn,
+      },
+    );
+    // Preserved mount — same as pre-hub#307.
+    expect(upstream.calls[0]?.url).toBe(
+      "http://127.0.0.1:1940/vault/default/.parachute/config/schema",
+    );
+  });
+
+  test("scribe (stripPrefix:true) — bare URL preserved (unchanged)", async () => {
+    // Pre-hub#307: stripPrefix:true produced /.parachute/config (via the
+    // stripPrefix branch). Post-fix: same result via the hostsBareParachute
+    // branch when /.parachute is in paths, or via the stripPrefix branch
+    // when it isn't. Scribe ships `paths: ["/scribe"]` (no /.parachute),
+    // so it takes the stripPrefix branch. Either way, the upstream URL is
+    // identical to pre-fix behavior.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-scribe",
+        port: 1943,
+        paths: ["/scribe"],
+        health: "/health",
+        version: "0.4.0",
+        stripPrefix: true,
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const upstream = makeFakeUpstream(() => Response.json({ type: "object", properties: {} }));
+    await handleApiModulesConfig(
+      makeReq("/api/modules/scribe/config/schema", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "scribe", suffix: "schema" },
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        upstreamFetch: upstream.fetchFn,
+      },
+    );
+    // Unchanged from pre-hub#307.
+    expect(upstream.calls[0]?.url).toBe("http://127.0.0.1:1943/.parachute/config/schema");
+  });
+
+  test("mixed: stripPrefix:false module with both /custom and /.parachute → bare for protocol, prefix for others", async () => {
+    // The hostsBareParachute branch only governs the `/.parachute/config*`
+    // proxy here. Other proxy code-paths (the generic services-proxy in
+    // hub-server.ts) handle non-protocol requests; this surface only ever
+    // forwards to `/.parachute/config[/schema]`, so verifying just that
+    // route is the right scope.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-runner",
+        port: 1945,
+        // Order doesn't matter for hostsBareParachute detection.
+        paths: ["/.parachute", "/runner"],
+        health: "/runner/healthz",
+        version: "0.1.0",
+        stripPrefix: false,
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const upstream = makeFakeUpstream(() => Response.json({ type: "object", properties: {} }));
+    await handleApiModulesConfig(
+      makeReq("/api/modules/runner/config/schema", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "runner", suffix: "schema" },
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        upstreamFetch: upstream.fetchFn,
+      },
+    );
+    expect(upstream.calls[0]?.url).toBe("http://127.0.0.1:1945/.parachute/config/schema");
+  });
+});
