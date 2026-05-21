@@ -2,6 +2,26 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.3] - 2026-05-21
+
+**fix(hub): route /.parachute/* to module's bare endpoint regardless of stripPrefix (#307).**
+
+Closes the hub#305 follow-up the rc.2 changelog flagged. The admin SPA's `/admin/modules/runner/config` button 404'd against runner because the proxy at `/api/modules/:short/config[/schema]` only honored two upstream shapes: `stripPrefix: true` → bare `/.parachute/config`, `stripPrefix: false` → `<mount>/.parachute/config`. Runner ships `paths: ["/runner", "/.parachute"]` with `stripPrefix: false` (its `/runner/jobs` admin routes want the literal `/runner` prefix; only its universal-protocol endpoints sit at the bare URL), so the proxy built `http://127.0.0.1:1945/runner/.parachute/config` — which runner's HTTP server doesn't match.
+
+**Fix:** `resolveUpstream` + `buildUpstreamPath` in `src/api-modules-config.ts` now detect when a module declares `/.parachute` in its `paths[]` and route to the bare `/.parachute/config[/schema]` URL regardless of `stripPrefix`. The asymmetry rationale:
+
+- **Runner-shape** (new): `/.parachute` in `paths[]`, `stripPrefix: false`. The module is announcing "I serve the universal module-protocol endpoints at the bare URL." Bare-route.
+- **Scribe-shape** (unchanged): `paths: ["/scribe"]`, `stripPrefix: true`. The hub strips the mount on every request, so bare-route falls out naturally — same upstream URL as before this fix.
+- **Vault/notes-shape** (unchanged): no `/.parachute` in `paths[]`, `stripPrefix: false`. The module routes its `.parachute/config` per-mount (vault's `.parachute/config` is per-vault, scoped under `/vault/<name>` — routing it bare would lose the vault-name context). Mount-preserved as before.
+
+The detection looks at both the live services.json entry's `paths` (operator-authoritative) and the FIRST_PARTY_FALLBACKS vendored `paths` (so a `bun link` install without a written entry still routes correctly). A trailing slash and a `/.parachute/<subpath>` declaration both count as "hosts the bare URL."
+
+**Tests** (`bun test ./src`): 1762 pass (was 1755; +7 in `api-modules-config.test.ts` covering runner GET-schema / GET-values / PUT, runner-without-services.json-entry, vault unchanged, scribe unchanged, mixed-paths-order runner shape). The new tests live in a dedicated `hostsBareParachute (hub#307)` describe block so future drift here surfaces in one suite. No fix changes outside `api-modules-config.ts` — same surface contract for every other call site.
+
+**Smoke:** verify-via-tests only (live runner-supervised setup wasn't running locally during this PR).
+
+`bun run typecheck` clean. `bunx biome check src/` clean.
+
 ## [0.5.13-rc.2] - 2026-05-21
 
 **feat(hub): runner added to FIRST_PARTY_FALLBACKS + CURATED_MODULES — admin SPA can install runner (hub#305).**

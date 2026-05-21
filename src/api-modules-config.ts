@@ -106,11 +106,27 @@ export function parseModulesConfigPath(pathname: string): PathMatch | undefined 
  * Returns `{installed: false}` when the module isn't in services.json —
  * the SPA renders an empty state pointing the operator at /admin/modules
  * to install it first.
+ *
+ * `hostsBareParachute` is true when the module declares `/.parachute` in
+ * its `paths[]`, meaning it serves the universal module-protocol endpoints
+ * at the bare URL (no module-name prefix) — runner is the first example.
+ * This is independent of `stripPrefix`: runner ships
+ * `paths: ["/runner", "/.parachute"]` with `stripPrefix: false` because its
+ * `/runner/jobs` admin endpoints want the literal `/runner` prefix, but
+ * `/.parachute/config` is hosted bare. See `buildUpstreamPath`.
  */
 function resolveUpstream(
   short: CuratedModuleShort,
   manifestPath: string,
-): { installed: true; port: number; mount: string; stripPrefix: boolean } | { installed: false } {
+):
+  | {
+      installed: true;
+      port: number;
+      mount: string;
+      stripPrefix: boolean;
+      hostsBareParachute: boolean;
+    }
+  | { installed: false } {
   const fb = FIRST_PARTY_FALLBACKS[short];
   if (!fb) return { installed: false };
   const manifest = readManifest(manifestPath);
@@ -125,20 +141,58 @@ function resolveUpstream(
   const mount = entry.paths[0] ?? fb.manifest.paths[0] ?? "/";
   const stripPrefix =
     entry.stripPrefix !== undefined ? entry.stripPrefix : (fb.manifest.stripPrefix ?? false);
-  return { installed: true, port: entry.port, mount, stripPrefix };
+  // Check both the live services.json entry (operator-authoritative) and the
+  // vendored fallback (so a `bun link` install without a written entry still
+  // routes correctly). Match a trailing slash too — `["/.parachute/"]` is the
+  // same intent as `["/.parachute"]`.
+  const isBareParachute = (p: string): boolean =>
+    p === "/.parachute" || p === "/.parachute/" || p.startsWith("/.parachute/");
+  const hostsBareParachute =
+    entry.paths.some(isBareParachute) || fb.manifest.paths.some(isBareParachute);
+  return { installed: true, port: entry.port, mount, stripPrefix, hostsBareParachute };
 }
 
 /**
- * Build the upstream URL for `.parachute/config[/schema]`. When `stripPrefix`
- * is true the module sees a bare `/.parachute/config/...`; otherwise the
- * mount prefix is preserved (`/scribe/.parachute/config/...`).
+ * Build the upstream URL for `.parachute/config[/schema]`.
  *
- * scribe ships `stripPrefix: true` (in FIRST_PARTY_FALLBACKS); notes and
- * vault are keep-prefix. Honoring this here means the same proxy works
- * across both shapes without per-module branches.
+ * The `/.parachute/*` endpoints (info, config, config/schema, clear-credential)
+ * are the **universal module protocol** — every module speaks them, and the
+ * shape they take depends on how the module exposes its mount(s):
+ *
+ *   1. **Module declares `/.parachute` in its `paths[]`** (runner-shape):
+ *      the module hosts the bare URL `/.parachute/config[/schema]` directly
+ *      and the proxy forwards there with no prefix, regardless of
+ *      `stripPrefix`. This is the explicit "I serve the universal endpoints
+ *      at the bare URL" declaration.
+ *   2. **`stripPrefix: true`** (scribe-shape): the proxy strips the module
+ *      mount on every request, so the bare `/.parachute/config[/schema]`
+ *      is what the module sees on the wire — same result as case 1.
+ *   3. **`stripPrefix: false` and no `/.parachute` in paths** (vault/notes-
+ *      shape): the proxy preserves the mount prefix
+ *      (`/vault/default/.parachute/config`). Vault routes its
+ *      `.parachute/config` per-vault, scoped under the `/vault/<name>` mount,
+ *      so it explicitly NEEDS the prefix to know which vault the request
+ *      targets.
+ *
+ * Case 1 was the gap that hub#307 fixed: runner ships
+ * `paths: ["/runner", "/.parachute"]` with `stripPrefix: false`. Before this
+ * fix, the proxy built `/runner/.parachute/config` because it only saw
+ * `paths[0]` and the stripPrefix flag — runner's HTTP server matches
+ * `/.parachute/config` literally and 404'd. Detecting the `/.parachute`
+ * declaration in `paths[]` lets runner (and any future module with the same
+ * shape) route correctly without affecting vault.
  */
-function buildUpstreamPath(mount: string, stripPrefix: boolean, suffix: "" | "schema"): string {
+function buildUpstreamPath(
+  mount: string,
+  stripPrefix: boolean,
+  hostsBareParachute: boolean,
+  suffix: "" | "schema",
+): string {
   const inner = suffix === "schema" ? "/.parachute/config/schema" : "/.parachute/config";
+  // Universal-protocol short-circuit: a module that declares `/.parachute`
+  // in its paths[] hosts the bare URL — same upstream path whether
+  // stripPrefix is true or false.
+  if (hostsBareParachute) return inner;
   if (stripPrefix) return inner;
   // Normalize trailing slash (mirrors `findServiceUpstream`'s normalization
   // so a `paths: ["/scribe/"]` entry doesn't double-slash).
@@ -259,7 +313,12 @@ export async function handleApiModulesConfig(
   }
 
   // Build upstream URL.
-  const path = buildUpstreamPath(upstream.mount, upstream.stripPrefix, match.suffix);
+  const path = buildUpstreamPath(
+    upstream.mount,
+    upstream.stripPrefix,
+    upstream.hostsBareParachute,
+    match.suffix,
+  );
   const url = `http://127.0.0.1:${upstream.port}${path}`;
 
   // Forward. We carry method + body through. The SPA's Authorization
