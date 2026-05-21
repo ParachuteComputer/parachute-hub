@@ -377,6 +377,55 @@ const CHANNEL_FALLBACK: FirstPartyFallback = {
   },
 };
 
+// FALLBACK: Delete when @openparachute/runner ships .parachute/module.json
+// in its published artifact (parachute-runner repo already vendors it
+// alongside the source at `.parachute/module.json` — this fallback exists
+// so on a fresh hub the admin SPA install catalog can surface runner
+// before any `bun add @openparachute/runner` has placed a manifest on
+// disk to read from. Retires once hub#305's follow-up wires "load
+// FIRST_PARTY_FALLBACKS from each repo's shipped module.json"; for now
+// the manifest is mirrored here verbatim).
+//
+// Mirror of `parachute-runner/.parachute/module.json` (rc.3 vintage —
+// 2026-05-21). Keep these two files byte-equivalent for the fields they
+// share. Scope declarations (`runner:read`, `runner:admin`) intentionally
+// omitted from the fallback: the manifest's `scopes.defines` field flows
+// through to `composeServiceSpec` only via the install-time
+// `getSpecFromInstallDir` path; the fallback's role is upstream-catalog
+// rendering + post-install seed, where scopes aren't consumed today.
+const RUNNER_FALLBACK: FirstPartyFallback = {
+  package: "@openparachute/runner",
+  manifest: {
+    name: "runner",
+    manifestName: "parachute-runner",
+    displayName: "Runner",
+    tagline:
+      "Vault-as-job-substrate engine — spawns claude -p against vault job notes on schedule.",
+    kind: "tool",
+    port: 1945,
+    // Runner exposes two mount prefixes: `/runner/*` for its admin
+    // endpoints (jobs / runs / run-now) and `/.parachute/*` for the
+    // module-protocol endpoints (info / config / config/schema /
+    // clear-credential). Hub's longest-prefix router in
+    // `findServiceUpstream` picks the right one per request.
+    paths: ["/runner", "/.parachute"],
+    health: "/runner/healthz",
+    startCmd: ["parachute-runner", "serve"],
+    // Runner's HTTP server matches `/runner/jobs`, `/.parachute/config`
+    // etc. literally — no internal mount strip. Hub forwards the full
+    // path. Contrast with scribe (stripPrefix: true) whose internal
+    // routes are bare.
+    stripPrefix: false,
+  },
+  extras: {
+    // Runner's HTTP routes (everything past `/healthz`) gate on a
+    // hub-issued JWT carrying `runner:admin` scope (see runner's
+    // `src/auth.ts`). Surfaces in `parachute status` as auth-required by
+    // default, same posture as vault.
+    hasAuth: true,
+  },
+};
+
 /**
  * Vendored manifests + extras for first-party modules. Indexed by short name
  * (the `parachute install <X>` token). Each entry retires when its upstream
@@ -388,6 +437,7 @@ export const FIRST_PARTY_FALLBACKS: Record<string, FirstPartyFallback> = {
   notes: NOTES_FALLBACK,
   scribe: SCRIBE_FALLBACK,
   channel: CHANNEL_FALLBACK,
+  runner: RUNNER_FALLBACK,
 };
 
 /**
