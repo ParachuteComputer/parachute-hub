@@ -11,6 +11,7 @@ import {
   validateModuleManifest,
 } from "../module-manifest.ts";
 import { assignServicePort } from "../port-assign.ts";
+import { finalizeModuleInstall, stampInstallDirOnRow } from "../post-install.ts";
 import {
   CANONICAL_PORT_MAX,
   CANONICAL_PORT_MIN,
@@ -21,6 +22,7 @@ import {
   isCanonicalPort,
 } from "../service-spec.ts";
 import { findService, readManifest, upsertService } from "../services-manifest.ts";
+import { WELL_KNOWN_PATH } from "../well-known.ts";
 import { start as lifecycleStart } from "./lifecycle.ts";
 import { migrateNotice } from "./migrate.ts";
 import {
@@ -142,6 +144,26 @@ export interface InstallOpts {
    * package's `name` (used to find the install dir post-bun-add).
    */
   readPackageName?: (absPath: string) => string | null;
+  /**
+   * Override the on-disk path for the regenerated `/.well-known/parachute.json`
+   * (test seam). When unset and `manifestPath` is the production default,
+   * defaults to `WELL_KNOWN_PATH` so an interactive `parachute install`
+   * refreshes the inspection artifact. When `manifestPath` is overridden
+   * (tests with tempdir services.json) AND this is unset, the regen is
+   * skipped — tests that want to assert on the well-known doc opt in by
+   * passing a tempdir path here.
+   */
+  wellKnownPath?: string;
+  /**
+   * Origin to embed in the regenerated well-known's `url` fields. When
+   * unset (the typical CLI case), the regen still runs but the
+   * canonicalOrigin defaults to `http://localhost:1939` — the live HTTP
+   * path at `/.well-known/parachute.json` rebuilds per request with the
+   * request's actual origin, so the on-disk doc's origin is best-effort
+   * for tooling that reads the file directly. Tests pass a synthetic
+   * origin for stable assertions.
+   */
+  wellKnownOrigin?: string;
 }
 
 async function defaultRunner(cmd: readonly string[]): Promise<number> {
@@ -612,9 +634,13 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   // the service's own init may have written the row without installDir, and
   // the seed itself doesn't carry it (composeServiceSpec → seedEntry uses
   // the manifest, which doesn't know its own install location).
-  if (entry && installDir && entry.installDir !== installDir) {
-    upsertService({ ...entry, installDir }, manifestPath);
-    entry = findService(entryName, manifestPath);
+  if (entry && installDir) {
+    const stamped = stampInstallDirOnRow({
+      manifestName: entryName,
+      installDir,
+      servicesJsonPath: manifestPath,
+    });
+    if (stamped) entry = findService(entryName, manifestPath);
   }
 
   if (!entry) {
@@ -693,10 +719,39 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   // missing entry into a visible failure rather than a silent one.
   let finalEntry = findService(entryName, manifestPath);
   // Re-stamp installDir if the service's first boot rewrote the row without
-  // it. Lifecycle commands beyond install (start/stop/restart/logs) need it
-  // present; we own this field, services don't have to know it exists.
-  if (finalEntry && installDir && finalEntry.installDir !== installDir) {
-    upsertService({ ...finalEntry, installDir }, manifestPath);
+  // it, AND refresh the on-disk well-known so the inspection artifact
+  // tracks the post-boot row. Lifecycle commands beyond install
+  // (start/stop/restart/logs) need installDir present; we own this field,
+  // services don't have to know it exists. The well-known regen mirrors
+  // what the API install path does (`runInstall` in api-modules-ops.ts) so
+  // CLI + API installs leave identical disk state — shared helper in
+  // `post-install.ts`, hub#293.
+  //
+  // Well-known regen is gated on `wellKnownPath` resolving to a non-null
+  // path. The production default (`manifestPath === SERVICES_MANIFEST_PATH`)
+  // falls back to `WELL_KNOWN_PATH`; tests with a tempdir manifestPath get
+  // `undefined` unless they opt in by passing `wellKnownPath` explicitly,
+  // so the test suite never writes to the operator's real
+  // `~/.parachute/well-known/`.
+  const wellKnownPath =
+    opts.wellKnownPath ?? (manifestPath === SERVICES_MANIFEST_PATH ? WELL_KNOWN_PATH : undefined);
+  if (finalEntry && installDir) {
+    if (wellKnownPath !== undefined) {
+      await finalizeModuleInstall({
+        manifestName: entryName,
+        installDir,
+        servicesJsonPath: manifestPath,
+        canonicalOrigin: opts.wellKnownOrigin ?? "http://localhost:1939",
+        wellKnownPath,
+        log,
+      });
+    } else {
+      stampInstallDirOnRow({
+        manifestName: entryName,
+        installDir,
+        servicesJsonPath: manifestPath,
+      });
+    }
     finalEntry = findService(entryName, manifestPath);
   }
   if (!finalEntry) {

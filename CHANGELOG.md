@@ -2,6 +2,28 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.12-rc.5] - 2026-05-21
+
+**refactor(hub): factor shared installDir-stamp + well-known regen between CLI and API install paths (#293).**
+
+Co-locates the two post-install responsibilities (stamp `installDir` on the services.json row, regenerate `/.well-known/parachute.json`) into a new `src/post-install.ts` so the CLI install path (`commands/install.ts`) and the API install path (`api-modules-ops.ts`) can't drift again. Background: hub#292 added both responsibilities inline in the API path after hub#298 caught that the API had diverged from the CLI on the installDir stamp — modules silently disappeared from the discovery page. The duplication is the failure mode.
+
+New surface:
+
+- `stampInstallDirOnRow({ manifestName, installDir, servicesJsonPath })` — idempotent stamp helper; returns true when a write happened.
+- `refreshWellKnown({ servicesJsonPath, canonicalOrigin, wellKnownPath, log, readModuleManifest? })` — regen-only wrapper around `regenerateWellKnown` with error-to-log semantics.
+- `finalizeModuleInstall(opts)` — paired entry point (stamp + regen) for callers that do both at one point.
+
+Call-site changes:
+
+- API `runInstall` / `runUpgrade` keep their pre-spawn `stampInstallDirOnRow` + post-spawn `refreshWellKnown` shape (the two ops happen at different timing points), now via the shared helpers.
+- API `handleUninstall` swaps its inline regen for `refreshWellKnown`.
+- CLI `install` calls `finalizeModuleInstall` at its terminal stamping point — adds well-known regen to interactive CLI installs (a small operator-visible enhancement; the live HTTP path already rebuilt per-request, this keeps the on-disk inspection artifact in sync). The mid-install intermediate stamp uses `stampInstallDirOnRow`. Test seam: `InstallOpts.wellKnownPath` defaults to `WELL_KNOWN_PATH` only when `manifestPath` is the production default, so the existing test suite (which uses tempdir `manifestPath`) never writes to `~/.parachute/well-known/`.
+
+Pure refactor on the API path — no behavior change. CLI install now regenerates the well-known doc (small enhancement, was a gap). New test asserts CLI- and API-path inputs through `finalizeModuleInstall` produce byte-identical well-known docs.
+
+`bun test ./src`: 1754 pass (was 1746; +8 from the new post-install suite). `bun run typecheck` + `bunx biome check src/` clean.
+
 ## [0.5.12-rc.4] - 2026-05-21
 
 **feat(hub): admin SPA module-config form (hub#260) — Phase 1 critical-path.**
