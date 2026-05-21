@@ -2,6 +2,70 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.12-rc.4] - 2026-05-21
+
+**feat(hub): admin SPA module-config form (hub#260) — Phase 1 critical-path.**
+
+The admin SPA at `/admin/modules/<short>/config` now renders a generic per-module configuration form, driven entirely by each module's own `/.parachute/config/schema` declaration. Friends deploying via Render can now configure scribe (transcription provider, cleanup provider, port, etc.) from the browser without dropping to a terminal — the last UI gap on the v0.6 single-container Phase 1 critical path.
+
+Architecture — Option A (hub mints `<short>:admin` token at proxy time):
+
+The SPA's session-derived bearer carries `parachute:host:admin`, but modules enforce per-module scopes on `/.parachute/config*` (e.g. scribe requires `scribe:admin`). Two choices to bridge the gap:
+
+- **Option A** (this PR): hub mints a short-lived (60s TTL) `<short>:admin` JWT on each proxied request, drops the SPA bearer, and forwards with the minted token. Audit-friendly (each proxy mint is one signed JWT), keeps modules ignorant of hub's session model, and reuses the existing `signAccessToken` pipeline. The minted token is NOT recorded in the tokens registry — it's a one-shot proxy artifact.
+- Option B (rejected): modules treat `parachute:host:admin` as a master scope that overrides all per-module scopes. Centralizes hub's vocabulary in every module's auth gate; couples module auth surfaces to hub's session model; harder to audit (no clear "who is acting on this module right now" trail).
+
+Renderer — hand-rolled, NOT `@rjsf/core`:
+
+The brief recommended `@rjsf/core` (industry-standard React JSON Schema Form library). The decision here is to hand-roll a focused renderer for the schema vocabulary Parachute modules actually use today: `string` / `number` / `integer` / `boolean`, `enum`, `default`, `title`, `description`, `minimum` / `maximum`, `writeOnly`. Rationale:
+
+- Bundle savings: @rjsf + ajv + plugins is ~250 KB; the SPA build today ships 301 KB total. The library would double our bundle.
+- Schema vocabulary: scribe's schema (the only module with a live schema today) uses none of @rjsf's heavy-hitter features (oneOf / anyOf / dependencies / conditionals). Hand-rolling matches the actual scribe schema shape exactly.
+- Growth path: if/when a module ships a schema feature the hand-roll doesn't cover, lift in @rjsf at that point. Today's call is "no debt, no library."
+
+writeOnly UX (Draft-07 secret-handling, forward-looking):
+
+scribe's current schema has no `writeOnly` fields, but the next module that needs a config-side secret (e.g. agent with API keys) will. The renderer implements the canonical pattern:
+
+- `writeOnly: true` string → `<input type="password">` with `autocomplete="new-password"`.
+- The module's `GET /.parachute/config` response omits writeOnly keys by convention. SPA infers "stored value exists" from "schema marks writeOnly AND value absent in GET response" and shows a `••••••••` placeholder.
+- Hint copy: "Leave blank to keep the current value." A blank password input the user didn't touch has `dirty: false` and is NOT included in the PUT payload — the module preserves its stored secret.
+- A user-typed value flips `dirty: true` and IS included; the module overwrites the stored secret.
+
+The pattern works for every module that ships a writeOnly field on the same `dirty-only-PUT` shape, no per-module branches needed.
+
+Form-state shape:
+
+- `draft`: user's edited values per field (keyed by property name).
+- `dirty`: per-field "did the user touch this?" gate.
+- Submit builds the PUT payload from `{name: draft[name] for name if dirty[name]}` — *only changed fields*. This is what makes the writeOnly preserve-on-blank semantics safe across all field types, not just secrets: a user who edits two fields and submits doesn't accidentally re-send the other 10 fields' current values back to the module (no churn on the underlying config.json, no "did the value just change?" noise in restart-required signals).
+
+Implementation:
+
+- `src/api-modules-config.ts` (new) — `handleApiModulesConfig` + `parseModulesConfigPath`. GET schema, GET values, PUT values. Validates `parachute:host:admin` on the SPA bearer; mints a `<short>:admin` JWT via `signAccessToken` for proxy use; forwards to `http://127.0.0.1:<modulePort>/.parachute/config[/schema]` (honors per-module `stripPrefix`); pipes the response body verbatim so module-side validation errors reach the SPA with their original `{error, message, errors[]}` shape. Special-case: upstream 404 on a GET surfaces as `no_config_schema` (not the raw 404) so the SPA can render a "module has no operator-editable config" empty state distinct from "module not installed."
+- `src/hub-server.ts` — dispatcher entry ahead of the install/restart/upgrade/uninstall switch (those routes use `parseModulesPath` which doesn't match the `/config` suffix shape).
+- `web/ui/src/routes/ModuleConfig.tsx` (new) — the SPA page. Switch-based renderer per schema property type. Five terminal states: loading / no_schema / not_installed / error / ok. writeOnly handling per-field.
+- `web/ui/src/lib/api.ts` — three new fetch helpers (`getModuleConfigSchema`, `getModuleConfigValues`, `putModuleConfigValues`) + four new exported types (`ConfigSchemaProperty`, `ModuleConfigSchema`, `ModuleConfigValues`, `ModuleConfigPutResult`).
+- `web/ui/src/App.tsx` — `/modules/:short/config` route mount + subtitle disambiguation for the per-module sub-page.
+- `web/ui/src/routes/Modules.tsx` — "Configure" link per installed module row. Stays enabled even when supervisor is offline (config endpoints are served by the module itself, not the supervisor).
+- `web/ui/src/styles.css` — minimal styles for the new page + `.btn` rule so the Configure `<Link>` looks like the sibling action buttons.
+
+Tests:
+
+- `src/__tests__/api-modules-config.test.ts` (new, 18 tests) — path parser shape coverage; 401 / 403 / 405 auth boundary; not-installed → 404; mint-and-forward (decodes the JWT the fake upstream receives + asserts scope=`<short>:admin`, audience=`<short>`, iss=hub, ttl=60s); GET schema / GET values / PUT body forwarding; 4xx verbatim; upstream 404 → `no_config_schema`; upstream unreachable → 502; stripPrefix true (scribe-shape) vs false (notes-shape) → correct upstream path.
+- `web/ui/src/routes/ModuleConfig.test.tsx` (new, 12 tests) — loading / no_schema / not_installed / error states; scribe golden fixture renders per-property correctly; submit sends only dirty fields; empty-submit rejected inline; restart_required list rendering; 4xx surfaces field errors; writeOnly renders as password input with placeholder; untouched writeOnly NOT sent; user-typed writeOnly IS sent.
+
+Gates:
+
+- hub: 1746 pass (1728 before, +18 new in `src/__tests__/api-modules-config.test.ts`).
+- web/ui: 160 pass (148 before, +12 new in `src/routes/ModuleConfig.test.tsx`).
+- typecheck + biome clean across root + web/ui.
+- SPA build clean (301 KB total — no library inflation).
+
+Smoke posture:
+
+Aaron is testing rc.3 in parallel against the live local hub + scribe, so this PR does not run a live smoke against the same hub (a side-by-side fresh-hub instance would diverge on issuer / JWKS and the running scribe would reject the minted JWT). Unit tests cover end-to-end JWT shape (decode + scope/audience/issuer assertions), proxy URL composition for both stripPrefix flavors, and the writeOnly safety property. Aaron tests the end-to-end SPA + live scribe write on rc.4 once this lands.
+
 ## [0.5.12-rc.3] - 2026-05-21
 
 **fix(hub): `parachute restart hub` detects orphan bun proc on bound port.**
