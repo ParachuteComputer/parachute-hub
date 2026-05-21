@@ -2,6 +2,26 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.1] - 2026-05-21
+
+**feat(hub): admin SPA install + upgrade UI — closes Phase 1 critical-path (hub#260).**
+
+`/admin/modules` now lays out as two clearly-grouped sections: **Installed modules** on top + **Install a module** below. The install + upgrade actions have been wired since hub#262 (the catalog page rendered them inline per-row), but pre-this-PR there was no visual grouping — an operator scanning a fresh-deploy hub had to read past three tagline-plus-meta blocks to find the Install buttons. With the split, an empty hub lands on a near-empty Installed section + a clear "Install a module" catalog underneath; a populated hub lands on its modules up top + a smaller "available to add" list underneath.
+
+**Install card** (the new `InstallableCard` component) is visually lighter than the existing `ModuleRow`: a name+tagline+package+latest-version line with a single Install button. No status badge (nothing to be installed yet), no meta grid, no per-row Configure / Restart / Uninstall sub-actions. Distinct shape because the only affordance is one action — "get me this module."
+
+**In-flight install handling**: while an install op is pending, the corresponding card disappears from the catalog (replaced by a small "Install in progress — see In progress above" hint) so a fast-finger operator can't kick off a second op against the same module before the first lands. Belt-and-suspenders against the ~50ms gap before the new op settles into `pendingOps`; the per-button `disabled={installing}` was already there.
+
+**Upgrade affordance** stays where hub#262 put it — inline on each installed `ModuleRow` row. The button label reads "Upgrade to v{latest}" when `installed_version !== latest_version` and "Up to date" (disabled) otherwise. The available-version detection is driven entirely off `latest_version` in the `GET /api/modules` response (hub#262 added this field with a 5-minute in-memory cache); no SPA-side npm lookup, no second roundtrip.
+
+**Backend**: zero changes. Existing endpoints (`POST /api/modules/<short>/install` / `/upgrade` async, `POST /api/modules/<short>/restart` / `/uninstall` sync, `GET /api/modules/operations/<id>` poll) shipped via hub#262 already expose the right shape. The `latest_version` field on each module row was added the same PR.
+
+**Available-modules list source**: the entries in `FIRST_PARTY_FALLBACKS` that intersect `CURATED_MODULES` (`vault`, `notes`, `scribe`). The hardcoded list comes off the existing backend wire shape — `available: true` filters in, `installed: false` keeps it in the catalog after install. Third-party / `module.json`-shipping modules aren't part of v0.6 (per hub#260 scope); they retire when each module ships its own `.parachute/module.json`.
+
+CSS: new `.install-list`, `.install-card`, `.modules-installed > h2` / `.modules-installable > h2` rules in `web/ui/src/styles.css` for the section grouping + lighter install-card chrome. No new bundle dependencies; SPA bundle still ~303 KB.
+
+`bun run typecheck` clean (root + web/ui). `bun test ./src`: 1754 pass (no backend change). `cd web/ui && bun run test`: 169 pass (was 161, +8 covering the new section split, in-flight install hide, install + upgrade kick-off, supervisor-unavailable disabled-install path). `bunx biome check` clean.
+
 ## [0.5.12-rc.5] - 2026-05-21
 
 **refactor(hub): factor shared installDir-stamp + well-known regen between CLI and API install paths (#293).**
