@@ -114,6 +114,7 @@ import { handleCreateVault } from "./admin-vaults.ts";
 import { handleAccountChangePasswordGet, handleAccountChangePasswordPost } from "./api-account.ts";
 import { handleApiMe } from "./api-me.ts";
 import { handleApiMintToken } from "./api-mint-token.ts";
+import { handleApiModulesConfig, parseModulesConfigPath } from "./api-modules-config.ts";
 import {
   getDefaultOperationsRegistry,
   handleInstall,
@@ -1540,6 +1541,29 @@ export function hubFetch(
         configDir: CONFIG_DIR,
         supervisor: deps.supervisor,
       });
+    }
+
+    // Per-module config surface (hub#260) — schema + values GET, values PUT.
+    // Sits ahead of the install/restart/upgrade/uninstall switch below so
+    // `/api/modules/<short>/config[/schema]` doesn't fall into the default-
+    // branch 404 (`parseModulesPath` only matches the action-suffix shape,
+    // not the `config` / `config/schema` shape).
+    //
+    // Diverges from the action endpoints in two ways: doesn't require a
+    // supervisor (we just proxy to the running module's HTTP surface, not
+    // spawn a child), and mints a `<short>:admin` token at proxy time so
+    // the upstream auth gate is satisfied without forcing the SPA bearer
+    // to carry per-module scopes.
+    {
+      const configMatch = parseModulesConfigPath(pathname);
+      if (configMatch) {
+        if (!getDb) return dbNotConfigured();
+        return handleApiModulesConfig(req, configMatch, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
+        });
+      }
     }
 
     // Per-module action endpoints: /api/modules/:short/{install,restart,upgrade,uninstall}.
