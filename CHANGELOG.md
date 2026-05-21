@@ -2,6 +2,16 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.11] - 2026-05-21
+
+Stable release. Bug-fix-only release covering issues Aaron surfaced during fresh-machine testing of 0.5.10:
+
+- **Modules on discovery page** (#292) — `runInstall` now stamps `installDir` on the services.json row (was diverged from the CLI install path) + regenerates the well-known doc after install/upgrade/uninstall. Modules installed via `/admin/modules` or the wizard now appear on `/` discovery without needing a hub restart.
+- **Approval page resolved scopes** (#294) — server-rendered approve-pending page substitutes unnamed `vault:<verb>` scopes to `vault:*:<verb>` form, matching the SPA approve page and the consent screen. Operator sees the scope shape that will actually appear in minted tokens.
+- **`parachute serve` banner** (#295) — startup line shows `http://localhost:<port>` when bound to `0.0.0.0`, with the bind address noted parenthetically. Pasting the bind address into a browser tripped Chrome's `0.0.0.0` block and surfaced as cross-origin errors.
+
+See individual rc entries below for full detail.
+
 ## [0.5.11-rc.3] - 2026-05-21
 
 **fix(serve): print localhost in banner when bound to 0.0.0.0 (operators couldn't navigate to bind address).**

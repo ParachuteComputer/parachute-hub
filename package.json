@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/hub",
-  "version": "0.5.11-rc.3",
+  "version": "0.5.11",
   "description": "parachute — the local hub for the Parachute ecosystem (discovery, ports, lifecycle, soon OAuth).",
   "license": "AGPL-3.0",
   "publishConfig": {
