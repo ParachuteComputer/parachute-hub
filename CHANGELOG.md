@@ -2,6 +2,26 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.2] - 2026-05-21
+
+**feat(hub): runner added to FIRST_PARTY_FALLBACKS + CURATED_MODULES — admin SPA can install runner (hub#305).**
+
+Closes the v0.6 friend-deploy gap that hub#304 left: the admin SPA install catalog renders from `FIRST_PARTY_FALLBACKS ∩ CURATED_MODULES`, and runner was in neither set, so operators landing on `/admin/modules` post-hub#304 had no UI affordance to install runner. After this PR the catalog renders four cards (vault → notes → scribe → runner), and clicking Install on runner kicks off the same `bun add @openparachute/runner` + supervised-spawn flow the other three modules use.
+
+**New entries:**
+
+- `service-spec.ts` — `RUNNER_FALLBACK` constant + `runner: RUNNER_FALLBACK` key on the `FIRST_PARTY_FALLBACKS` record. Mirror of `parachute-runner/.parachute/module.json` (rc.3 vintage, 2026-05-21). `kind: "tool"`, port `1945`, `paths: ["/runner", "/.parachute"]`, `health: "/runner/healthz"`, `startCmd: ["parachute-runner", "serve"]`, `stripPrefix: false` (runner's HTTP handler matches `/runner/jobs` + `/.parachute/config` literally — no internal mount strip). `extras.hasAuth: true` matches runner's posture (`runner:admin` scope gates everything past `/healthz`).
+- `api-modules.ts` — `CURATED_MODULES` grows from `["vault", "notes", "scribe"]` to `["vault", "notes", "scribe", "runner"]`. Order is recommended install order; runner is last because it depends on a working vault + scribe.
+
+**Tests** (`bun test ./src`): 1755 pass (was 1754; +1 — new `runner row carries package + display props` spot-check on the `GET /api/modules` wire shape). The existing `200 + curated list on fresh container` test updates its `expected` from three entries to four. No SPA-side test changes — `web/ui/src/routes/Modules.test.tsx` already drives module rendering off a per-test catalog fixture, not a hardcoded curated-list length.
+
+**Not in scope (follow-up):**
+
+- The `api-modules-config.ts` proxy for `/.parachute/config[/schema]` builds the upstream URL as `<paths[0]>/.parachute/config[/schema]`. For runner with `paths[0] === "/runner"` and `stripPrefix: false`, that produces `/runner/.parachute/config` — which runner's HTTP server does NOT match (it matches `/.parachute/config` literally, no `/runner/` prefix). The Configure button in the admin SPA will therefore 404 for runner until that proxy learns to use `/.parachute` from the module's `paths[]` when present. Tracked as a follow-up.
+- `PORT_RESERVATIONS` still labels slot 1945 as `"unassigned"`. The pattern doc says "first-party modules claim a slot the moment they ship"; runner ships rc.3 today, so a future doc-only PR can promote the entry to `"parachute-runner"`. Left out here to keep the PR a registry add.
+
+`bun run typecheck` clean. `cd web/ui && bun run test`: 169 pass (no SPA change). `bunx biome check src/` clean.
+
 ## [0.5.13-rc.1] - 2026-05-21
 
 **feat(hub): admin SPA install + upgrade UI — closes Phase 1 critical-path (hub#260).**

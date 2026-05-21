@@ -3,10 +3,10 @@
  *
  * Combines three sources into a single per-module row:
  *
- *   - **Curated availability** — vault, notes, scribe (the v0.6 release
- *     bar). The Phase-2 marketplace will broaden this; for now it's
- *     hardcoded so the admin UI has a stable "what can I install?" list
- *     even on a fresh container where services.json is empty.
+ *   - **Curated availability** — vault, notes, scribe, runner (the v0.6
+ *     release bar). The Phase-2 marketplace will broaden this; for now
+ *     it's hardcoded so the admin UI has a stable "what can I install?"
+ *     list even on a fresh container where services.json is empty.
  *   - **Installed state** — services.json reads (version, installDir).
  *   - **Supervisor state** — per-module run status (`running` / `stopped`
  *     / `crashed` / `starting` / `restarting`) + pid. Absent when the
@@ -39,10 +39,12 @@ export const API_MODULES_REQUIRED_SCOPE = "parachute:host:auth";
 
 /**
  * Curated module short-names for v0.6 Render self-host. Marketplace is
- * Phase 2 — until then, the admin UI offers exactly these three. Order
- * is the recommended install order (vault before notes, scribe last).
+ * Phase 2 — until then, the admin UI offers exactly these four. Order
+ * is the recommended install order (vault → notes → scribe → runner;
+ * runner comes last because it depends on a working vault + scribe to
+ * be useful, and operators usually wire those up first).
  */
-export const CURATED_MODULES = ["vault", "notes", "scribe"] as const;
+export const CURATED_MODULES = ["vault", "notes", "scribe", "runner"] as const;
 export type CuratedModuleShort = (typeof CURATED_MODULES)[number];
 
 export interface ApiModulesDeps {

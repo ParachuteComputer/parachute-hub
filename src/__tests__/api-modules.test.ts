@@ -149,8 +149,8 @@ describe("GET /api/modules", () => {
 
   test("200 + curated list on fresh container (empty services.json)", async () => {
     // The v0.6 hot path: brand-new Render container, no services.json
-    // yet. UI must render "install vault / notes / scribe" cards even
-    // though nothing's installed.
+    // yet. UI must render "install vault / notes / scribe / runner"
+    // cards even though nothing's installed.
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
@@ -168,13 +168,43 @@ describe("GET /api/modules", () => {
       }>;
       supervisor_available: boolean;
     };
-    // Curated order is preserved: vault → notes → scribe.
-    expect(body.modules.map((m) => m.short)).toEqual(["vault", "notes", "scribe"]);
+    // Curated order is preserved: vault → notes → scribe → runner.
+    expect(body.modules.map((m) => m.short)).toEqual(["vault", "notes", "scribe", "runner"]);
     expect(body.modules.every((m) => m.available)).toBe(true);
     expect(body.modules.every((m) => !m.installed)).toBe(true);
     expect(body.modules.every((m) => m.latest_version === "0.9.9")).toBe(true);
     // Supervisor wasn't injected → flag reflects that.
     expect(body.supervisor_available).toBe(false);
+  });
+
+  test("runner row carries package + display props from FIRST_PARTY_FALLBACKS (#305)", async () => {
+    // hub#305 added runner to CURATED_MODULES + FIRST_PARTY_FALLBACKS so
+    // the admin SPA install catalog surfaces it. Spot-check the wire
+    // shape resolves the runner-specific fields (package, displayName,
+    // tagline) from the vendored fallback rather than a stale default.
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => "0.1.0",
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      modules: Array<{
+        short: string;
+        package: string;
+        display_name: string;
+        tagline: string;
+        available: boolean;
+      }>;
+    };
+    const runner = body.modules.find((m) => m.short === "runner");
+    expect(runner).toBeDefined();
+    expect(runner?.package).toBe("@openparachute/runner");
+    expect(runner?.display_name).toBe("Runner");
+    expect(runner?.tagline).toContain("Vault-as-job-substrate");
+    expect(runner?.available).toBe(true);
   });
 
   test("surfaces installed_version from services.json", async () => {
