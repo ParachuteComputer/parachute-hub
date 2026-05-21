@@ -2,7 +2,7 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
-## [0.5.13-rc.1] - 2026-05-21
+## [0.5.12-rc.3] - 2026-05-21
 
 **fix(hub): `parachute restart hub` detects orphan bun proc on bound port.**
 
