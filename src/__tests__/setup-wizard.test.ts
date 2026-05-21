@@ -2592,4 +2592,103 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
       db.close();
     }
   });
+
+  // hub#297 reviewer-nit fold 3: pin the concurrent-claim race property.
+  //
+  // The wizard's account-claim POST has two layers of race-protection
+  // (chain documented inline below). The vault-POST analogue (idempotent
+  // short-circuit when supervisor.start is already running) has a test
+  // at setup-wizard.test.ts:N2 (`handleSetupVaultPost` — idempotent on
+  // concurrent POSTs); this is the missing partner pin for the account
+  // step.
+  //
+  // Race-protection chain:
+  //   1. First POST takes the token via verifyBootstrapToken (constant-
+  //      time check returns true), enters the createUser branch, and
+  //      consumes the token via consumeBootstrapToken AFTER the row
+  //      commits.
+  //   2. Second POST (if it arrives before the first finishes):
+  //      a. If the first POST hasn't consumed the token yet, both
+  //         POSTs pass verifyBootstrapToken. They race into createUser;
+  //         SQLite's UNIQUE constraint on `users.username` makes the
+  //         second `INSERT INTO users` throw. The handler's `catch`
+  //         block re-renders the form with a 400 + "username may
+  //         already be taken" banner — and crucially does NOT create
+  //         a second admin row.
+  //      b. If the first POST has already consumed the token, the
+  //         second POST's verifyBootstrapToken returns false (token
+  //         slot is undefined). 401 + form re-render.
+  //   3. Either way: exactly one admin row at rest, token consumed.
+  test("concurrent claim with the same token + username yields exactly one admin row (race property)", async () => {
+    const { generateBootstrapToken, getBootstrapToken } = await import("../bootstrap-token.ts");
+    const token = generateBootstrapToken();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const formA = formBody({
+        bootstrap_token: token,
+        username: "ops",
+        password: "correct horse battery",
+        password_confirm: "correct horse battery",
+        [CSRF_FIELD_NAME]: csrf,
+      });
+      // Two POSTs share the same body, same CSRF, same token, same
+      // username. Promise.all fires them as concurrently as the bun
+      // runtime allows; the deterministic interleaving covered here
+      // is: both pass CSRF (same cookie), both pass token verify (if
+      // they race before the first one's consume), both reach
+      // createUser, and exactly one INSERT wins.
+      const deps = {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      };
+      const post = (label: string) =>
+        handleSetupAccountPost(
+          req(`/admin/setup/account?race=${label}`, {
+            method: "POST",
+            body: formA.body,
+            headers: { ...formA.headers, cookie: `${CSRF_COOKIE_NAME}=${csrf}` },
+          }),
+          deps,
+        );
+
+      const [resA, resB] = await Promise.all([post("a"), post("b")]);
+
+      // Property 1: exactly one POST landed at the 303 success branch.
+      const successes = [resA, resB].filter((r) => r.status === 303);
+      const failures = [resA, resB].filter((r) => r.status !== 303);
+      expect(successes.length).toBe(1);
+      expect(failures.length).toBe(1);
+
+      // Property 2: the failure is either a 400 (UNIQUE collision via
+      // createUser → catch block) OR a 401 (token already consumed by
+      // the first POST → verifyBootstrapToken returned false on this
+      // one). Both are valid race outcomes; we don't pin which —
+      // the schedule is non-deterministic at the bun runtime layer.
+      const failStatus = failures[0]?.status;
+      expect(failStatus === 400 || failStatus === 401).toBe(true);
+
+      // Property 3: exactly one admin row exists in the users table.
+      expect(userCount(db)).toBe(1);
+
+      // Property 4: the bootstrap token is consumed (cannot be reused
+      // by a later POST). Even in the schedule where the second POST
+      // failed via UNIQUE (token wasn't consumed by the failing path —
+      // it was consumed by the succeeding path), the token slot is
+      // empty after both promises settle.
+      expect(getBootstrapToken()).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
 });

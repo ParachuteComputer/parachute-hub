@@ -1,5 +1,5 @@
 /**
- * Bootstrap token for first-boot wizard claim (hub#TODO).
+ * Bootstrap token for first-boot wizard claim (hub#297).
  *
  * On a fresh deploy with no admin row AND no `PARACHUTE_INITIAL_ADMIN_*`
  * env-seed, the hub enters "wizard mode" — the `/admin/setup` URL is

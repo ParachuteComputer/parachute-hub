@@ -63,7 +63,7 @@ describe("VaultsList", () => {
     );
   });
 
-  it("renders 'install vault module' empty state when no vault module is installed (hub#TODO)", async () => {
+  it("renders 'install vault module' empty state when no vault module is installed (hub#297)", async () => {
     vi.mocked(api.listVaults).mockResolvedValue({ vaults: [], moduleInstalled: false });
     renderList();
     await waitFor(() => expect(screen.getByText(/no vault module installed/i)).toBeInTheDocument());

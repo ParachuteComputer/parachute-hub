@@ -1,5 +1,5 @@
 /**
- * Bootstrap token (hub#TODO first-boot-path hardening).
+ * Bootstrap token (hub#297 first-boot-path hardening).
  *
  * The module is a tiny in-memory state machine: generate / consume /
  * verify. These tests pin:

@@ -1107,9 +1107,13 @@ export function hubFetch(
     // SPA + OAuth callers that branch on the structured body.
     if (getDb && (pathname === "/" || pathname === "/hub.html")) {
       const db = getDb();
-      const noAdmin = userCount(db) === 0;
-      const noVault = noAdmin || !hasVaultInstalled(manifestPath);
-      if (noAdmin || noVault) {
+      // Either condition triggers the wizard funnel:
+      //   - no admin row (the fresh-deploy case)
+      //   - admin row exists but no vault installed (env-seed case)
+      // Short-circuit the manifest read when `noAdmin` is true; the
+      // wizard's first step is admin creation regardless of vault state.
+      const needsWizard = userCount(db) === 0 || !hasVaultInstalled(manifestPath);
+      if (needsWizard) {
         return new Response(null, {
           status: 302,
           headers: { location: "/admin/setup" },
