@@ -341,3 +341,65 @@ describe("ModuleConfig — writeOnly fields", () => {
     expect(payload).toEqual({ apiKey: "sk-new-secret" });
   });
 });
+
+describe("ModuleConfig — $ref dereferencing (hub#303)", () => {
+  /**
+   * Integration check: a schema that uses `$ref` against a `definitions`
+   * block must render the same as if the property were inlined. This is
+   * the canonical use case scribe#47 worked around by inlining — once
+   * scribe reverts to `$ref`, the SPA continues to render writeOnly /
+   * required / hint copy correctly because the dereferenceSchema pass
+   * runs first.
+   */
+  const REF_SCHEMA: api.ModuleConfigSchema = {
+    type: "object",
+    properties: {
+      // {$ref, title} — sibling title overrides the definition's title,
+      // exercising the merge path end-to-end.
+      cleanup: {
+        $ref: "#/definitions/apiKeyAndModel",
+        title: "Cleanup credentials",
+      } as unknown as api.ConfigSchemaProperty,
+    },
+    definitions: {
+      apiKeyAndModel: {
+        type: "string",
+        writeOnly: true,
+        title: "Generic API key",
+        description: "Provider API key.",
+      },
+    },
+  };
+
+  it("renders a $ref-using schema as if the definition were inlined", async () => {
+    vi.mocked(api.getModuleConfigSchema).mockResolvedValue(REF_SCHEMA);
+    vi.mocked(api.getModuleConfigValues).mockResolvedValue({});
+    renderRoute();
+    await waitFor(() => expect(screen.getByTestId("config-form")).toBeInTheDocument());
+
+    // The sibling title wins — confirms the merge runs before render.
+    const cleanup = screen.getByLabelText(/cleanup credentials/i) as HTMLInputElement;
+    // writeOnly from the resolved definition propagates → password input.
+    expect(cleanup.type).toBe("password");
+    // Description from the definition survives the merge.
+    expect(screen.getByText(/provider api key/i)).toBeInTheDocument();
+  });
+
+  it("surfaces an error state when the schema contains a broken $ref", async () => {
+    const broken: api.ModuleConfigSchema = {
+      type: "object",
+      properties: {
+        // Pointer at a definition that doesn't exist — dereferenceSchema throws.
+        broken: { $ref: "#/definitions/missing" } as unknown as api.ConfigSchemaProperty,
+      },
+      definitions: {},
+    };
+    vi.mocked(api.getModuleConfigSchema).mockResolvedValue(broken);
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByText(/schema \$ref resolution failed/i)).toBeInTheDocument(),
+    );
+    // No form rendered when the schema is unresolvable.
+    expect(screen.queryByTestId("config-form")).not.toBeInTheDocument();
+  });
+});
