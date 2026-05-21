@@ -8,10 +8,12 @@ import {
 } from "../scribe-config.ts";
 import {
   FIRST_PARTY_FALLBACKS,
+  KNOWN_MODULES,
   type ServiceSpec,
   composeServiceSpec,
   knownServices,
 } from "../service-spec.ts";
+import type { ServiceEntry } from "../services-manifest.ts";
 import { findService } from "../services-manifest.ts";
 import { type InstallOpts, install } from "./install.ts";
 import type { InteractiveAvailability } from "./scribe-provider-interactive.ts";
@@ -59,11 +61,21 @@ export interface SetupOpts {
   noStart?: boolean;
 }
 
+/**
+ * Survey row. Pre-install we know manifestName + the optional
+ * `urlForEntry` quirk (vault wants `/mcp`, scribe wants the bare port); the
+ * full ServiceSpec only exists post-install for KNOWN_MODULES shorts
+ * (vault / scribe / runner — hub#310). The survey uses just these two
+ * fields, so a minimal shape avoids the spec round-trip pre-install.
+ */
 interface ServiceChoice {
   short: string;
   installed: boolean;
   manifestName: string;
-  spec: ServiceSpec;
+  /** Per-service URL composer used in the final-summary banner. Optional. */
+  urlForEntry?: (entry: ServiceEntry) => string | undefined;
+  /** Full spec when available (FIRST_PARTY_FALLBACKS shorts: notes / channel). */
+  spec?: ServiceSpec;
 }
 
 interface VaultAnswer {
@@ -97,25 +109,43 @@ function defaultAvailability(): InteractiveAvailability {
 
 /**
  * Survey the eligible services. We include the four first-party shortnames
- * (vault / notes / scribe / channel) but flag channel as exploratory in the
- * blurb so operators don't grab it by reflex. `installed` is true when the
- * service has a row in services.json.
+ * (vault / notes / scribe / channel + runner) but flag channel as exploratory
+ * in the blurb so operators don't grab it by reflex. `installed` is true when
+ * the service has a row in services.json.
+ *
+ * The full ServiceSpec is only available pre-install for FIRST_PARTY_FALLBACKS
+ * shorts (notes / channel — they carry a vendored manifest). KNOWN_MODULES
+ * shorts (vault / scribe / runner) ship `.parachute/module.json` and
+ * self-register; pre-install we know manifestName + the urlForEntry quirk
+ * from `KNOWN_MODULES[short].extras`, which is all the survey/summary needs.
  */
 function surveyServices(manifestPath: string): ServiceChoice[] {
   return knownServices().map((short) => {
     const fb = FIRST_PARTY_FALLBACKS[short];
-    if (!fb) throw new Error(`setup: unexpected first-party shortname ${short}`);
-    const spec = composeServiceSpec({
-      packageName: fb.package,
-      manifest: fb.manifest,
-      extras: fb.extras,
-    });
-    return {
+    if (fb) {
+      const spec = composeServiceSpec({
+        packageName: fb.package,
+        manifest: fb.manifest,
+        extras: fb.extras,
+      });
+      const choice: ServiceChoice = {
+        short,
+        manifestName: spec.manifestName,
+        spec,
+        installed: !!findService(spec.manifestName, manifestPath),
+      };
+      if (spec.urlForEntry) choice.urlForEntry = spec.urlForEntry;
+      return choice;
+    }
+    const km = KNOWN_MODULES[short];
+    if (!km) throw new Error(`setup: unexpected first-party shortname ${short}`);
+    const choice: ServiceChoice = {
       short,
-      manifestName: spec.manifestName,
-      spec,
-      installed: !!findService(spec.manifestName, manifestPath),
+      manifestName: km.manifestName,
+      installed: !!findService(km.manifestName, manifestPath),
     };
+    if (km.extras?.urlForEntry) choice.urlForEntry = km.extras.urlForEntry;
+    return choice;
   });
 }
 
@@ -127,7 +157,7 @@ const BLURBS: Record<string, string> = {
 };
 
 function blurbFor(choice: ServiceChoice): string {
-  return BLURBS[choice.short] ?? choice.spec.manifestName;
+  return BLURBS[choice.short] ?? choice.manifestName;
 }
 
 /**
@@ -246,7 +276,7 @@ function summarizeUrls(
       log(`  ⚠ ${choice.manifestName} not in services.json — re-run install if expected`);
       continue;
     }
-    const url = choice.spec.urlForEntry?.(entry);
+    const url = choice.urlForEntry?.(entry);
     log(`  ✓ ${entry.name}${url ? ` — ${url}` : ""}`);
   }
   log("");

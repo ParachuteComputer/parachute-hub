@@ -548,14 +548,14 @@ async function proxyToService(req: Request, manifestPath: string): Promise<Respo
     return new Response("not found", { status: 404 });
   }
   // Consult FIRST_PARTY_FALLBACKS as a fallback for `stripPrefix` (#196).
-  // Scribe v0.4.0 doesn't write `stripPrefix: true` to its services.json
-  // entry — the declaration only lives in hub's SCRIBE_FALLBACK manifest.
-  // Pre-#187 this didn't matter because the per-service tailscale serve
-  // plan baked the path into the target URL; post-#187 routing went through
-  // hub which wasn't consulting the fallback registry. Same shape as how
-  // `effectivePublicExposure` already handles fallback derivation in
-  // service-spec.ts. Explicit-on-entry still wins; absent → fallback →
-  // false (preserving existing keep-prefix default for unknown services).
+  // Pre-hub#310, scribe's `stripPrefix: true` lived only in hub's vendored
+  // fallback; post-#310 scribe self-registers with `stripPrefix: true` on
+  // its row, so the entry-based path is authoritative for scribe. The
+  // fallback consultation now matters only for notes / channel
+  // (FIRST_PARTY_FALLBACKS shorts that haven't yet self-registered with
+  // the canonical declaration). Explicit-on-entry still wins; absent →
+  // fallback → false (preserving the keep-prefix default for unknown
+  // services).
   const stripPrefix = stripPrefixFor(match.entry);
   const targetPath = stripPrefix ? url.pathname.slice(match.mount.length) || "/" : undefined;
   return proxyRequest(req, match.port, match.entry.name, targetPath);
@@ -563,10 +563,17 @@ async function proxyToService(req: Request, manifestPath: string): Promise<Respo
 
 /**
  * Resolve effective `stripPrefix` for a service entry. Explicit on-entry
- * wins; otherwise consult `FIRST_PARTY_FALLBACKS` keyed by short name (so
- * scribe's vendored fallback supplies `stripPrefix: true` even when scribe's
- * own boot doesn't write it). Defaults to `false` — keep the prefix —
- * matching the pre-#196 dispatch behavior for unknown / third-party services.
+ * wins; otherwise consult `FIRST_PARTY_FALLBACKS` keyed by short name (for
+ * notes / channel — vault/scribe/runner retired their FALLBACK entries in
+ * hub#310 and self-register with the canonical `stripPrefix` declaration on
+ * their services.json row). Defaults to `false` — keep the prefix — matching
+ * the pre-#196 dispatch behavior for unknown / third-party services.
+ *
+ * For a self-registering KNOWN_MODULES short whose row is missing entirely
+ * (uninstalled, never booted), the request never reaches this code path —
+ * `findServiceUpstream` returns undefined upstream and the proxy 404s. The
+ * "module not installed → not found" shape replaces the prior "fall through
+ * to vendored fallback" lookup.
  */
 function stripPrefixFor(entry: ServiceEntry): boolean {
   if (entry.stripPrefix !== undefined) return entry.stripPrefix;

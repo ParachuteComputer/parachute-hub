@@ -38,8 +38,15 @@ import { dirname } from "node:path";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import { getModuleInstallChannel } from "./hub-settings.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
+import { readModuleManifest } from "./module-manifest.ts";
 import { refreshWellKnown, stampInstallDirOnRow } from "./post-install.ts";
-import { FIRST_PARTY_FALLBACKS, type ServiceSpec, composeServiceSpec } from "./service-spec.ts";
+import {
+  KNOWN_MODULES,
+  type ServiceSpec,
+  composeKnownModuleSpec,
+  getSpec,
+  synthesizeManifestForKnownModule,
+} from "./service-spec.ts";
 import { findService, readManifest, removeService } from "./services-manifest.ts";
 import type { ModuleState, SpawnRequest, Supervisor } from "./supervisor.ts";
 import { WELL_KNOWN_PATH, type regenerateWellKnown } from "./well-known.ts";
@@ -263,19 +270,54 @@ async function authorize(req: Request, deps: ApiModulesOpsDeps): Promise<Respons
  * pair of (package, manifest) the supervisor + install runner act on.
  * Exported so non-API callers (the first-boot wizard, hub#259) can
  * reach the same spec the API handlers use without duplicating the
- * FIRST_PARTY_FALLBACKS lookup.
+ * curated-table lookup.
+ *
+ * Two source paths (hub#310, post-FALLBACK-retirement for vault/scribe/runner):
+ *
+ *   - **FIRST_PARTY_FALLBACKS** (notes / channel): vendored manifest is
+ *     authoritative pre-install — the embedded `manifest.startCmd` /
+ *     `manifest.paths` / etc. drive the install + spawn flow.
+ *   - **KNOWN_MODULES** (vault / scribe / runner): no vendored manifest.
+ *     Pre-install we know only the npm package + manifestName + canonical
+ *     port + imperative `extras` (init, postInstallFooter, urlForEntry,
+ *     hasAuth). Post-install, `runInstall` reads `<installDir>/.parachute/module.json`
+ *     to compose a full spawnable spec via `resolveSpawnSpec`.
+ *
+ * The returned spec carries `manifestName`, `package`, `seedEntry` (FALLBACK
+ * only), and `startCmd` (FALLBACK only — KNOWN_MODULES gets it post-install).
+ * Callers downstream of `bun add -g` consult `resolveSpawnSpec` to fill the
+ * KNOWN_MODULES gap.
  */
 export function specFor(short: CuratedModuleShort): ServiceSpec {
-  const fb = FIRST_PARTY_FALLBACKS[short];
-  // Curated set is a const; every entry has a fallback. The non-null
-  // assertion is safe because CURATED_MODULES is a tuple-literal
-  // intersected with the FIRST_PARTY_FALLBACKS key set.
-  if (!fb) throw new Error(`internal: no fallback for curated ${short}`);
-  return composeServiceSpec({
-    packageName: fb.package,
-    manifest: fb.manifest,
-    extras: fb.extras,
-  });
+  const spec = getSpec(short);
+  if (!spec) throw new Error(`internal: no curated entry for ${short}`);
+  return spec;
+}
+
+/**
+ * Compose the full spawnable spec for a KNOWN_MODULES short by reading
+ * `<installDir>/.parachute/module.json`. Used post-`bun add -g` in
+ * `runInstall` / `runUpgrade` to derive the startCmd hub needs to spawn the
+ * supervised child.
+ *
+ * Returns `null` when the manifest is absent or unreadable — caller surfaces
+ * a "module installed but no module.json on disk" error and the operation
+ * fails with status `failed`. Throws `ModuleManifestError` on a malformed
+ * manifest, same surface as `getSpecFromInstallDir`.
+ */
+async function resolveSpawnSpec(
+  short: CuratedModuleShort,
+  installDir: string,
+): Promise<ServiceSpec | null> {
+  const km = KNOWN_MODULES[short];
+  if (!km) return null;
+  // module.json is the canonical source — module is authoritative for its
+  // own startCmd / paths. Synthesize a minimal manifest from KNOWN_MODULES
+  // as a graceful-degrade fallback when the file isn't readable (legacy
+  // installs, test fixtures); the imperative `extras.startCmd` in
+  // KNOWN_MODULES still applies so the supervisor can spawn.
+  const manifest = (await readModuleManifest(installDir)) ?? synthesizeManifestForKnownModule(km);
+  return composeKnownModuleSpec(km, manifest);
 }
 
 function defaultRun(cmd: readonly string[]): Promise<number> {
@@ -446,13 +488,32 @@ export async function runInstall(
     });
   }
 
+  // KNOWN_MODULES shorts (vault / scribe / runner — hub#310): module.json
+  // is the canonical source for startCmd. Re-resolve the spec from
+  // `<installDir>/.parachute/module.json` when installDir is stamped so the
+  // module is authoritative for its own spawn cmd. Falls back to the
+  // imperative `extras.startCmd` carried by `spec` (from `specFor`) when
+  // installDir is absent or module.json is unreadable. FIRST_PARTY_FALLBACKS
+  // shorts (notes / channel) don't take this path — they're already in
+  // KNOWN_MODULES[short] === undefined so the short-circuit applies.
+  let spawnSpec: ServiceSpec = spec;
+  if (installDir && KNOWN_MODULES[short]) {
+    const resolved = await resolveSpawnSpec(short, installDir);
+    if (resolved) {
+      spawnSpec = resolved;
+    }
+  }
+
   // Spawn the child via the supervisor. Boot-spawn semantics apply.
-  const state = await spawnSupervised(short, spec, deps);
+  const state = await spawnSupervised(short, spawnSpec, deps);
   if (!state) {
     registry.update(
       opId,
-      { status: "failed", error: "module installed but spawn failed (no startCmd resolved)" },
-      `${short}: install succeeded but no startCmd resolvable from services.json`,
+      {
+        status: "failed",
+        error: "module installed but spawn failed (no startCmd resolved from module.json)",
+      },
+      `${short}: install succeeded but no startCmd resolvable — confirm <installDir>/.parachute/module.json carries a startCmd`,
     );
     return;
   }

@@ -17,7 +17,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { FIRST_PARTY_FALLBACKS, shortNameForManifest } from "./service-spec.ts";
+import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES, shortNameForManifest } from "./service-spec.ts";
 
 export type InstallSourceKind = "bun-linked" | "npm" | "unknown";
 
@@ -120,11 +120,12 @@ function isUnderBunGlobals(candidate: string, prefixes: readonly string[]): bool
 
 function packageNameFor(entryName: string): string | undefined {
   const short = shortNameForManifest(entryName);
-  if (short !== undefined) {
-    const fb = FIRST_PARTY_FALLBACKS[short];
-    if (fb) return fb.package;
-  }
-  return undefined;
+  if (short === undefined) return undefined;
+  const fb = FIRST_PARTY_FALLBACKS[short];
+  if (fb) return fb.package;
+  // KNOWN_MODULES (vault / scribe / runner — post hub#310 FALLBACK
+  // retirement) carries the package name without an embedded manifest.
+  return KNOWN_MODULES[short]?.package;
 }
 
 function readVersion(packageDir: string, readJson: (p: string) => unknown): string | undefined {

@@ -13,7 +13,7 @@ import {
   stopHub,
 } from "../hub-control.ts";
 import { HUB_ORIGIN_ENV, deriveHubOrigin } from "../hub-origin.ts";
-import { ModuleManifestError } from "../module-manifest.ts";
+import { ModuleManifestError, readModuleManifest } from "../module-manifest.ts";
 import {
   type AliveFn,
   clearPid,
@@ -24,7 +24,9 @@ import {
   writePid,
 } from "../process-state.ts";
 import {
+  KNOWN_MODULES,
   type ServiceSpec,
+  composeKnownModuleSpec,
   getSpec,
   getSpecFromInstallDir,
   knownServices,
@@ -254,7 +256,37 @@ async function specForEntry(
   entry: ServiceEntry,
 ): Promise<{ spec: ServiceSpec | undefined; error?: string }> {
   const firstParty = getSpec(short);
+  // KNOWN_MODULES shorts (vault / scribe / runner — post hub#310 FALLBACK
+  // retirement): if installDir is stamped (typical post-self-register),
+  // compose the spec from the module's own `.parachute/module.json` so the
+  // module is authoritative for its startCmd / paths / health. Falls back
+  // to the minimal `getSpec` (which carries an imperative `extras.startCmd`
+  // matching the module's canonical declaration) when installDir is absent
+  // or module.json is unreadable — covers legacy services.json rows from
+  // before installDir stamping landed.
+  const km = KNOWN_MODULES[short];
+  if (km) {
+    if (entry.installDir) {
+      try {
+        const manifest = await readModuleManifest(entry.installDir);
+        if (manifest) return { spec: composeKnownModuleSpec(km, manifest) };
+      } catch (err) {
+        if (err instanceof ModuleManifestError) {
+          // Surface the parse/validation error but keep the legacy
+          // imperative-startCmd spec so `start` can still spawn — better
+          // than no lifecycle at all when a module ships a typo'd manifest.
+          return { spec: firstParty, error: err.message };
+        }
+        throw err;
+      }
+    }
+    return { spec: firstParty };
+  }
+  // FIRST_PARTY_FALLBACKS shorts (notes / channel): the vendored manifest
+  // is authoritative — startCmd is composed from extras + manifest at
+  // `getSpec` time, no installDir read needed.
   if (firstParty) return { spec: firstParty };
+  // Third-party rows: spec lives in the module's installDir/module.json.
   if (!entry.installDir) return { spec: undefined };
   try {
     const spec = await getSpecFromInstallDir(entry.installDir, entry.name);
@@ -302,7 +334,15 @@ async function resolveTargets(
       if (!entry) {
         return { error: `${svc} isn't installed. Run \`parachute install ${svc}\` first.` };
       }
-      return { targets: [{ short: svc, entry, spec: firstPartySpec }] };
+      // KNOWN_MODULES path (hub#310): `getSpec` returns a startCmd-less
+      // minimal spec for vault / scribe / runner. Compose the full
+      // spawnable spec by reading installDir's module.json so `start` /
+      // `restart` see the real startCmd. FIRST_PARTY_FALLBACKS path:
+      // `firstPartySpec.startCmd` is already populated, and `specForEntry`
+      // short-circuits without re-reading.
+      const { spec, error } = await specForEntry(svc, entry);
+      if (error) return { error: `${svc}: invalid module.json — ${error}` };
+      return { targets: [{ short: svc, entry, spec: spec ?? firstPartySpec }] };
     }
     // Third-party: match a services.json row by name. Rows with `installDir`
     // resolve a full spec from the on-disk module.json. Rows without it are
@@ -327,7 +367,11 @@ async function resolveTargets(
   for (const entry of manifest.services) {
     const short = shortNameForManifest(entry.name);
     if (short) {
-      const spec = getSpec(short);
+      // KNOWN_MODULES path (hub#310): minimal `getSpec` returns no startCmd
+      // for vault / scribe / runner — read installDir's module.json to
+      // compose the spawnable spec. FIRST_PARTY_FALLBACKS shorts get
+      // back the same vendored-startCmd-bearing spec from `getSpec`.
+      const { spec } = await specForEntry(short, entry);
       targets.push({ short, entry, spec });
       continue;
     }
