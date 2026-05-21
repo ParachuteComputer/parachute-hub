@@ -462,6 +462,103 @@ describe("renderApprovePending unauthenticated CTAs", () => {
   });
 });
 
+describe("renderApprovePending scope display (wildcard substitution)", () => {
+  const COMMON = {
+    clientName: "MyApp",
+    clientId: "client-xyz",
+    redirectUris: ["https://app.example/cb"],
+    hubOrigin: "https://hub.example.com",
+  };
+
+  test("unnamed vault scopes render with the wildcard form (vault:*:<verb>)", () => {
+    // The bug Aaron hit on rc.1: the server-rendered approve-pending page
+    // showed raw `vault:read` / `vault:write` rather than the resolved
+    // `vault:*:<verb>` form the SPA already used. Both the unauth viewer
+    // and the authenticated admin branch get the substituted display so
+    // they match the SPA's `/admin/approve-client/<id>` view.
+    const html = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["vault:read", "vault:write"],
+    });
+    expect(html).toMatch(/<code class="scope-name">vault:\*:read<\/code>/);
+    expect(html).toMatch(/<code class="scope-name">vault:\*:write<\/code>/);
+    // Raw unnamed form must NOT appear in the rendered scope-row code
+    // blocks any more — that was the bug.
+    expect(html).not.toMatch(/<code class="scope-name">vault:read<\/code>/);
+    expect(html).not.toMatch(/<code class="scope-name">vault:write<\/code>/);
+  });
+
+  test("wildcard explanation surfaces below the scope list when any scope renders with `*`", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["vault:read"],
+    });
+    // The `<p class="scope-wildcard-note">…` element is what's conditional;
+    // `.scope-wildcard-note` as a CSS class name is always present in the
+    // stylesheet, so match the rendered element specifically.
+    expect(html).toMatch(/<p class="scope-wildcard-note">/);
+    expect(html).toContain("a specific vault is selected during sign-in");
+    expect(html).toContain("unbound shape");
+  });
+
+  test("wildcard explanation is omitted when no scope renders with `*`", () => {
+    // All-non-vault: explanation absent.
+    const nonVault = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["scribe:transcribe", "channel:send"],
+    });
+    expect(nonVault).not.toMatch(/<p class="scope-wildcard-note">/);
+    expect(nonVault).not.toContain("unbound shape");
+
+    // Already-named vault: explanation absent (vault already specified).
+    const named = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["vault:work:read"],
+    });
+    expect(named).not.toMatch(/<p class="scope-wildcard-note">/);
+    expect(named).not.toContain("unbound shape");
+
+    // Empty scopes: explanation absent (no scope rows at all).
+    const empty = renderApprovePending({ ...COMMON, requestedScopes: [] });
+    expect(empty).not.toMatch(/<p class="scope-wildcard-note">/);
+  });
+
+  test("already-named vault scopes still render as-is (no double substitution)", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["vault:work:read"],
+    });
+    expect(html).toMatch(/<code class="scope-name">vault:work:read<\/code>/);
+    // Pre-existing named scopes don't get mangled by the wildcard substitution.
+    expect(html).not.toMatch(/vault:\*:work/);
+  });
+
+  test("mixed scopes render the wildcard explanation when ANY scope is unnamed-vault", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["scribe:transcribe", "vault:read"],
+    });
+    expect(html).toMatch(/<code class="scope-name">scribe:transcribe<\/code>/);
+    expect(html).toMatch(/<code class="scope-name">vault:\*:read<\/code>/);
+    expect(html).toMatch(/<p class="scope-wildcard-note">/);
+  });
+
+  test("authenticated admin branch also gets the wildcard substitution + explanation", () => {
+    // Both branches of the page render through the same scope-display path
+    // — the inline-form admin viewer sees the same resolved scopes as the
+    // unauth viewer with the sign-in CTA.
+    const html = renderApprovePending({
+      ...COMMON,
+      requestedScopes: ["vault:read", "vault:write"],
+      approveForm: { csrfToken: CSRF, returnTo: "/oauth/authorize?client_id=client-xyz" },
+    });
+    expect(html).toContain('action="/oauth/authorize/approve"');
+    expect(html).toMatch(/<code class="scope-name">vault:\*:read<\/code>/);
+    expect(html).toMatch(/<code class="scope-name">vault:\*:write<\/code>/);
+    expect(html).toMatch(/<p class="scope-wildcard-note">/);
+  });
+});
+
 describe("CSS / styling guarantees", () => {
   test("does not load fonts from a third-party CDN (privacy)", () => {
     const html = renderLogin({ params: PARAMS, csrfToken: CSRF });

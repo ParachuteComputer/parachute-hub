@@ -359,10 +359,30 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
     approveForm,
   } = props;
   const redirectList = redirectUris.map((u) => `<li><code>${escapeHtml(u)}</code></li>`).join("");
+  // Substitute unnamed `vault:<verb>` rows with the wildcard display form
+  // (`vault:*:<verb>`) so the operator sees the shape that will appear in
+  // the token after consent narrows the scope to a specific vault. At
+  // approve time no vault has been picked yet — the SPA's
+  // `/admin/approve-client/<id>` view uses the same wildcard treatment
+  // (see `resolveScopeForDisplay` in `web/ui/src/routes/ApproveClient.tsx`).
+  const displayedScopes = requestedScopes.map((s) => substituteVaultDisplay(s, "*"));
   const scopeRows =
-    requestedScopes.length === 0
+    displayedScopes.length === 0
       ? `<li class="scope scope-empty">No scopes requested — the app gets a session token only.</li>`
-      : requestedScopes.map(renderScopeRow).join("\n");
+      : displayedScopes.map(renderScopeRow).join("\n");
+  // Wildcard explanation: surface the "the asterisk means the vault is
+  // picked later" hint below the scope list when at least one row carries
+  // `vault:*:<verb>`. Mirrors the SPA's inline note on
+  // `/admin/approve-client/<id>`. Omitted when no scope renders with `*`
+  // (all scopes are either non-vault or already-named).
+  const wildcardNote = displayedScopes.some((s) => /^vault:\*:(read|write)$/.test(s))
+    ? `
+        <p class="scope-wildcard-note">
+          <code>*</code> — a specific vault is selected during sign-in via the consent
+          picker (or the user's assigned vault for multi-user setups). The
+          <code>*</code> shows the unbound shape.
+        </p>`
+    : "";
   // Vault hint (closes #244): Notes' VaultPopover (notes#115) passes
   // `vault=<name>` on `/oauth/authorize` for per-vault grants. Surface it
   // alongside scopes so a multi-vault operator can tell which vault they're
@@ -414,7 +434,7 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
       </section>
       <section class="scopes">
         <h2 class="scopes-title">Permissions requested</h2>
-        <ul class="scope-list">${scopeRows}</ul>
+        <ul class="scope-list">${scopeRows}</ul>${wildcardNote}
       </section>
       ${formSection}
     </div>`;
@@ -1149,6 +1169,21 @@ const STYLES = `
     font-size: 0.78rem;
     color: ${PALETTE.fgDim};
     font-style: italic;
+  }
+  .scope-wildcard-note {
+    margin: 0.6rem 0 0;
+    font-size: 0.82rem;
+    color: ${PALETTE.fgDim};
+    font-style: italic;
+    line-height: 1.45;
+  }
+  .scope-wildcard-note code {
+    font-family: ${FONT_MONO};
+    font-style: normal;
+    background: ${PALETTE.bgSoft};
+    padding: 0.05rem 0.3rem;
+    border-radius: 4px;
+    color: ${PALETTE.fgMuted};
   }
   .badge {
     display: inline-block;
