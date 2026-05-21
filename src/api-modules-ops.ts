@@ -38,10 +38,11 @@ import { dirname } from "node:path";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import { getModuleInstallChannel } from "./hub-settings.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
+import { refreshWellKnown, stampInstallDirOnRow } from "./post-install.ts";
 import { FIRST_PARTY_FALLBACKS, type ServiceSpec, composeServiceSpec } from "./service-spec.ts";
-import { findService, readManifest, removeService, upsertService } from "./services-manifest.ts";
+import { findService, readManifest, removeService } from "./services-manifest.ts";
 import type { ModuleState, SpawnRequest, Supervisor } from "./supervisor.ts";
-import { regenerateWellKnown } from "./well-known.ts";
+import { WELL_KNOWN_PATH, type regenerateWellKnown } from "./well-known.ts";
 
 /**
  * Scope required for every POST + operation-poll endpoint here.
@@ -283,58 +284,25 @@ function defaultRun(cmd: readonly string[]): Promise<number> {
 }
 
 /**
- * Stamp `installDir` on the services.json row for `spec.manifestName` when
- * the package's globally-installed path can be resolved. Idempotent —
- * no-ops when the row already carries the same `installDir`, when no row
- * exists, or when `findGlobalInstall` can't locate the package (e.g. in
- * tests with no global install).
- *
- * Mirrors the same stamp `parachute install <svc>` does in
- * `commands/install.ts`. Without it, the discovery page's
- * `loadServiceUiMetadata` resolver in `hub-server.ts` skips the entry (it
- * reads `module.json` from `installDir`), so `uiUrl` never lands on the
- * row + the new module's tile never renders on `/`.
+ * Resolve the `installDir` for `spec` from `findGlobalInstall`. Null when
+ * the dep isn't wired (tests without a stub) or the package can't be
+ * located on disk. Same fallback semantics the previous inline
+ * `stampInstallDir` had — callers fall through to a regen-only path.
  */
-function stampInstallDir(spec: ServiceSpec, deps: ApiModulesOpsDeps): void {
+function resolveInstallDirForSpec(spec: ServiceSpec, deps: ApiModulesOpsDeps): string | null {
   const findGlobalInstall = deps.findGlobalInstall;
-  if (!findGlobalInstall) return;
+  if (!findGlobalInstall) return null;
   const pkgJson = findGlobalInstall(spec.package);
-  if (!pkgJson) return;
-  const installDir = dirname(pkgJson);
-  const entry = findService(spec.manifestName, deps.manifestPath);
-  if (!entry || entry.installDir === installDir) return;
-  upsertService({ ...entry, installDir }, deps.manifestPath);
+  return pkgJson ? dirname(pkgJson) : null;
 }
 
 /**
- * Regenerate `/.well-known/parachute.json` on disk after a state-changing
- * module op (install / upgrade / uninstall). Wraps `regenerateWellKnown`
- * with the deps-aware defaults — issuer for canonicalOrigin, deps-overridable
- * paths + manifest reader. Errors land in the operation log rather than
- * throwing back to the caller; the on-disk doc is a debug / inspection
- * artifact, not the live discovery source, so a regen failure shouldn't
- * mask the op's actual outcome.
+ * Build the op-log sink for `opId`. Threaded into `finalizeModuleInstall` /
+ * `refreshWellKnown` so their `regenerated <path>` / `well-known regen
+ * failed: …` lines land on the operation the UI is polling.
  */
-async function regenAfterOp(
-  opId: string,
-  registry: OperationsRegistry,
-  deps: ApiModulesOpsDeps,
-): Promise<void> {
-  try {
-    const regenOpts: Parameters<typeof regenerateWellKnown>[0] = {
-      manifestPath: deps.manifestPath,
-      canonicalOrigin: deps.issuer,
-    };
-    if (deps.wellKnownPath !== undefined) regenOpts.wellKnownPath = deps.wellKnownPath;
-    if (deps.readModuleManifest !== undefined) {
-      regenOpts.readModuleManifest = deps.readModuleManifest;
-    }
-    const { path } = await regenerateWellKnown(regenOpts);
-    registry.update(opId, {}, `regenerated ${path}`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    registry.update(opId, {}, `well-known regen failed: ${msg}`);
-  }
+function opLog(opId: string, registry: OperationsRegistry): (msg: string) => void {
+  return (msg) => registry.update(opId, {}, msg);
 }
 
 /**
@@ -463,13 +431,20 @@ export async function runInstall(
     }
   }
 
-  // Stamp installDir on the row so the discovery page's `uiUrl` /
-  // `displayName` resolver can find `<installDir>/.parachute/module.json`.
-  // Mirrors `parachute install <svc>` — without this, the new module's
-  // tile never renders on `/` because `loadServiceUiMetadata` skips
-  // installDir-less rows. (Doing this BEFORE the spawn so the supervisor
-  // also sees the updated row if it consults services.json post-spawn.)
-  stampInstallDir(spec, deps);
+  // Stamp `installDir` on the services.json row BEFORE the spawn so the
+  // supervisor sees the updated row if it consults services.json
+  // post-spawn. Mirrors `parachute install <svc>`. Without the stamp,
+  // the discovery page's `loadServiceUiMetadata` resolver skips the
+  // row (no installDir → no module.json → no uiUrl) and the new
+  // module's tile never renders on `/`.
+  const installDir = resolveInstallDirForSpec(spec, deps);
+  if (installDir) {
+    stampInstallDirOnRow({
+      manifestName: spec.manifestName,
+      installDir,
+      servicesJsonPath: deps.manifestPath,
+    });
+  }
 
   // Spawn the child via the supervisor. Boot-spawn semantics apply.
   const state = await spawnSupervised(short, spec, deps);
@@ -482,12 +457,20 @@ export async function runInstall(
     return;
   }
 
-  // Regenerate the on-disk well-known doc so the inspection artifact
-  // tracks the just-installed module's row. The HTTP path serves a
-  // per-request build, so the discovery page picks up the new module
-  // either way; this keeps `~/.parachute/well-known/parachute.json` in
-  // sync for tooling that reads it directly.
-  await regenAfterOp(opId, registry, deps);
+  // Regen the on-disk well-known doc. `~/.parachute/well-known/parachute.json`
+  // is an inspection artifact, not the live discovery source (hub-server.ts
+  // builds per-request from services.json), so it stays in lockstep with
+  // the live HTTP path only when we explicitly refresh it after a
+  // state-changing op. Paired with the pre-spawn stamp above so this op
+  // closes the "newly installed module doesn't appear on discovery"
+  // bug from hub#292 / hub#298.
+  await refreshWellKnown({
+    servicesJsonPath: deps.manifestPath,
+    canonicalOrigin: deps.issuer,
+    wellKnownPath: deps.wellKnownPath ?? WELL_KNOWN_PATH,
+    log: opLog(opId, registry),
+    ...(deps.readModuleManifest ? { readModuleManifest: deps.readModuleManifest } : {}),
+  });
 
   registry.update(opId, { status: "succeeded" }, `${short} installed + spawned (pid ${state.pid})`);
 }
@@ -575,7 +558,14 @@ async function runUpgrade(
   // Re-stamp installDir after upgrade — a major-version bump may relocate
   // the package on disk (e.g. node_modules layout change). Idempotent
   // when the path is stable.
-  stampInstallDir(spec, deps);
+  const installDir = resolveInstallDirForSpec(spec, deps);
+  if (installDir) {
+    stampInstallDirOnRow({
+      manifestName: spec.manifestName,
+      installDir,
+      servicesJsonPath: deps.manifestPath,
+    });
+  }
 
   const state = await deps.supervisor.restart(short);
   if (!state) {
@@ -591,7 +581,13 @@ async function runUpgrade(
   // module's row reflects the new install. The HTTP path rebuilds per
   // request, so the discovery page tracks the new version regardless;
   // this keeps the inspection artifact aligned.
-  await regenAfterOp(opId, registry, deps);
+  await refreshWellKnown({
+    servicesJsonPath: deps.manifestPath,
+    canonicalOrigin: deps.issuer,
+    wellKnownPath: deps.wellKnownPath ?? WELL_KNOWN_PATH,
+    log: opLog(opId, registry),
+    ...(deps.readModuleManifest ? { readModuleManifest: deps.readModuleManifest } : {}),
+  });
 
   registry.update(
     opId,
@@ -643,21 +639,13 @@ export async function handleUninstall(
   // longer appears in the inspection artifact. The HTTP path rebuilds
   // per request, so live discovery drops the entry immediately; this
   // is the disk-side equivalent.
-  try {
-    const regenOpts: Parameters<typeof regenerateWellKnown>[0] = {
-      manifestPath: deps.manifestPath,
-      canonicalOrigin: deps.issuer,
-    };
-    if (deps.wellKnownPath !== undefined) regenOpts.wellKnownPath = deps.wellKnownPath;
-    if (deps.readModuleManifest !== undefined) {
-      regenOpts.readModuleManifest = deps.readModuleManifest;
-    }
-    const { path } = await regenerateWellKnown(regenOpts);
-    log.push(`regenerated ${path}`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log.push(`well-known regen failed: ${msg}`);
-  }
+  await refreshWellKnown({
+    servicesJsonPath: deps.manifestPath,
+    canonicalOrigin: deps.issuer,
+    wellKnownPath: deps.wellKnownPath ?? WELL_KNOWN_PATH,
+    log: (msg) => log.push(msg),
+    ...(deps.readModuleManifest ? { readModuleManifest: deps.readModuleManifest } : {}),
+  });
 
   return jsonOk({ short, log });
 }
