@@ -2,6 +2,24 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.11-rc.3] - 2026-05-21
+
+**fix(serve): print localhost in banner when bound to 0.0.0.0 (operators couldn't navigate to bind address).**
+
+Aaron hit this on rc.2 testing: `parachute serve` printed `listening on http://0.0.0.0:1939` and pasting that URL into Chrome failed (browser refuses to navigate to `0.0.0.0`; even when it resolves, mixing the bind-address origin with other URLs like `localhost:1939` trips cross-origin checks). `0.0.0.0` is a kernel-side meta-address ("listen on all interfaces") — not an operator-usable URL.
+
+Fix shape:
+
+- Extracted `formatListeningBanner(...)` in `src/commands/serve.ts`. When the bind hostname is `0.0.0.0`, the banner now prints `http://localhost:<port>` with a parenthetical `(bound on all interfaces: 0.0.0.0:<port>)` so operators get a navigable URL while still seeing the actual bind address for diagnostic purposes.
+- When the operator has explicitly chosen a hostname via `PARACHUTE_BIND_HOST` (e.g. `127.0.0.1`, a LAN IP), the banner prints that hostname directly with no parenthetical — the operator knows what they wired.
+- Bind behaviour is unchanged: `Bun.serve({ hostname })` still receives the original `0.0.0.0` / `PARACHUTE_BIND_HOST` value, so containers + LAN exposure paths keep working exactly as before. Banner-only cosmetic fix.
+
+Tests added in `src/__tests__/serve.test.ts`:
+- `0.0.0.0` → banner displays `localhost` + parenthetical bind disclosure (URL precedes disclosure precedes contextual block).
+- `127.0.0.1` → banner displays the loopback verbatim, no bind disclosure.
+- `192.168.1.10` → banner displays the LAN IP verbatim, no bind disclosure.
+- Contextual block carries `PARACHUTE_HOME`, db, issuer, admin state; undefined issuer renders as `<request-origin>`.
+
 ## [0.5.11-rc.2] - 2026-05-20
 
 **fix(approve-pending): substitute unnamed vault scopes with wildcard form (matches SPA + consent).**
