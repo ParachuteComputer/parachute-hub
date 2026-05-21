@@ -2,6 +2,28 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.11-rc.2] - 2026-05-20
+
+**fix(approve-pending): substitute unnamed vault scopes with wildcard form (matches SPA + consent).**
+
+Aaron hit this on rc.1 testing: the server-rendered `ApprovePendingView` (the "App not yet approved — Sign in as admin to approve" page on `/oauth/authorize` for a pending client) showed raw OAuth scopes like `vault:read` and `vault:write` rather than the resolved `vault:*:read` / `vault:*:write` form. The SPA's `/admin/approve-client/<id>` view (hub#289) already substituted correctly; this brings the server-rendered version in line.
+
+Root cause: `renderApprovePending` rendered `requestedScopes` directly with no display-time substitution. Both branches (unauth viewer with sign-in CTA + authenticated admin with inline approve form) got the raw scope shape.
+
+Fix shape:
+
+- Documented the `'*'` mode on `substituteVaultDisplay(scope, displayVault)` — the literal string `'*'` renders unnamed `vault:<verb>` scopes as `vault:*:<verb>`. Already-named vault scopes (`vault:work:read`) and non-vault scopes (`scribe:transcribe`, `channel:send`) pass through unchanged.
+- `renderApprovePending` now maps requested scopes through `substituteVaultDisplay(s, '*')` before rendering.
+- Surfaces an inline explanation below the scope list when any scope renders with `*`: "a specific vault is selected during sign-in via the consent picker (or the user's assigned vault for multi-user setups). The `*` shows the unbound shape." Omitted when all scopes are non-vault or already-named. Mirrors the SPA's pattern in `ApproveClient.tsx`.
+
+Tests added in `src/__tests__/oauth-ui.test.ts`:
+- `substituteVaultDisplay` `'*'` mode: substitutes unnamed → wildcard, leaves non-vault + already-named pass-through.
+- `renderApprovePending` renders `vault:*:read` / `vault:*:write` (not raw) for unnamed input.
+- Wildcard explanation surfaces when any scope is unnamed-vault; absent for all-non-vault, all-already-named, and empty-scope inputs.
+- Authenticated admin branch gets the same substitution + explanation.
+
+Cross-reference: hub#289 (the SPA + consent renderer that already did this).
+
 ## [0.5.11-rc.1] - 2026-05-20
 
 **fix: regenerate well-known after install/upgrade/uninstall so discovery page reflects current state.**
