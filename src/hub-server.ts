@@ -48,6 +48,7 @@
  *   /api/modules/:short/upgrade   (POST)       → bun add @<channel> + restart (async op)
  *   /api/modules/:short/uninstall (POST)       → stop child + bun remove + drop row (sync)
  *   /api/modules/operations/:id   (GET)        → poll async op status
+ *   /api/settings/hub-origin      (GET + PUT)  → canonical hub URL (host:admin)
  *   /api/auth/mint-token          (POST)       → CLI/automation token mint (bearer)
  *   /api/auth/revoke-token        (POST)       → revoke registry-row token by jti
  *   /api/auth/tokens              (GET)        → paginated registry list
@@ -125,6 +126,7 @@ import {
 import { handleApiModules, handleApiModulesChannel } from "./api-modules.ts";
 import { REVOCATION_LIST_MOUNT, handleRevocationList } from "./api-revocation-list.ts";
 import { handleApiRevokeToken } from "./api-revoke-token.ts";
+import { handleApiSettingsHubOrigin } from "./api-settings-hub-origin.ts";
 import { handleApiTokens } from "./api-tokens.ts";
 import {
   handleCreateUser,
@@ -1497,6 +1499,21 @@ export function hubFetch(
       return handleApiModulesChannel(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
+      });
+    }
+
+    // Canonical hub URL (hub#298). Admin SPA reads + writes the
+    // operator-set issuer override. The handler computes the resolved
+    // issuer + source here so it can surface them in the GET payload
+    // without re-walking the precedence chain inside the handler.
+    if (pathname === "/api/settings/hub-origin") {
+      if (!getDb) return dbNotConfigured();
+      const db = getDb();
+      return handleApiSettingsHubOrigin(req, {
+        db,
+        issuer: oauthDeps(req).issuer,
+        resolvedIssuer: resolveIssuer(req, db, configuredIssuer),
+        resolvedSource: resolveIssuerSource(req, db, configuredIssuer),
       });
     }
 

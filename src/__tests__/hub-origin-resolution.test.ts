@@ -120,17 +120,17 @@ describe("resolveIssuer — precedence chain", () => {
 });
 
 describe("resolveIssuerSource — attribution for SPA", () => {
-  test("\"request\" when nothing is configured", () => {
+  test('"request" when nothing is configured', () => {
     expect(resolveIssuerSource(req("http://127.0.0.1:1939/"), db, undefined)).toBe("request");
   });
 
-  test("\"env\" when configuredIssuer is set + no settings row", () => {
+  test('"env" when configuredIssuer is set + no settings row', () => {
     expect(
       resolveIssuerSource(req("http://127.0.0.1:1939/"), db, "https://hub.from-env.example"),
     ).toBe("env");
   });
 
-  test("\"settings\" when hub_settings row is set, even if env is also set", () => {
+  test('"settings" when hub_settings row is set, even if env is also set', () => {
     setHubOrigin(db, "https://hub.from-settings.example");
     expect(
       resolveIssuerSource(req("http://127.0.0.1:1939/"), db, "https://hub.from-env.example"),

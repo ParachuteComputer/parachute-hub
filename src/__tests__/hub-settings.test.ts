@@ -429,7 +429,7 @@ describe("hub-settings — hub_origin (hub#298)", () => {
     }
   });
 
-  test("setHubOrigin(\"\") is treated as null (no falsy-row footgun)", () => {
+  test('setHubOrigin("") is treated as null (no falsy-row footgun)', () => {
     // An empty string would be a useless issuer + would cause source
     // attribution to lie ("from settings" while no real value).
     // Normalize at the write layer.
@@ -459,8 +459,13 @@ describe("hub-settings — hub_origin (hub#298)", () => {
         db.close();
       }
     } finally {
-      if (prior === undefined) delete process.env.PARACHUTE_HUB_ORIGIN;
-      else process.env.PARACHUTE_HUB_ORIGIN = prior;
+      if (prior === undefined) {
+        // Bun's process.env supports the `[key]: undefined` shape
+        // (biome's noDelete rule preferred this over `delete`).
+        process.env.PARACHUTE_HUB_ORIGIN = undefined;
+      } else {
+        process.env.PARACHUTE_HUB_ORIGIN = prior;
+      }
     }
   });
 });
