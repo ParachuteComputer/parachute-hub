@@ -2,6 +2,37 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.4] - 2026-05-21
+
+**feat(hub): admin SPA ModuleConfig dereferences $ref in schema definitions (#303).**
+
+Closes the friction that hub#260's first-pass `ModuleConfig` form left: the renderer walked `schema.properties` directly with no awareness of `$ref` / `definitions` / `$defs`, so a module reusing a shared property block had to inline it per call-site. Scribe#47 took that workaround for `apiKeyAndModel` across openai/gemini/groq cleanup providers; after this PR scribe can revert to a clean `$ref` shape (tracked as a follow-up on the scribe side, not folded here).
+
+**What landed:** a new `web/ui/src/lib/json-schema.ts` with a `dereferenceSchema(schema, root?)` helper. The signature:
+
+```ts
+export function dereferenceSchema(schema: JsonSchema, root?: JsonSchema): JsonSchema
+```
+
+`ModuleConfig.tsx` calls it ONCE at fetch time — every downstream walk (property iteration, switch on `type`, future structural rendering) sees fully-expanded property objects. The renderer stays `$ref`-unaware; the resolve-once pass is the single seam.
+
+**Resolution rules** (Draft-07-compatible subset, all unit-tested):
+
+- `#/definitions/<name>` → `root.definitions[<name>]`
+- `#/$defs/<name>` → `root.$defs[<name>]` (newer keyword)
+- Nested refs (a → b → c) recurse to fully resolve
+- Sibling keywords on a `$ref`-bearing object (e.g. `{$ref, title}`) MERGE over the resolved value — matches what tools commonly support and what call-sites use to override `title` / `description` per-use
+- Circular refs (a → b → a) — visited-set detection, throws clearly
+- Unknown definition paths — throws clearly
+- External refs (URLs / file paths) — refused with a clear error
+- Path-based refs (`#/properties/foo`) — supported via the generic pointer walker
+- JSON Pointer escapes (`~0` / `~1`) handled per RFC 6901
+- A broken schema lifts to the page's `error` load state with a "Schema $ref resolution failed — <message>" prefix so the operator sees a clean failure mode rather than a render crash; the module-side schema needs the actual fix
+
+**Explicitly out of scope** (deferred to a follow-up): structured rendering of `oneOf` / `anyOf` / `allOf` arms. The resolver does recurse into those arms so a `$ref` inside resolves, but the SPA still shows them via the unsupported-type fallback (JSON debug view). Adding structural rendering for those is a separate concern.
+
+**Tests** (`cd web/ui && bun run test`): 183 pass (was 169; +14 across `json-schema.test.ts` and a new `$ref dereferencing` describe block in `ModuleConfig.test.tsx`). Highlights: definitions/`$defs`/nested/circular/unknown/external/no-refs/sibling-merge/`oneOf`-recursion/pointer-escapes plus the end-to-end "writeOnly password input renders from a `$ref`-using schema" + "broken `$ref` surfaces as the error load state" integrations. `bun run typecheck` clean (root + web/ui). `bun test ./src` (hub) 1762 pass — unchanged, since the SPA changes don't touch the server. `bun run build` for web/ui clean. `bunx biome check .` clean.
+
 ## [0.5.13-rc.3] - 2026-05-21
 
 **fix(hub): route /.parachute/* to module's bare endpoint regardless of stripPrefix (#307).**

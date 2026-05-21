@@ -32,13 +32,20 @@
  *
  * Unsupported (intentionally — scribe's schemas don't use these today):
  *
- *   - nested objects / arrays / oneOf / anyOf / allOf / $ref
+ *   - nested objects / arrays / oneOf / anyOf / allOf
  *
- * If/when a module ships one of those, we'll either lift in `@rjsf/core`
- * (industry-standard library) or extend this renderer — neither hurries
- * us today. Hand-rolling at v1 saves the SPA bundle ~250 KB of @rjsf
- * + ajv + a plugin surface that doesn't match Parachute's narrow
- * schema vocabulary.
+ * `$ref` IS supported: the loaded schema is run through
+ * `dereferenceSchema` (see `../lib/json-schema.ts`) once at fetch time,
+ * so every downstream walk sees fully-expanded property objects. This
+ * lets modules reuse shared `definitions` / `$defs` shapes (scribe's
+ * `apiKeyAndModel` across openai/gemini/groq cleanup providers) without
+ * inlining. Added in hub#303 to retire scribe's inline workaround.
+ *
+ * If/when a module ships one of the other unsupported shapes, we'll
+ * either lift in `@rjsf/core` (industry-standard library) or extend
+ * this renderer — neither hurries us today. Hand-rolling at v1 saves
+ * the SPA bundle ~250 KB of @rjsf + ajv + a plugin surface that doesn't
+ * match Parachute's narrow schema vocabulary.
  *
  * Design choice — Option A vs B for upstream auth: hub mints a short-
  * lived `<short>:admin` JWT at proxy time and forwards it to the
@@ -57,6 +64,7 @@ import {
   getModuleConfigValues,
   putModuleConfigValues,
 } from "../lib/api.ts";
+import { dereferenceSchema } from "../lib/json-schema.ts";
 
 type LoadState =
   | { kind: "loading" }
@@ -104,9 +112,25 @@ export function ModuleConfig() {
     setSaveBanner(null);
     setFieldErrors({});
     try {
-      const schema = await getModuleConfigSchema(short);
-      if (schema === null) {
+      const rawSchema = await getModuleConfigSchema(short);
+      if (rawSchema === null) {
         setState({ kind: "no_schema" });
+        return;
+      }
+      // Resolve every `$ref` against `definitions` / `$defs` up front, so
+      // the downstream renderer walks fully-expanded property objects.
+      // Modules can use shared definition blocks without forcing the SPA
+      // to learn JSON Schema pointer-resolution at every walk site
+      // (hub#303). Errors here (circular, unknown, external) surface as
+      // the same "error" load state the network-failure path uses — the
+      // operator can retry, but the broken schema needs a module-side
+      // fix.
+      let schema: ModuleConfigSchema;
+      try {
+        schema = dereferenceSchema(rawSchema) as ModuleConfigSchema;
+      } catch (refErr) {
+        const refMsg = refErr instanceof Error ? refErr.message : String(refErr);
+        setState({ kind: "error", message: `Schema $ref resolution failed — ${refMsg}` });
         return;
       }
       const values = await getModuleConfigValues(short);
