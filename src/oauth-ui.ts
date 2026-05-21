@@ -507,6 +507,13 @@ function renderUnauthenticatedApproveCtas(hubOrigin: string, clientId: string): 
  *     the admin consent screen when the picker hasn't been touched yet, and
  *     on the operator approval page where the vault is selected at the
  *     per-user sign-in step, not at approve time.
+ *   - `displayVault === "*"` → render with a literal asterisk placeholder
+ *     (`vault:*:verb`). Used on the server-rendered approve-pending page
+ *     and the SPA's `/admin/approve-client/<id>` view: at approve time the
+ *     vault isn't bound yet (no consent picker has run), so the asterisk
+ *     signals "wildcard — a specific vault is selected later in the flow."
+ *     Callers that render this form should also surface the inline
+ *     explanation below the scope list (see `renderApprovePending`).
  *   - `displayVault === "name"` → render as `vault:name:verb` literally.
  *
  * Non-vault scopes pass through untouched. Already-named `vault:<x>:<verb>`

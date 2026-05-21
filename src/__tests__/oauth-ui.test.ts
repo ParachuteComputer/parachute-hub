@@ -308,6 +308,26 @@ describe("substituteVaultDisplay", () => {
     // consenting to literally.
     expect(substituteVaultDisplay("vault:admin", "work")).toBe("vault:admin");
   });
+
+  test("'*' → renders the wildcard display form (vault:*:<verb>)", () => {
+    // Approve-time rendering: no vault has been picked yet (the consent
+    // picker hasn't run), but rendering the raw `vault:read` form implies
+    // unrestricted full-vault access. The wildcard signals "scope will be
+    // narrowed to a specific vault at consent" — mirrors the SPA's
+    // `/admin/approve-client/<id>` view.
+    expect(substituteVaultDisplay("vault:read", "*")).toBe("vault:*:read");
+    expect(substituteVaultDisplay("vault:write", "*")).toBe("vault:*:write");
+  });
+
+  test("'*' → non-vault scopes still pass through unchanged", () => {
+    expect(substituteVaultDisplay("scribe:transcribe", "*")).toBe("scribe:transcribe");
+    expect(substituteVaultDisplay("channel:send", "*")).toBe("channel:send");
+  });
+
+  test("'*' → already-named vault scopes pass through (caller specified the vault)", () => {
+    expect(substituteVaultDisplay("vault:work:read", "*")).toBe("vault:work:read");
+    expect(substituteVaultDisplay("vault:other:write", "*")).toBe("vault:other:write");
+  });
 });
 
 describe("renderConsent displayVault substitution", () => {
