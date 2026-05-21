@@ -48,6 +48,7 @@
  *   /api/modules/:short/upgrade   (POST)       → bun add @<channel> + restart (async op)
  *   /api/modules/:short/uninstall (POST)       → stop child + bun remove + drop row (sync)
  *   /api/modules/operations/:id   (GET)        → poll async op status
+ *   /api/settings/hub-origin      (GET + PUT)  → canonical hub URL (host:admin)
  *   /api/auth/mint-token          (POST)       → CLI/automation token mint (bearer)
  *   /api/auth/revoke-token        (POST)       → revoke registry-row token by jti
  *   /api/auth/tokens              (GET)        → paginated registry list
@@ -125,6 +126,7 @@ import {
 import { handleApiModules, handleApiModulesChannel } from "./api-modules.ts";
 import { REVOCATION_LIST_MOUNT, handleRevocationList } from "./api-revocation-list.ts";
 import { handleApiRevokeToken } from "./api-revoke-token.ts";
+import { handleApiSettingsHubOrigin } from "./api-settings-hub-origin.ts";
 import { handleApiTokens } from "./api-tokens.ts";
 import {
   handleCreateUser,
@@ -138,6 +140,7 @@ import { ensureCsrfToken } from "./csrf.ts";
 import { readExposeState } from "./expose-state.ts";
 import { HUB_DEFAULT_PORT, HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
+import { getHubOrigin } from "./hub-settings.ts";
 import { type RenderHubOpts, renderHub } from "./hub.ts";
 import { pemToJwk } from "./jwks.ts";
 import {
@@ -887,6 +890,57 @@ function dbNotConfigured(): Response {
   );
 }
 
+/**
+ * Resolve the OAuth issuer URL for this request. Precedence, highest
+ * first (hub#298):
+ *
+ *   1. `hub_settings.hub_origin` — operator-set canonical URL from the
+ *      admin SPA. Wins when present.
+ *   2. `configuredIssuer` — `--issuer` flag or `PARACHUTE_HUB_ORIGIN`
+ *      env var captured at hub start. The deploy-time setting.
+ *   3. `new URL(req.url).origin` — the request's own origin. Local dev
+ *      + Render-assigned subdomains land here when nothing's been
+ *      configured.
+ *
+ * Per-request (not cached at hub start) so a PUT to
+ * `/api/settings/hub-origin` takes effect on the next request without a
+ * restart. The hub_settings read is a single small SQLite query — cheap
+ * relative to JWT signing on the same request path.
+ *
+ * `db` is optional because the wellknown / discovery surfaces are
+ * reachable on a hub with no DB configured (the dbNotConfigured 503
+ * gate sits behind these in the dispatcher). In that case we skip the
+ * settings layer and fall through to env/request precedence.
+ */
+export function resolveIssuer(
+  req: Request,
+  db: Database | undefined,
+  configuredIssuer: string | undefined,
+): string {
+  if (db !== undefined) {
+    const stored = getHubOrigin(db);
+    if (stored) return stored;
+  }
+  if (configuredIssuer) return configuredIssuer;
+  return new URL(req.url).origin;
+}
+
+/**
+ * Where did the resolved issuer come from? Drives the source-label
+ * surfaced in the admin SPA so operators can tell which precedence
+ * layer they're on without inspecting the DB or env.
+ */
+export type IssuerSource = "settings" | "env" | "request";
+
+export function resolveIssuerSource(
+  db: Database | undefined,
+  configuredIssuer: string | undefined,
+): IssuerSource {
+  if (db !== undefined && getHubOrigin(db)) return "settings";
+  if (configuredIssuer) return "env";
+  return "request";
+}
+
 export function hubFetch(
   wellKnownDir: string,
   deps?: HubFetchDeps,
@@ -910,7 +964,7 @@ export function hubFetch(
     });
 
   const oauthDeps = (req: Request) => {
-    const issuer = configuredIssuer ?? new URL(req.url).origin;
+    const issuer = resolveIssuer(req, getDb?.(), configuredIssuer);
     return {
       issuer,
       // Per-request resolution (closes #245): expose-state.json can change
@@ -1214,7 +1268,15 @@ export function hubFetch(
       // the request's own origin (fine for direct loopback hits).
       try {
         const manifest = readManifest(manifestPath);
-        const canonicalOrigin = configuredIssuer ?? new URL(req.url).origin;
+        // Same precedence as the OAuth issuer (hub#298): hub_settings →
+        // env → request origin. The well-known doc embeds this origin
+        // in service URLs + the issuer metadata link, so it must follow
+        // the same chain — otherwise a public-domain operator who set
+        // `hub_origin` would still see the Render-assigned URL on
+        // `/.well-known/parachute.json` while their JWTs carry the
+        // canonical URL, and discovery clients would split-brain on
+        // which one to trust.
+        const canonicalOrigin = resolveIssuer(req, getDb?.(), configuredIssuer);
         const readManifestFn = deps?.readModuleManifest ?? defaultReadModuleManifest;
         const [managementUrlByName, serviceUiMeta] = await Promise.all([
           loadManagementUrls(manifest.services, readManifestFn),
@@ -1436,6 +1498,21 @@ export function hubFetch(
       return handleApiModulesChannel(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
+      });
+    }
+
+    // Canonical hub URL (hub#298). Admin SPA reads + writes the
+    // operator-set issuer override. The handler computes the resolved
+    // issuer + source here so it can surface them in the GET payload
+    // without re-walking the precedence chain inside the handler.
+    if (pathname === "/api/settings/hub-origin") {
+      if (!getDb) return dbNotConfigured();
+      const db = getDb();
+      return handleApiSettingsHubOrigin(req, {
+        db,
+        issuer: oauthDeps(req).issuer,
+        resolvedIssuer: resolveIssuer(req, db, configuredIssuer),
+        resolvedSource: resolveIssuerSource(db, configuredIssuer),
       });
     }
 

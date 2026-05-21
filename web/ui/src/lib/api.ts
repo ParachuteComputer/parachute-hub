@@ -726,6 +726,79 @@ export async function setModuleChannel(
 }
 
 /**
+ * Where the resolved hub issuer came from — drives the source label
+ * on /admin/settings. Mirrors `IssuerSource` in src/hub-server.ts.
+ */
+export type IssuerSource = "settings" | "env" | "request";
+
+/**
+ * Response shape from `GET /api/settings/hub-origin` (hub#298). Carries
+ * three pieces:
+ *
+ *   - `hub_origin` — the value stored in hub_settings (or null when
+ *     unset). Drives the input field's pre-fill.
+ *   - `resolved_issuer` — the issuer URL hub will stamp on JWTs minted
+ *     by this request (precedence-aware). Drives the "current value"
+ *     readout.
+ *   - `source` — which precedence layer the resolved value came from.
+ *     Drives the source label so operators can tell apart settings vs
+ *     env vs request origin.
+ */
+export interface HubOriginSetting {
+  hub_origin: string | null;
+  resolved_issuer: string;
+  source: IssuerSource;
+}
+
+/**
+ * GET /api/settings/hub-origin — read the operator-set canonical hub
+ * URL + the currently-resolved issuer for the request.
+ */
+export async function getHubOriginSetting(): Promise<HubOriginSetting> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/settings/hub-origin", {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as HubOriginSetting;
+}
+
+/**
+ * PUT /api/settings/hub-origin — set or clear the operator-set
+ * canonical hub URL. Passing `null` clears the stored value and
+ * reverts to env / request-origin precedence on subsequent requests.
+ * Server-side validation runs the same shape as `validateHubOrigin`
+ * in src/api-settings-hub-origin.ts (https?: scheme, hostname, no
+ * trailing slash / path / query / fragment) — the SPA shows the
+ * server's 400 error_description verbatim rather than duplicating
+ * validation here.
+ */
+export async function setHubOriginSetting(hubOrigin: string | null): Promise<string | null> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/settings/hub-origin", {
+    method: "PUT",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify({ hub_origin: hubOrigin }),
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { hub_origin: string | null };
+  return body.hub_origin;
+}
+
+/**
  * GET /api/modules/operations/:id — poll for a long-running operation
  * kicked off by install or upgrade. Returns 404 (HttpError) when the
  * id is unknown / expired.

@@ -17,6 +17,7 @@
  * to use `parachute install/upgrade/restart` from their shell instead.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   type ModuleInstallChannel,
   type ModuleListing,
@@ -455,6 +456,9 @@ function ChannelToggle({ channel, disabled, onChange }: ChannelToggleProps) {
       <p className="muted">
         All future module installs and upgrades use this channel. Existing installed modules are
         unaffected — use <strong>Upgrade</strong> to pull a newer version.
+      </p>
+      <p className="muted">
+        More hub settings (canonical URL, etc.) at <Link to="/settings">Settings</Link>.
       </p>
     </fieldset>
   );
