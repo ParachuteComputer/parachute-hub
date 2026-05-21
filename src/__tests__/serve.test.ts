@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { seedInitialAdminIfNeeded } from "../commands/serve.ts";
+import { formatListeningBanner, seedInitialAdminIfNeeded } from "../commands/serve.ts";
 import { openHubDb } from "../hub-db.ts";
 import { getUserByUsername, userCount } from "../users.ts";
 
@@ -103,5 +103,62 @@ describe("seedInitialAdminIfNeeded", () => {
     );
     expect(result).toBe("needs-setup");
     expect(userCount(db)).toBe(0);
+  });
+});
+
+describe("formatListeningBanner", () => {
+  const base = {
+    port: 1939,
+    configDir: "/home/op/.parachute",
+    dbPath: "/home/op/.parachute/hub.db",
+    issuer: undefined,
+    adminBootstrap: "exists",
+  };
+
+  test("hostname 0.0.0.0 → display localhost + bound note", () => {
+    // Chrome refuses to navigate to `0.0.0.0`, and mixing it with
+    // `localhost` trips cross-origin errors. Operators paste the URL
+    // straight from the banner, so the printed URL must be navigable.
+    const line = formatListeningBanner({ ...base, hostname: "0.0.0.0" });
+    expect(line).toContain("listening on http://localhost:1939");
+    expect(line).toContain("(bound on all interfaces: 0.0.0.0:1939)");
+    // The bind disclosure should sit between the URL and the contextual
+    // PARACHUTE_HOME / db / issuer block, so an operator scanning the
+    // banner sees the URL first and the bind note second.
+    const urlIdx = line.indexOf("http://localhost:1939");
+    const boundIdx = line.indexOf("(bound on all interfaces");
+    const homeIdx = line.indexOf("PARACHUTE_HOME=");
+    expect(urlIdx).toBeLessThan(boundIdx);
+    expect(boundIdx).toBeLessThan(homeIdx);
+  });
+
+  test("hostname 127.0.0.1 (operator-chosen loopback) → display verbatim, no bound note", () => {
+    const line = formatListeningBanner({ ...base, hostname: "127.0.0.1" });
+    expect(line).toContain("listening on http://127.0.0.1:1939");
+    expect(line).not.toContain("bound on all interfaces");
+  });
+
+  test("hostname 192.168.x.x (operator-chosen LAN IP) → display verbatim, no bound note", () => {
+    const line = formatListeningBanner({ ...base, hostname: "192.168.1.10" });
+    expect(line).toContain("listening on http://192.168.1.10:1939");
+    expect(line).not.toContain("bound on all interfaces");
+  });
+
+  test("contextual block carries PARACHUTE_HOME, db, issuer, admin state", () => {
+    const line = formatListeningBanner({
+      ...base,
+      hostname: "0.0.0.0",
+      issuer: "https://hub.example.com",
+      adminBootstrap: "seeded",
+    });
+    expect(line).toContain("PARACHUTE_HOME=/home/op/.parachute");
+    expect(line).toContain("db=/home/op/.parachute/hub.db");
+    expect(line).toContain("issuer=https://hub.example.com");
+    expect(line).toContain("admin=seeded");
+  });
+
+  test("issuer undefined renders as <request-origin> placeholder", () => {
+    const line = formatListeningBanner({ ...base, hostname: "0.0.0.0" });
+    expect(line).toContain("issuer=<request-origin>");
   });
 });

@@ -75,6 +75,31 @@ export interface ServeResult {
 
 const DEFAULT_PORT = 1939;
 
+/**
+ * Build the startup banner line.
+ *
+ * `0.0.0.0` is a bind-host meta-address — the kernel uses it to mean "listen
+ * on all interfaces," but Chrome and other browsers refuse to navigate to it
+ * (and any cross-resource fetch that mixes `0.0.0.0` with `localhost` trips
+ * cross-origin checks). Operators who paste the banner URL into a browser
+ * need the loopback form. When the operator has explicitly chosen a
+ * hostname via `PARACHUTE_BIND_HOST` (e.g. `127.0.0.1`, a LAN IP), we
+ * honour their choice and print it directly — they know what they wired.
+ */
+export function formatListeningBanner(args: {
+  hostname: string;
+  port: number;
+  configDir: string;
+  dbPath: string;
+  issuer?: string;
+  adminBootstrap: string;
+}): string {
+  const { hostname, port, configDir, dbPath, issuer, adminBootstrap } = args;
+  const displayHost = hostname === "0.0.0.0" ? "localhost" : hostname;
+  const boundNote = hostname === "0.0.0.0" ? ` (bound on all interfaces: 0.0.0.0:${port})` : "";
+  return `parachute serve: listening on http://${displayHost}:${port}${boundNote} (PARACHUTE_HOME=${configDir}, db=${dbPath}, issuer=${issuer ?? "<request-origin>"}, admin=${adminBootstrap})`;
+}
+
 function parsePort(raw: string | undefined): number | undefined {
   if (raw === undefined || raw === "") return undefined;
   const n = Number.parseInt(raw, 10);
@@ -194,7 +219,14 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   });
 
   log(
-    `parachute serve: listening on http://${hostname}:${port} (PARACHUTE_HOME=${CONFIG_DIR}, db=${dbPath}, issuer=${issuer ?? "<request-origin>"}, admin=${adminBootstrap})`,
+    formatListeningBanner({
+      hostname,
+      port,
+      configDir: CONFIG_DIR,
+      dbPath,
+      issuer,
+      adminBootstrap,
+    }),
   );
 
   return {
