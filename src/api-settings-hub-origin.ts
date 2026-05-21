@@ -115,6 +115,16 @@ export function validateHubOrigin(value: unknown): ValidateOutcome {
       description: "hub_origin must be a valid URL",
     };
   }
+  // Reject embedded credentials explicitly. The normalization step below
+  // re-stringifies as `protocol + "//" + host`, which would silently strip
+  // any user:pass component — an operator who typos credentials in
+  // wouldn't notice the strip. Surface it as a hard error instead.
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      description: "hub_origin must not include credentials",
+    };
+  }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     return {
       ok: false,

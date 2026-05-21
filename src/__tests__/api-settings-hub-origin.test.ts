@@ -91,7 +91,7 @@ function deps(
     db: h.db,
     issuer: ISSUER,
     resolvedIssuer: resolveIssuer(getReq(), h.db, undefined),
-    resolvedSource: resolveIssuerSource(getReq(), h.db, undefined),
+    resolvedSource: resolveIssuerSource(h.db, undefined),
     ...overrides,
   };
 }
@@ -150,6 +150,22 @@ describe("validateHubOrigin — pure validator", () => {
   test("rejects URL with fragment", () => {
     const result = validateHubOrigin("https://hub.example.com#frag");
     expect(result.ok).toBe(false);
+  });
+
+  test("rejects URL with embedded user:pass credentials", () => {
+    // The normalization step re-stringifies as `protocol + "//" + host`,
+    // which silently strips a user:pass component — an operator who
+    // typos credentials in would have them invisibly dropped. Reject
+    // hard so the footgun surfaces.
+    const result = validateHubOrigin("https://user:pass@host.example.com");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.description).toMatch(/credentials/);
+  });
+
+  test("rejects URL with embedded username only", () => {
+    const result = validateHubOrigin("https://user@host.example.com");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.description).toMatch(/credentials/);
   });
 
   test("rejects non-string non-null types", () => {
@@ -399,7 +415,7 @@ describe("change takes effect on the next request (no restart needed)", () => {
       db: h.db,
       issuer: ISSUER,
       resolvedIssuer: resolveIssuer(getReq(), h.db, undefined),
-      resolvedSource: resolveIssuerSource(getReq(), h.db, undefined),
+      resolvedSource: resolveIssuerSource(h.db, undefined),
     });
     const b1 = (await g1.json()) as { source: string; resolved_issuer: string };
     expect(b1.source).toBe("request");
@@ -411,7 +427,7 @@ describe("change takes effect on the next request (no restart needed)", () => {
         db: h.db,
         issuer: ISSUER,
         resolvedIssuer: resolveIssuer(putReq({}), h.db, undefined),
-        resolvedSource: resolveIssuerSource(putReq({}), h.db, undefined),
+        resolvedSource: resolveIssuerSource(h.db, undefined),
       },
     );
     expect(p.status).toBe(200);
@@ -422,7 +438,7 @@ describe("change takes effect on the next request (no restart needed)", () => {
       db: h.db,
       issuer: ISSUER,
       resolvedIssuer: resolveIssuer(getReq(), h.db, undefined),
-      resolvedSource: resolveIssuerSource(getReq(), h.db, undefined),
+      resolvedSource: resolveIssuerSource(h.db, undefined),
     });
     const b2 = (await g2.json()) as {
       hub_origin: string | null;

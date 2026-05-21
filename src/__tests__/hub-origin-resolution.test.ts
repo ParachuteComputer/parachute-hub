@@ -121,20 +121,16 @@ describe("resolveIssuer — precedence chain", () => {
 
 describe("resolveIssuerSource — attribution for SPA", () => {
   test('"request" when nothing is configured', () => {
-    expect(resolveIssuerSource(req("http://127.0.0.1:1939/"), db, undefined)).toBe("request");
+    expect(resolveIssuerSource(db, undefined)).toBe("request");
   });
 
   test('"env" when configuredIssuer is set + no settings row', () => {
-    expect(
-      resolveIssuerSource(req("http://127.0.0.1:1939/"), db, "https://hub.from-env.example"),
-    ).toBe("env");
+    expect(resolveIssuerSource(db, "https://hub.from-env.example")).toBe("env");
   });
 
   test('"settings" when hub_settings row is set, even if env is also set', () => {
     setHubOrigin(db, "https://hub.from-settings.example");
-    expect(
-      resolveIssuerSource(req("http://127.0.0.1:1939/"), db, "https://hub.from-env.example"),
-    ).toBe("settings");
+    expect(resolveIssuerSource(db, "https://hub.from-env.example")).toBe("settings");
   });
 
   test("attribution matches resolved value across the chain", () => {
@@ -144,15 +140,15 @@ describe("resolveIssuerSource — attribution for SPA", () => {
     setHubOrigin(db, "https://hub.example.com");
     const r1 = req("http://127.0.0.1:1939/oauth/token");
     expect(resolveIssuer(r1, db, "https://hub.from-env.example")).toBe("https://hub.example.com");
-    expect(resolveIssuerSource(r1, db, "https://hub.from-env.example")).toBe("settings");
+    expect(resolveIssuerSource(db, "https://hub.from-env.example")).toBe("settings");
 
     setHubOrigin(db, null);
     expect(resolveIssuer(r1, db, "https://hub.from-env.example")).toBe(
       "https://hub.from-env.example",
     );
-    expect(resolveIssuerSource(r1, db, "https://hub.from-env.example")).toBe("env");
+    expect(resolveIssuerSource(db, "https://hub.from-env.example")).toBe("env");
 
     expect(resolveIssuer(r1, db, undefined)).toBe("http://127.0.0.1:1939");
-    expect(resolveIssuerSource(r1, db, undefined)).toBe("request");
+    expect(resolveIssuerSource(db, undefined)).toBe("request");
   });
 });

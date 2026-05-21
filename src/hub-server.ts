@@ -933,7 +933,6 @@ export function resolveIssuer(
 export type IssuerSource = "settings" | "env" | "request";
 
 export function resolveIssuerSource(
-  req: Request,
   db: Database | undefined,
   configuredIssuer: string | undefined,
 ): IssuerSource {
@@ -1513,7 +1512,7 @@ export function hubFetch(
         db,
         issuer: oauthDeps(req).issuer,
         resolvedIssuer: resolveIssuer(req, db, configuredIssuer),
-        resolvedSource: resolveIssuerSource(req, db, configuredIssuer),
+        resolvedSource: resolveIssuerSource(db, configuredIssuer),
       });
     }
 
