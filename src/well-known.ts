@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "./config.ts";
-import type { ServiceEntry } from "./services-manifest.ts";
+import { type ModuleManifest, readModuleManifest } from "./module-manifest.ts";
+import { type ServiceEntry, readManifest } from "./services-manifest.ts";
 
 export interface WellKnownServiceEntry {
   url: string;
@@ -213,4 +214,84 @@ export function writeWellKnownFile(doc: WellKnownDocument, path: string = WELL_K
   writeFileSync(tmp, `${JSON.stringify(doc, null, 2)}\n`);
   renameSync(tmp, path);
   return path;
+}
+
+export interface RegenerateWellKnownOpts {
+  /** Path to services.json. Defaults to `SERVICES_MANIFEST_PATH`. */
+  manifestPath: string;
+  /**
+   * Origin to embed in the doc's `url` fields. The hub HTTP path uses
+   * `configuredIssuer ?? new URL(req.url).origin`; module-ops callers don't
+   * have a request, so they pass `issuer` (the configured hub origin from
+   * `ApiModulesOpsDeps`) — same canonical URL the per-request build would
+   * emit.
+   */
+  canonicalOrigin: string;
+  /** Override the on-disk well-known path (test seam). Defaults to `WELL_KNOWN_PATH`. */
+  wellKnownPath?: string;
+  /**
+   * Reader for a module's `.parachute/module.json`. Production uses
+   * `readModuleManifest`; tests inject a stub. Mirrors hub-server's
+   * `readModuleManifest` seam so the disk regen and the per-request build
+   * stay in lockstep.
+   */
+  readModuleManifest?: (installDir: string) => Promise<ModuleManifest | null>;
+}
+
+/**
+ * Regenerate `/.well-known/parachute.json` on disk from current services.json.
+ *
+ * Mirrors the dynamic build inside `hub-server.ts`'s
+ * `/.well-known/parachute.json` handler so the on-disk doc tracks the same
+ * `uiUrl` / `displayName` / `managementUrl` shape the live discovery page
+ * fetches. Returns the path written + the resulting doc so callers can log
+ * and tests can assert without re-reading from disk.
+ *
+ * Used by `/api/modules/:short/{install,upgrade,uninstall}` post-mutation so
+ * the on-disk doc stays current after lifecycle ops. The per-request build
+ * in hub-server.ts remains the source of truth for live HTTP reads — this
+ * disk write is the inspection / debug artifact (and a belt-and-suspenders
+ * canary for anything that reads the file directly).
+ */
+export async function regenerateWellKnown(
+  opts: RegenerateWellKnownOpts,
+): Promise<{ path: string; doc: WellKnownDocument }> {
+  const read = opts.readModuleManifest ?? readModuleManifest;
+  const path = opts.wellKnownPath ?? WELL_KNOWN_PATH;
+  const services = readManifest(opts.manifestPath).services;
+  // Build the resolver maps the same way hub-server does — read each
+  // module's `.parachute/module.json` from `installDir` and harvest
+  // managementUrl (vault rows) + uiUrl + displayName (non-vault rows).
+  // Per-entry errors land in console.warn so one malformed manifest doesn't
+  // block the regen for everyone else.
+  const managementUrls = new Map<string, string>();
+  const uiUrls = new Map<string, string>();
+  const displayNames = new Map<string, string>();
+  await Promise.all(
+    services.map(async (s) => {
+      if (!s.installDir) return;
+      try {
+        const m = await read(s.installDir);
+        if (!m) return;
+        if (isVaultEntry(s)) {
+          if (m.managementUrl) managementUrls.set(s.name, m.managementUrl);
+        } else {
+          if (m.uiUrl) uiUrls.set(s.name, m.uiUrl);
+          if (m.displayName) displayNames.set(s.name, m.displayName);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`well-known regen: skipping module metadata for ${s.name}: ${msg}`);
+      }
+    }),
+  );
+  const doc = buildWellKnown({
+    services,
+    canonicalOrigin: opts.canonicalOrigin,
+    managementUrlFor: (entry) => managementUrls.get(entry.name),
+    uiUrlFor: (entry) => uiUrls.get(entry.name),
+    displayNameFor: (entry) => displayNames.get(entry.name),
+  });
+  writeWellKnownFile(doc, path);
+  return { path, doc };
 }

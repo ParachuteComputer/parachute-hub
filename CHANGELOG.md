@@ -2,6 +2,33 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.11-rc.1] - 2026-05-20
+
+**fix: regenerate well-known after install/upgrade/uninstall so discovery page reflects current state.**
+
+Aaron hit this on fresh-install testing: after installing a module via `/admin/modules` (or the first-boot wizard), the new module didn't appear on `/`. Two related bugs:
+
+1. **`runInstall` / `runUpgrade` did not stamp `installDir` on the seed services.json row.** The live `/.well-known/parachute.json` build in `hub-server.ts` calls `loadServiceUiMetadata(...)`, which skips entries without an `installDir` (it reads `<installDir>/.parachute/module.json` to find `uiUrl`). Without the stamp, the well-known doc shipped the new row but had no `uiUrl`, so the discovery page's tile renderer (`if (!svc.uiUrl) continue`) silently dropped it. The CLI `parachute install <svc>` already stamped `installDir` post-install — the API path didn't.
+
+2. **No on-disk regen of `/.well-known/parachute.json` after state-changing ops.** The live HTTP response builds per request (since hub#135), so the discovery page itself recovers as soon as #1 is fixed. But the on-disk artifact at `~/.parachute/well-known/parachute.json` had stayed stale since the last `parachute expose` — useful for `cat`-based inspection and any tooling that reads the file directly to be kept in sync.
+
+Fix shape:
+
+- Extracted `regenerateWellKnown(...)` helper in `src/well-known.ts`. Reads services.json, walks each module's `.parachute/module.json` (vault → `managementUrl`; non-vault → `uiUrl` + `displayName`), builds the doc with `buildWellKnown`, writes via `writeWellKnownFile`. Mirrors hub-server's per-request build so the disk doc and the live HTTP build don't drift.
+- `runInstall` / `runUpgrade` now call `stampInstallDir(spec, deps)` (using the same `findGlobalInstall` resolver the existing bun-add-retry path already uses) and then regen post-spawn / post-restart. Errors in the regen step land on the operation log instead of failing the op — the on-disk artifact is inspection-only.
+- `runUninstall` calls `regenerateWellKnown` after removing the services.json row + running `bun remove -g`.
+
+Tests:
+- `runInstall` happy path → installDir lands on the row + on-disk well-known includes the new module.
+- `runInstall` failure (bun add fails + findGlobalInstall null) → no well-known regen (asserted by file absence + no `regenerated` log line — no partial state).
+- `runUpgrade` regenerates with the row's current version on the doc.
+- `runUninstall` regenerates without the removed module (and keeps unrelated rows).
+- Regen is idempotent across two consecutive install ops on the same module.
+
+Test gate: `bun test ./src` → 1627 pass (was 1622, +5 new).
+
+Cross-reference: hub#271's "discovery refresh" was a browser-cache fix (`Cache-Control: no-store` on `/.well-known/parachute.json` + `cache: 'no-store'` on the page's fetch). This rc is the server-side companion — the page now also has fresh data to fetch (because the row carries `installDir`, the live build can surface `uiUrl`).
+
 ## [0.5.10] - 2026-05-20
 
 Stable release covering the v0.6 multi-user foundation + Gitcoin Brain UI compatibility. Cumulative changes since `0.5.9`:

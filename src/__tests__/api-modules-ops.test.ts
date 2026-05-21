@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -654,5 +654,287 @@ describe("GET /api/modules/operations/:id", () => {
       },
     );
     expect(res.status).toBe(404);
+  });
+});
+
+/**
+ * Well-known regen + installDir stamping coverage. These exercise the
+ * fix for the "newly installed module doesn't appear on discovery" bug:
+ * the live HTTP build at `/.well-known/parachute.json` reads each
+ * module's `installDir/.parachute/module.json` to find `uiUrl` (which
+ * the discovery page needs to render a tile). Without an installDir
+ * stamp post-install, the resolver skips the entry. We assert both
+ * the disk regen lands and the row carries installDir afterwards.
+ */
+describe("well-known regen after module ops", () => {
+  let h: Harness;
+  beforeEach(async () => {
+    h = await makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  /** Stub findGlobalInstall + readModuleManifest pair for in-memory installs. */
+  function fakeInstall(
+    pkg: string,
+    manifest: {
+      name: string;
+      manifestName: string;
+      kind: "api" | "frontend" | "tool";
+      port: number;
+      paths: string[];
+      health: string;
+      uiUrl?: string;
+      displayName?: string;
+    },
+  ): {
+    findGlobalInstall: (p: string) => string | null;
+    readModuleManifest: (dir: string) => Promise<typeof manifest | null>;
+    installDir: string;
+  } {
+    const installDir = join(h.dir, "fake-install", ...pkg.split("/"));
+    const pkgJson = join(installDir, "package.json");
+    return {
+      findGlobalInstall: (p) => (p === pkg ? pkgJson : null),
+      readModuleManifest: async (dir) => (dir === installDir ? manifest : null),
+      installDir,
+    };
+  }
+
+  test("runInstall happy path: regenerates well-known + stamps installDir", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    const { run } = alwaysOkRun();
+    const wkPath = join(h.dir, "well-known.json");
+    const install = fakeInstall("@openparachute/vault", {
+      name: "vault",
+      manifestName: "parachute-vault",
+      kind: "api",
+      port: 1940,
+      paths: ["/vault/default"],
+      health: "/vault/default/health",
+    });
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const deps = {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      supervisor,
+      run,
+      findGlobalInstall: install.findGlobalInstall,
+      readModuleManifest: install.readModuleManifest,
+      wellKnownPath: wkPath,
+    };
+    const res = await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      deps,
+    );
+    expect(res.status).toBe(202);
+    await new Promise((r) => setTimeout(r, 10));
+
+    // installDir landed on the row (so the live well-known build's
+    // `uiUrl` resolver can find the module's manifest).
+    const manifest = JSON.parse(readFileSync(h.manifestPath, "utf8")) as {
+      services: Array<{ name: string; installDir?: string }>;
+    };
+    const vaultRow = manifest.services.find((s) => s.name === "parachute-vault");
+    expect(vaultRow?.installDir).toBe(install.installDir);
+
+    // The on-disk well-known doc reflects the new module.
+    const doc = JSON.parse(readFileSync(wkPath, "utf8")) as {
+      services: Array<{ name: string; version: string }>;
+      vaults: Array<{ name: string }>;
+    };
+    expect(doc.services.some((s) => s.name === "parachute-vault")).toBe(true);
+    expect(doc.vaults.some((v) => v.name === "default")).toBe(true);
+  });
+
+  test("runInstall failure: bun add fails -> no well-known regen (no partial state)", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    const wkPath = join(h.dir, "well-known.json");
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const deps = {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      supervisor,
+      run: async () => 1,
+      findGlobalInstall: () => null,
+      wellKnownPath: wkPath,
+    };
+    const res = await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      deps,
+    );
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { operation_id: string };
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Operation failed.
+    const opRes = await handleOperationGet(
+      getReq(`/api/modules/operations/${body.operation_id}`, {
+        authorization: `Bearer ${bearer}`,
+      }),
+      body.operation_id,
+      deps,
+    );
+    const op = (await opRes.json()) as { status: string; log: string[] };
+    expect(op.status).toBe("failed");
+
+    // No well-known doc was written — the regen step only runs after a
+    // successful spawn, not on failure paths.
+    expect(existsSync(wkPath)).toBe(false);
+    // And the operation log carries no regen line (defensive — confirms
+    // the early-return short-circuit, not just an absent file).
+    expect(op.log.join(" ")).not.toMatch(/regenerated/);
+  });
+
+  test("runUpgrade regenerates well-known with the new version on the row", async () => {
+    // Seed services.json with an existing vault row at the old version,
+    // and make the supervisor's restart return a state (success path).
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.4.5",
+      },
+    ]);
+    const { supervisor } = makeIdleSupervisor();
+    await supervisor.start({ short: "vault", cmd: ["parachute-vault", "serve"] });
+
+    const { run } = alwaysOkRun();
+    const wkPath = join(h.dir, "well-known.json");
+    const install = fakeInstall("@openparachute/vault", {
+      name: "vault",
+      manifestName: "parachute-vault",
+      kind: "api",
+      port: 1940,
+      paths: ["/vault/default"],
+      health: "/vault/default/health",
+    });
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const deps = {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      supervisor,
+      run,
+      findGlobalInstall: install.findGlobalInstall,
+      readModuleManifest: install.readModuleManifest,
+      wellKnownPath: wkPath,
+    };
+    const res = await handleUpgrade(
+      postReq("/api/modules/vault/upgrade", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      deps,
+    );
+    expect(res.status).toBe(202);
+    await new Promise((r) => setTimeout(r, 10));
+
+    const doc = JSON.parse(readFileSync(wkPath, "utf8")) as {
+      services: Array<{ name: string; version: string }>;
+    };
+    const row = doc.services.find((s) => s.name === "parachute-vault");
+    expect(row?.version).toBe("0.4.5");
+  });
+
+  test("runUninstall regenerates well-known without the removed module", async () => {
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.4.5",
+      },
+      {
+        name: "parachute-notes",
+        port: 1942,
+        paths: ["/notes"],
+        health: "/notes/health",
+        version: "0.4.0",
+      },
+    ]);
+    const { supervisor } = makeIdleSupervisor();
+    const { run } = alwaysOkRun();
+    const wkPath = join(h.dir, "well-known.json");
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleUninstall(
+      postReq("/api/modules/vault/uninstall", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+        wellKnownPath: wkPath,
+      },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { log: string[] };
+    expect(body.log.join(" ")).toMatch(/regenerated/);
+
+    const doc = JSON.parse(readFileSync(wkPath, "utf8")) as {
+      services: Array<{ name: string }>;
+      vaults: Array<{ name: string }>;
+    };
+    // Vault gone, notes still present.
+    expect(doc.services.some((s) => s.name === "parachute-vault")).toBe(false);
+    expect(doc.vaults.some((v) => v.name === "default")).toBe(false);
+    expect(doc.services.some((s) => s.name === "parachute-notes")).toBe(true);
+  });
+
+  test("well-known regen is idempotent across two consecutive install ops", async () => {
+    // Two installs in a row of the same module produce the same on-disk
+    // doc — no drift from the regen path itself (e.g. extra entries,
+    // duplicated rows, non-deterministic ordering).
+    const { supervisor } = makeIdleSupervisor();
+    const { run } = alwaysOkRun();
+    const wkPath = join(h.dir, "well-known.json");
+    const install = fakeInstall("@openparachute/vault", {
+      name: "vault",
+      manifestName: "parachute-vault",
+      kind: "api",
+      port: 1940,
+      paths: ["/vault/default"],
+      health: "/vault/default/health",
+    });
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const deps = {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      supervisor,
+      run,
+      findGlobalInstall: install.findGlobalInstall,
+      readModuleManifest: install.readModuleManifest,
+      wellKnownPath: wkPath,
+    };
+    await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      deps,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    const first = readFileSync(wkPath, "utf8");
+
+    await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      deps,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    const second = readFileSync(wkPath, "utf8");
+
+    expect(second).toBe(first);
   });
 });
