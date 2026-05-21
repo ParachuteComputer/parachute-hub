@@ -2,6 +2,39 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.6] - 2026-05-21
+
+**refactor(hub): retire VAULT/SCRIBE/RUNNER FALLBACKs — modules now self-register canonically.**
+
+Closes the endgame of the FIRST_PARTY_FALLBACKS arc: vault (vault#356, 0.4.8-rc.4), scribe (scribe#50, 0.4.4-rc.4), and runner (runner#3, 0.1.0-rc.4) each now write their own services.json row at boot via filesystem-direct `selfRegister`. Hub previously vendored a `*_FALLBACK` entry per module so the bun-link dev case (module on disk, never booted) still rendered in the admin SPA catalog and could be installed; now those entries retire — services.json is the canonical source for installed modules, and `module.json` (read from `<installDir>/.parachute/module.json`) is the canonical source for the static manifest.
+
+**What's removed.** `VAULT_FALLBACK`, `SCRIBE_FALLBACK`, `RUNNER_FALLBACK` are gone from `FIRST_PARTY_FALLBACKS` in `src/service-spec.ts`. The remaining entries are `NOTES_FALLBACK` (frontend with a hub-side static-serve shim; retires once notes self-registers, notes#105) and `CHANNEL_FALLBACK` (exploration tier; may retire before it ever ships module.json).
+
+**What replaces them.** A new `KNOWN_MODULES` table carries the minimum hub needs pre-self-register: npm package + manifestName + canonical port / paths / health / kind + display props + imperative `extras` (vault's `init`, scribe's `postInstallFooter`, vault's `/mcp` URL suffix, hasAuth posture). The static-manifest fields are deliberately separate from FIRST_PARTY_FALLBACKS so a future re-introduction of vendored manifest data has to be explicit. `synthesizeManifestForKnownModule(km)` synthesizes a minimal `ModuleManifest` from these fields for graceful-degrade when `module.json` is unreadable (legacy installs from before the contract, test fixtures that mock the disk path).
+
+**The contract going forward.**
+
+- Module **installed** (services.json row present) → operations work using the row's fields. Operator-authoritative.
+- Module **not installed** (no row) → `module_not_installed` 404. Hub no longer falls back to vendored manifest data that would lie about an absent module.
+- Module's lifecycle commands (start/restart) re-resolve the spec from `<installDir>/.parachute/module.json` so the module is authoritative for its own startCmd / paths.
+
+**Consumers updated.**
+
+- `src/service-spec.ts` — split into FALLBACK + KNOWN_MODULES; `shortNameForManifest`, `knownServices`, `canonicalPortForManifest`, `effectivePublicExposure`, `getSpec` consult both tables. New helpers: `KnownModule` type, `composeKnownModuleSpec(km, manifest)`, `synthesizeManifestForKnownModule(km)`.
+- `src/api-modules.ts` — `lookupModule(short)` local helper hides the FALLBACK / KNOWN_MODULES split from the catalog rendering path.
+- `src/api-modules-config.ts` — `manifestNameForShort` + `fallbackPathsForShort` + `fallbackStripPrefixForShort` mirror the same pattern. The not-installed → 404 path now applies uniformly to all three retired shorts.
+- `src/api-modules-ops.ts` — `specFor` delegates to the unified `getSpec`. New `resolveSpawnSpec(short, installDir)` reads module.json post-`bun add -g` so the supervisor spawns with the module's own canonical startCmd. Graceful-degrade falls back to the synthesized manifest when module.json is unreadable.
+- `src/commands/install.ts` — new `kind: "known-module"` `ResolvedTarget` variant for CLI installs of vault / scribe / runner; reads module.json, falls back to `synthesizeManifestForKnownModule` with a clear log line.
+- `src/commands/lifecycle.ts` — `specForEntry` prefers `composeKnownModuleSpec(km, manifest)` (module.json wins) over the imperative `extras.startCmd` for KNOWN_MODULES shorts when installDir is stamped.
+- `src/commands/setup.ts` — `ServiceChoice` carries the minimal subset of spec data the survey + summary banner need so the pre-install path doesn't require a full ServiceSpec.
+- `src/install-source.ts`, `src/hub-server.ts` — small lookups updated to consult both tables.
+
+**Backward compatibility for legacy services.json rows.** KNOWN_MODULES carries an imperative `extras.startCmd` for vault / scribe / runner mirroring the module's canonical declaration. Rows that pre-date installDir stamping (so module.json can't be read because installDir is unknown) still spawn via this fallback startCmd. Once the module reboots and self-registers with installDir, lifecycle reads module.json directly — the imperative startCmd is the bootstrap-only path.
+
+**Tests.** `bun test ./src` 1767 pass (was 1762; +5 in a new `handleApiModulesConfig — FALLBACK retirement (hub#310)` describe block pinning the "not installed → 404 across vault/scribe/runner" + "self-registered row → upstream URL composed from entry" contract). Existing fixtures updated to write the now-authoritative `stripPrefix: true` on scribe rows that previously relied on the vendored fallback for that field (`api-modules-config.test.ts`, `hub-server.test.ts`). `bun run typecheck` clean. `bunx biome check src/` clean. `cd web/ui && bun run test` 183 pass — unchanged, SPA-only changes wouldn't be exercised by this PR.
+
+**NOT retired in this PR.** `NOTES_FALLBACK` stays — notes is a frontend served by hub's `notes-serve.ts` shim, so its startCmd is hub-side logic (port + mount derived from the entry); when notes ships its own server it can self-register and this fallback retires alongside the shim (notes#105). `CHANNEL_FALLBACK` similarly stays (exploration tier).
+
 ## [0.5.13-rc.4] - 2026-05-21
 
 **feat(hub): admin SPA ModuleConfig dereferences $ref in schema definitions (#303).**
