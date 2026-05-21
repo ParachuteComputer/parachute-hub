@@ -50,9 +50,9 @@ describe("listVaults", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const api = await import("./api.ts");
-    const vaults = await api.listVaults();
+    const result = await api.listVaults();
 
-    expect(vaults).toEqual([
+    expect(result.vaults).toEqual([
       {
         name: "work",
         url: "http://hub.local/vault/work/",
@@ -60,6 +60,9 @@ describe("listVaults", () => {
         path: "/vault/work",
       },
     ]);
+    // `parachute-vault-work` matches the canonical vault-entry shape, so
+    // the SPA flags the vault module as installed.
+    expect(result.moduleInstalled).toBe(true);
     expect(fetchMock).toHaveBeenCalledWith(
       "/.well-known/parachute.json",
       expect.objectContaining({ headers: { accept: "application/json" } }),
@@ -76,8 +79,8 @@ describe("listVaults", () => {
       ),
     );
     const api = await import("./api.ts");
-    const vaults = await api.listVaults();
-    expect(vaults[0]?.path).toBe("/vault/scratch");
+    const result = await api.listVaults();
+    expect(result.vaults[0]?.path).toBe("/vault/scratch");
   });
 
   it("throws HttpError on non-2xx", async () => {
@@ -92,13 +95,52 @@ describe("listVaults", () => {
     });
   });
 
-  it("returns [] when the doc has no vaults key", async () => {
+  it("returns moduleInstalled=false when no parachute-vault service entries exist", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => jsonResponse(200, { services: [] })),
     );
     const api = await import("./api.ts");
-    expect(await api.listVaults()).toEqual([]);
+    const result = await api.listVaults();
+    expect(result.vaults).toEqual([]);
+    expect(result.moduleInstalled).toBe(false);
+  });
+
+  it("returns moduleInstalled=true when a parachute-vault entry exists even with zero vaults", async () => {
+    // Edge case: vault module is registered but no vault instance has
+    // been provisioned yet. The SPA shows the "Create your first vault"
+    // CTA, not the "Install vault first" CTA.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(200, {
+          vaults: [],
+          services: [{ name: "parachute-vault", path: "/vault" }],
+        }),
+      ),
+    );
+    const api = await import("./api.ts");
+    const result = await api.listVaults();
+    expect(result.vaults).toEqual([]);
+    expect(result.moduleInstalled).toBe(true);
+  });
+
+  it("ignores non-vault services for moduleInstalled detection", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(200, {
+          vaults: [],
+          services: [
+            { name: "parachute-notes", path: "/notes" },
+            { name: "parachute-scribe", path: "/scribe" },
+          ],
+        }),
+      ),
+    );
+    const api = await import("./api.ts");
+    const result = await api.listVaults();
+    expect(result.moduleInstalled).toBe(false);
   });
 
   it("passes managementUrl through when the vault entry declares one", async () => {
@@ -118,8 +160,8 @@ describe("listVaults", () => {
       ),
     );
     const api = await import("./api.ts");
-    const [v] = await api.listVaults();
-    expect(v?.managementUrl).toBe("/admin");
+    const result = await api.listVaults();
+    expect(result.vaults[0]?.managementUrl).toBe("/admin");
   });
 
   it("omits managementUrl when the vault entry doesn't declare one", async () => {
@@ -132,8 +174,8 @@ describe("listVaults", () => {
       ),
     );
     const api = await import("./api.ts");
-    const [v] = await api.listVaults();
-    expect(v?.managementUrl).toBeUndefined();
+    const result = await api.listVaults();
+    expect(result.vaults[0]?.managementUrl).toBeUndefined();
   });
 });
 
