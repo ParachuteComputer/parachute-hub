@@ -389,6 +389,16 @@ function ModuleRow({
         )}
         {mod.installed && (
           <>
+            {/* Configure link routes to the generic per-module config
+                form (hub#260). Rendered as a Link rather than a button
+                because it's pure navigation — no async action attached,
+                no supervisor requirement. Stays clickable even when the
+                supervisor is offline so an operator on a hub-only CLI
+                install can still edit config (the config endpoints are
+                served by the module itself, not the supervisor). */}
+            <Link className="btn" to={`/modules/${encodeURIComponent(mod.short)}/config`}>
+              Configure
+            </Link>
             <button type="button" disabled={!canAct} onClick={onRestart}>
               Restart
             </button>

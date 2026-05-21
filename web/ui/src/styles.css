@@ -459,6 +459,119 @@ form .field-error {
 }
 
 /*
+ * /admin/modules/<short>/config — generic per-module config form
+ * (hub#260). Mirrors the form-row spacing used elsewhere in the SPA;
+ * banners reuse the `.banner-success` / `.banner-error` vocabulary
+ * from the rest of the admin shell.
+ */
+.module-config {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+.module-config-header h1 {
+  margin-bottom: 0.35rem;
+}
+.module-config-form fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.module-config-form .field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.module-config-form .field input,
+.module-config-form .field select,
+.module-config-form .field textarea {
+  width: 100%;
+}
+.module-config-form .field-inline {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.module-config-form .field-inline label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.module-config-form .field-inline .field-hint {
+  flex-basis: 100%;
+  margin-left: 1.6rem;
+}
+.module-config-form .field-invalid input,
+.module-config-form .field-invalid select,
+.module-config-form .field-invalid textarea {
+  border-color: var(--error);
+}
+.module-config-form .actions {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+.module-config-form .actions button.destructive {
+  background: white;
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+.module-config-form .actions button.destructive:hover {
+  background: var(--bg-soft);
+}
+.module-config-form .banner {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  font-size: 0.9rem;
+}
+.module-config-form .banner-success {
+  background: var(--success-soft);
+  border-color: var(--success);
+  color: var(--success);
+}
+.module-config-form .banner-success p,
+.module-config-form .banner-success ul {
+  margin: 0.4rem 0 0;
+}
+.module-config-form .banner-error {
+  background: var(--error-soft, rgba(163, 57, 43, 0.08));
+  border-color: var(--error);
+  color: var(--error);
+}
+
+/*
+ * "Configure" link styled to match sibling action buttons on
+ * `.module-row .actions`. React-router's <Link> renders an <a>, so
+ * default `a` styles take over without these overrides — we want it
+ * to look like a button next to Restart / Upgrade / Uninstall.
+ */
+.module-row .actions .btn,
+a.btn {
+  display: inline-block;
+  font: inherit;
+  background: var(--accent);
+  color: white;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.55rem 1.1rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  text-decoration: none;
+}
+.module-row .actions .btn:hover,
+a.btn:hover {
+  background: var(--accent-hover);
+  text-decoration: none;
+}
+
+/*
  * Visually-hidden utility for screen-reader-only text. Used by the
  * first-admin disabled-Delete button on /admin/users to wire
  * `aria-describedby` to an explanation that's invisible to sighted
