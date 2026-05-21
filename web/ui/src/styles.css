@@ -547,6 +547,89 @@ form .field-error {
 }
 
 /*
+ * /admin/modules — two-section layout (hub#260 closeout).
+ *
+ * Installed modules sit on top in `.modules-installed`; the
+ * "Install a module" catalog sits below in `.modules-installable`.
+ * Each section gets a small top-margin and a sub-heading; the empty
+ * states are inline muted prose, not the page-level `.empty` block
+ * (that's the route-level error / loading affordance).
+ */
+.modules-installed,
+.modules-installable {
+  margin-top: 1.75rem;
+}
+.modules-installed > h2,
+.modules-installable > h2 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 0 0 0.75rem;
+  color: var(--fg);
+}
+.modules-installed > p.muted,
+.modules-installable > p.muted {
+  margin: 0 0 0.5rem;
+}
+
+/*
+ * "Install a module" catalog row — visually lighter than the heavier
+ * `.module-row` (no status badge, no meta grid, just name + tagline +
+ * package + Install). The card lays out as body+actions side by side
+ * on wide viewports and stacks on narrow ones.
+ */
+.install-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.install-card {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.85rem 1rem;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: border-color 0.15s ease;
+}
+.install-card:hover {
+  border-color: var(--accent);
+}
+.install-card-body {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.install-card-body h3 {
+  margin: 0 0 0.2rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+.install-card-body .tagline {
+  margin: 0 0 0.35rem;
+  color: var(--fg-muted);
+  font-size: 0.92rem;
+}
+.install-card-meta {
+  margin: 0;
+  font-size: 0.82rem;
+}
+.install-card-actions {
+  flex: 0 0 auto;
+}
+.install-card .error {
+  flex-basis: 100%;
+  margin-top: 0.5rem;
+  color: var(--error);
+  font-size: 0.85rem;
+}
+
+/*
  * "Configure" link styled to match sibling action buttons on
  * `.module-row .actions`. React-router's <Link> renders an <a>, so
  * default `a` styles take over without these overrides — we want it
