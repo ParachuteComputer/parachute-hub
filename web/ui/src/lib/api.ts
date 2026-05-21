@@ -799,6 +799,143 @@ export async function setHubOriginSetting(hubOrigin: string | null): Promise<str
 }
 
 /**
+ * Subset of JSON Schema fields the generic config form understands. Mirrors
+ * what scribe + future modules surface today (Draft-07 style). Unknown
+ * fields pass through unread — the renderer ignores them, which means a
+ * module can add `pattern`, `format`, etc. without breaking the form.
+ *
+ * `writeOnly` is the Draft-07 marker for "this is a secret, the GET
+ * response omits the current value." The renderer treats it as a
+ * password input with a "leave blank to keep current value" affordance
+ * — the form only sends the field when the user actually types into it,
+ * so an empty submit doesn't accidentally clear a stored secret.
+ */
+export interface ConfigSchemaProperty {
+  type?: "string" | "number" | "integer" | "boolean";
+  title?: string;
+  description?: string;
+  enum?: ReadonlyArray<string | number>;
+  default?: string | number | boolean | null;
+  minimum?: number;
+  maximum?: number;
+  writeOnly?: boolean;
+}
+
+export interface ModuleConfigSchema {
+  type?: "object";
+  properties?: Record<string, ConfigSchemaProperty>;
+  required?: readonly string[];
+  /** Modules pass arbitrary x-* extensions through — surfaced as-is. */
+  [key: string]: unknown;
+}
+
+/** Resolved config values for a module. Any JSON-serializable scalar / object. */
+export type ModuleConfigValues = Record<string, unknown>;
+
+/**
+ * GET /api/modules/:short/config/schema — fetch the module's JSON Schema.
+ *
+ * Returns null when the module is up but doesn't expose a config schema
+ * (upstream 404 → hub's "no_config_schema" error). Throws on auth /
+ * not-installed / unreachable so the page can render a distinct
+ * error state per case.
+ */
+export async function getModuleConfigSchema(short: string): Promise<ModuleConfigSchema | null> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/modules/${encodeURIComponent(short)}/config/schema`, {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (res.status === 404) {
+    // Distinguish "module not installed" (operator path: go install first)
+    // from "module has no schema" (operator path: no UI for this module).
+    let code: string | undefined;
+    try {
+      const body = (await res.clone().json()) as { error?: string };
+      code = body.error;
+    } catch {
+      /* not JSON */
+    }
+    if (code === "no_config_schema") return null;
+    throw new HttpError(404, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as ModuleConfigSchema;
+}
+
+/**
+ * GET /api/modules/:short/config — fetch the module's current resolved
+ * config values. `writeOnly` keys are omitted by the module (the
+ * canonical Draft-07 secret-handling rule). 404 here means the module
+ * is installed but the operator hasn't loaded it through the form
+ * before — surface an empty object so the form pre-fills from
+ * schema defaults rather than 4xx'ing the whole page.
+ */
+export async function getModuleConfigValues(short: string): Promise<ModuleConfigValues> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/modules/${encodeURIComponent(short)}/config`, {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (res.status === 404) {
+    // Module installed but no config endpoint, or no values yet. Treat as
+    // empty so the form pre-fills from schema defaults.
+    return {};
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as ModuleConfigValues;
+}
+
+/**
+ * Response from PUT /api/modules/:short/config. Forwards whatever the
+ * module returned in its own success body — scribe surfaces
+ * `restart_required` so the operator knows which fields need a process
+ * bounce. Treat as opaque metadata: the caller renders it as a list
+ * but doesn't branch on the contents.
+ */
+export interface ModuleConfigPutResult {
+  restart_required?: string[];
+  [key: string]: unknown;
+}
+
+/**
+ * PUT /api/modules/:short/config — write new config values. Only fields
+ * the user actually changed should be in `values` (per the
+ * writeOnly-leave-blank-to-preserve rule). Server-side validation runs
+ * against the module's own schema; on a 400 the response body carries
+ * a `{error, message, errors[]}` shape the caller surfaces inline.
+ */
+export async function putModuleConfigValues(
+  short: string,
+  values: ModuleConfigValues,
+): Promise<ModuleConfigPutResult> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/modules/${encodeURIComponent(short)}/config`, {
+    method: "PUT",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify(values),
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as ModuleConfigPutResult;
+}
+
+/**
  * GET /api/modules/operations/:id — poll for a long-running operation
  * kicked off by install or upgrade. Returns 404 (HttpError) when the
  * id is unknown / expired.
