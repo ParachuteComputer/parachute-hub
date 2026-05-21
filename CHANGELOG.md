@@ -2,6 +2,36 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.12-rc.1] - 2026-05-21
+
+First-boot path hardening (from Aaron's real Render deploy testing):
+
+- **Bootstrap token for wizard mode** (security). When no admin exists AND no env-seed credentials, hub generates a one-time bootstrap token, logs it on startup, and requires it on the account-creation form. Closes the race where an attacker could claim a freshly-deployed hub's admin account before the operator. Env-seeded admins bypass the token (already claimed via env config).
+- **Wizard kicks in when admin exists but no vault**. Previously, env-seeded admins skipped the wizard entirely and had to manually find `/admin/modules` + `/admin/vaults`. Now the wizard auto-redirect on `/` and `/hub.html` fires when either (no admin) OR (admin exists but no vault).
+- **`/admin/vaults` gated on vault module installed**. When no vault module is installed, the page renders an empty-state CTA pointing at `/admin/modules` instead of showing an empty vault list with a "New vault" button that can't succeed. Removes the "where am I?" confusion Aaron hit.
+
+Token shape: `parachute-bootstrap-<43 base64url chars>` (~63 chars). Lives in process memory only — regenerated on every restart, never persisted. Constant-time compare via `crypto.timingSafeEqual`. Single-use: consumed on successful admin claim. Subsequent claim attempts return 410 Gone.
+
+Implementation:
+
+- `src/bootstrap-token.ts` — generate / verify / consume helpers, isolated module for clean test surface.
+- `src/commands/serve.ts` — mints the token + logs the multi-line `[wizard]` banner when `seedInitialAdminIfNeeded` returns `needs-setup`. New `formatBootstrapTokenBanner(token)` helper for testability.
+- `src/setup-wizard.ts` — `renderAccountStep` gains `requireBootstrapToken` + `bootstrapToken` props; `handleSetupAccountPost` enforces the token gate when `getBootstrapToken()` is set. Wrong token → 401 (form re-renders with empty token field, username preserved); already-claimed → 410 Gone.
+- `src/hub-server.ts` — extended the `/` and `/hub.html` redirect to fire when `hasVaultInstalled(manifestPath)` is false (alongside the existing `userCount === 0` gate). New `hasVaultInstalled` helper reads services.json on demand.
+- `web/ui/src/lib/api.ts` — `listVaults()` now returns `{ vaults, moduleInstalled }` instead of `VaultListing[]`. Detects vault module from any `parachute-vault[-<name>]` services-array entry.
+- `web/ui/src/routes/VaultsList.tsx` — when `moduleInstalled` is false AND vault list is empty, renders the "Install vault module" empty state with a CTA to `/modules` instead of "Create a vault" pointing at `/vaults/new`. Header CTA also flips to "Install vault module" so the operator can't click into a doomed `/vaults/new` flow.
+
+Tests:
+
+- `src/__tests__/bootstrap-token.test.ts` (new, 13 tests) — module lifecycle, format, constant-time semantics, length-mismatched rejects, prefix-stripped rejects.
+- `src/__tests__/setup-wizard.test.ts` — appended `bootstrap token gate` describe (7 tests): GET shows/hides field by token presence, POST with correct/wrong/missing token, 410 on already-claimed, on-box CLI back-compat with no token.
+- `src/__tests__/setup-gate.test.ts` — Issue 2 redirect (env-seed admin no vault → `/` → 302 /admin/setup), `/hub.html` likewise, admin+vault renders discovery, wizard at /admin/setup with env-seed admin renders vault step without token field.
+- `src/__tests__/serve.test.ts` — `formatBootstrapTokenBanner` shape + `[wizard]` prefix on every line; wiring tests that confirm `seedInitialAdminIfNeeded` itself doesn't mint (the mint is in the caller).
+- `web/ui/src/lib/api.test.ts` — `listVaults` returns the new `{ vaults, moduleInstalled }` shape; module detection covers `parachute-vault`, `parachute-vault-<name>`, ignores non-vault services.
+- `web/ui/src/routes/VaultsList.test.tsx` — empty-state branch flip on `moduleInstalled` false.
+
+Hub test gate: 1672 pass (up from 1641, +31 new). SPA test gate: 138 pass (up from 134, +4 new). Typecheck + biome clean across root + web/ui.
+
 ## [0.5.11] - 2026-05-21
 
 Stable release. Bug-fix-only release covering issues Aaron surfaced during fresh-machine testing of 0.5.10:
