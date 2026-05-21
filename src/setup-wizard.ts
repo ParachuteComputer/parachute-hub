@@ -41,6 +41,12 @@ import type { Database } from "bun:sqlite";
 import { type OperationsRegistry, runInstall, specFor } from "./api-modules-ops.ts";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import {
+  BOOTSTRAP_TOKEN_PREFIX,
+  consumeBootstrapToken,
+  getBootstrapToken,
+  verifyBootstrapToken,
+} from "./bootstrap-token.ts";
+import {
   CSRF_FIELD_NAME,
   ensureCsrfToken,
   renderCsrfHiddenInput,
@@ -254,12 +260,60 @@ export interface RenderAccountStepProps {
   errorMessage?: string;
   /** Pre-fill the username field after a validation failure. */
   username?: string;
+  /**
+   * Whether the bootstrap-token field should render and be required.
+   * True under `parachute serve` wizard mode (no admin, no env-seed) —
+   * `commands/serve.ts` mints + logs the token on boot and the form
+   * requires it to claim the admin row. False on the on-box CLI surface
+   * (the operator already has shell access; gating the form behind a
+   * token they'd also need to read from logs adds friction with no
+   * security gain).
+   *
+   * UX: when true, the token field is the FIRST field on the form so
+   * an operator who hasn't seen the log line stops here rather than
+   * filling username + password and bouncing off a 401.
+   */
+  requireBootstrapToken?: boolean;
+  /**
+   * Pre-fill the bootstrap-token field after a validation failure on a
+   * field OTHER than the token itself. We never echo a wrong token back
+   * — the form re-renders with an empty token field so the operator has
+   * to re-look-up the correct value.
+   */
+  bootstrapToken?: string;
 }
 
 export function renderAccountStep(props: RenderAccountStepProps): string {
-  const { csrfToken, errorMessage, username } = props;
+  const { csrfToken, errorMessage, username, requireBootstrapToken, bootstrapToken } = props;
   const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
   const usernameAttr = username ? ` value="${escapeAttr(username)}"` : "";
+  const tokenAttr = bootstrapToken ? ` value="${escapeAttr(bootstrapToken)}"` : "";
+  // Bootstrap-token field comes FIRST when required. An operator who
+  // missed the log line is stopped here rather than after filling
+  // username + password.
+  const bootstrapField = requireBootstrapToken
+    ? `
+        <label class="field">
+          <span class="field-label">Bootstrap token</span>
+          <input type="text" name="bootstrap_token" autocomplete="off"
+            autofocus required minlength="20" maxlength="200"
+            spellcheck="false" autocapitalize="off"
+            placeholder="${escapeAttr(BOOTSTRAP_TOKEN_PREFIX)}…"${tokenAttr} />
+          <span class="field-hint">Find this in your hub's startup logs.
+            Look for the <code>${escapeHtml(BOOTSTRAP_TOKEN_PREFIX)}</code> line.</span>
+        </label>`
+    : "";
+  // When the token is required we drop `autofocus` off the username field
+  // so it doesn't fight the token field's focus.
+  const usernameAutofocus = requireBootstrapToken ? "" : " autofocus";
+  const tokenCallout = requireBootstrapToken
+    ? `<aside class="bootstrap-callout">
+        <strong>One-time setup credential.</strong> This hub was deployed without
+        baked-in admin credentials, so it generated a one-time bootstrap token
+        on startup. Paste it below to claim the admin account. The token
+        expires once the admin is created (or when the hub restarts).
+      </aside>`
+    : "";
   const body = `
     <div class="card">
       <div class="card-header">
@@ -278,13 +332,15 @@ export function renderAccountStep(props: RenderAccountStepProps): string {
         <p>After this you'll name your first vault. The hub will install it
           and issue a token your Claude Code MCP client can use.</p>
       </section>
+      ${tokenCallout}
       ${error}
       <form method="POST" action="/admin/setup/account" class="auth-form">
         ${renderCsrfHiddenInput(csrfToken)}
+        ${bootstrapField}
         <label class="field">
           <span class="field-label">Username</span>
-          <input type="text" name="username" autocomplete="username"
-            autofocus required minlength="2" maxlength="64"
+          <input type="text" name="username" autocomplete="username"${usernameAutofocus}
+            required minlength="2" maxlength="64"
             pattern="[A-Za-z0-9_.-]+" title="letters, digits, _ . - (2–64 chars)"
             ${usernameAttr} />
           <span class="field-hint">letters, digits, <code>_</code>, <code>.</code>, <code>-</code></span>
@@ -307,7 +363,8 @@ export function renderAccountStep(props: RenderAccountStepProps): string {
         <p>Set <code>PARACHUTE_INITIAL_ADMIN_USERNAME</code> and
           <code>PARACHUTE_INITIAL_ADMIN_PASSWORD</code> on the container and
           restart. The hub will create the admin row on next boot and skip this
-          wizard.</p>
+          wizard (no bootstrap token needed — the env vars themselves are the
+          claim).</p>
       </details>
     </div>`;
   return baseDocument("Set up your Parachute hub — account", body);
@@ -1049,11 +1106,23 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
     });
   }
 
-  // Step 1+2 (no admin yet).
-  return new Response(renderAccountStep({ csrfToken: csrf.token }), {
-    status: 200,
-    headers: extraHeaders,
-  });
+  // Step 1+2 (no admin yet). Render with the bootstrap-token field iff a
+  // token is currently active — `commands/serve.ts` only mints one on
+  // wizard-mode boot (no env-seed), so the field's presence is a 1:1
+  // signal of "the operator needs a token to claim this hub." On the
+  // on-box CLI surface and on env-seed-followed-by-deleted-admin paths,
+  // the token is absent and the form renders the historical shape.
+  const requireToken = getBootstrapToken() !== undefined;
+  return new Response(
+    renderAccountStep({
+      csrfToken: csrf.token,
+      requireBootstrapToken: requireToken,
+    }),
+    {
+      status: 200,
+      headers: extraHeaders,
+    },
+  );
 }
 
 /**
@@ -1076,17 +1145,65 @@ export async function handleSetupAccountPost(
     return badRequestPage("Invalid form submission", "Reload and try again.");
   }
   // Already-bootstrapped: bounce. The wizard's GET state will resolve to
-  // step 3 or step 4 on the next request.
+  // step 3 or step 4 on the next request. We return 410 Gone for the
+  // case where a bootstrap token was active this boot AND has already
+  // been consumed by a prior POST — distinguishes "you missed your
+  // window" from "this hub never had a wizard-mode boot" so a racing
+  // attacker sees a hard-stop rather than a soft redirect.
+  const csrfToken = typeof formCsrf === "string" ? formCsrf : "";
+  const requireToken = getBootstrapToken() !== undefined;
   if (userCount(deps.db) > 0) {
-    return redirect("/admin/setup");
+    if (!requireToken) {
+      return redirect("/admin/setup");
+    }
+    // Defense in depth: a token was active but an admin already exists.
+    // Treat as consumed.
+    return new Response(renderClaimAlreadyHappenedPage(), {
+      status: 410,
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
+  }
+  // Bootstrap-token gate. Only enforced when wizard mode is active —
+  // env-seed admins never reach this path (they're admin-exists by
+  // boot time), CLI mode never mints a token (the on-box operator
+  // already has shell auth). Wrong token → 401 + form re-render with
+  // an empty token field; right token → fall through.
+  if (requireToken) {
+    const suppliedToken = String(form.get("bootstrap_token") ?? "").trim();
+    if (!verifyBootstrapToken(suppliedToken)) {
+      const username = String(form.get("username") ?? "").trim();
+      return htmlResponse(
+        renderAccountStep({
+          csrfToken,
+          username,
+          requireBootstrapToken: true,
+          // Deliberately do NOT echo the wrong supplied token back —
+          // forces re-look-up rather than tab-completing a typo.
+          errorMessage:
+            "Wrong bootstrap token. Re-check your hub's startup logs for the " +
+            "`parachute-bootstrap-…` line and try again.",
+        }),
+        401,
+      );
+    }
   }
   const username = String(form.get("username") ?? "").trim();
   const password = String(form.get("password") ?? "");
   const confirm = String(form.get("password_confirm") ?? "");
-  const csrfToken = typeof formCsrf === "string" ? formCsrf : "";
   const fieldErr = validateAccountFields({ username, password, confirm });
   if (fieldErr) {
-    return htmlResponse(renderAccountStep({ csrfToken, username, errorMessage: fieldErr }), 400);
+    return htmlResponse(
+      renderAccountStep({
+        csrfToken,
+        username,
+        // Re-render with the token field present iff still required (it
+        // was valid this attempt — the field-error came from username/
+        // password). Empty value so the operator pastes again.
+        requireBootstrapToken: requireToken,
+        errorMessage: fieldErr,
+      }),
+      400,
+    );
   }
   try {
     // Wizard-admin chose their password through this very form; skip the
@@ -1095,6 +1212,14 @@ export async function handleSetupAccountPost(
     // (the wizard never asks the first admin to pin themselves to a
     // single vault; that's a non-admin user pattern).
     const user = await createUser(deps.db, username, password, { passwordChanged: true });
+    // Consume the bootstrap token AFTER the admin row is committed.
+    // Doing it before would let a `createUser` exception (UNIQUE-collision,
+    // disk full, anything) leave the token un-consumed but the admin row
+    // partially written — and the operator without a way to retry.
+    // Doing it after means a successful claim invalidates the token for
+    // any racer who saw it over the operator's shoulder during the
+    // window between log-print and form-submit.
+    if (requireToken) consumeBootstrapToken();
     const session = createSession(deps.db, { userId: user.id });
     const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
       secure: isHttpsRequest(req),
@@ -1116,11 +1241,40 @@ export async function handleSetupAccountPost(
       renderAccountStep({
         csrfToken,
         username,
+        requireBootstrapToken: requireToken,
         errorMessage: "Failed to create account. The username may already be taken.",
       }),
       400,
     );
   }
+}
+
+/**
+ * Static error page surfaced when an `/admin/setup/account` POST arrives
+ * after the bootstrap token has already been consumed by a successful
+ * admin claim. Returned with HTTP 410 Gone (vs. the 302 redirect a
+ * stale-tab without a token gets) so a scripted attacker reading the
+ * status code sees an unmistakable "you missed the window" signal.
+ *
+ * No retry CTA — the wizard is past its account step; pointing the
+ * operator at /login is the right answer.
+ */
+function renderClaimAlreadyHappenedPage(): string {
+  const body = `
+    <div class="card">
+      ${header("account")}
+      <h1 class="error-title">Admin already claimed</h1>
+      <p class="subtitle">This hub's bootstrap token was already used to
+        create the admin account. The token is one-shot — it can't be
+        reused to claim a second admin or rotate the existing one.</p>
+      <p class="subtitle">If you're the legitimate operator, sign in at
+        <a href="/login"><code>/login</code></a>. If you've lost the
+        password, restart the hub (which mints a fresh token) and use
+        <code>parachute auth set-password</code> from a shell with
+        access to the hub's PARACHUTE_HOME.</p>
+      <p><a class="btn btn-primary" href="/login">Go to sign-in</a></p>
+    </div>`;
+  return baseDocument("Admin already claimed", body);
 }
 
 /**
@@ -1953,6 +2107,17 @@ const STYLES = `
     font-size: 0.9rem;
   }
   .error-title { color: ${PALETTE.danger}; }
+
+  .bootstrap-callout {
+    background: ${PALETTE.warnSoft};
+    border-left: 3px solid ${PALETTE.warn};
+    border-radius: 0 6px 6px 0;
+    padding: 0.7rem 0.9rem;
+    margin: 0 0 1rem;
+    font-size: 0.9rem;
+    color: ${PALETTE.fg};
+  }
+  .bootstrap-callout strong { color: ${PALETTE.fg}; }
 
   .op-log {
     background: ${PALETTE.bg};

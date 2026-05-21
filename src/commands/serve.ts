@@ -26,6 +26,7 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { generateBootstrapToken } from "../bootstrap-token.ts";
 // NOTE: CONFIG_DIR/WELL_KNOWN_DIR/SERVICES_MANIFEST_PATH are evaluated at
 // import time from process.env.PARACHUTE_HOME. The `env` parameter on
 // `serve()` cannot reroute them — set PARACHUTE_HOME before importing for
@@ -137,6 +138,31 @@ export async function seedInitialAdminIfNeeded(
 }
 
 /**
+ * Format the multi-line wizard-mode banner the operator must see in
+ * startup logs to claim the freshly-deployed hub. The token MUST be
+ * surfaced visibly enough that an operator scrolling Render's log tab
+ * spots it on the first scan — that's the design tension behind the
+ * line-spacing and the `[wizard]` prefix on every line.
+ *
+ * Threaded out as a pure function so tests can lock the shape; the
+ * banner is the security-critical interface (an operator who misses
+ * the token can't proceed; an attacker who reads it before the
+ * operator wins the race).
+ */
+export function formatBootstrapTokenBanner(token: string): string {
+  return [
+    "[wizard] No admin exists — wizard mode active. To claim ownership of this hub:",
+    "[wizard]   1. Visit http://localhost:1939/admin/setup (or your deployed URL)",
+    "[wizard]   2. Paste this bootstrap token into the form:",
+    "[wizard]",
+    `[wizard]   ${token}`,
+    "[wizard]",
+    "[wizard] This token grants permission to create the first admin. It expires when",
+    "[wizard] admin is created OR when hub restarts.",
+  ].join("\n");
+}
+
+/**
  * Run the hub fetch loop in the foreground. Resolves when `Bun.serve` is
  * bound; the returned `stop()` shuts the server down for tests.
  *
@@ -175,6 +201,12 @@ export async function serve(opts: ServeOpts = {}): Promise<{
     log(
       "parachute serve: no admin account configured. Set PARACHUTE_INITIAL_ADMIN_USERNAME + PARACHUTE_INITIAL_ADMIN_PASSWORD, or visit /admin/setup once the hub is reachable.",
     );
+    // Mint a bootstrap token + log it. The wizard's account POST will
+    // require this token, so an attacker who beats the operator to the
+    // freshly-provisioned URL still can't claim the admin row without
+    // shell access to the platform's startup logs.
+    const token = generateBootstrapToken();
+    log(formatBootstrapTokenBanner(token));
   }
 
   const supervisor = opts.supervisor ?? new Supervisor();
