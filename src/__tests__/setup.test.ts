@@ -123,6 +123,7 @@ describe("setup", () => {
         { name: "parachute-scribe", port: 1943 },
         { name: "parachute-channel", port: 1941 },
         { name: "parachute-runner", port: 1945 },
+        { name: "parachute-app", port: 1946 },
       ];
       for (const s of seeds) {
         upsertService(

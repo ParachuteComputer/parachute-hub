@@ -1522,7 +1522,11 @@ const INSTALL_TILE_PROPS: ReadonlyArray<{
   displayName: string;
   tagline: string;
 }> = [
-  { short: "notes", displayName: "Notes", tagline: "Notes PWA backed by your vault." },
+  {
+    short: "app",
+    displayName: "App",
+    tagline: "Host module for Parachute UIs — auto-installs Notes on first boot.",
+  },
   {
     short: "scribe",
     displayName: "Scribe",

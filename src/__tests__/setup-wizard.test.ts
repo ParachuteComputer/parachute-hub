@@ -1712,7 +1712,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
   });
   afterEach(() => h.cleanup());
 
-  test("done screen renders Install Notes + Install Scribe tiles when neither is installed", async () => {
+  test("done screen renders Install App + Install Scribe tiles when neither is installed", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -1747,10 +1747,21 @@ describe("done screen install tiles (hub#272 Item B)", () => {
       );
       const html = await res.text();
       expect(html).toContain("What's next?");
-      expect(html).toContain("Install Notes");
+      // hub#323: App replaces Notes as the first install tile. App auto-bootstraps
+      // Notes (parachute-app §17 Phase 2.1) so operators don't need to install
+      // notes-daemon directly; the tagline telegraphs that Notes comes with App.
+      expect(html).toContain("Install App");
       expect(html).toContain("Install Scribe");
-      expect(html).toContain('action="/admin/setup/install/notes"');
+      expect(html).toContain('action="/admin/setup/install/app"');
       expect(html).toContain('action="/admin/setup/install/scribe"');
+      // App tile sits first in the render order — verified by both tiles
+      // appearing AND app's index in the rendered HTML preceding scribe's.
+      expect(html.indexOf("Install App")).toBeLessThan(html.indexOf("Install Scribe"));
+      // Notes is no longer a wizard tile; notes-daemon still installable
+      // via /api/modules/notes/install for back-compat, but the wizard
+      // doesn't surface it.
+      expect(html).not.toContain("Install Notes");
+      expect(html).not.toContain('action="/admin/setup/install/notes"');
     } finally {
       db.close();
     }
@@ -1770,12 +1781,15 @@ describe("done screen install tiles (hub#272 Item B)", () => {
               paths: ["/vault/default"],
               health: "/health",
             },
+            // hub#323: app replaces notes as the wizard's first install tile.
+            // Seeding services.json with `parachute-app` exercises the
+            // already-installed render path on the wizard's first tile.
             {
-              name: "parachute-notes",
-              version: "0.1.0",
-              port: 1942,
-              paths: ["/notes"],
-              health: "/notes/health",
+              name: "parachute-app",
+              version: "0.2.0",
+              port: 1946,
+              paths: ["/app", "/.parachute"],
+              health: "/app/healthz",
             },
           ],
         },
@@ -1804,7 +1818,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
     }
   });
 
-  test("done screen renders op-poll panel when ?op_notes=<id> matches a registry op", async () => {
+  test("done screen renders op-poll panel when ?op_app=<id> matches a registry op", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -1824,12 +1838,15 @@ describe("done screen install tiles (hub#272 Item B)", () => {
       );
       setSetting(db, "setup_expose_mode", "localhost");
       const reg = getDefaultOperationsRegistry();
-      const op = reg.create("install", "notes");
-      reg.update(op.id, { status: "running" }, "running bun add -g @openparachute/notes@latest");
+      // hub#323: op-poll panel rides on the `app` tile now (app is the wizard's
+      // first install tile post-Notes-as-app-migration). Same shape as the
+      // pre-#324 `op_notes=<id>` flow.
+      const op = reg.create("install", "app");
+      reg.update(op.id, { status: "running" }, "running bun add -g @openparachute/app@latest");
       const { createSession } = await import("../sessions.ts");
       const session = createSession(db, { userId: user.id });
       const res = handleSetupGet(
-        req(`/admin/setup?just_finished=1&op_notes=${op.id}`, {
+        req(`/admin/setup?just_finished=1&op_app=${op.id}`, {
           headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
         }),
         {

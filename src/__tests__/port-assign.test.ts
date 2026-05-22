@@ -68,8 +68,13 @@ describe("assignPort (pure)", () => {
   });
 
   test("third-party with reservations occupied walks further in the range", () => {
+    // PORT_RESERVATIONS post-hub#323: 1944 reserved, 1945 reserved, 1946
+    // assigned (parachute-app — KNOWN_MODULES carries the canonical slot
+    // so the fallback walker doesn't hand it to a third party), 1947
+    // reserved. With 1944 + 1945 occupied, the walker skips the assigned
+    // 1946 slot and lands on the next reserved-and-free port — 1947.
     const result = assignPort(undefined, [1944, 1945]);
-    expect(result.port).toBe(1946);
+    expect(result.port).toBe(1947);
     expect(result.source).toBe("fallback-in-range");
   });
 });

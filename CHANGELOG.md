@@ -2,6 +2,28 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.12] - 2026-05-22
+
+**fix(hub): wizard prompts to install app (not notes-daemon) — auto-bootstrap handles notes-ui (#323).**
+
+The setup wizard's done-step install tiles still telegraphed `notes` as the canonical first install — operators walking through saw an "Install Notes" tile, i.e., the notes-daemon. With the Notes-as-app migration in progress (notes-daemon deprecation tracked in parachute-notes#154; parachute-app §17 Phase 2.1 auto-bootstraps `@openparachute/notes-ui` as a sub-unit on first `parachute-app serve` boot) the wizard should prompt `app` instead. App's bootstrap-default-apps step then installs notes-ui under `/app/notes` automatically, so the operator gets Notes-the-UX without having to know about the daemon-vs-app split.
+
+**What landed.**
+
+- **`INSTALL_TILE_PROPS` in `src/setup-wizard.ts`** swaps the first tile from `notes` → `app`. Tagline telegraphs the auto-bootstrap so the architecture is legible from the wizard ("Host module for Parachute UIs — auto-installs Notes on first boot."). Order preserved: app → scribe.
+- **`CURATED_MODULES` in `src/api-modules.ts`** now lists `["vault", "app", "notes", "scribe", "runner"]`. App slots between vault and notes — `notes` stays curated as the back-compat install path for operators on pre-app architecture (`/api/modules/notes/install` + `parachute install notes` still work). The wizard tile is what changed; the install surface kept the broader compatibility lane.
+- **`KNOWN_MODULES["app"]` in `src/service-spec.ts`** carries the bootstrap data the install pathway needs pre-self-register: `package: "@openparachute/app"`, `manifestName: "parachute-app"`, `canonicalPort: 1946`, `kind: "frontend"`, `canonicalPaths: ["/app", "/.parachute"]`, `canonicalHealth: "/app/healthz"`, `extras.hasAuth: true` (app's `/app/admin` + per-UI surfaces gate behind hub-issued JWTs per design doc §6), `extras.startCmd: () => ["parachute-app", "serve"]` (backward-compat fallback for rows without `installDir`). Post-install, `<installDir>/.parachute/module.json` is authoritative — KNOWN_MODULES is just the pre-install bootstrap shape.
+- **`PORT_RESERVATIONS`** entry added: `{ port: 1946, name: "parachute-app", status: "assigned" }`. Status `assigned` keeps the `assignPort` fallback walker from handing 1946 to a colliding third-party module.
+- **`parachute setup` CLI BLURBS** in `src/commands/setup.ts` add `app` + `runner` entries the table had been missing. App's blurb telegraphs the "recommended over notes-daemon" framing; notes's blurb adds the "(notes-daemon; superseded by `app`)" suffix.
+
+**Out of scope (intentional).**
+
+- Removing `notes` from `CURATED_MODULES`. Notes-daemon stays installable for operators on pre-app architecture — only the wizard's recommendation surface changed. The full daemon retirement lands in parachute-notes#154's Phase 3 once `app` is fully shipped and the redirect window (hub#316) is no longer load-bearing.
+
+**Tests.** `bun run typecheck` clean. `bun test ./src` 1862 pass (was 1861; +1 net — added the `app row carries package + display props from KNOWN_MODULES` test; updated the wizard done-screen tile test (app+scribe, asserting Notes is no longer surfaced + app sits before scribe in render order), the wizard already-installed test (seeds `parachute-app` instead of `parachute-notes`), the wizard op-poll test (`?op_app=<id>` instead of `?op_notes=<id>`), the api-modules curated-list test (vault → app → notes → scribe → runner), the port-assign third-party-walks test (1947 instead of 1946 because 1946 is now assigned to parachute-app), and the setup CLI all-installed test (seeds `parachute-app` alongside the other shorts). `cd web/ui && bun run test` 188 pass (unchanged — no SPA copy mentions Notes-as-first-install). `bunx biome check src/` clean.
+
+**Cross-references.** Issue hub#323 (this PR). parachute-notes#154 — notes-daemon deprecation. parachute-app §17 Phase 2.1 — bootstrap-default-apps. hub#316 — `/notes/*` → `/app/notes/*` 301 redirect (Phase 2 of the migration arc). The wizard tile change is the last operator-facing surface that recommended notes-daemon as the canonical first install — every other surface (`/api/modules` install catalog, `/.well-known/parachute.json`, the discovery page) now ride on services.json + module.json, which app self-registers on boot.
+
 ## [0.5.13-rc.11] - 2026-05-22
 
 **fix(hub): consent surfaces stale `assigned_vault` cleanly with picker fallback (#284).**

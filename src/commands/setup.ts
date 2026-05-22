@@ -151,8 +151,10 @@ function surveyServices(manifestPath: string): ServiceChoice[] {
 
 const BLURBS: Record<string, string> = {
   vault: "knowledge graph (MCP) — your owner-authenticated note + tag store",
-  notes: "Notes PWA — web/mobile UI on top of vault",
+  app: "Parachute UI host — auto-installs Notes on first boot (recommended over notes-daemon)",
+  notes: "Notes PWA — web/mobile UI on top of vault (notes-daemon; superseded by `app`)",
   scribe: "audio transcription for dictation + recordings",
+  runner: "vault-as-job-substrate — scheduled claude -p against vault job notes",
   channel: "(exploratory — may retire) notification fan-out across modules",
 };
 
