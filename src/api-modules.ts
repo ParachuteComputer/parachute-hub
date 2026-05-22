@@ -36,7 +36,7 @@ import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES } from "./service-spec.ts";
 // still required) and the latter for vault/scribe/runner (post-FALLBACK
 // retirement, hub#310). The local helper hides the split from the rest of
 // this file.
-import { readManifest } from "./services-manifest.ts";
+import { type UiSubUnit, type UiSubUnitStatus, readManifest } from "./services-manifest.ts";
 import type { ModuleState, Supervisor } from "./supervisor.ts";
 
 /**
@@ -107,6 +107,29 @@ export interface ApiModulesDeps {
   now?: () => number;
 }
 
+/**
+ * Wire shape for a sub-unit surfaced under a module row. Mirrors the
+ * services.json `UiSubUnit` map value, with the map key promoted to `name`
+ * — same shape `WellKnownUiSubUnit` uses. Snake-case keys to match the
+ * surrounding response (`display_name`, `oauth_client_id`).
+ *
+ * Discovery + admin SPA both consume this without reaching back into
+ * services.json — `display_name` / `path` / `icon_url` are sufficient to
+ * render the sub-row; `oauth_client_id` lets future SPA work cross-link
+ * to `/api/oauth/clients/<id>` for approval status without an extra
+ * resolver. Per parachute-app design doc §12.
+ */
+interface UiSubUnitWireShape {
+  name: string;
+  display_name: string;
+  path: string;
+  tagline: string | null;
+  icon_url: string | null;
+  version: string | null;
+  oauth_client_id: string | null;
+  status: UiSubUnitStatus | null;
+}
+
 interface ModuleWireShape {
   short: string;
   package: string;
@@ -125,6 +148,14 @@ interface ModuleWireShape {
    * so a vanished disk is obvious.
    */
   install_dir: string | null;
+  /**
+   * Hierarchical sub-units beneath this module (hub#313). Empty when the
+   * module's services.json row doesn't declare `uis` (vault, scribe, notes,
+   * runner today). Used by parachute-app to surface each hosted UI as its
+   * own discoverable sub-row under the App module. Per parachute-app
+   * design doc §12.
+   */
+  uis: UiSubUnitWireShape[];
 }
 
 interface ModulesResponse {
@@ -216,7 +247,10 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   // (fresh container), which is the v0.6 hot path — readManifest already
   // returns { services: [] } for a missing file, so no extra branching.
   const manifest = readManifest(deps.manifestPath);
-  const installedByShort = new Map<string, { version: string; installDir?: string }>();
+  const installedByShort = new Map<
+    string,
+    { version: string; installDir?: string; uis?: Record<string, UiSubUnit> }
+  >();
   for (const entry of manifest.services) {
     // Join services.json rows to CURATED_MODULES by manifestName. The
     // mapping table lives in lookupModule (which consults both
@@ -226,8 +260,13 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
     for (const short of CURATED_MODULES) {
       const m = lookupModule(short);
       if (m?.manifestName === entry.name) {
-        const value: { version: string; installDir?: string } = { version: entry.version };
+        const value: {
+          version: string;
+          installDir?: string;
+          uis?: Record<string, UiSubUnit>;
+        } = { version: entry.version };
         if (entry.installDir !== undefined) value.installDir = entry.installDir;
+        if (entry.uis !== undefined) value.uis = entry.uis;
         installedByShort.set(short, value);
       }
     }
@@ -289,6 +328,7 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
       supervisor_status: state?.status ?? null,
       pid: state?.pid ?? null,
       install_dir: installed?.installDir ?? null,
+      uis: toUisWireShape(installed?.uis),
     });
   }
 
@@ -395,6 +435,29 @@ function jsonError(status: number, code: string, description: string): Response 
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+/**
+ * Map a services.json `uis` record to the snake-case wire shape the SPA
+ * consumes. Each missing optional field on the source becomes an explicit
+ * `null` on the wire so the consumer's shape is uniform — same convention
+ * `install_dir` / `latest_version` follow on `ModuleWireShape`.
+ *
+ * Returns `[]` when the source is absent, so the response shape is uniform
+ * across modules with and without `uis` (the SPA can `.map` unconditionally).
+ */
+function toUisWireShape(uis: Record<string, UiSubUnit> | undefined): UiSubUnitWireShape[] {
+  if (!uis) return [];
+  return Object.entries(uis).map(([name, u]) => ({
+    name,
+    display_name: u.displayName,
+    path: u.path,
+    tagline: u.tagline ?? null,
+    icon_url: u.iconUrl ?? null,
+    version: u.version ?? null,
+    oauth_client_id: u.oauthClientId ?? null,
+    status: u.status ?? null,
+  }));
 }
 
 /**

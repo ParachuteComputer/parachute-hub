@@ -379,6 +379,186 @@ describe("buildWellKnown", () => {
     });
     expect(doc.vaults[0]?.url).toBe("https://x.example/");
   });
+
+  // Hierarchical sub-units (hub#313 — parachute-app design doc §12). Each
+  // entry in `s.uis` becomes one record in the well-known shape's
+  // `services[].uis` array, with map key promoted to `name` and `path`
+  // joined onto the canonical origin into a deep-linkable `url`.
+  describe("uis hierarchical sub-units (hub#313)", () => {
+    const app: ServiceEntry = {
+      name: "parachute-app",
+      port: 1946,
+      paths: ["/app"],
+      health: "/app/healthz",
+      version: "0.1.0",
+    };
+
+    test("uis map surfaces as services[].uis array with names promoted", () => {
+      const withUis: ServiceEntry = {
+        ...app,
+        uis: {
+          "gitcoin-brain": {
+            displayName: "Gitcoin Brain",
+            path: "/app/gitcoin-brain",
+            oauthClientId: "client_abc123",
+            status: "active",
+          },
+          "unforced-brain": {
+            displayName: "Unforced Brain",
+            path: "/app/unforced-brain",
+            oauthClientId: "client_def456",
+            status: "pending-oauth",
+          },
+        },
+      };
+      const doc = buildWellKnown({
+        services: [withUis],
+        canonicalOrigin: "https://x.example",
+      });
+      const appSvc = doc.services.find((s) => s.name === "parachute-app");
+      expect(appSvc?.uis).toEqual([
+        {
+          name: "gitcoin-brain",
+          displayName: "Gitcoin Brain",
+          path: "/app/gitcoin-brain",
+          url: "https://x.example/app/gitcoin-brain",
+          oauthClientId: "client_abc123",
+          status: "active",
+        },
+        {
+          name: "unforced-brain",
+          displayName: "Unforced Brain",
+          path: "/app/unforced-brain",
+          url: "https://x.example/app/unforced-brain",
+          oauthClientId: "client_def456",
+          status: "pending-oauth",
+        },
+      ]);
+    });
+
+    test("absent uis → services entry has no uis field (backwards-compat)", () => {
+      // The pre-#313 byte-identical shape for every existing module.
+      // Adding the `uis` field to the well-known doc when the parent
+      // didn't declare one would break consumers (and force a schema
+      // bump on every existing module).
+      const doc = buildWellKnown({
+        services: [notes, scribe, vault],
+        canonicalOrigin: "https://x.example",
+      });
+      for (const svc of doc.services) {
+        expect(svc).not.toHaveProperty("uis");
+      }
+    });
+
+    test("empty uis map → services entry has no uis field (avoid empty noise)", () => {
+      // Per buildWellKnown: an empty map omits the field. The SPA's
+      // `mod.uis.length > 0` predicate on the wire side already handles
+      // this, but the well-known doc is a public contract so we keep
+      // the shape tight.
+      const empty: ServiceEntry = { ...app, uis: {} };
+      const doc = buildWellKnown({
+        services: [empty],
+        canonicalOrigin: "https://x.example",
+      });
+      const svc = doc.services.find((s) => s.name === "parachute-app");
+      expect(svc).not.toHaveProperty("uis");
+    });
+
+    test("iconUrl resolves relative path to absolute against canonical origin", () => {
+      const withIcon: ServiceEntry = {
+        ...app,
+        uis: {
+          slug: {
+            displayName: "Slug",
+            path: "/app/slug",
+            iconUrl: "/app/slug/icon.svg",
+          },
+        },
+      };
+      const doc = buildWellKnown({
+        services: [withIcon],
+        canonicalOrigin: "https://x.example",
+      });
+      const svc = doc.services.find((s) => s.name === "parachute-app");
+      expect(svc?.uis?.[0]?.iconUrl).toBe("https://x.example/app/slug/icon.svg");
+    });
+
+    test("iconUrl absolute URL passes through verbatim", () => {
+      const withIcon: ServiceEntry = {
+        ...app,
+        uis: {
+          slug: {
+            displayName: "Slug",
+            path: "/app/slug",
+            iconUrl: "https://cdn.example.com/icon.svg",
+          },
+        },
+      };
+      const doc = buildWellKnown({
+        services: [withIcon],
+        canonicalOrigin: "https://x.example",
+      });
+      const svc = doc.services.find((s) => s.name === "parachute-app");
+      expect(svc?.uis?.[0]?.iconUrl).toBe("https://cdn.example.com/icon.svg");
+    });
+
+    test("optional fields ride through when present, absent when not", () => {
+      const mixed: ServiceEntry = {
+        ...app,
+        uis: {
+          full: {
+            displayName: "Full",
+            path: "/app/full",
+            tagline: "Has it all",
+            version: "0.3.1",
+            iconUrl: "/i.svg",
+            oauthClientId: "c1",
+            status: "disabled",
+          },
+          minimal: { displayName: "Minimal", path: "/app/minimal" },
+        },
+      };
+      const doc = buildWellKnown({
+        services: [mixed],
+        canonicalOrigin: "https://x.example",
+      });
+      const svc = doc.services.find((s) => s.name === "parachute-app");
+      const full = svc?.uis?.find((u) => u.name === "full");
+      const minimal = svc?.uis?.find((u) => u.name === "minimal");
+      expect(full?.tagline).toBe("Has it all");
+      expect(full?.version).toBe("0.3.1");
+      expect(full?.oauthClientId).toBe("c1");
+      expect(full?.status).toBe("disabled");
+      // Minimal carries only the required fields — no optional keys.
+      expect(minimal).toEqual({
+        name: "minimal",
+        displayName: "Minimal",
+        path: "/app/minimal",
+        url: "https://x.example/app/minimal",
+      });
+    });
+
+    test("multiple modules each carry their own uis", () => {
+      const app1: ServiceEntry = {
+        ...app,
+        uis: { a: { displayName: "A", path: "/app/a" } },
+      };
+      const app2: ServiceEntry = {
+        ...app,
+        name: "parachute-app-2",
+        port: 1947,
+        uis: { b: { displayName: "B", path: "/app-2/b" } },
+      };
+      const doc = buildWellKnown({
+        services: [app1, app2],
+        canonicalOrigin: "https://x.example",
+      });
+      const svc1 = doc.services.find((s) => s.name === "parachute-app");
+      const svc2 = doc.services.find((s) => s.name === "parachute-app-2");
+      expect(svc1?.uis?.map((u) => u.name)).toEqual(["a"]);
+      expect(svc2?.uis?.map((u) => u.name)).toEqual(["b"]);
+    });
+  });
 });
 
 describe("writeWellKnownFile", () => {
