@@ -6078,3 +6078,256 @@ describe("handleAuthorizePost — stale assigned_vault clean 400 (hub#284)", () 
     }
   });
 });
+
+// closes hub#284 reviewer fold — `hasStaleAssignment` predicate gates BOTH
+// the #75 skip-consent fast-path AND the hub#312 same-hub auto-trust gate,
+// not just the consent-render path. Pre-fold, a user with a prior
+// `vault:default:read` grant on a now-removed vault landed at the skip-
+// consent gate and silently minted a token for a vault the resource server
+// couldn't find — the consent screen (with its banner) never rendered. The
+// same-hub variant had the matching gap: a same-hub client requesting
+// `vault:default:read` on a stale assignment would auto-approve before the
+// stale-detection code at consent render ever ran. These tests pin both
+// gates to fall through to the consent render when assignment is stale.
+describe("handleAuthorizeGet — stale assignment gates both fast-paths (hub#284 reviewer)", () => {
+  // Manifest with only `other` — the user's assigned `default` is missing.
+  const otherOnlyManifest: ServicesManifest = {
+    services: [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/other"],
+        health: "/health",
+        version: "0.3.0",
+      },
+    ],
+  };
+
+  test("stale + prior grant covers scope → skip-consent gate SKIPPED, banner rendered (not silent mint)", async () => {
+    // Critical reviewer case. The variant most likely to bite real users:
+    // they previously consented to `vault:default:read` (grant recorded),
+    // then admin removed `default`. Pre-fold the next /authorize hit the
+    // skip-consent gate and silently issued a token for the missing vault.
+    // Post-fold the gate skips, the consent screen renders, banner shows.
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { recordGrant } = await import("../grants.ts");
+      // Prior grant: covers the request below exactly.
+      recordGrant(db, bob.id, reg.client.clientId, ["vault:default:read"]);
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => otherOnlyManifest,
+      });
+      // Consent screen rendered, NOT a 302 silent mint.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const html = await res.text();
+      expect(html).toContain('class="stale-assignment-banner"');
+      expect(html).toContain("Your assigned vault was removed");
+      expect(html).toContain("<code>default</code>");
+      // Approve gated because the named scope targets the stale vault.
+      expect(html).toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("stale + same-hub client → auto-trust gate SKIPPED, banner rendered (not silent mint)", async () => {
+    // The second variant: a same-hub client (parachute-app installed by
+    // the operator) requests `vault:default:read`, the operator's
+    // assigned vault is stale. Pre-fold the hub#312 gate auto-approved
+    // before stale-detection ever ran. Post-fold the gate skips, the
+    // consent screen renders.
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => otherOnlyManifest,
+      });
+      // Consent screen rendered, NOT a 302 silent mint.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const html = await res.text();
+      expect(html).toContain('class="stale-assignment-banner"');
+      expect(html).toContain("Your assigned vault was removed");
+      expect(html).toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("stale + non-vault scope + same-hub client → banner informational, Approve enabled", async () => {
+    // A same-hub client requesting a non-vault scope (`scribe:transcribe`)
+    // hits the auto-trust gate. With a stale assignment we still skip the
+    // auto-trust gate per the fold (assignment is stale = always fall
+    // through), but the scope doesn't depend on a vault so Approve stays
+    // enabled — the user can still consent to scribe access.
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "scribe:transcribe",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => otherOnlyManifest,
+      });
+      // Consent rendered (auto-trust skipped because assignment is stale).
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('class="stale-assignment-banner"');
+      // Approve NOT disabled — non-vault scope is consentable even when
+      // the vault assignment is broken.
+      expect(html).not.toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("not-stale + prior grant covers scope → skip-consent fast-path preserved (no regression)", async () => {
+    // The happy path: user's assigned vault still exists, prior grant
+    // covers the request, /authorize redirects with the auth code. Pin
+    // the fast-path so the fold doesn't break the existing UX.
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { recordGrant } = await import("../grants.ts");
+      recordGrant(db, bob.id, reg.client.clientId, ["vault:default:read"]);
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+          state: "fast-path",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      // Fixture manifest has `default`, matching bob's assignment.
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("code")?.length).toBeGreaterThan(20);
+      expect(loc.searchParams.get("state")).toBe("fast-path");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("not-stale + same-hub client → auto-trust fast-path preserved (no regression)", async () => {
+    // The happy path for the hub#312 gate: same-hub client requests a
+    // non-admin vault scope, user's assignment is intact, gate fires.
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+          state: "same-hub-fast",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("code")?.length).toBeGreaterThan(20);
+      expect(loc.searchParams.get("state")).toBe("same-hub-fast");
+    } finally {
+      cleanup();
+    }
+  });
+});

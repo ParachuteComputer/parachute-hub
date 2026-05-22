@@ -707,6 +707,36 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     return htmlResponse(renderLogin({ params: parsed, csrfToken: csrf.token }), 200, extra);
   }
 
+  // Multi-user Phase 1: non-admin users (with `assigned_vault !== null`) see
+  // the picker locked to their assigned vault — they can't pick a different
+  // one. Admin users (assigned_vault === null) see the full dropdown.
+  // Defensive null-coalesce: the session points at a deleted user shouldn't
+  // 500; treat as admin posture (the broader scope-validation gate will
+  // catch any actual privilege issue).
+  //
+  // Resolved here (before the fast-paths) because the stale-assignment
+  // predicate below — which gates both skip-consent (#75) and same-hub
+  // auto-trust (hub#312) — needs both the user's assignment AND the live
+  // vault list. Keeping the manifest read in the hot path is the price of
+  // closing the silent-mint-on-stale-vault gap; the read is one JSON parse
+  // off-disk per /authorize.
+  const user = getUserById(db, session.userId);
+  const lockedVault = user?.assignedVault ?? null;
+  const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
+  const vaultNames = listVaultNames(manifest);
+
+  // Stale-assignment predicate (hub#284 reviewer fold). The user has an
+  // `assigned_vault` pinned on their row but the named vault is no longer
+  // in services.json. Both fast-paths below (#75 skip-consent, hub#312
+  // same-hub auto-trust) would otherwise silently mint a token for a vault
+  // that doesn't exist — the user thinks consent succeeded but the
+  // downstream API calls fail with no actionable signal. Fall through to
+  // the consent render in either case so the banner UX (and the disabled
+  // Approve when the requested scope depends on a vault) surfaces the
+  // condition + admin-remediation path. Admin users (`lockedVault === null`)
+  // are never stale.
+  const hasStaleAssignment = lockedVault !== null && !vaultNames.includes(lockedVault);
+
   // Skip-consent gate (#75). If the user has previously granted every
   // requested scope to this client, mint the auth code immediately. Two
   // important constraints:
@@ -717,8 +747,15 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   //   - The grant covers `requestedScopes` exactly when every requested
   //     scope appears in the stored set. A strict superset (client wants
   //     something new) falls through to the consent screen.
+  //   - Stale-assignment (above) also forces the consent render so the
+  //     banner explains the broken state rather than silently minting a
+  //     token against the missing vault.
   const hasUnnamedVault = unnamedVaultVerbs(requestedScopes).length > 0;
-  if (!hasUnnamedVault && isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)) {
+  if (
+    !hasStaleAssignment &&
+    !hasUnnamedVault &&
+    isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)
+  ) {
     console.log(
       `consent skipped: existing grant covers requested scope client_id=${client.clientId} user_id=${session.userId} scopes=${requestedScopes.join(" ")}`,
     );
@@ -739,12 +776,16 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   //      still want explicit consent as a sanity gate.
   //   3. No unnamed vault verbs are requested — those need the picker to
   //      narrow `vault:<verb>` → `vault:<name>:<verb>` before mint.
+  //   4. The user's assigned_vault is not stale (hub#284 reviewer fold) —
+  //      otherwise the same-hub gate would silently mint a token for a
+  //      removed vault before the consent-render path's stale detection
+  //      ever runs.
   //
   // The grant is also recorded so subsequent flows with the same scopes
   // hit the standard skip-consent gate above. Logged so an operator
   // auditing "who did this" can trace it back to a same-hub DCR.
   const hasAdminScope = requestedScopes.some(scopeIsAdmin);
-  if (client.sameHub && !hasAdminScope && !hasUnnamedVault) {
+  if (client.sameHub && !hasAdminScope && !hasUnnamedVault && !hasStaleAssignment) {
     console.log(
       `[oauth] auto-approved same-hub client client_id=${client.clientId} user_id=${session.userId} scopes=${requestedScopes.join(" ")} (hub#312)`,
     );
@@ -755,17 +796,6 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
   }
 
-  // Multi-user Phase 1: non-admin users (with `assigned_vault !== null`) see
-  // the picker locked to their assigned vault — they can't pick a different
-  // one. Admin users (assigned_vault === null) see the full dropdown.
-  // Defensive null-coalesce: the session points at a deleted user shouldn't
-  // 500; treat as admin posture (the broader scope-validation gate will
-  // catch any actual privilege issue).
-  const user = getUserById(db, session.userId);
-  const lockedVault = user?.assignedVault ?? null;
-
-  const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
-  const vaultNames = listVaultNames(manifest);
   return htmlResponse(
     renderConsent(consentProps(client, parsed, vaultNames, csrf.token, lockedVault)),
     200,
