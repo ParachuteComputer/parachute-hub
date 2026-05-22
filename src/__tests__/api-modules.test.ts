@@ -149,8 +149,10 @@ describe("GET /api/modules", () => {
 
   test("200 + curated list on fresh container (empty services.json)", async () => {
     // The v0.6 hot path: brand-new Render container, no services.json
-    // yet. UI must render "install vault / notes / scribe / runner"
-    // cards even though nothing's installed.
+    // yet. UI must render "install vault / app / notes / scribe / runner"
+    // cards even though nothing's installed. hub#323 inserted `app` between
+    // `vault` and `notes` — app auto-bootstraps notes-ui as a sub-unit;
+    // `notes` (notes-daemon) stays curated for back-compat install paths.
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
@@ -168,13 +170,44 @@ describe("GET /api/modules", () => {
       }>;
       supervisor_available: boolean;
     };
-    // Curated order is preserved: vault → notes → scribe → runner.
-    expect(body.modules.map((m) => m.short)).toEqual(["vault", "notes", "scribe", "runner"]);
+    // Curated order is preserved: vault → app → notes → scribe → runner.
+    expect(body.modules.map((m) => m.short)).toEqual(["vault", "app", "notes", "scribe", "runner"]);
     expect(body.modules.every((m) => m.available)).toBe(true);
     expect(body.modules.every((m) => !m.installed)).toBe(true);
     expect(body.modules.every((m) => m.latest_version === "0.9.9")).toBe(true);
     // Supervisor wasn't injected → flag reflects that.
     expect(body.supervisor_available).toBe(false);
+  });
+
+  test("app row carries package + display props from KNOWN_MODULES (#323)", async () => {
+    // hub#323 added app to CURATED_MODULES + KNOWN_MODULES so the admin SPA
+    // install catalog + setup-wizard install tile surface it. Spot-check the
+    // wire shape resolves app-specific fields (package, displayName, tagline)
+    // from KNOWN_MODULES rather than a stale default — same shape as the
+    // runner row test below.
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => "0.2.0",
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      modules: Array<{
+        short: string;
+        package: string;
+        display_name: string;
+        tagline: string;
+        available: boolean;
+      }>;
+    };
+    const app = body.modules.find((m) => m.short === "app");
+    expect(app).toBeDefined();
+    expect(app?.package).toBe("@openparachute/app");
+    expect(app?.display_name).toBe("App");
+    expect(app?.tagline).toContain("auto-installs Notes");
+    expect(app?.available).toBe(true);
   });
 
   test("runner row carries package + display props from FIRST_PARTY_FALLBACKS (#305)", async () => {

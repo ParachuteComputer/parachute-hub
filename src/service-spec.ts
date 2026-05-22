@@ -64,7 +64,11 @@ export const PORT_RESERVATIONS: readonly PortReservation[] = [
   { port: 1943, name: "parachute-scribe", status: "assigned" },
   { port: 1944, name: "unassigned", status: "reserved" },
   { port: 1945, name: "unassigned", status: "reserved" },
-  { port: 1946, name: "unassigned", status: "reserved" },
+  // hub#323: parachute-app's canonical slot. Status `assigned` keeps the
+  // fallback-port walker (`assignPort` in port-assign.ts) from handing this
+  // port out to a colliding third-party module. The matching KNOWN_MODULES
+  // row carries the canonicalPort + paths for status/expose surfaces.
+  { port: 1946, name: "parachute-app", status: "assigned" },
   { port: 1947, name: "unassigned", status: "reserved" },
   { port: 1948, name: "unassigned", status: "reserved" },
   { port: 1949, name: "unassigned", status: "reserved" },
@@ -481,6 +485,37 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
       // hub-issued JWT carrying `runner:admin` scope (see runner's
       // `src/auth.ts`). Surfaces in `parachute status` as auth-required by
       // default, same posture as vault.
+      hasAuth: true,
+    },
+  },
+  app: {
+    short: "app",
+    package: "@openparachute/app",
+    manifestName: "parachute-app",
+    canonicalPort: 1946,
+    displayName: "App",
+    // Tagline telegraphs the auto-bootstrap so wizard + admin-SPA copy explain
+    // the architecture: installing `app` brings Notes (and other UIs) along
+    // via the Phase 2.1 bootstrap-default-apps step. The notes-daemon path
+    // still exists as a back-compat install (CURATED_MODULES still lists
+    // `notes`) but `app` is the recommended first install post-vault.
+    tagline: "Host module for Parachute UIs — auto-installs Notes on first boot.",
+    // Frontend posture: app's primary surface is serving sub-app UIs under
+    // `/app/<name>/` mounted under one origin (design doc §12). Hub's
+    // exposure-default + supervisor-defaults follow the frontend lane.
+    kind: "frontend",
+    canonicalPaths: ["/app", "/.parachute"],
+    canonicalHealth: "/app/healthz",
+    canonicalStripPrefix: false,
+    extras: {
+      // Backward-compat startCmd — same rationale as scribe / vault / runner
+      // above. Post-self-register, lifecycle reads module.json's startCmd via
+      // `composeKnownModuleSpec` and that path wins.
+      startCmd: () => ["parachute-app", "serve"],
+      // App's admin + per-UI surfaces gate behind hub-issued JWTs (design
+      // doc §6 same-hub auto-trust + scope `app:admin`). Surfaces in
+      // `parachute status` as auth-required by default, same posture as vault
+      // + runner.
       hasAuth: true,
     },
   },

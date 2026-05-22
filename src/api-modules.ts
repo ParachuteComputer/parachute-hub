@@ -77,12 +77,14 @@ export const API_MODULES_REQUIRED_SCOPE = "parachute:host:auth";
 
 /**
  * Curated module short-names for v0.6 Render self-host. Marketplace is
- * Phase 2 — until then, the admin UI offers exactly these four. Order
- * is the recommended install order (vault → notes → scribe → runner;
- * runner comes last because it depends on a working vault + scribe to
- * be useful, and operators usually wire those up first).
+ * Phase 2 — until then, the admin UI offers exactly these. Order is the
+ * recommended install order (vault → app → notes → scribe → runner;
+ * app auto-bootstraps notes-ui on first boot — `notes` here is the
+ * notes-daemon back-compat install path retained for operators still on
+ * the pre-app architecture; scribe + runner come last because they
+ * depend on a working vault + app to be useful).
  */
-export const CURATED_MODULES = ["vault", "notes", "scribe", "runner"] as const;
+export const CURATED_MODULES = ["vault", "app", "notes", "scribe", "runner"] as const;
 export type CuratedModuleShort = (typeof CURATED_MODULES)[number];
 
 export interface ApiModulesDeps {
