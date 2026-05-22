@@ -5265,3 +5265,422 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
     }
   });
 });
+
+// closes hub#312 — DCR clients registered by the hub's own operator (bearer
+// hub:admin OR session-cookie + same-origin) land same_hub=true and bypass
+// the consent screen at /oauth/authorize for non-admin scopes. Foundational
+// for the parachute-app friend-deploy story (zero consent screens per UI
+// the app installs).
+describe("DCR same-hub auto-trust (hub#312)", () => {
+  const SESSION_COOKIE_TTL_S = Math.floor(SESSION_TTL_MS / 1000);
+
+  test("register: no auth → same_hub=false (response + DB)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const req = new Request(`${ISSUER}/oauth/register`, {
+        method: "POST",
+        body: JSON.stringify({ redirect_uris: ["https://app.example/cb"] }),
+        headers: { "content-type": "application/json" },
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.same_hub).toBe(false);
+      const row = getClient(db, body.client_id as string);
+      expect(row?.sameHub).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("register: operator-bearer (hub:admin) → same_hub=true", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const { rotateSigningKey } = await import("../signing-keys.ts");
+      const { mintOperatorToken } = await import("../operator-token.ts");
+      rotateSigningKey(db);
+      const user = await createUser(db, "owner", "pw");
+      const operator = await mintOperatorToken(db, user.id, { issuer: ISSUER });
+      const req = new Request(`${ISSUER}/oauth/register`, {
+        method: "POST",
+        body: JSON.stringify({ redirect_uris: ["https://app.example/cb"] }),
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${operator.token}`,
+        },
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("approved");
+      expect(body.same_hub).toBe(true);
+      const row = getClient(db, body.client_id as string);
+      expect(row?.sameHub).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("register: session cookie + same-origin → same_hub=true", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const req = new Request(`${ISSUER}/oauth/register`, {
+        method: "POST",
+        body: JSON.stringify({ redirect_uris: ["https://app.example/cb"] }),
+        headers: {
+          "content-type": "application/json",
+          cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S),
+          origin: ISSUER,
+        },
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.same_hub).toBe(true);
+      const row = getClient(db, body.client_id as string);
+      expect(row?.sameHub).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("register: session cookie + cross-origin → same_hub=false (CSRF defense)", async () => {
+    // Same-origin gate must reject — a cross-site forgery can't ride the
+    // cookie into a same_hub=true claim. Matches the #199 status pending
+    // path on the same gate.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const req = new Request(`${ISSUER}/oauth/register`, {
+        method: "POST",
+        body: JSON.stringify({ redirect_uris: ["https://app.example/cb"] }),
+        headers: {
+          "content-type": "application/json",
+          cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S),
+          origin: "https://attacker.example",
+        },
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.same_hub).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("register: wizard-window auto-approve → same_hub=false (approval ≠ ownership)", async () => {
+    // The first-client wizard window (#268) is auto-APPROVE but external —
+    // the operator deliberately ran the wizard but the registrant (the
+    // app being installed) is not operator-authenticated. Approval and
+    // ownership are different things; the test pins that they stay
+    // separate.
+    const { db, cleanup } = await makeDb();
+    try {
+      const t0 = new Date("2026-05-22T00:00:00.000Z");
+      openFirstClientAutoApproveWindow(db, () => t0);
+      const req = new Request(`${ISSUER}/oauth/register`, {
+        method: "POST",
+        body: JSON.stringify({ redirect_uris: ["https://app.example/cb"] }),
+        headers: { "content-type": "application/json" },
+      });
+      const res = await handleRegister(db, req, { issuer: ISSUER, now: () => t0 });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      // Approved by the wizard window, but NOT same_hub — the registrant
+      // is external.
+      expect(body.status).toBe("approved");
+      expect(body.same_hub).toBe(false);
+      const row = getClient(db, body.client_id as string);
+      expect(row?.sameHub).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("authorize: same_hub=true + non-admin scope → silent-approve (302 with code)", async () => {
+    // The payoff. A parachute-app-registered client requesting `vault:default:read`
+    // gets the auth code immediately — no consent HTML screen rendered.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "same-hub-1",
+        }),
+        { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("code")?.length).toBeGreaterThan(20);
+      expect(loc.searchParams.get("state")).toBe("same-hub-1");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("authorize: same_hub=true + non-admin scope → grant recorded for follow-up flows", async () => {
+    // Subsequent flows (same scopes, even if the same-hub gate ever moves)
+    // should hit the standard #75 skip-consent gate uniformly. We pin that
+    // by checking grants directly — the next flow doesn't need to re-trip
+    // the same-hub gate to stay silent.
+    const { db, cleanup } = await makeDb();
+    try {
+      const { isCoveredByGrant } = await import("../grants.ts");
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read scribe:transcribe",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      // Grant landed for the consented scopes.
+      expect(
+        isCoveredByGrant(db, user.id, reg.client.clientId, [
+          "vault:default:read",
+          "scribe:transcribe",
+        ]),
+      ).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("authorize: same_hub=true + admin scope → consent screen (high-power sanity gate)", async () => {
+    // hub:admin is requestable via DCR (only `parachute:host:admin` and
+    // per-vault `vault:*:admin` are non-requestable). For same-hub
+    // clients we DO still show consent on admin scopes — the operator
+    // who registered the client may not want to grant their own session
+    // hub-wide admin access without an explicit click.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "hub:admin",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      // Consent rendered, not silent-approve.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const html = await res.text();
+      expect(html).toContain("hub:admin");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("authorize: same_hub=true + mixed admin+non-admin → consent screen (any admin scope shows consent)", async () => {
+    // Defensive: a request asking for `vault:default:read hub:admin` must
+    // NOT silent-approve on the strength of the non-admin scope. Any
+    // admin scope present forces consent.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read hub:admin",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("authorize: same_hub=true + unnamed vault verb → consent screen (picker needed)", async () => {
+    // Unnamed `vault:read` needs the picker to narrow to
+    // `vault:<name>:read` before mint. The same-hub gate must not
+    // skip past this — it would mint a token with an unscoped
+    // `vault:read` claim that downstream resource servers couldn't
+    // pin to a specific vault.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("authorize: same_hub=false → consent screen (current behavior, any scope)", async () => {
+    // The default for externally-registered clients (DCR without auth, or
+    // wizard-window-approved). Pinning that nothing about the new gate
+    // affects the external-DCR consent shape.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: false,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("authorize: same-hub silent-approve emits audit log line", async () => {
+    const { db, cleanup } = await makeDb();
+    const originalLog = console.log;
+    const lines: string[] = [];
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+
+      const auto = lines.find((l) => l.startsWith("[oauth] auto-approved same-hub client"));
+      expect(auto).toBeDefined();
+      expect(auto).toContain(`client_id=${reg.client.clientId}`);
+      expect(auto).toContain(`user_id=${user.id}`);
+      expect(auto).toContain("scopes=vault:default:read");
+      expect(auto).toContain("hub#312");
+    } finally {
+      console.log = originalLog;
+      cleanup();
+    }
+  });
+
+  test("migration backfill: existing rows (pre-migration) get same_hub=false", async () => {
+    // The migration v9 backfills every pre-existing client to same_hub=0.
+    // We can't easily simulate "registered before migration" without a v8-
+    // only DB, so the indirect test is: insert a row via INSERT bypassing
+    // RegisterClientOpts.sameHub (defaults to false from the helper), and
+    // confirm the row reads back same_hub=false. The migration's UPDATE
+    // shape (SET same_hub = 0) is the same as the column's NOT NULL DEFAULT
+    // 0 — a v8→v9 upgrade and a v9 fresh-DB land identical defaults.
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        // No sameHub: omitted → defaults false.
+      });
+      expect(reg.client.sameHub).toBe(false);
+      const row = getClient(db, reg.client.clientId);
+      expect(row?.sameHub).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+});

@@ -66,11 +66,7 @@ import {
 } from "./oauth-ui.ts";
 import { isSameOriginRequest } from "./origin-check.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
-import {
-  isNonRequestableScope,
-  isRequestableScope,
-  scopeIsAdmin,
-} from "./scope-explanations.ts";
+import { isNonRequestableScope, isRequestableScope, scopeIsAdmin } from "./scope-explanations.ts";
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
 import {
   type ServicesManifest,
