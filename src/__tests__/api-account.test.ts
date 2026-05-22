@@ -29,6 +29,11 @@ import {
 } from "../api-account.ts";
 import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import {
+  CHANGE_PASSWORD_MAX_ATTEMPTS,
+  CHANGE_PASSWORD_WINDOW_MS,
+  changePasswordRateLimiter,
+} from "../rate-limit.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
 import { createUser, getUserById, verifyPassword } from "../users.ts";
 
@@ -84,6 +89,13 @@ function formBody(values: Record<string, string>): {
 let harness: Harness;
 beforeEach(() => {
   harness = makeHarness();
+  // Per-test rate-limit reset — change-password tests share the
+  // singleton `changePasswordRateLimiter`, and a test that exhausts a
+  // user-id bucket would 429-cascade into the next test if the user-id
+  // happened to collide. Per-harness DB → fresh user-ids, so in practice
+  // there's no collision, but the explicit reset matches `admin-handlers`
+  // discipline and pins the contract.
+  changePasswordRateLimiter.reset();
 });
 afterEach(() => {
   harness.cleanup();
@@ -437,6 +449,161 @@ describe("POST /account/change-password", () => {
     // current password).
     const setCookie = res.headers.get("set-cookie") ?? "";
     expect(setCookie).not.toContain("Max-Age=0");
+  });
+
+  // hub#282 — per-user rate-limit on /account/change-password.
+  // CHANGE_PASSWORD_MAX_ATTEMPTS attempts per CHANGE_PASSWORD_WINDOW_MS;
+  // (CHANGE_PASSWORD_MAX_ATTEMPTS+1)th attempt within the window is 429.
+  test("rapid wrong-current_password attempts exhaust the bucket and 429 with Retry-After", async () => {
+    const { cookie } = await sessionCookieFor(harness.db, "newbie", "correct-pw", {
+      passwordChanged: false,
+    });
+    const buildReq = () => {
+      const { body, headers } = formBody({
+        [CSRF_FIELD_NAME]: TEST_CSRF,
+        current_password: "this-is-wrong",
+        new_password: "long-enough-passphrase",
+        new_password_confirm: "long-enough-passphrase",
+      });
+      return new Request("http://hub.test/account/change-password", {
+        method: "POST",
+        headers: { ...headers, cookie },
+        body,
+      });
+    };
+    // First N attempts: wrong current → 401 each (admitted by rate limiter,
+    // failed by argon2id verify).
+    for (let i = 0; i < CHANGE_PASSWORD_MAX_ATTEMPTS; i++) {
+      const r = await handleAccountChangePasswordPost(buildReq(), { db: harness.db });
+      expect(r.status).toBe(401);
+    }
+    // (N+1)th attempt: rate-limit fires before argon2id → 429 + Retry-After.
+    const denied = await handleAccountChangePasswordPost(buildReq(), { db: harness.db });
+    expect(denied.status).toBe(429);
+    const retryAfter = denied.headers.get("retry-after");
+    expect(retryAfter).not.toBeNull();
+    const seconds = Number(retryAfter);
+    expect(seconds).toBeGreaterThan(0);
+    // Window is CHANGE_PASSWORD_WINDOW_MS, so retry-after sits in (0, window].
+    expect(seconds).toBeLessThanOrEqual(CHANGE_PASSWORD_WINDOW_MS / 1000);
+    // Body should re-render the form with the rate-limit message.
+    const html = await denied.text();
+    expect(html).toContain("Too many password-change attempts");
+  });
+
+  test("rate-limit is per-user: two users have independent buckets", async () => {
+    const userA = await sessionCookieFor(harness.db, "user-a", "pw-a", {
+      passwordChanged: false,
+    });
+    const userB = await sessionCookieFor(harness.db, "user-b", "pw-b", {
+      passwordChanged: false,
+      allowMulti: true,
+    });
+    const buildReq = (cookie: string) => {
+      const { body, headers } = formBody({
+        [CSRF_FIELD_NAME]: TEST_CSRF,
+        current_password: "wrong",
+        new_password: "long-enough-passphrase",
+        new_password_confirm: "long-enough-passphrase",
+      });
+      return new Request("http://hub.test/account/change-password", {
+        method: "POST",
+        headers: { ...headers, cookie },
+        body,
+      });
+    };
+    // Exhaust user-a's bucket.
+    for (let i = 0; i < CHANGE_PASSWORD_MAX_ATTEMPTS; i++) {
+      await handleAccountChangePasswordPost(buildReq(userA.cookie), { db: harness.db });
+    }
+    const aDenied = await handleAccountChangePasswordPost(buildReq(userA.cookie), {
+      db: harness.db,
+    });
+    expect(aDenied.status).toBe(429);
+    // user-b's bucket is untouched — first attempt should be admitted
+    // (and reject for wrong current → 401, not 429).
+    const bAttempt = await handleAccountChangePasswordPost(buildReq(userB.cookie), {
+      db: harness.db,
+    });
+    expect(bAttempt.status).toBe(401);
+  });
+
+  test("rate-limit gate fires before argon2id verify (denied request is fast)", async () => {
+    // Pin the "fires before verifyPassword" property with an elapsed-time
+    // floor on the 429 response — argon2id verify would push elapsed
+    // into the hundreds of ms; the 429 path skips it.
+    const { cookie } = await sessionCookieFor(harness.db, "newbie", "correct-pw", {
+      passwordChanged: false,
+    });
+    const buildReq = () => {
+      const { body, headers } = formBody({
+        [CSRF_FIELD_NAME]: TEST_CSRF,
+        current_password: "wrong",
+        new_password: "long-enough-passphrase",
+        new_password_confirm: "long-enough-passphrase",
+      });
+      return new Request("http://hub.test/account/change-password", {
+        method: "POST",
+        headers: { ...headers, cookie },
+        body,
+      });
+    };
+    // Fill the bucket.
+    for (let i = 0; i < CHANGE_PASSWORD_MAX_ATTEMPTS; i++) {
+      await handleAccountChangePasswordPost(buildReq(), { db: harness.db });
+    }
+    // The (N+1)th attempt should 429-and-return without touching argon2id.
+    const t0 = Date.now();
+    const denied = await handleAccountChangePasswordPost(buildReq(), { db: harness.db });
+    const elapsed = Date.now() - t0;
+    expect(denied.status).toBe(429);
+    // 200ms is enough headroom even on a noisy runner; an argon2id verify
+    // would push elapsed into the hundreds of ms.
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  test("CSRF failure does NOT burn a rate-limit slot", async () => {
+    // Gate-order invariant: rate-limit fires *after* CSRF, so a junk
+    // cross-site POST (which would never have a valid CSRF token) doesn't
+    // burn a bucket slot for the victim's session. Pin by sending
+    // (max+1) CSRF-broken requests and then confirming a fresh, valid
+    // attempt is admitted (would-be 401 for wrong current_password, not
+    // 429).
+    const { cookie } = await sessionCookieFor(harness.db, "newbie", "correct-pw", {
+      passwordChanged: false,
+    });
+    const csrfBroken = () => {
+      const { body, headers } = formBody({
+        [CSRF_FIELD_NAME]: "wrong-token",
+        current_password: "wrong",
+        new_password: "long-enough-passphrase",
+        new_password_confirm: "long-enough-passphrase",
+      });
+      return new Request("http://hub.test/account/change-password", {
+        method: "POST",
+        headers: { ...headers, cookie },
+        body,
+      });
+    };
+    for (let i = 0; i < CHANGE_PASSWORD_MAX_ATTEMPTS + 2; i++) {
+      const r = await handleAccountChangePasswordPost(csrfBroken(), { db: harness.db });
+      expect(r.status).toBe(400);
+    }
+    // Now send a CSRF-valid attempt — should NOT be 429 (CSRF-broken
+    // attempts never reached the rate limiter).
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      current_password: "wrong",
+      new_password: "long-enough-passphrase",
+      new_password_confirm: "long-enough-passphrase",
+    });
+    const valid = new Request("http://hub.test/account/change-password", {
+      method: "POST",
+      headers: { ...headers, cookie },
+      body,
+    });
+    const res = await handleAccountChangePasswordPost(valid, { db: harness.db });
+    expect(res.status).toBe(401);
   });
 });
 

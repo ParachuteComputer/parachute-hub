@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  CHANGE_PASSWORD_MAX_ATTEMPTS,
+  CHANGE_PASSWORD_WINDOW_MS,
   MAX_ATTEMPTS,
+  RateLimiter,
   UNKNOWN_IP_SENTINEL,
   WINDOW_MS,
   __resetForTests,
+  changePasswordRateLimiter,
   checkAndRecord,
   clientIpFromRequest,
 } from "../rate-limit.ts";
@@ -186,5 +190,115 @@ describe("clientIpFromRequest — header priority", () => {
       headers: { "cf-connecting-ip": "", "x-forwarded-for": "198.51.100.99" },
     });
     expect(clientIpFromRequest(req)).toBe("198.51.100.99");
+  });
+});
+
+// hub#282 — `RateLimiter` is a class so each auth surface can pick its
+// own capacity / window. Pin the per-instance shape (independent buckets,
+// independent reset, configurable thresholds) so a future call site that
+// instantiates a third limiter inherits a known-good contract.
+describe("RateLimiter — class with per-instance capacity and window", () => {
+  test("respects the constructor's maxAttempts (cap=3)", () => {
+    const rl = new RateLimiter(3, 60_000);
+    const now = new Date("2026-05-22T12:00:00Z");
+    for (let i = 0; i < 3; i++) {
+      expect(rl.checkAndRecord("user-a", now).allowed).toBe(true);
+    }
+    const denied = rl.checkAndRecord("user-a", now);
+    expect(denied.allowed).toBe(false);
+    expect(denied.retryAfterSeconds).toBe(60);
+  });
+
+  test("respects the constructor's windowMs (5min)", () => {
+    const windowMs = 5 * 60 * 1000;
+    const rl = new RateLimiter(3, windowMs);
+    const t0 = new Date("2026-05-22T12:00:00Z");
+    for (let i = 0; i < 3; i++) rl.checkAndRecord("user-a", t0);
+    const denied = rl.checkAndRecord("user-a", t0);
+    expect(denied.allowed).toBe(false);
+    expect(denied.retryAfterSeconds).toBe(windowMs / 1000);
+    // Past the window, bucket drains.
+    expect(rl.checkAndRecord("user-a", new Date(t0.getTime() + windowMs + 1000)).allowed).toBe(
+      true,
+    );
+  });
+
+  test("two instances have independent bucket maps", () => {
+    const rlA = new RateLimiter(2, 60_000);
+    const rlB = new RateLimiter(2, 60_000);
+    const now = new Date("2026-05-22T12:00:00Z");
+    // Fill rlA's bucket for key "x".
+    expect(rlA.checkAndRecord("x", now).allowed).toBe(true);
+    expect(rlA.checkAndRecord("x", now).allowed).toBe(true);
+    expect(rlA.checkAndRecord("x", now).allowed).toBe(false);
+    // rlB's "x" key is untouched.
+    expect(rlB.checkAndRecord("x", now).allowed).toBe(true);
+    expect(rlB.checkAndRecord("x", now).allowed).toBe(true);
+  });
+
+  test("reset() clears just this instance's buckets", () => {
+    const rlA = new RateLimiter(1, 60_000);
+    const rlB = new RateLimiter(1, 60_000);
+    const now = new Date("2026-05-22T12:00:00Z");
+    rlA.checkAndRecord("x", now);
+    rlB.checkAndRecord("x", now);
+    expect(rlA.checkAndRecord("x", now).allowed).toBe(false);
+    expect(rlB.checkAndRecord("x", now).allowed).toBe(false);
+    rlA.reset();
+    // rlA's "x" is allowed again; rlB's "x" is still denied.
+    expect(rlA.checkAndRecord("x", now).allowed).toBe(true);
+    expect(rlB.checkAndRecord("x", now).allowed).toBe(false);
+  });
+});
+
+// hub#282 — the `changePasswordRateLimiter` singleton. Pin its
+// configured thresholds (3 attempts / 5 min) so a refactor that
+// accidentally widens them surfaces here.
+describe("changePasswordRateLimiter — tighter floor for /account/change-password", () => {
+  // Reset the singleton between tests so the assertions on which
+  // attempts succeed / fail aren't sensitive to prior-test leakage.
+  // The shared `__resetForTests` at the top of the file already covers
+  // this (it resets both singletons), but make the local intent
+  // explicit.
+  afterEach(() => {
+    changePasswordRateLimiter.reset();
+  });
+
+  test("admits CHANGE_PASSWORD_MAX_ATTEMPTS, then denies", () => {
+    const now = new Date("2026-05-22T12:00:00Z");
+    for (let i = 0; i < CHANGE_PASSWORD_MAX_ATTEMPTS; i++) {
+      expect(changePasswordRateLimiter.checkAndRecord("user-a", now).allowed).toBe(true);
+    }
+    const denied = changePasswordRateLimiter.checkAndRecord("user-a", now);
+    expect(denied.allowed).toBe(false);
+    // Same instant → reset is exactly one window away.
+    expect(denied.retryAfterSeconds).toBe(CHANGE_PASSWORD_WINDOW_MS / 1000);
+  });
+
+  test("keyed independently by user-id (one user's exhausted bucket doesn't affect another)", () => {
+    const now = new Date("2026-05-22T12:00:00Z");
+    for (let i = 0; i < CHANGE_PASSWORD_MAX_ATTEMPTS; i++) {
+      changePasswordRateLimiter.checkAndRecord("user-a", now);
+    }
+    expect(changePasswordRateLimiter.checkAndRecord("user-a", now).allowed).toBe(false);
+    expect(changePasswordRateLimiter.checkAndRecord("user-b", now).allowed).toBe(true);
+  });
+
+  test("CHANGE_PASSWORD limits are tighter than /login limits", () => {
+    // Sanity check that the constants stay in their intended relationship.
+    // If a future PR loosens change-password to match /login, this test
+    // surfaces the change and forces a design-doc update.
+    expect(CHANGE_PASSWORD_MAX_ATTEMPTS).toBeLessThan(MAX_ATTEMPTS);
+    expect(CHANGE_PASSWORD_WINDOW_MS).toBeLessThan(WINDOW_MS);
+  });
+
+  test("`__resetForTests` clears the change-password singleton too", () => {
+    const now = new Date("2026-05-22T12:00:00Z");
+    for (let i = 0; i < CHANGE_PASSWORD_MAX_ATTEMPTS; i++) {
+      changePasswordRateLimiter.checkAndRecord("user-a", now);
+    }
+    expect(changePasswordRateLimiter.checkAndRecord("user-a", now).allowed).toBe(false);
+    __resetForTests();
+    expect(changePasswordRateLimiter.checkAndRecord("user-a", now).allowed).toBe(true);
   });
 });

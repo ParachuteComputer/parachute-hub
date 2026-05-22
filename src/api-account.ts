@@ -50,6 +50,7 @@ import { hash as argonHash } from "@node-rs/argon2";
 import { type ChangePasswordMode, renderChangePassword } from "./account-change-password-ui.ts";
 import { renderAdminError } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
+import { changePasswordRateLimiter } from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { findActiveSession } from "./sessions.ts";
 import {
@@ -235,6 +236,34 @@ export async function handleAccountChangePasswordPost(
   const confirmPassword = String(form.get("new_password_confirm") ?? "");
   const next = safeNext(String(form.get("next") ?? ""));
   const mode = modeFor(user.passwordChanged);
+
+  // Rate-limit gate (hub#282). Fires *after* CSRF (so a junk cross-site
+  // POST doesn't burn a bucket slot for the victim's session) but *before*
+  // the argon2id verifyPassword call below. Keyed by user-id rather than
+  // IP because the endpoint is session-gated — identity is already
+  // established. Keying by user-id means an attacker rotating egress IPs
+  // against the same stolen cookie can't get fresh buckets per IP.
+  // Bucket: 3 attempts per 5 minutes (CHANGE_PASSWORD_*). Legitimate
+  // users typing their current password wrong 3 times in 5 minutes is
+  // already an outlier; a session-hijack attacker shouldn't get a 5-shot
+  // grind window against argon2id. Same 429 + Retry-After shape as
+  // /login (admin-handlers.ts), with the re-rendered form body so the
+  // signed-in user sees a coherent page rather than a bare error chrome.
+  const rlNow = deps.now ? deps.now() : new Date();
+  const gate = changePasswordRateLimiter.checkAndRecord(user.id, rlNow);
+  if (!gate.allowed) {
+    return htmlResponse(
+      renderChangePassword({
+        mode,
+        csrfToken,
+        username: user.username,
+        next,
+        errorMessage: `Too many password-change attempts. Try again in ${gate.retryAfterSeconds ?? 1} seconds.`,
+      }),
+      429,
+      { "retry-after": String(gate.retryAfterSeconds ?? 1) },
+    );
+  }
 
   // Required-field check before any expensive work.
   if (!currentPassword || !newPassword || !confirmPassword) {

@@ -1,48 +1,79 @@
 /**
- * Per-IP rate-limit on `POST /login`. Lands as a floor under brute-force
- * after hub#187 collapsed the public-reach matrix: with a cloudflare tunnel
- * up, `/login` is now reachable from the open internet, and 2FA (#186)
- * is the next PR rather than this one. A 5-attempts-per-15-minute bucket per
- * IP is the standard login-form floor; it's not the primary defense, just the
- * one that turns "infinite credential grinding" into "rotate IPs".
+ * Rate-limit primitives for hub auth-surface endpoints.
  *
- * (Endpoint was `/admin/login` pre-rename; bucket logic is path-agnostic so
- * the rename was a comment-only change here.)
+ * Two limiters today (one floor each — neither is the primary defense):
  *
- * Shape: sliding window. Each key keeps the last N attempt timestamps; on a
- * new attempt we prune anything older than the window, count what remains,
- * decide allow / deny, and (on allow) append the current timestamp. Sliding
- * gives an exact `Retry-After` (seconds until the *oldest* in-window
- * timestamp falls off) rather than the rough next-refill of a token bucket.
+ *   - `/login` (per-IP, hub#187 / hub#188): 5 attempts / 15 min.
+ *     Lands as a floor under brute-force after hub#187 collapsed the
+ *     public-reach matrix: with a cloudflare tunnel up, `/login` is now
+ *     reachable from the open internet, and 2FA (#186) is the next PR
+ *     rather than this one. A 5-attempts-per-15-minute bucket per IP is
+ *     the standard login-form floor; it's not the primary defense, just
+ *     the one that turns "infinite credential grinding" into "rotate IPs".
+ *     (Endpoint was `/admin/login` pre-rename; bucket logic is path-
+ *     agnostic so the rename was a comment-only change here.)
  *
- * Storage: process-local `Map`. Persistence isn't worth a SQLite write per
- * attempt — process restart is itself a defense (the attacker loses all
- * progress against any one bucket). Memory is bounded by an opportunistic
- * sweep of empty buckets every time we touch the map, so an attacker
- * cycling through IPs can't grow the map without also leaving timestamps in
- * each.
+ *   - `/account/change-password` (per-user, hub#282): 3 attempts / 5 min.
+ *     The endpoint is session-gated, so the threat model isn't open-
+ *     internet brute-force — it's a compromised session (stolen cookie)
+ *     hammering argon2id verifications against the current password
+ *     without bound. Keyed by user-id (not IP) because the session
+ *     already identifies the user — sharing across IPs is correct here
+ *     (an attacker rotating egress IPs against the same stolen cookie
+ *     shouldn't get five fresh buckets).
+ *
+ * Shape: sliding window. Each key keeps the last N attempt timestamps; on
+ * a new attempt we prune anything older than the window, count what
+ * remains, decide allow / deny, and (on allow) append the current
+ * timestamp. Sliding gives an exact `Retry-After` (seconds until the
+ * *oldest* in-window timestamp falls off) rather than the rough next-
+ * refill of a token bucket.
+ *
+ * Storage: process-local `Map` per limiter instance. Persistence isn't
+ * worth a SQLite write per attempt — process restart is itself a defense
+ * (the attacker loses all progress against any one bucket). Memory is
+ * bounded by an opportunistic prune of empty buckets every time we touch
+ * the map, so an attacker cycling through keys can't grow the map
+ * without also leaving timestamps in each.
  *
  * Auth-stage independence: callers MUST gate via `checkAndRecord` *before*
- * the credential check. A 2FA (or password) failure should count toward the
- * same bucket as a wrong password — an attacker who knows the password
- * shouldn't get unlimited grinding against backup codes.
+ * the credential check. A 2FA (or password) failure should count toward
+ * the same bucket as a wrong password — an attacker who knows the
+ * password shouldn't get unlimited grinding against backup codes.
  *
- * Layer-independent: the limiter applies on every layer (loopback included).
- * A buggy script hammering loopback gets 429'd just like a public attacker.
- * The one wrinkle is `tailscale serve` proxying from `127.0.0.1`, so all
- * tailnet logins share the loopback bucket — acceptable because tailnet is
- * authed at the network layer and brute-force isn't the threat model there.
+ * Layer-independent: the limiter applies on every layer (loopback
+ * included). A buggy script hammering loopback gets 429'd just like a
+ * public attacker. The one wrinkle is `tailscale serve` proxying from
+ * `127.0.0.1`, so all tailnet logins share the loopback bucket —
+ * acceptable because tailnet is authed at the network layer and brute-
+ * force isn't the threat model there.
  *
  * Testable: inject the clock via `now` so the tests can advance time
- * deterministically without `setTimeout`. Module-level state is exported via
- * `__resetForTests` so the test file can reset between cases without
+ * deterministically without `setTimeout`. Per-limiter state is reset via
+ * `RateLimiter.reset()` so the test file can clear between cases without
  * recreating the module.
  */
 
-/** Window length: 15 minutes. */
+/** `/login` window length: 15 minutes. */
 export const WINDOW_MS = 15 * 60 * 1000;
-/** Attempts allowed per window. 6th attempt within the window is denied. */
+/** `/login` attempts allowed per window. 6th attempt within the window is denied. */
 export const MAX_ATTEMPTS = 5;
+/**
+ * `/account/change-password` window length: 5 minutes. Tighter than
+ * `/login`'s 15-minute floor because the endpoint is session-gated —
+ * the threat model is a compromised session hammering argon2id, which
+ * a smaller window with a smaller cap chokes off without inconveniencing
+ * a legitimate user who fat-fingered their current password.
+ */
+export const CHANGE_PASSWORD_WINDOW_MS = 5 * 60 * 1000;
+/**
+ * `/account/change-password` attempts allowed per window. 4th attempt
+ * within the window is denied. Tighter than `/login`'s 5 because the
+ * legitimate-user path here is "I'm rotating my password" — typing the
+ * current password wrong 3 times is already an outlier, and a stolen-
+ * cookie attacker shouldn't get a 5-shot grind window.
+ */
+export const CHANGE_PASSWORD_MAX_ATTEMPTS = 3;
 /** Sentinel for the IP-extraction priority chain when nothing parsed. */
 export const UNKNOWN_IP_SENTINEL = "unknown";
 
@@ -54,71 +85,129 @@ export interface RateLimitResult {
    * Only set when `allowed` is false. Always >= 1: the deny branch only
    * fires when the oldest in-window timestamp is strictly inside the
    * window, so `Math.ceil(positiveMs / 1000) >= 1` naturally. The
-   * `Math.max(1, ...)` clamp inside `checkAndRecord` is a defense-in-depth
-   * floor in case the filter logic is ever loosened.
+   * `Math.max(1, ...)` clamp inside `RateLimiter.checkAndRecord` is a
+   * defense-in-depth floor in case the filter logic is ever loosened.
    */
   retryAfterSeconds?: number;
 }
 
 /**
- * Module-level state. `Map<key, attemptsTimestampsMs[]>`. Each array holds
- * raw `Date.now()`-style millisecond timestamps for in-window attempts.
- */
-const buckets: Map<string, number[]> = new Map();
-
-/**
- * Record an attempt and return whether it's admitted. `key` is typically a
- * client IP from `clientIpFromRequest`. `now` is injected for testability;
- * production callers pass `new Date()`.
+ * A configurable sliding-window rate limiter. Each instance owns its own
+ * bucket map — limiters with different capacities (`/login` vs
+ * `/account/change-password`) don't share state.
  *
- * Behavior:
- *   - Prune timestamps older than `now - WINDOW_MS`.
- *   - If remaining count >= MAX_ATTEMPTS, deny with `retryAfterSeconds`
- *     pointing at the oldest in-window timestamp's age-out moment. The
- *     denied attempt is NOT recorded — we don't want a flood of denials
- *     pushing the reset further into the future. The window stays anchored
- *     to the actual 5 admitted attempts.
- *   - Otherwise admit, append the current timestamp, return allowed.
+ * Shape mirrors the original module-level `checkAndRecord` exactly; this
+ * class is the same algorithm, parameterized, so the test suite from
+ * hub#188 still applies to the `/login` limiter unchanged.
  */
-export function checkAndRecord(key: string, now: Date): RateLimitResult {
-  const cutoff = now.getTime() - WINDOW_MS;
-  const existing = buckets.get(key) ?? [];
-  // Drop anything that fell out of the window. Mutating a copy keeps the
-  // semantics clear: `pruned` is always the in-window slice.
-  const pruned = existing.filter((t) => t > cutoff);
+export class RateLimiter {
+  /**
+   * Module-level state. `Map<key, attemptsTimestampsMs[]>`. Each array holds
+   * raw `Date.now()`-style millisecond timestamps for in-window attempts.
+   */
+  private readonly buckets: Map<string, number[]> = new Map();
 
-  if (pruned.length >= MAX_ATTEMPTS) {
-    // Reset moment = oldest in-window attempt + WINDOW_MS. `pruned[0]` is
-    // the oldest because timestamps are appended in order. Subtract `now`
-    // for seconds-until-reset. The unclamped value is provably >= 1 in this
-    // branch (see below), but `Math.max(1, ...)` stays as a defense-in-depth
-    // floor so Retry-After never reads 0 if the filter logic is ever
-    // loosened. Reasoning: the deny branch requires `pruned.length >=
-    // MAX_ATTEMPTS`, which implies every entry survived the `t > cutoff`
-    // filter, i.e. `pruned[0] > now - WINDOW_MS` strictly, i.e. `resetAtMs -
-    // now > 0` strictly, i.e. `Math.ceil(positive / 1000) >= 1`.
-    const resetAtMs = (pruned[0] ?? now.getTime()) + WINDOW_MS;
-    const retryAfterSeconds = Math.max(1, Math.ceil((resetAtMs - now.getTime()) / 1000));
-    // Denied attempt: the bucket is still full (>= MAX_ATTEMPTS in-window
-    // entries), so unconditionally re-store the pruned slice. Persisting the
-    // prune keeps stale entries from leaking forward past their window. We
-    // do NOT delete here — that branch is structurally unreachable in deny
-    // because deny requires a non-empty `pruned`.
-    buckets.set(key, pruned);
-    return { allowed: false, retryAfterSeconds };
+  constructor(
+    /** Attempts allowed within the window. */
+    private readonly maxAttempts: number,
+    /** Window length, in milliseconds. */
+    private readonly windowMs: number,
+  ) {}
+
+  /**
+   * Record an attempt and return whether it's admitted. `key` is whatever
+   * identifies the actor for this limiter (client IP for `/login`,
+   * user-id for `/account/change-password`). `now` is injected for
+   * testability; production callers pass `new Date()`.
+   *
+   * Behavior:
+   *   - Prune timestamps older than `now - windowMs`.
+   *   - If remaining count >= maxAttempts, deny with `retryAfterSeconds`
+   *     pointing at the oldest in-window timestamp's age-out moment. The
+   *     denied attempt is NOT recorded — we don't want a flood of denials
+   *     pushing the reset further into the future. The window stays
+   *     anchored to the actual N admitted attempts.
+   *   - Otherwise admit, append the current timestamp, return allowed.
+   */
+  checkAndRecord(key: string, now: Date): RateLimitResult {
+    const cutoff = now.getTime() - this.windowMs;
+    const existing = this.buckets.get(key) ?? [];
+    // Drop anything that fell out of the window. Mutating a copy keeps the
+    // semantics clear: `pruned` is always the in-window slice.
+    const pruned = existing.filter((t) => t > cutoff);
+
+    if (pruned.length >= this.maxAttempts) {
+      // Reset moment = oldest in-window attempt + windowMs. `pruned[0]` is
+      // the oldest because timestamps are appended in order. Subtract `now`
+      // for seconds-until-reset. The unclamped value is provably >= 1 in
+      // this branch (see below), but `Math.max(1, ...)` stays as a
+      // defense-in-depth floor so Retry-After never reads 0 if the filter
+      // logic is ever loosened. Reasoning: the deny branch requires
+      // `pruned.length >= maxAttempts`, which implies every entry survived
+      // the `t > cutoff` filter, i.e. `pruned[0] > now - windowMs`
+      // strictly, i.e. `resetAtMs - now > 0` strictly, i.e.
+      // `Math.ceil(positive / 1000) >= 1`.
+      const resetAtMs = (pruned[0] ?? now.getTime()) + this.windowMs;
+      const retryAfterSeconds = Math.max(1, Math.ceil((resetAtMs - now.getTime()) / 1000));
+      // Denied attempt: the bucket is still full (>= maxAttempts in-window
+      // entries), so unconditionally re-store the pruned slice. Persisting
+      // the prune keeps stale entries from leaking forward past their
+      // window. We do NOT delete here — that branch is structurally
+      // unreachable in deny because deny requires a non-empty `pruned`.
+      this.buckets.set(key, pruned);
+      return { allowed: false, retryAfterSeconds };
+    }
+
+    pruned.push(now.getTime());
+    this.buckets.set(key, pruned);
+    return { allowed: true };
   }
 
-  pruned.push(now.getTime());
-  buckets.set(key, pruned);
-  return { allowed: true };
+  /**
+   * Test-only escape hatch. Production code never calls this; the test
+   * files use it between cases so per-limiter state doesn't leak across
+   * tests.
+   */
+  reset(): void {
+    this.buckets.clear();
+  }
 }
 
 /**
- * Test-only escape hatch. Production code never calls this; the test file
- * uses it between cases so module-level state doesn't leak across tests.
+ * `/login` rate limiter — per-IP, 5 attempts / 15 min. Exported as a
+ * singleton so all callers share one bucket map (rotating IPs across the
+ * test suite or across a real attack must hit the same backing store).
+ */
+export const loginRateLimiter = new RateLimiter(MAX_ATTEMPTS, WINDOW_MS);
+
+/**
+ * `/account/change-password` rate limiter — per-user, 3 attempts / 5 min.
+ * Keyed by user-id (session-gated endpoint, so identity is established
+ * before this limiter is reached).
+ */
+export const changePasswordRateLimiter = new RateLimiter(
+  CHANGE_PASSWORD_MAX_ATTEMPTS,
+  CHANGE_PASSWORD_WINDOW_MS,
+);
+
+/**
+ * Backwards-compat shim for hub#188's call sites: the original
+ * top-level `checkAndRecord` was the login limiter. New code should
+ * reach into `loginRateLimiter.checkAndRecord` directly.
+ */
+export function checkAndRecord(key: string, now: Date): RateLimitResult {
+  return loginRateLimiter.checkAndRecord(key, now);
+}
+
+/**
+ * Backwards-compat shim for hub#188's tests: the original
+ * `__resetForTests` cleared the (only) bucket map. We now have two
+ * limiters; reset both so any test that called this still gets the
+ * fully-clean state it expected.
  */
 export function __resetForTests(): void {
-  buckets.clear();
+  loginRateLimiter.reset();
+  changePasswordRateLimiter.reset();
 }
 
 /**
