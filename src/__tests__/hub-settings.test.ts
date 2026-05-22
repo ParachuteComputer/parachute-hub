@@ -23,10 +23,12 @@ import {
   getSetting,
   isFirstClientAutoApproveWindowOpen,
   isModuleInstallChannel,
+  isNotesRedirectDisabled,
   isSetupExposeMode,
   openFirstClientAutoApproveWindow,
   setHubOrigin,
   setModuleInstallChannel,
+  setNotesRedirectDisabled,
   setSetting,
 } from "../hub-settings.ts";
 
@@ -466,6 +468,69 @@ describe("hub-settings — hub_origin (hub#298)", () => {
       } else {
         process.env.PARACHUTE_HUB_ORIGIN = prior;
       }
+    }
+  });
+});
+
+describe("hub-settings — notes_redirect_disabled (parachute-app §16)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hub-settings-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("isNotesRedirectDisabled defaults to false when no row is present", () => {
+    // Migration-default direction: absent row = redirect on.
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      expect(isNotesRedirectDisabled(db)).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("setNotesRedirectDisabled(true) flips the flag to true", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setNotesRedirectDisabled(db, true);
+      expect(isNotesRedirectDisabled(db)).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("setNotesRedirectDisabled(false) clears the row → reads as false again", () => {
+    // Passing false clears the row rather than writing "false" — the
+    // absent-row state is the canonical redirect-on default.
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setNotesRedirectDisabled(db, true);
+      setNotesRedirectDisabled(db, false);
+      expect(isNotesRedirectDisabled(db)).toBe(false);
+      // The underlying row is actually gone, not stamped with "false".
+      expect(getSetting(db, "notes_redirect_disabled")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("any non-'true' value parses as redirect-on (corruption-resistant)", () => {
+    // The KV table is TEXT-typed, so a manual sqlite edit or a future
+    // schema drift could land an unexpected value. Read-side strictness
+    // means we only opt-out on the literal "true" — the migration-default
+    // direction is sticky.
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setSetting(db, "notes_redirect_disabled", "yes");
+      expect(isNotesRedirectDisabled(db)).toBe(false);
+      setSetting(db, "notes_redirect_disabled", "1");
+      expect(isNotesRedirectDisabled(db)).toBe(false);
+      setSetting(db, "notes_redirect_disabled", "false");
+      expect(isNotesRedirectDisabled(db)).toBe(false);
+      setSetting(db, "notes_redirect_disabled", "TRUE");
+      expect(isNotesRedirectDisabled(db)).toBe(false);
+    } finally {
+      db.close();
     }
   });
 });

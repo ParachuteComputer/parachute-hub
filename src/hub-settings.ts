@@ -66,7 +66,19 @@ export type HubSettingKey =
   // Operators must accept that flipping the canonical hub URL
   // invalidates any tokens already in circulation (issuer mismatch on
   // verification) — surfaced in the admin SPA's helper copy.
-  | "hub_origin";
+  | "hub_origin"
+  // Notes-as-app migration Phase 2 (parachute-app design doc §16).
+  // When unset (default) or "false", hub serves a 301 redirect from
+  // `/notes/*` → `/app/notes/*` so existing bookmarks transparently
+  // follow the operator to the apps-hosted Notes. When "true", the
+  // redirect is skipped and `/notes/*` falls through to the existing
+  // services.json-driven proxy — the escape hatch for operators
+  // running notes-as-a-module only (no parachute-app installed yet)
+  // who want the legacy daemon to keep serving its old mount during
+  // the deprecation window. Stored as the literal string "true" /
+  // "false"; any other value parses as "redirect on" (the migration
+  // default — operators must opt out, not opt in).
+  | "notes_redirect_disabled";
 
 export type SetupExposeMode = "localhost" | "tailnet" | "public";
 
@@ -308,4 +320,41 @@ export function setHubOrigin(db: Database, value: string | null): void {
     return;
   }
   setSetting(db, "hub_origin", value);
+}
+
+// --- domain helpers: notes-as-app redirect (parachute-app §16 Phase 2) ----
+
+/**
+ * Read whether the `/notes/*` → `/app/notes/*` redirect is disabled. Default
+ * is `false` (redirect on) — Phase 2 migrates operators to apps-hosted
+ * Notes, so the bookmark-friendly path is the default-on behavior. Only an
+ * operator running notes-as-a-module without parachute-app installed should
+ * flip this to `true`.
+ *
+ * Returns `true` only when the stored value is the literal string "true".
+ * Any other value (missing row, "false", typo, empty string) means
+ * redirect-enabled — the migration-default direction.
+ */
+export function isNotesRedirectDisabled(db: Database): boolean {
+  return getSetting(db, "notes_redirect_disabled") === "true";
+}
+
+/**
+ * Write the notes-redirect opt-out flag. The string form ("true"/"false")
+ * mirrors how other boolean-ish settings would land if we add them — the
+ * KV table is TEXT-typed, and centralizing the encoding here keeps any
+ * future caller from accidentally storing "1" / "0" / "on" / etc.
+ *
+ * Passing `false` deletes the row rather than writing the string "false"
+ * — the absent-row state is the canonical "redirect on" default, and
+ * leaving an explicit "false" in the row would be a footgun if a future
+ * default flip ever made absence mean something different. (Mirrors the
+ * `setHubOrigin(null)` semantics.)
+ */
+export function setNotesRedirectDisabled(db: Database, value: boolean): void {
+  if (value) {
+    setSetting(db, "notes_redirect_disabled", "true");
+  } else {
+    deleteSetting(db, "notes_redirect_disabled");
+  }
 }
