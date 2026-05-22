@@ -78,6 +78,10 @@ describe("scopeIsAdmin", () => {
     expect(scopeIsAdmin("channel:send")).toBe(false);
     expect(scopeIsAdmin("unknown:anything")).toBe(false);
   });
+
+  test("scopeIsAdmin('runner:admin') returns false — module-declared admin scopes don't participate (deliberate; see scope-explanations.ts comment)", () => {
+    expect(scopeIsAdmin("runner:admin")).toBe(false);
+  });
 });
 
 describe("NON_REQUESTABLE_SCOPES (#96)", () => {

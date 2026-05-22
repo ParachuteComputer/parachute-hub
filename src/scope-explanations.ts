@@ -188,6 +188,17 @@ export function explainScope(scope: string): ScopeExplanation | null {
   return null;
 }
 
+/**
+ * Module-declared scopes (e.g. `runner:admin`) don't participate in
+ * `scopeIsAdmin` because `SCOPE_EXPLANATIONS` only covers core scopes —
+ * `explainScope` returns null for them, so `scopeIsAdmin` returns false.
+ * This is deliberate for now: module-declared admin scopes aren't
+ * requestable via the public OAuth flow (they're host-admin-minted only).
+ * If module-declared admin scopes ever become public-requestable, this
+ * function needs to consult the live module-scope registry too — otherwise
+ * a `runner:admin` (or similar) grant would silently bypass the admin-
+ * scope guardrails. See the regression test pinning this gap.
+ */
 export function scopeIsAdmin(scope: string): boolean {
   return explainScope(scope)?.level === "admin";
 }

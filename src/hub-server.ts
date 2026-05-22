@@ -161,6 +161,7 @@ import { buildHubBoundOrigins } from "./origin-check.ts";
 import { clearPid, writePid } from "./process-state.ts";
 import {
   FIRST_PARTY_FALLBACKS,
+  KNOWN_MODULES,
   effectivePublicExposure,
   shortNameForManifest,
 } from "./service-spec.ts";
@@ -566,8 +567,12 @@ async function proxyToService(req: Request, manifestPath: string): Promise<Respo
  * wins; otherwise consult `FIRST_PARTY_FALLBACKS` keyed by short name (for
  * notes / channel — vault/scribe/runner retired their FALLBACK entries in
  * hub#310 and self-register with the canonical `stripPrefix` declaration on
- * their services.json row). Defaults to `false` — keep the prefix — matching
- * the pre-#196 dispatch behavior for unknown / third-party services.
+ * their services.json row). `KNOWN_MODULES[short]?.canonicalStripPrefix`
+ * is the next fallback — covers the edge case where a self-registering
+ * module wrote its row before the `stripPrefix` field was being emitted
+ * (e.g. pre-scribe#50 services.json rows). Defaults to `false` — keep the
+ * prefix — matching the pre-#196 dispatch behavior for unknown / third-
+ * party services.
  *
  * For a self-registering KNOWN_MODULES short whose row is missing entirely
  * (uninstalled, never booted), the request never reaches this code path —
@@ -579,7 +584,8 @@ function stripPrefixFor(entry: ServiceEntry): boolean {
   if (entry.stripPrefix !== undefined) return entry.stripPrefix;
   const short = shortNameForManifest(entry.name);
   const fb = short !== undefined ? FIRST_PARTY_FALLBACKS[short] : undefined;
-  return fb?.manifest.stripPrefix ?? false;
+  const km = short !== undefined ? KNOWN_MODULES[short] : undefined;
+  return fb?.manifest.stripPrefix ?? km?.canonicalStripPrefix ?? false;
 }
 
 export interface HubFetchDeps {

@@ -2313,6 +2313,47 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
     }
   });
 
+  test("scribe row missing stripPrefix field falls back to KNOWN_MODULES.canonicalStripPrefix (#310 reviewer)", async () => {
+    // After hub#310 retired SCRIBE_FALLBACK, the only fallback for a
+    // legacy services.json row that pre-dates scribe#50 (scribe 0.4.4-rc.4)
+    // is `KNOWN_MODULES.scribe.canonicalStripPrefix: true`. Without that
+    // second-level fallback, `stripPrefixFor` would default to `false` and
+    // scribe paths would route incorrectly — `/scribe/health` would 404
+    // because hub would forward the mount-prefixed path to scribe (which
+    // serves bare paths). This pins the safety net for the
+    // operator-on-old-scribe-row edge case.
+    const h = makeHarness();
+    const upstream = startUpstream("scribe");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.4.0",
+              // stripPrefix intentionally omitted — pre-scribe#50 shape.
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string; pathname: string };
+      expect(body.tag).toBe("scribe");
+      // The KNOWN_MODULES.scribe.canonicalStripPrefix fallback strips the
+      // mount — backend sees the bare `/health` route.
+      expect(body.pathname).toBe("/health");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
   test("explicit stripPrefix:false on entry overrides FIRST_PARTY_FALLBACKS (#196)", async () => {
     // Explicit-on-entry must win, even when the fallback would default to
     // stripping. Documents the precedence ordering: explicit > fallback >
