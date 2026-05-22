@@ -2,6 +2,24 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.9] - 2026-05-22
+
+**feat(hub): `/notes/*` → `/app/notes/*` redirect (Phase 2 of Notes migration arc).**
+
+Phase 2 of the Notes-as-app migration (parachute-app design doc §16). The notes-daemon retires over four phases; this PR adds the hub-side redirect window so operators with existing `/notes/*` bookmarks transparently land on the apps-hosted Notes (`parachute-app add @openparachute/notes-ui --name notes --path /app/notes`). Phase 3 (parachute-notes v0.5) retires the redirect entirely once the legacy daemon is fully decommissioned.
+
+**What landed.**
+
+- **`/notes`, `/notes/`, `/notes/*` → 301 → `/app/notes[/...]`.** Method-agnostic, matches the shape of the existing back-compat 301s in hub-server's dispatch. Query string is preserved verbatim. The new redirect block sits between the legacy `/admin/login`-style 301s and the CORS preflight handler — it fires before the generic services.json proxy (which is where `/notes/*` would otherwise route to notes-daemon).
+- **`hub_settings.notes_redirect_disabled` opt-out flag.** Default `false` (redirect on); set to `true` to skip the redirect and fall through to the legacy services.json proxy. The escape hatch covers the deprecation-window case where an operator runs notes-as-module without parachute-app installed yet — without the opt-out they'd hit redirect → 404. Stored as `"true"` / absent-row in the bare KV `hub_settings` table; `setNotesRedirectDisabled(false)` clears the row rather than writing `"false"` so the canonical "redirect on" default is an absent-row state. New helpers: `isNotesRedirectDisabled`, `setNotesRedirectDisabled`.
+- **Throttled migration log.** `[notes-migration] redirect /notes/foo → /app/notes/foo` fires on each hit, throttled per-path to one line per 60 seconds — operators see migration activity without flooding stdout if a misconfigured PWA loops.
+- **Boundary check on the match predicate.** `/notes`, `/notes/`, `/notes/*` match; `/notesy`, `/notes-archive`, `/vault/default/notes` do NOT (the prefix-with-no-boundary case that would otherwise capture unrelated paths).
+- **Lazy DB read.** The dispatch only consults `getDb` when the path actually matches a legacy notes prefix — every non-notes request still skips the DB entirely (the `/health` route + several CORS preflight tests assert this).
+
+**Tests.** `bun run typecheck` clean. `bun test ./src` 1836 pass (was 1805; +31 — 5 in hub-server's redirect-routing block, 22 in the new notes-redirect helper suite, 4 in hub-settings for the new flag). `cd web/ui && bun run test` 188 pass (unchanged — SPA not touched). `bunx biome check src/` clean.
+
+**Cross-references.** parachute-app design doc §16 names the four-phase Notes migration; this PR lands Phase 2. The opt-out flag retires when Phase 3 ships (parachute-notes v0.5 fully retires the module form + the redirect goes away).
+
 ## [0.5.13-rc.8] - 2026-05-22
 
 **feat(hub): ServiceEntry hierarchical `uis` schema extension (#313) — parachute-app sub-unit discovery.**

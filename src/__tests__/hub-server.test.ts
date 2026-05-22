@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { HUB_SVC, hubPortPath } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { findServiceUpstream, findVaultUpstream, hubFetch, layerOf } from "../hub-server.ts";
+import { setNotesRedirectDisabled } from "../hub-settings.ts";
+import { clearNotesRedirectLogState } from "../notes-redirect.ts";
 import { pidPath } from "../process-state.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
@@ -858,6 +860,92 @@ describe("hubFetch routing", () => {
       const res = await hubFetch(h.dir)(req("/admin/logout"));
       expect(res.status).toBe(301);
       expect(res.headers.get("location")).toBe("/logout");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // Notes-as-app migration Phase 2 (parachute-app design doc §16).
+  // `/notes/*` 301-redirects to `/app/notes/*` so legacy bookmarks land
+  // on the apps-hosted Notes. Tested with no DB (the migration-default
+  // path — absent DB or absent row means redirect-on).
+  test("301: /notes/ → /app/notes/", async () => {
+    clearNotesRedirectLogState();
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/notes/"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/app/notes/");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("301: bare /notes → /app/notes", async () => {
+    // The bare-prefix form (no trailing slash) is the path browsers land
+    // on when an operator types `https://hub.example/notes` directly.
+    clearNotesRedirectLogState();
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/notes"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/app/notes");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("301: /notes/some/path?q=1 preserves query string", async () => {
+    clearNotesRedirectLogState();
+    const h = makeHarness();
+    try {
+      const res = await hubFetch(h.dir)(req("/notes/some/path?q=1&n=2"));
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/app/notes/some/path?q=1&n=2");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("301: /notes/* does NOT redirect when notes_redirect_disabled = true", async () => {
+    // Opt-out flag — the legacy operator running notes-as-module without
+    // parachute-app installed sets this so the dispatch falls through to
+    // the generic services.json proxy. Without an upstream registered
+    // here we expect a 404 (the proxy can't find a /notes route), which
+    // is exactly the pre-redirect behavior — proving the opt-out wires
+    // the dispatch back to the same shape it had before this PR.
+    clearNotesRedirectLogState();
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        setNotesRedirectDisabled(db, true);
+        const res = await hubFetch(h.dir, {
+          manifestPath: h.manifestPath,
+          getDb: () => db,
+        })(req("/notes/sw.js"));
+        expect(res.status).toBe(404);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/notesy (unrelated prefix) does NOT match the notes redirect", async () => {
+    // Boundary check — `/notes` matches `/notes`, `/notes/`, and
+    // `/notes/<rest>`, but a path that merely starts with the same five
+    // letters (`/notesy`, `/notes-archive`) is unrelated and falls
+    // through to the normal dispatch (which 404s here, no service
+    // registered).
+    clearNotesRedirectLogState();
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(req("/notesy"));
+      expect(res.status).toBe(404);
     } finally {
       h.cleanup();
     }
@@ -1805,10 +1893,15 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
     }
   });
 
-  test("routes /notes/sw.js to the matching upstream", async () => {
+  test("routes /notes/sw.js to the matching upstream (notes-redirect opt-out)", async () => {
     // Notes is the canonical path-mount case — the PWA shell has to see the
     // full `/notes/...` path so its service worker registers correctly (the
     // motivator for the `--mount` strip in notes-serve.ts).
+    //
+    // Post-parachute-app §16 Phase 2 the `/notes/*` path 301-redirects to
+    // `/app/notes/*` by default. This test pins the notes-as-module legacy
+    // path (notes-daemon still serving its own mount); set the opt-out
+    // flag so the dispatch falls through to the generic proxy.
     const h = makeHarness();
     const upstream = startUpstream("notes");
     try {
@@ -1826,12 +1919,21 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
         },
         h.manifestPath,
       );
-      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/notes/sw.js"));
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { tag: string; pathname: string };
-      expect(body.tag).toBe("notes");
-      expect(body.pathname).toBe("/notes/sw.js");
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        setNotesRedirectDisabled(db, true);
+        const fetcher = hubFetch(h.dir, {
+          manifestPath: h.manifestPath,
+          getDb: () => db,
+        });
+        const res = await fetcher(req("/notes/sw.js"));
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { tag: string; pathname: string };
+        expect(body.tag).toBe("notes");
+        expect(body.pathname).toBe("/notes/sw.js");
+      } finally {
+        db.close();
+      }
     } finally {
       upstream.stop();
       h.cleanup();
@@ -2002,6 +2104,10 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
     // forward the full path. The /notes/sw.js test above already exercises
     // this in the happy case; this test makes the absence-of-flag → keep-
     // prefix contract explicit.
+    //
+    // Notes-as-module legacy: the notes-redirect opt-out is set so the
+    // /notes/* request reaches proxyToService instead of 301-redirecting
+    // (parachute-app §16 Phase 2).
     const h = makeHarness();
     const upstream = startUpstream("notes");
     try {
@@ -2020,11 +2126,20 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
         },
         h.manifestPath,
       );
-      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/notes/health"));
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { pathname: string };
-      expect(body.pathname).toBe("/notes/health");
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        setNotesRedirectDisabled(db, true);
+        const fetcher = hubFetch(h.dir, {
+          manifestPath: h.manifestPath,
+          getDb: () => db,
+        });
+        const res = await fetcher(req("/notes/health"));
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { pathname: string };
+        expect(body.pathname).toBe("/notes/health");
+      } finally {
+        db.close();
+      }
     } finally {
       upstream.stop();
       h.cleanup();
@@ -2037,6 +2152,9 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
     // keep-prefix behavior as omitting the field. Confirms validator round-
     // tripping doesn't lose the explicit-false (separate from the absent
     // case which is checked above).
+    //
+    // Notes-as-module legacy: opt-out flag set so /notes/* reaches the
+    // proxy instead of 301-redirecting (parachute-app §16 Phase 2).
     const h = makeHarness();
     const upstream = startUpstream("notes");
     try {
@@ -2055,11 +2173,20 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
         },
         h.manifestPath,
       );
-      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/notes/sw.js"));
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { pathname: string };
-      expect(body.pathname).toBe("/notes/sw.js");
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        setNotesRedirectDisabled(db, true);
+        const fetcher = hubFetch(h.dir, {
+          manifestPath: h.manifestPath,
+          getDb: () => db,
+        });
+        const res = await fetcher(req("/notes/sw.js"));
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { pathname: string };
+        expect(body.pathname).toBe("/notes/sw.js");
+      } finally {
+        db.close();
+      }
     } finally {
       upstream.stop();
       h.cleanup();
@@ -2234,6 +2361,9 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
     // because `pathname.startsWith("/notes//")` is always false. Hub
     // returned 404 for `/notes/assets/*.js` even though the SPA shell
     // loaded fine, breaking the page silently.
+    //
+    // Notes-as-module legacy: opt-out flag set so /notes/* reaches the
+    // proxy instead of 301-redirecting (parachute-app §16 Phase 2).
     const h = makeHarness();
     const upstream = startUpstream("notes");
     try {
@@ -2251,14 +2381,23 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
         },
         h.manifestPath,
       );
-      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/notes/assets/index-XXX.js"));
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { tag: string; pathname: string };
-      expect(body.tag).toBe("notes");
-      // Path is forwarded verbatim — no stripPrefix on the notes entry, so
-      // backend sees the full mount-prefixed path.
-      expect(body.pathname).toBe("/notes/assets/index-XXX.js");
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        setNotesRedirectDisabled(db, true);
+        const fetcher = hubFetch(h.dir, {
+          manifestPath: h.manifestPath,
+          getDb: () => db,
+        });
+        const res = await fetcher(req("/notes/assets/index-XXX.js"));
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { tag: string; pathname: string };
+        expect(body.tag).toBe("notes");
+        // Path is forwarded verbatim — no stripPrefix on the notes entry,
+        // so backend sees the full mount-prefixed path.
+        expect(body.pathname).toBe("/notes/assets/index-XXX.js");
+      } finally {
+        db.close();
+      }
     } finally {
       upstream.stop();
       h.cleanup();
