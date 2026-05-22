@@ -563,6 +563,30 @@ export async function approveOauthClient(clientId: string): Promise<ApproveClien
 }
 
 /**
+ * Status of a hosted UI sub-unit, mirrors `UiSubUnitStatus` server-side.
+ * Absent (null) → discovery treats as "active".
+ */
+export type UiSubUnitStatus = "active" | "pending-oauth" | "disabled";
+
+/**
+ * One sub-unit beneath a module — surfaced on `ModuleListing.uis` when the
+ * underlying services.json row declares a `uis` map. Snake-case to mirror
+ * the wire shape from `src/api-modules.ts:UiSubUnitWireShape`. See
+ * parachute-app design doc §12 for the canonical use case (per-UI rows
+ * under the App module).
+ */
+export interface ModuleUiSubUnit {
+  name: string;
+  display_name: string;
+  path: string;
+  tagline: string | null;
+  icon_url: string | null;
+  version: string | null;
+  oauth_client_id: string | null;
+  status: UiSubUnitStatus | null;
+}
+
+/**
  * One row from `GET /api/modules`. Mirrors the snake_case wire shape
  * from `src/api-modules.ts`.
  */
@@ -578,6 +602,12 @@ export interface ModuleListing {
   supervisor_status: "starting" | "running" | "stopped" | "crashed" | "restarting" | null;
   pid: number | null;
   install_dir: string | null;
+  /**
+   * Hierarchical sub-units (hub#313). Empty when the row doesn't declare
+   * `uis` — most modules today. parachute-app's App module is the first
+   * consumer; the SPA renders each entry as an expandable sub-row.
+   */
+  uis: ModuleUiSubUnit[];
 }
 
 /** Module install channel — `latest` (stable) or `rc` (release candidates). */

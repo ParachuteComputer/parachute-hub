@@ -32,6 +32,7 @@ import {
   type ModuleInstallChannel,
   type ModuleListing,
   type ModuleOperation,
+  type ModuleUiSubUnit,
   type ModulesCatalog,
   getModuleOperation,
   installModule,
@@ -447,6 +448,16 @@ function ModuleRow({
         )}
       </dl>
 
+      {/*
+        Hierarchical sub-units (hub#313). Rendered only when the module's
+        services.json row declares a non-empty `uis` map — most modules
+        today have none and this block is omitted entirely. parachute-app
+        is the first consumer: the App module surfaces each hosted UI
+        (Gitcoin Brain, Unforced Brain, ...) as its own discoverable
+        sub-row. See parachute-app design doc §12.
+      */}
+      {mod.uis.length > 0 && <UiSubUnitsList uis={mod.uis} />}
+
       <div className="actions">
         {/* Configure link routes to the generic per-module config form
             (hub#260). Rendered as a Link rather than a button because
@@ -533,6 +544,63 @@ function statusLabel(mod: ModuleListing): string {
   if (!mod.installed) return "not installed";
   if (!mod.supervisor_status) return "not supervised";
   return mod.supervisor_status;
+}
+
+interface UiSubUnitsListProps {
+  uis: ModuleUiSubUnit[];
+}
+
+/**
+ * Hierarchical sub-units rendered under a module row (hub#313). The shape
+ * mirrors parachute-app's per-UI registry: each entry surfaces an icon,
+ * display name, mount path, and lifecycle status. Status badges follow
+ * the same `status-<state>` class convention `ModuleRow` uses for the
+ * supervisor badge, so the SPA's existing palette covers active /
+ * pending-oauth / disabled without new tokens.
+ *
+ * `path` is rendered as a same-origin anchor so an operator clicking
+ * "Gitcoin Brain" lands on `/app/gitcoin-brain` — not a SPA link
+ * (`Link to`) because the sub-unit lives outside the SPA's mount basename
+ * and we want the browser to hard-navigate. Aaron's call: keep the SPA
+ * itself narrow, let the underlying module own its own UI shell.
+ */
+function UiSubUnitsList({ uis }: UiSubUnitsListProps) {
+  return (
+    <details className="module-uis" data-testid="module-uis" open>
+      <summary>
+        Hosted UIs <span className="muted">({uis.length})</span>
+      </summary>
+      <ul className="ui-sub-units">
+        {uis.map((u) => {
+          const status = u.status ?? "active";
+          return (
+            <li key={u.name} className="ui-sub-unit" data-name={u.name}>
+              {u.icon_url && (
+                <img
+                  src={u.icon_url}
+                  alt=""
+                  className="ui-icon"
+                  width={20}
+                  height={20}
+                  loading="lazy"
+                />
+              )}
+              <div className="ui-sub-unit-body">
+                <a href={u.path} className="ui-sub-unit-link">
+                  <strong>{u.display_name}</strong>
+                  <span className="muted"> · {u.path}</span>
+                </a>
+                {u.tagline ? <p className="tagline">{u.tagline}</p> : null}
+              </div>
+              <span className={`status status-${status}`} data-testid={`ui-status-${u.name}`}>
+                {status}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </details>
+  );
 }
 
 interface ChannelToggleProps {
