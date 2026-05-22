@@ -2,6 +2,41 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.8] - 2026-05-22
+
+**feat(hub): ServiceEntry hierarchical `uis` schema extension (#313) — parachute-app sub-unit discovery.**
+
+Foundational schema work for parachute-app (per parachute-app design doc §12). apps wants hub's discovery surfaces — the well-known doc + admin SPA Modules view — to render the App module with each hosted UI (Gitcoin Brain, Unforced Brain, …) expanded as a sub-row, mirroring the per-instance shape vault already gives for `/vault/default`, `/vault/work`, etc. Today services.json entries are flat (`paths: ["/vault/default", "/vault/gitcoin"]`); this PR teaches the schema to carry display metadata per sub-unit so the discovery row can show a name + icon + status, not just a path.
+
+The extension is purely additive: existing flat entries (vault / scribe / notes / runner) continue to round-trip byte-identically — the `uis` field is optional throughout the read + write paths.
+
+**What landed.**
+
+- **`ServiceEntry.uis: Record<string, UiSubUnit>` on `src/services-manifest.ts`.** New `UiSubUnit` type carries `displayName` + `path` (required) plus optional `tagline`, `iconUrl`, `version`, `oauthClientId`, and `status` (`"active" | "pending-oauth" | "disabled"`). Validation runs in `validateEntry` → `validateUis` → `validateUiSubUnit`; the error messages name the offending sub-unit key so operators with N rows can jump straight to the offender.
+- **Well-known doc surfaces the sub-units.** `WellKnownServicesEntry.uis?: WellKnownUiSubUnit[]` mirrors the on-disk shape with the map key promoted to `name` and `path` joined onto the canonical origin into a deep-linkable `url`. `iconUrl` follows the same path-or-absolute-URL rule the services-level `uiUrl` uses. Empty map → field omitted (keeps the public contract tight); absent `uis` → field omitted (pre-#313 byte-identical for every existing module).
+- **`GET /api/modules` surfaces `uis: UiSubUnitWireShape[]` per row.** Snake-case wire keys (`display_name`, `oauth_client_id`, `icon_url`) to match the surrounding response. Empty array when the row doesn't declare `uis` — uniform shape across modules so the SPA can `.map` unconditionally.
+- **Admin SPA Modules view renders a `<details>`-wrapped "Hosted UIs" section per installed module with sub-units.** Each sub-row shows icon + displayName + path (same-origin anchor, not `<Link>` — the sub-unit lives outside the SPA's basename) + tagline + a status badge using the existing `status-<state>` class palette. Status falls back to `"active"` when absent. Empty / absent `uis` → section omitted entirely.
+
+**UiSubUnit shape (the canonical contract):**
+
+```ts
+export interface UiSubUnit {
+  displayName: string;
+  tagline?: string;
+  path: string;
+  iconUrl?: string;
+  version?: string;
+  oauthClientId?: string;
+  status?: "active" | "pending-oauth" | "disabled";
+}
+```
+
+`oauthClientId` is the load-bearing field for app's "install-once, multi-vault" pattern (design doc §6): each hosted UI gets its own OAuth client at install time, the operator sees the id verbatim on the approval surface, and revoking the client retires the UI's access in one shot without touching siblings.
+
+**Out of scope (deliberate).** Vault still uses flat `paths: ["/vault/default", "/vault/gitcoin"]`; a future PR can migrate vault to the hierarchical shape for per-instance display metadata. The flat shape continues to work through hub's existing path-prefix routing — the point of this PR is to make the hierarchical option available, not to retire the flat one.
+
+**Tests.** `bun run typecheck` clean (root + `web/ui`). `bun test ./src` 1805 pass (was 1781; +24 — 13 in services-manifest, 8 in well-known, 3 in api-modules). `cd web/ui && bun run test` 188 pass (was 183; +5 covering the SPA's Hosted UIs section across empty, populated, status-badge, icon, and sub-unit-count cases). `bunx biome check src/` clean.
+
 ## [0.5.13-rc.7] - 2026-05-22
 
 **feat(hub): mark same-hub DCR clients for auto-trust (#312) — parachute-app integration.**

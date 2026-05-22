@@ -22,6 +22,81 @@ import { SERVICES_MANIFEST_PATH } from "./config.ts";
  */
 export type PublicExposure = "allowed" | "loopback" | "auth-required";
 
+/**
+ * Visible-to-discovery state of a UI sub-unit. Mirrors parachute-app's
+ * `RegisteredUi.status` so hub renders the same label the app's admin SPA
+ * shows. Absent → hub treats the sub-unit as "active" (the discovery
+ * default).
+ *
+ *   "active"        — UI is installed, OAuth client is approved, ready to serve.
+ *   "pending-oauth" — UI is installed but its OAuth client hasn't been approved
+ *                     yet (operator still needs to click through `/admin/oauth-clients`
+ *                     or the app's admin SPA gate). Discovery should render the
+ *                     row but signal "not yet usable."
+ *   "disabled"      — Operator-disabled. Renders greyed-out; no link.
+ */
+export type UiSubUnitStatus = "active" | "pending-oauth" | "disabled";
+
+/**
+ * A sub-unit beneath a module — used today by parachute-app to surface each
+ * hosted UI as its own discoverable row under the App module, and the shape
+ * vault is expected to adopt in a follow-up so per-vault display metadata
+ * (icon, tagline) can ride alongside the mount path.
+ *
+ * Per parachute-app design doc §12, the canonical shape for parachute-app's
+ * services.json row mirrors vault's multi-instance pattern but carries
+ * display metadata per instance. Today vault encodes instances as flat
+ * `paths: ["/vault/default", "/vault/work"]`; the discovery surface only
+ * sees the path. With `uis`, each sub-unit can ride its own displayName,
+ * tagline, iconUrl, and OAuth client id without the parent module forging
+ * a fake services.json row per UI.
+ *
+ * `oauthClientId` is the load-bearing field for app's "install-once,
+ * multi-vault" pattern (design doc §6 ¶219): each UI gets its own OAuth
+ * client at install time, the operator sees that id verbatim on the
+ * approval surface, and revoking the client retires the UI's access in
+ * one shot without touching its siblings.
+ *
+ * Backwards-compat: this is purely additive. Modules that don't use `uis`
+ * (vault, scribe, notes, runner today) continue to render as flat rows;
+ * the field is optional throughout the read + write paths.
+ */
+export interface UiSubUnit {
+  /** Human-readable name for the discovery row (e.g. "Gitcoin Brain"). */
+  displayName: string;
+  /** One-line subtitle, same shape as `ServiceEntry.tagline`. */
+  tagline?: string;
+  /**
+   * Path under the hub origin where this sub-unit is mounted (e.g.
+   * `/app/gitcoin-brain`). Must start with `/` — same shape rule as
+   * `ServiceEntry.paths[]`.
+   */
+  path: string;
+  /**
+   * Absolute URL or path to an icon (svg / png). Discovery renders this as
+   * the sub-unit's tile glyph; absent → hub falls back to a generic
+   * placeholder. Path-relative URLs are resolved against the hub origin
+   * the same way `uiUrl` is in `well-known.ts`.
+   */
+  iconUrl?: string;
+  /**
+   * Optional version stamp. Each UI iterates independently of its parent
+   * module — Gitcoin Brain at 0.3.1 + Unforced Brain at 0.2.0 ride on the
+   * same parachute-app process. Surfaced on the admin SPA row so operators
+   * can spot a drift.
+   */
+  version?: string;
+  /**
+   * OAuth client id minted at UI install time. Hub doesn't validate this
+   * shape (the OAuth server already does); it round-trips verbatim so the
+   * admin SPA can render the per-UI approval status without re-resolving
+   * from `/api/oauth/clients/<id>`.
+   */
+  oauthClientId?: string;
+  /** UI sub-unit lifecycle state. Absent → discovery treats as "active". */
+  status?: UiSubUnitStatus;
+}
+
 export interface ServiceEntry {
   name: string;
   port: number;
@@ -61,6 +136,21 @@ export interface ServiceEntry {
    *     bridges the gap. Tracked in parachute-scribe (separate issue).
    */
   stripPrefix?: boolean;
+  /**
+   * Sub-units hosted under this module — parachute-app's bag of UIs, and
+   * the shape vault is expected to adopt for per-instance metadata in a
+   * follow-up. Empty or absent → flat row, the legacy shape. See
+   * `UiSubUnit` above + parachute-app design doc §12 for the canonical
+   * usage. Keys are short slugs (`gitcoin-brain`, `default`); the slug
+   * carries no semantic meaning beyond being a stable identity for the
+   * row across renders.
+   *
+   * Discovery surfaces (`/.well-known/parachute.json`, admin SPA Modules
+   * view) render each entry as a discoverable sub-row under the parent
+   * module — same UX shape as vault's per-instance paths today, only
+   * with display metadata attached.
+   */
+  uis?: Record<string, UiSubUnit>;
 }
 
 export interface ServicesManifest {
@@ -125,13 +215,91 @@ function validateEntry(raw: unknown, where: string): ServiceEntry {
   if (stripPrefix !== undefined && typeof stripPrefix !== "boolean") {
     throw new ServicesManifestError(`${where}: "stripPrefix" must be a boolean if present`);
   }
+  const uis = e.uis;
+  const validatedUis = validateUis(uis, where);
   const entry: ServiceEntry = { name, port, paths: paths as string[], health, version };
   if (displayName !== undefined) entry.displayName = displayName;
   if (tagline !== undefined) entry.tagline = tagline;
   if (publicExposure !== undefined) entry.publicExposure = publicExposure as PublicExposure;
   if (installDir !== undefined) entry.installDir = installDir;
   if (stripPrefix !== undefined) entry.stripPrefix = stripPrefix;
+  if (validatedUis !== undefined) entry.uis = validatedUis;
   return entry;
+}
+
+/**
+ * Validate the optional `uis` map on a ServiceEntry. `undefined` round-trips
+ * unchanged (the field is optional); a present map must be a plain object
+ * keyed by string with each value satisfying `UiSubUnit`.
+ *
+ * Each sub-unit is validated against the same shape `UiSubUnit` declares:
+ * `displayName` + `path` required, everything else optional with type-narrow
+ * checks. Errors carry the parent entry's `where` context plus the offending
+ * sub-unit key so an operator scanning logs knows exactly which row to
+ * reconcile.
+ */
+function validateUis(raw: unknown, where: string): Record<string, UiSubUnit> | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ServicesManifestError(`${where}: "uis" must be an object map if present`);
+  }
+  const out: Record<string, UiSubUnit> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof key !== "string" || key.length === 0) {
+      throw new ServicesManifestError(`${where}: "uis" keys must be non-empty strings`);
+    }
+    out[key] = validateUiSubUnit(value, `${where} uis[${JSON.stringify(key)}]`);
+  }
+  return out;
+}
+
+function validateUiSubUnit(raw: unknown, where: string): UiSubUnit {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ServicesManifestError(`${where}: expected object, got ${typeof raw}`);
+  }
+  const u = raw as Record<string, unknown>;
+  const displayName = u.displayName;
+  const path = u.path;
+  if (typeof displayName !== "string" || displayName.length === 0) {
+    throw new ServicesManifestError(`${where}: "displayName" must be a non-empty string`);
+  }
+  if (typeof path !== "string" || !path.startsWith("/")) {
+    throw new ServicesManifestError(`${where}: "path" must be a path starting with "/"`);
+  }
+  const tagline = u.tagline;
+  const iconUrl = u.iconUrl;
+  const version = u.version;
+  const oauthClientId = u.oauthClientId;
+  const status = u.status;
+  if (tagline !== undefined && typeof tagline !== "string") {
+    throw new ServicesManifestError(`${where}: "tagline" must be a string if present`);
+  }
+  if (iconUrl !== undefined && typeof iconUrl !== "string") {
+    throw new ServicesManifestError(`${where}: "iconUrl" must be a string if present`);
+  }
+  if (version !== undefined && typeof version !== "string") {
+    throw new ServicesManifestError(`${where}: "version" must be a string if present`);
+  }
+  if (oauthClientId !== undefined && typeof oauthClientId !== "string") {
+    throw new ServicesManifestError(`${where}: "oauthClientId" must be a string if present`);
+  }
+  if (
+    status !== undefined &&
+    status !== "active" &&
+    status !== "pending-oauth" &&
+    status !== "disabled"
+  ) {
+    throw new ServicesManifestError(
+      `${where}: "status" must be "active" | "pending-oauth" | "disabled" if present`,
+    );
+  }
+  const out: UiSubUnit = { displayName, path };
+  if (tagline !== undefined) out.tagline = tagline;
+  if (iconUrl !== undefined) out.iconUrl = iconUrl;
+  if (version !== undefined) out.version = version;
+  if (oauthClientId !== undefined) out.oauthClientId = oauthClientId;
+  if (status !== undefined) out.status = status as UiSubUnitStatus;
+  return out;
 }
 
 /**

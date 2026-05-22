@@ -66,6 +66,7 @@ function moduleRow(short: string, overrides: Partial<api.ModuleListing> = {}): a
     supervisor_status: null,
     pid: null,
     install_dir: null,
+    uis: [],
     ...overrides,
   };
 }
@@ -539,5 +540,169 @@ describe("Modules — install channel toggle (hub#275)", () => {
     fireEvent.click(screen.getByRole("radio", { name: /stable/i }));
     await Promise.resolve();
     expect(api.setModuleChannel).not.toHaveBeenCalled();
+  });
+});
+
+// Hierarchical sub-units (hub#313). Installed module rows render an
+// expandable "Hosted UIs" section per sub-unit when `uis` is non-empty.
+// Empty (the default for vault / notes / scribe / runner) suppresses the
+// section entirely.
+describe("Modules — hierarchical sub-units (hub#313)", () => {
+  function makeUi(overrides: Partial<api.ModuleUiSubUnit>): api.ModuleUiSubUnit {
+    return {
+      name: "gitcoin-brain",
+      display_name: "Gitcoin Brain",
+      path: "/app/gitcoin-brain",
+      tagline: null,
+      icon_url: null,
+      version: null,
+      oauth_client_id: null,
+      status: null,
+      ...overrides,
+    };
+  }
+
+  it("does not render the Hosted UIs section when uis is empty", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({
+        modules: [
+          moduleRow("vault", {
+            installed: true,
+            installed_version: "0.4.5",
+            latest_version: "0.4.5",
+            supervisor_status: "running",
+            uis: [],
+          }),
+        ],
+      }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+    expect(screen.queryByTestId("module-uis")).not.toBeInTheDocument();
+  });
+
+  it("renders the Hosted UIs section with one row per sub-unit", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({
+        modules: [
+          moduleRow("vault", {
+            display_name: "App",
+            installed: true,
+            installed_version: "0.1.0",
+            latest_version: "0.1.0",
+            supervisor_status: "running",
+            uis: [
+              makeUi({
+                name: "gitcoin-brain",
+                display_name: "Gitcoin Brain",
+                path: "/app/gitcoin-brain",
+                tagline: "Reading room for the Gitcoin team",
+                status: "active",
+              }),
+              makeUi({
+                name: "unforced-brain",
+                display_name: "Unforced Brain",
+                path: "/app/unforced-brain",
+                status: "pending-oauth",
+              }),
+            ],
+          }),
+        ],
+      }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("App")).toBeInTheDocument());
+    const section = screen.getByTestId("module-uis");
+    expect(within(section).getByText("Gitcoin Brain")).toBeInTheDocument();
+    expect(within(section).getByText("Unforced Brain")).toBeInTheDocument();
+    // Tagline rides through verbatim.
+    expect(within(section).getByText("Reading room for the Gitcoin team")).toBeInTheDocument();
+    // Path is rendered as a same-origin anchor (the sub-unit lives outside
+    // the SPA's basename — see UiSubUnitsList comment for the rationale).
+    const link = within(section).getByText("Gitcoin Brain").closest("a");
+    expect(link?.getAttribute("href")).toBe("/app/gitcoin-brain");
+  });
+
+  it("renders per-sub-unit status badges using status-<state> class", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({
+        modules: [
+          moduleRow("vault", {
+            installed: true,
+            installed_version: "0.1.0",
+            latest_version: "0.1.0",
+            supervisor_status: "running",
+            uis: [
+              makeUi({ name: "a", display_name: "A", status: "active" }),
+              makeUi({ name: "b", display_name: "B", status: "pending-oauth" }),
+              makeUi({ name: "c", display_name: "C", status: "disabled" }),
+              makeUi({ name: "d", display_name: "D", status: null }),
+            ],
+          }),
+        ],
+      }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByTestId("module-uis")).toBeInTheDocument());
+    expect(screen.getByTestId("ui-status-a")).toHaveClass("status-active");
+    expect(screen.getByTestId("ui-status-b")).toHaveClass("status-pending-oauth");
+    expect(screen.getByTestId("ui-status-c")).toHaveClass("status-disabled");
+    // Null status falls back to "active" — same default as discovery.
+    expect(screen.getByTestId("ui-status-d")).toHaveClass("status-active");
+  });
+
+  it("renders the icon when icon_url is present, skips it when absent", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({
+        modules: [
+          moduleRow("vault", {
+            installed: true,
+            installed_version: "0.1.0",
+            latest_version: "0.1.0",
+            supervisor_status: "running",
+            uis: [
+              makeUi({
+                name: "with-icon",
+                display_name: "With Icon",
+                icon_url: "/app/with-icon/icon.svg",
+              }),
+              makeUi({ name: "no-icon", display_name: "No Icon", icon_url: null }),
+            ],
+          }),
+        ],
+      }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByTestId("module-uis")).toBeInTheDocument());
+    const section = screen.getByTestId("module-uis");
+    // The icon <img alt=""> is presentational (per a11y conventions for
+    // decorative images), so getByRole("img") wouldn't match. Query via
+    // the .ui-icon class instead — same class the component renders.
+    const imgs = section.querySelectorAll("img.ui-icon");
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0]?.getAttribute("src")).toBe("/app/with-icon/icon.svg");
+  });
+
+  it("shows the sub-unit count in the section summary", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({
+        modules: [
+          moduleRow("vault", {
+            installed: true,
+            installed_version: "0.1.0",
+            latest_version: "0.1.0",
+            supervisor_status: "running",
+            uis: [
+              makeUi({ name: "a", display_name: "A" }),
+              makeUi({ name: "b", display_name: "B" }),
+              makeUi({ name: "c", display_name: "C" }),
+            ],
+          }),
+        ],
+      }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByTestId("module-uis")).toBeInTheDocument());
+    expect(screen.getByText(/\(3\)/)).toBeInTheDocument();
   });
 });

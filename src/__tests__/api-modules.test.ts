@@ -349,6 +349,164 @@ describe("GET /api/modules", () => {
     const body = (await res.json()) as { module_install_channel: string };
     expect(body.module_install_channel).toBe("rc");
   });
+
+  // Hierarchical sub-units on the wire (hub#313). Each module row carries
+  // a `uis: []` array — empty for vault / scribe / notes / runner, populated
+  // for parachute-app once apps starts writing them. Snake-case keys
+  // throughout to match the rest of the response.
+  describe("uis hierarchical sub-units (hub#313)", () => {
+    test("uis defaults to empty array on every row when none declare it", async () => {
+      // The post-#313 wire shape must include `uis` unconditionally so
+      // the SPA can `.map` without a presence check. Modules with no
+      // `uis` declaration → empty array.
+      const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+      const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        fetchLatestVersion: async () => null,
+      });
+      const body = (await res.json()) as {
+        modules: Array<{ short: string; uis: unknown[] }>;
+      };
+      for (const m of body.modules) {
+        expect(Array.isArray(m.uis)).toBe(true);
+        expect(m.uis).toHaveLength(0);
+      }
+    });
+
+    test("vault row carries uis sub-units when services.json declares them", async () => {
+      // Synthetic: vault doesn't actually use `uis` yet, but the curated
+      // join is by manifestName so any short can carry a `uis` map.
+      // Once vault migrates (separate PR), this test pins the wire shape.
+      writeManifest(h.manifestPath, [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/vault/default/health",
+          version: "0.4.5",
+          uis: {
+            default: {
+              displayName: "Default Vault",
+              path: "/vault/default",
+              oauthClientId: "client_v1",
+              status: "active",
+            },
+            techne: {
+              displayName: "Techne",
+              path: "/vault/techne",
+              status: "pending-oauth",
+            },
+          },
+        },
+      ]);
+      const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+      const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        fetchLatestVersion: async () => null,
+      });
+      const body = (await res.json()) as {
+        modules: Array<{
+          short: string;
+          uis: Array<{
+            name: string;
+            display_name: string;
+            path: string;
+            tagline: string | null;
+            icon_url: string | null;
+            version: string | null;
+            oauth_client_id: string | null;
+            status: string | null;
+          }>;
+        }>;
+      };
+      const vault = body.modules.find((m) => m.short === "vault");
+      expect(vault?.uis).toEqual([
+        {
+          name: "default",
+          display_name: "Default Vault",
+          path: "/vault/default",
+          tagline: null,
+          icon_url: null,
+          version: null,
+          oauth_client_id: "client_v1",
+          status: "active",
+        },
+        {
+          name: "techne",
+          display_name: "Techne",
+          path: "/vault/techne",
+          tagline: null,
+          icon_url: null,
+          version: null,
+          oauth_client_id: null,
+          status: "pending-oauth",
+        },
+      ]);
+      // Other curated rows stay empty — uis is per-row, not global.
+      const notes = body.modules.find((m) => m.short === "notes");
+      expect(notes?.uis).toEqual([]);
+    });
+
+    test("optional fields ride through verbatim, missing fields become null on the wire", async () => {
+      writeManifest(h.manifestPath, [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/vault/default/health",
+          version: "0.4.5",
+          uis: {
+            "full-fields": {
+              displayName: "Full",
+              tagline: "All set",
+              path: "/vault/full",
+              iconUrl: "/vault/full/icon.svg",
+              version: "0.3.1",
+              oauthClientId: "c1",
+              status: "disabled",
+            },
+          },
+        },
+      ]);
+      const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+      const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        fetchLatestVersion: async () => null,
+      });
+      const body = (await res.json()) as {
+        modules: Array<{
+          short: string;
+          uis: Array<{
+            name: string;
+            display_name: string;
+            path: string;
+            tagline: string | null;
+            icon_url: string | null;
+            version: string | null;
+            oauth_client_id: string | null;
+            status: string | null;
+          }>;
+        }>;
+      };
+      const vault = body.modules.find((m) => m.short === "vault");
+      expect(vault?.uis[0]).toEqual({
+        name: "full-fields",
+        display_name: "Full",
+        path: "/vault/full",
+        tagline: "All set",
+        icon_url: "/vault/full/icon.svg",
+        version: "0.3.1",
+        oauth_client_id: "c1",
+        status: "disabled",
+      });
+    });
+  });
 });
 
 describe("PUT /api/modules/channel — hub#275 channel toggle", () => {

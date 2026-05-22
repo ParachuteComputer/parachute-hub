@@ -2,11 +2,42 @@ import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "./config.ts";
 import { type ModuleManifest, readModuleManifest } from "./module-manifest.ts";
-import { type ServiceEntry, readManifest } from "./services-manifest.ts";
+import {
+  type ServiceEntry,
+  type UiSubUnit,
+  type UiSubUnitStatus,
+  readManifest,
+} from "./services-manifest.ts";
 
 export interface WellKnownServiceEntry {
   url: string;
   version: string;
+}
+
+/**
+ * Sub-unit entry surfaced in `/.well-known/parachute.json` under a parent
+ * module. Mirrors the shape `UiSubUnit` carries on disk, plus:
+ *
+ *   - `name` — the map key promoted to a field so consumers iterating an
+ *     array don't have to round-trip through the parent map. Same shape
+ *     `WellKnownVaultEntry` uses.
+ *   - `url` — `path` joined onto `canonicalOrigin`, so a consumer can deep
+ *     link to the sub-unit without re-resolving the hub origin.
+ *
+ * `iconUrl` is resolved through the same path-or-absolute-URL rule the
+ * services-level `uiUrl` uses (absolute http(s) → verbatim; path → joined
+ * onto `canonicalOrigin`).
+ */
+export interface WellKnownUiSubUnit {
+  name: string;
+  displayName: string;
+  path: string;
+  url: string;
+  tagline?: string;
+  iconUrl?: string;
+  version?: string;
+  oauthClientId?: string;
+  status?: UiSubUnitStatus;
 }
 
 export interface WellKnownVaultEntry {
@@ -52,6 +83,14 @@ export interface WellKnownServicesEntry {
   uiUrl?: string;
   /** One-line subtitle for the discovery tile, sourced from `services.json:tagline`. */
   tagline?: string;
+  /**
+   * Sub-units hosted under this module, surfaced as an array (the on-disk
+   * shape is a map; the well-known shape is an array so consumers iterate
+   * cleanly). Each entry promotes the map key into `name`. Absent on
+   * modules that don't declare `uis` (vault, scribe, notes, runner today).
+   * See `UiSubUnit` in services-manifest.ts + parachute-app design doc §12.
+   */
+  uis?: WellKnownUiSubUnit[];
 }
 
 /**
@@ -147,6 +186,42 @@ function joinInfoPath(path: string): string {
   return `${trimmed}/.parachute/info`;
 }
 
+/**
+ * Resolve a UI sub-unit map to the well-known array shape. Per hub#313 /
+ * parachute-app design doc §12: each map entry expands into a
+ * `WellKnownUiSubUnit` record with the map key promoted to `name` and
+ * `path` joined onto `canonicalOrigin` for a deep-linkable `url`. Empty
+ * map → empty array (the caller decides whether to omit the field).
+ *
+ * `iconUrl` follows the same shape `uiUrl` does on the services row:
+ * absolute http(s) → verbatim; relative path → joined onto `base`.
+ *
+ * Pulled out of `buildWellKnown` so the per-sub-unit shape stays a pure
+ * transform — tests can call it directly; consumers can re-use it for
+ * their own well-known builders (rare, but the surface stays small).
+ */
+function buildUisArray(uis: Record<string, UiSubUnit>, base: string): WellKnownUiSubUnit[] {
+  return Object.entries(uis).map(([name, u]) => {
+    const url = new URL(u.path, `${base}/`).toString();
+    const out: WellKnownUiSubUnit = {
+      name,
+      displayName: u.displayName,
+      path: u.path,
+      url,
+    };
+    if (u.tagline !== undefined) out.tagline = u.tagline;
+    if (u.iconUrl !== undefined) {
+      out.iconUrl = /^https?:\/\//i.test(u.iconUrl)
+        ? u.iconUrl
+        : new URL(u.iconUrl, `${base}/`).toString();
+    }
+    if (u.version !== undefined) out.version = u.version;
+    if (u.oauthClientId !== undefined) out.oauthClientId = u.oauthClientId;
+    if (u.status !== undefined) out.status = u.status;
+    return out;
+  });
+}
+
 export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
   const base = opts.canonicalOrigin.replace(/\/$/, "");
   const doc: WellKnownDocument = { vaults: [], services: [] };
@@ -184,6 +259,24 @@ export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
         entry.uiUrl = /^https?:\/\//i.test(uiUrlRaw)
           ? uiUrlRaw
           : new URL(uiUrlRaw, `${base}/`).toString();
+      }
+      // Hierarchical sub-units (hub#313 / parachute-app design doc §12). The
+      // on-disk shape is a map keyed by short slug; the well-known shape is
+      // an array of records so JS consumers iterate cleanly without a second
+      // Object.entries round-trip. `name` promotes the map key into a field
+      // — same convention as `WellKnownVaultEntry`. Absent on the parent
+      // when the entry doesn't declare `uis`, so vault / notes / scribe /
+      // runner rows stay byte-identical to their pre-#313 shape.
+      //
+      // Emitted on every path of a multi-path entry — today only vault has
+      // multi-path entries, and vault doesn't declare `uis` yet, so the
+      // duplication is theoretical. Once vault adopts the hierarchical
+      // shape (separate migration), each path-loop iteration will still see
+      // the same `uis` map and emit the same array; consumers de-duplicate
+      // by parent `services[].name` if they care.
+      if (s.uis) {
+        const arr = buildUisArray(s.uis, base);
+        if (arr.length > 0) entry.uis = arr;
       }
       doc.services.push(entry);
       if (isVault) {

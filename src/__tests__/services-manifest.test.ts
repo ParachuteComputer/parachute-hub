@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   type ServiceEntry,
   ServicesManifestError,
+  type UiSubUnit,
   findService,
   readManifest,
   removeService,
@@ -221,6 +222,236 @@ describe("services-manifest", () => {
     } finally {
       cleanup();
     }
+  });
+
+  // Hierarchical sub-units (hub#313). parachute-app registers as a single
+  // module row with a `uis` map; each entry surfaces as a discoverable
+  // sub-row under the App module in hub's discovery surfaces. Schema is
+  // purely additive — pre-#313 flat entries (vault / scribe / notes /
+  // runner) round-trip byte-identically.
+  describe("ServiceEntry.uis hierarchical sub-units (hub#313)", () => {
+    const app: ServiceEntry = {
+      name: "parachute-app",
+      port: 1946,
+      paths: ["/app"],
+      health: "/app/healthz",
+      version: "0.1.0",
+    };
+
+    test("round-trips a fully-populated uis map", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        const full: ServiceEntry = {
+          ...app,
+          uis: {
+            "gitcoin-brain": {
+              displayName: "Gitcoin Brain",
+              tagline: "Reading room for the Gitcoin team's vault.",
+              path: "/app/gitcoin-brain",
+              iconUrl: "/app/gitcoin-brain/icon.svg",
+              version: "0.3.1",
+              oauthClientId: "client_abc123",
+              status: "active",
+            },
+            "unforced-brain": {
+              displayName: "Unforced Brain",
+              path: "/app/unforced-brain",
+              oauthClientId: "client_def456",
+              status: "pending-oauth",
+            },
+          },
+        };
+        upsertService(full, path);
+        expect(readManifest(path).services[0]).toEqual(full);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("absent uis round-trips as absent — backwards-compat for flat entries", () => {
+      // Vault / scribe / notes / runner all ship without `uis` today.
+      // The schema must round-trip them byte-identically so the post-#313
+      // services.json shape is a strict superset of the pre-#313 shape.
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(vault, path);
+        const got = readManifest(path).services[0];
+        expect(got).toEqual(vault);
+        expect(got).not.toHaveProperty("uis");
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("empty uis map round-trips as empty (not omitted)", () => {
+      // An app with no UIs yet is a distinct state from "doesn't support
+      // UIs" — preserve it so the SPA can render "no UIs installed yet"
+      // distinctly from "this isn't a UI-host module."
+      const { path, cleanup } = makeTempPath();
+      try {
+        const empty: ServiceEntry = { ...app, uis: {} };
+        upsertService(empty, path);
+        expect(readManifest(path).services[0]).toEqual(empty);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("minimal sub-unit — displayName + path only — accepted", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        const minimal: ServiceEntry = {
+          ...app,
+          uis: {
+            slug: { displayName: "Slug", path: "/app/slug" },
+          },
+        };
+        upsertService(minimal, path);
+        expect(readManifest(path).services[0]).toEqual(minimal);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("rejects uis that isn't an object", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        expect(() =>
+          upsertService({ ...app, uis: [] as unknown as Record<string, never> }, path),
+        ).toThrow(/"uis" must be an object map/);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("rejects sub-unit missing displayName", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        const bad: ServiceEntry = {
+          ...app,
+          uis: {
+            slug: { path: "/app/slug" } as unknown as UiSubUnit,
+          },
+        };
+        expect(() => upsertService(bad, path)).toThrow(/displayName/);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("rejects sub-unit missing path", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        const bad: ServiceEntry = {
+          ...app,
+          uis: {
+            slug: { displayName: "Slug" } as unknown as UiSubUnit,
+          },
+        };
+        expect(() => upsertService(bad, path)).toThrow(/"path"/);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("rejects sub-unit path not starting with /", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        const bad: ServiceEntry = {
+          ...app,
+          uis: { slug: { displayName: "S", path: "app/slug" } },
+        };
+        expect(() => upsertService(bad, path)).toThrow(/"path"/);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("rejects invalid status value", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        const bad: ServiceEntry = {
+          ...app,
+          uis: {
+            slug: {
+              displayName: "S",
+              path: "/app/s",
+              status: "weird" as unknown as "active",
+            },
+          },
+        };
+        expect(() => upsertService(bad, path)).toThrow(/status/);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("rejects non-string oauthClientId", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        const bad: ServiceEntry = {
+          ...app,
+          uis: {
+            slug: {
+              displayName: "S",
+              path: "/app/s",
+              oauthClientId: 42 as unknown as string,
+            },
+          },
+        };
+        expect(() => upsertService(bad, path)).toThrow(/oauthClientId/);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("rejects empty-string key in uis map", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        writeFileSync(
+          path,
+          JSON.stringify({
+            services: [
+              {
+                ...app,
+                uis: {
+                  "": { displayName: "S", path: "/app/s" },
+                },
+              },
+            ],
+          }),
+        );
+        expect(() => readManifest(path)).toThrow(/"uis" keys/);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("error message names the offending sub-unit key", () => {
+      // Multiple sub-units in the same entry — the error should pinpoint
+      // which slug carries the bad shape so an operator with N rows can
+      // jump straight to the offender.
+      const { path, cleanup } = makeTempPath();
+      try {
+        writeFileSync(
+          path,
+          JSON.stringify({
+            services: [
+              {
+                ...app,
+                uis: {
+                  good: { displayName: "Good", path: "/app/good" },
+                  "bad-one": { displayName: "Bad", path: "no-leading-slash" },
+                },
+              },
+            ],
+          }),
+        );
+        expect(() => readManifest(path)).toThrow(/bad-one/);
+      } finally {
+        cleanup();
+      }
+    });
   });
 
   // Duplicate-port detection (hub#195). The original collision had
