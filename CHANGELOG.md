@@ -2,6 +2,38 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.7] - 2026-05-22
+
+**feat(hub): mark same-hub DCR clients for auto-trust (#312) — parachute-app integration.**
+
+Foundational for parachute-app's friend-deploy story (per parachute-app design doc §6 + apps Phase 2.0): apps installs UIs by calling hub's DCR endpoint with the operator bearer; hub now records those as "same-hub" and skips the consent screen at `/oauth/authorize` for non-admin scopes. The operator who installed the app IS the implicit consent for each UI it registers — a per-UI consent click was friction without security value.
+
+This generalizes hub#270's "auto-approve first OAuth client after wizard" — now any same-hub app auto-approves, not just the first.
+
+**What landed.**
+
+- **Migration v9.** Adds `INTEGER NOT NULL DEFAULT 0` column `same_hub` to the `clients` table. Pre-existing rows backfill to 0 (the safe default — they keep requiring consent).
+- **DCR registration (`POST /oauth/register`).** Marks new clients `same_hub=true` when the registrant authenticated as the operator: bearer with `hub:admin` (the install-time path used by parachute-app + first-party modules) OR session-cookie + same-origin POST (the operator's own browser). Wizard-window auto-approve (#268) does NOT set same_hub — that path approves an external registrant, doesn't claim ownership. The response body echoes `same_hub` so callers can verify the marker landed.
+- **Authorize gate (`GET /oauth/authorize`).** New silent-approve gate after the existing scope-coverage gate (#75): when `client.same_hub === true` AND no requested scope is admin-level AND no unnamed vault verb is present (picker still needed for those), the consent HTML is skipped and the auth code minted immediately. A `grants` row is also recorded so subsequent flows hit the standard #75 path uniformly. Logged as `[oauth] auto-approved same-hub client client_id=<id> user_id=<id> scopes=<list>` for audit.
+- **Admin SPA surface.** `/api/oauth/clients/<id>` adds `same_hub: boolean` so future per-client SPA badging (same-hub vs external) can read it directly.
+
+**Auto-approve rule (the load-bearing conditional in `handleAuthorizeGet`):**
+
+```ts
+const hasAdminScope = requestedScopes.some(scopeIsAdmin);
+if (client.sameHub && !hasAdminScope && !hasUnnamedVault) {
+  console.log(`[oauth] auto-approved same-hub client ... (hub#312)`);
+  recordGrant(db, session.userId, client.clientId, requestedScopes);
+  return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
+}
+```
+
+Admin scopes (`hub:admin`, anything `scopeIsAdmin` returns true for) stay on the consent path — even for same-hub clients, the operator should still click for high-power. `parachute:host:admin` + per-vault `vault:<name>:admin` are non-requestable so they never reach this gate anyway.
+
+**Backwards compatibility.** Migration backfills every pre-existing row to `same_hub=0`. They continue to require consent for everything — the safe default. Operators who want to upgrade an existing client to same-hub trust will need a future admin action (out of scope for this PR; the SPA's existing approve-client view doesn't currently expose same_hub editing). The 13 new tests in `DCR same-hub auto-trust (hub#312)` cover the full matrix: DCR marker for each auth path, authorize gate for each scope shape, migration backfill, and audit log emission.
+
+**Tests.** `bun run typecheck` clean. `bun test ./src` 1781 pass (was 1767; +14 — 13 in the new same-hub describe block, 1 in admin-clients). `bunx biome check src/` clean. SPA tests unchanged — no SPA route changes in this PR.
+
 ## [0.5.13-rc.6] - 2026-05-21
 
 **refactor(hub): retire VAULT/SCRIBE/RUNNER FALLBACKs — modules now self-register canonically.**
