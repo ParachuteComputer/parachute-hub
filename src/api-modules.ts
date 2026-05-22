@@ -30,9 +30,47 @@ import {
   setModuleInstallChannel,
 } from "./hub-settings.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
-import { FIRST_PARTY_FALLBACKS } from "./service-spec.ts";
+import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES } from "./service-spec.ts";
+// `FIRST_PARTY_FALLBACKS` and `KNOWN_MODULES` are both consulted by
+// `lookupModule` below — the former for notes/channel (vendored manifests
+// still required) and the latter for vault/scribe/runner (post-FALLBACK
+// retirement, hub#310). The local helper hides the split from the rest of
+// this file.
 import { readManifest } from "./services-manifest.ts";
 import type { ModuleState, Supervisor } from "./supervisor.ts";
+
+/**
+ * Resolve a curated module to the display + install bootstrap data the
+ * admin SPA renders. Reads from FIRST_PARTY_FALLBACKS (notes / channel)
+ * first, KNOWN_MODULES (vault / scribe / runner) second.
+ *
+ * Returns `undefined` if the short isn't curated — `CURATED_MODULES` is a
+ * const tuple intersected with both tables, so undefined here is a programmer
+ * error (caught by the type system in practice).
+ */
+function lookupModule(
+  short: string,
+): { package: string; manifestName: string; displayName: string; tagline: string } | undefined {
+  const fb = FIRST_PARTY_FALLBACKS[short];
+  if (fb) {
+    return {
+      package: fb.package,
+      manifestName: fb.manifest.manifestName,
+      displayName: fb.manifest.displayName ?? fb.manifest.name,
+      tagline: fb.manifest.tagline ?? "",
+    };
+  }
+  const km = KNOWN_MODULES[short];
+  if (km) {
+    return {
+      package: km.package,
+      manifestName: km.manifestName,
+      displayName: km.displayName,
+      tagline: km.tagline,
+    };
+  }
+  return undefined;
+}
 
 /** Scope required on the bearer token to call this endpoint. */
 export const API_MODULES_REQUIRED_SCOPE = "parachute:host:auth";
@@ -180,14 +218,14 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   const manifest = readManifest(deps.manifestPath);
   const installedByShort = new Map<string, { version: string; installDir?: string }>();
   for (const entry of manifest.services) {
-    // The installed-by-short map is keyed on `short` for join against
-    // the curated list. shortNameForManifest reads from
-    // FIRST_PARTY_FALLBACKS — we walk that table directly to derive the
-    // mapping, since `entry.name` is the long manifestName and we want
-    // the canonical short here without re-importing the helper.
+    // Join services.json rows to CURATED_MODULES by manifestName. The
+    // mapping table lives in lookupModule (which consults both
+    // FIRST_PARTY_FALLBACKS and KNOWN_MODULES) — so a row written by a
+    // self-registered vault / scribe / runner matches even though those
+    // shorts no longer have FALLBACK entries (hub#310).
     for (const short of CURATED_MODULES) {
-      const fb = FIRST_PARTY_FALLBACKS[short];
-      if (fb?.manifest.manifestName === entry.name) {
+      const m = lookupModule(short);
+      if (m?.manifestName === entry.name) {
         const value: { version: string; installDir?: string } = { version: entry.version };
         if (entry.installDir !== undefined) value.installDir = entry.installDir;
         installedByShort.set(short, value);
@@ -213,12 +251,12 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   const latestByShort = new Map<string, string | null>();
   await Promise.all(
     CURATED_MODULES.map(async (short) => {
-      const fb = FIRST_PARTY_FALLBACKS[short];
-      if (!fb) {
+      const m = lookupModule(short);
+      if (!m) {
         latestByShort.set(short, null);
         return;
       }
-      const pkg = fb.package;
+      const pkg = m.package;
       const cached = latestVersionCache.get(pkg);
       if (cached && cacheTtl > 0 && now() - cached.fetchedAt < cacheTtl) {
         latestByShort.set(short, cached.value);
@@ -235,15 +273,15 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   // are appended at the end with `available: false`.
   const modules: ModuleWireShape[] = [];
   for (const short of CURATED_MODULES) {
-    const fb = FIRST_PARTY_FALLBACKS[short];
-    if (!fb) continue;
+    const m = lookupModule(short);
+    if (!m) continue;
     const installed = installedByShort.get(short);
     const state = stateByShort.get(short);
     modules.push({
       short,
-      package: fb.package,
-      display_name: fb.manifest.displayName ?? fb.manifest.name,
-      tagline: fb.manifest.tagline ?? "",
+      package: m.package,
+      display_name: m.displayName,
+      tagline: m.tagline,
       available: true,
       installed: installed !== undefined,
       installed_version: installed?.version ?? null,

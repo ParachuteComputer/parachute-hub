@@ -66,7 +66,7 @@ import {
 } from "./oauth-ui.ts";
 import { isSameOriginRequest } from "./origin-check.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
-import { isNonRequestableScope, isRequestableScope } from "./scope-explanations.ts";
+import { isNonRequestableScope, isRequestableScope, scopeIsAdmin } from "./scope-explanations.ts";
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
 import {
   type ServicesManifest,
@@ -722,6 +722,36 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     console.log(
       `consent skipped: existing grant covers requested scope client_id=${client.clientId} user_id=${session.userId} scopes=${requestedScopes.join(" ")}`,
     );
+    return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
+  }
+
+  // Same-hub auto-trust gate (hub#312, parachute-app design §6). When the
+  // DCR registrant authenticated as the operator (bearer hub:admin OR
+  // session-cookie + same-origin), the resulting client is "owned by this
+  // hub" — the operator who installed the app IS the implicit consent for
+  // each UI the app registers. Skip the consent screen and mint the auth
+  // code immediately, but only when:
+  //
+  //   1. The client is marked same_hub=true in the DB (set at DCR time).
+  //   2. None of the requested scopes are admin-level — admin scopes
+  //      (`*:admin`, `hub:admin`, per-vault `vault:<name>:admin` is non-
+  //      requestable so never reaches here) are high-power enough that we
+  //      still want explicit consent as a sanity gate.
+  //   3. No unnamed vault verbs are requested — those need the picker to
+  //      narrow `vault:<verb>` → `vault:<name>:<verb>` before mint.
+  //
+  // The grant is also recorded so subsequent flows with the same scopes
+  // hit the standard skip-consent gate above. Logged so an operator
+  // auditing "who did this" can trace it back to a same-hub DCR.
+  const hasAdminScope = requestedScopes.some(scopeIsAdmin);
+  if (client.sameHub && !hasAdminScope && !hasUnnamedVault) {
+    console.log(
+      `[oauth] auto-approved same-hub client client_id=${client.clientId} user_id=${session.userId} scopes=${requestedScopes.join(" ")} (hub#312)`,
+    );
+    // Record the grant so the next /authorize for this (user, client, scopes)
+    // hits the standard skip-consent path (#75) — keeps the audit story
+    // consistent between same-hub and externally-approved flows.
+    recordGrant(db, session.userId, client.clientId, requestedScopes);
     return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
   }
 
@@ -1649,7 +1679,7 @@ function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
  * caller who tried to authenticate but failed wants to know why, not get
  * `pending` back and wonder why their module can't OAuth.
  *
- * Access-control matrix:
+ * Access-control matrix (status):
  *   no auth                       → pending
  *   bearer (hub:admin)            → approved (#74)
  *   bearer (other scope)          → 403 insufficient_scope
@@ -1658,6 +1688,19 @@ function resolveBoundOrigins(deps: OAuthDeps): readonly string[] {
  *   session cookie + cross-origin → pending (CSRF defense)
  *   session cookie + no Origin/Referer → pending
  *   expired/unknown session       → pending
+ *
+ * Same-hub marker (closes hub#312). Orthogonal to status — the marker
+ * records "was this client registered BY this hub's operator". Wired here:
+ *
+ *   bearer (hub:admin)            → same_hub=true
+ *   session cookie + same-origin  → same_hub=true
+ *   first-client wizard window    → same_hub=false (auto-approved, but the
+ *                                   registrant is external — wizard window
+ *                                   approves, doesn't claim ownership)
+ *   anything else                 → same_hub=false
+ *
+ * The same_hub marker drives the consent-screen auto-trust path at
+ * `/oauth/authorize` for non-admin scopes (parachute-app design §6).
  */
 export async function handleRegister(
   db: Database,
@@ -1694,11 +1737,17 @@ export async function handleRegister(
   // Operator-bearer auto-approve. No header → public DCR path (status=pending).
   // Header present → must validate as a hub:admin operator token; any failure
   // is surfaced (don't silently fall through to pending).
+  //
+  // Both operator-authenticated paths (bearer + session-cookie) also mark
+  // same_hub=true so the consent-screen gate at /oauth/authorize can auto-
+  // trust the client for non-admin scopes (hub#312).
   let status: ClientStatus = "pending";
+  let sameHub = false;
   if (req.headers.get("authorization")) {
     try {
       await requireScope(db, req, "hub:admin", deps.issuer);
       status = "approved";
+      sameHub = true;
     } catch (err) {
       if (err instanceof AdminAuthError) return adminAuthErrorResponse(err);
       throw err;
@@ -1716,6 +1765,7 @@ export async function handleRegister(
     const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
     if (session && isSameOriginRequest(req, resolveBoundOrigins(deps))) {
       status = "approved";
+      sameHub = true;
     }
   }
   // First-client auto-approve window (hub#268 Item 3). The wizard's expose
@@ -1724,6 +1774,12 @@ export async function handleRegister(
   // success, so client #2 falls through to the standard pending-approval
   // flow. Logged so an operator chasing odd behavior can see it fired
   // and which client got the free pass.
+  //
+  // Wizard-window approval does NOT set same_hub=true. The window says
+  // "approve the next external client" — the registrant is still external
+  // (a browser, a third-party app, an install script). Approval ≠
+  // ownership; the operator deliberately ran the wizard but didn't
+  // register-as-themselves the way the bearer/session paths do.
   let autoApprovedByWizardWindow = false;
   if (status === "pending") {
     if (consumeFirstClientAutoApproveWindow(db, deps.now ?? (() => new Date()))) {
@@ -1741,6 +1797,7 @@ export async function handleRegister(
       clientName: body.client_name,
       confidential,
       status,
+      sameHub,
       now: deps.now,
     });
   } catch (err) {
@@ -1752,6 +1809,11 @@ export async function handleRegister(
       `[oauth] auto-approved first client clientId=${registered.client.clientId} within wizard window (hub#268 Item 3)`,
     );
   }
+  if (sameHub) {
+    console.log(
+      `[oauth] same-hub DCR registration clientId=${registered.client.clientId} (hub#312)`,
+    );
+  }
   const respBody: Record<string, unknown> = {
     client_id: registered.client.clientId,
     redirect_uris: registered.client.redirectUris,
@@ -1760,6 +1822,7 @@ export async function handleRegister(
     token_endpoint_auth_method: confidential ? "client_secret_post" : "none",
     client_id_issued_at: Math.floor(new Date(registered.client.registeredAt).getTime() / 1000),
     status: registered.client.status,
+    same_hub: registered.client.sameHub,
   };
   if (registered.client.scopes.length > 0) respBody.scope = registered.client.scopes.join(" ");
   if (registered.client.clientName) respBody.client_name = registered.client.clientName;

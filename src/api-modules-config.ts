@@ -47,8 +47,33 @@
 import type { Database } from "bun:sqlite";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import { signAccessToken, validateAccessToken } from "./jwt-sign.ts";
-import { FIRST_PARTY_FALLBACKS } from "./service-spec.ts";
+import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES } from "./service-spec.ts";
 import { readManifest } from "./services-manifest.ts";
+
+/**
+ * Resolve a curated short to its services.json `manifestName` key. Consults
+ * both FIRST_PARTY_FALLBACKS (notes / channel) and KNOWN_MODULES
+ * (vault / scribe / runner — post-FALLBACK retirement, hub#310). Returns
+ * undefined when the short is unknown (shouldn't happen in this file — the
+ * parsing layer restricts to CURATED_MODULES).
+ */
+function manifestNameForShort(short: string): string | undefined {
+  return FIRST_PARTY_FALLBACKS[short]?.manifest.manifestName ?? KNOWN_MODULES[short]?.manifestName;
+}
+
+/**
+ * Vendored fallback paths for the FIRST_PARTY_FALLBACKS shorts (notes /
+ * channel). KNOWN_MODULES shorts (vault / scribe / runner) don't carry
+ * vendored paths — they self-register and services.json is authoritative;
+ * absent a services.json entry the module is "not installed."
+ */
+function fallbackPathsForShort(short: string): readonly string[] | undefined {
+  return FIRST_PARTY_FALLBACKS[short]?.manifest.paths;
+}
+
+function fallbackStripPrefixForShort(short: string): boolean | undefined {
+  return FIRST_PARTY_FALLBACKS[short]?.manifest.stripPrefix;
+}
 
 /** Scope required on the SPA's bearer to call any of these endpoints. */
 export const API_MODULES_CONFIG_REQUIRED_SCOPE = "parachute:host:admin";
@@ -127,10 +152,10 @@ function resolveUpstream(
       hostsBareParachute: boolean;
     }
   | { installed: false } {
-  const fb = FIRST_PARTY_FALLBACKS[short];
-  if (!fb) return { installed: false };
+  const manifestName = manifestNameForShort(short);
+  if (!manifestName) return { installed: false };
   const manifest = readManifest(manifestPath);
-  const entry = manifest.services.find((s) => s.name === fb.manifest.manifestName);
+  const entry = manifest.services.find((s) => s.name === manifestName);
   if (!entry) return { installed: false };
   // Mount = the first path the service registers (canonical convention
   // matches `findServiceUpstream` in hub-server.ts). Strip prefix mirrors
@@ -138,17 +163,24 @@ function resolveUpstream(
   // the default. We compute it here rather than threading the proxy helper
   // because we're constructing the upstream URL ourselves, not piggy-backing
   // on `proxyRequest`.
-  const mount = entry.paths[0] ?? fb.manifest.paths[0] ?? "/";
+  //
+  // KNOWN_MODULES shorts (vault / scribe / runner) self-register their
+  // canonical `paths` + `stripPrefix` into the entry on boot, so the
+  // fallback-paths consultation below is a no-op for them — only notes /
+  // channel still need the vendored fallback shape.
+  const fbPaths = fallbackPathsForShort(short);
+  const fbStripPrefix = fallbackStripPrefixForShort(short);
+  const mount = entry.paths[0] ?? fbPaths?.[0] ?? "/";
   const stripPrefix =
-    entry.stripPrefix !== undefined ? entry.stripPrefix : (fb.manifest.stripPrefix ?? false);
+    entry.stripPrefix !== undefined ? entry.stripPrefix : (fbStripPrefix ?? false);
   // Check both the live services.json entry (operator-authoritative) and the
   // vendored fallback (so a `bun link` install without a written entry still
-  // routes correctly). Match a trailing slash too — `["/.parachute/"]` is the
-  // same intent as `["/.parachute"]`.
+  // routes correctly for notes / channel). Match a trailing slash too —
+  // `["/.parachute/"]` is the same intent as `["/.parachute"]`.
   const isBareParachute = (p: string): boolean =>
     p === "/.parachute" || p === "/.parachute/" || p.startsWith("/.parachute/");
   const hostsBareParachute =
-    entry.paths.some(isBareParachute) || fb.manifest.paths.some(isBareParachute);
+    entry.paths.some(isBareParachute) || (fbPaths?.some(isBareParachute) ?? false);
   return { installed: true, port: entry.port, mount, stripPrefix, hostsBareParachute };
 }
 

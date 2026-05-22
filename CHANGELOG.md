@@ -2,6 +2,71 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.7] - 2026-05-22
+
+**feat(hub): mark same-hub DCR clients for auto-trust (#312) — parachute-app integration.**
+
+Foundational for parachute-app's friend-deploy story (per parachute-app design doc §6 + apps Phase 2.0): apps installs UIs by calling hub's DCR endpoint with the operator bearer; hub now records those as "same-hub" and skips the consent screen at `/oauth/authorize` for non-admin scopes. The operator who installed the app IS the implicit consent for each UI it registers — a per-UI consent click was friction without security value.
+
+This generalizes hub#270's "auto-approve first OAuth client after wizard" — now any same-hub app auto-approves, not just the first.
+
+**What landed.**
+
+- **Migration v9.** Adds `INTEGER NOT NULL DEFAULT 0` column `same_hub` to the `clients` table. Pre-existing rows backfill to 0 (the safe default — they keep requiring consent).
+- **DCR registration (`POST /oauth/register`).** Marks new clients `same_hub=true` when the registrant authenticated as the operator: bearer with `hub:admin` (the install-time path used by parachute-app + first-party modules) OR session-cookie + same-origin POST (the operator's own browser). Wizard-window auto-approve (#268) does NOT set same_hub — that path approves an external registrant, doesn't claim ownership. The response body echoes `same_hub` so callers can verify the marker landed.
+- **Authorize gate (`GET /oauth/authorize`).** New silent-approve gate after the existing scope-coverage gate (#75): when `client.same_hub === true` AND no requested scope is admin-level AND no unnamed vault verb is present (picker still needed for those), the consent HTML is skipped and the auth code minted immediately. A `grants` row is also recorded so subsequent flows hit the standard #75 path uniformly. Logged as `[oauth] auto-approved same-hub client client_id=<id> user_id=<id> scopes=<list>` for audit.
+- **Admin SPA surface.** `/api/oauth/clients/<id>` adds `same_hub: boolean` so future per-client SPA badging (same-hub vs external) can read it directly.
+
+**Auto-approve rule (the load-bearing conditional in `handleAuthorizeGet`):**
+
+```ts
+const hasAdminScope = requestedScopes.some(scopeIsAdmin);
+if (client.sameHub && !hasAdminScope && !hasUnnamedVault) {
+  console.log(`[oauth] auto-approved same-hub client ... (hub#312)`);
+  recordGrant(db, session.userId, client.clientId, requestedScopes);
+  return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
+}
+```
+
+Admin scopes (`hub:admin`, anything `scopeIsAdmin` returns true for) stay on the consent path — even for same-hub clients, the operator should still click for high-power. `parachute:host:admin` + per-vault `vault:<name>:admin` are non-requestable so they never reach this gate anyway.
+
+**Backwards compatibility.** Migration backfills every pre-existing row to `same_hub=0`. They continue to require consent for everything — the safe default. Operators who want to upgrade an existing client to same-hub trust will need a future admin action (out of scope for this PR; the SPA's existing approve-client view doesn't currently expose same_hub editing). The 13 new tests in `DCR same-hub auto-trust (hub#312)` cover the full matrix: DCR marker for each auth path, authorize gate for each scope shape, migration backfill, and audit log emission.
+
+**Tests.** `bun run typecheck` clean. `bun test ./src` 1781 pass (was 1767; +14 — 13 in the new same-hub describe block, 1 in admin-clients). `bunx biome check src/` clean. SPA tests unchanged — no SPA route changes in this PR.
+
+## [0.5.13-rc.6] - 2026-05-21
+
+**refactor(hub): retire VAULT/SCRIBE/RUNNER FALLBACKs — modules now self-register canonically.**
+
+Closes the endgame of the FIRST_PARTY_FALLBACKS arc: vault (vault#356, 0.4.8-rc.4), scribe (scribe#50, 0.4.4-rc.4), and runner (runner#3, 0.1.0-rc.4) each now write their own services.json row at boot via filesystem-direct `selfRegister`. Hub previously vendored a `*_FALLBACK` entry per module so the bun-link dev case (module on disk, never booted) still rendered in the admin SPA catalog and could be installed; now those entries retire — services.json is the canonical source for installed modules, and `module.json` (read from `<installDir>/.parachute/module.json`) is the canonical source for the static manifest.
+
+**What's removed.** `VAULT_FALLBACK`, `SCRIBE_FALLBACK`, `RUNNER_FALLBACK` are gone from `FIRST_PARTY_FALLBACKS` in `src/service-spec.ts`. The remaining entries are `NOTES_FALLBACK` (frontend with a hub-side static-serve shim; retires once notes self-registers, notes#105) and `CHANNEL_FALLBACK` (exploration tier; may retire before it ever ships module.json).
+
+**What replaces them.** A new `KNOWN_MODULES` table carries the minimum hub needs pre-self-register: npm package + manifestName + canonical port / paths / health / kind + display props + imperative `extras` (vault's `init`, scribe's `postInstallFooter`, vault's `/mcp` URL suffix, hasAuth posture). The static-manifest fields are deliberately separate from FIRST_PARTY_FALLBACKS so a future re-introduction of vendored manifest data has to be explicit. `synthesizeManifestForKnownModule(km)` synthesizes a minimal `ModuleManifest` from these fields for graceful-degrade when `module.json` is unreadable (legacy installs from before the contract, test fixtures that mock the disk path).
+
+**The contract going forward.**
+
+- Module **installed** (services.json row present) → operations work using the row's fields. Operator-authoritative.
+- Module **not installed** (no row) → `module_not_installed` 404. Hub no longer falls back to vendored manifest data that would lie about an absent module.
+- Module's lifecycle commands (start/restart) re-resolve the spec from `<installDir>/.parachute/module.json` so the module is authoritative for its own startCmd / paths.
+
+**Consumers updated.**
+
+- `src/service-spec.ts` — split into FALLBACK + KNOWN_MODULES; `shortNameForManifest`, `knownServices`, `canonicalPortForManifest`, `effectivePublicExposure`, `getSpec` consult both tables. New helpers: `KnownModule` type, `composeKnownModuleSpec(km, manifest)`, `synthesizeManifestForKnownModule(km)`.
+- `src/api-modules.ts` — `lookupModule(short)` local helper hides the FALLBACK / KNOWN_MODULES split from the catalog rendering path.
+- `src/api-modules-config.ts` — `manifestNameForShort` + `fallbackPathsForShort` + `fallbackStripPrefixForShort` mirror the same pattern. The not-installed → 404 path now applies uniformly to all three retired shorts.
+- `src/api-modules-ops.ts` — `specFor` delegates to the unified `getSpec`. New `resolveSpawnSpec(short, installDir)` reads module.json post-`bun add -g` so the supervisor spawns with the module's own canonical startCmd. Graceful-degrade falls back to the synthesized manifest when module.json is unreadable.
+- `src/commands/install.ts` — new `kind: "known-module"` `ResolvedTarget` variant for CLI installs of vault / scribe / runner; reads module.json, falls back to `synthesizeManifestForKnownModule` with a clear log line.
+- `src/commands/lifecycle.ts` — `specForEntry` prefers `composeKnownModuleSpec(km, manifest)` (module.json wins) over the imperative `extras.startCmd` for KNOWN_MODULES shorts when installDir is stamped.
+- `src/commands/setup.ts` — `ServiceChoice` carries the minimal subset of spec data the survey + summary banner need so the pre-install path doesn't require a full ServiceSpec.
+- `src/install-source.ts`, `src/hub-server.ts` — small lookups updated to consult both tables.
+
+**Backward compatibility for legacy services.json rows.** KNOWN_MODULES carries an imperative `extras.startCmd` for vault / scribe / runner mirroring the module's canonical declaration. Rows that pre-date installDir stamping (so module.json can't be read because installDir is unknown) still spawn via this fallback startCmd. Once the module reboots and self-registers with installDir, lifecycle reads module.json directly — the imperative startCmd is the bootstrap-only path.
+
+**Tests.** `bun test ./src` 1767 pass (was 1762; +5 in a new `handleApiModulesConfig — FALLBACK retirement (hub#310)` describe block pinning the "not installed → 404 across vault/scribe/runner" + "self-registered row → upstream URL composed from entry" contract). Existing fixtures updated to write the now-authoritative `stripPrefix: true` on scribe rows that previously relied on the vendored fallback for that field (`api-modules-config.test.ts`, `hub-server.test.ts`). `bun run typecheck` clean. `bunx biome check src/` clean. `cd web/ui && bun run test` 183 pass — unchanged, SPA-only changes wouldn't be exercised by this PR.
+
+**NOT retired in this PR.** `NOTES_FALLBACK` stays — notes is a frontend served by hub's `notes-serve.ts` shim, so its startCmd is hub-side logic (port + mount derived from the entry); when notes ships its own server it can self-register and this fallback retires alongside the shim (notes#105). `CHANNEL_FALLBACK` similarly stays (exploration tier).
+
 ## [0.5.13-rc.4] - 2026-05-21
 
 **feat(hub): admin SPA ModuleConfig dereferences $ref in schema definitions (#303).**

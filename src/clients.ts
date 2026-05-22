@@ -34,6 +34,17 @@ export interface OAuthClient {
   registeredAt: string;
   /** Whether the client may participate in OAuth flows. See file header. */
   status: ClientStatus;
+  /**
+   * True when the DCR registrant authenticated as the operator of this hub
+   * (bearer `hub:admin` OR session-cookie + same-origin). The
+   * `/oauth/authorize` consent gate auto-approves same-hub clients for
+   * non-admin scopes — the operator who registered the client is the
+   * implicit consent. External DCR clients (unauthenticated, or auto-
+   * approved via the wizard window) land `sameHub: false` and require
+   * explicit consent regardless of scope (closes hub#312, parachute-app
+   * design §6).
+   */
+  sameHub: boolean;
 }
 
 export class ClientNotFoundError extends Error {
@@ -58,6 +69,7 @@ interface Row {
   client_name: string | null;
   registered_at: string;
   status: string;
+  same_hub: number;
 }
 
 function rowToClient(r: Row): OAuthClient {
@@ -69,6 +81,7 @@ function rowToClient(r: Row): OAuthClient {
     clientName: r.client_name,
     registeredAt: r.registered_at,
     status: r.status === "approved" ? "approved" : "pending",
+    sameHub: r.same_hub === 1,
   };
 }
 
@@ -88,6 +101,13 @@ export interface RegisterClientOpts {
    * before they can run an OAuth flow (closes #74).
    */
   status?: ClientStatus;
+  /**
+   * True when the registrant is the operator of this hub (bearer hub:admin
+   * OR session-cookie + same-origin POST). Drives the consent-screen
+   * auto-approve for non-admin scopes (closes hub#312). Defaults to false
+   * — direct callers (tests, install-time seeds) opt in explicitly.
+   */
+  sameHub?: boolean;
   now?: () => Date;
 }
 
@@ -114,10 +134,11 @@ export function registerClient(db: Database, opts: RegisterClientOpts): Register
   const registeredAt = (opts.now?.() ?? new Date()).toISOString();
   const scopes = (opts.scopes ?? []).join(" ");
   const status: ClientStatus = opts.status ?? "approved";
+  const sameHub = opts.sameHub ?? false;
   db.prepare(
     `INSERT INTO clients
-     (client_id, client_secret_hash, redirect_uris, scopes, client_name, registered_at, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+     (client_id, client_secret_hash, redirect_uris, scopes, client_name, registered_at, status, same_hub)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     clientId,
     clientSecretHash,
@@ -126,6 +147,7 @@ export function registerClient(db: Database, opts: RegisterClientOpts): Register
     opts.clientName ?? null,
     registeredAt,
     status,
+    sameHub ? 1 : 0,
   );
   return {
     client: {
@@ -136,6 +158,7 @@ export function registerClient(db: Database, opts: RegisterClientOpts): Register
       clientName: opts.clientName ?? null,
       registeredAt,
       status,
+      sameHub,
     },
     clientSecret,
   };

@@ -247,6 +247,37 @@ const MIGRATIONS: readonly Migration[] = [
       UPDATE users SET password_changed = 1;
     `,
   },
+  {
+    version: 9,
+    sql: `
+      -- Same-hub DCR auto-trust (hub#312, design-doc parachute-app §6).
+      -- One column on \`clients\`:
+      --
+      --   * same_hub (INTEGER 0/1) — true when the DCR caller authenticated
+      --     as the operator (bearer hub:admin OR session-cookie+same-origin),
+      --     so the resulting client is "owned by this hub". The /oauth/
+      --     authorize consent gate skips the consent screen for same_hub
+      --     clients requesting only non-admin scopes — the operator who
+      --     registered the client IS the implicit consent, and a repeated
+      --     click per UI install is friction without security value.
+      --
+      -- External DCR (no auth, or post-#268 wizard-window approve) lands
+      -- same_hub=0 and requires explicit consent regardless of scope. The
+      -- first-client wizard-window (hub#268) auto-APPROVES but is NOT same-
+      -- hub: the operator deliberately ran the wizard, but the registrant
+      -- (a third-party app from a friend's hub, browser, install script)
+      -- is external. Approval ≠ ownership.
+      --
+      -- Backfill: every existing row pre-dates this migration. The safe
+      -- default is same_hub=0 — pre-existing clients keep showing consent.
+      -- Operators who want to upgrade an existing client to same-hub trust
+      -- can do so via a future admin action (out of scope for this PR; the
+      -- SPA's existing approve-client view doesn't currently surface
+      -- same_hub).
+      ALTER TABLE clients ADD COLUMN same_hub INTEGER NOT NULL DEFAULT 0;
+      UPDATE clients SET same_hub = 0;
+    `,
+  },
 ];
 
 export function openHubDb(path: string = hubDbPath()): Database {

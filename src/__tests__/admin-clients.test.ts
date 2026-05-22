@@ -115,6 +115,32 @@ describe("handleGetClient", () => {
     expect(body.redirect_uris).toEqual(["https://app.example/cb"]);
     expect(body.scopes).toEqual(["vault:work:read"]);
     expect(typeof body.registered_at).toBe("string");
+    // hub#312 — same_hub surfaced for future SPA badging. Default false
+    // when the test registers via the helper (no operator-auth path).
+    expect(body.same_hub).toBe(false);
+  });
+
+  test("same_hub=true client surfaces same_hub: true in the response (hub#312)", async () => {
+    // The DCR path stamps same_hub=true on operator-authenticated
+    // registrations. Pin that the admin view exposes that flag so future
+    // SPA changes (per-client same-hub badge) can read it directly from
+    // /api/oauth/clients/<id>.
+    const { bearer } = await makeOperatorBearer();
+    const r = registerClient(harness.db, {
+      redirectUris: ["https://app.example/cb"],
+      scopes: ["vault:work:read"],
+      status: "approved",
+      sameHub: true,
+      clientName: "SameHubApp",
+    });
+    const id = r.client.clientId;
+    const res = await handleGetClient(getReq(id, bearer), id, {
+      db: harness.db,
+      issuer: ISSUER,
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.same_hub).toBe(true);
   });
 
   test("returns the row's status after approval (so the SPA can short-circuit re-approve)", async () => {

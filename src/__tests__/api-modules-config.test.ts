@@ -248,20 +248,155 @@ describe("handleApiModulesConfig — module-not-installed", () => {
   });
 });
 
+/**
+ * Regression suite for hub#310 — vault / scribe / runner retired their
+ * FIRST_PARTY_FALLBACKS entries because each module now self-registers its
+ * services.json row at boot (vault#356, scribe#50, runner#3). The contract:
+ *
+ *   - **services.json has a row** → operations work using its fields
+ *     (operator-authoritative).
+ *   - **services.json has no row** → `module_not_installed` 404. Hub no
+ *     longer falls back to vendored manifest data — pretending a module is
+ *     installed when it isn't was the anti-pattern we're retiring.
+ *
+ * These tests pin both halves of that contract per FALLBACK-retired short
+ * (vault / scribe / runner) so a future re-introduction of vendored data
+ * would have to explicitly delete them.
+ */
+describe("handleApiModulesConfig — FALLBACK retirement (hub#310)", () => {
+  let h: Harness;
+  beforeEach(async () => {
+    h = await makeHarness();
+  });
+  afterEach(() => h.cleanup());
+
+  test("vault not in services.json → 404 module_not_installed (no vendored fallback)", async () => {
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const res = await handleApiModulesConfig(
+      makeReq("/api/modules/vault/config/schema", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "vault", suffix: "schema" },
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath },
+    );
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toBe("module_not_installed");
+  });
+
+  test("scribe not in services.json → 404 module_not_installed (no vendored fallback)", async () => {
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const res = await handleApiModulesConfig(
+      makeReq("/api/modules/scribe/config/schema", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "scribe", suffix: "schema" },
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath },
+    );
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toBe("module_not_installed");
+  });
+
+  test("runner not in services.json → 404 module_not_installed (no vendored fallback)", async () => {
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const res = await handleApiModulesConfig(
+      makeReq("/api/modules/runner/config/schema", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "runner", suffix: "schema" },
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath },
+    );
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: string }).error).toBe("module_not_installed");
+  });
+
+  test("vault in services.json with self-registered fields → upstream URL composed from entry", async () => {
+    // Self-registered vault row (mirrors what vault#356's `selfRegister` writes):
+    // installDir + canonical paths + version + stripPrefix omitted (vault doesn't
+    // strip). The config proxy must build `/vault/default/.parachute/config/schema`
+    // — vault's per-mount routing requires the prefix.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.4.8-rc.4",
+        installDir: "/parachute/modules/node_modules/@openparachute/vault",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const upstream = makeFakeUpstream(() => Response.json({ type: "object", properties: {} }));
+    const res = await handleApiModulesConfig(
+      makeReq("/api/modules/vault/config/schema", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "vault", suffix: "schema" },
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        upstreamFetch: upstream.fetchFn,
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(upstream.calls[0]?.url).toBe(
+      "http://127.0.0.1:1940/vault/default/.parachute/config/schema",
+    );
+  });
+
+  test("runner in services.json with self-registered fields → routes to bare /.parachute path", async () => {
+    // Self-registered runner row (mirrors what runner#3's `selfRegister` writes):
+    // multi-path declaration with `/.parachute` second → hub#307 routes the
+    // config proxy to the bare URL regardless of stripPrefix.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-runner",
+        port: 1945,
+        paths: ["/runner", "/.parachute"],
+        health: "/runner/healthz",
+        version: "0.1.0-rc.4",
+        stripPrefix: false,
+        installDir: "/parachute/modules/node_modules/@openparachute/runner",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_CONFIG_REQUIRED_SCOPE]);
+    const upstream = makeFakeUpstream(() => Response.json({ type: "object" }));
+    const res = await handleApiModulesConfig(
+      makeReq("/api/modules/runner/config/schema", {
+        headers: { authorization: `Bearer ${bearer}` },
+      }),
+      { short: "runner", suffix: "schema" },
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        upstreamFetch: upstream.fetchFn,
+      },
+    );
+    expect(res.status).toBe(200);
+    // Bare path — runner hosts /.parachute at root regardless of stripPrefix.
+    expect(upstream.calls[0]?.url).toBe("http://127.0.0.1:1945/.parachute/config/schema");
+  });
+});
+
 describe("handleApiModulesConfig — proxy + mint", () => {
   let h: Harness;
   beforeEach(async () => {
     h = await makeHarness();
-    // Scribe at port 1943 with `/scribe` mount + stripPrefix true (matches
-    // FIRST_PARTY_FALLBACKS — verified upstream paths must be the bare
-    // `/.parachute/config/schema` shape).
+    // Scribe at port 1943 with `/scribe` mount + `stripPrefix: true`.
+    // Post hub#310 (vault/scribe/runner FALLBACK retirement), services.json
+    // is the authoritative source for `stripPrefix` — scribe#50 self-
+    // registers the flag at boot, so the canonical post-self-register row
+    // carries it. Verified upstream paths must be the bare
+    // `/.parachute/config[/schema]` shape.
     writeManifest(h.manifestPath, [
       {
         name: "parachute-scribe",
         port: 1943,
         paths: ["/scribe"],
         health: "/health",
-        version: "0.4.0",
+        version: "0.4.4-rc.4",
+        stripPrefix: true,
       },
     ]);
   });

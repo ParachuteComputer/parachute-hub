@@ -16,10 +16,14 @@ import {
   CANONICAL_PORT_MAX,
   CANONICAL_PORT_MIN,
   FIRST_PARTY_FALLBACKS,
+  type FirstPartyExtras,
   type FirstPartyFallback,
+  KNOWN_MODULES,
+  type KnownModule,
   type ServiceSpec,
   composeServiceSpec,
   isCanonicalPort,
+  synthesizeManifestForKnownModule,
 } from "../service-spec.ts";
 import { findService, readManifest, upsertService } from "../services-manifest.ts";
 import { WELL_KNOWN_PATH } from "../well-known.ts";
@@ -354,6 +358,17 @@ async function readInstalledManifest(
  * and the resolution decides everything downstream — package name to bun-add,
  * whether a vendored fallback applies, whether a missing
  * `.parachute/module.json` is a hard error.
+ *
+ * The first-party path splits two ways post-hub#310:
+ *
+ *   - **fallback**: notes / channel still ship a vendored manifest + extras
+ *     in FIRST_PARTY_FALLBACKS. Missing `module.json` is non-fatal — the
+ *     embedded manifest carries the install through.
+ *   - **known**: vault / scribe / runner have retired their FALLBACK entries.
+ *     We know the package + manifestName + imperative extras (init,
+ *     postInstallFooter, urlForEntry, hasAuth) but NOT the static manifest;
+ *     `module.json` is the contract and a missing one is a hard error,
+ *     same posture as third-party.
  */
 type ResolvedTarget =
   | {
@@ -361,6 +376,12 @@ type ResolvedTarget =
       readonly short: string;
       readonly packageName: string;
       readonly fallback: FirstPartyFallback;
+    }
+  | {
+      readonly kind: "known-module";
+      readonly short: string;
+      readonly packageName: string;
+      readonly known: KnownModule;
     }
   | {
       readonly kind: "npm";
@@ -400,6 +421,18 @@ function resolveInstallTarget(
       short: candidate,
       packageName: fb.package,
       fallback: fb,
+    };
+  }
+  const km = KNOWN_MODULES[candidate];
+  if (km) {
+    if (aliased !== undefined) {
+      log(`"${input}" has been renamed to "${aliased}"; installing ${aliased}.`);
+    }
+    return {
+      kind: "known-module",
+      short: candidate,
+      packageName: km.package,
+      known: km,
     };
   }
 
@@ -457,7 +490,10 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
       targetReal = target.absPath;
     }
   }
-  if (target.kind === "first-party" && isLinked(target.packageName)) {
+  if (
+    (target.kind === "first-party" || target.kind === "known-module") &&
+    isLinked(target.packageName)
+  ) {
     log(`${target.packageName} is already linked globally (bun link) — skipping bun add.`);
   } else if (target.kind === "local-path" && localAlreadyLinkedTo === targetReal) {
     log(`${target.packageName} is already linked at ${target.absPath} — skipping bun add.`);
@@ -513,10 +549,28 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   if (installedManifest === "error") return 1;
 
   let manifest: ModuleManifest;
-  let extras = undefined as FirstPartyFallback["extras"] | undefined;
+  let extras: FirstPartyExtras | undefined;
   if (target.kind === "first-party") {
     manifest = installedManifest ?? target.fallback.manifest;
     extras = target.fallback.extras;
+  } else if (target.kind === "known-module") {
+    // KNOWN_MODULES shorts (vault / scribe / runner) carry no vendored
+    // manifest (hub#310). The module's own `.parachute/module.json` is the
+    // canonical source. When it's unreadable (legacy installs from before
+    // module.json shipped, or test fixtures that mock the disk path without
+    // writing a real manifest), synthesize a minimal manifest from
+    // KNOWN_MODULES' canonical fields so the install path can still seed
+    // services.json. The synthesized version mirrors what the module's
+    // module.json carries — kept in sync as a graceful-degrade safety net.
+    // The CLI imperative bits (init, postInstallFooter, urlForEntry,
+    // hasAuth) come from `target.known.extras`.
+    manifest = installedManifest ?? synthesizeManifestForKnownModule(target.known);
+    if (!installedManifest) {
+      log(
+        `${target.packageName} did not ship .parachute/module.json — using hub's vendored canonical manifest as a fallback. Re-install with a newer module to pick up its own module.json.`,
+      );
+    }
+    extras = target.known.extras;
   } else {
     if (!installedManifest) {
       log(`✗ ${target.packageName} does not ship .parachute/module.json — not a Parachute module.`);
@@ -528,7 +582,10 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     // Third-party `name` collides with a first-party shortname → reject
     // before we mint a services.json row that would hide a real first-party
     // install. (Scope namespace is also `name`; collision == squatting.)
-    if (FIRST_PARTY_FALLBACKS[installedManifest.name] !== undefined) {
+    if (
+      FIRST_PARTY_FALLBACKS[installedManifest.name] !== undefined ||
+      KNOWN_MODULES[installedManifest.name] !== undefined
+    ) {
       log(
         `✗ ${target.packageName}: module name "${installedManifest.name}" collides with a first-party Parachute module.`,
       );
@@ -537,7 +594,8 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     manifest = installedManifest;
   }
 
-  const short = target.kind === "first-party" ? target.short : manifest.name;
+  const short =
+    target.kind === "first-party" || target.kind === "known-module" ? target.short : manifest.name;
   const spec: ServiceSpec = composeServiceSpec({
     packageName: target.packageName,
     manifest,
@@ -550,7 +608,10 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   // CLI seed alone would create dueling rows. The first-party migration to
   // name-keyed rows happens when each upstream ships its own module.json
   // (parachute-hub#56 follow-ups). See parachute-hub#85.
-  const entryName = target.kind === "first-party" ? spec.manifestName : manifest.name;
+  const entryName =
+    target.kind === "first-party" || target.kind === "known-module"
+      ? spec.manifestName
+      : manifest.name;
 
   if (spec.init) {
     // Forward --vault-name from the InstallOpts when set so `parachute setup`

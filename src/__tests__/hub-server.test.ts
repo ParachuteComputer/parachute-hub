@@ -2265,21 +2265,63 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
     }
   });
 
-  test("FIRST_PARTY_FALLBACKS supplies stripPrefix when entry omits it (#196)", async () => {
-    // Operator-symptom regression: scribe `/scribe/health` 404 on Aaron's
-    // box (2026-05-08). Scribe v0.4.0 doesn't write `stripPrefix: true` to
-    // its services.json entry; the declaration only lives in hub's
-    // SCRIBE_FALLBACK manifest. Pre-#187 this didn't matter because the
-    // per-service `tailscale serve` plan baked the path into the target
-    // URL; post-#187 routing went through hub which wasn't consulting the
-    // fallback registry. Result: hub forwarded `/scribe/health` verbatim
-    // to scribe at :1943, scribe served bare paths and 404'd. Fix: hub-
-    // side fallback merge in `stripPrefixFor`.
+  test("self-registered scribe carries stripPrefix on its services.json row (post hub#310)", async () => {
+    // Pre-hub#310, hub vendored `SCRIBE_FALLBACK.manifest.stripPrefix: true`
+    // as a safety net for scribe v0.4.0 (which didn't write the flag to its
+    // own row). Operator-symptom regression on Aaron's box (2026-05-08) for
+    // the missing-flag case: `/scribe/health` 404'd because hub forwarded
+    // the mount-prefixed path verbatim to scribe at :1943 and scribe served
+    // bare paths. Fix: hub-side fallback merge in `stripPrefixFor`.
     //
-    // Use a `parachute-scribe` manifestName so `shortNameForManifest`
-    // resolves to "scribe" → SCRIBE_FALLBACK (which declares
-    // `stripPrefix: true`). The entry itself omits stripPrefix to mirror
-    // what scribe v0.4.0 actually writes today.
+    // Scribe 0.4.4-rc.4+ self-registers `stripPrefix: true` on its row
+    // (scribe#50), so the fallback retired in hub#310. The post-retirement
+    // contract: services.json is authoritative for `stripPrefix` on a
+    // KNOWN_MODULES row; an operator whose row pre-dates scribe#50 needs
+    // to restart scribe to re-stamp. This test pins the
+    // operator-authoritative `stripPrefix: true` case so the proxy still
+    // strips on the canonical post-self-register row.
+    const h = makeHarness();
+    const upstream = startUpstream("scribe");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.4.4-rc.4",
+              // Explicit on-entry — scribe#50 writes this on every boot.
+              stripPrefix: true,
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string; pathname: string };
+      expect(body.tag).toBe("scribe");
+      // The mount prefix is stripped — backend sees the bare `/health`
+      // route that scribe serves.
+      expect(body.pathname).toBe("/health");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("scribe row missing stripPrefix field falls back to KNOWN_MODULES.canonicalStripPrefix (#310 reviewer)", async () => {
+    // After hub#310 retired SCRIBE_FALLBACK, the only fallback for a
+    // legacy services.json row that pre-dates scribe#50 (scribe 0.4.4-rc.4)
+    // is `KNOWN_MODULES.scribe.canonicalStripPrefix: true`. Without that
+    // second-level fallback, `stripPrefixFor` would default to `false` and
+    // scribe paths would route incorrectly — `/scribe/health` would 404
+    // because hub would forward the mount-prefixed path to scribe (which
+    // serves bare paths). This pins the safety net for the
+    // operator-on-old-scribe-row edge case.
     const h = makeHarness();
     const upstream = startUpstream("scribe");
     try {
@@ -2292,8 +2334,7 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
               paths: ["/scribe"],
               health: "/scribe/health",
               version: "0.4.0",
-              // stripPrefix intentionally omitted — must be derived from
-              // FIRST_PARTY_FALLBACKS.scribe.manifest.stripPrefix.
+              // stripPrefix intentionally omitted — pre-scribe#50 shape.
             },
           ],
         },
@@ -2304,8 +2345,8 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as { tag: string; pathname: string };
       expect(body.tag).toBe("scribe");
-      // The mount prefix is stripped — backend sees the bare `/health`
-      // route that scribe v0.4.0 actually serves.
+      // The KNOWN_MODULES.scribe.canonicalStripPrefix fallback strips the
+      // mount — backend sees the bare `/health` route.
       expect(body.pathname).toBe("/health");
     } finally {
       upstream.stop();
