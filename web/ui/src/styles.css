@@ -655,6 +655,117 @@ a.btn:hover {
 }
 
 /*
+ * Hosted-UI sub-units rendered under a `.module-row` (hub#313 / #315).
+ *
+ * `<details className="module-uis">` is the operator-collapsible
+ * wrapper; the `<ul className="ui-sub-units">` inside it lays each
+ * sub-unit out as a single icon + body + status row. Indented from the
+ * parent module row so the operator reads it as "stuff this module
+ * hosts" rather than as a peer module. Status badges reuse the same
+ * `.status status-<state>` shape as the supervisor badge on
+ * `.module-row` — colors are sourced from the existing accent / warn /
+ * fg-muted tokens so the palette stays continuous.
+ */
+.module-uis {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0 0;
+  border-top: 1px solid var(--border-light);
+}
+.module-uis > summary {
+  cursor: pointer;
+  font-size: 0.88rem;
+  color: var(--fg-muted);
+  font-weight: 500;
+  padding: 0.15rem 0;
+  list-style: revert; /* keep native disclosure triangle */
+}
+.module-uis > summary:hover {
+  color: var(--fg);
+}
+.ui-sub-units {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.ui-sub-unit {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.ui-sub-unit:hover {
+  border-color: var(--accent);
+  background: white;
+}
+.ui-icon {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  object-fit: contain;
+}
+.ui-sub-unit-body {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.ui-sub-unit-link {
+  color: var(--fg);
+  font-size: 0.95rem;
+  text-decoration: none;
+}
+.ui-sub-unit-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.ui-sub-unit-link strong {
+  font-weight: 600;
+}
+.ui-sub-unit .tagline {
+  margin: 0.2rem 0 0;
+  font-size: 0.82rem;
+  color: var(--fg-muted);
+}
+
+/*
+ * Generic `.status` badge + per-state colors. Used by both the
+ * `.module-row` supervisor badge and by `.ui-sub-unit` (hub#313).
+ * Shape mirrors `.tag` — small inline-block pill, palette-aligned.
+ * Defaults to muted gray; per-state classes override only color +
+ * background so adding a new state is a one-rule extension.
+ */
+.status {
+  flex: 0 0 auto;
+  display: inline-block;
+  padding: 0.1em 0.55em;
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+  border-radius: 4px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.status-active {
+  background: var(--success-soft);
+  color: var(--success);
+}
+.status-pending-oauth {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.status-disabled {
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+}
+
+/*
  * Visually-hidden utility for screen-reader-only text. Used by the
  * first-admin disabled-Delete button on /admin/users to wire
  * `aria-describedby` to an explanation that's invisible to sighted
