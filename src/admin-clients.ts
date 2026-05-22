@@ -44,6 +44,13 @@ export interface AdminClientView {
   scopes: string[];
   status: "pending" | "approved";
   registered_at: string;
+  /**
+   * True when the client was registered by the operator of this hub
+   * (bearer hub:admin OR session-cookie + same-origin DCR). Used by the
+   * authorize handler to auto-approve non-admin scopes (hub#312). Surfaced
+   * here so future SPA views can badge same-hub vs external clients.
+   */
+  same_hub: boolean;
 }
 
 export async function handleGetClient(
@@ -70,6 +77,7 @@ export async function handleGetClient(
     scopes: client.scopes,
     status: client.status,
     registered_at: client.registeredAt,
+    same_hub: client.sameHub,
   };
   return new Response(JSON.stringify(view), {
     status: 200,
