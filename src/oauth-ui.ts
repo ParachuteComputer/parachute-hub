@@ -104,6 +104,33 @@ export interface ConsentViewProps {
    * itself.
    */
   displayVault?: string | null;
+  /**
+   * Multi-user Phase 1 (hub#284): set when the signed-in user's
+   * `assigned_vault` no longer matches a vault registered on this hub.
+   * The hub-side fallout of an admin removing / renaming a vault that's
+   * still pinned to one or more users — the user's locked picker would
+   * otherwise post the stale name and the server-side defense at
+   * `handleConsentSubmit` rejects it with a generic "Unknown vault" 400
+   * that doesn't tell the user what to do next.
+   *
+   * Renders a warning banner above the scope list explaining the state +
+   * pointing the user at admin remediation, and the picker section
+   * substitutes the no-vaults-available shape (`availableVaults: []`,
+   * `lockedVault: undefined`) so the form gracefully rejects an Approve
+   * click instead of silently submitting the missing vault name.
+   */
+  staleAssignedVault?: string;
+  /**
+   * Set when `staleAssignedVault` is set AND the requested scope depends
+   * on a vault (unnamed `vault:<verb>` that needs the picker, or a named
+   * `vault:<staleAssignedVault>:<verb>` requested by the client). When
+   * true, the Approve button renders disabled — the user can't validly
+   * mint a token against a vault that doesn't exist. When the banner
+   * fires for a non-vault-scoped request (e.g. consenting to
+   * `scribe:transcribe` while assignment is stale), this stays false and
+   * the user can still proceed.
+   */
+  blockApproveForStaleAssignment?: boolean;
 }
 
 export interface VaultPicker {
@@ -220,7 +247,17 @@ export function renderLogin(props: LoginViewProps): string {
 }
 
 export function renderConsent(props: ConsentViewProps): string {
-  const { params, clientName, clientId, scopes, vaultPicker, csrfToken, displayVault } = props;
+  const {
+    params,
+    clientName,
+    clientId,
+    scopes,
+    vaultPicker,
+    csrfToken,
+    displayVault,
+    staleAssignedVault,
+    blockApproveForStaleAssignment,
+  } = props;
   // Substitute unnamed `vault:<verb>` rows with the resolved named form so
   // the operator sees the scope shape that will appear in the token. Raw
   // `scopes` keeps the wire form for the hidden form fields; only what's
@@ -235,9 +272,38 @@ export function renderConsent(props: ConsentViewProps): string {
   // empty-vault branch (no vaults registered) is the original case. A
   // locked-vault picker (multi-user Phase 1) always has a valid value via
   // the hidden input, so Approve stays enabled.
+  //
+  // Stale-assignment case (hub#284): the user's assigned_vault no longer
+  // exists in services.json, so even though the GET handler resolved
+  // `assignedVault` for the session user, we deliberately omit `lockedVault`
+  // from the picker and present `availableVaults: []` instead — the user
+  // can't validly Approve without admin remediation. Disabling Approve
+  // matches the empty-vault posture so a form submit never sends a vault
+  // name that the server-side defense would reject as Unknown vault.
+  // `blockApproveForStaleAssignment` is set by the handler only when the
+  // requested scope actually depends on a vault — non-vault flows (e.g.
+  // `scribe:transcribe` only) keep Approve enabled so the user can still
+  // proceed despite the informational banner.
   const approveDisabled =
-    vaultPicker && vaultPicker.lockedVault === undefined && vaultPicker.availableVaults.length === 0
+    (vaultPicker &&
+      vaultPicker.lockedVault === undefined &&
+      vaultPicker.availableVaults.length === 0) ||
+    blockApproveForStaleAssignment === true
       ? " disabled"
+      : "";
+  // Banner copy (hub#284). Worded to the *user* — "ask the admin" framing
+  // matches the user-facing tone of the rest of the consent screen. The
+  // vault name is HTML-escaped before insertion; the issue's pinned scope is
+  // a user-actionable message rather than the pre-rc.11 generic 400.
+  const staleBanner =
+    staleAssignedVault !== undefined
+      ? `<p class="stale-assignment-banner" role="alert">
+            <strong>Your assigned vault was removed.</strong>
+            The vault <code>${escapeHtml(staleAssignedVault)}</code> is no longer
+            registered on this hub. Ask the hub admin to reassign you to an
+            existing vault via <code>/admin/users</code>, then try signing in
+            again.
+          </p>`
       : "";
   const body = `
     <div class="card">
@@ -255,6 +321,7 @@ export function renderConsent(props: ConsentViewProps): string {
           <code>${escapeHtml(clientId)}</code>
         </p>
       </div>
+      ${staleBanner}
       <section class="scopes">
         <h2 class="scopes-title">Permissions requested</h2>
         <ul class="scope-list">${scopeRows}</ul>
@@ -908,6 +975,25 @@ const STYLES = `
     padding: 0.6rem 0.8rem;
     margin: 0 0 1rem;
     font-size: 0.9rem;
+  }
+  /* hub#284 — surfaces "your assigned vault was removed" above the
+     consent scope list. Same shape as error-banner but slightly more
+     room for the multi-sentence remediation copy. */
+  .stale-assignment-banner {
+    background: ${PALETTE.dangerSoft};
+    border: 1px solid ${PALETTE.danger};
+    border-radius: 6px;
+    color: ${PALETTE.danger};
+    padding: 0.75rem 0.9rem;
+    margin: 0 0 1.25rem;
+    font-size: 0.9rem;
+    line-height: 1.45;
+  }
+  .stale-assignment-banner strong { display: block; margin-bottom: 0.25rem; }
+  .stale-assignment-banner code {
+    background: rgba(0, 0, 0, 0.04);
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
   }
   .error-title { color: ${PALETTE.danger}; }
   .error-help {

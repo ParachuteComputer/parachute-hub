@@ -5684,3 +5684,650 @@ describe("DCR same-hub auto-trust (hub#312)", () => {
     }
   });
 });
+
+// closes hub#284 — multi-user Phase 2 polish. A user has an `assigned_vault`
+// pinned on their row but the admin later removes the matching vault from
+// services.json. Pre-rc.11 the user landed on the consent screen with the
+// locked picker rendering the missing name, submitted the form, and hit a
+// generic "Unknown vault" 400 that gave no path forward. These tests cover
+// the new shape:
+//
+//   - GET handler renders a "Your assigned vault was removed" banner + an
+//     admin-managed remediation hint + a no-vaults picker section + disabled
+//     Approve (when the requested scope depends on a vault).
+//   - POST handler surfaces the same admin-managed remediation hint in the
+//     400 body when a hand-crafted form bypasses the disabled-Approve UI
+//     and posts the stale name, AND when a named `vault:<stale>:<verb>`
+//     scope was requested directly.
+//   - Banner is informational only when the requested scope doesn't depend
+//     on a vault — the user can still consent to e.g. `scribe:transcribe`
+//     while their assignment is stale.
+describe("handleAuthorizeGet — stale assigned_vault surfaces banner (hub#284)", () => {
+  // Manifest with only `other` — the user's assigned `default` is missing
+  // (admin removed it without reassigning).
+  const otherOnlyManifest: ServicesManifest = {
+    services: [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/other"],
+        health: "/health",
+        version: "0.3.0",
+      },
+    ],
+  };
+  // Empty manifest — every vault has been removed.
+  const emptyVaultManifest: ServicesManifest = {
+    services: [
+      {
+        name: "parachute-scribe",
+        port: 1943,
+        paths: ["/scribe"],
+        health: "/health",
+        version: "0.3.0-rc.1",
+      },
+    ],
+  };
+
+  test("unnamed vault scope + stale assignment → banner + no-vaults picker + disabled Approve", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => otherOnlyManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Banner present with the stale vault name + admin remediation hint.
+      expect(html).toContain('class="stale-assignment-banner"');
+      expect(html).toContain("Your assigned vault was removed");
+      expect(html).toContain("<code>default</code>");
+      expect(html).toContain("/admin/users");
+      // Picker pivoted to no-vaults-available — NO locked-picker hidden
+      // input carrying the stale name, NO radio choices for `other`.
+      expect(html).not.toContain('<input type="hidden" name="vault_pick" value="default"');
+      expect(html).not.toContain('type="radio" name="vault_pick"');
+      // Approve button is disabled.
+      expect(html).toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("named vault scope targeting stale assignment → banner + disabled Approve", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          // Client knew the vault name + asked directly for the named verb.
+          scope: "vault:default:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => otherOnlyManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('class="stale-assignment-banner"');
+      expect(html).toContain("Your assigned vault was removed");
+      // Approve disabled — the token would point at a vault that doesn't
+      // exist, so don't let the user mint it.
+      expect(html).toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-vault scope + stale assignment → informational banner + Approve stays enabled", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          // Non-vault scope only — user CAN still consent to scribe access
+          // despite the stale assignment.
+          scope: "scribe:transcribe",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => emptyVaultManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Banner shown for visibility even though scope is vault-free.
+      expect(html).toContain('class="stale-assignment-banner"');
+      expect(html).toContain("Your assigned vault was removed");
+      // Approve NOT disabled — user can still consent to scribe-only access.
+      expect(html).not.toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("admin user (assigned_vault null) → no stale-assignment banner ever", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin-aaron", "pw");
+      const session = createSession(db, { userId: admin.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      // Even with zero vaults registered, admin sees the existing
+      // empty-vault picker, not the stale-assignment banner — the banner
+      // is for `assigned_vault !== null` only.
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => emptyVaultManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain('class="stale-assignment-banner"');
+      expect(html).not.toContain("Your assigned vault was removed");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("user with intact assignment → no banner (pre-#284 happy path stays clean)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      // Fixture manifest has `default`, matching bob's assignment.
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain('class="stale-assignment-banner"');
+      expect(html).not.toContain("Your assigned vault was removed");
+      // Locked-picker still rendered as before.
+      expect(html).toContain('<input type="hidden" name="vault_pick" value="default"');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("handleAuthorizePost — stale assigned_vault clean 400 (hub#284)", () => {
+  const otherOnlyManifest: ServicesManifest = {
+    services: [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/other"],
+        health: "/health",
+        version: "0.3.0",
+      },
+    ],
+  };
+
+  test("hand-crafted POST with stale vault_pick → 'Assigned vault was removed' 400 (not generic Unknown vault)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        // Hand-crafted POST submitting bob's stale assignment — simulates a
+        // bypass of the GET handler's disabled Approve.
+        vault_pick: "default",
+      });
+      const res = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: () => otherOnlyManifest },
+      );
+      expect(res.status).toBe(400);
+      const html = await res.text();
+      // New copy: title + body name the actual condition + remediation.
+      expect(html).toContain("Assigned vault was removed");
+      expect(html).toContain("/admin/users");
+      expect(html).toContain("&quot;default&quot;");
+      // Old generic copy must NOT be the title in this case.
+      expect(html).not.toMatch(/<h1[^>]*>Unknown vault<\/h1>/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("hand-crafted POST with vault_pick naming a never-existed vault → still hits generic Unknown vault 400", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        // A name that's not bob's assignment AND not in the manifest. The
+        // mismatch check should fire first (since it's not bob's assigned
+        // vault). Pin the existing shape against accidental capture by the
+        // hub#284 special-case.
+        vault_pick: "ghost-vault",
+      });
+      const res = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: () => otherOnlyManifest },
+      );
+      expect(res.status).toBe(400);
+      const html = await res.text();
+      // The mismatch check fires BEFORE the validNames check at the picker
+      // site (validNames-fail-then-special-case is a per-site narrowing) —
+      // but the named-scope mismatch check fires at the second site. Either
+      // way the response should NOT be the new stale-assignment copy.
+      expect(html).not.toContain("Assigned vault was removed");
+      expect(html).not.toContain("/admin/users");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("named scope vault:<stale>:read → POST refuses with 'Assigned vault was removed' 400", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        // Named scope shape: client asked for `vault:default:read` directly
+        // (knew the user's assignment). No picker involved.
+        scope: "vault:default:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+      });
+      const res = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: () => otherOnlyManifest },
+      );
+      expect(res.status).toBe(400);
+      const html = await res.text();
+      expect(html).toContain("Assigned vault was removed");
+      expect(html).toContain("&quot;default&quot;");
+      expect(html).toContain("/admin/users");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// closes hub#284 reviewer fold — `hasStaleAssignment` predicate gates BOTH
+// the #75 skip-consent fast-path AND the hub#312 same-hub auto-trust gate,
+// not just the consent-render path. Pre-fold, a user with a prior
+// `vault:default:read` grant on a now-removed vault landed at the skip-
+// consent gate and silently minted a token for a vault the resource server
+// couldn't find — the consent screen (with its banner) never rendered. The
+// same-hub variant had the matching gap: a same-hub client requesting
+// `vault:default:read` on a stale assignment would auto-approve before the
+// stale-detection code at consent render ever ran. These tests pin both
+// gates to fall through to the consent render when assignment is stale.
+describe("handleAuthorizeGet — stale assignment gates both fast-paths (hub#284 reviewer)", () => {
+  // Manifest with only `other` — the user's assigned `default` is missing.
+  const otherOnlyManifest: ServicesManifest = {
+    services: [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/other"],
+        health: "/health",
+        version: "0.3.0",
+      },
+    ],
+  };
+
+  test("stale + prior grant covers scope → skip-consent gate SKIPPED, banner rendered (not silent mint)", async () => {
+    // Critical reviewer case. The variant most likely to bite real users:
+    // they previously consented to `vault:default:read` (grant recorded),
+    // then admin removed `default`. Pre-fold the next /authorize hit the
+    // skip-consent gate and silently issued a token for the missing vault.
+    // Post-fold the gate skips, the consent screen renders, banner shows.
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { recordGrant } = await import("../grants.ts");
+      // Prior grant: covers the request below exactly.
+      recordGrant(db, bob.id, reg.client.clientId, ["vault:default:read"]);
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => otherOnlyManifest,
+      });
+      // Consent screen rendered, NOT a 302 silent mint.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const html = await res.text();
+      expect(html).toContain('class="stale-assignment-banner"');
+      expect(html).toContain("Your assigned vault was removed");
+      expect(html).toContain("<code>default</code>");
+      // Approve gated because the named scope targets the stale vault.
+      expect(html).toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("stale + same-hub client → auto-trust gate SKIPPED, banner rendered (not silent mint)", async () => {
+    // The second variant: a same-hub client (parachute-app installed by
+    // the operator) requests `vault:default:read`, the operator's
+    // assigned vault is stale. Pre-fold the hub#312 gate auto-approved
+    // before stale-detection ever ran. Post-fold the gate skips, the
+    // consent screen renders.
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => otherOnlyManifest,
+      });
+      // Consent screen rendered, NOT a 302 silent mint.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const html = await res.text();
+      expect(html).toContain('class="stale-assignment-banner"');
+      expect(html).toContain("Your assigned vault was removed");
+      expect(html).toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("stale + non-vault scope + same-hub client → banner informational, Approve enabled", async () => {
+    // A same-hub client requesting a non-vault scope (`scribe:transcribe`)
+    // hits the auto-trust gate. With a stale assignment we still skip the
+    // auto-trust gate per the fold (assignment is stale = always fall
+    // through), but the scope doesn't depend on a vault so Approve stays
+    // enabled — the user can still consent to scribe access.
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "scribe:transcribe",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => otherOnlyManifest,
+      });
+      // Consent rendered (auto-trust skipped because assignment is stale).
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('class="stale-assignment-banner"');
+      // Approve NOT disabled — non-vault scope is consentable even when
+      // the vault assignment is broken.
+      expect(html).not.toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("not-stale + prior grant covers scope → skip-consent fast-path preserved (no regression)", async () => {
+    // The happy path: user's assigned vault still exists, prior grant
+    // covers the request, /authorize redirects with the auth code. Pin
+    // the fast-path so the fold doesn't break the existing UX.
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { recordGrant } = await import("../grants.ts");
+      recordGrant(db, bob.id, reg.client.clientId, ["vault:default:read"]);
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+          state: "fast-path",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      // Fixture manifest has `default`, matching bob's assignment.
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("code")?.length).toBeGreaterThan(20);
+      expect(loc.searchParams.get("state")).toBe("fast-path");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("not-stale + same-hub client → auto-trust fast-path preserved (no regression)", async () => {
+    // The happy path for the hub#312 gate: same-hub client requests a
+    // non-admin vault scope, user's assignment is intact, gate fires.
+    const { db, cleanup } = await makeDb();
+    try {
+      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+          state: "same-hub-fast",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("code")?.length).toBeGreaterThan(20);
+      expect(loc.searchParams.get("state")).toBe("same-hub-fast");
+    } finally {
+      cleanup();
+    }
+  });
+});
