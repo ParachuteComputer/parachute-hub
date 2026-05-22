@@ -113,6 +113,33 @@ export interface CreateScopeGuardOptions {
    */
   hubOrigin: string | (() => string);
 
+  /**
+   * Accept hub-signed JWTs that lack the `jti` claim entirely. **Default
+   * `false` — strict rejection** (per hub#218 hardening). Operators with
+   * pre-Phase-1 legacy tokens (issued before the token-registry contract
+   * stamped `jti` on every mint) can set this to `true` during a
+   * transition window; the validate path logs a warning via
+   * `missingJtiLogger` (when supplied) but accepts the token.
+   *
+   * Trust framing: rejection is the right default because revocation
+   * cannot be enforced on tokens we can't index. A jti-less hub-signed
+   * JWT is an anomaly — either a pre-registry mint that should have
+   * aged out, or a forged token from an attacker who got a signing key
+   * but skipped the registry path. Operators who explicitly know they
+   * still have legacy tokens in flight can opt out; everyone else gets
+   * the security floor.
+   */
+  allowMissingJti?: boolean;
+
+  /**
+   * Logger called when a jti-less token is accepted under
+   * `allowMissingJti: true`. Lets operators monitor the legacy-token
+   * decay curve before flipping the opt-out back off. Defaults to a
+   * no-op when omitted — callers who want observability supply their
+   * service's structured logger here.
+   */
+  missingJtiLogger?: (info: { sub: string; aud: string | undefined; iat?: number }) => void;
+
   /** Optional JWKS cache tuning. Defaults: 5min cacheMaxAge, 30s cooldown. */
   jwks?: JwksOptions;
 
@@ -195,7 +222,13 @@ function resolveOrigin(input: string | (() => string)): string {
  * and reuse.
  */
 export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
-  const { hubOrigin, jwks: jwksOpts, jwksGetter: injected } = opts;
+  const {
+    hubOrigin,
+    jwks: jwksOpts,
+    jwksGetter: injected,
+    allowMissingJti = false,
+    missingJtiLogger,
+  } = opts;
 
   function pickGetter(origin: string): JwksGetter {
     if (injected) return injected;
@@ -266,7 +299,38 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
       const scopeRaw = (payload as { scope?: unknown }).scope;
       const scopes = typeof scopeRaw === "string" ? parseScopes(scopeRaw) : [];
 
-      const jti = typeof payload.jti === "string" ? payload.jti : undefined;
+      // jti presence is required by default (hub#218 hardening). The hub
+      // token-registry contract (introduced in hub#212 Phase 1) stamps `jti`
+      // on every issued JWT; a hub-signed token lacking the claim is an
+      // anomaly — either a pre-registry mint that should have aged out, or
+      // a forgery from an attacker who got a signing key but skipped the
+      // registry path. Revocation can't be enforced on tokens we can't
+      // index, so the strict default rejects them.
+      //
+      // Operators with legitimate pre-Phase-1 tokens still in flight can
+      // opt out via `allowMissingJti: true`, in which case the missing
+      // claim is logged (when `missingJtiLogger` is supplied) and the
+      // token is accepted. The opt-out is a transition aid, not a steady
+      // state.
+      //
+      // Placement: after signature + iss + sub + audience (so we don't
+      // surface a jti-shape error on a malformed/forged token whose
+      // signature already failed), but before the revocation lookup
+      // (which depends on jti existing).
+      const jtiRaw = payload.jti;
+      const jti = typeof jtiRaw === "string" && jtiRaw.length > 0 ? jtiRaw : undefined;
+      if (jti === undefined) {
+        if (!allowMissingJti) {
+          throw new HubJwtError("shape", "hub JWT missing required `jti` claim");
+        }
+        // Opt-out path: token is accepted but logged so operators can
+        // monitor the legacy-token decay curve.
+        missingJtiLogger?.({
+          sub: payload.sub,
+          aud,
+          iat: typeof payload.iat === "number" ? payload.iat : undefined,
+        });
+      }
       const clientIdRaw = (payload as { client_id?: unknown }).client_id;
       const clientId = typeof clientIdRaw === "string" ? clientIdRaw : undefined;
 
@@ -284,12 +348,14 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
         : [];
 
       // Revocation enforcement runs LAST — only consulted if the JWT is
-      // otherwise valid. Cheaper checks (signature, iss, aud, expiry) reject
-      // first, so a bad signature never costs a network roundtrip. A token
-      // with no jti claim can't appear on any revocation list (lists are
-      // keyed by jti); we let it through. The hub always stamps jti on
-      // OAuth-issued tokens — only ad-hoc/legacy tokens lack one, and those
-      // are out of scope for revocation.
+      // otherwise valid. Cheaper checks (signature, iss, aud, expiry,
+      // jti-presence) reject first, so a bad signature never costs a
+      // network roundtrip. A token with no jti claim can't appear on any
+      // revocation list (lists are keyed by jti); under the strict default
+      // the jti-presence check above already rejected, so we only reach
+      // here with a defined jti. Under the `allowMissingJti: true` opt-out
+      // we may have undefined jti — those tokens skip the lookup entirely
+      // since revocation can't be enforced without an index key.
       if (jti !== undefined) {
         const cache = pickRevocationCache(origin);
         const outcome = await cache.check(jti);

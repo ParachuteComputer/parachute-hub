@@ -575,7 +575,13 @@ describe("createScopeGuard — revocation enforcement", () => {
     guard.resetRevocationCache();
   });
 
-  test("token without jti skips revocation lookup entirely", async () => {
+  test("token without jti (strict default) → code: shape, revocation not consulted", async () => {
+    // hub#218 hardening: a hub-signed JWT lacking `jti` is rejected by
+    // default. The hub token-registry contract (hub#212 Phase 1) stamps
+    // jti on every mint; a jti-less hub JWT is an anomaly we refuse to
+    // validate. Also pins ordering: jti-presence check runs before the
+    // revocation lookup (which depends on jti existing), so a jti-less
+    // token costs zero revocation calls.
     let revocationCalls = 0;
     const guard = createScopeGuard({
       hubOrigin: fixture.origin,
@@ -594,11 +600,157 @@ describe("createScopeGuard — revocation enforcement", () => {
       .setIssuedAt(iat)
       .setExpirationTime(iat + 60)
       .sign(kp.privateKey);
-    const claims = await guard.validateHubJwt(tokenNoJti);
-    expect(claims.jti).toBeUndefined();
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(tokenNoJti);
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught).toBeInstanceOf(HubJwtError);
+    expect(caught?.code).toBe("shape");
+    expect(caught?.message).toMatch(/missing required `jti`/);
     expect(revocationCalls).toBe(0);
     guard.resetJwksCache();
     guard.resetRevocationCache();
+  });
+
+  test("token with empty-string jti → code: shape (strict default)", async () => {
+    // Empty-string jti is treated the same as missing — revocation lookup
+    // would be a no-op (no list entry can match the empty string in a way
+    // that maps back to a real token) and accepting it would let an
+    // attacker bypass the registry contract by emitting `jti: ""` on a
+    // forged token.
+    const guard = makeGuard();
+    const iat = Math.floor(Date.now() / 1000);
+    const tokenEmptyJti = await new SignJWT({ scope: "vault:read", client_id: "test-client" })
+      .setProtectedHeader({ alg: "RS256", kid: kp.kid })
+      .setIssuer(fixture.origin)
+      .setSubject("user-1")
+      .setAudience("operator")
+      .setIssuedAt(iat)
+      .setExpirationTime(iat + 60)
+      .setJti("")
+      .sign(kp.privateKey);
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(tokenEmptyJti);
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught).toBeInstanceOf(HubJwtError);
+    expect(caught?.code).toBe("shape");
+    expect(caught?.message).toMatch(/missing required `jti`/);
+    guard.resetJwksCache();
+  });
+
+  test("allowMissingJti: true → jti-less token accepted, logger fires, revocation skipped", async () => {
+    // The opt-out path. Operators with pre-Phase-1 legacy tokens in flight
+    // set `allowMissingJti: true` during the transition window; jti-less
+    // tokens validate successfully but the missing claim is logged so
+    // operators can monitor the legacy-token decay curve before flipping
+    // strict-mode back on.
+    let revocationCalls = 0;
+    const logged: Array<{ sub: string; aud: string | undefined; iat?: number }> = [];
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowMissingJti: true,
+      missingJtiLogger: (info) => logged.push(info),
+      revocationFetcher: async () => {
+        revocationCalls += 1;
+        return { generated_at: new Date().toISOString(), jtis: [] };
+      },
+    });
+    const iat = Math.floor(Date.now() / 1000);
+    const tokenNoJti = await new SignJWT({ scope: "vault:read", client_id: "test-client" })
+      .setProtectedHeader({ alg: "RS256", kid: kp.kid })
+      .setIssuer(fixture.origin)
+      .setSubject("user-1")
+      .setAudience("operator")
+      .setIssuedAt(iat)
+      .setExpirationTime(iat + 60)
+      .sign(kp.privateKey);
+    const claims = await guard.validateHubJwt(tokenNoJti);
+    expect(claims.jti).toBeUndefined();
+    expect(claims.sub).toBe("user-1");
+    expect(revocationCalls).toBe(0);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]?.sub).toBe("user-1");
+    expect(logged[0]?.aud).toBe("operator");
+    expect(logged[0]?.iat).toBe(iat);
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("allowMissingJti: true + no logger supplied → no throw, no observability", async () => {
+    // The logger is optional — operators who opt in without wiring a
+    // logger get the back-compat behavior (silent accept). The logger
+    // is the observability seam, not a required dependency of the opt-out.
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowMissingJti: true,
+    });
+    const iat = Math.floor(Date.now() / 1000);
+    const tokenNoJti = await new SignJWT({ scope: "vault:read", client_id: "test-client" })
+      .setProtectedHeader({ alg: "RS256", kid: kp.kid })
+      .setIssuer(fixture.origin)
+      .setSubject("user-1")
+      .setAudience("operator")
+      .setIssuedAt(iat)
+      .setExpirationTime(iat + 60)
+      .sign(kp.privateKey);
+    const claims = await guard.validateHubJwt(tokenNoJti);
+    expect(claims.jti).toBeUndefined();
+    guard.resetJwksCache();
+  });
+
+  test("allowMissingJti: true does NOT relax revocation enforcement for tokens that DO carry jti", async () => {
+    // The opt-out narrows the jti-presence check, not the revocation
+    // lookup. A token with jti still goes through revocation; opt-out is
+    // a transition aid for legacy tokens, not a general-purpose
+    // security-relax.
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowMissingJti: true,
+    });
+    fixture.setRevokedJtis(["jti-doomed"]);
+    const token = await signJwt(kp, { iss: fixture.origin, jti: "jti-doomed" });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(token);
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught?.code).toBe("revoked");
+    guard.resetJwksCache();
+    guard.resetRevocationCache();
+  });
+
+  test("jti-presence check runs AFTER signature/iss/sub/aud (no info leak on malformed tokens)", async () => {
+    // Pin the ordering: a jti-less token whose signature is bad surfaces
+    // as `signature`, not `shape`. Without this ordering an attacker
+    // probing for forgeable shapes could distinguish "bad signature on a
+    // jti-having token" from "bad signature on a jti-less token" — the
+    // former is a single failure, the latter could be two stacked
+    // failures we'd surface unhelpfully.
+    const guard = makeGuard();
+    const otherKp = await makeKeypair("k1"); // same kid, different key
+    const iat = Math.floor(Date.now() / 1000);
+    const tokenBadSigNoJti = await new SignJWT({ scope: "vault:read" })
+      .setProtectedHeader({ alg: "RS256", kid: otherKp.kid })
+      .setIssuer(fixture.origin)
+      .setSubject("user-1")
+      .setAudience("operator")
+      .setIssuedAt(iat)
+      .setExpirationTime(iat + 60)
+      .sign(otherKp.privateKey);
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(tokenBadSigNoJti);
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught?.code).toBe("signature");
+    guard.resetJwksCache();
   });
 });
 
