@@ -2,7 +2,7 @@
 
 `@openparachute/hub` — the local hub for the [Parachute](https://parachute.computer) ecosystem. The `parachute` binary is one of its surfaces.
 
-The hub coordinates the modules running on your machine: it installs them, runs them as background processes, exposes them over Tailscale, serves the discovery document at `/.well-known/parachute.json`, and (soon) issues OAuth tokens. Each module (vault, notes, scribe, channel, …) stays a standalone package; the hub stitches them together.
+The hub coordinates the modules running on your machine: it installs them, runs them as background processes, exposes them over Tailscale, serves the discovery document at `/.well-known/parachute.json`, and (soon) issues OAuth tokens. Each module (vault, app, scribe, …) stays a standalone package; the hub stitches them together.
 
 > Previously published as `@openparachute/cli`. Renamed 2026-04-26 to better reflect the role — see [parachute-patterns/hub-as-issuer](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/hub-as-issuer.md). The `parachute` binary name is unchanged.
 
@@ -160,16 +160,19 @@ Parachute services reserve a block of loopback ports in the canonical range **19
 | 1939 | parachute-hub (internal proxy + static) |
 | 1940 | parachute-vault    |
 | 1941 | parachute-channel  |
-| 1942 | parachute-notes    |
+| 1942 | parachute-notes *(deprecating — see [notes#154](https://github.com/ParachuteComputer/parachute-notes/issues/154); folds into parachute-app at 1946)* |
 | 1943 | parachute-scribe   |
-| 1944–1949 | *unassigned (CLI fallback range)* |
+| 1944 | *parachute-agent (retired 2026-05-20; slot held — see [`parachute-agent/DEPRECATED.md`](https://github.com/ParachuteComputer/parachute-agent/blob/main/DEPRECATED.md))* |
+| 1945 | parachute-runner *(shipped; exploration-tier, not committed-core)* |
+| 1946 | parachute-app *(committed core; UI host, ships Notes as canonical first app)* |
+| 1947–1949 | *unassigned (CLI fallback range)* |
 
 The hub pins 1939 — no fallback. If something else is on 1939 when you run `parachute expose`, the command fails with a pointer to `lsof -iTCP:1939` rather than walking up into another service's slot.
 
 **The CLI is the port authority.** `parachute install <svc>` picks the port at install time and writes `PORT=<port>` into `~/.parachute/<svc>/.env`; lifecycle.start merges that .env into the spawn env so the next daemon boot binds the port the CLI assigned. The algorithm:
 
 1. Prefer the canonical slot (e.g. vault → 1940).
-2. On collision, walk the unassigned range (1944–1949).
+2. On collision, walk the unassigned range (1947–1949).
 3. Range exhausted: assign past 1949 with a warning.
 
 Idempotent: an existing `PORT=` in `~/.parachute/<svc>/.env` wins, so re-installs and operator-edited ports survive across upgrades. Services keep their compiled-in fallbacks (vault → 1940 etc.) so a stand-alone `bun run` still works without a CLI-managed .env.
