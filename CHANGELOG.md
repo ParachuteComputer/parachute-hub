@@ -2,6 +2,24 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.10] - 2026-05-22
+
+**feat(hub): rate-limit `/login` + `/account/change-password` against brute-force / credential-stuffing (#282).**
+
+Auth-surface hardening surfaced during the hub#281 reviewer pass. The `/login` per-IP rate-limit floor (5 attempts / 15 min, hub#188) had already landed; this PR completes the auth-surface sweep by adding a parallel per-user floor on `/account/change-password`, which is the only other interactive POST that calls `argon2id` verify. Threat shape on change-password is different from /login — the endpoint is session-gated, so the worry isn't open-internet brute-force; it's a compromised session (stolen cookie) hammering verifications against the current password without bound.
+
+**What landed.**
+
+- **`RateLimiter` class** in `src/rate-limit.ts`. The sliding-window algorithm from hub#188 lifted out of the module-level singleton into a class with constructor-parameterized `maxAttempts` + `windowMs`. Each instance owns its own bucket map — limiters with different capacities don't share state. Existing `checkAndRecord` / `__resetForTests` top-level exports stay as backward-compat shims for hub#188's `/login` call sites + tests.
+- **`loginRateLimiter` singleton.** Per-IP, 5 attempts per 15 min (`MAX_ATTEMPTS` / `WINDOW_MS`). Same behavior as before the refactor; wired into `handleAdminLoginPost` via the backward-compat `checkAndRecord` shim — no change at the call site.
+- **`changePasswordRateLimiter` singleton.** Per-user, 3 attempts per 5 min (`CHANGE_PASSWORD_MAX_ATTEMPTS` / `CHANGE_PASSWORD_WINDOW_MS`). Tighter than `/login` because the legitimate-user path here is "I'm rotating my password" — typing the current password wrong 3 times in 5 minutes is already an outlier, and a session-hijack attacker shouldn't get a 5-shot grind window against argon2id.
+- **`/account/change-password` POST wired** (`src/api-account.ts`). Gate fires *after* CSRF (so a junk cross-site POST doesn't burn a bucket slot for the victim's session) but *before* `verifyPassword`. Keyed by `user.id` rather than IP because the endpoint is session-gated — identity is already established, and keying by user-id means an attacker rotating egress IPs against the same stolen cookie can't get fresh buckets per IP. 429 response carries `Retry-After: <seconds>` header and re-renders the change-password form with an inline `"Too many password-change attempts. Try again in N seconds."` banner — same UX shape as the existing `/login` 429 path.
+- **IP extraction stays as-is** (`clientIpFromRequest`): `CF-Connecting-IP` → `X-Forwarded-For` first hop → `UNKNOWN_IP_SENTINEL`. Documented assumption: hub trusts these headers when set, which means hub MUST be behind a reverse proxy (cloudflared, nginx) that strips them from external requests. Direct-loopback callers without these headers fall through to the sentinel, which is the intended bound (all curl-from-same-host requests share one bucket).
+
+**Tests.** `bun run typecheck` clean. `bun test ./src` 1848 pass (was 1836; +12 — 9 in the rate-limit suite covering the new `RateLimiter` class shape + the `changePasswordRateLimiter` singleton's configured thresholds, 4 in `api-account` covering the wired gate: exhaustion → 429, per-user independence, gate-fires-before-argon2id timing pin, CSRF-failure-does-not-burn-bucket invariant). `bunx biome check src/` clean.
+
+**Cross-references.** Issue hub#282. Threat-model framing from the hub#281 reviewer's pass: "A compromised session (stolen cookie) could hammer argon2id verifications against the current password without bound." Bucket-parameter choice rationale lives in the `rate-limit.ts` header docstring + the inline comment at the wire site in `api-account.ts`. Config-via-env-var deferred — code constants are the v0.6 shape per the issue's "low-medium priority" framing; hub_settings overrides land if operators report tuning needs.
+
 ## [0.5.13-rc.9] - 2026-05-22
 
 **feat(hub): `/notes/*` → `/app/notes/*` redirect (Phase 2 of Notes migration arc).**
