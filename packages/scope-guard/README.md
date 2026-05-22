@@ -6,11 +6,11 @@ The Parachute hub mints OAuth access tokens as RS256 JWTs and publishes its publ
 
 ## What's in the box
 
-- **`createScopeGuard({ hubOrigin, jwks?, jwksGetter? })`** — factory bound to a hub origin. Holds the JWKS getter so the cache lives across requests. `hubOrigin` may be a string or a resolver function (for layered env-var precedence).
-- **`guard.validateHubJwt(token, { expectedAudience? })`** — JWKS-backed verify. Pins `iss` to the configured hub origin, strict-checks `aud` (RFC 7519 string-or-array) when supplied. Throws `HubJwtError` (with a `code`) on failure.
+- **`createScopeGuard({ hubOrigin, jwks?, jwksGetter?, allowMissingJti?, missingJtiLogger? })`** — factory bound to a hub origin. Holds the JWKS getter so the cache lives across requests. `hubOrigin` may be a string or a resolver function (for layered env-var precedence). `allowMissingJti` (default `false` — strict) controls whether hub-signed JWTs lacking a `jti` claim are accepted (see [Versioning](#versioning) for the 0.4.0 rationale).
+- **`guard.validateHubJwt(token, { expectedAudience? })`** — JWKS-backed verify. Pins `iss` to the configured hub origin, strict-checks `aud` (RFC 7519 string-or-array) when supplied. Rejects hub-signed tokens lacking `jti` by default (since 0.4.0; see CHANGELOG for the opt-out). Throws `HubJwtError` (with a `code`) on failure.
 - **`parseScopes(raw)` / `extractBearer(authHeader)` / `looksLikeJwt(token)`** — string helpers every consumer reaches for.
 - **`hasScope(granted, required)`** — generic `<resource>:<verb>` and `<resource>:<name>:<verb>` matcher with `admin ⊇ write ⊇ read` inheritance. The lib is the engine, not the dictionary; per-service vocabularies and cross-resource catch-alls stay in each service.
-- **`HubJwtError.code`** — single error class with a coarse code: `signature | issuer | expired | kid | jwks | audience | shape`. Branch on `code` rather than catching subclasses.
+- **`HubJwtError.code`** — single error class with a coarse code: `signature | issuer | expired | kid | jwks | audience | shape | revoked | revocation_unavailable`. Branch on `code` rather than catching subclasses.
 
 ## Quick start
 

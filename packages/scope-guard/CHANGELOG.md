@@ -4,6 +4,41 @@ All notable changes to `@openparachute/scope-guard` are documented here. The for
 
 The library's RC cadence is independent of `@openparachute/hub`'s — they ship from the same repo but aren't coupled in version.
 
+## 0.4.0-rc.1 — 2026-05-22
+
+Adds the hub#218 jti-presence hardening: hub-signed JWTs that lack a `jti` claim are rejected by default. **Behaviour-breaking minor** — any adopter that bumps from `0.3.x` will start rejecting jti-less hub-signed tokens. The default is the security floor; an `allowMissingJti: true` opt-out is available for operators with pre-Phase-1 legacy tokens still in flight.
+
+### Why this is hardening, not a bug fix
+
+Per hub#218 (and the conservative-today choice in hub#217 Phase 4), `validateHubJwt` previously *skipped* the revocation lookup for tokens without `jti` — they passed validation entirely. All legitimate hub-issued tokens carry `jti` per the token-registry contract introduced in hub#212 Phase 1 (the `tokens` table is keyed by jti; every mint path — `signAccessToken`, `recordTokenMint`, `signRefreshToken` — stamps one). A jti-less, hub-signed JWT is therefore an anomaly: either a pre-Phase-1 legacy issuance path that should have aged out, or a token forged by an attacker who got a signing key but skipped the registry path. Accepting it is the conservative-today choice; the stricter posture is to reject because revocation cannot be enforced on tokens we can't index.
+
+### Added
+
+- **`HubJwtError(code: "shape", "hub JWT missing required \`jti\` claim")`** for jti-less or empty-jti tokens. Surfaces alongside the existing `sub`-shape rejection so consumers can branch on `code: "shape"` and inspect the message for the specific missing-field detail.
+- **`CreateScopeGuardOptions.allowMissingJti?: boolean`** — operator opt-out for the strict default. When `true`, jti-less tokens validate successfully (with revocation-lookup skipped, since lists are keyed by jti). When `false` (the default), jti-less tokens are rejected as `code: "shape"`. The opt-out exists for the transition window where operators have legitimate pre-Phase-1 tokens in flight; it's NOT a steady-state configuration.
+- **`CreateScopeGuardOptions.missingJtiLogger?: (info) => void`** — observability seam for the opt-out path. When `allowMissingJti: true` and a jti-less token is accepted, the logger fires with `{ sub, aud, iat }` so operators can monitor the legacy-token decay curve before flipping strict-mode back on. Optional — omitting it gives silent accept.
+
+### Changed
+
+- **`validateHubJwt` rejects jti-less tokens by default.** The jti-presence check runs after signature + iss + sub + audience (so a forged or malformed token's signature failure surfaces first — no information leak about whether the forgery happened to carry a jti) but before the revocation lookup (which depends on jti existing). Tokens that DO carry jti still go through revocation enforcement unchanged.
+- **Empty-string `jti` ("")** is treated identically to a missing claim — the same `code: "shape"` rejection. Accepting it would let a forger bypass the registry contract by emitting `jti: ""`.
+
+### Migration notes for adopters (vault, scribe, parachute-agent)
+
+- **The behaviour change is automatic on dep bump.** Adopters that pick up `0.4.0` will start rejecting any hub-signed JWT without `jti`. Pre-Phase-1 hubs (older than `0.5.7`, before the token-registry contract) issued some tokens without `jti`; those tokens will be rejected once the consumer dep-bumps. Hub mints from `0.5.7` onwards all carry jti, so the practical exposure is "tokens minted before 2026-05 that haven't yet expired."
+- **Operators with legacy tokens in flight** set `allowMissingJti: true` in their `createScopeGuard({ ... })` call during a transition window. Once the legacy decay curve flattens (visible via `missingJtiLogger` traffic dropping to zero), flip back to the strict default.
+- **Adopting consumers should add a regression test** that exercises both paths: (a) a hand-built jti-less token is rejected with `code: "shape"` under the strict default, (b) the same token is accepted under `allowMissingJti: true`.
+
+### Compatibility
+
+- **bundler-resolution consumers (vault, scribe, hub workspace):** behavior change as above. The `vaultScope` claim surface from 0.3.0 carries forward unchanged.
+- **NodeNext-strict consumers (agent's tsc + vitest):** behavior change as above. The `.js`-extension convention from 0.2.1 carries forward.
+- **The new options (`allowMissingJti`, `missingJtiLogger`)** are both optional — the type signature change is additive at the construction site.
+
+### Hub-side audit
+
+Confirmed (via `git grep "SignJWT\\|setJti"` over hub's `src/`) that every JWT mint path in hub goes through `signAccessToken` (`src/jwt-sign.ts`), which always stamps jti via `randomBytes(16).toString("base64url")` when none is supplied. Callers: `oauth-handlers.ts` (auth-code + refresh grants), `api-mint-token.ts`, `operator-token.ts`, `admin-host-admin-token.ts`, `admin-vault-admin-token.ts`, `api-modules-config.ts`, `commands/auth.ts`. No raw `new SignJWT(...)` calls outside `signAccessToken`. The hub side is clean — no mint-path patches needed for this release.
+
 ## [0.3.0] - 2026-05-20
 
 Stable release. Multi-user Phase 1 vault scope enforcement.
