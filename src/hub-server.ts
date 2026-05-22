@@ -22,6 +22,11 @@
  *   /hub, /hub/                                → 301 → /admin/vaults
  *   /admin/login, /admin/logout                → 301 → /login, /logout
  *
+ *   # Notes-as-app migration Phase 2 (parachute-app design doc §16).
+ *   /notes, /notes/, /notes/*                  → 301 → /app/notes[/...]
+ *                                                (opt-out via
+ *                                                 hub_settings.notes_redirect_disabled)
+ *
  *   # Discovery + well-known.
  *   /, /hub.html                               → hub.html (the discovery page)
  *   /.well-known/parachute.json                → built dynamically from services.json
@@ -148,6 +153,7 @@ import {
   type ModuleManifest,
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
+import { logNotesRedirect, maybeRedirectNotes } from "./notes-redirect.ts";
 import {
   authorizationServerMetadata,
   handleApproveClientPost,
@@ -1067,6 +1073,34 @@ export function hubFetch(
         status: 301,
         headers: { location: `/logout${url.search}` },
       });
+    }
+
+    // Notes-as-app migration Phase 2 (parachute-app design doc §16).
+    // `/notes/*` 301-redirects to `/app/notes/*` so legacy bookmarks land on
+    // the apps-hosted Notes. Default-on; operators on notes-as-module-only
+    // installs can opt out via `hub_settings.notes_redirect_disabled = true`
+    // (see hub-settings.ts). The opt-out exists so a legacy operator
+    // doesn't hit redirect → 404 in the deprecation window. Phase 3
+    // (parachute-notes v0.5) retires this redirect entirely.
+    //
+    // Method-agnostic — same shape as the other back-compat 301s above.
+    // The browser re-issues GET on the new URL per RFC 7231 (a POST won't
+    // round-trip its body, but no /notes/* path hosts a POST endpoint
+    // worth preserving — the Notes PWA is read-write against vault, not
+    // against the hub mount itself).
+    //
+    // Lazy DB read: only consult `getDb` when the path actually matches a
+    // legacy notes prefix — every non-notes request must NOT touch the DB
+    // here (some tests + the /health route assert getDb is never called).
+    if (pathname === "/notes" || pathname.startsWith("/notes/")) {
+      const notesRedirect = maybeRedirectNotes(pathname, url.search, getDb?.());
+      if (notesRedirect !== undefined) {
+        logNotesRedirect(pathname, notesRedirect);
+        return new Response("", {
+          status: 301,
+          headers: { location: notesRedirect },
+        });
+      }
     }
 
     // CORS preflight for the public OAuth + discovery surface. Browsers
