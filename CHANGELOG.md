@@ -2,6 +2,36 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.23] - 2026-05-23
+
+**feat(hub): `/api/hub` endpoint + Hub Version Badge in admin SPA (version visibility) (closes [hub#348](https://github.com/ParachuteComputer/parachute-hub/issues/348)).**
+
+Aaron's framing (2026-05-23, mid-install): "I can't really tell with mine if it's updated or not. And I'm not sure how I would queue it to update or if it just already did." Render auto-deploys on every push to source; the operator doesn't actively trigger updates and needs to see the result land somewhere visible. The CLI surface `parachute status` already shows version + uptime + install-source; this PR mirrors it for the admin SPA.
+
+### Added
+
+- `/api/hub` endpoint + Hub Version Badge in admin SPA. Operators can now see at a glance what version of hub they're running, when it last started, and how it's installed (npm tag, bun-linked checkout, or container). Especially useful for Render deployers tracking auto-deploys from main. Click the badge for a detail panel + manual refresh button.
+
+### What landed
+
+- **`src/api-hub.ts`** — new `GET /api/hub` handler. Bearer-gated on `parachute:host:admin` (same as `/vaults` and `/api/grants`). Returns `{ version, started_at, uptime_ms, source, bun_linked_path?, git_head?, container_build_time? }`. `source` reuses `detectHubInstallSource` from install-source.ts with one container override: when `PARACHUTE_HOME === "/parachute"` (the Render Blueprint pin) we surface `"container"` instead of `"bun-linked from /app"` — operator-friendly. `started_at` is captured once at module load (`HUB_PROCESS_STARTED_AT`); `uptime_ms` is computed server-side so the client doesn't deal with clock skew. `PARACHUTE_BUILD_TIME` env var passes through opportunistically as `container_build_time` (not surfaced when unset).
+- **`src/hub-server.ts`** — wires the new `/api/hub` route alongside `/api/me`; adds it to the route-table docstring.
+- **`web/ui/src/lib/api.ts`** — `getHubStatus()` + `HubStatus` / `HubStatusSource` types. Same `getHostAdminToken()` bearer pattern as the other admin endpoints; 401/403 clears the cached token.
+- **`web/ui/src/components/HubVersionBadge.tsx`** — persistent footer affordance. Renders `Hub <version> · running <uptime> · <source>` on one muted line. Click expands an inline detail panel with the full source label (bun-linked path + git head when applicable), formatted UTC timestamps for started + built, plus a Refresh button. Auto-refreshes every 30s while mounted and on tab focus. 401/403 collapses to render-null (no redirect loop — the SPA's other surfaces handle auth flow).
+- **`web/ui/src/App.tsx`** — mounts `<HubVersionBadge />` at the bottom of the page, gated on `me?.hasSession` so it never renders for signed-out visitors (the badge would 401 anyway).
+- **`web/ui/src/styles.css`** — `.hub-version-badge` + panel styling. Muted single line above a `1px` top-border, expandable `<dl>` grid for the detail rows.
+
+### Verification
+
+- `bun test ./src` 1919 pass / 0 fail (delta: +7 new tests in `src/__tests__/api-hub.test.ts` — 405 / 401 / 403 gate; happy path shape; uptime increments between calls; `PARACHUTE_HOME=/parachute` overrides to `container`; `PARACHUTE_BUILD_TIME` passes through).
+- `cd web/ui && bunx vitest run` 203 pass / 0 fail (delta: +10 new tests in `HubVersionBadge.test.tsx` — `formatUptime` boundaries; null-on-pending render; happy-path render; null-on-401; click-expand panel; refresh button refetches; container_build_time surfaces).
+- `bun run typecheck` clean.
+- `cd web/ui && bun run build` clean (`verify-base.mjs` passes; `/admin/`-prefixed asset URLs intact).
+
+### Patterns check
+
+- No pattern shifts. New `/api/*` endpoint follows the canonical bearer-gated read shape established by `/api/grants`, `/api/tokens`, `/api/modules` — `requireScope(parachute:host:admin)`, snake-case wire fields, `cache-control: no-store`. SPA-side, the badge follows the existing `getHostAdminToken()` cached-bearer pattern; auto-refresh + focus-refresh mirror what the Modules page already does for the supervisor status poll.
+
 ## [0.5.13-rc.22] - 2026-05-23
 
 **fix(hub): Render Blueprint default channel `latest`, not `rc` (rc is now opt-in for dev/testing).**

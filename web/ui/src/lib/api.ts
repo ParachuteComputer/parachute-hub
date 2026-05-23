@@ -1115,6 +1115,45 @@ export async function listUserVaults(): Promise<string[]> {
   return body.vaults ?? [];
 }
 
+/**
+ * Wire shape returned by `GET /api/hub`. Mirrors the snake_case payload
+ * defined in `src/api-hub.ts:HubStatusResponse`. Drives the admin SPA's
+ * version badge.
+ */
+export type HubStatusSource = "bun-linked" | "npm" | "container" | "unknown";
+
+export interface HubStatus {
+  version: string;
+  started_at: string;
+  uptime_ms: number;
+  source: HubStatusSource;
+  bun_linked_path?: string;
+  git_head?: string;
+  container_build_time?: string;
+}
+
+/**
+ * GET /api/hub — read hub runtime info for the admin SPA's version badge.
+ * Same `parachute:host:admin` Bearer pattern as the other read endpoints.
+ *
+ * On 401/403 the badge collapses to a non-rendered state — see
+ * `HubVersionBadge` for the swallow-and-render-empty contract. We surface
+ * a typed null here so callers don't have to catch.
+ */
+export async function getHubStatus(): Promise<HubStatus> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/hub", {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as HubStatus;
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const text = await res.text();

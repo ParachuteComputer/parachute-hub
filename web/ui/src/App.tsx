@@ -23,13 +23,8 @@
  */
 import { type ReactNode, useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
-import {
-  type MeResponse,
-  type ModuleListing,
-  getMe,
-  listModules,
-  signOut,
-} from "./lib/api.ts";
+import { HubVersionBadge } from "./components/HubVersionBadge.tsx";
+import { type MeResponse, type ModuleListing, getMe, listModules, signOut } from "./lib/api.ts";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
 import { ModuleConfig } from "./routes/ModuleConfig.tsx";
 import { Modules } from "./routes/Modules.tsx";
@@ -182,6 +177,13 @@ export function App() {
           }
         />
       </Routes>
+
+      {/* Hub version + uptime badge (hub#348). Persistent footer affordance
+          so operators (especially Render auto-deployers) can confirm at a
+          glance which hub version is running and when it last restarted.
+          Hidden when /api/me reports no session — only signed-in operators
+          ever see admin diagnostics, and /api/hub would 401 anyway. */}
+      {me?.hasSession ? <HubVersionBadge /> : null}
     </div>
   );
 }

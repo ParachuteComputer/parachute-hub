@@ -46,6 +46,7 @@
  *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
+ *   /api/hub                      (GET)        → hub version + uptime + install-source (host:admin)
  *   /api/modules                  (GET)        → curated + installed module catalog (host:auth)
  *   /api/modules/channel          (PUT)        → operator channel toggle (host:admin)
  *   /api/modules/:short/install   (POST)       → bun add + spawn (async op)
@@ -117,6 +118,7 @@ import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
 import { handleAccountChangePasswordGet, handleAccountChangePasswordPost } from "./api-account.ts";
+import { handleApiHub } from "./api-hub.ts";
 import { handleApiMe } from "./api-me.ts";
 import { handleApiMintToken } from "./api-mint-token.ts";
 import { handleApiModulesConfig, parseModulesConfigPath } from "./api-modules-config.ts";
@@ -1524,6 +1526,17 @@ export function hubFetch(
     if (pathname === "/api/me") {
       if (!getDb) return dbNotConfigured();
       return handleApiMe(req, { db: getDb() });
+    }
+
+    // Hub version + uptime + install-source — drives the admin SPA's
+    // version badge (hub#348). Bearer-gated on `parachute:host:admin`
+    // (same as the rest of the operator-only admin surface).
+    if (pathname === "/api/hub") {
+      if (!getDb) return dbNotConfigured();
+      return handleApiHub(req, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+      });
     }
 
     if (pathname === "/api/modules") {
