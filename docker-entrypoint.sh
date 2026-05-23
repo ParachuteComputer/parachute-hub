@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+# Idempotent chown — only runs if /parachute is NOT already bun-owned.
+# Handles both fresh disks (already correct) and stale-ownership disks
+# from operators whose deploys predate the chown-at-build Dockerfile line.
+#
+# The `stat -c '%u'` check returns the numeric uid. The `bun` user in
+# the oven/bun-alpine image is uid 1000.
+if [ "$(stat -c '%u' /parachute 2>/dev/null)" != "1000" ]; then
+  echo "[parachute] chowning /parachute to bun:bun (was owned by uid $(stat -c '%u' /parachute 2>/dev/null || echo unknown))" >&2
+  chown -R bun:bun /parachute
+fi
+
+# Drop privileges + run hub. gosu does this safely (forwards signals,
+# preserves process tree under tini).
+exec gosu bun "$@"
