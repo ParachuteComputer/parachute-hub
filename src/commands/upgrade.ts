@@ -74,17 +74,22 @@ export interface UpgradeRunner {
 
 export const defaultRunner: UpgradeRunner = {
   async run(cmd, opts) {
+    // Inherit env so `bun add -g` etc. see TMPDIR, BUN_INSTALL, PATH, HOME.
+    // Bun.spawn defaults to empty env — see api-modules-ops.ts:defaultRun.
     const proc = Bun.spawn([...cmd], {
       cwd: opts?.cwd,
       stdio: ["inherit", "inherit", "inherit"],
+      env: process.env,
     });
     return await proc.exited;
   },
   async capture(cmd, opts) {
+    // Inherit env — same rationale as `run` above.
     const proc = Bun.spawn([...cmd], {
       cwd: opts?.cwd,
       stdout: "pipe",
       stderr: "pipe",
+      env: process.env,
     });
     const [stdout, stderr] = await Promise.all([
       new Response(proc.stdout).text(),

@@ -250,7 +250,13 @@ export interface InstallOpts {
 }
 
 async function defaultRunner(cmd: readonly string[]): Promise<number> {
-  const proc = Bun.spawn([...cmd], { stdio: ["inherit", "inherit", "inherit"] });
+  // Inherit env (TMPDIR, BUN_INSTALL, PATH, HOME, PARACHUTE_*, etc.) — see
+  // api-modules-ops.ts:defaultRun for the rationale. Same Bun.spawn-defaults-
+  // to-empty-env bug; same one-line fix. See hub#349.
+  const proc = Bun.spawn([...cmd], {
+    stdio: ["inherit", "inherit", "inherit"],
+    env: process.env,
+  });
   return await proc.exited;
 }
 

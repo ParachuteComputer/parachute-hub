@@ -403,6 +403,10 @@ async function pumpLines(
 const defaultSpawnFn: SpawnFn = (req) => {
   const spawnOpts: Parameters<typeof Bun.spawn>[1] = {
     stdio: ["ignore", "pipe", "pipe"],
+    // Inherit env so supervised module sees PATH, HOME, PARACHUTE_HOME, etc.
+    // Bun.spawn defaults to empty env — see api-modules-ops.ts:defaultRun.
+    // Per-call `req.env` overrides merge on top below.
+    env: process.env,
   };
   if (req.cwd) spawnOpts.cwd = req.cwd;
   if (req.env) spawnOpts.env = { ...process.env, ...req.env };

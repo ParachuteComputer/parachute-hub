@@ -69,7 +69,12 @@ export const defaultCloudflaredSpawner: CloudflaredSpawner = {
   spawn(cmd, logFile) {
     mkdirSync(dirname(logFile), { recursive: true });
     const fd = openSync(logFile, "a");
-    const proc = Bun.spawn([...cmd], { stdio: ["ignore", fd, fd] });
+    // Inherit env so cloudflared sees HOME (where it reads ~/.cloudflared/),
+    // PATH, etc. Bun.spawn defaults to empty env — see api-modules-ops.ts.
+    const proc = Bun.spawn([...cmd], {
+      stdio: ["ignore", fd, fd],
+      env: process.env,
+    });
     proc.unref();
     return proc.pid;
   },
