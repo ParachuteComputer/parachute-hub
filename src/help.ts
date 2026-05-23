@@ -34,8 +34,8 @@ export function installHelp(): string {
   return `parachute install — install and register a Parachute service
 
 Usage:
-  parachute install <service> [--tag <name>] [--no-start]
-  parachute install all       [--tag <name>] [--no-start]
+  parachute install <service> [--channel rc|latest] [--tag <name>] [--no-start]
+  parachute install all       [--channel rc|latest] [--tag <name>] [--no-start]
   parachute install scribe    [--scribe-provider <name>] [--scribe-key <key>]
 
 Services:
@@ -54,8 +54,14 @@ What it does:
   6. start the service in the background (idempotent — no-op if already up)
 
 Flags:
+  --channel rc|latest       npm dist-tag channel for the install. Defaults to
+                            \`latest\` unless \`PARACHUTE_INSTALL_CHANNEL\` is set
+                            (see Environment below). Loses to \`--tag\` (which
+                            pins an exact version / tag). Garbage env values
+                            fall back to \`latest\` with a warning.
   --tag <name>              npm dist-tag or exact version to install
-                            (e.g. \`--tag rc\` → \`bun add -g @openparachute/vault@rc\`)
+                            (e.g. \`--tag rc\` → \`bun add -g @openparachute/vault@rc\`).
+                            Wins over \`--channel\` and the env var.
                             Skipped if the package is already \`bun link\`-ed locally.
   --no-start                skip the post-install daemon start. For piped / CI
                             installs that own their own process model.
@@ -66,6 +72,14 @@ Flags:
                             Stored in ~/.parachute/scribe/.env. Only meaningful for
                             cloud providers (groq → GROQ_API_KEY, openai → OPENAI_API_KEY).
 
+Environment:
+  PARACHUTE_INSTALL_CHANNEL=rc|latest
+                            cluster-wide default channel. Lets a Render deploy
+                            running the hub at \`@rc\` cascade rc to vault / app /
+                            scribe / runner installed via the admin SPA — without
+                            an explicit \`--channel\` per call. Loses to \`--channel\`
+                            and \`--tag\`. Defaults to \`latest\` when unset.
+
 Examples:
   parachute install vault                                   # installs, runs init, starts vault
   parachute install app                                     # installs app (auto-bootstraps Notes)
@@ -73,8 +87,10 @@ Examples:
   parachute install scribe                                  # installs, prompts for provider, starts scribe
   parachute install scribe --scribe-provider groq --scribe-key gsk_…
                                                             # non-interactive scribe setup
-  parachute install vault --tag rc                          # pin to rc dist-tag
-  parachute install all --tag rc                            # bootstrap whole ecosystem to rc
+  parachute install vault --channel rc                      # pin to rc dist-tag
+  PARACHUTE_INSTALL_CHANNEL=rc parachute install vault      # same, env-driven
+  parachute install vault --tag 0.3.0-rc.1                  # pin to an exact version (wins over --channel)
+  parachute install all --channel rc                        # bootstrap whole ecosystem to rc
   parachute install vault --no-start                        # install without auto-starting (CI)
 
 Aliases:

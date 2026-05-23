@@ -30,6 +30,19 @@
 #                                       would write to bun's per-user prefix
 #                                       on the ephemeral image layer and
 #                                       vanish on every redeploy.
+#   PARACHUTE_INSTALL_CHANNEL         — cluster-wide channel cascade for
+#                                       `parachute install` and the admin SPA
+#                                       install API (hub#337). When set to
+#                                       `rc`, every module installed via
+#                                       /admin/modules resolves
+#                                       `@openparachute/<pkg>@rc` rather than
+#                                       `@latest`. Render's blueprint pins
+#                                       this to `rc` so a hub-on-rc deploy
+#                                       cascades the rc-ness across vault /
+#                                       app / scribe / runner; flip to
+#                                       `latest` once 1.0 lands. Per-call
+#                                       `--channel rc|latest` and `--tag`
+#                                       still override.
 
 ARG BUN_VERSION=1.3
 FROM oven/bun:${BUN_VERSION}-alpine AS builder

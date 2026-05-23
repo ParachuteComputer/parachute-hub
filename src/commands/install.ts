@@ -38,6 +38,67 @@ import {
 export type Runner = (cmd: readonly string[]) => Promise<number>;
 
 /**
+ * Env var that defaults the install channel for `parachute install <svc>`
+ * (hub#337). When set to `rc` or `latest`, becomes the default channel for
+ * every `bun add -g <pkg>@<channel>` the install command composes. The
+ * explicit `--channel` flag (and `--tag`) override the env var per call.
+ *
+ * Rationale: the canonical Render deploy ships the hub container from
+ * `main` (which tracks the rc chain per governance rule 2). Without this
+ * env var the supervisor's `/admin/modules` install API would still
+ * resolve `@latest` for vault / app / scribe / runner — leaving a hub-on-rc
+ * cluster bootstrapping its other modules on stable, which silently
+ * fragments the cluster's version axis. Setting `PARACHUTE_INSTALL_CHANNEL=rc`
+ * at the platform level cascades the rc-ness across every module install,
+ * matching what an `npm i -g @openparachute/hub@rc` operator does on the
+ * CLI side.
+ *
+ * Garbage values (`PARACHUTE_INSTALL_CHANNEL=banana`) fall back to `latest`
+ * with a warning so an operator typo can't crash the install path.
+ */
+export const PARACHUTE_INSTALL_CHANNEL_ENV = "PARACHUTE_INSTALL_CHANNEL";
+
+const VALID_INSTALL_CHANNELS = ["latest", "rc"] as const;
+export type InstallChannel = (typeof VALID_INSTALL_CHANNELS)[number];
+
+function isInstallChannel(v: string): v is InstallChannel {
+  return (VALID_INSTALL_CHANNELS as readonly string[]).includes(v);
+}
+
+/**
+ * Resolve the dist-tag to use for `bun add -g <pkg>@<tag>` in `parachute
+ * install`. Precedence (highest → lowest):
+ *
+ *   1. explicit `--tag <name>` (programmatic — exact pin, may be a version)
+ *   2. explicit `--channel rc|latest` (operator-facing dist-tag override)
+ *   3. `PARACHUTE_INSTALL_CHANNEL` env var (platform-default cascade)
+ *   4. `"latest"` fallback (the npm default; back-compat for existing operators)
+ *
+ * Garbage env-var values fall back to `"latest"` with a warning. The
+ * `env` + `warn` knobs are test seams; production uses `process.env` +
+ * `console.warn`.
+ */
+export function resolveInstallChannel(opts: {
+  tag?: string;
+  channel?: string;
+  env?: NodeJS.ProcessEnv;
+  warn?: (msg: string) => void;
+}): string {
+  if (opts.tag) return opts.tag;
+  if (opts.channel) return opts.channel;
+  const env = opts.env ?? process.env;
+  const fromEnv = env[PARACHUTE_INSTALL_CHANNEL_ENV];
+  if (typeof fromEnv === "string" && fromEnv.length > 0) {
+    if (isInstallChannel(fromEnv)) return fromEnv;
+    const warn = opts.warn ?? ((msg: string) => console.warn(msg));
+    warn(
+      `[parachute install] ${PARACHUTE_INSTALL_CHANNEL_ENV}="${fromEnv}" is not a valid channel — expected one of ${VALID_INSTALL_CHANNELS.join(", ")}. Falling back to "latest".`,
+    );
+  }
+  return "latest";
+}
+
+/**
  * Transition aliases for services that were renamed. Accepted for one
  * release cycle with a rename notice, then removed. `lens → notes`
  * exists because the frontend was briefly renamed Notes → Lens (Apr 19)
@@ -77,8 +138,26 @@ export interface InstallOpts {
    * `bun add -g` call is composed as `<package>@<tag>` so RC testers can
    * pin a pre-release channel. `isLinked` still short-circuits — if the
    * package is bun-linked locally, the tag is moot.
+   *
+   * Precedence: `tag` > `channel` > `PARACHUTE_INSTALL_CHANNEL` env > `"latest"`.
    */
   tag?: string;
+  /**
+   * Operator-facing channel (`--channel rc|latest`, hub#337). Picks a npm
+   * dist-tag for the `bun add -g <pkg>@<channel>` call. Wins over the
+   * `PARACHUTE_INSTALL_CHANNEL` env var but loses to `tag` (which is the
+   * programmatic-pin escape hatch — e.g. an exact version string). The
+   * CLI argv parser rejects values outside `rc`/`latest` before this
+   * point; the install command itself trusts the caller's input.
+   */
+  channel?: string;
+  /**
+   * Override `process.env` for channel resolution (test seam). Production
+   * reads from `process.env`. Tests inject a deterministic object to
+   * exercise the `PARACHUTE_INSTALL_CHANNEL` precedence + invalid-value
+   * fallback without polluting the real environment.
+   */
+  envOverride?: NodeJS.ProcessEnv;
   /**
    * Override the random-token source for the vault↔scribe auto-wire.
    * Tests pass a deterministic string; production uses crypto.randomBytes.
@@ -498,12 +577,35 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   } else if (target.kind === "local-path" && localAlreadyLinkedTo === targetReal) {
     log(`${target.packageName} is already linked at ${target.absPath} — skipping bun add.`);
   } else {
-    const addSpec =
-      target.kind === "local-path"
-        ? target.absPath
-        : opts.tag
-          ? `${target.packageName}@${opts.tag}`
-          : target.packageName;
+    // Channel resolution (hub#337): `--tag` > `--channel` > env > "latest".
+    // Local-path installs always pass the absolute path through verbatim
+    // (no channel applies — we're installing from the filesystem, not npm).
+    let addSpec: string;
+    if (target.kind === "local-path") {
+      addSpec = target.absPath;
+    } else {
+      const resolveOpts: Parameters<typeof resolveInstallChannel>[0] = {
+        warn: (msg) => log(`⚠ ${msg}`),
+      };
+      if (opts.tag !== undefined) resolveOpts.tag = opts.tag;
+      if (opts.channel !== undefined) resolveOpts.channel = opts.channel;
+      if (opts.envOverride !== undefined) resolveOpts.env = opts.envOverride;
+      const channel = resolveInstallChannel(resolveOpts);
+      // Suppress `@latest` from the displayed/composed spec when nothing
+      // was explicitly requested — bun resolves bare names to @latest
+      // anyway, and keeping the spec bare preserves byte-identical
+      // back-compat with pre-hub#337 logs ("Installing @openparachute/vault…"
+      // not "Installing @openparachute/vault@latest…"). Any explicit
+      // tag/channel/env value still flows through.
+      const explicit = opts.tag !== undefined || opts.channel !== undefined;
+      const envSet =
+        opts.envOverride !== undefined
+          ? typeof opts.envOverride[PARACHUTE_INSTALL_CHANNEL_ENV] === "string" &&
+            opts.envOverride[PARACHUTE_INSTALL_CHANNEL_ENV] !== ""
+          : typeof process.env[PARACHUTE_INSTALL_CHANNEL_ENV] === "string" &&
+            process.env[PARACHUTE_INSTALL_CHANNEL_ENV] !== "";
+      addSpec = explicit || envSet ? `${target.packageName}@${channel}` : target.packageName;
+    }
     log(`Installing ${addSpec}…`);
     const addCode = await runner(["bun", "add", "-g", addSpec]);
     if (addCode !== 0) {

@@ -2,6 +2,47 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.18] - 2026-05-23
+
+**feat(hub): `parachute install` accepts `--channel rc|latest` + honors `PARACHUTE_INSTALL_CHANNEL` env; Render deploy cascades rc across modules.**
+
+`parachute install <svc>` previously ran `bun add -g <pkg>` (bun resolves bare names to `@latest`). For Aaron's canonical Render deploy — hub container shipped from `main`, which tracks the rc chain per [governance rule 2](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md) — the admin SPA's `/admin/modules` install flow would land vault / app / scribe / runner at `@latest` regardless. The cluster's version axis silently fragmented: hub on rc, modules on stable. Closes [hub#337](https://github.com/ParachuteComputer/parachute-hub/issues/337) (sibling to [hub#338](https://github.com/ParachuteComputer/parachute-hub/pull/338), which fixed the same shape for `parachute upgrade`).
+
+### Added
+
+- `parachute install <svc>` now accepts `--channel rc|latest` and honors a `PARACHUTE_INSTALL_CHANNEL` env var (default: `latest`). The `bun add -g <pkg>@<channel>` composition reflects the resolved channel; `--tag <name>` still wins over both for programmatic exact-version pins. Closes [hub#337](https://github.com/ParachuteComputer/parachute-hub/issues/337).
+- Admin SPA install API (`POST /api/modules/:short/install`) now accepts an optional JSON body `{ "channel": "rc" | "latest" }` for per-call overrides, and honors the same `PARACHUTE_INSTALL_CHANNEL` env var. Precedence (highest → lowest): body channel > env var > `hub_settings.module_install_channel` (the existing admin SPA toggle, hub#275) > `latest`.
+- Render deploy now sets `PARACHUTE_INSTALL_CHANNEL=rc` (`render.yaml`) so operators forking the repo to deploy from `main` (which tracks rc) get an rc-cascade: hub at rc plus all modules installed via the admin SPA also at rc. This is the canonical "rc dev deploy" shape; flip to `latest` (or remove the key) once 1.0 lands.
+
+### What landed
+
+- **`resolveInstallChannel` (`src/commands/install.ts`)** — precedence chain: `--tag` > `--channel` > `PARACHUTE_INSTALL_CHANNEL` env > `"latest"`. Garbage env values (e.g. `PARACHUTE_INSTALL_CHANNEL=banana`) warn + fall back to `latest` rather than crashing the install path — operator typos at the platform layer can't take down installs.
+- **CLI flag (`src/cli.ts`)** — `--channel rc|latest` for `parachute install`. Validated at argv-parse time (invalid value → exit 1 with an actionable error). Mirrors the `--channel` shape already on `parachute upgrade` (hub#338) so the operator surface is uniform.
+- **Help text (`src/help.ts:installHelp`)** — documents the new `--channel` flag, the `PARACHUTE_INSTALL_CHANNEL` env var, and the precedence relative to `--tag`. Includes worked examples for both forms.
+- **API install (`src/api-modules-ops.ts:handleInstall` + `runInstall`)** — reads optional `{ channel }` from the request body, threads through `runInstall`'s new `channelOverride` parameter. The new `resolveApiInstallChannel` helper applies the precedence chain. Existing `hub_settings.module_install_channel` (admin SPA toggle, hub#275) is preserved as the cluster-wide default below env-var override.
+- **`Dockerfile` docstring** — documents `PARACHUTE_INSTALL_CHANNEL` in the operator-facing env-var table at the top.
+- **`render.yaml`** — sets `PARACHUTE_INSTALL_CHANNEL=rc` as the deploy-default, with an inline comment explaining the rc-cascade rationale and the flip-to-latest direction.
+
+### Back-compat
+
+Defaults to `latest` when nothing's set, which is what bun resolves bare names to anyway — so a `parachute install vault` with no flag, no env, and no admin-toggle still produces the byte-identical `bun add -g @openparachute/vault` invocation as pre-#337. Explicit channel / env-set / DB-stored channel paths flow through to `<pkg>@<channel>`. Existing API callers (no body, or body without `channel`) keep working unchanged.
+
+### Tests
+
+`bun test ./src` — 1906 pass / 0 fail (was 1889 in rc.17; +17 new cases across `src/__tests__/install.test.ts`, `src/__tests__/api-modules-ops.test.ts`, and `src/__tests__/cli.test.ts`). New coverage: CLI default-channel back-compat (no @latest suffix); env-driven rc; `--channel` flag winning over env; `--tag` winning over both; garbage env value with warning; bun-link short-circuit ignores channel; local-path install bypasses channel; CLI rejects missing / invalid `--channel` values; API body `{ channel }` override winning over hub_settings; API body invalid channel → 400; API missing body → fallback to hub_settings; API env-var > hub_settings; API body > env > hub_settings; API garbage env warns + falls back. `bun run typecheck` clean. `bunx biome check src/` clean.
+
+### Intentionally not changed
+
+- **`parachute upgrade`** — hub#338's channel-preservation + downgrade-refusal shape stays as-is. Upgrade detects channel from the installed version string by default; the `--channel` override is already there. Out of scope for #337.
+- **`parachute setup`** — interactive wizard already accepts `--tag`; surfaces the install command per-service. Channel cascade flows through the env var the same way.
+- **Existing `PARACHUTE_MODULE_CHANNEL` env (hub#275)** — kept as-is; it's a one-time DB-seed used by the admin SPA toggle. `PARACHUTE_INSTALL_CHANNEL` is the new per-call/per-platform default that doesn't write to the DB. The two coexist — `INSTALL_CHANNEL` is the cluster cascade, `MODULE_CHANNEL` is the admin's stored preference.
+
+### Cross-references
+
+- [hub#337](https://github.com/ParachuteComputer/parachute-hub/issues/337) — closes.
+- [hub#338](https://github.com/ParachuteComputer/parachute-hub/pull/338) — sibling `parachute upgrade` channel fix (rc.17).
+- [governance rule 2](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md) — RC versioning convention informing the rc-cascade direction.
+
 ## [0.5.13-rc.17] - 2026-05-23
 
 **fix(hub): `parachute upgrade` preserves the operator's channel + refuses silent downgrades.**

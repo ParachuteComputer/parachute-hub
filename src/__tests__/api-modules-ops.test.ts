@@ -70,6 +70,14 @@ function postReq(path: string, headers: Record<string, string>): Request {
   return new Request(`http://localhost${path}`, { method: "POST", headers });
 }
 
+function postReqJson(path: string, headers: Record<string, string>, body: unknown): Request {
+  return new Request(`http://localhost${path}`, {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 function getReq(path: string, headers: Record<string, string>): Request {
   return new Request(`http://localhost${path}`, { method: "GET", headers });
 }
@@ -347,6 +355,222 @@ describe("POST /api/modules/:short/install", () => {
     expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
   });
 
+  // hub#337 — per-request channel in body + PARACHUTE_INSTALL_CHANNEL env var.
+  // Precedence: body.channel > PARACHUTE_INSTALL_CHANNEL env > hub_settings row > "latest".
+
+  test("body { channel: 'rc' } overrides the hub_settings row (hub#337)", async () => {
+    // SPA-driven "install X at rc" affordance: per-call override that
+    // doesn't flip the cluster-wide toggle.
+    setModuleInstallChannel(h.db, "latest");
+    const { supervisor } = makeIdleSupervisor();
+    const { run, calls } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleInstall(
+      postReqJson(
+        "/api/modules/vault/install",
+        { authorization: `Bearer ${bearer}` },
+        { channel: "rc" },
+      ),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+      },
+    );
+    expect(res.status).toBe(202);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+    expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+  });
+
+  test("body { channel: 'latest' } overrides hub_settings.module_install_channel = rc (hub#337)", async () => {
+    setModuleInstallChannel(h.db, "rc");
+    const { supervisor } = makeIdleSupervisor();
+    const { run, calls } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    await handleInstall(
+      postReqJson(
+        "/api/modules/vault/install",
+        { authorization: `Bearer ${bearer}` },
+        { channel: "latest" },
+      ),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+      },
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+    expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+  });
+
+  test("body { channel: 'banana' } returns 400 invalid_channel (hub#337)", async () => {
+    // Operator-typed garbage in the SPA → don't silently fall through to
+    // the default; surface the typo immediately.
+    const { supervisor } = makeIdleSupervisor();
+    const { run } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleInstall(
+      postReqJson(
+        "/api/modules/vault/install",
+        { authorization: `Bearer ${bearer}` },
+        { channel: "banana" },
+      ),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+      },
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("invalid_channel");
+    expect(body.error_description).toMatch(/banana/);
+  });
+
+  test("missing body / empty body falls through to hub_settings channel (back-compat)", async () => {
+    // Pre-hub#337 callers don't send a JSON body. The existing SPA paths
+    // (and the first-boot wizard) keep working unchanged.
+    setModuleInstallChannel(h.db, "rc");
+    const { supervisor } = makeIdleSupervisor();
+    const { run, calls } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+      },
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+  });
+
+  test("PARACHUTE_INSTALL_CHANNEL env overrides hub_settings.module_install_channel (hub#337)", async () => {
+    // The Render-deploy cascade shape: the platform sets the env var to
+    // `rc`, hub's API path picks it up over the DB-stored default. Lets
+    // an operator-toggle override that the platform-team hasn't pinned
+    // still work via the SPA toggle below it — but with the env in
+    // play, the env wins.
+    setModuleInstallChannel(h.db, "latest");
+    const prior = process.env.PARACHUTE_INSTALL_CHANNEL;
+    process.env.PARACHUTE_INSTALL_CHANNEL = "rc";
+    try {
+      const { supervisor } = makeIdleSupervisor();
+      const { run, calls } = alwaysOkRun();
+      const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+      await handleInstall(
+        postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+        "vault",
+        {
+          db: h.db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          supervisor,
+          run,
+        },
+      );
+      await new Promise((r) => setTimeout(r, 10));
+      expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+      expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+    } finally {
+      // Bun's process.env supports the `[key]: undefined` shape
+      // (biome's noDelete rule preferred this over `delete`).
+      if (prior === undefined) process.env.PARACHUTE_INSTALL_CHANNEL = undefined;
+      else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
+    }
+  });
+
+  test("body channel wins over PARACHUTE_INSTALL_CHANNEL env (hub#337)", async () => {
+    // Per-request override beats the platform default — the SPA's
+    // "install this one at latest even though the cluster's on rc" path.
+    setModuleInstallChannel(h.db, "latest");
+    const prior = process.env.PARACHUTE_INSTALL_CHANNEL;
+    process.env.PARACHUTE_INSTALL_CHANNEL = "rc";
+    try {
+      const { supervisor } = makeIdleSupervisor();
+      const { run, calls } = alwaysOkRun();
+      const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+      await handleInstall(
+        postReqJson(
+          "/api/modules/vault/install",
+          { authorization: `Bearer ${bearer}` },
+          { channel: "latest" },
+        ),
+        "vault",
+        {
+          db: h.db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          supervisor,
+          run,
+        },
+      );
+      await new Promise((r) => setTimeout(r, 10));
+      expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+      expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+    } finally {
+      // Bun's process.env supports the `[key]: undefined` shape
+      // (biome's noDelete rule preferred this over `delete`).
+      if (prior === undefined) process.env.PARACHUTE_INSTALL_CHANNEL = undefined;
+      else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
+    }
+  });
+
+  test("garbage PARACHUTE_INSTALL_CHANNEL env falls back to hub_settings (no crash)", async () => {
+    // Operator typo at the platform layer shouldn't crash installs.
+    // Warns + falls through to the DB-stored channel.
+    setModuleInstallChannel(h.db, "rc");
+    const prior = process.env.PARACHUTE_INSTALL_CHANNEL;
+    process.env.PARACHUTE_INSTALL_CHANNEL = "banana";
+    try {
+      const { supervisor } = makeIdleSupervisor();
+      const { run, calls } = alwaysOkRun();
+      const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+      const res = await handleInstall(
+        postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+        "vault",
+        {
+          db: h.db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          supervisor,
+          run,
+        },
+      );
+      expect(res.status).toBe(202);
+      await new Promise((r) => setTimeout(r, 10));
+      // Falls back to the DB-stored rc, not "@latest".
+      expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+    } finally {
+      // Bun's process.env supports the `[key]: undefined` shape
+      // (biome's noDelete rule preferred this over `delete`).
+      if (prior === undefined) process.env.PARACHUTE_INSTALL_CHANNEL = undefined;
+      else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
+    }
+  });
+
   test("failed bun-add surfaces failed status on the operation", async () => {
     const { supervisor } = makeIdleSupervisor();
     // Run returns 1 + findGlobalInstall returns null = real failure.
@@ -488,6 +712,39 @@ describe("POST /api/modules/:short/upgrade", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
     expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+  });
+
+  test("PARACHUTE_INSTALL_CHANNEL env cascades to upgrade too (hub#339 symmetry)", async () => {
+    // The Render-deploy operator sets PARACHUTE_INSTALL_CHANNEL=rc cluster-
+    // wide expecting BOTH install and upgrade through the admin SPA to
+    // honor it. Asymmetry between the two paths would surprise them.
+    setModuleInstallChannel(h.db, "latest"); // DB says latest
+    const prior = process.env.PARACHUTE_INSTALL_CHANNEL;
+    process.env.PARACHUTE_INSTALL_CHANNEL = "rc"; // env says rc — should win
+    try {
+      const { supervisor } = makeIdleSupervisor();
+      await supervisor.start({ short: "vault", cmd: ["parachute-vault", "serve"] });
+      const { run, calls } = alwaysOkRun();
+      const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+      await handleUpgrade(
+        postReq("/api/modules/vault/upgrade", { authorization: `Bearer ${bearer}` }),
+        "vault",
+        {
+          db: h.db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          supervisor,
+          run,
+        },
+      );
+      await new Promise((r) => setTimeout(r, 10));
+      expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+      expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+    } finally {
+      if (prior === undefined) process.env.PARACHUTE_INSTALL_CHANNEL = undefined;
+      else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
+    }
   });
 
   test("fails with 'try install first' when module is installed but never supervised", async () => {

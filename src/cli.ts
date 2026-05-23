@@ -315,7 +315,22 @@ async function main(argv: string[]): Promise<number> {
         console.error(`parachute install: ${tagExtract.error}`);
         return 1;
       }
-      const providerExtract = extractNamedFlag(tagExtract.rest, "--scribe-provider");
+      const channelExtract = extractNamedFlag(tagExtract.rest, "--channel");
+      if (channelExtract.error) {
+        console.error(`parachute install: ${channelExtract.error}`);
+        return 1;
+      }
+      if (
+        channelExtract.value !== undefined &&
+        channelExtract.value !== "rc" &&
+        channelExtract.value !== "latest"
+      ) {
+        console.error(
+          `parachute install: --channel must be "rc" or "latest" (got "${channelExtract.value}")`,
+        );
+        return 1;
+      }
+      const providerExtract = extractNamedFlag(channelExtract.rest, "--scribe-provider");
       if (providerExtract.error) {
         console.error(`parachute install: ${providerExtract.error}`);
         return 1;
@@ -329,7 +344,9 @@ async function main(argv: string[]): Promise<number> {
       const installArgs = keyExtract.rest.filter((a) => a !== "--no-start");
       const service = installArgs[0];
       if (!service) {
-        console.error("usage: parachute install <service|all> [--tag <name>] [--no-start]");
+        console.error(
+          "usage: parachute install <service|all> [--channel rc|latest] [--tag <name>] [--no-start]",
+        );
         console.error(
           "       parachute install scribe [--scribe-provider <name>] [--scribe-key <key>]",
         );
@@ -338,6 +355,9 @@ async function main(argv: string[]): Promise<number> {
       }
       const installOpts: Parameters<typeof install>[1] = {};
       if (tagExtract.tag) installOpts.tag = tagExtract.tag;
+      if (channelExtract.value === "rc" || channelExtract.value === "latest") {
+        installOpts.channel = channelExtract.value;
+      }
       if (noStart) installOpts.noStart = true;
       if (providerExtract.value) installOpts.scribeProvider = providerExtract.value;
       if (keyExtract.value) installOpts.scribeKey = keyExtract.value;
