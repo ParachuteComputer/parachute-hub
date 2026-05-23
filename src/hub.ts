@@ -357,6 +357,12 @@ const HTML_TEMPLATE = `<!doctype html>
     <p class="tagline">Your personal-computing modules.</p>
   </header>
 
+  <section class="section" id="get-started-section" hidden>
+    <h2>Get started</h2>
+    <p class="section-sub">Jump straight into what you came here for.</p>
+    <div class="grid" id="get-started-grid"></div>
+  </section>
+
   <section class="section" id="services-section">
     <h2>Services</h2>
     <p class="section-sub">Surfaces provided by services running on this hub.</p>
@@ -379,6 +385,8 @@ const HTML_TEMPLATE = `<!doctype html>
 (async () => {
   const servicesGrid = document.getElementById('services-grid');
   const adminGrid = document.getElementById('admin-grid');
+  const getStartedSection = document.getElementById('get-started-section');
+  const getStartedGrid = document.getElementById('get-started-grid');
 
   // Services entries are now data-driven from /.well-known/parachute.json.
   // Each services[] row carries (since hub#... — Phase D consumer side):
@@ -444,6 +452,68 @@ const HTML_TEMPLATE = `<!doctype html>
     }
   }
 
+  /**
+   * Render the "Get started" section (hub#342) above the Services grid.
+   *
+   * Two hardcoded targets, each conditional on its prerequisite being
+   * installed:
+   *   - "Open Notes" → /app/notes/  (requires parachute-app installed;
+   *     App auto-bootstraps Notes-as-UI per parachute-app §17, so the
+   *     mere presence of App means /app/notes/ is live)
+   *   - "Browse Vault" → /vault/<first-vault-name>/admin/  (requires
+   *     parachute-vault installed; uses the first vault's name from
+   *     its services.json mount path tail)
+   *
+   * If neither prerequisite is met (fresh install pre-wizard) the
+   * section stays hidden. The hardcoded shape mirrors the wizard's
+   * own done-screen "Start using your vault" tile — same architectural
+   * shape (single obvious entry point) at a different surface.
+   *
+   * Not driven by /api/modules because discovery is unauth — the
+   * services list from /.well-known/parachute.json is sufficient
+   * (it carries the same install-detection signal we need, no
+   * Bearer required).
+   */
+  function renderGetStarted(services) {
+    if (!getStartedGrid || !getStartedSection) return;
+    const tiles = [];
+    const hasApp = services.some((s) => s && s.name === 'parachute-app');
+    // services[] is fanned out per-vault for parachute-vault rows (see
+    // well-known.ts emitVaultRows) — "path" is the per-instance mount
+    // "/vault/<name>". Pick the first vault entry; the order matches
+    // services.json's paths[] order, so this is deterministic.
+    const vault = services.find((s) => s && s.name === 'parachute-vault');
+    if (hasApp) {
+      tiles.push({
+        title: 'Open Notes',
+        desc: 'Browse + capture in the Notes app — reads from your vault.',
+        href: '/app/notes/',
+      });
+    }
+    if (vault) {
+      // vault.path is the per-instance mount "/vault/<name>". Extract
+      // the tail as the display name; mirror the wizard's own
+      // firstVaultName() shape.
+      let vaultName = 'default';
+      if (typeof vault.path === 'string' && vault.path.startsWith('/vault/')) {
+        const tail = vault.path.slice('/vault/'.length).replace(/\/+$/, '');
+        if (tail.length > 0) vaultName = tail;
+      }
+      tiles.push({
+        title: 'Browse Vault',
+        desc: "Open your vault's admin UI — content, settings, MCP.",
+        href: '/vault/' + encodeURIComponent(vaultName) + '/admin/',
+      });
+    }
+    if (tiles.length === 0) {
+      getStartedSection.setAttribute('hidden', '');
+      return;
+    }
+    getStartedSection.removeAttribute('hidden');
+    getStartedGrid.innerHTML = '';
+    for (const tile of tiles) getStartedGrid.appendChild(renderTile(tile));
+  }
+
   function renderServices(services) {
     // Render one tile per service that declares a uiUrl. Entries without
     // uiUrl are intentionally omitted — vault is the canonical example
@@ -503,6 +573,7 @@ const HTML_TEMPLATE = `<!doctype html>
       if (!wk.ok) throw new Error('well-known fetch failed: ' + wk.status);
       const doc = await wk.json();
       const services = Array.isArray(doc.services) ? doc.services : [];
+      renderGetStarted(services);
       renderServices(services);
     } catch (err) {
       servicesGrid.innerHTML = '<div class="error">Could not load services: ' +

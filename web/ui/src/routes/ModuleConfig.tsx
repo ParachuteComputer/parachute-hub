@@ -1,6 +1,22 @@
 /**
  * /admin/modules/:short/config — generic per-module config form.
  *
+ * **DEPRECATED (hub#342).** As of the 2026-05-23 UI pass, the admin SPA
+ * Modules page no longer links here — "Configure" collapsed into "Open"
+ * per Aaron's architectural framing (each module ships its OWN UI
+ * handling both viewing and configuring; hub becomes a dispatcher to
+ * that UI via `managementUrl`). The route + handler stay so existing
+ * bookmarks don't 404, but no SPA surface links to it anymore. A
+ * future PR deletes this route + the `/api/modules/:short/config{,
+ * /schema}` endpoints once the migration period has settled.
+ *
+ * Historical context (hub#260): the generic per-module config form was
+ * built because scribe was the only module shipping a schema-backed
+ * config endpoint, and we wanted one hub-side form rather than a
+ * per-module SPA. The Aaron-driven shift to "each module owns its UI"
+ * inverts that — scribe (scribe#53) and runner (runner#8) will ship
+ * their own admin SPAs per `module-surfaces.md`.
+ *
  * Mounted off `/admin/modules` (the Modules page exposes a "Configure"
  * link per installed module). The page fetches three things on load:
  *

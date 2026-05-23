@@ -1534,6 +1534,11 @@ export function hubFetch(
         manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
       };
       if (deps?.supervisor !== undefined) modulesDeps.supervisor = deps.supervisor;
+      // hub#342: thread the test-injectable module-manifest reader
+      // through so `management_url` resolution can be exercised in
+      // unit tests without writing real install dirs.
+      if (deps?.readModuleManifest !== undefined)
+        modulesDeps.readModuleManifest = deps.readModuleManifest;
       return handleApiModules(req, modulesDeps);
     }
 

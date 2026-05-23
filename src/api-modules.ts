@@ -30,6 +30,10 @@ import {
   setModuleInstallChannel,
 } from "./hub-settings.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
+import {
+  type ModuleManifest,
+  readModuleManifest as defaultReadModuleManifest,
+} from "./module-manifest.ts";
 import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES } from "./service-spec.ts";
 // `FIRST_PARTY_FALLBACKS` and `KNOWN_MODULES` are both consulted by
 // `lookupModule` below — the former for notes/channel (vendored manifests
@@ -107,6 +111,13 @@ export interface ApiModulesDeps {
   cacheTtlMs?: number;
   /** Test seam over wall-clock. */
   now?: () => number;
+  /**
+   * Override the per-module `.parachute/module.json` reader. Production
+   * reads from disk via `module-manifest.readModuleManifest`; tests
+   * inject a fake. Used to surface `managementUrl` on the wire shape
+   * (hub#342 — drives the admin SPA Modules page's "Open" button).
+   */
+  readModuleManifest?: (installDir: string) => Promise<ModuleManifest | null>;
 }
 
 /**
@@ -158,6 +169,30 @@ interface ModuleWireShape {
    * design doc §12.
    */
   uis: UiSubUnitWireShape[];
+  /**
+   * Canonical user-facing URL for this module's own UI (hub#342). Drives
+   * the admin SPA Modules page's "Open" button — clicking lands the
+   * operator on the module's own surface (combining view + configure
+   * per Aaron's framing: each module ships its own UI handling both).
+   *
+   * Resolution order:
+   *   1. Module's `managementUrl` from `<installDir>/.parachute/module.json`,
+   *      resolved against the module's mounted URL — matches the
+   *      well-known doc's resolution for vault rows.
+   *   2. Module's `uiUrl` from the same manifest, when it's the only
+   *      declared surface — for modules where the user-facing UI IS
+   *      the operator UI (App today).
+   *   3. Null when the module hasn't declared either field — the SPA
+   *      renders a disabled "Open" tooltip ("module hasn't shipped an
+   *      admin UI yet"). Tracked as follow-up issues per module
+   *      (scribe#53, runner#8 today).
+   *
+   * Always an absolute path on the hub origin (leading `/`) — the SPA
+   * navigates same-origin, no need to worry about cross-origin
+   * managementUrls (those are an escape hatch for off-origin admin
+   * surfaces, unused by first-party modules today).
+   */
+  management_url: string | null;
 }
 
 interface ModulesResponse {
@@ -251,7 +286,12 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   const manifest = readManifest(deps.manifestPath);
   const installedByShort = new Map<
     string,
-    { version: string; installDir?: string; uis?: Record<string, UiSubUnit> }
+    {
+      version: string;
+      installDir?: string;
+      uis?: Record<string, UiSubUnit>;
+      mountPath?: string;
+    }
   >();
   for (const entry of manifest.services) {
     // Join services.json rows to CURATED_MODULES by manifestName. The
@@ -266,13 +306,68 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
           version: string;
           installDir?: string;
           uis?: Record<string, UiSubUnit>;
+          mountPath?: string;
         } = { version: entry.version };
         if (entry.installDir !== undefined) value.installDir = entry.installDir;
         if (entry.uis !== undefined) value.uis = entry.uis;
+        // First non-`.parachute` path is the module's user-facing mount
+        // (`/app`, `/scribe`, `/vault/<name>`). Used below to resolve
+        // a relative `managementUrl` to a full hub-origin path. Skips
+        // `.parachute` entries because those are protocol mounts, not
+        // user surfaces — every module declares one.
+        const userPath = (entry.paths ?? []).find(
+          (p) => p !== "/.parachute" && !p.startsWith("/.parachute/"),
+        );
+        if (userPath !== undefined) value.mountPath = userPath;
         installedByShort.set(short, value);
       }
     }
   }
+
+  // Read each installed module's `.parachute/module.json` so we can
+  // surface `managementUrl` on the wire shape (hub#342). Quiet on
+  // per-entry errors: a malformed manifest on one module shouldn't 500
+  // the whole catalog response — its row just renders with a null
+  // management_url and the SPA shows the disabled "Open" tooltip.
+  const readModuleManifestFn = deps.readModuleManifest ?? defaultReadModuleManifest;
+  const managementUrlByShort = new Map<string, string>();
+  await Promise.all(
+    Array.from(installedByShort.entries()).map(async ([short, value]) => {
+      if (!value.installDir) return;
+      try {
+        const m = await readModuleManifestFn(value.installDir);
+        if (!m) return;
+        // Resolution per the module-ui-declaration.md hierarchy:
+        // managementUrl > uiUrl. Both are EITHER an absolute
+        // http(s) URL OR a relative path. Relative paths are joined
+        // against the module's mount path (entry.paths[0]) since both
+        // surfaces conventionally live under it (vault's `/admin`,
+        // app's `/admin`). Absolute URLs pass through verbatim.
+        const candidate = m.managementUrl ?? m.uiUrl;
+        if (candidate === undefined) return;
+        if (/^https?:\/\//i.test(candidate)) {
+          managementUrlByShort.set(short, candidate);
+          return;
+        }
+        const mount = value.mountPath;
+        if (mount === undefined) {
+          // No user-facing mount declared — we can't resolve a relative
+          // path. Skip rather than guess. Vault rows hit this when
+          // services.json was hand-edited to remove the mount; the
+          // disabled-tooltip state in the SPA is the right surface.
+          return;
+        }
+        // Join mount + candidate path. Both pieces have leading slashes
+        // already (mount per services.json convention; candidate per
+        // managementUrl validation). Drop one to avoid `//`.
+        const tail = candidate.startsWith("/") ? candidate : `/${candidate}`;
+        managementUrlByShort.set(short, `${mount}${tail}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`api-modules: skipping managementUrl for ${short}: ${msg}`);
+      }
+    }),
+  );
 
   // Supervisor state — per-module run status snapshot.
   const supervisor = deps.supervisor;
@@ -331,6 +426,7 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
       pid: state?.pid ?? null,
       install_dir: installed?.installDir ?? null,
       uis: toUisWireShape(installed?.uis),
+      management_url: managementUrlByShort.get(short) ?? null,
     });
   }
 

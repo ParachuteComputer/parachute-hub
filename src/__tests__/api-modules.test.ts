@@ -315,6 +315,96 @@ describe("GET /api/modules", () => {
     expect(body.supervisor_available).toBe(true);
   });
 
+  test("populates management_url from a relative managementUrl + module mount (hub#342)", async () => {
+    // Vault declares `managementUrl: "/admin"` in its module.json — hub
+    // resolves that against the entry's mount path (`/vault/default`)
+    // to produce the absolute admin URL the SPA's "Open" button targets.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.4.5",
+        installDir: "/install/dir/vault",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+      readModuleManifest: async (installDir) => {
+        // Return a minimal module.json with managementUrl set. Cast the
+        // shape via `as unknown as ...` because the test only exercises
+        // the consumer-side resolver, not the validator (which lives in
+        // module-manifest.ts and has its own test suite).
+        if (installDir === "/install/dir/vault") {
+          return {
+            name: "parachute-vault",
+            manifestName: "parachute-vault",
+            displayName: "Vault",
+            tagline: "",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/health",
+            managementUrl: "/admin",
+          } as unknown as Awaited<
+            ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
+          >;
+        }
+        return null;
+      },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      modules: Array<{ short: string; management_url: string | null }>;
+    };
+    const vault = body.modules.find((m) => m.short === "vault");
+    expect(vault?.management_url).toBe("/vault/default/admin");
+  });
+
+  test("management_url is null when the module declares neither managementUrl nor uiUrl (hub#342)", async () => {
+    // Scribe + runner today: no managementUrl declared yet. The SPA's
+    // "Open" button renders disabled with a follow-up tooltip in that
+    // case — null on the wire is the canonical signal.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-scribe",
+        port: 1942,
+        paths: ["/scribe"],
+        health: "/scribe/health",
+        version: "0.1.0",
+        installDir: "/install/dir/scribe",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+      readModuleManifest: async () =>
+        ({
+          name: "parachute-scribe",
+          manifestName: "parachute-scribe",
+          displayName: "Scribe",
+          tagline: "",
+          port: 1942,
+          paths: ["/scribe"],
+          health: "/health",
+        }) as unknown as Awaited<
+          ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
+        >,
+    });
+    const body = (await res.json()) as {
+      modules: Array<{ short: string; management_url: string | null }>;
+    };
+    const scribe = body.modules.find((m) => m.short === "scribe");
+    expect(scribe?.management_url).toBeNull();
+  });
+
   test("npm probe failure → latest_version is null but response still 200", async () => {
     // The whole point of the probe-is-opportunistic posture: a flaky
     // npm registry must not break the page render. The UI handles

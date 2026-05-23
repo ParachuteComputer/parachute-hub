@@ -67,6 +67,7 @@ function moduleRow(short: string, overrides: Partial<api.ModuleListing> = {}): a
     pid: null,
     install_dir: null,
     uis: [],
+    management_url: null,
     ...overrides,
   };
 }
@@ -161,6 +162,72 @@ describe("Modules — catalog rendering", () => {
     await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
     expect(screen.getByText(/running/i)).toBeInTheDocument();
     expect(screen.getByText("v0.4.5")).toBeInTheDocument();
+  });
+});
+
+describe("Modules — Open button (hub#342)", () => {
+  it("renders an active <a> when management_url is set", async () => {
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        moduleRow("vault", {
+          installed: true,
+          installed_version: "0.4.5",
+          latest_version: "0.4.5",
+          supervisor_status: "running",
+          management_url: "/vault/default/admin",
+        }),
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+    const open = screen.getByTestId("open-vault");
+    expect(open.tagName).toBe("A");
+    expect(open.getAttribute("href")).toBe("/vault/default/admin");
+  });
+
+  it("renders a disabled button with a follow-up tooltip when management_url is null", async () => {
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        moduleRow("scribe", {
+          installed: true,
+          installed_version: "0.1.0",
+          latest_version: "0.1.0",
+          supervisor_status: "running",
+          management_url: null,
+        }),
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Scribe")).toBeInTheDocument());
+    const open = screen.getByTestId("open-scribe");
+    expect(open.tagName).toBe("BUTTON");
+    expect(open).toBeDisabled();
+    expect(open.getAttribute("title")).toContain("scribe#53");
+  });
+
+  it("does not render the Configure link anymore (it was collapsed into Open)", async () => {
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        moduleRow("vault", {
+          installed: true,
+          installed_version: "0.4.5",
+          latest_version: "0.4.5",
+          supervisor_status: "running",
+          management_url: "/vault/default/admin",
+        }),
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+    // Pre-#342 had a "Configure" link under the actions row. Post-#342
+    // has only "Open" (and Restart / Upgrade / Uninstall).
+    expect(screen.queryByText(/^Configure$/)).toBeNull();
   });
 });
 

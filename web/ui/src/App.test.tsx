@@ -210,6 +210,78 @@ describe("App — auth indicator (rc.13)", () => {
   });
 });
 
+describe("App — installed-services dropdown (hub#342)", () => {
+  it("renders nothing in the nav when no modules are installed", async () => {
+    vi.mocked(api.getMe).mockResolvedValue({
+      hasSession: true,
+      user: { id: "u1", displayName: "aaron" },
+      csrf: "csrf",
+    });
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderAt("/vaults");
+    await waitFor(() => expect(screen.getByText(/signed in as/i)).toBeInTheDocument());
+    expect(screen.queryByTestId("installed-services-dropdown")).toBeNull();
+  });
+
+  it("renders an active <a> per installed module with a management_url", async () => {
+    vi.mocked(api.getMe).mockResolvedValue({
+      hasSession: true,
+      user: { id: "u1", displayName: "aaron" },
+      csrf: "csrf",
+    });
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        {
+          short: "vault",
+          package: "@openparachute/vault",
+          display_name: "Vault",
+          tagline: "",
+          available: true,
+          installed: true,
+          installed_version: "0.4.5",
+          latest_version: "0.4.5",
+          supervisor_status: "running",
+          pid: 1,
+          install_dir: null,
+          uis: [],
+          management_url: "/vault/default/admin",
+        },
+        {
+          short: "scribe",
+          package: "@openparachute/scribe",
+          display_name: "Scribe",
+          tagline: "",
+          available: true,
+          installed: true,
+          installed_version: "0.1.0",
+          latest_version: "0.1.0",
+          supervisor_status: "running",
+          pid: 2,
+          install_dir: null,
+          uis: [],
+          management_url: null,
+        },
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderAt("/vaults");
+    await waitFor(() =>
+      expect(screen.getByTestId("installed-services-dropdown")).toBeInTheDocument(),
+    );
+    const vaultItem = screen.getByTestId("nav-service-vault");
+    expect(vaultItem.tagName).toBe("A");
+    expect(vaultItem.getAttribute("href")).toBe("/vault/default/admin");
+    const scribeItem = screen.getByTestId("nav-service-scribe");
+    expect(scribeItem.tagName).toBe("SPAN");
+    expect(scribeItem.getAttribute("aria-disabled")).toBe("true");
+  });
+});
+
 describe("App — route rendering", () => {
   it("/vaults renders VaultsList (heading 'Vaults')", async () => {
     renderAt("/vaults");

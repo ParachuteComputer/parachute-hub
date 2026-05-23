@@ -143,6 +143,69 @@ code {
   align-self: center;
 }
 
+/* Installed-services quick-access dropdown in the nav (hub#342).
+   Native <details>/<summary> for the toggle behavior, absolute-
+   positioned panel so the dropdown doesn't push siblings around when
+   open. summary triangle is suppressed for visual parity with the
+   other nav items. */
+.nav .nav-dropdown {
+  position: relative;
+}
+.nav .nav-dropdown-summary {
+  list-style: none;
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: 0.95rem;
+  user-select: none;
+}
+.nav .nav-dropdown-summary::-webkit-details-marker {
+  display: none;
+}
+.nav .nav-dropdown-summary:hover {
+  color: var(--fg);
+}
+.nav .nav-dropdown[open] > .nav-dropdown-summary {
+  color: var(--fg);
+}
+.nav .nav-dropdown-summary::after {
+  content: ' \25BE'; /* ▾ */
+  font-size: 0.7em;
+  color: var(--fg-dim);
+}
+.nav .nav-dropdown-panel {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  left: 0;
+  z-index: 10;
+  min-width: 12rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  padding: 0.4rem 0;
+  display: flex;
+  flex-direction: column;
+}
+.nav .nav-dropdown-item {
+  padding: 0.4rem 0.85rem;
+  color: var(--fg);
+  font-size: 0.9rem;
+  text-decoration: none;
+}
+.nav .nav-dropdown-item:hover {
+  background: var(--bg-soft);
+  color: var(--fg);
+  text-decoration: none;
+}
+.nav .nav-dropdown-item-disabled {
+  color: var(--fg-dim);
+  cursor: not-allowed;
+}
+.nav .nav-dropdown-item-disabled:hover {
+  background: transparent;
+  color: var(--fg-dim);
+}
+
 /* SPA auth indicator — "Signed in as <name> · Sign out" or "Sign in".
    Sits in the nav, after brand's margin-right:auto pushes everything
    right. The brand keeps the layout balance; auth lands in the
