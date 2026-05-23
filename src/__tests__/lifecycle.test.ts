@@ -1013,6 +1013,84 @@ describe("parachute logs", () => {
       h.cleanup();
     }
   });
+
+  test("running daemon + missing log file: surfaces alive-but-no-log shape (hub#335)", async () => {
+    // Aaron's #335 reproducer shape: parachute-app daemon was running
+    // (curl proxied 200s, pidfile alive) but `parachute logs app` printed
+    // `parachute start app to begin` — telling the operator to start a
+    // service that was already up. The fix: when the log file is missing
+    // but a live pidfile exists, surface the running pid + the path we
+    // expected instead of the misleading start-hint.
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writePid("vault", 9999, h.configDir);
+      const lines: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        // pid 9999 is "alive" — simulates the running daemon case.
+        alive: () => true,
+        log: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      const out = lines.join("\n");
+      expect(out).toMatch(/vault is running \(pid 9999\)/);
+      expect(out).toMatch(/no log file/);
+      expect(out).not.toMatch(/parachute start vault/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("stale pidfile + missing log file: falls through to start hint", async () => {
+    // The other half of the disambiguation: pidfile exists but the process
+    // is gone (stale pidfile, or cleanly shut down). That's effectively
+    // "not running," so the original `parachute start` hint is still the
+    // right message.
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writePid("vault", 9999, h.configDir);
+      const lines: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        // pid 9999 is "dead" — `processState` returns `stopped`.
+        alive: () => false,
+        log: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      expect(lines.join("\n")).toMatch(/no logs yet for vault/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("log file exists: prints tail regardless of pidfile state (hub#335)", async () => {
+    // The happy path Aaron's title calls out: when the log file exists,
+    // we tail it — independent of whether the pidfile is present. A
+    // running daemon's logs are useful; a stopped daemon's prior logs are
+    // useful too (post-mortem). Pidfile state only changes the message
+    // when the file is missing.
+    const h = makeHarness();
+    try {
+      const p = ensureLogPath("vault", h.configDir);
+      writeFileSync(p, "vault line a\nvault line b\n");
+      // No pidfile written — verify we still print the tail.
+      const lines: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        alive: () => false,
+        log: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      expect(lines).toEqual(["vault line a", "vault line b"]);
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 describe("process-group lifecycle (hub#88)", () => {

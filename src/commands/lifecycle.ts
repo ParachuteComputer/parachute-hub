@@ -594,6 +594,11 @@ export interface LogsOpts {
   /** Number of trailing lines to print (default 200). */
   lines?: number;
   follow?: boolean;
+  /**
+   * Liveness probe seam — tests inject deterministic pid-alive answers.
+   * Defaults to the group-aware `defaultAlive` (hub#88).
+   */
+  alive?: AliveFn;
 }
 
 export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
@@ -602,6 +607,7 @@ export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
   const log = opts.log ?? ((line) => console.log(line));
   const lines = opts.lines ?? 200;
   const follow = opts.follow ?? false;
+  const alive = opts.alive ?? defaultAlive;
 
   // logs only needs a valid short name to find the log file. First-party
   // wins via the spec lookup; third-party rows match by `entry.name`; the
@@ -620,6 +626,20 @@ export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
 
   const path = logPathFor(svc, configDir);
   if (!existsSync(path)) {
+    // Distinguish "daemon never started" from "daemon is running but the
+    // log file is missing" (hub#335). The latter shape surfaces when a
+    // module self-registers + spawns its own logger without going through
+    // `parachute start <svc>` (no hub-managed log file), or when an
+    // operator deletes the log mid-run. Previously both shapes printed the
+    // same `parachute start ${svc}` hint, leading operators to think their
+    // running daemon hadn't started.
+    const state = processState(svc, configDir, alive);
+    if (state.status === "running") {
+      log(
+        `${svc} is running (pid ${state.pid}) but no log file at ${path}. The daemon may be writing logs elsewhere — check its stdout/stderr or its own log destination.`,
+      );
+      return 0;
+    }
     log(`no logs yet for ${svc}. \`parachute start ${svc}\` to begin.`);
     return 0;
   }

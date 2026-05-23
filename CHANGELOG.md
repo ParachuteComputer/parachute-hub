@@ -2,6 +2,32 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.21] - 2026-05-23
+
+**fix(hub): `parachute logs <svc>` no longer misreports a running daemon as not-started (closes [hub#335](https://github.com/ParachuteComputer/parachute-hub/issues/335)).**
+
+Aaron's reproducer (during install testing 2026-05-23): `parachute logs app --tail 5` printed `no logs yet for app. \`parachute start app\` to begin.` — even though parachute-app was up (curl through the proxy returned 200). The misleading "start the service" hint was emitted on a single condition (`!existsSync(logFile)`), conflating two distinct shapes: (1) daemon never started, (2) daemon is running but the hub-managed log file isn't at the expected path (because the module spawned itself outside `parachute start`, or the file was deleted mid-run, or stdout/stderr was redirected elsewhere).
+
+### Changed
+
+- `logs()` consults `processState(svc, configDir)` on the missing-file path. When the pidfile is present + the process is alive, surfaces `<svc> is running (pid <N>) but no log file at <path>` instead of the start-hint. Stale pidfile (or no pidfile) keeps the original `parachute start <svc>` hint — that's still the right message when the daemon really isn't up.
+- `LogsOpts` gains an `alive?: AliveFn` seam (defaults to the group-aware `defaultAlive` from hub#88) so tests can drive the pidfile-alive branch deterministically.
+- Happy-path tail behavior unchanged: when the log file exists, we read + print it, regardless of pidfile state. Post-mortem logs from a stopped daemon stay readable.
+
+### What landed
+
+- **`src/commands/lifecycle.ts`** — `logs()` adds the `processState` branch on the missing-file path; `LogsOpts` extended with `alive`.
+- **`src/__tests__/lifecycle.test.ts`** — three new tests: running daemon + missing log file (asserts the new alive-but-no-log shape), stale pidfile + missing log file (asserts fall-through to original start-hint), log file exists + dead pidfile (asserts tail prints regardless).
+
+### Verification
+
+- `bun test ./src` 1915 pass / 0 fail (delta: +3 new tests in the `parachute logs` block).
+- `bun run typecheck` clean.
+
+### Patterns check
+
+- No pattern shifts. Lifecycle's pidfile contract ([`process-state.ts`](./src/process-state.ts)) and `logPath` shape are unchanged; this fix consumes `processState` exactly as documented.
+
 ## [0.5.13-rc.20] - 2026-05-23
 
 **feat(hub): comprehensive UI pass — wizard done-screen + Modules page Open + discovery quick-start (closes [hub#342](https://github.com/ParachuteComputer/parachute-hub/issues/342)).**
