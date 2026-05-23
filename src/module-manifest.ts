@@ -77,14 +77,16 @@ export interface ModuleManifest {
   /** One-line subtitle rendered under displayName. */
   readonly tagline?: string;
   /**
-   * Drives card vs. iframe vs. launcher in the hub. Optional since hub#301
-   * Phase A: when absent the validator defaults to `"api"` (backend-proxy)
-   * and emits a soft-warning log line so operators know the field can be
-   * removed in modules they author. `"frontend"` is the only value with
-   * distinct routing today — `"api"` and `"tool"` are observationally
-   * identical, which is what motivated the migration.
+   * Historically drove card vs. iframe vs. launcher in the hub. As of
+   * hub#301 Phase A's fold (#327) the validator no longer inspects `kind` —
+   * any value, or no value at all, is accepted and passes through untouched.
+   * Routing branches downstream use `=== "frontend"` style checks which
+   * treat undefined/other values as the backend-proxy default (so the
+   * routing remains correct without validator enforcement). New modules
+   * may safely omit the field; existing values are preserved for the
+   * narrow `kind === "frontend"` branch in `commands/upgrade.ts`.
    */
-  readonly kind: ModuleKind;
+  readonly kind?: ModuleKind;
   /** Default loopback port. CLI warns on conflict, doesn't block. */
   readonly port: number;
   /** URL paths the module serves under the hub origin. */
@@ -175,36 +177,18 @@ function asOptionalString(v: unknown, where: string, field: string): string | un
 }
 
 /**
- * Optional `kind` validator (hub#301 Phase A).
+ * Pass-through `kind` reader (hub#301 Phase A fold — #327).
  *
- * Three shapes:
- *   - present + valid (`"api" | "frontend" | "tool"`) → return as-is
- *   - absent (undefined) → default to `"api"` (matches hub's backend-proxy
- *     routing, which is what `"api"` and `"tool"` both produce). Emits a
- *     soft-warning so operators authoring new modules know the field is no
- *     longer required.
- *   - present + invalid value → still rejected. We only relax the *missing*
- *     case; a typo'd value (`"backend"`, `"static"`, etc.) is still an error
- *     because the author had an intent and got it wrong.
- *
- * Returning `{ kind, warn }` lets `validateModuleManifest` log the warning
- * via the optional logger rather than `console.warn` — the validator stays
- * pure-ish (no implicit IO) and tests can assert against a captured logger.
+ * The validator no longer inspects `kind`. Any value, or no value, is
+ * accepted. We narrow to the canonical `ModuleKind` only when the input is
+ * one of the three known strings — otherwise we drop the field entirely so
+ * downstream `kind === "frontend"` branches fall through to the
+ * backend-proxy default. Author intent (typo, novel value, omission) is no
+ * longer surfaced from this layer; it's not the validator's job anymore.
  */
-function asKind(
-  v: unknown,
-  where: string,
-): { kind: ModuleKind; warn?: string } {
-  if (v === undefined) {
-    return {
-      kind: "api",
-      warn: `${where}: "kind" is absent — defaulting to "api". The field is optional as of hub#301 Phase A; you may safely remove it from authored manifests, but if you want backend-proxy routing the default is correct.`,
-    };
-  }
-  if (v !== "api" && v !== "frontend" && v !== "tool") {
-    throw new ModuleManifestError(`${where}: "kind" must be "api" | "frontend" | "tool"`);
-  }
-  return { kind: v };
+function asKind(v: unknown): ModuleKind | undefined {
+  if (v === "api" || v === "frontend" || v === "tool") return v;
+  return undefined;
 }
 
 function asPort(v: unknown, where: string): number {
@@ -374,16 +358,19 @@ function asDependencies(v: unknown, where: string): Record<string, ModuleDepende
 /**
  * Strict validator. Throws `ModuleManifestError` with the source path so
  * malformed third-party modules get a clear-enough error to fix. Required
- * fields are name, manifestName, port, paths, health. `kind` is optional
- * as of hub#301 Phase A — see `asKind` for the default behavior.
+ * fields are name, manifestName, port, paths, health. `kind` is no longer
+ * inspected as of hub#301 Phase A's fold (#327) — any value (or none) is
+ * accepted and passes through untouched. See `asKind` for the narrowing
+ * behavior.
  *
- * Pass an optional `logger` to capture the soft-warning emitted when `kind`
- * is absent. Defaults to `console`.
+ * The optional `logger` parameter is retained for forward-compatibility
+ * with future validator soft-warnings, even though the kind soft-warning
+ * it was originally added for has been removed.
  */
 export function validateModuleManifest(
   raw: unknown,
   where: string,
-  logger: Pick<Console, "warn"> = console,
+  _logger: Pick<Console, "warn"> = console,
 ): ModuleManifest {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new ModuleManifestError(`${where}: root must be an object`);
@@ -397,9 +384,7 @@ export function validateModuleManifest(
     );
   }
   const manifestName = asString(m.manifestName, where, "manifestName");
-  const kindResult = asKind(m.kind, where);
-  if (kindResult.warn) logger.warn(kindResult.warn);
-  const kind = kindResult.kind;
+  const kind = asKind(m.kind);
   const port = asPort(m.port, where);
   const paths = asStringArray(m.paths, where, "paths");
   const health = asHealthPath(m.health, where);
@@ -447,7 +432,8 @@ export function validateModuleManifest(
     stripPrefix = m.stripPrefix;
   }
 
-  const out: ModuleManifest = { name, manifestName, kind, port, paths, health };
+  const out: ModuleManifest = { name, manifestName, port, paths, health };
+  if (kind !== undefined) (out as { kind?: ModuleKind }).kind = kind;
   if (displayName !== undefined) (out as { displayName?: string }).displayName = displayName;
   if (tagline !== undefined) (out as { tagline?: string }).tagline = tagline;
   if (startCmd !== undefined) (out as { startCmd?: readonly string[] }).startCmd = startCmd;
@@ -514,8 +500,8 @@ function asPathOrUrl(v: unknown, where: string, field: string): string | undefin
  * back to the vendored manifest; third-party hard-errors). Throws
  * `ModuleManifestError` on parse / validation failure.
  *
- * Pass an optional `logger` to capture validator soft-warnings (e.g. the
- * hub#301 Phase A "kind absent" notice). Defaults to `console`.
+ * The optional `logger` parameter is retained for forward-compatibility
+ * with future validator soft-warnings. Defaults to `console`.
  */
 export async function readModuleManifest(
   packageDir: string,

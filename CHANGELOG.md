@@ -4,24 +4,25 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 
 ## [0.5.13-rc.14] - 2026-05-22
 
-**feat(hub): `kind` field now optional in module.json (closes Phase A of [#301](https://github.com/ParachuteComputer/parachute-hub/issues/301)).**
+**feat(hub): `kind` field no longer validated in module.json (closes [#301](https://github.com/ParachuteComputer/parachute-hub/issues/301) Phase A more aggressively than initially planned; folded per [#327](https://github.com/ParachuteComputer/parachute-hub/issues/327) into rc.14).**
 
-The `kind ∈ {"api" | "frontend" | "tool"}` trichotomy conflates two concerns: "is this served as static UI?" and "what's the module's role?" In practice hub only branches on `kind === "frontend"`; api-vs-tool is observationally identical. Per the phased migration in [#301](https://github.com/ParachuteComputer/parachute-hub/issues/301), Phase A relaxes the field to optional so module authors can stop carrying a value the validator otherwise demands.
+The `kind ∈ {"api" | "frontend" | "tool"}` trichotomy conflated two concerns: "is this served as static UI?" and "what's the module's role?" In practice hub only branches on `kind === "frontend"` (in `commands/upgrade.ts`, to decide whether to run `bun run build`); api-vs-tool is observationally identical. Per Aaron's direction on the [#301](https://github.com/ParachuteComputer/parachute-hub/issues/301) Phase A fold ([#327](https://github.com/ParachuteComputer/parachute-hub/issues/327)): stop validating it entirely. The field is no longer enforced — present, absent, valid, typo'd, wrong-typed, all accepted. Routing branches downstream use `=== "frontend"` style checks which gracefully handle undefined/other values as the backend-proxy default.
 
-**What landed.**
+**What landed (vs the rc.13 → rc.14 in-flight version).**
 
-- **`asKind` in `src/module-manifest.ts`** now treats `undefined` as a valid input — defaults to `"api"` (backend-proxy, matches existing `"api" === "tool"` routing) and emits a soft-warning log line so operators authoring new modules know the field can be removed.
-- **Invalid `kind` values are still rejected.** Only the *missing* case relaxes. A typo'd value (`"static"`, `"backend"`, etc.) still errors — the author had intent and got it wrong; surface that loudly.
-- **`validateModuleManifest` + `readModuleManifest` accept an optional `logger`** so the soft-warning can be captured in tests and routed through hub's own logger seam at production call sites (defaults to `console`).
-- **`ModuleManifest.kind` JSDoc** now documents the optional-since-Phase-A semantics + the api/tool/frontend routing distinction (only `"frontend"` is observationally different today).
+- **`asKind` in `src/module-manifest.ts`** is now a pass-through narrower: returns the value if it's one of `"api" | "frontend" | "tool"`, otherwise returns `undefined`. No throws, no warnings. The validator no longer inspects the field's intent.
+- **`ModuleManifest.kind` is now optional** in the type. The single downstream read site (`commands/upgrade.ts:376` — `target.spec?.kind === "frontend"`) gracefully treats undefined and other values as the backend-proxy default.
+- **`ServiceSpec.kind` is now optional** in `src/service-spec.ts` to mirror the manifest relaxation. Same downstream consumer, already-graceful handling.
+- **Removed the soft-warning log line.** The initial rc.14 version (soft-warn approach) defaulted missing kind to `"api"` and emitted a warning. Per Aaron's fold direction: missing kind is genuinely fine, not a "you should know" situation, so the warning is gone too.
+- **`validateModuleManifest` + `readModuleManifest` retain the optional `logger` parameter** for forward-compatibility with future validator soft-warnings, even though the kind warning it was originally added for has been removed.
 
-**Why this unblocks app.** parachute-app's `0.2.0-rc.5` shipped `.parachute/module.json` without `kind`, anticipating Phase A. The validator's pre-existing strict-require turned that into a boot-time crash — `parachute start app` failing with `"kind" must be "api" | "frontend" | "tool"`, no bootstrap, no notes-ui under `/app/notes`. App `0.2.0-rc.6` carries an explicit `kind: "frontend"` to unblock the immediate test loop; once hub rc.14 ships, future app releases can drop the field.
+**Why this unblocks app.** parachute-app's `0.2.0-rc.5` shipped `.parachute/module.json` without `kind`. The validator's pre-fold strict-require turned that into a boot-time crash. App's `0.2.0-rc.6` (now correcting to `kind: "api"` per the routing-semantics fold in app#14 — app is a backend that proxies, not a static-served frontend) is unblocked once hub rc.14 propagates; future app releases can drop the field entirely.
 
 **Out of scope (intentional).**
 
-- Phases B–D from [#301](https://github.com/ParachuteComputer/parachute-hub/issues/301): the explicit `static: boolean` field, per-module migrations (notes/vault/scribe/runner dropping `kind`), and the eventual full removal of `kind` from the manifest schema. Phase A is the validator-side surface area only.
+- Phases B–D from [#301](https://github.com/ParachuteComputer/parachute-hub/issues/301): the explicit `static: boolean` field, per-module migrations (notes/vault/scribe/runner dropping `kind`), and the eventual full removal of `kind` from the manifest schema. Phase A — now the validator no longer inspects the field — is the validator-side surface area only.
 
-**Tests.** New `kind is optional (hub#301 Phase A)` suite in `src/__tests__/module-manifest.test.ts` — five cases covering: missing kind defaults + warns; explicit `frontend` / `api` / `tool` pass through silently; invalid values still rejected. `bun run typecheck` clean. `bun test ./src` — passes. `cd web/ui && bun run test` unchanged.
+**Tests.** Renamed suite to `kind is no longer validated (hub#327)` in `src/__tests__/module-manifest.test.ts` — six cases covering: missing kind → undefined; explicit `frontend` / `api` / `tool` pass through; invalid values (`"static"`, `"backend"`, `null`, `42`) also accepted (narrowed to `undefined`); defensive check that `kind === "frontend"` still survives the validator (the one routing branch in `commands/upgrade.ts` intact). `bun run typecheck` clean. `bun test ./src` — passes. `cd web/ui && bun run test` unchanged.
 
 ## [0.5.13-rc.13] - 2026-05-22
 
