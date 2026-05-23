@@ -33,7 +33,7 @@ Per [governance rule 2](https://github.com/ParachuteComputer/parachute-patterns/
 
 ### Install command — same bug?
 
-`parachute install <svc>` runs `bun add -g <pkg>` (no `@latest` literal but bun resolves an unsuffixed package to `@latest`). For install that's by design — there's no installed version to read a channel from. The fresh-install default-channel question is a separate concern; filing as a follow-up.
+`parachute install <svc>` runs `bun add -g <pkg>` (no `@latest` literal but bun resolves an unsuffixed package to `@latest`). For install that's by design — there's no installed version to read a channel from. The fresh-install default-channel question is a separate concern; tracked at [hub#337](https://github.com/ParachuteComputer/parachute-hub/issues/337).
 
 ### Cross-references
 

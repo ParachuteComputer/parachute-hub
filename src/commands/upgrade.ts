@@ -582,10 +582,15 @@ async function upgradeNpm(target: ResolvedTarget, sourceDir: string, r: Resolved
       if (cmp !== null && cmp < 0) {
         const channelHint =
           channel === "rc" ? "" : " or rerun with `--channel rc` to stay on the rc chain";
+        const rcNote =
+          channel === "rc"
+            ? "  (Unusual but possible: the @rc dist-tag may have been re-pointed at an older release.)"
+            : null;
         r.log(
           `✗ ${target.short}: refusing to downgrade — installed ${beforeVersion}, ` +
             `target @${channel} resolves to ${targetVersion}.`,
         );
+        if (rcNote) r.log(rcNote);
         r.log(
           `  To force this downgrade, run: bun add -g ${target.packageName}@${targetVersion}${channelHint}`,
         );
