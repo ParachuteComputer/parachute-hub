@@ -2,6 +2,40 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.25] - 2026-05-23
+
+**fix(hub): `TMPDIR=/parachute/tmp` so bun installs work on cross-mount filesystems (closes [hub#349](https://github.com/ParachuteComputer/parachute-hub/issues/349) root cause).**
+
+Aaron ran `bun add -g --verbose cowsay` inside a Render shell and surfaced the actual failure mode:
+
+```
+info: cannot move files from tempdir: RenameAcrossMountPoints, using fallback
+error: Failed to link cowsay: EACCES
+```
+
+The Render container's filesystem layout has `/parachute` mounted as a separate block device (`/dev/nvme16n1` on ext4). Bun's default tempdir is `/tmp` — on the container's overlay filesystem. When `bun add -g <pkg>` extracts the package and `rename()`s files from `/tmp/.bun-tmp-*` into `/parachute/modules/install/global/node_modules/...`, the kernel rejects with `EXDEV` (`RenameAcrossMountPoints`). Bun's fallback copy path then hits `EACCES` on a follow-up step and the link phase fails. Same-filesystem `bun add` in `/tmp/test` succeeds; cross-filesystem `bun add -g` fails.
+
+The previous fix in [#350](https://github.com/ParachuteComputer/parachute-hub/pull/350) (entrypoint chown of `/parachute`) was defensive hardening against stale disk ownership — useful, but not the actual root cause. This PR pins `TMPDIR` to `/parachute/tmp` so bun's extraction tempdir lives on the same filesystem as `BUN_INSTALL=/parachute/modules`, and `rename()` succeeds.
+
+### Fixed
+
+- **Render install failure resolved**: `bun add -g <module>` was failing with `Failed to link X: EACCES` on Render deploys. Root cause: Render mounts the persistent disk as a separate block device (`/dev/nvme*` on `/parachute`), and bun's default tempdir (`/tmp`, on the container's overlay filesystem) means cross-mount `rename()` fails with `EXDEV` during the link phase. Fix: `TMPDIR=/parachute/tmp` in the Dockerfile so bun's tempdir is on the same filesystem as `BUN_INSTALL=/parachute/modules`. Entrypoint script now creates `/parachute/tmp` and chowns it to bun. Resolves the install-blocker that prevented operators from installing modules via the admin SPA. Closes hub#349 (the real root cause, not the disk-ownership theory that earlier PRs addressed defensively).
+
+### What landed
+
+- **`Dockerfile`** — `ENV TMPDIR=/parachute/tmp` added alongside the existing `PARACHUTE_HOME` / `BUN_INSTALL` block in the runtime stage. Inline comment block explains the EXDEV / cross-mount diagnosis so the next operator doesn't have to re-derive it.
+- **`docker-entrypoint.sh`** — after the existing chown-if-needed block, `mkdir -p /parachute/tmp && chown bun:bun /parachute/tmp` ensures the tempdir exists and is writable by the bun user. Both ops are idempotent and microseconds — safe to run on every startup. Drop-to-bun via `gosu` is unchanged.
+
+### Verification
+
+- `bun test ./src` clean (no source change).
+- `bun run typecheck` clean (no TS impact).
+- Dockerfile + entrypoint diff reviewed manually; placement of `TMPDIR` in the ENV block + the tmpdir-create step in the entrypoint mirror the existing patterns for `BUN_INSTALL` + chown-if-needed.
+
+### Patterns check
+
+- No pattern shifts. The "TMPDIR-on-same-filesystem-as-target" pattern is a Unix invariant (`rename(2)` requires source + dest on the same filesystem; `EXDEV` is the standard cross-mount errno). The change is internal to the container build — no cross-repo coordination needed.
+
 ## [0.5.13-rc.24] - 2026-05-23
 
 **fix(hub): Dockerfile entrypoint chowns `/parachute` on startup (handles stale-ownership disks from older deploys) (closes [hub#349](https://github.com/ParachuteComputer/parachute-hub/issues/349)).**

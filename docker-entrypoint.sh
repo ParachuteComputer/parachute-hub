@@ -12,6 +12,15 @@ if [ "$(stat -c '%u' /parachute 2>/dev/null)" != "1000" ]; then
   chown -R bun:bun /parachute
 fi
 
+# Ensure /parachute/tmp exists and is bun-owned. Bun uses TMPDIR for
+# package extraction during `bun add`; if TMPDIR is on a different
+# filesystem than $BUN_INSTALL (e.g. Render's /tmp on overlay vs.
+# /parachute on a separate ext4 block device), rename() across mounts
+# fails with EXDEV and the install errors with "Failed to link: EACCES".
+# Putting TMPDIR on the same filesystem as BUN_INSTALL fixes it.
+mkdir -p /parachute/tmp
+chown bun:bun /parachute/tmp
+
 # Drop privileges + run hub. gosu does this safely (forwards signals,
 # preserves process tree under tini).
 exec gosu bun "$@"

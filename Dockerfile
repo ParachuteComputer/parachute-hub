@@ -102,10 +102,18 @@ COPY --from=builder /app/README.md ./README.md
 # resolves to `$BUN_INSTALL/install/global/node_modules/<pkg>`; module
 # discovery in src/install-source.ts already honors this env var, so
 # the supervisor finds children at the new path without code changes.
+#
+# TMPDIR pinned to /parachute/tmp so bun's `bun add` package extraction
+# happens ON the persistent disk. Without this, bun extracts to /tmp
+# (overlay filesystem) and rename() across mount points fails with
+# EXDEV — the same Render-disk-as-separate-block-device issue that
+# makes operators see "Failed to link: EACCES" on `parachute install`.
+# See hub#349 for the diagnosis trail.
 ENV PARACHUTE_HOME=/parachute \
     PORT=1939 \
     PARACHUTE_BIND_HOST=0.0.0.0 \
     BUN_INSTALL=/parachute/modules \
+    TMPDIR=/parachute/tmp \
     NODE_ENV=production
 
 # Pre-create the persistent-disk mount point AND the BUN_INSTALL subdir,
