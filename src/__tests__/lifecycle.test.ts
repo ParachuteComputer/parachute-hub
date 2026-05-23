@@ -80,7 +80,6 @@ function seedThirdParty(
   const manifest = {
     name,
     manifestName: opts.manifestName ?? name,
-    kind: "api" as const,
     port: opts.port ?? 1944,
     paths: [`/${name}`],
     health: `/${name}/health`,

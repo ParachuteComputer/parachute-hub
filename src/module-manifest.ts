@@ -24,8 +24,6 @@
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
 
-export type ModuleKind = "api" | "frontend" | "tool";
-
 export interface ModuleScopeBlock {
   /** OAuth scopes this module owns. Namespaced by `name` per oauth-scopes.md. */
   readonly defines?: readonly string[];
@@ -76,17 +74,6 @@ export interface ModuleManifest {
   readonly displayName?: string;
   /** One-line subtitle rendered under displayName. */
   readonly tagline?: string;
-  /**
-   * Historically drove card vs. iframe vs. launcher in the hub. As of
-   * hub#301 Phase A's fold (#327) the validator no longer inspects `kind` —
-   * any value, or no value at all, is accepted and passes through untouched.
-   * Routing branches downstream use `=== "frontend"` style checks which
-   * treat undefined/other values as the backend-proxy default (so the
-   * routing remains correct without validator enforcement). New modules
-   * may safely omit the field; existing values are preserved for the
-   * narrow `kind === "frontend"` branch in `commands/upgrade.ts`.
-   */
-  readonly kind?: ModuleKind;
   /** Default loopback port. CLI warns on conflict, doesn't block. */
   readonly port: number;
   /** URL paths the module serves under the hub origin. */
@@ -174,21 +161,6 @@ function asOptionalString(v: unknown, where: string, field: string): string | un
     throw new ModuleManifestError(`${where}: "${field}" must be a string if present`);
   }
   return v;
-}
-
-/**
- * Pass-through `kind` reader (hub#301 Phase A fold — #327).
- *
- * The validator no longer inspects `kind`. Any value, or no value, is
- * accepted. We narrow to the canonical `ModuleKind` only when the input is
- * one of the three known strings — otherwise we drop the field entirely so
- * downstream `kind === "frontend"` branches fall through to the
- * backend-proxy default. Author intent (typo, novel value, omission) is no
- * longer surfaced from this layer; it's not the validator's job anymore.
- */
-function asKind(v: unknown): ModuleKind | undefined {
-  if (v === "api" || v === "frontend" || v === "tool") return v;
-  return undefined;
 }
 
 function asPort(v: unknown, where: string): number {
@@ -358,10 +330,10 @@ function asDependencies(v: unknown, where: string): Record<string, ModuleDepende
 /**
  * Strict validator. Throws `ModuleManifestError` with the source path so
  * malformed third-party modules get a clear-enough error to fix. Required
- * fields are name, manifestName, port, paths, health. `kind` is no longer
- * inspected as of hub#301 Phase A's fold (#327) — any value (or none) is
- * accepted and passes through untouched. See `asKind` for the narrowing
- * behavior.
+ * fields are name, manifestName, port, paths, health. The historical `kind`
+ * field is fully retired as of hub#301 Phase C/D (#330) — any value (or none)
+ * is silently ignored; modules and third parties may continue to ship it in
+ * `module.json` without error but hub no longer reads it.
  *
  * The optional `logger` parameter is retained for forward-compatibility
  * with future validator soft-warnings, even though the kind soft-warning
@@ -384,7 +356,6 @@ export function validateModuleManifest(
     );
   }
   const manifestName = asString(m.manifestName, where, "manifestName");
-  const kind = asKind(m.kind);
   const port = asPort(m.port, where);
   const paths = asStringArray(m.paths, where, "paths");
   const health = asHealthPath(m.health, where);
@@ -433,7 +404,6 @@ export function validateModuleManifest(
   }
 
   const out: ModuleManifest = { name, manifestName, port, paths, health };
-  if (kind !== undefined) (out as { kind?: ModuleKind }).kind = kind;
   if (displayName !== undefined) (out as { displayName?: string }).displayName = displayName;
   if (tagline !== undefined) (out as { tagline?: string }).tagline = tagline;
   if (startCmd !== undefined) (out as { startCmd?: readonly string[] }).startCmd = startCmd;

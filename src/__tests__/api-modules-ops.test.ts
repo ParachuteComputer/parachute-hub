@@ -937,7 +937,6 @@ describe("well-known regen after module ops", () => {
     manifest: {
       name: string;
       manifestName: string;
-      kind: "api" | "frontend" | "tool";
       port: number;
       paths: string[];
       health: string;
@@ -965,7 +964,6 @@ describe("well-known regen after module ops", () => {
     const install = fakeInstall("@openparachute/vault", {
       name: "vault",
       manifestName: "parachute-vault",
-      kind: "api",
       port: 1940,
       paths: ["/vault/default"],
       health: "/vault/default/health",
@@ -1069,7 +1067,6 @@ describe("well-known regen after module ops", () => {
     const install = fakeInstall("@openparachute/vault", {
       name: "vault",
       manifestName: "parachute-vault",
-      kind: "api",
       port: 1940,
       paths: ["/vault/default"],
       health: "/vault/default/health",
@@ -1159,7 +1156,6 @@ describe("well-known regen after module ops", () => {
     const install = fakeInstall("@openparachute/vault", {
       name: "vault",
       manifestName: "parachute-vault",
-      kind: "api",
       port: 1940,
       paths: ["/vault/default"],
       health: "/vault/default/health",

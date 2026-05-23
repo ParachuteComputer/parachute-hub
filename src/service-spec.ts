@@ -79,16 +79,6 @@ export function isCanonicalPort(port: number): boolean {
 }
 
 /**
- * Broad shape of a service. Matches the hub's card-kind taxonomy.
- *   "frontend"  a user-facing UI (notes). Safe to expose by default.
- *   "api"       a programmatic surface (vault, channel, scribe). Whether
- *               it's safe to expose depends on `hasAuth`.
- *   "tool"      like "api" but specifically MCP-shaped / agent-callable.
- *               Treated the same as "api" for exposure defaults.
- */
-export type ServiceKind = "api" | "tool" | "frontend";
-
-/**
  * Imperative behaviors that don't fit the static `module.json` schema.
  *
  * First-party only. Each first-party fallback declares its own extras
@@ -174,14 +164,6 @@ export interface ServiceSpec {
    * First service boot overwrites the seed with its own authoritative version.
    */
   readonly seedEntry?: () => ServiceEntry;
-  /**
-   * Optional as of hub#327 (Phase A's fold): the validator no longer
-   * inspects `kind`, so synthesized + third-party-manifest specs may
-   * carry `undefined` here. The single read site
-   * (`commands/upgrade.ts: target.spec?.kind === "frontend"`) handles
-   * the absent case via the `=== "frontend"` falsy-fallthrough.
-   */
-  readonly kind?: ServiceKind;
   readonly hasAuth?: boolean;
   readonly urlForEntry?: (entry: ServiceEntry) => string | undefined;
   readonly postInstallFooter?: () => readonly string[];
@@ -239,7 +221,6 @@ export function composeServiceSpec(opts: {
     package: packageName,
     manifestName: manifest.manifestName,
     seedEntry: () => seedEntryFromManifest(manifest),
-    kind: manifest.kind,
   };
   if (extras?.init !== undefined) (spec as { init?: readonly string[] }).init = extras.init;
   if (startCmd !== undefined) {
@@ -301,7 +282,6 @@ const NOTES_FALLBACK: FirstPartyFallback = {
     manifestName: "parachute-notes",
     displayName: "Notes",
     tagline: "Notes PWA — daemon deprecated 2026-05-22; install `app` for the current path.",
-    kind: "frontend",
     port: 1942,
     paths: ["/notes"],
     health: "/notes/health",
@@ -331,7 +311,6 @@ const CHANNEL_FALLBACK: FirstPartyFallback = {
     manifestName: "parachute-channel",
     displayName: "Channel",
     tagline: "Notification fan-out across modules.",
-    kind: "api",
     port: 1941,
     paths: ["/channel"],
     health: "/channel/health",
@@ -397,9 +376,6 @@ export interface KnownModule {
   /** Pre-install catalog surfaces use these. After install, services.json wins. */
   readonly displayName: string;
   readonly tagline: string;
-  /** Module kind — needed for `synthesizeManifest` since KNOWN_MODULES doesn't
-   *  carry an embedded manifest. All three current entries are api/tool. */
-  readonly kind: ModuleKind;
   /** Canonical mount paths — used to synthesize a minimal manifest when
    *  module.json is unreadable (legacy install paths, test fixtures). The
    *  module's own `module.json` overrides these once it's installed. */
@@ -412,12 +388,6 @@ export interface KnownModule {
   readonly extras?: FirstPartyExtras;
 }
 
-// Local import-time alias for ModuleKind so the public KnownModule type can
-// reference it without forcing every consumer to import from
-// module-manifest. The same `ModuleKind` type is exported from there for
-// callers that want it directly.
-type ModuleKind = ModuleManifest["kind"];
-
 export const KNOWN_MODULES: Record<string, KnownModule> = {
   vault: {
     short: "vault",
@@ -426,7 +396,6 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
     canonicalPort: 1940,
     displayName: "Vault",
     tagline: "Your owner-authenticated MCP knowledge store.",
-    kind: "api",
     canonicalPaths: ["/vault/default"],
     canonicalHealth: "/vault/default/health",
     extras: {
@@ -446,7 +415,6 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
     canonicalPort: 1943,
     displayName: "Scribe",
     tagline: "Local audio transcription for vault recordings.",
-    kind: "api",
     canonicalPaths: ["/scribe"],
     canonicalHealth: "/scribe/health",
     canonicalStripPrefix: true,
@@ -481,7 +449,6 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
     displayName: "Runner",
     tagline:
       "Vault-as-job-substrate engine — spawns claude -p against vault job notes on schedule.",
-    kind: "tool",
     canonicalPaths: ["/runner", "/.parachute"],
     canonicalHealth: "/runner/healthz",
     canonicalStripPrefix: false,
@@ -507,10 +474,6 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
     // still exists as a back-compat install (CURATED_MODULES still lists
     // `notes`) but `app` is the recommended first install post-vault.
     tagline: "Host module for Parachute UIs — auto-installs Notes on first boot.",
-    // Frontend posture: app's primary surface is serving sub-app UIs under
-    // `/app/<name>/` mounted under one origin (design doc §12). Hub's
-    // exposure-default + supervisor-defaults follow the frontend lane.
-    kind: "frontend",
     canonicalPaths: ["/app", "/.parachute"],
     canonicalHealth: "/app/healthz",
     canonicalStripPrefix: false,
@@ -576,7 +539,6 @@ export function synthesizeManifestForKnownModule(km: KnownModule): ModuleManifes
     manifestName: km.manifestName,
     displayName: km.displayName,
     tagline: km.tagline,
-    kind: km.kind,
     port: km.canonicalPort,
     paths: km.canonicalPaths,
     health: km.canonicalHealth,
@@ -611,30 +573,17 @@ export function effectivePublicExposure(
   if (entry.publicExposure !== undefined) return entry.publicExposure;
   const short = shortNameForManifest(entry.name);
   if (short === undefined) return "allowed";
-  // FALLBACK path: notes / channel still vendor their kind + extras.
+  // Post hub#301 Phase C/D (`kind` field retired — hub#330), the
+  // exposure-default heuristic collapses to the imperative `extras.hasAuth`
+  // signal: an explicit `hasAuth: false` declaration ("no auth gate
+  // implemented yet") → require auth before exposing; anything else →
+  // allowed. Scribe is the canonical `hasAuth: false` case today.
   const fb = FIRST_PARTY_FALLBACKS[short];
   if (fb) {
-    if (
-      (fb.manifest.kind === "api" || fb.manifest.kind === "tool") &&
-      fb.extras?.hasAuth === false
-    ) {
-      return "auth-required";
-    }
-    return "allowed";
+    return fb.extras?.hasAuth === false ? "auth-required" : "allowed";
   }
-  // KNOWN_MODULES path: vault / scribe / runner. The `kind` lives on
-  // services.json (operator-authoritative after self-register) — if the row
-  // doesn't declare it, fall through to the imperative `extras.hasAuth`
-  // signal which says "no auth gate → require auth before exposing." This
-  // matches the pre-retirement FALLBACK behavior for scribe.
   const km = KNOWN_MODULES[short];
-  if (km && km.extras?.hasAuth === false) {
-    // Only api/tool services hit the "auth-required default" lane —
-    // services.json's `kind` is the authoritative source; absent it,
-    // KNOWN_MODULES doesn't carry `kind` so we assume an api/tool posture
-    // (the three KNOWN_MODULES entries are all api/tool today).
-    return "auth-required";
-  }
+  if (km && km.extras?.hasAuth === false) return "auth-required";
   return "allowed";
 }
 
@@ -699,14 +648,13 @@ export function getSpec(short: string): ServiceSpec | undefined {
   const km = KNOWN_MODULES[short];
   if (!km) return undefined;
   // Use the synthesized manifest from KNOWN_MODULES' canonical fields so
-  // downstream consumers (seedEntry, kind-aware exposure, port assignment)
-  // see a coherent spec. Module.json wins at lifecycle time
-  // (`composeKnownModuleSpec`); this synth is the bootstrap shape.
+  // downstream consumers (seedEntry, port assignment) see a coherent spec.
+  // Module.json wins at lifecycle time (`composeKnownModuleSpec`); this
+  // synth is the bootstrap shape.
   const synthManifest = synthesizeManifestForKnownModule(km);
   const spec: ServiceSpec = {
     package: km.package,
     manifestName: km.manifestName,
-    kind: synthManifest.kind,
     seedEntry: () => seedEntryFromManifest(synthManifest),
   };
   if (km.extras?.hasAuth !== undefined) {

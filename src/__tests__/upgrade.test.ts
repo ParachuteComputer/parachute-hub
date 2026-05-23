@@ -288,7 +288,13 @@ describe("parachute upgrade", () => {
     }
   });
 
-  test("bun-linked frontend: runs bun run build before restart", async () => {
+  // hub#301 Phase C/D (#330): `kind` retired and the bun-linked
+  // `kind === "frontend"` build branch retires with it. Notes-daemon's
+  // `prepublishOnly` builds dist at publish time so consumers don't need a
+  // post-install rebuild; this test pins the new behavior — even a
+  // historical frontend module (with a `build` script in package.json)
+  // does NOT trigger `bun run build` during an upgrade.
+  test("bun-linked: no bun run build invoked (kind branch retired in #330)", async () => {
     const h = makeHarness();
     try {
       const installDir = join(h.installRoot, "notes");
@@ -341,7 +347,7 @@ describe("parachute upgrade", () => {
         log: () => {},
       });
       expect(code).toBe(0);
-      expect(ranBuild.value).toBe(true);
+      expect(ranBuild.value).toBe(false);
     } finally {
       h.cleanup();
     }

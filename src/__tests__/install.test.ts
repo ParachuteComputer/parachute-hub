@@ -779,7 +779,6 @@ describe("install", () => {
         readManifest: async () => ({
           name: "demo",
           manifestName: "@local/demo",
-          kind: "api",
           port: 1951,
           paths: ["/demo"],
           health: "/healthz",
@@ -1421,7 +1420,6 @@ describe("install", () => {
         readManifest: async () => ({
           name: "widget",
           manifestName: "@acme/widget",
-          kind: "api",
           port: 1950,
           paths: ["/widget"],
           health: "/healthz",
@@ -1479,7 +1477,6 @@ describe("install", () => {
         readManifest: async () => ({
           name: "vault",
           manifestName: "@evil/squatter",
-          kind: "api",
           port: 1950,
           paths: ["/vault"],
           health: "/healthz",
@@ -1512,7 +1509,6 @@ describe("install", () => {
         readManifest: async () => ({
           name: "demo",
           manifestName: "@local/demo",
-          kind: "api",
           port: 1951,
           paths: ["/demo"],
           health: "/healthz",
@@ -1564,7 +1560,6 @@ describe("install", () => {
         readManifest: async () => ({
           name: "demo",
           manifestName: "@local/demo",
-          kind: "api",
           port: 1951,
           paths: ["/demo"],
           health: "/healthz",
@@ -1608,7 +1603,6 @@ describe("install", () => {
         readManifest: async () => ({
           name: "demo",
           manifestName: "@local/demo",
-          kind: "api",
           port: 1951,
           paths: ["/demo"],
           health: "/healthz",
@@ -1641,7 +1635,6 @@ describe("install", () => {
         readManifest: async () => ({
           name: "widget",
           manifestName: "@vendor/widget",
-          kind: "api",
           port: 1952,
           paths: ["/widget"],
           health: "/widget/health",
@@ -1684,7 +1677,6 @@ describe("install", () => {
         readManifest: async () => ({
           name: "someapp",
           manifestName: "parachute-someapp",
-          kind: "api",
           port: 1945,
           paths: ["/someapp"],
           health: "/someapp/health",

@@ -243,7 +243,6 @@ describe("hubFetch routing", () => {
         readModuleManifest: async () => ({
           name: "vault",
           manifestName: "parachute-vault",
-          kind: "api",
           port: 1940,
           paths: ["/vault/default"],
           health: "/health",
@@ -298,7 +297,6 @@ describe("hubFetch routing", () => {
         readModuleManifest: async () => ({
           name: "notes",
           manifestName: "parachute-notes",
-          kind: "frontend",
           port: 5173,
           paths: ["/notes"],
           health: "/health",
@@ -335,7 +333,6 @@ describe("hubFetch routing", () => {
         readModuleManifest: async () => ({
           name: "notes",
           manifestName: "parachute-notes",
-          kind: "frontend",
           port: 5173,
           paths: ["/notes"],
           health: "/health",
@@ -362,7 +359,6 @@ describe("hubFetch routing", () => {
         readModuleManifest: async () => ({
           name: "vault",
           manifestName: "parachute-vault",
-          kind: "api",
           port: 1940,
           paths: ["/vault/default"],
           health: "/health",

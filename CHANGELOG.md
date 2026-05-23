@@ -2,6 +2,34 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.19] - 2026-05-23
+
+**chore(hub): retire `kind` from types + manifest parser + `KNOWN_MODULES` + `upgrade.ts` build branch (closes [hub#330](https://github.com/ParachuteComputer/parachute-hub/issues/330)).**
+
+Completes hub#301 Phase C/D. Phase A ([hub#327](https://github.com/ParachuteComputer/parachute-hub/pull/327)) made `kind` optional in the manifest validator; Phase B retired `kind` from the per-module `.parachute/module.json` files in vault, scribe, runner, and app (vault#359, scribe#52, runner#7, app#29 — all merged); patterns#84 dropped the field from the canonical module-protocol pattern docs. This PR finishes the cleanup by deleting hub's remaining references.
+
+### Removed
+
+- `kind` field fully retired from hub. Removed the `ModuleKind` type alias, `ServiceKind` type alias, the `asKind` parser, and all `kind:` declarations in `KNOWN_MODULES` / `FIRST_PARTY_FALLBACKS`. The `upgrade.ts` `kind === "frontend"` branch (which ran `bun run build` post-install for notes-daemon on the bun-linked path) also retires — notes-daemon's `prepublishOnly` script builds `dist/` at publish time and its `files` array ships `dist/`, so consumers don't need a post-install rebuild. Module authors who still ship `kind` in `module.json` aren't broken: the validator silently ignores it.
+
+### What landed
+
+- **`src/module-manifest.ts`** — deleted `ModuleKind` export, the `kind?: ModuleKind` field from `ModuleManifest`, the `asKind` parser function, and the validator's `kind` write-through.
+- **`src/service-spec.ts`** — deleted the `ServiceKind` type alias, the `kind?: ServiceKind` field from `ServiceSpec`, the `kind: ModuleKind` field from `KnownModule`, the import-time `ModuleKind` alias, and the `kind:` value on every `KNOWN_MODULES` entry (vault, scribe, runner, app) + on both `FIRST_PARTY_FALLBACKS` (notes, channel). `composeServiceSpec`, `synthesizeManifestForKnownModule`, and `getSpec`'s synthesis path no longer set `kind`. `effectivePublicExposure` collapses to a single signal: `extras.hasAuth === false` ⇒ "auth-required", else "allowed" — same outcome for every module today (scribe is the canonical `hasAuth: false` case).
+- **`src/commands/upgrade.ts`** — dropped the `if (target.spec?.kind === "frontend") { bun run build }` branch and the now-unused `packageHasScript` helper. Updated the file's docstring to remove the "bun run build (frontend kind, if `build` script exists)" line.
+- **Tests** — collapsed `module-manifest.test.ts`'s five "kind is no longer validated" sub-tests into one "kind values in module.json are silently ignored" test that pins the new behavior (parsed manifest exposes no `kind` field). Refactored `upgrade.test.ts`'s "bun-linked frontend: runs bun run build" test into the inverse assertion: `bun run build` is NOT invoked even when a module declares a `build` script. Removed `kind:` from `readModuleManifest` fixtures in `hub-server.test.ts`, `post-install.test.ts`, `api-modules-ops.test.ts`, `install.test.ts`, and `lifecycle.test.ts` — those fixtures are typed against `ModuleManifest`, so the field deletion cascades into the test surface.
+
+### Verification
+
+- Notes-daemon's `prepublishOnly` runs `bun run build` (verified in `parachute-notes/packages/notes-daemon/package.json`); the `files` array publishes `dist/`. Post-install rebuild on the consumer side was never load-bearing — npm tarballs ship complete.
+- `bun run typecheck` clean; `bun test ./src` 1902 pass / 0 fail (delta from rc.18: −5 tests, all from the module-manifest kind sub-test collapse + the upgrade frontend-build test refactor); `bunx biome check src/` clean.
+
+### Back-compat
+
+- Third-party + first-party `module.json` files that still declare `kind` keep parsing fine — the validator silently ignores the field, no warnings, no errors.
+- Modules previously installed under any `kind` value continue to start, restart, upgrade, and expose normally. The `effectivePublicExposure` defaults preserve the previous behavior for every known module (vault / scribe / runner / app / notes / channel).
+- The bun-linked-checkout `parachute upgrade notes` path no longer runs `bun run build` post-pull. Operators running notes-daemon from a local checkout who relied on this can run `bun run build` themselves; the published npm tarball already includes `dist/`.
+
 ## [0.5.13-rc.18] - 2026-05-23
 
 **feat(hub): `parachute install` accepts `--channel rc|latest` + honors `PARACHUTE_INSTALL_CHANNEL` env; Render deploy cascades rc across modules.**
