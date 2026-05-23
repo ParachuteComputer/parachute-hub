@@ -8,11 +8,27 @@ The hub coordinates the modules running on your machine: it installs them, runs 
 
 ## Install
 
+### Local (Bun)
+
 ```sh
 bun add -g @openparachute/hub
 ```
 
 Prereqs: [Bun](https://bun.sh) 1.3.0 or later. `parachute expose` also requires [Tailscale](https://tailscale.com/download) **1.82 or newer** (installed + `tailscale up` run once); the `expose` path is under active polish for launch, so expect rough edges.
+
+### Hosted (Render)
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/ParachuteComputer/parachute-hub)
+
+One-click Render deploy via the `render.yaml` Blueprint in this repo. Provisions a $7/mo Starter service + 1 GiB persistent disk + auto-deploys from `main`. Comes pre-configured with `PARACHUTE_INSTALL_CHANNEL=rc` so any modules you add via the admin SPA (vault, app, scribe, runner) install at the rc channel — matching the hub's rc release line. Flip to `latest` in your Render dashboard if you prefer stable cluster-wide.
+
+After deploy:
+
+1. Open your Render service URL → wizard runs at `/admin/setup`
+2. Set custom domain (optional) → set `PARACHUTE_HUB_ORIGIN` env to match
+3. Install modules via the admin SPA at `/admin/modules` (or via the wizard)
+
+Render's docs on Blueprints: <https://render.com/docs/blueprint-spec>
 
 ## First 5 minutes
 
