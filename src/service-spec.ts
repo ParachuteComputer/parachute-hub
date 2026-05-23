@@ -551,10 +551,10 @@ export function synthesizeManifestForKnownModule(km: KnownModule): ModuleManifes
 
 /**
  * Effective publicExposure for a service, given what's on its services.json
- * entry. Explicit wins. If absent, derive from the spec: known api/tool
- * services without declared auth fall back to "auth-required"; everything
- * else defaults to "allowed" — so vault, notes, channel and unknown
- * third-party services continue to be exposed without needing to opt in.
+ * entry. Explicit wins. If absent, derive from the spec: services with
+ * declared auth (extras.hasAuth === true, or no hasAuth set) default to
+ * "allowed"; services with extras.hasAuth === false default to
+ * "auth-required". Unknown third-party services default to "allowed".
  *
  * Layer behavior (post-#187 layer-aware proxy):
  *   "allowed"        — reaches all layers (loopback / tailnet / public);
@@ -628,7 +628,7 @@ export function canonicalPortForManifest(manifestName: string): number | undefin
  *
  * KNOWN_MODULES shorts (vault / scribe / runner — post hub#310 FALLBACK
  * retirement) return a **minimal** spec carrying `package`, `manifestName`,
- * `kind` (best-effort api/tool), and the imperative `extras` fields
+ * and the imperative `extras` fields
  * (`init`, `hasAuth`, `urlForEntry`, `postInstallFooter`). They do NOT carry
  * `startCmd` or `seedEntry` — those come from `<installDir>/.parachute/module.json`
  * at lifecycle time via {@link getSpecFromInstallDir}, since the module

@@ -18,7 +18,7 @@ import { RETIRED_MODULES } from "./service-spec.ts";
  *                   auth state over `/.parachute/info`.
  *
  * Absent field: the CLI derives a safe default from the service's ServiceSpec
- * (known api/tool services without declared auth → "auth-required"; everything
+ * (services with extras.hasAuth === false → "auth-required"; everything
  * else → "allowed"). Unknown services default to "allowed" for back-compat.
  */
 export type PublicExposure = "allowed" | "loopback" | "auth-required";
