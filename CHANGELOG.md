@@ -2,6 +2,39 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.16] - 2026-05-23
+
+**fix(hub): update operator-facing help text post-Notes-as-app migration.**
+
+Aaron's audit script ([`parachute-patterns/scripts/audit-canonical-refs.sh`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/scripts/audit-canonical-refs.sh)) flagged four operator-facing references in `src/help.ts` (the output of `parachute install --help`, `parachute setup --help`, `parachute status --help`) that still framed `parachute install notes` as the canonical install path. Post-Notes-as-app migration (Phase 2, 2026-05-21), the canonical path is `parachute install app` — the host module that auto-bootstraps Notes under `/app/notes` on first `parachute-app serve` (parachute-app §17 Phase 2.1). The notes-daemon (`parachute install notes`) still works for back-compat but is no longer the recommended path.
+
+### What landed
+
+- **`installHelp` examples (`src/help.ts:70-72`)** — `parachute install app # installs app (auto-bootstraps Notes)` now leads; the legacy `parachute install notes` line moved below and is annotated as `back-compat: legacy notes-daemon (Phase 2 deprecating)`.
+- **`setupHelp` description (`src/help.ts:96`)** — `(vault, notes, scribe; channel is exploratory …)` → `(vault, app, scribe; channel is exploratory …)`.
+- **`setupHelp` description (`src/help.ts:103`)** — `summary banner with the running URLs (hub, vault, notes, scribe)` → `(hub, vault, app, scribe)`.
+- **`statusHelp` example (`src/help.ts:156-159`)** — example row replaced from a stopped `parachute-notes` daemon at port 1942 → a running `parachute-app` at port 1946 with the canonical `/app/notes` URL. Version pinned to `0.2.0-rc.4` (current published `@openparachute/app@latest` on npm; local checkout is rc.7 but the example mirrors what an `npm install` operator would see).
+
+### Intentionally not touched
+
+- **`notes-serve.ts:135`** — error message text mentioning `parachute install notes` (back-compat path is still wired; the error fires from `parachute install notes` itself when notes can't be resolved, so the hint is correct in context).
+- **Test files referencing port 1942 (`status.test.ts`, `setup.test.ts`, `hub-server.test.ts`, etc.)** — these exercise the daemon back-compat code paths and should continue testing them.
+- **`hub-settings.ts:16` historical motivator comment** — narration of the original onboarding arc, not operator-visible.
+- **Launch-day docs** (`LAUNCH_SMOKE.md`, `BETA-EMAIL-launch-day.md`, `RELEASE-NOTES-launch-day.md`) — historical reference per workspace `CLAUDE.md`.
+
+### Tests
+
+`bun run typecheck` clean. `bun test ./src` — passing, count unchanged (no test assertions on the exact help-text strings that changed; `cli.test.ts` uses loose regex matchers like `/parachute install/` which still pass).
+
+### Cross-references
+
+- Audit script catch: [`parachute-patterns/scripts/audit-canonical-refs.sh`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/scripts/audit-canonical-refs.sh) — first block (`parachute install notes`) + fourth block (hardcoded port 1942 outside parachute-notes).
+- Notes-as-app migration arc: [`parachute-patterns/migrations/2026-05-21-notes-as-app.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/migrations/2026-05-21-notes-as-app.md).
+- [parachute-notes#154](https://github.com/ParachuteComputer/parachute-notes/issues/154) — notes-daemon deprecation arc.
+- [#324](https://github.com/ParachuteComputer/parachute-hub/pull/324) — wizard switched to install app (sibling cleanup).
+- [#326](https://github.com/ParachuteComputer/parachute-hub/pull/326) — notes module tagline cleanup (sibling audit catch).
+- parachute-app §17 Phase 2.1 — `bootstrap-default-apps` auto-installs notes-ui under `/app/notes`.
+
 ## [0.5.13-rc.15] - 2026-05-22
 
 **fix(hub): auto-drop legacy short-name rows in services.json on read (rescues operators tripped by parachute-app#13 / parachute-runner#4).**

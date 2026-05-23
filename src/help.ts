@@ -68,7 +68,8 @@ Flags:
 
 Examples:
   parachute install vault                                   # installs, runs init, starts vault
-  parachute install notes                                   # installs and starts notes
+  parachute install app                                     # installs app (auto-bootstraps Notes)
+  parachute install notes                                   # back-compat: legacy notes-daemon (Phase 2 deprecating)
   parachute install scribe                                  # installs, prompts for provider, starts scribe
   parachute install scribe --scribe-provider groq --scribe-key gsk_…
                                                             # non-interactive scribe setup
@@ -93,14 +94,14 @@ What it does:
   1. surveys ~/.parachute/services.json — already-installed services are
      reported, then skipped from the picker
   2. shows a numbered multi-select for the remaining first-party services
-     (vault, notes, scribe; channel is exploratory and only offered by name)
+     (vault, app, scribe; channel is exploratory and only offered by name)
   3. pre-collects all interactive answers up front so the installs can run
      without further prompting:
        - vault: vault name (default \`default\`)
        - scribe: transcription provider + API key for cloud providers
   4. iterates \`parachute install <svc>\` per pick, threading the collected
      answers and the shared --tag / --no-start flags
-  5. prints a summary banner with the running URLs (hub, vault, notes, scribe)
+  5. prints a summary banner with the running URLs (hub, vault, app, scribe)
      and a hint for connecting Claude Code
 
 Behavior:
@@ -109,7 +110,7 @@ Behavior:
     (root cause), so subsequent fallout doesn't mask the original problem.
   - Non-TTY / piped invocations should use \`parachute install <svc>\` per
     service instead — \`setup\` assumes a terminal for the prompts.
-  - Selection accepts numbers (\`1,3\`), names (\`vault, notes\`), or \`all\`.
+  - Selection accepts numbers (\`1,3\`), names (\`vault, app\`), or \`all\`.
 
 Flags:
   --tag <name>     npm dist-tag or exact version, applied to every install
@@ -155,8 +156,8 @@ Example:
   SERVICE          PORT  VERSION  PROCESS  PID    UPTIME  HEALTH  LATENCY  SOURCE
   parachute-vault  1940  0.2.4    running  12345  2h 13m  ok      2ms      bun-linked → parachute-vault @ 8aa167b
     → http://127.0.0.1:1940/vault/default/mcp
-  parachute-notes  1942  0.0.1    stopped  -      -       -       -        npm (0.3.15-rc.1)
-    → http://127.0.0.1:1942/notes
+  parachute-app    1946  0.2.0    running  12346  2h 12m  ok      3ms      npm (0.2.0-rc.4)
+    → http://127.0.0.1:1946/app/notes
 `;
 }
 
@@ -280,8 +281,9 @@ Start commands by service:
   hub       bun <cli>/hub-server.ts --port <picked> ...
   vault     parachute-vault serve
   scribe    parachute-scribe serve
+  app       parachute-app serve
   channel   parachute-channel daemon
-  notes     bun <cli>/notes-serve.ts --port <configured> --mount <paths[0]>
+  notes     bun <cli>/notes-serve.ts --port <configured> --mount <paths[0]>   # back-compat: legacy notes-daemon
 `;
 }
 
