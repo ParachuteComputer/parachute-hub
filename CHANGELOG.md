@@ -2,6 +2,27 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.27] - 2026-05-23
+
+**fix(hub): drop admin env vars from default Render deploy + make bootstrap token banner prominent.**
+
+Aaron's framing: on first-time setup we don't want admin username/password as default config variables prompted in Render's dashboard — we just want to make sure the bootstrap token is easy to spot in the logs.
+
+### Changed
+
+- Render deploy default flow simplified: removed `PARACHUTE_INITIAL_ADMIN_USERNAME` / `PARACHUTE_INITIAL_ADMIN_PASSWORD` as prompted fields in `render.yaml`. New default: operators check Render Logs for the bootstrap token (now in a visually prominent banner with ═ delimiters), visit `/admin/setup`, paste the token, create admin. Operators who want env-var seeding can still set these env vars manually in the Render dashboard — hub honors them via `seedInitialAdminIfNeeded`. Cleaner secret hygiene: no admin passwords stored in Render's env-var dashboard.
+- The bootstrap-token banner in hub's startup logs now uses ═ delimiters + ALL-CAPS heading, making it easy to spot when scrolling through container logs. The `parachute-bootstrap-` prefix on the token line is preserved so operators can grep for that exact string.
+- README "Hosted (Render)" section updated to lead with the bootstrap-token-from-logs flow.
+
+### Patterns check
+
+- No pattern shifts. Surface polish on the Render deploy + first-boot operator experience; complements the rc.26 spawn-env fix that unblocked Render module installs. Cross-refs hub#337 / hub#347 (Render deploy infrastructure).
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src` — banner tests updated, all pass.
+
 ## [0.5.13-rc.26] - 2026-05-23
 
 **fix(hub): `Bun.spawn` subprocess calls now inherit `process.env` (closes the real-real root cause of [hub#349](https://github.com/ParachuteComputer/parachute-hub/issues/349)).**

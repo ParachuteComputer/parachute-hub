@@ -150,15 +150,21 @@ export async function seedInitialAdminIfNeeded(
  * operator wins the race).
  */
 export function formatBootstrapTokenBanner(token: string): string {
+  const rule = "═".repeat(64);
   return [
-    "[wizard] No admin exists — wizard mode active. To claim ownership of this hub:",
-    "[wizard]   1. Visit http://localhost:1939/admin/setup (or your deployed URL)",
-    "[wizard]   2. Paste this bootstrap token into the form:",
+    "[wizard]",
+    `[wizard] ${rule}`,
+    "[wizard]   PARACHUTE BOOTSTRAP TOKEN",
+    `[wizard] ${rule}`,
     "[wizard]",
     `[wizard]   ${token}`,
     "[wizard]",
-    "[wizard] This token grants permission to create the first admin. It expires when",
-    "[wizard] admin is created OR when hub restarts.",
+    "[wizard]   → Visit <hub-url>/admin/setup and paste this token to create",
+    "[wizard]     your admin account.",
+    "[wizard]   → Expires when admin is created OR when hub restarts.",
+    "[wizard]",
+    `[wizard] ${rule}`,
+    "[wizard]",
   ].join("\n");
 }
 
