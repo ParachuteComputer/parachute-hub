@@ -2,6 +2,31 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.24] - 2026-05-23
+
+**fix(hub): Dockerfile entrypoint chowns `/parachute` on startup (handles stale-ownership disks from older deploys) (closes [hub#349](https://github.com/ParachuteComputer/parachute-hub/issues/349)).**
+
+Aaron's reproducer (2026-05-23): `error: Failed to link @openparachute/vault: EACCES` on a Render deploy whose persistent disk was provisioned during the hub 0.5.11 era — long before the current `chown -R bun:bun /parachute` line was added to the Dockerfile. Render preserves disk ownership across deploys, and chown-at-build only affects the image layer, not the mounted volume. Result: a uid-0-owned `/parachute` mounted into a container running as uid 1000, and every `bun add` write fails with EACCES.
+
+### Fixed
+
+- Dockerfile entrypoint now idempotently chowns `/parachute` to `bun:bun` at startup, fixing the EACCES install failure on Render deploys whose persistent disk dates from before the chown-at-build line was added. Drops to the `bun` user via `gosu` after the chown — tini still wraps the tree for signal forwarding. Closes hub#349.
+
+### What landed
+
+- **`docker-entrypoint.sh`** (new) — POSIX `sh` script. Runs as root briefly: if `stat -c '%u' /parachute` is not `1000` (the bun uid), runs `chown -R bun:bun /parachute` and logs the prior uid. Then `exec gosu bun "$@"` drops privileges to the bun user before handing off to the `CMD`. Idempotent — fresh disks (already owned by uid 1000) skip the chown.
+- **`Dockerfile`** — installs `gosu` alongside `tini` in the runtime stage; removes the build-time `USER bun` directive (the entrypoint script does the drop now); copies `docker-entrypoint.sh` to `/usr/local/bin/`, makes it executable, and wires it as the entrypoint after `tini --`. The CMD (`bun src/cli.ts serve`) is unchanged. The pre-existing build-time `chown -R bun:bun /parachute` stays — it handles the fresh-image case so the runtime chown is genuinely a no-op for new deploys; the runtime chown handles the carry-over disk case.
+
+### Verification
+
+- `bun test ./src` clean (no code change in `src/`).
+- `bun run typecheck` clean (no TS impact).
+- Dockerfile reviewed manually: layer order verified (gosu install before entrypoint copy; `USER bun` removed; tini still wraps the tree).
+
+### Patterns check
+
+- No pattern shifts. The "root-briefly-then-drop" pattern is the canonical Docker-on-persistent-disk shape (used by oven/bun-alpine's own conventions for non-root operation under mounted volumes). The change is internal to the container build — no cross-repo coordination needed.
+
 ## [0.5.13-rc.23] - 2026-05-23
 
 **feat(hub): `/api/hub` endpoint + Hub Version Badge in admin SPA (version visibility) (closes [hub#348](https://github.com/ParachuteComputer/parachute-hub/issues/348)).**

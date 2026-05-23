@@ -77,8 +77,10 @@ WORKDIR /app
 
 # tini reaps zombies + forwards signals so `docker stop` / Render redeploys
 # shut the hub down cleanly instead of getting SIGKILLed after the grace
-# period.
-RUN apk add --no-cache tini
+# period. gosu drops privileges from root → bun inside the entrypoint
+# script (see docker-entrypoint.sh + hub#349) while preserving the
+# process tree so tini's signal forwarding still works end-to-end.
+RUN apk add --no-cache tini gosu
 
 # Bring over installed deps + the built SPA + source. The image runs the
 # hub from source via Bun (no separate build artifact for src/).
@@ -107,14 +109,10 @@ ENV PARACHUTE_HOME=/parachute \
     NODE_ENV=production
 
 # Pre-create the persistent-disk mount point AND the BUN_INSTALL subdir,
-# then hand both to the non-root `bun` user (uid 1000). Docker creates
-# a VOLUME mount with root:root permissions inheriting the image layer's
-# owner; without this chown the first `mkdirSync('/parachute/well-known')`
-# from `parachute serve` (or `bun add` writing into
-# `/parachute/modules/install/global/...`) fails with EACCES. Render's
-# disks come up pre-owned per Render's docs but anonymous-volume
-# `docker run` and bind-mount paths both need this seed directory to
-# exist with the right uid.
+# then hand both to the non-root `bun` user (uid 1000). The runtime
+# entrypoint script chowns /parachute idempotently to handle disks that
+# were created before this line existed (Render persistent disks
+# preserve ownership across deploys — see hub#349).
 RUN mkdir -p /parachute/modules && chown -R bun:bun /parachute
 
 # Render mounts the persistent disk at $PARACHUTE_HOME; declare the volume
@@ -124,12 +122,14 @@ VOLUME ["/parachute"]
 
 EXPOSE 1939
 
-# Run as the non-root `bun` user that the base image already provides.
-# The persistent disk needs to be readable+writable by uid/gid 1000; both
-# Render disks and standard bind mounts default to a mode that works.
-USER bun
+# Copy entrypoint that runs as root → chowns /parachute if needed → drops to bun.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-ENTRYPOINT ["/sbin/tini", "--"]
+# DO NOT set USER bun here — the entrypoint runs as root briefly to
+# fix disk ownership, then `exec gosu bun "$@"` drops privileges before
+# hub starts. Tini wraps the whole tree for clean signal forwarding.
+ENTRYPOINT ["/sbin/tini", "--", "docker-entrypoint.sh"]
 # `parachute serve` is the container-shape entrypoint: foreground hub, env-
 # driven config, env-driven first-boot admin seed. The bare
 # `bun src/hub-server.ts` path also works (and supports env via parseArgs)
