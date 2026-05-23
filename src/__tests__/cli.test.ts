@@ -64,6 +64,19 @@ describe("cli", () => {
     expect(stderr).toMatch(/usage: parachute install/);
   });
 
+  test("install --channel without a value exits 1 (hub#337)", async () => {
+    const { code, stderr } = await runCli(["install", "vault", "--channel"]);
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/--channel requires a value/);
+  });
+
+  test("install --channel with an invalid value exits 1 (hub#337)", async () => {
+    const { code, stderr } = await runCli(["install", "vault", "--channel", "banana"]);
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/--channel must be "rc" or "latest"/);
+    expect(stderr).toMatch(/banana/);
+  });
+
   test("unknown command exits 1", async () => {
     const { code, stderr } = await runCli(["wat"]);
     expect(code).toBe(1);

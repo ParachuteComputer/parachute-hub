@@ -36,6 +36,7 @@ import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
+import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
 import { getModuleInstallChannel } from "./hub-settings.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import { readModuleManifest } from "./module-manifest.ts";
@@ -326,6 +327,37 @@ function defaultRun(cmd: readonly string[]): Promise<number> {
 }
 
 /**
+ * Resolve which `<pkg>@<channel>` the API install path should ship,
+ * given the per-request override (POST body `channel`) and the
+ * cascading defaults. See `runInstall` for the precedence chain.
+ *
+ * Exported (test-only) so the api-modules-ops tests can assert the
+ * resolution without re-driving a full install through the registry.
+ */
+function resolveApiInstallChannel(
+  channelOverride: string | undefined,
+  deps: ApiModulesOpsDeps,
+): string {
+  // 1. Per-request override.
+  if (channelOverride === "rc" || channelOverride === "latest") return channelOverride;
+  // 2. `PARACHUTE_INSTALL_CHANNEL` env var — cluster-wide cascade.
+  const fromEnv = process.env[PARACHUTE_INSTALL_CHANNEL_ENV];
+  if (typeof fromEnv === "string") {
+    if (fromEnv === "rc" || fromEnv === "latest") return fromEnv;
+    if (fromEnv.length > 0) {
+      // Garbage env value — log once per op so the operator notices, then
+      // fall through to the DB-stored channel. Don't crash the install.
+      console.warn(
+        `[api-modules-ops] ${PARACHUTE_INSTALL_CHANNEL_ENV}="${fromEnv}" is not a valid channel — falling back to admin-toggle setting.`,
+      );
+    }
+  }
+  // 3. Admin-toggle setting (hub#275). Seeds from `PARACHUTE_MODULE_CHANNEL`
+  // on first read; after that the row is source of truth.
+  return getModuleInstallChannel(deps.db);
+}
+
+/**
  * Resolve the `installDir` for `spec` from `findGlobalInstall`. Null when
  * the dep isn't wired (tests without a stub) or the package can't be
  * located on disk. Same fallback semantics the previous inline
@@ -392,6 +424,32 @@ export async function handleInstall(
   const authFail = await authorize(req, deps);
   if (authFail) return authFail;
 
+  // Optional `{ channel: "rc" | "latest" }` in the body — per-call override
+  // for the SPA's "install X at rc" affordance (hub#337). Missing body /
+  // empty body / non-JSON body all fall through silently to the env →
+  // DB-stored channel resolution chain. A malformed `channel` value (not
+  // in the union) is rejected — operators shouldn't get a silent fallback
+  // on a typo they explicitly typed.
+  let bodyChannel: string | undefined;
+  if (req.headers.get("content-type")?.includes("application/json")) {
+    try {
+      const body = (await req.json()) as { channel?: unknown };
+      if (body && typeof body.channel === "string") {
+        if (body.channel !== "rc" && body.channel !== "latest") {
+          return jsonError(
+            400,
+            "invalid_channel",
+            `channel must be "rc" or "latest" (got "${body.channel}")`,
+          );
+        }
+        bodyChannel = body.channel;
+      }
+    } catch {
+      // Empty body / unparseable JSON — silently ignore; the env/DB
+      // resolution chain still applies.
+    }
+  }
+
   const registry = deps.registry ?? defaultRegistry;
   const op = registry.create("install", short);
 
@@ -409,7 +467,7 @@ export async function handleInstall(
   // Kick off the async work. We DON'T await — the response goes back
   // immediately + the work runs in the background. Errors get logged
   // to the operation; nothing throws back to the request handler.
-  void runInstall(op.id, short, spec, deps).catch((err) => {
+  void runInstall(op.id, short, spec, deps, bodyChannel).catch((err) => {
     const msg = err instanceof Error ? err.message : String(err);
     registry.update(op.id, { status: "failed", error: msg }, `install failed: ${msg}`);
   });
@@ -432,14 +490,22 @@ export async function runInstall(
   short: CuratedModuleShort,
   spec: ServiceSpec,
   deps: ApiModulesOpsDeps,
+  channelOverride?: string,
 ): Promise<void> {
   const registry = deps.registry ?? defaultRegistry;
   const run = deps.run ?? defaultRun;
-  // hub#275: operator-settable channel (`latest` | `rc`). Read on every
-  // op so a toggle change applies to the next install without a hub
-  // restart. The hub-settings layer seeds from PARACHUTE_MODULE_CHANNEL
-  // on first read; after that the row is source of truth.
-  const channel = getModuleInstallChannel(deps.db);
+  // Channel resolution (hub#337) — precedence:
+  //   1. per-request `channelOverride` (POST body `{channel}`)
+  //   2. `PARACHUTE_INSTALL_CHANNEL` env var (platform-default cascade for
+  //      Render-style deploys that ship hub on rc and want rc for every
+  //      module installed via /admin/modules too)
+  //   3. `hub_settings.module_install_channel` (admin SPA toggle, hub#275 —
+  //      seeded from `PARACHUTE_MODULE_CHANNEL` on first read)
+  //   4. "latest" fallback
+  //
+  // Read on every op so a toggle change applies to the next install
+  // without a hub restart.
+  const channel = resolveApiInstallChannel(channelOverride, deps);
   const spec_str = `${spec.package}@${channel}`;
   registry.update(opId, { status: "running" }, `running bun add -g ${spec_str}`);
   const code = await run(["bun", "add", "-g", spec_str]);

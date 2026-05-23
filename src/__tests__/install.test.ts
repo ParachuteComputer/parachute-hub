@@ -556,6 +556,247 @@ describe("install", () => {
     }
   });
 
+  // hub#337 — channel resolution (--channel flag + PARACHUTE_INSTALL_CHANNEL env var).
+  // Precedence: --tag > --channel > env > "latest" default.
+
+  test("default channel: bare bun-add (no @latest suffix) when nothing requested (back-compat)", async () => {
+    // Back-compat: pre-hub#337 `parachute install vault` ran `bun add -g
+    // @openparachute/vault` with no suffix. The env-default plumbing keeps
+    // emitting the bare spec when nothing's explicitly chosen — bun
+    // resolves bare names to @latest anyway, so this is a no-op for npm,
+    // but keeps logs byte-identical with the pre-#337 shape.
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const code = await install("vault", {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: () => {},
+        // No env override → defaults to process.env. We explicitly pass
+        // a stub object so a real-shell `PARACHUTE_INSTALL_CHANNEL=…` can't
+        // leak into the test.
+        envOverride: {},
+      });
+      expect(code).toBe(0);
+      expect(calls[0]).toEqual(["bun", "add", "-g", "@openparachute/vault"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("PARACHUTE_INSTALL_CHANNEL=rc env composes <pkg>@rc for bun add", async () => {
+    // Cluster-wide cascade: when the platform sets the env var, every
+    // `parachute install <svc>` lands on the rc dist-tag without a flag.
+    // The Render-deploy shape — hub container on rc → all modules
+    // installed via /admin/modules also on rc.
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const logs: string[] = [];
+      const code = await install("vault", {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+        envOverride: { PARACHUTE_INSTALL_CHANNEL: "rc" },
+      });
+      expect(code).toBe(0);
+      expect(calls[0]).toEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+      expect(logs.join("\n")).toMatch(/Installing @openparachute\/vault@rc/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("--channel rc flag wins over PARACHUTE_INSTALL_CHANNEL=latest env", async () => {
+    // Per-call flag is the operator's deliberate intent; it beats the
+    // platform default.
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const code = await install("vault", {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: () => {},
+        channel: "rc",
+        envOverride: { PARACHUTE_INSTALL_CHANNEL: "latest" },
+      });
+      expect(code).toBe(0);
+      expect(calls[0]).toEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("--channel latest flag wins over PARACHUTE_INSTALL_CHANNEL=rc env", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const code = await install("vault", {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: () => {},
+        channel: "latest",
+        envOverride: { PARACHUTE_INSTALL_CHANNEL: "rc" },
+      });
+      expect(code).toBe(0);
+      expect(calls[0]).toEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("--tag wins over both --channel and the env var (programmatic pin)", async () => {
+    // `--tag` is the exact-pin escape hatch (e.g. `--tag 0.3.0-rc.1`),
+    // wins over both operator-facing flag and env default. Mirrors the
+    // upgrade-command shape (hub#338) where tag is the programmatic
+    // override above all channel resolution.
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const code = await install("vault", {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: () => {},
+        tag: "0.3.0-rc.1",
+        channel: "latest",
+        envOverride: { PARACHUTE_INSTALL_CHANNEL: "rc" },
+      });
+      expect(code).toBe(0);
+      expect(calls[0]).toEqual(["bun", "add", "-g", "@openparachute/vault@0.3.0-rc.1"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("garbage PARACHUTE_INSTALL_CHANNEL value falls back to latest with a warning (no crash)", async () => {
+    // Operator typo (`PARACHUTE_INSTALL_CHANNEL=banana`) shouldn't crash
+    // a Render container at boot. Warn loudly, then fall back to the
+    // safe default so installs keep working.
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const logs: string[] = [];
+      const code = await install("vault", {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+        envOverride: { PARACHUTE_INSTALL_CHANNEL: "banana" },
+      });
+      expect(code).toBe(0);
+      // Falls back to "@latest" — explicit because the env var WAS set (just
+      // to a bad value), so we make the resolution visible in the spec.
+      expect(calls[0]).toEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/PARACHUTE_INSTALL_CHANNEL="banana" is not a valid channel/);
+      expect(joined).toMatch(/Falling back to "latest"/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("--channel is moot when the package is already bun-linked (link short-circuit wins)", async () => {
+    // Same shape as the --tag short-circuit test: local-link beats remote
+    // dist-tag resolution. No `bun add` invocation at all.
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const logs: string[] = [];
+      const code = await install("scribe", {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => true,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+        channel: "rc",
+        envOverride: { PARACHUTE_INSTALL_CHANNEL: "rc" },
+      });
+      expect(code).toBe(0);
+      expect(calls).toHaveLength(0);
+      expect(logs.join("\n")).toMatch(/already linked globally/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("local-path install ignores --channel + env (filesystem source, not npm)", async () => {
+    // The local-path branch installs from the operator's checkout via
+    // `bun add -g <abspath>`; there's no npm dist-tag to resolve. Channel
+    // resolution is bypassed entirely.
+    const { path, cleanup } = makeTempPath();
+    const pkgDir = mkdtempSync(join(tmpdir(), "pcli-localpkg-"));
+    try {
+      const calls: string[][] = [];
+      const code = await install(pkgDir, {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: () => {},
+        readManifest: async () => ({
+          name: "demo",
+          manifestName: "@local/demo",
+          kind: "api",
+          port: 1951,
+          paths: ["/demo"],
+          health: "/healthz",
+        }),
+        readPackageName: () => "@local/demo",
+        channel: "rc",
+        envOverride: { PARACHUTE_INSTALL_CHANNEL: "rc" },
+      });
+      expect(code).toBe(0);
+      // No `@rc` suffix — the absolute path passes through verbatim.
+      expect(calls[0]).toEqual(["bun", "add", "-g", pkgDir]);
+    } finally {
+      cleanup();
+      rmSync(pkgDir, { recursive: true, force: true });
+    }
+  });
+
   test("linked vault still runs init and defers to init's manifest write", async () => {
     const { path, cleanup } = makeTempPath();
     try {
