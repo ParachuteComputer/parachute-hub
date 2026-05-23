@@ -66,17 +66,13 @@ services:
       - key: BUN_INSTALL
         value: /parachute/modules
 
-      # Cascade installs to @rc so vault/app/scribe/runner installed via
-      # /admin/modules pull the same rc chain as hub itself (this image
-      # is built from `main`, which tracks rc per governance rule 2). An
-      # operator forking this repo gets the canonical "rc dev deploy"
-      # shape — modules installed via admin SPA cascade to this channel
-      # by default. `latest` is the right default for most operators
+      # Modules installed via admin SPA cascade to this channel by
+      # default. `latest` is the right default for most operators
       # (stable releases of vault / app / scribe / runner). Flip to
       # `rc` in your Render dashboard if you want the rc cascade
       # (pre-release modules; useful for dev/testing). Per-call
       # `--channel` and `--tag` still override on the install command.
-      # (hub#337)
+      # (hub#337, hub#347)
       - key: PARACHUTE_INSTALL_CHANNEL
         value: latest
 
