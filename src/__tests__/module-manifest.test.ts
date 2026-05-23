@@ -35,6 +35,9 @@ describe("validateModuleManifest", () => {
 
   test("rejects missing required fields", () => {
     expect(() => validateModuleManifest({ ...VALID, name: undefined }, "x")).toThrow(/name/);
+    // `kind` is OPTIONAL as of hub#301 Phase A — only invalid *values* are
+    // rejected. The missing-kind case is exercised in the "kind is optional
+    // (hub#301 Phase A)" suite below.
     expect(() => validateModuleManifest({ ...VALID, kind: "weird" }, "x")).toThrow(/kind/);
     expect(() => validateModuleManifest({ ...VALID, port: -1 }, "x")).toThrow(/port/);
     expect(() => validateModuleManifest({ ...VALID, port: 99999 }, "x")).toThrow(/port/);
@@ -42,6 +45,59 @@ describe("validateModuleManifest", () => {
     expect(() => validateModuleManifest({ ...VALID, health: "no-leading-slash" }, "x")).toThrow(
       /health/,
     );
+  });
+
+  // hub#301 Phase A: `kind` is no longer required. Missing → defaults to "api"
+  // and emits a soft-warning. Invalid values (typos) are still rejected — we
+  // relax only the *missing* case because a typo is intent + a mistake, not
+  // absence of intent.
+  describe("kind is optional (hub#301 Phase A)", () => {
+    test("missing kind defaults to api and emits a soft-warning", () => {
+      const warnings: string[] = [];
+      const logger = { warn: (msg: string) => warnings.push(msg) };
+      const { kind: _ignored, ...withoutKind } = VALID;
+      const m = validateModuleManifest(withoutKind, "x", logger);
+      expect(m.kind).toBe("api");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/"kind" is absent/);
+      expect(warnings[0]).toMatch(/defaulting to "api"/);
+      expect(warnings[0]).toMatch(/hub#301/);
+    });
+
+    test("explicit kind: 'frontend' passes through unchanged and emits no warning", () => {
+      const warnings: string[] = [];
+      const logger = { warn: (msg: string) => warnings.push(msg) };
+      const m = validateModuleManifest({ ...VALID, kind: "frontend" }, "x", logger);
+      expect(m.kind).toBe("frontend");
+      expect(warnings).toHaveLength(0);
+    });
+
+    test("explicit kind: 'api' passes through unchanged and emits no warning", () => {
+      const warnings: string[] = [];
+      const logger = { warn: (msg: string) => warnings.push(msg) };
+      const m = validateModuleManifest({ ...VALID, kind: "api" }, "x", logger);
+      expect(m.kind).toBe("api");
+      expect(warnings).toHaveLength(0);
+    });
+
+    test("explicit kind: 'tool' passes through unchanged and emits no warning", () => {
+      const warnings: string[] = [];
+      const logger = { warn: (msg: string) => warnings.push(msg) };
+      const m = validateModuleManifest({ ...VALID, kind: "tool" }, "x", logger);
+      expect(m.kind).toBe("tool");
+      expect(warnings).toHaveLength(0);
+    });
+
+    test("invalid kind value is still rejected (only missing relaxes)", () => {
+      // Typos / invalid values still error — we relax the *missing* case
+      // only, because absence-of-intent is a different signal than
+      // wrong-intent. A module shipping `kind: "static"` or `kind: "backend"`
+      // had an intent and got it wrong; surface that loudly.
+      expect(() => validateModuleManifest({ ...VALID, kind: "static" }, "x")).toThrow(/kind/);
+      expect(() => validateModuleManifest({ ...VALID, kind: "backend" }, "x")).toThrow(/kind/);
+      expect(() => validateModuleManifest({ ...VALID, kind: null }, "x")).toThrow(/kind/);
+      expect(() => validateModuleManifest({ ...VALID, kind: 42 }, "x")).toThrow(/kind/);
+    });
   });
 
   test("rejects invalid name shape", () => {
