@@ -293,7 +293,7 @@ const NOTES_FALLBACK: FirstPartyFallback = {
     name: "notes",
     manifestName: "parachute-notes",
     displayName: "Notes",
-    tagline: "Notes PWA backed by your vault.",
+    tagline: "Notes PWA — daemon deprecated 2026-05-22; install `app` for the current path.",
     kind: "frontend",
     port: 1942,
     paths: ["/notes"],

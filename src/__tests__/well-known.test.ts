@@ -361,14 +361,16 @@ describe("buildWellKnown", () => {
   test("tagline rides through from services.json (no resolver needed)", () => {
     const notesWithTagline: ServiceEntry = {
       ...notes,
-      tagline: "Notes PWA backed by your vault.",
+      tagline: "Notes PWA — daemon deprecated 2026-05-22; install `app` for the current path.",
     };
     const doc = buildWellKnown({
       services: [notesWithTagline],
       canonicalOrigin: "https://x.example",
     });
     const svc = doc.services.find((s) => s.name === "parachute-notes");
-    expect(svc?.tagline).toBe("Notes PWA backed by your vault.");
+    expect(svc?.tagline).toBe(
+      "Notes PWA — daemon deprecated 2026-05-22; install `app` for the current path.",
+    );
   });
 
   test("falls back to / for empty paths", () => {

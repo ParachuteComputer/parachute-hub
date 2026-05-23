@@ -2,6 +2,25 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.13] - 2026-05-22
+
+**fix(hub): notes module tagline reflects deprecation (caught by audit script post-cleanup).**
+
+The `notes` entry in `NOTES_FALLBACK` (`src/service-spec.ts`) carried the pre-migration tagline `"Notes PWA backed by your vault."`, which made sense when notes-daemon was the canonical install path. Post-Notes-as-app migration (notes-daemon deprecation tracked in parachute-notes#154; wizard switched to `app` in #324), the tagline is stale — operators scanning the discovery surfaces shouldn't see notes-daemon framed as the canonical PWA. Audit script flagged it post-cleanup-wave as one of the last operator-visible stale refs.
+
+**What landed.**
+
+- **`NOTES_FALLBACK.manifest.tagline`** in `src/service-spec.ts:296` updated to `"Notes PWA — daemon deprecated 2026-05-22; install `app` for the current path."`. Telegraphs the deprecation + points operators at `parachute install app` (which auto-bootstraps notes-ui under `/app/notes` via parachute-app §17 Phase 2.1). Mirrors the tone the retired `parachute-agent` spec used before it was removed from the fallbacks.
+- **Assertion sites in `src/__tests__/well-known.test.ts:364, 371`** updated to match the new copy. The test exercises tagline-pass-through behavior; the literal string was incidental but had to track the spec.
+
+**Out of scope (intentional).**
+
+- The rest of the `NOTES_FALLBACK` entry (port `1942`, paths `["/notes"]`, health, startCmd, postInstallFooter). The daemon is still installable for back-compat — only the operator-facing tagline copy changed. Full daemon retirement lands in parachute-notes#154 Phase 3 once `app` is fully shipped and the redirect window (hub#316) is no longer load-bearing.
+
+**Tests.** `bun run typecheck` clean. `bun test ./src` — passing, count unchanged. `cd web/ui && bun run test` unchanged. `bunx biome check src/` clean.
+
+**Cross-references.** Audit script catch post-cleanup-wave. parachute-notes#154 — notes-daemon deprecation. #324 — wizard recommends `app` over notes-daemon (the previous rc in this chain). parachute-app §17 Phase 2.1 — bootstrap-default-apps auto-installs notes-ui.
+
 ## [0.5.13-rc.12] - 2026-05-22
 
 **fix(hub): wizard prompts to install app (not notes-daemon) — auto-bootstrap handles notes-ui (#323).**
