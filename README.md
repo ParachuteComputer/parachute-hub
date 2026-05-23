@@ -20,7 +20,9 @@ Prereqs: [Bun](https://bun.sh) 1.3.0 or later. `parachute expose` also requires 
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/ParachuteComputer/parachute-hub)
 
-One-click Render deploy via the `render.yaml` Blueprint in this repo. Provisions a $7/mo Starter service + 1 GiB persistent disk + auto-deploys from `main`. Comes pre-configured with `PARACHUTE_INSTALL_CHANNEL=rc` so any modules you add via the admin SPA (vault, app, scribe, runner) install at the rc channel — matching the hub's rc release line. Flip to `latest` in your Render dashboard if you prefer stable cluster-wide.
+One-click Render deploy via the `render.yaml` Blueprint in this repo. Provisions a $7/mo Starter service + 1 GiB persistent disk + auto-deploys from `main`. Comes pre-configured with `PARACHUTE_INSTALL_CHANNEL=latest` so modules you install via the admin SPA (vault, app, scribe, runner) pull stable releases by default.
+
+**Want pre-release / rc modules?** Set `PARACHUTE_INSTALL_CHANNEL=rc` in your Render dashboard env vars (useful for dev/testing against the rc release line).
 
 After deploy:
 

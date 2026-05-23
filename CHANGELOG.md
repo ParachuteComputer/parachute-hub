@@ -2,6 +2,20 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.22] - 2026-05-23
+
+**fix(hub): Render Blueprint default channel `latest`, not `rc` (rc is now opt-in for dev/testing).**
+
+Per Aaron: "I don't want it all to be rc, just for that to be a choice. Most people installing via render want latest for hub and latest for other modules. But flexibility is key here. And for me, I want to be testing it with rc."
+
+Changes:
+
+- `render.yaml`: `PARACHUTE_INSTALL_CHANNEL` value `rc` → `latest`. Comment updated to reflect that rc is the opt-in choice (set in Render dashboard) rather than the default.
+- `README.md`: "Hosted (Render)" section now leads with "stable by default" and surfaces the rc-flip in a bold callout.
+- The rc.20 CHANGELOG entry for hub#337/#339 remains accurate as historical record (Aaron's testing did rely on rc-as-default during that rc chain); this rc reverses the default for the canonical operator path.
+
+Existing Render deploys with the env var manually set in the dashboard are unaffected — Render doesn't auto-overwrite operator-set env vars on Blueprint redeploys.
+
 ## [0.5.13-rc.21] - 2026-05-23
 
 **fix(hub): `parachute logs <svc>` no longer misreports a running daemon as not-started (closes [hub#335](https://github.com/ParachuteComputer/parachute-hub/issues/335)).**
