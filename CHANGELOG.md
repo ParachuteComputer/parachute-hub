@@ -2,6 +2,27 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.14] - 2026-05-22
+
+**feat(hub): `kind` field now optional in module.json (closes Phase A of [#301](https://github.com/ParachuteComputer/parachute-hub/issues/301)).**
+
+The `kind ∈ {"api" | "frontend" | "tool"}` trichotomy conflates two concerns: "is this served as static UI?" and "what's the module's role?" In practice hub only branches on `kind === "frontend"`; api-vs-tool is observationally identical. Per the phased migration in [#301](https://github.com/ParachuteComputer/parachute-hub/issues/301), Phase A relaxes the field to optional so module authors can stop carrying a value the validator otherwise demands.
+
+**What landed.**
+
+- **`asKind` in `src/module-manifest.ts`** now treats `undefined` as a valid input — defaults to `"api"` (backend-proxy, matches existing `"api" === "tool"` routing) and emits a soft-warning log line so operators authoring new modules know the field can be removed.
+- **Invalid `kind` values are still rejected.** Only the *missing* case relaxes. A typo'd value (`"static"`, `"backend"`, etc.) still errors — the author had intent and got it wrong; surface that loudly.
+- **`validateModuleManifest` + `readModuleManifest` accept an optional `logger`** so the soft-warning can be captured in tests and routed through hub's own logger seam at production call sites (defaults to `console`).
+- **`ModuleManifest.kind` JSDoc** now documents the optional-since-Phase-A semantics + the api/tool/frontend routing distinction (only `"frontend"` is observationally different today).
+
+**Why this unblocks app.** parachute-app's `0.2.0-rc.5` shipped `.parachute/module.json` without `kind`, anticipating Phase A. The validator's pre-existing strict-require turned that into a boot-time crash — `parachute start app` failing with `"kind" must be "api" | "frontend" | "tool"`, no bootstrap, no notes-ui under `/app/notes`. App `0.2.0-rc.6` carries an explicit `kind: "frontend"` to unblock the immediate test loop; once hub rc.14 ships, future app releases can drop the field.
+
+**Out of scope (intentional).**
+
+- Phases B–D from [#301](https://github.com/ParachuteComputer/parachute-hub/issues/301): the explicit `static: boolean` field, per-module migrations (notes/vault/scribe/runner dropping `kind`), and the eventual full removal of `kind` from the manifest schema. Phase A is the validator-side surface area only.
+
+**Tests.** New `kind is optional (hub#301 Phase A)` suite in `src/__tests__/module-manifest.test.ts` — five cases covering: missing kind defaults + warns; explicit `frontend` / `api` / `tool` pass through silently; invalid values still rejected. `bun run typecheck` clean. `bun test ./src` — passes. `cd web/ui && bun run test` unchanged.
+
 ## [0.5.13-rc.13] - 2026-05-22
 
 **fix(hub): notes module tagline reflects deprecation (caught by audit script post-cleanup).**
