@@ -608,6 +608,19 @@ export interface ModuleListing {
    * consumer; the SPA renders each entry as an expandable sub-row.
    */
   uis: ModuleUiSubUnit[];
+  /**
+   * Canonical user-facing URL for this module's own UI (hub#342). Drives
+   * the Modules page's "Open" button. Resolved server-side from the
+   * module's `.parachute/module.json` (`managementUrl` ?? `uiUrl`)
+   * joined against its mount path. Null when the module hasn't declared
+   * either field — SPA renders a disabled-with-tooltip "Open" button
+   * pointing at the per-module follow-up issue.
+   *
+   * The collapse of Open + Configure into a single button is the
+   * architectural through-line: each module ships its own UI handling
+   * both viewing AND configuring; hub becomes a dispatcher to that UI.
+   */
+  management_url: string | null;
 }
 
 /** Module install channel — `latest` (stable) or `rc` (release candidates). */

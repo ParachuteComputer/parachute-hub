@@ -400,10 +400,46 @@ interface ModuleRowProps {
 }
 
 /**
+ * Per-module follow-up issues filed alongside hub#342 (when a module
+ * hasn't yet shipped its own admin UI surface). Rendered as the
+ * `title` attribute on a disabled "Open" button so the operator knows
+ * the issue tracking the gap, not just that the button is greyed out.
+ *
+ * Vault declares `managementUrl: "/admin"` already, so it's not in this
+ * map — its row gets an active Open button pointing at its own UI.
+ * Notes is the deprecating notes-daemon path; its install surface
+ * still ships its own UI under `/notes/`, so it has a valid mount but
+ * doesn't actively need a follow-up. Scribe + runner are the
+ * outstanding gaps.
+ */
+const NO_UI_FOLLOWUPS: Record<string, string> = {
+  scribe: "Scribe admin SPA tracked at scribe#53",
+  runner: "Runner admin SPA tracked at runner#8",
+};
+
+/**
  * Row for an installed module — shows version + supervisor status +
- * Configure / Restart / Upgrade / Uninstall affordances. The "install"
- * action lives on `InstallableCard` instead; this row is only rendered
- * for `installed: true` modules.
+ * Open / Restart / Upgrade / Uninstall affordances.
+ *
+ * The "Open" button (hub#342) is the architectural-pivot affordance:
+ * Aaron's framing is that each module ships its OWN UI that handles
+ * both viewing and configuring; hub becomes a dispatcher. Pre-#342
+ * had both "Configure" (in-hub config form at `/admin/modules/<short>/config`)
+ * and an implicit "navigate to the module's own UI somewhere" — the
+ * two surfaces blurred. Post-#342 there's one click target: Open,
+ * which lands the operator on the module's `managementUrl`
+ * (resolved server-side from `.parachute/module.json`). The in-hub
+ * config form code at `/admin/modules/:short/config` is retained for
+ * the moment but no longer linked from this page; a future PR
+ * deletes it after the migration period.
+ *
+ * Modules without a declared `management_url` (today: scribe, runner —
+ * tracked at scribe#53, runner#8) get a disabled Open button with a
+ * tooltip pointing at the follow-up. Gentler than 404-on-click and
+ * makes the gap discoverable to operators.
+ *
+ * The "install" action lives on `InstallableCard` instead; this row is
+ * only rendered for `installed: true` modules.
  */
 function ModuleRow({
   module: mod,
@@ -417,6 +453,8 @@ function ModuleRow({
   const canAct = supervisorAvailable && !syncBusy;
   const upgradeAvailable =
     mod.installed_version !== mod.latest_version && mod.latest_version !== null;
+  const openUrl = mod.management_url;
+  const openFollowup = NO_UI_FOLLOWUPS[mod.short];
 
   return (
     <li className="module-row" data-short={mod.short}>
@@ -459,16 +497,27 @@ function ModuleRow({
       {mod.uis.length > 0 && <UiSubUnitsList uis={mod.uis} />}
 
       <div className="actions">
-        {/* Configure link routes to the generic per-module config form
-            (hub#260). Rendered as a Link rather than a button because
-            it's pure navigation — no async action attached, no
-            supervisor requirement. Stays clickable even when the
-            supervisor is offline so an operator on a hub-only CLI
-            install can still edit config (the config endpoints are
-            served by the module itself, not the supervisor). */}
-        <Link className="btn" to={`/modules/${encodeURIComponent(mod.short)}/config`}>
-          Configure
-        </Link>
+        {/* Open → the module's own UI (hub#342). Full-page navigation
+            via <a href> rather than react-router Link because we're
+            leaving the SPA — the module owns its surface. Disabled
+            state for modules without a declared management_url
+            telegraphs "this module hasn't shipped its UI yet" via
+            tooltip rather than 404-ing the operator. */}
+        {openUrl ? (
+          <a className="btn" href={openUrl} data-testid={`open-${mod.short}`}>
+            Open
+          </a>
+        ) : (
+          <button
+            type="button"
+            className="btn"
+            disabled
+            title={openFollowup ?? "This module hasn't shipped an admin UI yet."}
+            data-testid={`open-${mod.short}`}
+          >
+            Open
+          </button>
+        )}
         <button type="button" disabled={!canAct} onClick={onRestart}>
           Restart
         </button>

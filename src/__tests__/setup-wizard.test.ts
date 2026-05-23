@@ -2709,3 +2709,231 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
     }
   });
 });
+
+// --- hub#342 UI pass: "Start using your vault" lead tile + Use it now ---
+
+describe("done screen — 'Start using your vault' tile (hub#342)", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  test("when only vault is installed, the lead tile links to vault admin", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?just_finished=1", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      const html = await res.text();
+      // Section heading present + primary CTA points at the vault's own admin.
+      expect(html).toContain("Start using your vault");
+      expect(html).toContain('href="/vault/default/admin/"');
+      // Lead tile precedes the MCP / install tiles (it's the lead).
+      const startIdx = html.indexOf("Start using your vault");
+      const installIdx = html.indexOf("What's next?");
+      expect(startIdx).toBeLessThan(installIdx);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("when app is also installed, the lead tile links to /app/notes/", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+            {
+              name: "parachute-app",
+              version: "0.2.0",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?just_finished=1", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      const html = await res.text();
+      expect(html).toContain("Start using your vault");
+      // App installed → primary CTA links to Notes-as-UI inside App.
+      expect(html).toContain('href="/app/notes/"');
+      expect(html).toContain("Open Notes");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("succeeded install op renders a 'Use it now' link pointing at the module's surface", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const reg = getDefaultOperationsRegistry();
+      const op = reg.create("install", "app");
+      reg.update(op.id, { status: "succeeded" }, "installed @openparachute/app");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req(`/admin/setup?just_finished=1&op_app=${op.id}`, {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: reg,
+        },
+      );
+      const html = await res.text();
+      expect(html).toContain("status: succeeded");
+      // Primary "Use it now" link goes to the app's surface; secondary
+      // "Manage modules" link still present.
+      expect(html).toContain(">Use it now<");
+      expect(html).toContain('href="/app/notes/"');
+      expect(html).toContain(">Manage modules<");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("'Already installed' tile gains a 'Use it now' link too", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+            {
+              name: "parachute-app",
+              version: "0.2.0",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?just_finished=1", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      const html = await res.text();
+      expect(html).toContain("Already installed");
+      // App's already-installed tile carries the Use it now link.
+      expect(html).toContain('href="/app/notes/"');
+    } finally {
+      db.close();
+    }
+  });
+
+  test("install-log CSS includes overflow-wrap so long lines wrap in the card", async () => {
+    // Smoke test for the CSS fold (hub#342): the .op-log block sets
+    // overflow-x:auto and the .log-lines li set white-space:pre-wrap +
+    // overflow-wrap:anywhere. These are the three properties Aaron's
+    // bug report flagged — without them long install logs blow up the
+    // wizard layout.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const html = await res.text();
+      expect(html).toContain("overflow-x: auto");
+      expect(html).toContain("white-space: pre-wrap");
+      expect(html).toContain("overflow-wrap: anywhere");
+    } finally {
+      db.close();
+    }
+  });
+});

@@ -23,7 +23,13 @@
  */
 import { type ReactNode, useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
-import { type MeResponse, getMe, signOut } from "./lib/api.ts";
+import {
+  type MeResponse,
+  type ModuleListing,
+  getMe,
+  listModules,
+  signOut,
+} from "./lib/api.ts";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
 import { ModuleConfig } from "./routes/ModuleConfig.tsx";
 import { Modules } from "./routes/Modules.tsx";
@@ -70,6 +76,11 @@ export function App() {
   const subtitle = subtitleFor(pathname);
   const [me, setMe] = useState<MeResponse | null>(null);
   const [signingOut, setSigningOut] = useState(false);
+  // hub#342: surface a "Services" quick-access dropdown in the nav with
+  // an entry per installed module that declares a `management_url`. One
+  // round-trip per nav mount; failures collapse silently (the dropdown
+  // just doesn't render).
+  const [installedServices, setInstalledServices] = useState<ModuleListing[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -90,6 +101,29 @@ export function App() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    // Don't fetch modules until we know we have a session — pre-auth
+    // the listModules() call would fail with 401 and pollute the
+    // console. The 401-clears-token shape in listModules cleans up
+    // after itself either way; this is just noise reduction.
+    if (!me || !me.hasSession) return;
+    let cancelled = false;
+    listModules()
+      .then((catalog) => {
+        if (cancelled) return;
+        setInstalledServices(catalog.modules.filter((m) => m.installed));
+      })
+      .catch(() => {
+        // Quiet failure — the dropdown just doesn't render. The Modules
+        // page itself surfaces the underlying error on its own.
+        if (cancelled) return;
+        setInstalledServices([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [me]);
 
   async function onSignOut(csrf: string): Promise<void> {
     setSigningOut(true);
@@ -117,6 +151,7 @@ export function App() {
         <AuthIndicator me={me} signingOut={signingOut} onSignOut={onSignOut} />
         <Link to="/vaults">Vaults</Link>
         <Link to="/modules">Modules</Link>
+        <InstalledServicesDropdown services={installedServices} />
         <Link to="/users">Users</Link>
         <Link to="/permissions">Permissions</Link>
         <Link to="/tokens">Tokens</Link>
@@ -148,6 +183,61 @@ export function App() {
         />
       </Routes>
     </div>
+  );
+}
+
+/**
+ * "Services" quick-access dropdown in the admin SPA nav (hub#342).
+ *
+ * Lists each installed module that declares a `management_url`, linking
+ * to that URL (full-page navigation — the module owns its surface).
+ * Modules without a `management_url` (scribe, runner today; tracked at
+ * scribe#53, runner#8) appear as disabled items with a follow-up
+ * tooltip so operators can see what's installed but-not-yet-open-able.
+ *
+ * Native `<details>` for the click-to-expand behavior — no client-side
+ * focus management, no portal, no z-index dance. Matches the existing
+ * `module-uis` `<details>` pattern in Modules.tsx.
+ *
+ * Renders nothing when no modules are installed yet (fresh hub) so the
+ * nav doesn't show an empty "Services ▾" affordance.
+ */
+function InstalledServicesDropdown({ services }: { services: ModuleListing[] }) {
+  if (services.length === 0) return null;
+  return (
+    <details className="nav-dropdown" data-testid="installed-services-dropdown">
+      <summary className="nav-dropdown-summary">Services</summary>
+      <div className="nav-dropdown-panel" role="menu">
+        {services.map((mod) => {
+          const url = mod.management_url;
+          if (url) {
+            return (
+              <a
+                key={mod.short}
+                className="nav-dropdown-item"
+                href={url}
+                role="menuitem"
+                data-testid={`nav-service-${mod.short}`}
+              >
+                {mod.display_name}
+              </a>
+            );
+          }
+          return (
+            <span
+              key={mod.short}
+              className="nav-dropdown-item nav-dropdown-item-disabled"
+              role="menuitem"
+              aria-disabled="true"
+              title="This module hasn't shipped an admin UI yet."
+              data-testid={`nav-service-${mod.short}`}
+            >
+              {mod.display_name}
+            </span>
+          );
+        })}
+      </div>
+    </details>
   );
 }
 

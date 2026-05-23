@@ -646,22 +646,41 @@ export interface RenderDoneStepProps {
    * shape.
    */
   installTiles?: readonly ModuleInstallTileState[];
+  /**
+   * Whether parachute-app is installed alongside the vault. Drives the
+   * "Start using your vault" lead tile (hub#342): when true, the tile
+   * links to `/app/notes/` (the canonical user-facing surface — App
+   * auto-bootstraps Notes-as-UI per the 2026-05-21 migration). When
+   * false, it falls back to the vault's own admin UI at
+   * `/vault/<name>/admin/` so the operator still has a single obvious
+   * "start using parachute" target. Omitted = back-compat with tests
+   * that render the done step without dependency-checking; defaults to
+   * false (vault-admin fallback).
+   */
+  appInstalled?: boolean;
 }
 
 export function renderDoneStep(props: RenderDoneStepProps): string {
-  const { vaultName, hubOrigin, exposeMode, mintedToken, installTiles } = props;
+  const { vaultName, hubOrigin, exposeMode, mintedToken, installTiles, appInstalled } = props;
   const reachable = exposeMode ? renderReachableTile(exposeMode, hubOrigin) : "";
   const mcpTile = renderMcpTile(vaultName, hubOrigin, mintedToken);
   const tiles = installTiles && installTiles.length > 0 ? installTiles : [];
   const installSection = tiles.length > 0 ? renderInstallTiles(tiles) : "";
+  const startTile = renderStartUsingTile(vaultName, appInstalled === true);
   // The done-grid hosts the MCP-connect tile + the admin-UI fallback.
-  // The install tiles sit above it as a primary "what's next?" surface —
-  // they're the highest-friction next-step for most operators (operator
-  // just provisioned a vault, the obvious next action is installing the
-  // PWA / transcription module on top of it). Reachable tile leads
-  // everything because it answers "where's my hub?" before anything
-  // else — the question every operator hits before MCP / module
-  // installs even matter.
+  // The install tiles sit above it as a "what's next?" surface (curated
+  // catalog of modules an operator might want next). The "Start using
+  // your vault" tile leads everything user-facing because it answers
+  // Aaron's hub#342 friction directly: there was no clear way from the
+  // wizard's done screen to actually USE Parachute — the wizard
+  // surfaced "install more" + "go to admin" + an MCP command, none of
+  // which is "open the canonical user-facing UI" (Notes via App). With
+  // this tile in pole position, the operator's first click goes to a
+  // surface that says "hello, here's your vault" rather than a hub
+  // admin page. The reachable tile sits above even the start tile
+  // because "where's my hub?" answers the URL question every operator
+  // hits before they can click anything else (especially on tailnet /
+  // public expose where the loopback URL isn't the answer).
   const body = `
     <div class="card">
       <div class="card-header">
@@ -670,6 +689,7 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
         <p class="subtitle">Your hub is ready. Here's what to do next.</p>
       </div>
       ${reachable}
+      ${startTile}
       ${installSection}
       <section class="done-grid">
         ${mcpTile}
@@ -840,6 +860,51 @@ function renderMcpTile(
 }
 
 /**
+ * The "Start using your vault" lead tile on the done step (hub#342).
+ *
+ * Closes Aaron's "no clear way to go from setting up parachute to
+ * actually using parachute" friction. Sits above the MCP / install
+ * tiles because it's the canonical user-facing entry point —
+ * everything else on the done screen is operator-flavored (MCP
+ * command, admin UI, additional module installs).
+ *
+ * Two shapes:
+ *   - **App installed** → primary tile targets `/app/notes/` (the
+ *     Notes app reading the just-created vault). This is the
+ *     canonical surface post-Notes-as-app migration (parachute-app §17).
+ *   - **App NOT installed** → primary tile targets the vault's own
+ *     admin UI at `/vault/<name>/admin/`. The copy explains that
+ *     installing App + Notes is the recommended next step for a
+ *     content-browsing surface, and points at the install tile below.
+ *
+ * Either way, the operator has ONE obvious click target that says
+ * "start using parachute" — not three competing tiles where the
+ * "real" entry point is buried under the MCP command pre-hub#342.
+ */
+function renderStartUsingTile(vaultName: string, appInstalled: boolean): string {
+  const safeVault = escapeHtml(vaultName);
+  // Vault names pass `/^[a-z0-9][a-z0-9-]*$/i` so URL-encoding is mostly
+  // a no-op today, but use encodeURIComponent defensively to match hub.ts:505.
+  const urlVault = encodeURIComponent(vaultName);
+  if (appInstalled) {
+    return `<section class="start-using" data-testid="start-using-tile">
+      <h2>Start using your vault</h2>
+      <p>Notes is installed and ready. Capture your first note in the
+        Notes app — it reads from <code>${safeVault}</code> directly.</p>
+      <p><a class="btn btn-primary" href="/app/notes/">Open Notes</a></p>
+    </section>`;
+  }
+  return `<section class="start-using" data-testid="start-using-tile">
+    <h2>Start using your vault</h2>
+    <p>Your vault <code>${safeVault}</code> is provisioned. Install
+      <strong>App</strong> below (it bundles the Notes UI) to start
+      capturing — or open the vault's admin UI now to see what's
+      inside.</p>
+    <p><a class="btn btn-primary" href="/vault/${urlVault}/admin/">Open vault admin</a></p>
+  </section>`;
+}
+
+/**
  * The "What's next?" install-tiles row (hub#272 Item B). One tile per
  * curated module the operator might want next (Notes, Scribe). Each
  * tile is either an install form (POST → /admin/setup/install/<short>
@@ -859,6 +924,15 @@ function renderInstallTile(tile: ModuleInstallTileState): string {
   const safeShort = escapeHtml(tile.short);
   const safeName = escapeHtml(tile.displayName);
   const safeTagline = escapeHtml(tile.tagline);
+  const useItNowUrl = USE_IT_NOW_URLS[tile.short];
+  // "Use it now" → the canonical user-facing URL per
+  // module-ui-declaration.md, rendered as the PRIMARY action on a
+  // succeeded / already-installed install tile (hub#342). "Manage
+  // modules" stays as the secondary affordance so the admin SPA is
+  // one click away too. The URL table is keyed by the wizard's
+  // curated shorts (app, scribe today; vault excluded since the
+  // wizard owns its step); modules with no known surface fall
+  // through to a single "Manage modules" link, same as pre-#342.
   if (tile.operation) {
     const op = tile.operation;
     const logLines = op.log.map((l) => `<li>${escapeHtml(l)}</li>`).join("");
@@ -870,7 +944,13 @@ function renderInstallTile(tile: ModuleInstallTileState): string {
     // catches every in-flight op at once).
     let actions = "";
     if (op.status === "succeeded") {
-      actions = `<p><a class="btn btn-secondary" href="/admin/modules">Manage modules</a></p>`;
+      const useItNowLink = useItNowUrl
+        ? `<a class="btn btn-primary" href="${escapeAttr(useItNowUrl)}">Use it now</a>`
+        : "";
+      actions = `<p class="install-tile-actions">
+        ${useItNowLink}
+        <a class="btn btn-secondary" href="/admin/modules">Manage modules</a>
+      </p>`;
     } else if (op.status === "failed") {
       actions = `<form method="POST" action="/admin/setup/install/${safeShort}" class="install-retry">
         ${renderInstallTileCsrfPlaceholder()}
@@ -889,11 +969,17 @@ function renderInstallTile(tile: ModuleInstallTileState): string {
     </div>`;
   }
   if (tile.alreadyInstalled) {
+    const useItNowLink = useItNowUrl
+      ? `<a class="btn btn-primary" href="${escapeAttr(useItNowUrl)}">Use it now</a>`
+      : "";
     return `<div class="install-tile install-tile-installed">
       <h3>${safeName}</h3>
       <p class="install-tile-tagline">${safeTagline}</p>
       <p class="install-tile-status">Already installed.</p>
-      <p><a class="btn btn-secondary" href="/admin/modules">Manage in admin</a></p>
+      <p class="install-tile-actions">
+        ${useItNowLink}
+        <a class="btn btn-secondary" href="/admin/modules">Manage in admin</a>
+      </p>
     </div>`;
   }
   return `<div class="install-tile">
@@ -905,6 +991,30 @@ function renderInstallTile(tile: ModuleInstallTileState): string {
     </form>
   </div>`;
 }
+
+/**
+ * Canonical "Use it now" target per curated module short (hub#342).
+ * Each value is the canonical user-facing URL the module ships its UI
+ * at — per `module-ui-declaration.md` (`uiUrl` / `managementUrl` rules).
+ * App's surface is the bundled Notes-as-UI auto-bootstrap mount;
+ * Scribe is the operator-facing admin UI (per `module-surfaces.md`,
+ * scribe's admin surface is at `/scribe/admin` once an admin SPA ships
+ * — scribe#53 tracks). Missing entries here fall through to "Manage
+ * modules" only — i.e. modules without a declared first-party UI
+ * surface. Vault is intentionally omitted: the wizard's own vault
+ * step owns the post-vault-install flow and the lead "Start using
+ * your vault" tile (above the install row) handles the vault-side
+ * surface decision.
+ */
+const USE_IT_NOW_URLS: Partial<Record<CuratedModuleShort, string>> = {
+  app: "/app/notes/",
+  notes: "/notes/",
+  // Omitted: scribe + runner. They don't ship an admin SPA yet
+  // (scribe#53, runner#8 track). Pointing "Use it now" at /scribe/admin
+  // or /runner/admin today would 404 — better to fall through to the
+  // "Manage modules" link than to send the operator into a dead end.
+  // Add the entry here once those modules ship their admin UI.
+};
 
 /**
  * CSRF token placeholder for install-tile forms. The token comes from
@@ -1045,10 +1155,16 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       // Module install tiles (hub#272 Item B). One per curated module
       // other than vault (which the wizard already provisioned).
       const installTiles = buildInstallTiles(url, deps);
+      // hub#342: drive the lead "Start using your vault" tile's target.
+      // When parachute-app is installed alongside vault, the tile links
+      // to `/app/notes/` (auto-bootstrapped Notes-as-UI per parachute-app
+      // §17). Otherwise it falls back to the vault's own admin UI.
+      const appInstalled = isModuleInstalled("app", deps.manifestPath);
       const doneProps: RenderDoneStepProps = {
         vaultName,
         hubOrigin: deps.issuer,
         installTiles,
+        appInstalled,
       };
       if (exposeMode !== undefined) doneProps.exposeMode = exposeMode;
       if (mintedToken) doneProps.mintedToken = mintedToken;
@@ -1691,6 +1807,20 @@ function validateAccountFields(input: {
 }
 
 /**
+ * Whether a given curated module is currently installed (has a row in
+ * services.json keyed by its canonical `manifestName`). Used by the
+ * done-step renderer (hub#342) to decide whether to point the "Start
+ * using your vault" tile at `/app/notes/` (App installed → Notes UI
+ * auto-bootstrapped) vs the vault's own admin UI. Cheap manifest read
+ * shared with `buildInstallTiles`.
+ */
+function isModuleInstalled(short: CuratedModuleShort, manifestPath: string): boolean {
+  const manifest = readManifest(manifestPath);
+  const spec = specFor(short);
+  return manifest.services.some((s) => s.name === spec.manifestName);
+}
+
+/**
  * Read the first vault's display name from services.json for the
  * step-4 success page. Falls back to "default" if for any reason the
  * entry's metadata isn't present.
@@ -2046,6 +2176,18 @@ const STYLES = `
     display: flex;
     flex-direction: column;
     gap: 0.4rem;
+    /* min-width: 0 lets the grid track shrink below the tile's intrinsic
+       content width — without it a long log line in .install-tile-log
+       forces the tile (and its parent grid track) wider than the card,
+       which is what stretched the wizard when Aaron clicked Install App. */
+    min-width: 0;
+  }
+  /* "Use it now" action row on a successful install-tile (hub#342 item 3). */
+  .install-tile-actions {
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
   }
   .install-tile h3 {
     margin: 0;
@@ -2131,6 +2273,23 @@ const STYLES = `
     margin: 1rem 0;
     font-family: ${FONT_MONO};
     font-size: 0.85rem;
+    /* Install logs spit long lines (npm package names with paths, JSON
+       dumps, stack traces). Without these constraints the <li> contents
+       overflow the card horizontally — caught Aaron mid-install (hub#342):
+       clicking Install App / Install Scribe blew up the entire wizard
+       layout, font size jumped, the page stretched off-screen. The
+       triple of overflow-x:auto + white-space:pre-wrap + min-width:0
+       keeps the log inside its container regardless of line length:
+       overflow-x:auto on .op-log gives a horizontal scrollbar as a
+       last-resort affordance; pre-wrap on .log-lines li wraps cleanly
+       at whitespace so the common case never even needs to scroll;
+       min-width:0 on the outer log-lines list is the magic-flex bit
+       that lets the list itself shrink below its content's intrinsic
+       width inside the card's flex/grid layout. break-word (rather
+       than break-all) keeps URLs / paths legible when they DO have to
+       break. */
+    overflow-x: auto;
+    max-width: 100%;
   }
   .op-status {
     margin: 0 0 0.5rem;
@@ -2139,8 +2298,18 @@ const STYLES = `
   }
   .op-succeeded { color: ${PALETTE.success}; }
   .op-failed { color: ${PALETTE.danger}; }
-  .log-lines { margin: 0; padding-left: 1.25rem; color: ${PALETTE.fgMuted}; }
-  .log-lines li { margin: 0.15rem 0; }
+  .log-lines {
+    margin: 0;
+    padding-left: 1.25rem;
+    color: ${PALETTE.fgMuted};
+    min-width: 0;
+  }
+  .log-lines li {
+    margin: 0.15rem 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
 
   .done-grid {
     display: grid;
@@ -2257,6 +2426,30 @@ const STYLES = `
     margin: 0.4rem 0;
   }
   .reachable .fine { font-size: 0.85rem; color: ${PALETTE.fgMuted}; margin: 0.4rem 0 0; }
+
+  /* "Start using your vault" lead tile on the done step (hub#342).
+     Same visual weight as .reachable so the operator's eye lands here
+     as the primary user-facing entry — slightly more prominent
+     padding + a stronger heading to telegraph "this is the click
+     you're looking for." */
+  .start-using {
+    background: ${PALETTE.cardBg};
+    border: 1px solid ${PALETTE.accent};
+    border-radius: 8px;
+    padding: 1rem 1.1rem;
+    margin: 0 0 1rem;
+  }
+  .start-using h2 {
+    margin: 0 0 0.5rem;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 1.1rem;
+    color: ${PALETTE.fg};
+    font-family: ${FONT_SERIF};
+    font-weight: 400;
+  }
+  .start-using p { margin: 0.4rem 0; }
+  .start-using p:last-child { margin-bottom: 0; }
 
   code {
     background: ${PALETTE.borderLight};

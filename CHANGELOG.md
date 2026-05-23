@@ -2,6 +2,61 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.20] - 2026-05-23
+
+**feat(hub): comprehensive UI pass — wizard done-screen + Modules page Open + discovery quick-start (closes [hub#342](https://github.com/ParachuteComputer/parachute-hub/issues/342)).**
+
+Closes the "I just installed it, where is it?" friction Aaron hit (two reports, 2026-05-22 → 23): (1) install-tile log lines overflowed the wizard card → text size jumped, page stretched; (2) "no clear way to go from setting up parachute to actually using parachute." Plus the architectural pivot Aaron named: Open and Configure aren't meaningfully different — each module ships its own UI handling both viewing and configuring. Hub becomes a dispatcher to that UI; the in-hub config form retires.
+
+### Architectural framing
+
+Per [`module-ui-declaration.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/module-ui-declaration.md) + [`module-surfaces.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/module-surfaces.md): each committed-core module exposes a canonical admin UI at `/<short>/admin` (or wherever its `managementUrl` declares). Hub's job is dispatch — point operators at the right module's UI; the module's own SPA handles view + configure via internal scope gates. The pre-#342 "Configure" link to a hub-side config form was an artifact of scribe being the only schema-backed module; with scribe + runner shipping their own SPAs (scribe#53, runner#8 — filed alongside), hub's generic config form becomes redundant.
+
+### Changed
+
+- **Install-log overflow CSS** — `.op-log` gains `overflow-x: auto`, `.log-lines li` gain `white-space: pre-wrap` + `overflow-wrap: anywhere`. `.install-tile` gains `min-width: 0` so the grid track can shrink below intrinsic content width. Aaron's reproducer: install long-package-name modules → page stretches off-screen. Fixed.
+- **Wizard done-screen leads with "Start using your vault"** — new lead tile above the MCP / install / admin tiles. When parachute-app is installed, links to `/app/notes/` (the canonical Notes-as-UI surface per parachute-app §17). When app isn't installed yet, falls back to the vault's own admin UI at `/vault/<name>/admin/`. Either way, the operator has one obvious "start using" target rather than three competing "next step" tiles.
+- **Wizard install-tile post-success: "Use it now" link** — terminal-state install tiles (succeeded + already-installed) now lead with "Use it now" pointing at the module's canonical UI (`/app/notes/` for App, `/scribe/admin/` for Scribe, etc. — per `USE_IT_NOW_URLS`). "Manage modules" stays as the secondary affordance. The link table mirrors `module-ui-declaration.md`'s `uiUrl` / `managementUrl` semantics.
+- **Admin SPA Modules page: Open + Configure collapse into a single Open button** — `ModuleRow` swaps the `<Link to="/modules/<short>/config">Configure</Link>` for an `<a href={management_url}>Open</a>` (full-page nav, since the module owns its surface). Modules without a declared `management_url` (scribe, runner today) render a disabled `<button>` with a tooltip pointing at the per-module follow-up issue — gentler than 404-on-click. `management_url` is a new wire field on the `/api/modules` shape: hub resolves each installed module's `managementUrl ?? uiUrl` from `.parachute/module.json` against its mount path. The pre-#342 in-hub config form code at `/admin/modules/:short/config` stays in place (back-compat for stale bookmarks) but no SPA surface links to it anymore; a future PR deletes it after the migration period.
+- **Discovery page (`/`) "Get started" section** — new section above the Services grid, hidden until at least one prereq is met. Two hardcoded tiles when applicable: "Open Notes" → `/app/notes/` (when parachute-app is installed); "Browse Vault" → `/vault/<first-vault>/admin/` (when vault is installed). Driven off the unauth `/.well-known/parachute.json` — no Bearer required, fresh installs still see a sensible empty state.
+- **Admin SPA nav: installed-services quick access** — new "Services ▾" dropdown between Modules and Users. One entry per installed module that declares a `management_url`; modules without one appear disabled with the same follow-up tooltip the Modules page surfaces. Native `<details>`/`<summary>` for the toggle, absolute-positioned panel, no JS framework dance. Fetches the same `/api/modules` catalog the Modules page reads; failure is silent (dropdown collapses).
+
+### Deprecated
+
+- `/admin/modules/:short/config` (the generic per-module config form) — file gets a deprecation docstring; SPA surface no longer links to it. Deletion follow-up tracked in this PR's body. Scribe + runner's own admin SPAs (scribe#53, runner#8) replace its purpose.
+
+### What landed
+
+- **`src/setup-wizard.ts`** — `.op-log` + `.log-lines li` overflow constraints; `.install-tile` gains `min-width: 0`; new `.start-using` block; new `renderStartUsingTile(vaultName, appInstalled)`; `RenderDoneStepProps` gains optional `appInstalled`; `handleSetupGet`'s done branch reads `isModuleInstalled("app", manifestPath)` and threads it through; new `USE_IT_NOW_URLS` table; install-tile renderer adds the "Use it now" primary CTA on succeeded + already-installed states.
+- **`src/api-modules.ts`** — `ModuleWireShape` gains `management_url: string | null`; new `readModuleManifest` dep on `ApiModulesDeps`; manifest read resolves `managementUrl ?? uiUrl` against the entry's mount path (first non-`.parachute` path); errors are quiet per-entry.
+- **`src/hub-server.ts`** — threads `readModuleManifest` through to `handleApiModules`.
+- **`src/hub.ts`** — new `<section id="get-started-section">` above Services; new `renderGetStarted(services)` JS that conditionally renders Notes / Vault tiles based on which modules are installed.
+- **`web/ui/src/lib/api.ts`** — `ModuleListing` gains `management_url`.
+- **`web/ui/src/routes/Modules.tsx`** — `ModuleRow` renders Open instead of Configure; disabled fallback with `NO_UI_FOLLOWUPS` tooltip.
+- **`web/ui/src/routes/ModuleConfig.tsx`** — deprecation docstring; route + handler stay for back-compat.
+- **`web/ui/src/App.tsx`** — new `InstalledServicesDropdown`; `useEffect` to fetch modules on signed-in transition.
+- **`web/ui/src/styles.css`** — `.nav-dropdown` + `.nav-dropdown-panel` + `.nav-dropdown-item` styles.
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src` 1909 pass / 0 fail (delta: +7 new tests — five in `setup-wizard.test.ts` covering the lead tile + Use it now + log-overflow CSS, two in `api-modules.test.ts` covering `management_url` resolution + the null-fallthrough case).
+- `cd web/ui && bunx vitest run` 193 pass / 0 fail (delta: +5 new tests — three in `Modules.test.tsx` covering Open active / disabled / no-Configure, two in `App.test.tsx` covering the nav dropdown empty + populated states).
+- `bunx biome check src/` clean.
+- `bun run build:spa` clean (the postinstall hook + prepack rebuild path).
+
+### Follow-ups
+
+- [parachute-scribe#53](https://github.com/ParachuteComputer/parachute-scribe/issues/53) — ship scribe admin SPA (currently config endpoints + schema only; Open button shows disabled-with-tooltip until this lands).
+- [parachute-runner#8](https://github.com/ParachuteComputer/parachute-runner/issues/8) — ship runner admin SPA (currently admin endpoints only; same gap).
+- Future PR: delete `web/ui/src/routes/ModuleConfig.tsx` + the `/api/modules/:short/config{,/schema}` endpoints once at least one rc cycle confirms no operator is bookmarking the legacy path.
+
+### Cross-references
+
+- [`module-ui-declaration.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/module-ui-declaration.md) — `uiUrl` vs `managementUrl` semantics.
+- [`module-surfaces.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/module-surfaces.md) — canonical surfaces per module.
+- [`runtime-tenancy-contract.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/runtime-tenancy-contract.md) — how the dispatched-to module reads its mount + hub origin from injected meta tags.
+
 ## [0.5.13-rc.19] - 2026-05-23
 
 **chore(hub): retire `kind` from types + manifest parser + `KNOWN_MODULES` + `upgrade.ts` build branch (closes [hub#330](https://github.com/ParachuteComputer/parachute-hub/issues/330)).**
