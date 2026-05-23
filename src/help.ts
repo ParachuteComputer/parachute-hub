@@ -110,7 +110,7 @@ Behavior:
     (root cause), so subsequent fallout doesn't mask the original problem.
   - Non-TTY / piped invocations should use \`parachute install <svc>\` per
     service instead — \`setup\` assumes a terminal for the prompts.
-  - Selection accepts numbers (\`1,3\`), names (\`vault, notes\`), or \`all\`.
+  - Selection accepts numbers (\`1,3\`), names (\`vault, app\`), or \`all\`.
 
 Flags:
   --tag <name>     npm dist-tag or exact version, applied to every install
@@ -281,8 +281,9 @@ Start commands by service:
   hub       bun <cli>/hub-server.ts --port <picked> ...
   vault     parachute-vault serve
   scribe    parachute-scribe serve
+  app       parachute-app serve
   channel   parachute-channel daemon
-  notes     bun <cli>/notes-serve.ts --port <configured> --mount <paths[0]>
+  notes     bun <cli>/notes-serve.ts --port <configured> --mount <paths[0]>   # back-compat: legacy notes-daemon
 `;
 }
 
