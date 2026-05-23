@@ -7,9 +7,9 @@
 #
 # To use: connect a fresh Render account to a fork of this repo and click
 # "New Blueprint" → point at this file. Render will provision the
-# service + disk and start the build. Set the admin-seed env vars in the
-# Render dashboard (marked `sync: false`) or use the web wizard at
-# `/admin/setup` after the first deploy.
+# service + disk and start the build. After deploy, open Render Logs and
+# search for `parachute-bootstrap-` to find your one-time admin setup
+# token, then visit `/admin/setup` and paste it in.
 #
 # Custom domains: add the domain on the Render service page, then set
 # PARACHUTE_HUB_ORIGIN to `https://<your-domain>`. The OAuth issuer claim
@@ -90,17 +90,16 @@ services:
       - key: PARACHUTE_HUB_ORIGIN
         sync: false
 
-      # First-boot admin seed. Optional — if unset, the hub still comes
-      # up and routes non-/.well-known requests to /admin/setup so the
-      # operator can bootstrap via the web wizard.
+      # Admin setup: hub generates a one-time bootstrap token on first
+      # boot (printed prominently to logs). Visit /admin/setup, paste
+      # the token, create your admin account. No env-var passwords in
+      # the Render dashboard by default — cleaner secret hygiene.
       #
-      # `sync: false` so secrets never land in source control. Setting
-      # these is a one-time act; once an admin exists in hub.db, the
-      # seed code path is a no-op even if the env vars stay set.
-      - key: PARACHUTE_INITIAL_ADMIN_USERNAME
-        sync: false
-      - key: PARACHUTE_INITIAL_ADMIN_PASSWORD
-        sync: false
+      # Operators who need env-var-driven setup (CI, scripted deploys,
+      # etc.) can still add `PARACHUTE_INITIAL_ADMIN_USERNAME` +
+      # `PARACHUTE_INITIAL_ADMIN_PASSWORD` env vars manually in the
+      # Render dashboard. Hub honors them when present (per the
+      # `seedInitialAdminIfNeeded` code path in src/commands/serve.ts).
 
       # Run with a sensible Node-style production hint. Bun honors this
       # for any libraries that branch on NODE_ENV.

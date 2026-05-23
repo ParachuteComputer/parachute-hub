@@ -184,6 +184,15 @@ describe("formatBootstrapTokenBanner", () => {
       expect(line.startsWith("[wizard]")).toBe(true);
     }
   });
+
+  test("uses ═ delimiters and an ALL-CAPS heading so operators spot the block in log viewers", () => {
+    const banner = formatBootstrapTokenBanner("parachute-bootstrap-visual-token");
+    // The ═ box-drawing char is the visual cue an operator scrolling
+    // Render's log tab keys off; this assertion locks the new shape so
+    // a stylistic regression doesn't silently demote the banner.
+    expect(banner).toContain("═");
+    expect(banner).toContain("PARACHUTE BOOTSTRAP TOKEN");
+  });
 });
 
 // --- bootstrap-token generation under needs-setup (Issue 1 wiring) -------

@@ -24,11 +24,14 @@ One-click Render deploy via the `render.yaml` Blueprint in this repo. Provisions
 
 **Want pre-release / rc modules?** Set `PARACHUTE_INSTALL_CHANNEL=rc` in your Render dashboard env vars (useful for dev/testing against the rc release line).
 
-After deploy:
+After deploy completes:
 
-1. Open your Render service URL → wizard runs at `/admin/setup`
-2. Set custom domain (optional) → set `PARACHUTE_HUB_ORIGIN` env to match
-3. Install modules via the admin SPA at `/admin/modules` (or via the wizard)
+1. Open Render Logs → search for `parachute-bootstrap-` to find your one-time admin setup token (printed in a prominent banner on first boot).
+2. Visit your Render service URL's `/admin/setup` → paste the token → create your admin account.
+3. Set custom domain (optional) → set `PARACHUTE_HUB_ORIGIN` env to match.
+4. Install modules via the admin SPA at `/admin/modules` (or via the wizard).
+
+Operators who want env-var-driven seeding (CI, scripted deploys) can still set `PARACHUTE_INITIAL_ADMIN_USERNAME` + `PARACHUTE_INITIAL_ADMIN_PASSWORD` manually in the Render dashboard — hub honors them when present.
 
 Render's docs on Blueprints: <https://render.com/docs/blueprint-spec>
 
