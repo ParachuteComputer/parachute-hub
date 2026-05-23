@@ -441,7 +441,7 @@ function dropRetiredModuleRows(raw: unknown, where: string): { raw: unknown; cha
   for (const d of dropped) {
     const replacementLine = d.replacement ? ` Replacement: ${d.replacement}.` : "";
     console.error(
-      `${where}: dropped stale row for retired module '${d.name}' (retired ${d.retiredAt}).${replacementLine} If the ${d.name} daemon is still running, stop it with: ps aux | grep parachute-${d.name} && kill <pid>`,
+      `${where}: dropped stale row for retired module '${d.name}' (retired ${d.retiredAt}).${replacementLine} If the ${d.name} daemon is still running, stop it (e.g. \`ps aux | grep ${d.name}\` then \`kill <pid>\`).`,
     );
   }
 
