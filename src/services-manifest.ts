@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
+import { RETIRED_MODULES } from "./service-spec.ts";
 
 /**
  * Whether the service is safe to mount on public-facing expose layers.
@@ -376,10 +377,169 @@ export function readManifest(path: string = SERVICES_MANIFEST_PATH): ServicesMan
       `failed to parse ${path}: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  const validated = validateManifest(raw, path);
+  // Retired-module + legacy short-name row cleanup runs BEFORE shape
+  // validation because the bugs they heal (rows that conflict on port with
+  // a current row) would otherwise throw inside `validateManifest`'s
+  // duplicate-port gate. Order matters: drop retired-module rows FIRST so
+  // their absence can unmask a `parachute-<X>` ↔ `<X>` pair underneath that
+  // `dropLegacyShortNameRows` then handles. The reverse order would leave
+  // a retired row that the short-name pass doesn't recognize. Both passes
+  // mutate the raw JSON object's `services` array; we re-validate against
+  // the cleaned shape. See `dropRetiredModuleRows` + `dropLegacyShortNameRows`
+  // for the full discipline.
+  const afterRetired = dropRetiredModuleRows(raw, path);
+  const cleaned = dropLegacyShortNameRows(afterRetired.raw, path);
+  const validated = validateManifest(cleaned.raw, path);
   const migrated = migrateClawToAgent(validated);
-  if (migrated.changed) writeManifest(migrated.manifest, path);
+  const changed = afterRetired.changed || cleaned.changed || migrated.changed;
+  if (changed) writeManifest(migrated.manifest, path);
   return migrated.manifest;
+}
+
+/**
+ * Drop rows whose `name` matches a registered retired module (see
+ * `RETIRED_MODULES` in `service-spec.ts`). Retirement is unconditional —
+ * unlike `dropLegacyShortNameRows`, which only fires when a same-port
+ * manifestName twin is present, this pass drops a retired row whether or
+ * not anything else collides with it. The row is stale by definition: the
+ * module's npm package and daemon are no longer first-party, and leaving
+ * the row in place either (a) routes operators to a no-longer-supported
+ * binary or (b) blocks a current module from claiming the port the retired
+ * row squats on (Aaron's 2026-05-22 reproducer: stale `agent` row at 1946
+ * collided with `parachute-app` self-registering at 1946).
+ *
+ * Per-row stderr warning is operator-actionable: cites the retirement date,
+ * names the replacement module (if any), and includes a one-line shell
+ * snippet for stopping the still-running daemon process. The row reappears
+ * on the next read if the daemon is still up (its self-register writes
+ * back the same name), so the warning steers operators to fully retire
+ * the legacy process, not just hand-edit the file.
+ *
+ * Operates on raw JSON rather than validated entries so a retired row that
+ * shares a port with a current row doesn't trip `validateManifest`'s
+ * duplicate-port gate before this helper runs. Closes hub#334.
+ */
+function dropRetiredModuleRows(raw: unknown, where: string): { raw: unknown; changed: boolean } {
+  if (!raw || typeof raw !== "object") return { raw, changed: false };
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return { raw, changed: false };
+
+  type Dropped = { name: string; retiredAt: string; replacement?: string };
+  const dropped: Dropped[] = [];
+  const nextServices = services.filter((row) => {
+    if (!row || typeof row !== "object") return true;
+    const name = (row as Record<string, unknown>).name;
+    if (typeof name !== "string") return true;
+    const retired = RETIRED_MODULES[name];
+    if (retired === undefined) return true;
+    dropped.push({ name, retiredAt: retired.retiredAt, replacement: retired.replacement });
+    return false;
+  });
+
+  if (dropped.length === 0) return { raw, changed: false };
+
+  for (const d of dropped) {
+    const replacementLine = d.replacement ? ` Replacement: ${d.replacement}.` : "";
+    console.error(
+      `${where}: dropped stale row for retired module '${d.name}' (retired ${d.retiredAt}).${replacementLine} If the ${d.name} daemon is still running, stop it (e.g. \`ps aux | grep ${d.name}\` then \`kill <pid>\`).`,
+    );
+  }
+
+  return {
+    raw: { ...(raw as Record<string, unknown>), services: nextServices },
+    changed: true,
+  };
+}
+
+/**
+ * Drop legacy short-name rows when a same-module manifestName row exists
+ * on the same port. Handles the duplicate-row class introduced when a
+ * module's self-register wrote `name: "<short>"` (e.g. `"app"`) while
+ * hub's install path stamped `name: "parachute-<short>"` (the canonical
+ * manifestName key). The two rows shared a port and tripped the
+ * duplicate-port read gate, leaving operators with an unbootable
+ * services.json until they edited by hand. Aaron hit this on 2026-05-22
+ * with `parachute-app` + `app` after parachute-app#13 + parachute-runner#4
+ * had already fixed the upstream self-register writes; this gate cleans
+ * up legacy state on operators who had already booted the bad code path.
+ *
+ * Detection is structural — no module registry import needed:
+ *   - two rows share a port (NOT the multi-vault carve-out)
+ *   - one row's name matches `parachute-<X>`
+ *   - the other row's name matches `<X>` (same `<X>`)
+ *
+ * When that shape is present, drop the short-named row + log a warning
+ * to stderr so operators see the auto-cleanup the next time they read
+ * services.json (via any CLI command that touches the file). The
+ * manifestName row wins — it carries the hub-stamped fields (installDir,
+ * version after self-register's first overwrite) operators care about.
+ *
+ * Returns the (possibly mutated) raw object + a `changed` flag so the
+ * caller can re-write services.json with the cleaned shape. Operates on
+ * raw JSON rather than validated entries because the duplicate-port row
+ * pair would otherwise throw during validation before this helper had a
+ * chance to run.
+ */
+function dropLegacyShortNameRows(raw: unknown, where: string): { raw: unknown; changed: boolean } {
+  if (!raw || typeof raw !== "object") return { raw, changed: false };
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return { raw, changed: false };
+
+  // Build a port → [rows] index to spot same-port pairs. We only care
+  // about rows that parse to the minimal `{ name, port }` shape — anything
+  // else fails downstream validation anyway and isn't part of the bug
+  // class.
+  type Probe = { name: string; port: number; index: number };
+  const byPort = new Map<number, Probe[]>();
+  services.forEach((row, index) => {
+    if (!row || typeof row !== "object") return;
+    const name = (row as Record<string, unknown>).name;
+    const port = (row as Record<string, unknown>).port;
+    if (typeof name !== "string" || typeof port !== "number") return;
+    const bucket = byPort.get(port) ?? [];
+    bucket.push({ name, port, index });
+    byPort.set(port, bucket);
+  });
+
+  const dropIndices = new Set<number>();
+  for (const bucket of byPort.values()) {
+    if (bucket.length < 2) continue;
+    for (const a of bucket) {
+      for (const b of bucket) {
+        if (a.index === b.index) continue;
+        // a is the "short" candidate, b is the "manifestName" candidate.
+        // The shape rule: b.name === `parachute-${a.name}` and a is not
+        // itself a `parachute-…` name. Both halves matter: without the
+        // second check, `parachute-vault` paired with `parachute-parachute-vault`
+        // would drop the real vault row (no such pair exists today, but
+        // the shape rule keeps the heuristic narrow on principle).
+        if (a.name.startsWith("parachute-")) continue;
+        if (b.name !== `parachute-${a.name}`) continue;
+        dropIndices.add(a.index);
+      }
+    }
+  }
+
+  if (dropIndices.size === 0) return { raw, changed: false };
+
+  const dropped: string[] = [];
+  const nextServices = services.filter((row, index) => {
+    if (!dropIndices.has(index)) return true;
+    if (row && typeof row === "object") {
+      const name = (row as Record<string, unknown>).name;
+      if (typeof name === "string") dropped.push(name);
+    }
+    return false;
+  });
+
+  console.error(
+    `${where}: dropped legacy short-name row(s) [${dropped.join(", ")}] in favor of same-port manifestName row(s). This is the parachute-app#13 / parachute-runner#4 self-register fixup. See parachute-patterns/patterns/services-json-row-conventions.md.`,
+  );
+
+  return {
+    raw: { ...(raw as Record<string, unknown>), services: nextServices },
+    changed: true,
+  };
 }
 
 /**

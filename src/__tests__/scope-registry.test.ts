@@ -140,7 +140,7 @@ describe("loadDeclaredScopes", () => {
   test("readModuleScopes receives installDir from services.json (closes #85 follow-up)", () => {
     // Regression: scope-registry was looking up by services.json `name` in
     // bun-globals. For third-party modules where name (canonical short like
-    // "agent") differs from the npm package name on disk ("nanoagent" for
+    // "someapp") differs from the npm package name on disk ("nanoapp" for
     // forks), that lookup fails and the module's scopes are never declared.
     // installDir from hub#84 is the correct path source.
     const { manifestPath, cleanup } = tmp();
@@ -150,12 +150,12 @@ describe("loadDeclaredScopes", () => {
         JSON.stringify({
           services: [
             {
-              name: "agent",
+              name: "someapp",
               port: 1944,
-              paths: ["/agent"],
+              paths: ["/someapp"],
               health: "/api/health",
               version: "0.0.0-linked",
-              installDir: "/Users/test/ParachuteComputer/parachute-agent",
+              installDir: "/Users/test/ParachuteComputer/parachute-someapp",
             },
           ],
         }),
@@ -165,15 +165,15 @@ describe("loadDeclaredScopes", () => {
         manifestPath,
         readModuleScopes: (pkg, installDir) => {
           calls.push({ pkg, installDir });
-          return pkg === "agent" ? ["agent:read", "agent:write", "agent:admin"] : null;
+          return pkg === "someapp" ? ["someapp:read", "someapp:write", "someapp:admin"] : null;
         },
       });
       expect(calls).toEqual([
-        { pkg: "agent", installDir: "/Users/test/ParachuteComputer/parachute-agent" },
+        { pkg: "someapp", installDir: "/Users/test/ParachuteComputer/parachute-someapp" },
       ]);
-      expect(declared.has("agent:read")).toBe(true);
-      expect(declared.has("agent:write")).toBe(true);
-      expect(declared.has("agent:admin")).toBe(true);
+      expect(declared.has("someapp:read")).toBe(true);
+      expect(declared.has("someapp:write")).toBe(true);
+      expect(declared.has("someapp:admin")).toBe(true);
     } finally {
       cleanup();
     }
