@@ -714,6 +714,39 @@ describe("POST /api/modules/:short/upgrade", () => {
     expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
   });
 
+  test("PARACHUTE_INSTALL_CHANNEL env cascades to upgrade too (hub#339 symmetry)", async () => {
+    // The Render-deploy operator sets PARACHUTE_INSTALL_CHANNEL=rc cluster-
+    // wide expecting BOTH install and upgrade through the admin SPA to
+    // honor it. Asymmetry between the two paths would surprise them.
+    setModuleInstallChannel(h.db, "latest"); // DB says latest
+    const prior = process.env.PARACHUTE_INSTALL_CHANNEL;
+    process.env.PARACHUTE_INSTALL_CHANNEL = "rc"; // env says rc — should win
+    try {
+      const { supervisor } = makeIdleSupervisor();
+      await supervisor.start({ short: "vault", cmd: ["parachute-vault", "serve"] });
+      const { run, calls } = alwaysOkRun();
+      const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+      await handleUpgrade(
+        postReq("/api/modules/vault/upgrade", { authorization: `Bearer ${bearer}` }),
+        "vault",
+        {
+          db: h.db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          supervisor,
+          run,
+        },
+      );
+      await new Promise((r) => setTimeout(r, 10));
+      expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@rc"]);
+      expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+    } finally {
+      if (prior === undefined) process.env.PARACHUTE_INSTALL_CHANNEL = undefined;
+      else process.env.PARACHUTE_INSTALL_CHANNEL = prior;
+    }
+  });
+
   test("fails with 'try install first' when module is installed but never supervised", async () => {
     // Module has a services.json row (e.g. seeded by `parachute install`
     // pre-supervisor era) but the supervisor never spawned it.

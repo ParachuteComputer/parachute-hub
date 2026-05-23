@@ -664,7 +664,13 @@ async function runUpgrade(
 ): Promise<void> {
   const registry = deps.registry ?? defaultRegistry;
   const run = deps.run ?? defaultRun;
-  const channel = getModuleInstallChannel(deps.db);
+  // Mirror runInstall's precedence so PARACHUTE_INSTALL_CHANNEL=rc cascades
+  // to admin-SPA-driven upgrades too. Without this, a Render deploy with
+  // env=rc would install at @rc but upgrade through the SPA at whatever
+  // the DB toggle says — asymmetric + surprising to the operator.
+  // (Operators who want different install vs upgrade channels can still
+  // do so via the DB toggle when no env is set.)
+  const channel = resolveApiInstallChannel(undefined, deps);
   const spec_str = `${spec.package}@${channel}`;
   registry.update(opId, { status: "running" }, `running bun add -g ${spec_str}`);
   const code = await run(["bun", "add", "-g", spec_str]);
