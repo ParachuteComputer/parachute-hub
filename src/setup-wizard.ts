@@ -883,6 +883,9 @@ function renderMcpTile(
  */
 function renderStartUsingTile(vaultName: string, appInstalled: boolean): string {
   const safeVault = escapeHtml(vaultName);
+  // Vault names pass `/^[a-z0-9][a-z0-9-]*$/i` so URL-encoding is mostly
+  // a no-op today, but use encodeURIComponent defensively to match hub.ts:505.
+  const urlVault = encodeURIComponent(vaultName);
   if (appInstalled) {
     return `<section class="start-using" data-testid="start-using-tile">
       <h2>Start using your vault</h2>
@@ -897,7 +900,7 @@ function renderStartUsingTile(vaultName: string, appInstalled: boolean): string 
       <strong>App</strong> below (it bundles the Notes UI) to start
       capturing — or open the vault's admin UI now to see what's
       inside.</p>
-    <p><a class="btn btn-primary" href="/vault/${safeVault}/admin/">Open vault admin</a></p>
+    <p><a class="btn btn-primary" href="/vault/${urlVault}/admin/">Open vault admin</a></p>
   </section>`;
 }
 
@@ -1005,9 +1008,12 @@ function renderInstallTile(tile: ModuleInstallTileState): string {
  */
 const USE_IT_NOW_URLS: Partial<Record<CuratedModuleShort, string>> = {
   app: "/app/notes/",
-  scribe: "/scribe/admin/",
   notes: "/notes/",
-  runner: "/runner/admin/",
+  // Omitted: scribe + runner. They don't ship an admin SPA yet
+  // (scribe#53, runner#8 track). Pointing "Use it now" at /scribe/admin
+  // or /runner/admin today would 404 — better to fall through to the
+  // "Manage modules" link than to send the operator into a dead end.
+  // Add the entry here once those modules ship their admin UI.
 };
 
 /**
