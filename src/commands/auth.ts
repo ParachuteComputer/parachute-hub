@@ -60,7 +60,13 @@ export interface Runner {
 
 export const defaultRunner: Runner = {
   async run(cmd) {
-    const proc = Bun.spawn([...cmd], { stdio: ["inherit", "inherit", "inherit"] });
+    // Inherit env so the child (e.g. parachute-vault subprocess) sees PATH,
+    // HOME, PARACHUTE_HOME, etc. Bun.spawn defaults to empty env — see
+    // api-modules-ops.ts:defaultRun.
+    const proc = Bun.spawn([...cmd], {
+      stdio: ["inherit", "inherit", "inherit"],
+      env: process.env,
+    });
     return await proc.exited;
   },
 };

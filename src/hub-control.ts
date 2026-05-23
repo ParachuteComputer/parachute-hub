@@ -74,7 +74,12 @@ export interface HubSpawner {
 export const defaultHubSpawner: HubSpawner = {
   spawn(cmd, logFile) {
     const fd = openSync(logFile, "a");
-    const proc = Bun.spawn([...cmd], { stdio: ["ignore", fd, fd] });
+    // Inherit env so the hub child process sees PATH, HOME, PARACHUTE_HOME,
+    // etc. Bun.spawn defaults to empty env — see api-modules-ops.ts.
+    const proc = Bun.spawn([...cmd], {
+      stdio: ["ignore", fd, fd],
+      env: process.env,
+    });
     proc.unref();
     return proc.pid;
   },

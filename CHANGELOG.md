@@ -2,6 +2,50 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.26] - 2026-05-23
+
+**fix(hub): `Bun.spawn` subprocess calls now inherit `process.env` (closes the real-real root cause of [hub#349](https://github.com/ParachuteComputer/parachute-hub/issues/349)).**
+
+`Bun.spawn` defaults to an **EMPTY** env when `env` is not passed — it does NOT inherit the parent's environment the way `child_process.spawn` does in Node. Every place in hub that called `Bun.spawn` without an explicit `env: process.env` was handing the child a clean env: no `PATH`, no `HOME`, no `TMPDIR`, no `BUN_INSTALL`, no `PARACHUTE_*`. The Render install failure was the visible symptom (#350's chown + #351's `TMPDIR=/parachute/tmp` were both necessary but neither sufficient — the spawned `bun add -g` subprocess never saw the env vars set in the Dockerfile), but the same class of bug was sitting in 13 other call sites waiting to bite.
+
+### Fixed
+
+- Fixed: hub's `Bun.spawn` subprocess calls now inherit the parent's environment (`env: process.env`). Bun.spawn defaults to an EMPTY env, which meant subprocess `bun add -g` didn't see `TMPDIR`, `BUN_INSTALL`, or any other env vars set by the Dockerfile or operator. This was the actual root cause of the Render install EACCES — even after rc.25 set `TMPDIR=/parachute/tmp` in the Dockerfile ENV, hub's spawned `bun add` didn't inherit it. Closes hub#349 (real-real root cause; prior chown + TMPDIR fixes were necessary but not sufficient). Fixed across 14 `Bun.spawn` call sites — every non-test spawn in `src/` now propagates env, which prevents the same class of bug from surprising operators with subprocess calls.
+
+### What landed
+
+The fix is mechanical: add `env: process.env` to the `Bun.spawn` options at every call site that didn't already set `env`. For the two seams that conditionally merged `process.env` only when a per-call override was provided (`src/supervisor.ts:defaultSpawnFn`, `src/commands/lifecycle.ts:defaultSpawner`), the default branch now also sets `env: process.env`; the override branch's `{ ...process.env, ...opts.env }` merge is unchanged.
+
+Call sites updated:
+
+1. `src/api-modules-ops.ts:defaultRun` — admin SPA install/upgrade (the Render-failure trigger)
+2. `src/commands/install.ts:defaultRunner` — CLI install
+3. `src/admin-vaults.ts:defaultRunCommand` — admin SPA vault ops
+4. `src/commands/expose-auth-preflight.ts:defaultInteractiveRunner` — Tailscale auth check
+5. `src/commands/auth.ts:defaultRunner` — `parachute auth` forwarding to vault
+6. `src/commands/expose-cloudflare.ts:defaultCloudflaredSpawner` — `cloudflared` subprocess (needs `HOME` for `~/.cloudflared/`)
+7. `src/commands/expose-interactive.ts:defaultInteractiveRunner` — interactive expose flows
+8. `src/commands/vault-tokens-create-interactive.ts:defaultInteractiveRunner` — interactive vault token mint
+9. `src/commands/vault.ts:dispatchVault` — `parachute vault <args>` forwarder
+10. `src/commands/lifecycle.ts:defaultSpawner` — module daemon spawner (default branch + per-call merge preserved)
+11. `src/commands/lifecycle.ts` tail-spawner — `parachute logs -f` `tail -f`
+12. `src/commands/upgrade.ts:defaultRunner` — `parachute upgrade` (both `.run` and `.capture`)
+13. `src/hub-control.ts:defaultHubSpawner` — `parachute serve` background hub
+14. `src/supervisor.ts:defaultSpawnFn` — supervised module subprocess (default branch + per-call merge preserved)
+15. `src/tailscale/run.ts:defaultRunner` — every `tailscale ...` shell-out
+
+Each site has an inline comment pointing back to `api-modules-ops.ts:defaultRun` for the rationale (DRY on the "why").
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src` — 1921 pass / 0 fail (+2 from `src/__tests__/spawn-env-propagation.test.ts` regression test: positive case asserts `env: process.env` propagates, negative-control case asserts that omitting `env` produces an empty-env child — locks the Bun.spawn behavior so a future regression is caught here, not in production on Render).
+- `bunx biome check src/` clean.
+
+### Patterns check
+
+- No pattern shifts. The "spawned subprocesses inherit env unless deliberately scrubbed" expectation is a Unix-tooling convention shared with `child_process.spawn`'s default; this PR makes hub's `Bun.spawn` usage conform to that convention. Worth noting in [`parachute-patterns/patterns/`](https://github.com/ParachuteComputer/parachute-patterns/tree/main/patterns) as a Bun-runtime gotcha for future modules in the ecosystem (vault, scribe, app — all of which also use `Bun.spawn`), but the doc is out-of-scope for this hub-only PR.
+
 ## [0.5.13-rc.25] - 2026-05-23
 
 **fix(hub): `TMPDIR=/parachute/tmp` so bun installs work on cross-mount filesystems (closes [hub#349](https://github.com/ParachuteComputer/parachute-hub/issues/349) root cause).**

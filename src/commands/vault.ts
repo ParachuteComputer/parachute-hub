@@ -2,6 +2,9 @@ export async function dispatchVault(args: readonly string[]): Promise<number> {
   try {
     const proc = Bun.spawn(["parachute-vault", ...args], {
       stdio: ["inherit", "inherit", "inherit"],
+      // Inherit env so parachute-vault sees PATH, HOME, PARACHUTE_HOME, etc.
+      // Bun.spawn defaults to empty env — see api-modules-ops.ts:defaultRun.
+      env: process.env,
     });
     return await proc.exited;
   } catch (err) {

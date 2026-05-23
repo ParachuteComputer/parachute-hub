@@ -206,7 +206,12 @@ function buildEntry(
 }
 
 async function defaultRunCommand(cmd: readonly string[]): Promise<RunResult> {
-  const proc = Bun.spawn([...cmd], { stdio: ["ignore", "pipe", "pipe"] });
+  // Inherit env so the child sees PATH, HOME, BUN_INSTALL, etc. Bun.spawn
+  // defaults to empty env — see api-modules-ops.ts:defaultRun for the rationale.
+  const proc = Bun.spawn([...cmd], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: process.env,
+  });
   // Drain both pipes in parallel — leaving stderr unread can deadlock long
   // installs once the OS pipe buffer fills (#97). Captured stderr is folded
   // into the orchestration error message on non-zero exit.

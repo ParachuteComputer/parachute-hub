@@ -322,7 +322,14 @@ async function resolveSpawnSpec(
 }
 
 function defaultRun(cmd: readonly string[]): Promise<number> {
-  const proc = Bun.spawn([...cmd], { stdio: ["ignore", "inherit", "inherit"] });
+  // Inherit env so child `bun add` sees TMPDIR, BUN_INSTALL, PARACHUTE_*,
+  // etc. set by the Dockerfile / Render env. Bun.spawn defaults to empty
+  // env — without this, bun-add fails with cross-mount rename errors on
+  // Render (where TMPDIR points at the persistent disk). See hub#349.
+  const proc = Bun.spawn([...cmd], {
+    stdio: ["ignore", "inherit", "inherit"],
+    env: process.env,
+  });
   return proc.exited;
 }
 

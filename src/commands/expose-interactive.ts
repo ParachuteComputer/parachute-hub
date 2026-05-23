@@ -46,7 +46,13 @@ import { type ExposeOpts, exposePublic } from "./expose.ts";
 export type InteractiveRunner = (cmd: readonly string[]) => Promise<number>;
 
 const defaultInteractiveRunner: InteractiveRunner = async (cmd) => {
-  const proc = Bun.spawn([...cmd], { stdio: ["inherit", "inherit", "inherit"] });
+  // Inherit env so interactive subprocesses (e.g. `brew install cloudflared`,
+  // `cloudflared tunnel login`) see PATH, HOME, etc. Bun.spawn defaults to
+  // empty env — see api-modules-ops.ts:defaultRun.
+  const proc = Bun.spawn([...cmd], {
+    stdio: ["inherit", "inherit", "inherit"],
+    env: process.env,
+  });
   return await proc.exited;
 };
 

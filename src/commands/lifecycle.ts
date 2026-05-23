@@ -67,6 +67,10 @@ export const defaultSpawner: Spawner = {
       // wrapped startCmds like `pnpm exec tsx server.ts` leave the tsx
       // grandchild bound to the port after stop → restart hits EADDRINUSE.
       detached: true,
+      // Inherit env so child sees PATH, HOME, PARACHUTE_HOME, etc.
+      // Bun.spawn defaults to empty env — see api-modules-ops.ts:defaultRun.
+      // Per-call `opts.env` overrides merge on top below.
+      env: process.env,
     };
     if (opts?.env) spawnOpts.env = { ...process.env, ...opts.env };
     if (opts?.cwd) spawnOpts.cwd = opts.cwd;
@@ -647,7 +651,12 @@ export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
   if (follow) {
     const spawner = opts.tailSpawner ?? {
       spawn(cmd) {
-        const proc = Bun.spawn([...cmd], { stdio: ["ignore", "inherit", "inherit"] });
+        // Inherit env so `tail` sees PATH, etc. Bun.spawn defaults to empty
+        // env — see api-modules-ops.ts:defaultRun.
+        const proc = Bun.spawn([...cmd], {
+          stdio: ["ignore", "inherit", "inherit"],
+          env: process.env,
+        });
         return proc.pid;
       },
     };
