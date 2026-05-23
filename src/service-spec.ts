@@ -174,7 +174,14 @@ export interface ServiceSpec {
    * First service boot overwrites the seed with its own authoritative version.
    */
   readonly seedEntry?: () => ServiceEntry;
-  readonly kind: ServiceKind;
+  /**
+   * Optional as of hub#327 (Phase A's fold): the validator no longer
+   * inspects `kind`, so synthesized + third-party-manifest specs may
+   * carry `undefined` here. The single read site
+   * (`commands/upgrade.ts: target.spec?.kind === "frontend"`) handles
+   * the absent case via the `=== "frontend"` falsy-fallthrough.
+   */
+  readonly kind?: ServiceKind;
   readonly hasAuth?: boolean;
   readonly urlForEntry?: (entry: ServiceEntry) => string | undefined;
   readonly postInstallFooter?: () => readonly string[];

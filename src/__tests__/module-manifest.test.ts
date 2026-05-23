@@ -35,13 +35,69 @@ describe("validateModuleManifest", () => {
 
   test("rejects missing required fields", () => {
     expect(() => validateModuleManifest({ ...VALID, name: undefined }, "x")).toThrow(/name/);
-    expect(() => validateModuleManifest({ ...VALID, kind: "weird" }, "x")).toThrow(/kind/);
+    // `kind` is NOT validated as of hub#327 — see the "kind is no longer
+    // validated" suite below for the full behavior surface.
     expect(() => validateModuleManifest({ ...VALID, port: -1 }, "x")).toThrow(/port/);
     expect(() => validateModuleManifest({ ...VALID, port: 99999 }, "x")).toThrow(/port/);
     expect(() => validateModuleManifest({ ...VALID, paths: "not-array" }, "x")).toThrow(/paths/);
     expect(() => validateModuleManifest({ ...VALID, health: "no-leading-slash" }, "x")).toThrow(
       /health/,
     );
+  });
+
+  // hub#327 (hub#301 Phase A fold): the validator no longer inspects `kind`.
+  // Any value — present, absent, valid string, typo, wrong type — is
+  // accepted. The single downstream read site
+  // (`commands/upgrade.ts: target.spec?.kind === "frontend"`) handles the
+  // absent / non-"frontend" case via falsy-fallthrough into the
+  // backend-proxy default.
+  describe("kind is no longer validated (hub#327)", () => {
+    test("missing kind is accepted and produces an undefined kind", () => {
+      const { kind: _ignored, ...withoutKind } = VALID;
+      const m = validateModuleManifest(withoutKind, "x");
+      expect(m.kind).toBeUndefined();
+    });
+
+    test("explicit kind: 'frontend' passes through unchanged", () => {
+      const m = validateModuleManifest({ ...VALID, kind: "frontend" }, "x");
+      expect(m.kind).toBe("frontend");
+    });
+
+    test("explicit kind: 'api' passes through unchanged", () => {
+      const m = validateModuleManifest({ ...VALID, kind: "api" }, "x");
+      expect(m.kind).toBe("api");
+    });
+
+    test("explicit kind: 'tool' passes through unchanged", () => {
+      const m = validateModuleManifest({ ...VALID, kind: "tool" }, "x");
+      expect(m.kind).toBe("tool");
+    });
+
+    test("invalid kind values are also accepted (validator no longer inspects)", () => {
+      // Per Aaron's direction on #327: stop validating kind. Typos,
+      // novel strings, wrong types — none of them error. The validator
+      // simply doesn't look at the field. Downstream routing branches on
+      // `kind === "frontend"` and falls through gracefully for anything
+      // else (including these), so accepting them is safe.
+      const m1 = validateModuleManifest({ ...VALID, kind: "static" }, "x");
+      expect(m1.kind).toBeUndefined();
+      const m2 = validateModuleManifest({ ...VALID, kind: "backend" }, "x");
+      expect(m2.kind).toBeUndefined();
+      const m3 = validateModuleManifest({ ...VALID, kind: null }, "x");
+      expect(m3.kind).toBeUndefined();
+      const m4 = validateModuleManifest({ ...VALID, kind: 42 }, "x");
+      expect(m4.kind).toBeUndefined();
+    });
+
+    test("routing-relevant kind: 'frontend' still survives the validator (upgrade.ts branch intact)", () => {
+      // Defensive sanity check: the one downstream branch that reads kind
+      // (commands/upgrade.ts checks `target.spec?.kind === "frontend"` to
+      // decide whether to run `bun run build`) keeps working — when a
+      // module DOES declare `kind: "frontend"`, the value reaches that
+      // branch untouched.
+      const m = validateModuleManifest({ ...VALID, kind: "frontend" }, "x");
+      expect(m.kind === "frontend").toBe(true);
+    });
   });
 
   test("rejects invalid name shape", () => {

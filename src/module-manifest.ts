@@ -76,8 +76,17 @@ export interface ModuleManifest {
   readonly displayName?: string;
   /** One-line subtitle rendered under displayName. */
   readonly tagline?: string;
-  /** Drives card vs. iframe vs. launcher in the hub. */
-  readonly kind: ModuleKind;
+  /**
+   * Historically drove card vs. iframe vs. launcher in the hub. As of
+   * hub#301 Phase A's fold (#327) the validator no longer inspects `kind` —
+   * any value, or no value at all, is accepted and passes through untouched.
+   * Routing branches downstream use `=== "frontend"` style checks which
+   * treat undefined/other values as the backend-proxy default (so the
+   * routing remains correct without validator enforcement). New modules
+   * may safely omit the field; existing values are preserved for the
+   * narrow `kind === "frontend"` branch in `commands/upgrade.ts`.
+   */
+  readonly kind?: ModuleKind;
   /** Default loopback port. CLI warns on conflict, doesn't block. */
   readonly port: number;
   /** URL paths the module serves under the hub origin. */
@@ -167,11 +176,19 @@ function asOptionalString(v: unknown, where: string, field: string): string | un
   return v;
 }
 
-function asKind(v: unknown, where: string): ModuleKind {
-  if (v !== "api" && v !== "frontend" && v !== "tool") {
-    throw new ModuleManifestError(`${where}: "kind" must be "api" | "frontend" | "tool"`);
-  }
-  return v;
+/**
+ * Pass-through `kind` reader (hub#301 Phase A fold — #327).
+ *
+ * The validator no longer inspects `kind`. Any value, or no value, is
+ * accepted. We narrow to the canonical `ModuleKind` only when the input is
+ * one of the three known strings — otherwise we drop the field entirely so
+ * downstream `kind === "frontend"` branches fall through to the
+ * backend-proxy default. Author intent (typo, novel value, omission) is no
+ * longer surfaced from this layer; it's not the validator's job anymore.
+ */
+function asKind(v: unknown): ModuleKind | undefined {
+  if (v === "api" || v === "frontend" || v === "tool") return v;
+  return undefined;
 }
 
 function asPort(v: unknown, where: string): number {
@@ -341,9 +358,20 @@ function asDependencies(v: unknown, where: string): Record<string, ModuleDepende
 /**
  * Strict validator. Throws `ModuleManifestError` with the source path so
  * malformed third-party modules get a clear-enough error to fix. Required
- * fields are name, manifestName, kind, port, paths, health.
+ * fields are name, manifestName, port, paths, health. `kind` is no longer
+ * inspected as of hub#301 Phase A's fold (#327) — any value (or none) is
+ * accepted and passes through untouched. See `asKind` for the narrowing
+ * behavior.
+ *
+ * The optional `logger` parameter is retained for forward-compatibility
+ * with future validator soft-warnings, even though the kind soft-warning
+ * it was originally added for has been removed.
  */
-export function validateModuleManifest(raw: unknown, where: string): ModuleManifest {
+export function validateModuleManifest(
+  raw: unknown,
+  where: string,
+  _logger: Pick<Console, "warn"> = console,
+): ModuleManifest {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new ModuleManifestError(`${where}: root must be an object`);
   }
@@ -356,7 +384,7 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
     );
   }
   const manifestName = asString(m.manifestName, where, "manifestName");
-  const kind = asKind(m.kind, where);
+  const kind = asKind(m.kind);
   const port = asPort(m.port, where);
   const paths = asStringArray(m.paths, where, "paths");
   const health = asHealthPath(m.health, where);
@@ -404,7 +432,8 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
     stripPrefix = m.stripPrefix;
   }
 
-  const out: ModuleManifest = { name, manifestName, kind, port, paths, health };
+  const out: ModuleManifest = { name, manifestName, port, paths, health };
+  if (kind !== undefined) (out as { kind?: ModuleKind }).kind = kind;
   if (displayName !== undefined) (out as { displayName?: string }).displayName = displayName;
   if (tagline !== undefined) (out as { tagline?: string }).tagline = tagline;
   if (startCmd !== undefined) (out as { startCmd?: readonly string[] }).startCmd = startCmd;
@@ -470,8 +499,14 @@ function asPathOrUrl(v: unknown, where: string, field: string): string | undefin
  * absent (caller decides whether that's an error — first-party modules fall
  * back to the vendored manifest; third-party hard-errors). Throws
  * `ModuleManifestError` on parse / validation failure.
+ *
+ * The optional `logger` parameter is retained for forward-compatibility
+ * with future validator soft-warnings. Defaults to `console`.
  */
-export async function readModuleManifest(packageDir: string): Promise<ModuleManifest | null> {
+export async function readModuleManifest(
+  packageDir: string,
+  logger: Pick<Console, "warn"> = console,
+): Promise<ModuleManifest | null> {
   const path = join(packageDir, ".parachute", "module.json");
   let buf: string;
   try {
@@ -488,5 +523,5 @@ export async function readModuleManifest(packageDir: string): Promise<ModuleMani
       `${path}: failed to parse JSON: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  return validateModuleManifest(parsed, path);
+  return validateModuleManifest(parsed, path, logger);
 }
