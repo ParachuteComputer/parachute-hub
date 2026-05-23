@@ -1418,16 +1418,18 @@ describe("install", () => {
   });
 
   test("third-party with diverging name/manifestName keys services.json by name (hub#85)", async () => {
-    // Repro for parachute-hub#85: parachute-agent ships `name: "agent",
-    // manifestName: "parachute-agent"`. Install used to seed services.json
-    // under `parachute-agent` (the npm label) while lifecycle looks up by
-    // `agent` (the canonical short) → "unknown service". Fix: services.json
-    // key is always `manifest.name` for third-party.
+    // Repro for parachute-hub#85: a module ships `name: "someapp",
+    // manifestName: "parachute-someapp"`. Install used to seed services.json
+    // under `parachute-someapp` (the npm label) while lifecycle looks up by
+    // `someapp` (the canonical short) → "unknown service". Fix: services.json
+    // key is always `manifest.name` for third-party. Original repro was
+    // against parachute-agent before it was retired (2026-05-20); the same
+    // shape applies to any third-party module with diverging name/manifestName.
     const { path, configDir, cleanup } = makeTempPath();
     try {
       const startCalls: string[] = [];
       const logs: string[] = [];
-      const code = await install("parachute-agent", {
+      const code = await install("parachute-someapp", {
         runner: async () => 0,
         manifestPath: path,
         configDir,
@@ -1439,29 +1441,29 @@ describe("install", () => {
         portProbe: async () => false,
         log: (l) => logs.push(l),
         readManifest: async () => ({
-          name: "agent",
-          manifestName: "parachute-agent",
+          name: "someapp",
+          manifestName: "parachute-someapp",
           kind: "api",
           port: 1945,
-          paths: ["/agent"],
-          health: "/agent/health",
+          paths: ["/someapp"],
+          health: "/someapp/health",
           startCmd: ["bun", "server.ts"],
         }),
-        findGlobalInstall: () => "/fake/prefix/parachute-agent/package.json",
+        findGlobalInstall: () => "/fake/prefix/parachute-someapp/package.json",
       });
       expect(code).toBe(0);
       // services.json is keyed by `name`, not `manifestName`.
-      expect(findService("agent", path)?.name).toBe("agent");
-      expect(findService("parachute-agent", path)).toBeUndefined();
+      expect(findService("someapp", path)?.name).toBe("someapp");
+      expect(findService("parachute-someapp", path)).toBeUndefined();
       // Auto-start receives the canonical short name (= manifest.name).
-      expect(startCalls).toEqual(["agent"]);
+      expect(startCalls).toEqual(["someapp"]);
       // Log lines speak in the canonical short name too. Port comes from
       // assignServicePort (third-party gets the first unassigned canonical
       // slot, currently 1944), not the manifest's port hint.
       const joined = logs.join("\n");
-      expect(joined).toMatch(/Seeded services\.json entry for agent/);
-      expect(joined).toMatch(/agent registered on port \d+/);
-      expect(joined).not.toMatch(/Seeded services\.json entry for parachute-agent/);
+      expect(joined).toMatch(/Seeded services\.json entry for someapp/);
+      expect(joined).toMatch(/someapp registered on port \d+/);
+      expect(joined).not.toMatch(/Seeded services\.json entry for parachute-someapp/);
     } finally {
       cleanup();
     }

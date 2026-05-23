@@ -1940,19 +1940,20 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
     }
   });
 
-  test("routes a deep /agent/api/health to the matching upstream", async () => {
-    // Agent registers `/agent`; deeper paths route by prefix.
+  test("routes a deep /someapp/api/health to the matching upstream", async () => {
+    // A generic third-party module registers `/someapp`; deeper paths
+    // route by prefix.
     const h = makeHarness();
-    const upstream = startUpstream("agent");
+    const upstream = startUpstream("someapp");
     try {
       writeManifest(
         {
           services: [
             {
-              name: "agent",
+              name: "someapp",
               port: upstream.port,
-              paths: ["/agent"],
-              health: "/agent/api/health",
+              paths: ["/someapp"],
+              health: "/someapp/api/health",
               version: "0.1.0",
             },
           ],
@@ -1960,11 +1961,11 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
         h.manifestPath,
       );
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/agent/api/health?probe=1"));
+      const res = await fetcher(req("/someapp/api/health?probe=1"));
       expect(res.status).toBe(200);
       const body = (await res.json()) as { tag: string; pathname: string; search: string };
-      expect(body.tag).toBe("agent");
-      expect(body.pathname).toBe("/agent/api/health");
+      expect(body.tag).toBe("someapp");
+      expect(body.pathname).toBe("/someapp/api/health");
       expect(body.search).toBe("?probe=1");
     } finally {
       upstream.stop();

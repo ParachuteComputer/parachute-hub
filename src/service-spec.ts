@@ -529,6 +529,35 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
 };
 
 /**
+ * Modules that were once first-party (committed-core or FIRST_PARTY_FALLBACKS)
+ * but have since been retired. Services.json rows under these names are
+ * GC'd on load with a stderr warning.
+ *
+ * Adding a name here is a deliberate retirement signal — operators who
+ * still have the module's daemon running will see the warning + a hint
+ * to stop the daemon. The row reappears if they restart the daemon
+ * (which still self-registers under its old name), but the GC ensures
+ * routing isn't blocked by a stale row.
+ *
+ * Curation rules:
+ *   - Only add an entry when the module is *explicitly* retired (see
+ *     `parachute-patterns/migrations/` + per-module DEPRECATED.md). Don't
+ *     speculate on Phase-2-deprecating modules — they're still serving
+ *     back-compat traffic and adding them here would prematurely break
+ *     legacy operators. `notes` (the daemon) is the canonical
+ *     "deprecating-but-not-retired" case as of 2026-05-22: do not add
+ *     until its Phase 3 retirement lands.
+ *   - Entries stay forever. Removing an entry would let a stale row
+ *     reappear silently on legacy installs.
+ */
+export const RETIRED_MODULES: Record<string, { retiredAt: string; replacement?: string }> = {
+  agent: {
+    retiredAt: "2026-05-20",
+    replacement: "parachute-app or parachute-runner (depending on use case)",
+  },
+};
+
+/**
  * Synthesize a minimal `ModuleManifest` from a KNOWN_MODULES entry. Used as
  * a fallback when `<installDir>/.parachute/module.json` can't be read
  * (legacy installs from pre-module.json era, or test fixtures that mock the

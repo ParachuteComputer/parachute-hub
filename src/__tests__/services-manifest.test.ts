@@ -455,13 +455,12 @@ describe("services-manifest", () => {
   });
 
   // Duplicate-port detection (hub#195). The original collision had
-  // parachute-scribe and agent both at 1944 in services.json with no
-  // operator-visible warning. The OS lets only one service bind, the
-  // hub reverse-proxy quietly routes everyone to whoever won the race,
-  // and `/agent` requests silently land on scribe. Reject at parse time
-  // so the same shape can't recur silently. Underlying overwrite bugs
-  // were fixed in parachute-scribe#41 + parachute-agent#146; this is
-  // the hub-side gate.
+  // parachute-scribe and a third-party service both at 1944 in services.json
+  // with no operator-visible warning. The OS lets only one service bind, the
+  // hub reverse-proxy quietly routes everyone to whoever won the race, and
+  // requests silently land on the wrong service. Reject at parse time so the
+  // same shape can't recur silently. Underlying overwrite bugs were fixed in
+  // parachute-scribe#41; this is the hub-side gate.
   describe("duplicate port rejection", () => {
     test("rejects manifest where two entries share a port", () => {
       const { path, cleanup } = makeTempPath();
@@ -478,10 +477,10 @@ describe("services-manifest", () => {
                 version: "0.4.0",
               },
               {
-                name: "agent",
+                name: "someapp",
                 port: 1944,
-                paths: ["/agent"],
-                health: "/agent/health",
+                paths: ["/someapp"],
+                health: "/someapp/health",
                 version: "0.1.0",
               },
             ],
@@ -508,10 +507,10 @@ describe("services-manifest", () => {
                 version: "0.4.0",
               },
               {
-                name: "agent",
+                name: "someapp",
                 port: 1944,
-                paths: ["/agent"],
-                health: "/agent/health",
+                paths: ["/someapp"],
+                health: "/someapp/health",
                 version: "0.1.0",
               },
             ],
@@ -522,7 +521,7 @@ describe("services-manifest", () => {
         // they know which two rows to reconcile).
         expect(() => readManifest(path)).toThrow(/duplicate port 1944/);
         expect(() => readManifest(path)).toThrow(/parachute-scribe/);
-        expect(() => readManifest(path)).toThrow(/agent/);
+        expect(() => readManifest(path)).toThrow(/someapp/);
       } finally {
         cleanup();
       }
@@ -668,7 +667,7 @@ describe("services-manifest", () => {
   // catches duplicate ports on the next `readManifest`, but without a
   // matching write-side check `upsertService` happily writes a corrupt
   // manifest to disk and only the next read surfaces the fault. A buggy
-  // service boot calling `upsertService({ name: "agent", port: 1944 })`
+  // service boot calling `upsertService({ name: "someapp", port: 1944 })`
   // while scribe is already at 1944 must fail before `writeManifest` runs.
   // Same multi-vault carve-out applies.
   describe("upsertService duplicate-port rejection (hub#205)", () => {
@@ -679,11 +678,11 @@ describe("services-manifest", () => {
       health: "/scribe/health",
       version: "0.4.0",
     };
-    const agent: ServiceEntry = {
-      name: "agent",
+    const someapp: ServiceEntry = {
+      name: "someapp",
       port: 1944,
-      paths: ["/agent"],
-      health: "/agent/health",
+      paths: ["/someapp"],
+      health: "/someapp/health",
       version: "0.1.0",
     };
 
@@ -691,7 +690,7 @@ describe("services-manifest", () => {
       const { path, cleanup } = makeTempPath();
       try {
         upsertService(scribe, path);
-        const m = upsertService({ ...agent, port: 1945 }, path);
+        const m = upsertService({ ...someapp, port: 1945 }, path);
         expect(m.services).toHaveLength(2);
         expect(m.services.map((s) => s.port).sort()).toEqual([1944, 1945]);
         // And it actually wrote: a fresh read sees both rows.
@@ -705,14 +704,14 @@ describe("services-manifest", () => {
       const { path, cleanup } = makeTempPath();
       try {
         upsertService(scribe, path);
-        expect(() => upsertService(agent, path)).toThrow(ServicesManifestError);
+        expect(() => upsertService(someapp, path)).toThrow(ServicesManifestError);
         // Error names the colliding port and both services so an operator
         // scanning logs knows which two rows to reconcile.
-        expect(() => upsertService(agent, path)).toThrow(/duplicate port 1944/);
-        expect(() => upsertService(agent, path)).toThrow(/parachute-scribe/);
-        expect(() => upsertService(agent, path)).toThrow(/agent/);
+        expect(() => upsertService(someapp, path)).toThrow(/duplicate port 1944/);
+        expect(() => upsertService(someapp, path)).toThrow(/parachute-scribe/);
+        expect(() => upsertService(someapp, path)).toThrow(/someapp/);
         // Crucially: services.json was NOT corrupted on the failed write.
-        // The pre-existing row stays, and the agent row never lands.
+        // The pre-existing row stays, and the someapp row never lands.
         const m = readManifest(path);
         expect(m.services).toHaveLength(1);
         expect(m.services[0]?.name).toBe("parachute-scribe");
@@ -760,7 +759,7 @@ describe("services-manifest", () => {
       const { path, cleanup } = makeTempPath();
       try {
         upsertService(scribe, path); // port 1944
-        upsertService({ ...agent, port: 1945 }, path); // port 1945
+        upsertService({ ...someapp, port: 1945 }, path); // port 1945
         // Move scribe from 1944 to 1948 (free): succeeds.
         const m = upsertService({ ...scribe, port: 1948 }, path);
         expect(m.services).toHaveLength(2);
@@ -780,15 +779,15 @@ describe("services-manifest", () => {
       const { path, cleanup } = makeTempPath();
       try {
         upsertService(scribe, path); // port 1944
-        upsertService({ ...agent, port: 1945 }, path); // port 1945
-        // Move scribe to 1945, where agent already lives: must throw.
+        upsertService({ ...someapp, port: 1945 }, path); // port 1945
+        // Move scribe to 1945, where someapp already lives: must throw.
         expect(() => upsertService({ ...scribe, port: 1945 }, path)).toThrow(ServicesManifestError);
         expect(() => upsertService({ ...scribe, port: 1945 }, path)).toThrow(/duplicate port 1945/);
-        // And the on-disk state stayed coherent — scribe at 1944, agent at
+        // And the on-disk state stayed coherent — scribe at 1944, someapp at
         // 1945 — because the gate fires before writeManifest.
         const persisted = readManifest(path);
         expect(persisted.services.find((s) => s.name === "parachute-scribe")?.port).toBe(1944);
-        expect(persisted.services.find((s) => s.name === "agent")?.port).toBe(1945);
+        expect(persisted.services.find((s) => s.name === "someapp")?.port).toBe(1945);
       } finally {
         cleanup();
       }
@@ -798,11 +797,18 @@ describe("services-manifest", () => {
 
 describe("claw → agent migration", () => {
   // Paraclaw was renamed to parachute-agent across the ecosystem (npm
-  // package, mount path, short name). Operators who upgraded hub but
-  // still have the old paraclaw row in services.json otherwise see a
-  // tile labelled "Claw" and a hub route at `/claw` while their newly
-  // upgraded daemon listens on `/agent`. The migration runs on
-  // readManifest, rewrites the row in-place, and writes back.
+  // package, mount path, short name). The migration was a transitional
+  // read-time rewrite that aliased legacy `name: "claw"` rows to
+  // `name: "agent"` so operators on the old shape kept routing.
+  //
+  // As of 2026-05-20, parachute-agent itself is retired (hub#334 added
+  // `agent` to RETIRED_MODULES). The migration still runs — and operators
+  // with claw rows on disk still see them rewritten to `agent` on the
+  // first read — but the retired-module GC then drops the rewritten row
+  // on the next read. The migration is effectively a one-step retirement
+  // path: claw → agent → dropped. The tests below assert the
+  // intermediate rewrite behavior; the retired-module suite asserts the
+  // GC step.
   const claw: ServiceEntry = {
     name: "claw",
     port: 1944,
@@ -823,9 +829,12 @@ describe("claw → agent migration", () => {
     try {
       writeFileSync(path, `${JSON.stringify({ services: [claw] }, null, 2)}\n`);
       const got = readManifest(path);
+      // Migration ran in this read (claw → agent on raw entries), then
+      // the row was rewritten to disk. Retired GC won't touch `claw`-
+      // typed rows on the way in, only `agent`-typed rows — so the
+      // first read returns the migrated `agent` shape; the second read
+      // will then GC it (covered below).
       expect(got.services).toEqual([agent]);
-      // Persisted: a second read sees the migrated shape directly, no
-      // re-migration required.
       const reread = JSON.parse(readFileSync(path, "utf8")) as {
         services: ServiceEntry[];
       };
@@ -837,16 +846,31 @@ describe("claw → agent migration", () => {
     }
   });
 
-  test("idempotent: an already-agent entry is not rewritten and not rewritten on re-read", () => {
+  test("retired GC drops the migrated agent row on the next read (post-retirement)", () => {
+    // Confirms the migration's role as an intermediate retirement step:
+    // first read migrates claw → agent and writes back; second read
+    // applies the retired-module GC and drops the row entirely.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(path, `${JSON.stringify({ services: [claw] }, null, 2)}\n`);
+      const first = readManifest(path);
+      expect(first.services).toEqual([agent]);
+      const second = readManifest(path);
+      expect(second.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("an already-agent entry is dropped by retired GC (was: idempotent migration)", () => {
+    // Pre-hub#334 this test verified the migration was idempotent — an
+    // already-agent row round-tripped unchanged. Post-retirement, the
+    // GC takes over: an agent row is stale and gets removed on read.
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(path, `${JSON.stringify({ services: [agent] }, null, 2)}\n`);
-      const beforeMtime = statSync(path).mtimeMs;
       const got = readManifest(path);
-      expect(got.services).toEqual([agent]);
-      // No write back when nothing changed: mtime stays put.
-      const afterMtime = statSync(path).mtimeMs;
-      expect(afterMtime).toBe(beforeMtime);
+      expect(got.services).toHaveLength(0);
     } finally {
       cleanup();
     }
@@ -864,6 +888,8 @@ describe("claw → agent migration", () => {
       };
       writeFileSync(path, `${JSON.stringify({ services: [vault, claw, scribe] }, null, 2)}\n`);
       const got = readManifest(path);
+      // First read: claw migrates to agent (retired GC didn't see `claw`
+      // on the way in). Vault + scribe round-trip unchanged.
       expect(got.services).toHaveLength(3);
       expect(got.services[0]).toEqual(vault);
       expect(got.services[1]).toEqual(agent);
@@ -1048,13 +1074,15 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
     }
   });
 
-  test("does not drop parachute-X when paired with a non-matching short-name", () => {
-    // The heuristic is narrow: only drop short-name rows whose name is
-    // exactly the suffix of a same-port `parachute-<short>` row. A
-    // collision between e.g. `parachute-app` and `agent` (Aaron's
-    // ambient case: stale agent row on the canonical app port) doesn't
-    // match the shape — it's a separate problem with its own
-    // duplicate-port error.
+  test("does not drop parachute-X when paired with a non-matching, non-retired short-name", () => {
+    // The legacy-short-name heuristic is narrow: only drop short-name
+    // rows whose name is exactly the suffix of a same-port
+    // `parachute-<short>` row. A collision between e.g. `parachute-app`
+    // and an unrelated third-party `unknownmod` doesn't match the
+    // shape — it's a separate problem with its own duplicate-port error.
+    // (Aaron's ambient `parachute-app` + `agent` case is now handled
+    // upstream by `dropRetiredModuleRows`; see the retired-module
+    // suite below.)
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1069,10 +1097,10 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
               version: "0.2.0",
             },
             {
-              name: "agent",
+              name: "unknownmod",
               port: 1946,
-              paths: ["/agent"],
-              health: "/agent/health",
+              paths: ["/unknownmod"],
+              health: "/unknownmod/health",
               version: "0.1.4",
             },
           ],
@@ -1080,7 +1108,7 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
       );
       // Both rows pass through the de-dupe; validation then catches the
       // duplicate-port collision and throws. Operators on this shape
-      // resolve it by removing the stale `agent` row manually.
+      // resolve it by removing the colliding row manually.
       expect(() => readManifest(path)).toThrow(/duplicate port 1946/);
     } finally {
       cleanup();
@@ -1117,6 +1145,178 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
       // assert on the post-mtime equality after a synchronous re-read.
       readManifest(path);
       expect(statSync(path).mtimeMs).toBe(mtimeAfterFirstRead);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Retired-module row cleanup (hub#334 — Aaron's actual reproducer on
+// 2026-05-22). His services.json carried a stale `agent` row at 1946
+// (left over from parachute-agent's brief committed-core window
+// 2026-05-05 → 2026-05-20) colliding with `parachute-app`'s new
+// canonical slot at 1946. The legacy-short-name de-dupe doesn't help —
+// `agent` isn't the short-name twin of `parachute-app`. The retired-
+// module GC fires unconditionally on rows whose name appears in
+// `RETIRED_MODULES`, regardless of port collision.
+describe("retired-module row de-dupe (hub#334)", () => {
+  test("drops a row whose name is in RETIRED_MODULES (agent)", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "agent",
+              port: 1946,
+              paths: ["/agent"],
+              health: "/agent/health",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(0);
+      // The on-disk file is rewritten clean too.
+      const onDisk = JSON.parse(readFileSync(path, "utf8"));
+      expect(onDisk.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("retirement is unconditional — no other rows required", () => {
+    // Verifies dropRetiredModuleRows doesn't depend on a collision
+    // partner (unlike dropLegacyShortNameRows). An agent row sitting
+    // alone is still stale.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "agent",
+              port: 9999,
+              paths: ["/agent"],
+              health: "/agent/health",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("no-op when services.json has no retired rows", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+              version: "0.2.0",
+            },
+          ],
+        }),
+      );
+      const mtimeBefore = statSync(path).mtimeMs;
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.name).toBe("parachute-app");
+      // No rewrite when there's nothing to clean.
+      expect(statSync(path).mtimeMs).toBe(mtimeBefore);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("Aaron's reproducer — agent + parachute-app at same port resolves cleanly", () => {
+    // The motivating bug for hub#334. With dropRetiredModuleRows
+    // running before validateManifest, the stale agent row is GC'd
+    // and the duplicate-port gate doesn't trip downstream.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "agent",
+              port: 1946,
+              paths: ["/agent"],
+              health: "/agent/health",
+              version: "0.1.4",
+            },
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+              version: "0.2.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.name).toBe("parachute-app");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("interaction — retired row + legacy short-name pair both cleaned, correct order", () => {
+    // Drop order matters: retired-module cleanup runs first, then
+    // legacy-short-name cleanup. This test ensures both passes
+    // compose correctly on a services.json that exercises both
+    // shapes simultaneously. The agent row is unconditional retire;
+    // the parachute-runner + runner pair triggers legacy-short-name
+    // dedup at port 1945.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "agent",
+              port: 1946,
+              paths: ["/agent"],
+              health: "/agent/health",
+              version: "0.1.4",
+            },
+            {
+              name: "parachute-runner",
+              port: 1945,
+              paths: ["/runner"],
+              health: "/runner/healthz",
+              version: "0.1.5",
+            },
+            {
+              name: "runner",
+              port: 1945,
+              paths: ["/runner"],
+              health: "/runner/healthz",
+              version: "0.1.5",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      const names = m.services.map((s) => s.name).sort();
+      expect(names).toEqual(["parachute-runner"]);
     } finally {
       cleanup();
     }

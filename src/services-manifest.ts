@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
+import { RETIRED_MODULES } from "./service-spec.ts";
 
 /**
  * Whether the service is safe to mount on public-facing expose layers.
@@ -376,19 +377,78 @@ export function readManifest(path: string = SERVICES_MANIFEST_PATH): ServicesMan
       `failed to parse ${path}: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  // Legacy short-name row cleanup runs BEFORE shape validation because the
-  // bug it heals (two rows on one port, one keyed by short name + one by
-  // manifestName for the same module) is itself a duplicate-port violation
-  // that would otherwise throw inside `validateManifest`. We rewrite the
-  // raw JSON object's `services` array if any short-name duplicates are
-  // present, then run normal validation against the cleaned shape. See
-  // `dropLegacyShortNameRows` for the full discipline.
-  const cleaned = dropLegacyShortNameRows(raw, path);
+  // Retired-module + legacy short-name row cleanup runs BEFORE shape
+  // validation because the bugs they heal (rows that conflict on port with
+  // a current row) would otherwise throw inside `validateManifest`'s
+  // duplicate-port gate. Order matters: drop retired-module rows FIRST so
+  // their absence can unmask a `parachute-<X>` ↔ `<X>` pair underneath that
+  // `dropLegacyShortNameRows` then handles. The reverse order would leave
+  // a retired row that the short-name pass doesn't recognize. Both passes
+  // mutate the raw JSON object's `services` array; we re-validate against
+  // the cleaned shape. See `dropRetiredModuleRows` + `dropLegacyShortNameRows`
+  // for the full discipline.
+  const afterRetired = dropRetiredModuleRows(raw, path);
+  const cleaned = dropLegacyShortNameRows(afterRetired.raw, path);
   const validated = validateManifest(cleaned.raw, path);
   const migrated = migrateClawToAgent(validated);
-  const changed = cleaned.changed || migrated.changed;
+  const changed = afterRetired.changed || cleaned.changed || migrated.changed;
   if (changed) writeManifest(migrated.manifest, path);
   return migrated.manifest;
+}
+
+/**
+ * Drop rows whose `name` matches a registered retired module (see
+ * `RETIRED_MODULES` in `service-spec.ts`). Retirement is unconditional —
+ * unlike `dropLegacyShortNameRows`, which only fires when a same-port
+ * manifestName twin is present, this pass drops a retired row whether or
+ * not anything else collides with it. The row is stale by definition: the
+ * module's npm package and daemon are no longer first-party, and leaving
+ * the row in place either (a) routes operators to a no-longer-supported
+ * binary or (b) blocks a current module from claiming the port the retired
+ * row squats on (Aaron's 2026-05-22 reproducer: stale `agent` row at 1946
+ * collided with `parachute-app` self-registering at 1946).
+ *
+ * Per-row stderr warning is operator-actionable: cites the retirement date,
+ * names the replacement module (if any), and includes a one-line shell
+ * snippet for stopping the still-running daemon process. The row reappears
+ * on the next read if the daemon is still up (its self-register writes
+ * back the same name), so the warning steers operators to fully retire
+ * the legacy process, not just hand-edit the file.
+ *
+ * Operates on raw JSON rather than validated entries so a retired row that
+ * shares a port with a current row doesn't trip `validateManifest`'s
+ * duplicate-port gate before this helper runs. Closes hub#334.
+ */
+function dropRetiredModuleRows(raw: unknown, where: string): { raw: unknown; changed: boolean } {
+  if (!raw || typeof raw !== "object") return { raw, changed: false };
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return { raw, changed: false };
+
+  type Dropped = { name: string; retiredAt: string; replacement?: string };
+  const dropped: Dropped[] = [];
+  const nextServices = services.filter((row) => {
+    if (!row || typeof row !== "object") return true;
+    const name = (row as Record<string, unknown>).name;
+    if (typeof name !== "string") return true;
+    const retired = RETIRED_MODULES[name];
+    if (retired === undefined) return true;
+    dropped.push({ name, retiredAt: retired.retiredAt, replacement: retired.replacement });
+    return false;
+  });
+
+  if (dropped.length === 0) return { raw, changed: false };
+
+  for (const d of dropped) {
+    const replacementLine = d.replacement ? ` Replacement: ${d.replacement}.` : "";
+    console.error(
+      `${where}: dropped stale row for retired module '${d.name}' (retired ${d.retiredAt}).${replacementLine} If the ${d.name} daemon is still running, stop it with: ps aux | grep parachute-${d.name} && kill <pid>`,
+    );
+  }
+
+  return {
+    raw: { ...(raw as Record<string, unknown>), services: nextServices },
+    changed: true,
+  };
 }
 
 /**

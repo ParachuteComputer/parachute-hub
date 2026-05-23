@@ -686,12 +686,12 @@ describe("status", () => {
       try {
         upsertService(
           {
-            name: "agent",
+            name: "someapp",
             port: 1946,
-            paths: ["/agent"],
-            health: "/agent/health",
+            paths: ["/someapp"],
+            health: "/someapp/health",
             version: "0.1.4-rc.1",
-            // No installDir; agent isn't in FIRST_PARTY_FALLBACKS by short name,
+            // No installDir; someapp isn't in FIRST_PARTY_FALLBACKS by short name,
             // and the fallback bun-global lookup needs a known package name.
           },
           path,
