@@ -2,6 +2,44 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.17] - 2026-05-23
+
+**fix(hub): `parachute upgrade` preserves the operator's channel + refuses silent downgrades.**
+
+`parachute upgrade <svc>` previously ran `bun add -g <pkg>@latest` unconditionally on the npm-installed path. When `@latest` pointed at a prior stable (the typical state mid-rc-chain), an operator on `@rc` got silently downgraded. Aaron's reproducer ([hub#332](https://github.com/ParachuteComputer/parachute-hub/issues/332)):
+
+```
+$ parachute upgrade hub
+hub: bun add -g @openparachute/hub@latest
+installed @openparachute/hub@0.5.10 with binaries:
+ - parachute
+hub: 0.5.13-rc.13 → 0.5.10; restarting…
+```
+
+Per [governance rule 2](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md), pre-1.0 operators on the dev chain stay on `@rc`; `@latest` is the explicit-stable channel. `parachute upgrade` now respects that.
+
+### What landed
+
+- **Channel auto-detection (`src/commands/upgrade.ts:detectChannel`)** — reads the installed `package.json` `version` and infers the channel: a trailing `-rc(\.\d+)?$` (e.g. `0.5.13-rc.13`, `0.5.13-rc`) → `@rc`; anything else → `@latest`. The npm branch composes `bun add -g <pkg>@<detected-channel>` instead of the old hardcoded `@latest`.
+- **Downgrade refusal (`src/commands/upgrade.ts:upgradeNpm`)** — before running `bun add -g`, resolves `npm view <pkg>@<channel> version` and compares to the installed version with an inline semver comparator (no new dependency). If the resolved target is lower, aborts with an actionable message that includes the exact `bun add -g <pkg>@<version>` command to force the downgrade, plus a `--channel rc` hint when the operator's on stable. Fail-open: a flaky `npm view` (network down, registry unreachable) skips the guard rather than blocking.
+- **`--channel rc|latest` flag (`src/cli.ts`, `src/help.ts`)** — operator override. Wins over auto-detection.
+- **`--allow-downgrade` flag (`src/cli.ts`)** — opt-in bypass of the refusal.
+- **`--tag <name>`** — still works, still ignored when bun-linked. Takes precedence over `--channel` for programmatic callers.
+- **Help text (`src/help.ts:upgradeHelp`)** — documents the new flags + the auto-detection rule.
+
+### Tests
+
+`bun test ./src` — 1889 pass / 0 fail (was 1880 in rc.16; +9 new cases in `src/__tests__/upgrade.test.ts` covering: `detectChannel` rc/latest discrimination including the `-rc` (no `.N`) edge case; `compareVersions` ordering (stable > matching rc, lower triple < higher rc); rc auto-detection from a rc.13-suffixed installed version; stable auto-detection from a clean version; `--channel rc` override against stable detection; downgrade refusal when `@rc` resolves to a lower version; `--allow-downgrade` bypass; Aaron's exact reproducer driven through the fix (rc.13 → rc.14 via `@rc`, not rc.13 → 0.5.10 via `@latest`); and `tag` precedence over both auto-detection and `--channel`). `bun run typecheck` clean. `bunx biome check src/` clean.
+
+### Install command — same bug?
+
+`parachute install <svc>` runs `bun add -g <pkg>` (no `@latest` literal but bun resolves an unsuffixed package to `@latest`). For install that's by design — there's no installed version to read a channel from. The fresh-install default-channel question is a separate concern; tracked at [hub#337](https://github.com/ParachuteComputer/parachute-hub/issues/337).
+
+### Cross-references
+
+- [hub#332](https://github.com/ParachuteComputer/parachute-hub/issues/332) — closes.
+- [governance rule 2](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md) — RC versioning convention.
+
 ## [0.5.13-rc.16] - 2026-05-23
 
 **fix(hub): update operator-facing help text post-Notes-as-app migration.**

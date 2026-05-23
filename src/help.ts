@@ -330,9 +330,17 @@ export function upgradeHelp(): string {
 Usage:
   parachute upgrade                 upgrade every installed service
   parachute upgrade <service>       upgrade just that one
+  parachute upgrade [svc] --channel rc|latest
+                                    pin the dist-tag channel explicitly. Default:
+                                    auto-detect from the installed version (a
+                                    \`-rc\` suffix → rc; otherwise latest).
+  parachute upgrade [svc] --allow-downgrade
+                                    bypass the "refuses to downgrade" guard.
   parachute upgrade [svc] --tag <name>
-                                    npm-installed services only — pin a dist-tag
-                                    (default: latest). Ignored when bun-linked.
+                                    npm-installed services only — pin to an
+                                    explicit dist-tag or exact version. Overrides
+                                    --channel auto-detection. Ignored when
+                                    bun-linked.
 
 What it does:
   Detects whether the target service is bun-linked from a local checkout
@@ -343,18 +351,29 @@ What it does:
                 modules with a build script, then \`parachute restart\`.
                 Refuses on a dirty working tree — commit or stash first.
 
-    npm         bun add -g <pkg>@<tag>, then \`parachute restart\` if the
-                installed version actually moved.
+    npm         bun add -g <pkg>@<channel>, then \`parachute restart\` if the
+                installed version actually moved. Refuses silent downgrades:
+                if the resolved channel version is lower than what's installed,
+                aborts with an actionable message.
 
   Idempotent: if the source didn't change (HEAD unchanged after pull, or
   package.json version unchanged after bun add -g), the restart is skipped.
   Re-running on an up-to-date install is a fast no-op.
 
+Channel detection (hub#332):
+  Pre-1.0 governance ships two channels — \`@rc\` (the development chain) and
+  \`@latest\` (explicitly-promoted stable). \`parachute upgrade\` reads the
+  installed package.json \`version\` and keeps you on the same channel: a
+  \`-rc\` suffix (e.g. \`0.5.13-rc.13\`) means you're on rc and the upgrade
+  pulls \`@rc\`; otherwise it pulls \`@latest\`. Override with \`--channel\`.
+
 Examples:
   parachute upgrade                 sweep hub + every installed service
   parachute upgrade vault           just vault
   parachute upgrade hub             upgrade the dispatcher itself (closes #251)
-  parachute upgrade vault --tag rc  pin the rc dist-tag (npm path only)
+  parachute upgrade hub --channel rc        pin the rc channel
+  parachute upgrade hub --channel latest    pin the stable channel
+  parachute upgrade vault --tag 0.4.1       pin to an exact version
 `;
 }
 
