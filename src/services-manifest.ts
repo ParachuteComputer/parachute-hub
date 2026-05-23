@@ -376,10 +376,110 @@ export function readManifest(path: string = SERVICES_MANIFEST_PATH): ServicesMan
       `failed to parse ${path}: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  const validated = validateManifest(raw, path);
+  // Legacy short-name row cleanup runs BEFORE shape validation because the
+  // bug it heals (two rows on one port, one keyed by short name + one by
+  // manifestName for the same module) is itself a duplicate-port violation
+  // that would otherwise throw inside `validateManifest`. We rewrite the
+  // raw JSON object's `services` array if any short-name duplicates are
+  // present, then run normal validation against the cleaned shape. See
+  // `dropLegacyShortNameRows` for the full discipline.
+  const cleaned = dropLegacyShortNameRows(raw, path);
+  const validated = validateManifest(cleaned.raw, path);
   const migrated = migrateClawToAgent(validated);
-  if (migrated.changed) writeManifest(migrated.manifest, path);
+  const changed = cleaned.changed || migrated.changed;
+  if (changed) writeManifest(migrated.manifest, path);
   return migrated.manifest;
+}
+
+/**
+ * Drop legacy short-name rows when a same-module manifestName row exists
+ * on the same port. Handles the duplicate-row class introduced when a
+ * module's self-register wrote `name: "<short>"` (e.g. `"app"`) while
+ * hub's install path stamped `name: "parachute-<short>"` (the canonical
+ * manifestName key). The two rows shared a port and tripped the
+ * duplicate-port read gate, leaving operators with an unbootable
+ * services.json until they edited by hand. Aaron hit this on 2026-05-22
+ * with `parachute-app` + `app` after parachute-app#13 + parachute-runner#4
+ * had already fixed the upstream self-register writes; this gate cleans
+ * up legacy state on operators who had already booted the bad code path.
+ *
+ * Detection is structural — no module registry import needed:
+ *   - two rows share a port (NOT the multi-vault carve-out)
+ *   - one row's name matches `parachute-<X>`
+ *   - the other row's name matches `<X>` (same `<X>`)
+ *
+ * When that shape is present, drop the short-named row + log a warning
+ * to stderr so operators see the auto-cleanup the next time they read
+ * services.json (via any CLI command that touches the file). The
+ * manifestName row wins — it carries the hub-stamped fields (installDir,
+ * version after self-register's first overwrite) operators care about.
+ *
+ * Returns the (possibly mutated) raw object + a `changed` flag so the
+ * caller can re-write services.json with the cleaned shape. Operates on
+ * raw JSON rather than validated entries because the duplicate-port row
+ * pair would otherwise throw during validation before this helper had a
+ * chance to run.
+ */
+function dropLegacyShortNameRows(raw: unknown, where: string): { raw: unknown; changed: boolean } {
+  if (!raw || typeof raw !== "object") return { raw, changed: false };
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return { raw, changed: false };
+
+  // Build a port → [rows] index to spot same-port pairs. We only care
+  // about rows that parse to the minimal `{ name, port }` shape — anything
+  // else fails downstream validation anyway and isn't part of the bug
+  // class.
+  type Probe = { name: string; port: number; index: number };
+  const byPort = new Map<number, Probe[]>();
+  services.forEach((row, index) => {
+    if (!row || typeof row !== "object") return;
+    const name = (row as Record<string, unknown>).name;
+    const port = (row as Record<string, unknown>).port;
+    if (typeof name !== "string" || typeof port !== "number") return;
+    const bucket = byPort.get(port) ?? [];
+    bucket.push({ name, port, index });
+    byPort.set(port, bucket);
+  });
+
+  const dropIndices = new Set<number>();
+  for (const bucket of byPort.values()) {
+    if (bucket.length < 2) continue;
+    for (const a of bucket) {
+      for (const b of bucket) {
+        if (a.index === b.index) continue;
+        // a is the "short" candidate, b is the "manifestName" candidate.
+        // The shape rule: b.name === `parachute-${a.name}` and a is not
+        // itself a `parachute-…` name. Both halves matter: without the
+        // second check, `parachute-vault` paired with `parachute-parachute-vault`
+        // would drop the real vault row (no such pair exists today, but
+        // the shape rule keeps the heuristic narrow on principle).
+        if (a.name.startsWith("parachute-")) continue;
+        if (b.name !== `parachute-${a.name}`) continue;
+        dropIndices.add(a.index);
+      }
+    }
+  }
+
+  if (dropIndices.size === 0) return { raw, changed: false };
+
+  const dropped: string[] = [];
+  const nextServices = services.filter((row, index) => {
+    if (!dropIndices.has(index)) return true;
+    if (row && typeof row === "object") {
+      const name = (row as Record<string, unknown>).name;
+      if (typeof name === "string") dropped.push(name);
+    }
+    return false;
+  });
+
+  console.error(
+    `${where}: dropped legacy short-name row(s) [${dropped.join(", ")}] in favor of same-port manifestName row(s). This is the parachute-app#13 / parachute-runner#4 self-register fixup. See parachute-patterns/patterns/services-json-row-conventions.md.`,
+  );
+
+  return {
+    raw: { ...(raw as Record<string, unknown>), services: nextServices },
+    changed: true,
+  };
 }
 
 /**

@@ -909,3 +909,216 @@ describe("claw → agent migration", () => {
     }
   });
 });
+
+// Legacy short-name row cleanup (the parachute-app#13 + parachute-runner#4
+// self-register fixup, surfaced 2026-05-22 when Aaron's services.json
+// carried both `parachute-app` (hub-stamped) and `app` (legacy
+// self-register) at port 1946 and the duplicate-port read gate refused to
+// boot the file). Hub auto-heals on read: drops the legacy short-name row
+// when a same-port `parachute-<short>` row is present, then rewrites the
+// file so the next read is clean.
+describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
+  test("drops the short-name row when a same-port manifestName row exists", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+              version: "0.2.0",
+            },
+            {
+              name: "app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+              version: "0.2.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.name).toBe("parachute-app");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("rewrites services.json on disk after de-dupe so the next read is clean", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-runner",
+              port: 1945,
+              paths: ["/runner"],
+              health: "/runner/healthz",
+              version: "0.1.5",
+            },
+            {
+              name: "runner",
+              port: 1945,
+              paths: ["/runner"],
+              health: "/runner/healthz",
+              version: "0.1.5",
+            },
+          ],
+        }),
+      );
+      readManifest(path);
+      // The on-disk file no longer contains the duplicate — a fresh
+      // reader (one that didn't go through the de-dupe path) sees the
+      // clean shape.
+      const onDisk = JSON.parse(readFileSync(path, "utf8"));
+      expect(onDisk.services).toHaveLength(1);
+      expect(onDisk.services[0].name).toBe("parachute-runner");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("leaves a lone short-name row alone (no same-port manifestName twin)", () => {
+    // Operators on an old self-register that never got the manifestName
+    // write keep working — the row is non-duplicated, hub just renders
+    // them under the legacy name. Auto-rewriting standalone short-name
+    // rows would surprise operators who hand-edit services.json on
+    // purpose; we only intervene when the duplicate breaks reads.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+              version: "0.2.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.name).toBe("app");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("leaves a deliberate third-party short-name row alone (different port from any parachute-X)", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+              version: "0.2.0",
+            },
+            {
+              name: "app",
+              port: 9999,
+              paths: ["/their-app"],
+              health: "/their-app/health",
+              version: "1.0.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(2);
+      expect(m.services.map((s) => s.name).sort()).toEqual(["app", "parachute-app"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("does not drop parachute-X when paired with a non-matching short-name", () => {
+    // The heuristic is narrow: only drop short-name rows whose name is
+    // exactly the suffix of a same-port `parachute-<short>` row. A
+    // collision between e.g. `parachute-app` and `agent` (Aaron's
+    // ambient case: stale agent row on the canonical app port) doesn't
+    // match the shape — it's a separate problem with its own
+    // duplicate-port error.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+              version: "0.2.0",
+            },
+            {
+              name: "agent",
+              port: 1946,
+              paths: ["/agent"],
+              health: "/agent/health",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      // Both rows pass through the de-dupe; validation then catches the
+      // duplicate-port collision and throws. Operators on this shape
+      // resolve it by removing the stale `agent` row manually.
+      expect(() => readManifest(path)).toThrow(/duplicate port 1946/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("idempotent — second read leaves the cleaned file alone", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+              version: "0.2.0",
+            },
+            {
+              name: "app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/healthz",
+              version: "0.2.0",
+            },
+          ],
+        }),
+      );
+      readManifest(path);
+      const mtimeAfterFirstRead = statSync(path).mtimeMs;
+      // Brief no-op gate: a second read should not rewrite the file. We
+      // assert on the post-mtime equality after a synchronous re-read.
+      readManifest(path);
+      expect(statSync(path).mtimeMs).toBe(mtimeAfterFirstRead);
+    } finally {
+      cleanup();
+    }
+  });
+});

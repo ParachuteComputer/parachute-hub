@@ -2,6 +2,27 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.15] - 2026-05-22
+
+**fix(hub): auto-drop legacy short-name rows in services.json on read (rescues operators tripped by parachute-app#13 / parachute-runner#4).**
+
+Aaron walked a fresh install on 2026-05-22 and hit `duplicate port 1946 — claimed by both "parachute-app" and "app"`. Root cause was upstream: parachute-app's self-register (pre-app#13) wrote a row keyed by the short name `"app"`, while hub's install path stamped a row keyed by `"parachute-app"` (the canonical `manifestName`). The two rows shared a port, tripped read-side `assertNoDuplicatePorts`, and left services.json unbootable until the operator hand-edited the file. parachute-runner had the same shape (fixed in runner#4). The new [`parachute-patterns/patterns/services-json-row-conventions.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/services-json-row-conventions.md) doc captures the convention so future modules don't recreate it.
+
+**The fix.** Hub's install path was already writing `name: manifestName` correctly (verified against [hub#324](https://github.com/ParachuteComputer/parachute-hub/issues/324)'s KNOWN_MODULES[`app`] entry → `entryName = spec.manifestName` → seed-row `name: manifest.manifestName`); no install-time change was needed. The remaining concern was the on-disk legacy state Aaron and other early operators were left holding. Hub now auto-heals on read:
+
+- **`dropLegacyShortNameRows` in `src/services-manifest.ts`** runs before shape validation. For every same-port row pair, if one is named `parachute-<X>` and the other is named `<X>` (same `<X>`), drop the short-name row. The cleaned shape is re-validated, the file is rewritten on disk, and a one-line warning lands on stderr citing the affected name + the pattern doc.
+- **Idempotent.** A second `readManifest` against the cleaned file is a no-op (no rewrite, no warning).
+- **Narrow heuristic.** Only fires on structural matches (`parachute-X` ↔ `X` at the same port). A deliberate third-party row literally named `"app"` on a different port is left alone. A `parachute-app` + `agent` collision on the same port (Aaron's ambient case, unrelated stale row from the retired agent module) still throws the normal duplicate-port error — that's a separate problem with its own resolution.
+
+**Intentionally not addressed.**
+
+- The `NOTES_FALLBACK.manifest.name = "notes"` and `CHANNEL_FALLBACK.manifest.name = "channel"` short-name shapes in `src/service-spec.ts` are correct per the `ModuleManifest` schema (`name` IS the short identifier; `manifestName` is the services.json key). Seed-row writes through `seedEntryFromManifest` pull `manifest.manifestName`, not `manifest.name`. No change needed.
+- Operators on a lone short-name row (no manifestName twin) keep working unchanged — auto-rewriting standalone legacy names would surprise operators who hand-edit services.json deliberately. The de-dupe intervenes only when the duplicate would otherwise break reads.
+
+**Tests.** Six new cases in `src/__tests__/services-manifest.test.ts` under `legacy short-name row de-dupe`: drops the short-name twin on a port match (`parachute-app` + `app` → keeps `parachute-app`); rewrites the file on disk so the next read is clean; leaves a lone short-name row alone; leaves a deliberate third-party short-name row on a different port alone; lets a non-matching same-port collision (`parachute-app` + `agent`) still throw `duplicate port` (different problem class); idempotent second read no-ops (mtime unchanged). `bun test ./src` → 1874 pass, 0 fail. `bun run typecheck` clean.
+
+**Cross-refs.** [parachute-app#13](https://github.com/ParachuteComputer/parachute-app/pull/13) + [parachute-runner#4](https://github.com/ParachuteComputer/parachute-runner/pull/4) (the symmetric self-register fixes that resolved the upstream bug); [parachute-patterns#77](https://github.com/ParachuteComputer/parachute-patterns/pull/77) (the pattern doc); [hub#324](https://github.com/ParachuteComputer/parachute-hub/pull/324) (the PR that added `app` to KNOWN_MODULES — hub's install side was correct, the duplicate originated upstream).
+
 ## [0.5.13-rc.14] - 2026-05-22
 
 **feat(hub): `kind` field no longer validated in module.json (closes [#301](https://github.com/ParachuteComputer/parachute-hub/issues/301) Phase A more aggressively than initially planned; folded per [#327](https://github.com/ParachuteComputer/parachute-hub/issues/327) into rc.14).**
