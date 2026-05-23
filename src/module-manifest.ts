@@ -76,7 +76,14 @@ export interface ModuleManifest {
   readonly displayName?: string;
   /** One-line subtitle rendered under displayName. */
   readonly tagline?: string;
-  /** Drives card vs. iframe vs. launcher in the hub. */
+  /**
+   * Drives card vs. iframe vs. launcher in the hub. Optional since hub#301
+   * Phase A: when absent the validator defaults to `"api"` (backend-proxy)
+   * and emits a soft-warning log line so operators know the field can be
+   * removed in modules they author. `"frontend"` is the only value with
+   * distinct routing today — `"api"` and `"tool"` are observationally
+   * identical, which is what motivated the migration.
+   */
   readonly kind: ModuleKind;
   /** Default loopback port. CLI warns on conflict, doesn't block. */
   readonly port: number;
@@ -167,11 +174,37 @@ function asOptionalString(v: unknown, where: string, field: string): string | un
   return v;
 }
 
-function asKind(v: unknown, where: string): ModuleKind {
+/**
+ * Optional `kind` validator (hub#301 Phase A).
+ *
+ * Three shapes:
+ *   - present + valid (`"api" | "frontend" | "tool"`) → return as-is
+ *   - absent (undefined) → default to `"api"` (matches hub's backend-proxy
+ *     routing, which is what `"api"` and `"tool"` both produce). Emits a
+ *     soft-warning so operators authoring new modules know the field is no
+ *     longer required.
+ *   - present + invalid value → still rejected. We only relax the *missing*
+ *     case; a typo'd value (`"backend"`, `"static"`, etc.) is still an error
+ *     because the author had an intent and got it wrong.
+ *
+ * Returning `{ kind, warn }` lets `validateModuleManifest` log the warning
+ * via the optional logger rather than `console.warn` — the validator stays
+ * pure-ish (no implicit IO) and tests can assert against a captured logger.
+ */
+function asKind(
+  v: unknown,
+  where: string,
+): { kind: ModuleKind; warn?: string } {
+  if (v === undefined) {
+    return {
+      kind: "api",
+      warn: `${where}: "kind" is absent — defaulting to "api". The field is optional as of hub#301 Phase A; you may safely remove it from authored manifests, but if you want backend-proxy routing the default is correct.`,
+    };
+  }
   if (v !== "api" && v !== "frontend" && v !== "tool") {
     throw new ModuleManifestError(`${where}: "kind" must be "api" | "frontend" | "tool"`);
   }
-  return v;
+  return { kind: v };
 }
 
 function asPort(v: unknown, where: string): number {
@@ -341,9 +374,17 @@ function asDependencies(v: unknown, where: string): Record<string, ModuleDepende
 /**
  * Strict validator. Throws `ModuleManifestError` with the source path so
  * malformed third-party modules get a clear-enough error to fix. Required
- * fields are name, manifestName, kind, port, paths, health.
+ * fields are name, manifestName, port, paths, health. `kind` is optional
+ * as of hub#301 Phase A — see `asKind` for the default behavior.
+ *
+ * Pass an optional `logger` to capture the soft-warning emitted when `kind`
+ * is absent. Defaults to `console`.
  */
-export function validateModuleManifest(raw: unknown, where: string): ModuleManifest {
+export function validateModuleManifest(
+  raw: unknown,
+  where: string,
+  logger: Pick<Console, "warn"> = console,
+): ModuleManifest {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new ModuleManifestError(`${where}: root must be an object`);
   }
@@ -356,7 +397,9 @@ export function validateModuleManifest(raw: unknown, where: string): ModuleManif
     );
   }
   const manifestName = asString(m.manifestName, where, "manifestName");
-  const kind = asKind(m.kind, where);
+  const kindResult = asKind(m.kind, where);
+  if (kindResult.warn) logger.warn(kindResult.warn);
+  const kind = kindResult.kind;
   const port = asPort(m.port, where);
   const paths = asStringArray(m.paths, where, "paths");
   const health = asHealthPath(m.health, where);
@@ -470,8 +513,14 @@ function asPathOrUrl(v: unknown, where: string, field: string): string | undefin
  * absent (caller decides whether that's an error — first-party modules fall
  * back to the vendored manifest; third-party hard-errors). Throws
  * `ModuleManifestError` on parse / validation failure.
+ *
+ * Pass an optional `logger` to capture validator soft-warnings (e.g. the
+ * hub#301 Phase A "kind absent" notice). Defaults to `console`.
  */
-export async function readModuleManifest(packageDir: string): Promise<ModuleManifest | null> {
+export async function readModuleManifest(
+  packageDir: string,
+  logger: Pick<Console, "warn"> = console,
+): Promise<ModuleManifest | null> {
   const path = join(packageDir, ".parachute", "module.json");
   let buf: string;
   try {
@@ -488,5 +537,5 @@ export async function readModuleManifest(packageDir: string): Promise<ModuleMani
       `${path}: failed to parse JSON: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  return validateModuleManifest(parsed, path);
+  return validateModuleManifest(parsed, path, logger);
 }
