@@ -32,6 +32,19 @@
  * `bun add -g` to detect "already at latest" (the dist-tag didn't move).
  * Doing this avoids an unnecessary restart on a stable channel — a lot
  * cheaper than re-spawning a daemon that's already running the right code.
+ *
+ * Channel preservation (hub#332). The npm branch infers which dist-tag to
+ * use from the currently-installed version string: a `-rc(\.\d+)?$` suffix
+ * means the operator is on the rc chain → upgrade via `@rc`; otherwise
+ * `@latest`. This is load-bearing under pre-1.0 RC governance (parachute-
+ * patterns/patterns/governance.md rule 2): rc operators must stay on rc
+ * unless they explicitly promote. Before #332 the upgrade unconditionally
+ * pulled `@latest`, which silently downgraded an rc operator the moment
+ * `@latest` pointed at a prior stable. Operators can override the
+ * detection with `--channel rc|latest`. We also gate against silent
+ * downgrades: if `npm view <pkg>@<channel> version` resolves to something
+ * lower than what's installed, we abort with an actionable message
+ * (override with `--allow-downgrade`).
  */
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
@@ -101,8 +114,45 @@ export interface UpgradeOpts {
    * upgrade flow can be exercised without spawning real children.
    */
   restartFn?: (svc: string, opts: LifecycleOpts) => Promise<number>;
-  /** npm dist-tag for the npm-installed branch. Defaults to `latest`. Ignored when bun-linked. */
+  /**
+   * Explicit npm dist-tag for the npm-installed branch. When set, this
+   * overrides channel auto-detection AND the operator's `--channel` flag
+   * (it's a programmatic pin used by callers that already know what they
+   * want — e.g. tests). Operators don't pass `tag` directly; they pass
+   * `--channel rc|latest` which flows into `channel` below.
+   *
+   * Ignored when bun-linked.
+   */
   tag?: string;
+  /**
+   * Operator-facing channel override (`--channel rc|latest`). Bypasses the
+   * auto-detection that infers the channel from the currently-installed
+   * version string. When unset, `parachute upgrade` reads the installed
+   * package.json `version` and picks `@rc` if it matches `/-rc(\.\d+)?$/`,
+   * `@latest` otherwise.
+   *
+   * Per governance rule 2 (pre-1.0 RC versioning,
+   * `parachute-patterns/patterns/governance.md`), operators on the dev
+   * chain run `@rc`; `@latest` is the explicit-stable channel. The default
+   * `parachute upgrade` (pre hub#332) hard-coded `@latest`, which silently
+   * downgraded rc operators when `@latest` pointed at a prior stable.
+   */
+  channel?: "rc" | "latest";
+  /**
+   * Bypass the "refuses-to-downgrade" guard. The npm-install branch
+   * compares the target version (what `npm view <pkg>@<channel> version`
+   * resolves to) against the installed version and aborts if it would go
+   * backward. Set true to opt in to a real downgrade.
+   */
+  allowDowngrade?: boolean;
+  /**
+   * Test seam for resolving a dist-tag to a concrete version. Defaults to
+   * `npm view <pkg>@<channel> version` via the injected runner. Returning
+   * null is treated as "unknown — skip the downgrade guard" (network down,
+   * registry unreachable, package not yet published on that channel) so a
+   * flaky probe never blocks a legitimate upgrade.
+   */
+  resolveChannelVersion?: (pkg: string, channel: string) => Promise<string | null>;
 }
 
 interface ResolvedTarget {
@@ -119,7 +169,15 @@ interface Resolved {
   log: (line: string) => void;
   findGlobalInstall: (pkg: string) => string | null;
   restartFn: (svc: string, opts: LifecycleOpts) => Promise<number>;
-  tag: string;
+  /**
+   * Explicit pin (programmatic). When set, overrides both auto-detection
+   * and `channelOverride`. Undefined in the operator-facing default path.
+   */
+  tag: string | undefined;
+  /** Operator override (`--channel rc|latest`). Undefined → auto-detect. */
+  channelOverride: "rc" | "latest" | undefined;
+  allowDowngrade: boolean;
+  resolveChannelVersion: (pkg: string, channel: string) => Promise<string | null>;
 }
 
 function bunGlobalPrefixes(): string[] {
@@ -139,15 +197,117 @@ function defaultFindGlobalInstall(pkg: string): string | null {
 }
 
 function resolve(opts: UpgradeOpts): Resolved {
+  const runner = opts.runner ?? defaultRunner;
   return {
-    runner: opts.runner ?? defaultRunner,
+    runner,
     manifestPath: opts.manifestPath ?? SERVICES_MANIFEST_PATH,
     configDir: opts.configDir ?? CONFIG_DIR,
     log: opts.log ?? ((line) => console.log(line)),
     findGlobalInstall: opts.findGlobalInstall ?? defaultFindGlobalInstall,
     restartFn: opts.restartFn ?? ((svc, lifecycleOpts) => lifecycleRestart(svc, lifecycleOpts)),
-    tag: opts.tag ?? "latest",
+    tag: opts.tag,
+    channelOverride: opts.channel,
+    allowDowngrade: opts.allowDowngrade ?? false,
+    resolveChannelVersion:
+      opts.resolveChannelVersion ?? ((pkg, channel) => npmViewVersion(pkg, channel, runner)),
   };
+}
+
+/**
+ * Channel detection from a semver-ish version string. Pre-1.0 governance
+ * (parachute-patterns/patterns/governance.md rule 2) ships rc chains as
+ * `<x>.<y>.<z>-rc.<N>` (or sometimes `-rc` with no N). Anything matching that
+ * trailing suffix is the rc channel; everything else is the stable channel.
+ */
+export function detectChannel(installedVersion: string): "rc" | "latest" {
+  return /-rc(\.\d+)?$/.test(installedVersion) ? "rc" : "latest";
+}
+
+/**
+ * Inline semver-ish comparator. Returns < 0 / 0 / > 0 like `Array.prototype.sort`.
+ *
+ * Hub doesn't depend on `semver` and adding it for one call is overkill —
+ * npm dist-tags resolve to fully-qualified versions like `0.5.13-rc.13` or
+ * `0.5.10`, and we only need an ordering predicate ("would this be a
+ * downgrade?"). Spec compliance: split into [major, minor, patch] + an
+ * optional prerelease tail; numeric-compare the triple, then break ties by
+ * "no prerelease > has prerelease" (semver §11.4.3) and lex/numeric compare
+ * the prerelease dot-segments (§11.4.1–11.4.2). Returns null on malformed
+ * inputs so the caller can fail-open (skip the downgrade guard rather than
+ * block on a parser disagreement).
+ */
+export function compareVersions(a: string, b: string): number | null {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa || !pb) return null;
+  for (let i = 0; i < 3; i++) {
+    const av = pa.parts[i] ?? 0;
+    const bv = pb.parts[i] ?? 0;
+    if (av !== bv) return av - bv;
+  }
+  // Equal triple: pre-release loses to no-pre-release.
+  if (pa.pre.length === 0 && pb.pre.length === 0) return 0;
+  if (pa.pre.length === 0) return 1;
+  if (pb.pre.length === 0) return -1;
+  // Both have pre-releases: dot-segment compare.
+  const len = Math.max(pa.pre.length, pb.pre.length);
+  for (let i = 0; i < len; i++) {
+    const av = pa.pre[i];
+    const bv = pb.pre[i];
+    if (av === undefined) return -1;
+    if (bv === undefined) return 1;
+    const an = /^\d+$/.test(av) ? Number(av) : null;
+    const bn = /^\d+$/.test(bv) ? Number(bv) : null;
+    if (an !== null && bn !== null) {
+      if (an !== bn) return an - bn;
+      continue;
+    }
+    if (an !== null) return -1; // numeric < non-numeric
+    if (bn !== null) return 1;
+    if (av < bv) return -1;
+    if (av > bv) return 1;
+  }
+  return 0;
+}
+
+function parseSemver(v: string): { parts: number[]; pre: string[] } | null {
+  // Tolerate a leading `v` and ignore build metadata after `+`.
+  const stripped = v.replace(/^v/, "").split("+")[0];
+  if (!stripped) return null;
+  const [core, ...preTail] = stripped.split("-");
+  if (!core) return null;
+  const partStrs = core.split(".");
+  if (partStrs.length < 1 || partStrs.length > 3) return null;
+  const parts: number[] = [];
+  for (const p of partStrs) {
+    if (!/^\d+$/.test(p)) return null;
+    parts.push(Number(p));
+  }
+  const pre = preTail.length === 0 ? [] : preTail.join("-").split(".").filter(Boolean);
+  return { parts, pre };
+}
+
+/**
+ * Resolve `<pkg>@<channel>` to a concrete version via `npm view`. Returns
+ * null when the probe fails (network down, registry unreachable, package
+ * not yet published on that channel) so callers can fail-open on the
+ * downgrade guard rather than block on a parser disagreement.
+ */
+async function npmViewVersion(
+  pkg: string,
+  channel: string,
+  runner: UpgradeRunner,
+): Promise<string | null> {
+  const { code, stdout } = await runner.capture(["npm", "view", `${pkg}@${channel}`, "version"]);
+  if (code !== 0) return null;
+  const trimmed = stdout.trim();
+  if (!trimmed) return null;
+  // `npm view <pkg>@<tag> version` prints a single line ("0.5.10\n").
+  // Tag points to no version → empty stdout → return null above.
+  // Belt-and-braces: take the last non-empty line in case npm decided to be
+  // chatty.
+  const lines = trimmed.split("\n").filter(Boolean);
+  return lines[lines.length - 1] ?? null;
 }
 
 /**
@@ -389,10 +549,53 @@ async function upgradeLinked(
   return await r.restartFn(target.short, { manifestPath: r.manifestPath, configDir: r.configDir });
 }
 
+/**
+ * Pick which dist-tag we're going to ship at. Precedence:
+ *
+ *   1. explicit `tag` (programmatic — caller passed it directly)
+ *   2. operator `--channel rc|latest` flag
+ *   3. auto-detected from the installed version string (`-rc` suffix → rc)
+ *   4. `latest` fallback (no installed version to read — fresh-install case)
+ */
+function pickChannel(installedVersion: string | null, r: Resolved): string {
+  if (r.tag) return r.tag;
+  if (r.channelOverride) return r.channelOverride;
+  if (installedVersion) return detectChannel(installedVersion);
+  return "latest";
+}
+
 async function upgradeNpm(target: ResolvedTarget, sourceDir: string, r: Resolved): Promise<number> {
   r.log(`${target.short}: npm-installed (${sourceDir})`);
   const beforeVersion = readPackageVersion(join(sourceDir, "package.json"));
-  const spec = `${target.packageName}@${r.tag}`;
+  const channel = pickChannel(beforeVersion, r);
+
+  // Downgrade guard: refuse to silently move backward. Only applies when
+  // we can read both sides — beforeVersion from disk, targetVersion via
+  // `npm view`. A null on either side means we fail-open (legacy
+  // behavior: just run `bun add -g`). This is the load-bearing fix for
+  // hub#332 — Aaron got `0.5.13-rc.13` → `0.5.10` because the implicit
+  // `@latest` resolved to a prior stable while he was on the rc chain.
+  if (beforeVersion && !r.allowDowngrade) {
+    const targetVersion = await r.resolveChannelVersion(target.packageName, channel);
+    if (targetVersion) {
+      const cmp = compareVersions(targetVersion, beforeVersion);
+      if (cmp !== null && cmp < 0) {
+        const channelHint =
+          channel === "rc" ? "" : " or rerun with `--channel rc` to stay on the rc chain";
+        r.log(
+          `✗ ${target.short}: refusing to downgrade — installed ${beforeVersion}, ` +
+            `target @${channel} resolves to ${targetVersion}.`,
+        );
+        r.log(
+          `  To force this downgrade, run: bun add -g ${target.packageName}@${targetVersion}${channelHint}`,
+        );
+        r.log("  Or re-run with --allow-downgrade to bypass this check.");
+        return 1;
+      }
+    }
+  }
+
+  const spec = `${target.packageName}@${channel}`;
   r.log(`${target.short}: bun add -g ${spec}`);
   const code = await r.runner.run(["bun", "add", "-g", spec]);
   if (code !== 0) {

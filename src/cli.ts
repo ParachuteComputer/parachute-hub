@@ -549,14 +549,40 @@ async function main(argv: string[]): Promise<number> {
         console.error(`parachute upgrade: ${tagExtract.error}`);
         return 1;
       }
-      const remaining = tagExtract.rest;
+      const channelExtract = extractNamedFlag(tagExtract.rest, "--channel");
+      if (channelExtract.error) {
+        console.error(`parachute upgrade: ${channelExtract.error}`);
+        return 1;
+      }
+      if (
+        channelExtract.value !== undefined &&
+        channelExtract.value !== "rc" &&
+        channelExtract.value !== "latest"
+      ) {
+        console.error(
+          `parachute upgrade: --channel must be "rc" or "latest" (got "${channelExtract.value}")`,
+        );
+        return 1;
+      }
+      let remaining = channelExtract.rest;
+      const allowDowngradeIdx = remaining.indexOf("--allow-downgrade");
+      const allowDowngrade = allowDowngradeIdx !== -1;
+      if (allowDowngrade) {
+        remaining = remaining.filter((a) => a !== "--allow-downgrade");
+      }
       if (remaining.length > 1) {
         console.error(`parachute upgrade: unexpected argument "${remaining[1]}"`);
-        console.error("usage: parachute upgrade [<service>] [--tag <name>]");
+        console.error(
+          "usage: parachute upgrade [<service>] [--channel rc|latest] [--allow-downgrade] [--tag <name>]",
+        );
         return 1;
       }
       const upgradeOpts: Parameters<typeof upgrade>[1] = {};
       if (tagExtract.tag) upgradeOpts.tag = tagExtract.tag;
+      if (channelExtract.value === "rc" || channelExtract.value === "latest") {
+        upgradeOpts.channel = channelExtract.value;
+      }
+      if (allowDowngrade) upgradeOpts.allowDowngrade = true;
       return await upgrade(remaining[0], upgradeOpts);
     }
 

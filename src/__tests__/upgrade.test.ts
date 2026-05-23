@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UpgradeRunner } from "../commands/upgrade.ts";
-import { upgrade } from "../commands/upgrade.ts";
+import { compareVersions, detectChannel, upgrade } from "../commands/upgrade.ts";
 import { upsertService } from "../services-manifest.ts";
 
 interface RunCall {
@@ -777,6 +777,359 @@ describe("parachute upgrade", () => {
       // Hub skipped restart (version unchanged), notes restarted after version bump.
       expect(restartCalls).toEqual(["notes"]);
       expect(logs.join("\n")).toMatch(/vault: bun add -g failed \(exit 7\)/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // hub#332 — channel preservation + downgrade refusal
+  // -------------------------------------------------------------------------
+
+  test("detectChannel: rc suffixes → 'rc', everything else → 'latest'", () => {
+    expect(detectChannel("0.5.13-rc.13")).toBe("rc");
+    expect(detectChannel("0.5.13-rc.1")).toBe("rc");
+    expect(detectChannel("0.5.13-rc")).toBe("rc"); // no .N suffix
+    expect(detectChannel("0.5.10")).toBe("latest");
+    expect(detectChannel("1.0.0")).toBe("latest");
+    expect(detectChannel("0.5.13-beta.1")).toBe("latest"); // not rc
+    expect(detectChannel("0.5.13-alpha")).toBe("latest");
+  });
+
+  test("compareVersions: stable > matching rc; later rc > earlier rc", () => {
+    // Stable beats prerelease at equal triple (semver §11.4.3)
+    expect(compareVersions("0.5.13", "0.5.13-rc.13")).toBeGreaterThan(0);
+    expect(compareVersions("0.5.13-rc.13", "0.5.13")).toBeLessThan(0);
+    // Aaron's reproducer: 0.5.10 < 0.5.13-rc.13 (lower triple beats prerelease tail)
+    expect(compareVersions("0.5.10", "0.5.13-rc.13")).toBeLessThan(0);
+    expect(compareVersions("0.5.13-rc.14", "0.5.13-rc.13")).toBeGreaterThan(0);
+    expect(compareVersions("0.5.13-rc.13", "0.5.13-rc.13")).toBe(0);
+    // Patch difference dominates prerelease tail
+    expect(compareVersions("0.5.14", "0.5.13-rc.99")).toBeGreaterThan(0);
+    // Garbage in → null
+    expect(compareVersions("not-a-version", "0.5.10")).toBeNull();
+  });
+
+  test("auto-detects rc channel: installed 0.5.13-rc.13 → bun add -g @openparachute/hub@rc", async () => {
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.13-rc.13" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            writePackageJson(hubInstallDir, {
+              name: "@openparachute/hub",
+              version: "0.5.13-rc.14",
+            });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const code = await upgrade("hub", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async () => 0,
+        // No resolveChannelVersion → npm view stub returns empty → guard skipped
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@rc"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("auto-detects stable channel: installed 0.5.10 → bun add -g @openparachute/hub@latest", async () => {
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.10" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.11" });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      await upgrade("hub", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async () => 0,
+        log: () => {},
+      });
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@latest"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--channel rc overrides stable detection", async () => {
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.10" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            writePackageJson(hubInstallDir, {
+              name: "@openparachute/hub",
+              version: "0.5.13-rc.14",
+            });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      await upgrade("hub", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async () => 0,
+        channel: "rc",
+        log: () => {},
+      });
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@rc"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("refuses downgrade: installed 0.5.13-rc.13, @rc resolves to 0.5.10 → abort", async () => {
+    // Aaron's exact reproducer modulo the channel fix — once channel detection
+    // lands, @rc is the right tag; if @rc itself somehow resolves backward we
+    // still refuse.
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.13-rc.13" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const logs: string[] = [];
+      let restartCalled = false;
+      const code = await upgrade("hub", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async () => {
+          restartCalled = true;
+          return 0;
+        },
+        resolveChannelVersion: async (_pkg, _channel) => "0.5.10",
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(1);
+      expect(restartCalled).toBe(false);
+      // bun add was never run
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toBeUndefined();
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/refusing to downgrade/);
+      expect(joined).toMatch(/installed 0\.5\.13-rc\.13/);
+      expect(joined).toMatch(/0\.5\.10/);
+      expect(joined).toMatch(/--allow-downgrade/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--allow-downgrade bypasses the refusal", async () => {
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.13-rc.13" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.10" });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const code = await upgrade("hub", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async () => 0,
+        resolveChannelVersion: async () => "0.5.10",
+        allowDowngrade: true,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      // Channel was auto-detected as `rc` from the rc-suffixed installed version
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@rc"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("Aaron's reproducer: installed 0.5.13-rc.13 → upgrades via @rc, version goes UP not down", async () => {
+    // This is the exact bug from hub#332. Before the fix, `parachute upgrade
+    // hub` ran `bun add -g @openparachute/hub@latest` which (because @latest
+    // pointed at 0.5.10) silently downgraded an rc.13 install. With auto-
+    // channel detection: rc.13 → @rc → 0.5.13-rc.14, version increases.
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.13-rc.13" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          if (
+            cmd[0] === "bun" &&
+            cmd[1] === "add" &&
+            cmd[2] === "-g" &&
+            cmd[3] === "@openparachute/hub@rc"
+          ) {
+            writePackageJson(hubInstallDir, {
+              name: "@openparachute/hub",
+              version: "0.5.13-rc.14",
+            });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const logs: string[] = [];
+      let restartedShort: string | undefined;
+      const code = await upgrade("hub", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async (svc) => {
+          restartedShort = svc;
+          return 0;
+        },
+        // @rc resolves to a HIGHER version than installed — no downgrade.
+        resolveChannelVersion: async (_pkg, channel) =>
+          channel === "rc" ? "0.5.13-rc.14" : "0.5.10",
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(restartedShort).toBe("hub");
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@rc"]);
+      const joined = logs.join("\n");
+      // Version went UP (rc.13 → rc.14), not DOWN as in the original report
+      expect(joined).toMatch(/0\.5\.13-rc\.13 → 0\.5\.13-rc\.14/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--tag still overrides everything (back-compat for programmatic pin)", async () => {
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.13-rc.13" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      await upgrade("hub", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async () => 0,
+        // Programmatic `tag` wins over auto-detection AND --channel.
+        tag: "next",
+        channel: "rc",
+        log: () => {},
+      });
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@next"]);
     } finally {
       h.cleanup();
     }
