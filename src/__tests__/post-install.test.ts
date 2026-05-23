@@ -176,7 +176,6 @@ describe("refreshWellKnown", () => {
             ? {
                 name: "notes",
                 manifestName: "parachute-notes",
-                kind: "frontend",
                 port: 5173,
                 paths: ["/notes"],
                 health: "/notes/health",
@@ -260,7 +259,6 @@ describe("finalizeModuleInstall", () => {
       const manifest = {
         name: "vault",
         manifestName: "parachute-vault",
-        kind: "api" as const,
         port: 1940,
         paths: ["/vault/default"],
         health: "/vault/default/health",

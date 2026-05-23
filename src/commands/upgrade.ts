@@ -7,7 +7,6 @@
  *
  *   bun-linked:   git -C <checkout> pull --ff-only;
  *                 bun install --frozen-lockfile (if package.json/bun.lock changed);
- *                 bun run build (frontend kind, if `build` script exists);
  *                 parachute restart <svc>.
  *
  *   npm-installed: bun add -g <pkg>@<tag>; parachute restart <svc>.
@@ -458,15 +457,6 @@ async function listChangedFiles(
   return stdout.trim().split("\n").filter(Boolean);
 }
 
-function packageHasScript(pkgJsonPath: string, name: string): boolean {
-  try {
-    const json = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
-    return Boolean(json?.scripts && typeof json.scripts[name] === "string");
-  } catch {
-    return false;
-  }
-}
-
 function readPackageVersion(pkgJsonPath: string): string | null {
   try {
     const json = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
@@ -530,18 +520,6 @@ async function upgradeLinked(
     if (inst !== 0) {
       r.log(`✗ ${target.short}: bun install failed (exit ${inst})`);
       return inst;
-    }
-  }
-
-  if (target.spec?.kind === "frontend") {
-    const pkgJsonPath = join(sourceDir, "package.json");
-    if (packageHasScript(pkgJsonPath, "build")) {
-      r.log(`${target.short}: bun run build`);
-      const build = await r.runner.run(["bun", "run", "build"], { cwd: sourceDir });
-      if (build !== 0) {
-        r.log(`✗ ${target.short}: bun run build failed (exit ${build})`);
-        return build;
-      }
     }
   }
 
