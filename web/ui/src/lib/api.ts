@@ -1130,6 +1130,9 @@ export interface HubStatus {
   bun_linked_path?: string;
   git_head?: string;
   container_build_time?: string;
+  /** Render-set runtime env vars surfaced when running on Render. */
+  render_commit?: string;
+  render_branch?: string;
 }
 
 /**

@@ -150,6 +150,15 @@ export function HubVersionBadge() {
                 <dd>{formatTimestampUtc(status.container_build_time)}</dd>
               </>
             ) : null}
+            {status.render_commit ? (
+              <>
+                <dt>Commit</dt>
+                <dd>
+                  <code>{status.render_commit.slice(0, 8)}</code>
+                  {status.render_branch ? <> on <code>{status.render_branch}</code></> : null}
+                </dd>
+              </>
+            ) : null}
             {lastCheckedAt ? (
               <>
                 <dt>Last checked</dt>

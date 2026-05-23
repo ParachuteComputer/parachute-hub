@@ -82,6 +82,9 @@ export interface HubStatusResponse {
   bun_linked_path?: string;
   git_head?: string;
   container_build_time?: string;
+  /** Render-set runtime env vars surfaced when running on Render. Sourced from RENDER_GIT_COMMIT + RENDER_GIT_BRANCH. */
+  render_commit?: string;
+  render_branch?: string;
 }
 
 export async function handleApiHub(req: Request, deps: ApiHubDeps): Promise<Response> {
@@ -129,12 +132,29 @@ export async function handleApiHub(req: Request, deps: ApiHubDeps): Promise<Resp
   if (!isContainer && source.kind === "bun-linked" && source.path) {
     body.bun_linked_path = source.path;
   }
-  if (source.gitHead) {
+  // `git_head` is meaningful only for bun-linked dev installs — the container
+  // image strips `.git` at build time so source.gitHead is always undefined
+  // there. Explicit !isContainer guard for symmetry with bun_linked_path.
+  if (!isContainer && source.gitHead) {
     body.git_head = source.gitHead;
   }
   const buildTime = env.PARACHUTE_BUILD_TIME;
   if (typeof buildTime === "string" && buildTime.length > 0) {
     body.container_build_time = buildTime;
+  }
+  // Render exposes RENDER_GIT_COMMIT + RENDER_GIT_BRANCH at runtime when
+  // the container is running on Render. Surface for operator diagnostics
+  // (the commit SHA is a more rigorous identity than build-time wall-clock).
+  // Container-mode only — local dev never has these set.
+  if (isContainer) {
+    const renderCommit = env.RENDER_GIT_COMMIT;
+    if (typeof renderCommit === "string" && renderCommit.length > 0) {
+      body.render_commit = renderCommit;
+    }
+    const renderBranch = env.RENDER_GIT_BRANCH;
+    if (typeof renderBranch === "string" && renderBranch.length > 0) {
+      body.render_branch = renderBranch;
+    }
   }
 
   return new Response(JSON.stringify(body), {
