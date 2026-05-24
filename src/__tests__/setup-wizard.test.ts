@@ -2143,6 +2143,10 @@ describe("typed vault name (hub#267)", () => {
       const vaultSpawn = spawnRequests.find((s) => s.short === "vault");
       expect(vaultSpawn).toBeDefined();
       expect(vaultSpawn?.env?.PARACHUTE_VAULT_NAME).toBe("smoke-1940");
+      // PORT also injected (hub#356) — supervisor always sets it from the
+      // services.json entry regardless of whether the typed-name path
+      // contributed any additional env vars.
+      expect(vaultSpawn?.env?.PORT).toBe("1940");
     } finally {
       db.close();
     }

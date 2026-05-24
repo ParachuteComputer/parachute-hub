@@ -436,7 +436,13 @@ export async function start(svc: string | undefined, opts: LifecycleOpts = {}): 
     // wrapper for launchd / systemd) — this is idempotent there. Hub-origin
     // override wins on collision; that's the live-exposure source of truth.
     const fileEnv = readEnvFileValues(join(r.configDir, short, ".env"));
-    const env: Record<string, string> = { ...fileEnv };
+    // PORT override (hub#356): same shape as `spawnSupervised` in
+    // api-modules-ops.ts. Without this, operators running `parachute start
+    // vault` inside a container that has PORT in env (Render / Fly / etc.)
+    // hit EADDRINUSE on hub's port. Local dev typically doesn't set PORT, so
+    // this is a no-op there. fileEnv wins on collision so per-service .env
+    // can still override if an operator deliberately set PORT in there.
+    const env: Record<string, string> = { PORT: String(entry.port), ...fileEnv };
     if (r.hubOrigin) env[HUB_ORIGIN_ENV] = r.hubOrigin;
     const spawnerOpts: { env?: Record<string, string>; cwd?: string } = {};
     if (Object.keys(env).length > 0) spawnerOpts.env = env;
