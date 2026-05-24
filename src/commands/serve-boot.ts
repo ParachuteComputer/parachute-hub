@@ -89,11 +89,15 @@ export async function bootSupervisedModules(
       continue;
     }
 
-    // Per-module .env layers under HUB_ORIGIN (hub-origin wins on
-    // collision — it's the canonical issuer source, and a stale .env
-    // shouldn't override the live `parachute serve` env).
+    // PORT override (hub#357 — third spawn site missed by hub#356).
+    // Without this, modules that read process.env.PORT (vault, scribe)
+    // inherit hub's PORT from Bun.spawn's env: process.env default and
+    // crash EADDRINUSE on hub's port. Container deploy was still broken
+    // after #356 because this BOOT path runs on hub startup before the
+    // supervisor's other spawn paths see any traffic. fileEnv wins on
+    // collision so per-service .env can still override.
     const fileEnv = readEnvFileValues(join(opts.configDir, short, ".env"));
-    const env: Record<string, string> = { ...fileEnv };
+    const env: Record<string, string> = { PORT: String(entry.port), ...fileEnv };
     if (opts.hubOrigin) env[HUB_ORIGIN_ENV] = opts.hubOrigin;
 
     const req: {
