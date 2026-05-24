@@ -43,7 +43,9 @@ When the rc chain is ready to release:
 
 ### Doc-only PRs
 
-Skip the rc chain per governance — bump straight to the next patch (e.g. `0.5.13` → `0.5.14`), tag, ship. No rc.N for docs.
+Per governance, doc-only PRs are EXEMPT from rc.N bumping — they merge without a version bump and get picked up by the next code-touching PR's rc bump (or by the stable promotion, whichever comes first). Don't fragment a release into many patch bumps mid-validation.
+
+If you DO need to ship a doc-only fix outside an active rc chain (i.e. main is on a stable version with no rc.N in flight), bump the next patch (`0.5.13` → `0.5.14`), tag, ship.
 
 ## One-time setup (operator)
 
@@ -51,7 +53,7 @@ Before the workflow can publish, this repo needs:
 
 1. **`NPM_TOKEN` secret**: log into npmjs.com → Access Tokens → New Token (type: **Automation**) → scope to `@openparachute/*` packages. Add as `NPM_TOKEN` in [repo settings → Secrets and variables → Actions](https://github.com/ParachuteComputer/parachute-hub/settings/secrets/actions).
 
-2. **ghcr.io permissions**: no secret needed — the workflow uses the runner's auto-provisioned `GITHUB_TOKEN`. First push of the image will create the package; you may want to make it public under [package settings](https://github.com/orgs/ParachuteComputer/packages/container/parachute-hub/settings) once it lands.
+2. **ghcr.io permissions**: no secret needed — the workflow uses the runner's auto-provisioned `GITHUB_TOKEN`. First push of the image will create the package as **private by default**. After that first push, go to [package settings](https://github.com/orgs/ParachuteComputer/packages/container/parachute-hub/settings) → "Change visibility" → **Public**. Until you do this, any deploy target that pulls the image (Render, etc.) will 403 on `docker pull` unless you supply a `GHCR_PAT` read token. Doing it once at first-push time is the simplest path.
 
 ## Verifying a release
 
@@ -72,7 +74,12 @@ The npm tarball page links to the GitHub Actions run that produced it (provenanc
 There's no "unpublish" path for either npm (npm has a strict 72-hour unpublish policy that you should avoid for published packages anyway) or ghcr (containers are append-only). To roll back:
 
 - Cut a new patch from a known-good commit (e.g. `0.5.13` → `0.5.14` reverting the bad change).
-- Optionally republish the previous `:stable` ghcr tag onto the older image by pushing under the new tag locally and `docker push`-ing.
+- Optionally re-point `:stable` ghcr tag to an older image so existing deploys pull the safe version. If you've already pruned the older image locally, pull it first:
+  ```sh
+  docker pull ghcr.io/parachutecomputer/parachute-hub:v0.5.10
+  docker tag ghcr.io/parachutecomputer/parachute-hub:v0.5.10 ghcr.io/parachutecomputer/parachute-hub:stable
+  docker push ghcr.io/parachutecomputer/parachute-hub:stable
+  ```
 
 ## Troubleshooting
 
