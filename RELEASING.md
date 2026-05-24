@@ -57,7 +57,9 @@ Before the workflow can publish, this repo needs:
    - Workflow filename: `release.yml`
    - Environment name: (leave blank)
 
-   Repeat for `@openparachute/scope-guard` (same workflow, since scope-guard ships from the same repo). No `NPM_TOKEN` secret needed — the workflow uses OIDC.
+   No `NPM_TOKEN` secret needed — the workflow uses OIDC.
+
+   `@openparachute/scope-guard` ships from this same repo but **this workflow does not publish it today** — scope-guard's CI publish path is a follow-up (independent release cadence, separate tag-prefix convention). A Trusted Publisher rule for scope-guard pointing at `release.yml` is harmless (it just won't ever fire under this workflow) but unnecessary until that follow-up lands.
 
 2. **ghcr.io permissions**: no secret needed — the workflow uses the runner's auto-provisioned `GITHUB_TOKEN`. First push of the image will create the package as **private by default**. After that first push, go to [package settings](https://github.com/orgs/ParachuteComputer/packages/container/parachute-hub/settings) → "Change visibility" → **Public**. Until you do this, any deploy target that pulls the image (Render, etc.) will 403 on `docker pull` unless you supply a `GHCR_PAT` read token. Doing it once at first-push time is the simplest path.
 

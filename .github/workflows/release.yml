@@ -13,10 +13,12 @@
 #        - npm        (with provenance attestation, dist-tag = rc or latest)
 #        - ghcr.io    (multi-tagged: :rc / :stable / :vX.Y.Z[-rc.N])
 #
-# Operator setup (one-time):
-#   - npmjs.com → Access Tokens → New Token (Automation) → scope @openparachute/*
-#   - Add as `NPM_TOKEN` repo secret in GitHub settings
-#   - ghcr.io needs no secret (uses the runner's GITHUB_TOKEN)
+# Operator setup (one-time) — see RELEASING.md for the full walkthrough:
+#   - npm Trusted Publisher: npmjs.com → @openparachute/hub → Settings →
+#     Trusted Publishers → add GitHub Actions rule (org=ParachuteComputer,
+#     repo=parachute-hub, workflow=release.yml, env blank). OIDC-based;
+#     no NPM_TOKEN secret needed.
+#   - ghcr.io needs no secret (uses the runner's GITHUB_TOKEN).
 #
 # Why tag-triggered (not push-to-main):
 #   - tag = explicit release signal; main commits without a tag don't publish.
