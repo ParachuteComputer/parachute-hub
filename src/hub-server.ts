@@ -167,6 +167,7 @@ import {
 } from "./oauth-handlers.ts";
 import { buildHubBoundOrigins } from "./origin-check.ts";
 import { clearPid, writePid } from "./process-state.ts";
+import { isHttpsRequest } from "./request-protocol.ts";
 import {
   FIRST_PARTY_FALLBACKS,
   KNOWN_MODULES,
@@ -944,7 +945,18 @@ export function resolveIssuer(
     if (stored) return stored;
   }
   if (configuredIssuer) return configuredIssuer;
-  return new URL(req.url).origin;
+  // Reverse-proxy aware: Render / Tailscale Funnel / cloudflared terminate
+  // TLS at the edge and forward plain HTTP to hub. Without X-Forwarded-Proto
+  // honoring, `req.url.origin` is `http://...` and hub publishes mixed-content
+  // URLs in OAuth discovery (`registration_endpoint`, `authorization_endpoint`,
+  // etc.) — browsers block them when the page itself loaded over https://.
+  // The `isHttpsRequest` helper is the canonical place where this trust
+  // is established (also used for the Secure cookie attribute).
+  const url = new URL(req.url);
+  if (isHttpsRequest(req)) {
+    url.protocol = "https:";
+  }
+  return url.origin;
 }
 
 /**
