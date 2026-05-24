@@ -1390,7 +1390,8 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
       fetch: async (req) => {
         const u = new URL(req.url);
         // Echo enough metadata for tests to verify path + method + body
-        // arrive intact end-to-end.
+        // arrive intact end-to-end. Also echo X-Forwarded-* headers so
+        // tests can assert hub forwards proxy hints (hub#358).
         const body = req.body ? await req.text() : "";
         return new Response(
           JSON.stringify({
@@ -1399,6 +1400,8 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
             pathname: u.pathname,
             search: u.search,
             body,
+            forwardedHost: req.headers.get("x-forwarded-host"),
+            forwardedProto: req.headers.get("x-forwarded-proto"),
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
@@ -1408,6 +1411,87 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
     // returns synchronously with the bound port — non-null assertion is safe.
     return { port: server.port as number, stop: () => server.stop(true) };
   }
+
+  test("forwards X-Forwarded-Host + X-Forwarded-Proto to upstream (hub#358)", async () => {
+    // Container deploys: supervised modules (vault, scribe, app) reverse-
+    // proxy through hub. They need the public origin to construct OAuth
+    // discovery metadata and redirect URIs. Without forwarded headers,
+    // they fall back to their internal loopback URL — breaking OAuth
+    // flows for clients that landed on a hub-proxied URL.
+    const h = makeHarness();
+    const upstream = startUpstream("hdr-test");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      // Simulate Render-shape: page came in over HTTPS at parachute-hub.onrender.com
+      // Render terminates TLS and sets X-Forwarded-Proto: https; the Host
+      // header is preserved as the public hostname.
+      const incoming = new Request("http://parachute-hub.onrender.com/vault/default/.well-known/oauth-authorization-server", {
+        headers: {
+          host: "parachute-hub.onrender.com",
+          "x-forwarded-proto": "https",
+        },
+      });
+      const res = await fetcher(incoming);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { forwardedHost: string; forwardedProto: string };
+      // Hub captured the public Host and forwarded it as X-Forwarded-Host.
+      expect(body.forwardedHost).toBe("parachute-hub.onrender.com");
+      // X-Forwarded-Proto preserved (edge already set it).
+      expect(body.forwardedProto).toBe("https");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("synthesizes X-Forwarded-Proto when edge didn't set it (direct HTTPS to hub)", async () => {
+    // Non-Render shape: hub bound directly to https (e.g. local TLS or a
+    // proxy that doesn't set X-Forwarded-Proto). isHttpsRequest sees the
+    // URL's https scheme; proxyRequest synthesizes X-Forwarded-Proto.
+    const h = makeHarness();
+    const upstream = startUpstream("hdr-test");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const incoming = new Request("https://hub.example.com/vault/default/health", {
+        headers: { host: "hub.example.com" },
+      });
+      const res = await fetcher(incoming);
+      const body = (await res.json()) as { forwardedHost: string; forwardedProto: string };
+      expect(body.forwardedHost).toBe("hub.example.com");
+      expect(body.forwardedProto).toBe("https");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
 
   test("proxies a /vault/<name>/* request to the matching upstream", async () => {
     const h = makeHarness();
