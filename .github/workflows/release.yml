@@ -65,6 +65,11 @@ jobs:
         run: bun run typecheck
       - name: hub tests
         run: bun test ./src
+      - name: scope-guard tests
+        # Run both suites regardless of tag prefix — small extra cost (~1s)
+        # for the safety of catching scope-guard regressions before
+        # publishing scope-guard.
+        run: bun test ./packages/scope-guard/src
 
   publish-hub-npm:
     name: publish hub to npm
@@ -132,7 +137,10 @@ jobs:
       id-token: write
     defaults:
       run:
-        # All shell steps run from the scope-guard package dir.
+        # All shell steps default to the scope-guard package dir. Steps
+        # that need to run from the repo root explicitly override
+        # `working-directory: ${{ github.workspace }}` (e.g. the workspace
+        # install below).
         working-directory: packages/scope-guard
     steps:
       - uses: actions/checkout@v4
@@ -145,9 +153,9 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
       - name: install deps
-        # Install at workspace root so hoisted deps resolve; scope-guard
-        # is a workspace package.
-        working-directory: .
+        # Install at workspace root so hoisted deps resolve. Override the
+        # job's default working-directory.
+        working-directory: ${{ github.workspace }}
         run: bun install --frozen-lockfile
       - name: verify package.json version matches tag
         run: |
