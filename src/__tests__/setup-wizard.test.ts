@@ -2254,10 +2254,13 @@ describe("typed vault name (hub#267)", () => {
       await new Promise((r) => setTimeout(r, 50));
       const vaultSpawn = spawnRequests.find((s) => s.short === "vault");
       expect(vaultSpawn).toBeDefined();
-      // No env override on the default-name path (vault's
+      // No PARACHUTE_VAULT_NAME override on the default-name path (vault's
       // resolveFirstBootVaultName already defaults to "default" when the
-      // env var is absent, so the override would be redundant).
-      expect(vaultSpawn?.env).toBeUndefined();
+      // env var is absent). PORT is set by the supervisor (hub#356) for
+      // every supervised child regardless — assert the empty-name path
+      // doesn't add PARACHUTE_VAULT_NAME.
+      expect(vaultSpawn?.env?.PARACHUTE_VAULT_NAME).toBeUndefined();
+      expect(vaultSpawn?.env?.PORT).toBe("1940");
     } finally {
       db.close();
     }

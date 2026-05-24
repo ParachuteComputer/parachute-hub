@@ -1005,6 +1005,44 @@ describe("well-known regen after module ops", () => {
     expect(doc.vaults.some((v) => v.name === "default")).toBe(true);
   });
 
+  test("runInstall sets PORT in child env from services.json entry (hub#356)", async () => {
+    // Container deploys (Render / etc.) set PORT in hub's env via the
+    // Dockerfile / platform. Without explicit override at spawn time, every
+    // supervised child inherits hub's PORT via `env: process.env` and tries
+    // to bind hub's own port — EADDRINUSE → crashloop → supervisor gives up.
+    // Regression guard: the spawn captures the child's services.json port.
+    const { supervisor, spawns } = makeIdleSupervisor();
+    const { run } = alwaysOkRun();
+    const wkPath = join(h.dir, "well-known.json");
+    const install = fakeInstall("@openparachute/vault", {
+      name: "vault",
+      manifestName: "parachute-vault",
+      port: 1940,
+      paths: ["/vault/default"],
+      health: "/vault/default/health",
+    });
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const deps = {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      supervisor,
+      run,
+      findGlobalInstall: install.findGlobalInstall,
+      readModuleManifest: install.readModuleManifest,
+      wellKnownPath: wkPath,
+    };
+    await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      deps,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(spawns.length).toBe(1);
+    expect(spawns[0]?.env?.PORT).toBe("1940");
+  });
+
   test("runInstall failure: bun add fails -> no well-known regen (no partial state)", async () => {
     const { supervisor } = makeIdleSupervisor();
     const wkPath = join(h.dir, "well-known.json");

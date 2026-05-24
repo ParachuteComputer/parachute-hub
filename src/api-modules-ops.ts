@@ -401,11 +401,23 @@ async function spawnSupervised(
   if (!entry) return undefined;
   const cmd = spec.startCmd?.(entry);
   if (!cmd || cmd.length === 0) return undefined;
+  // PORT override (hub#356): in container deploys, hub binds its own port
+  // via the PORT env var (Render sets PORT=$PORT, Dockerfile defaults to
+  // 1939). Bun.spawn's `env: process.env` propagates that PORT to every
+  // supervised child — so vault (which reads `process.env.PORT` in
+  // server.ts:230) tries to bind hub's port and crashes EADDRINUSE.
+  // Explicitly override with the child's services.json port so children
+  // honor their canonical port assignment regardless of hub's PORT.
+  // `deps.spawnEnv` still wins (test seam + first-boot vault-name pass-through).
+  const childEnv: Record<string, string> = {
+    PORT: String(entry.port),
+    ...(deps.spawnEnv ?? {}),
+  };
   const req: SpawnRequest = {
     short,
     cmd,
     ...(entry.installDir ? { cwd: entry.installDir } : {}),
-    ...(deps.spawnEnv && Object.keys(deps.spawnEnv).length > 0 ? { env: deps.spawnEnv } : {}),
+    env: childEnv,
   };
   return deps.supervisor.start(req);
 }
