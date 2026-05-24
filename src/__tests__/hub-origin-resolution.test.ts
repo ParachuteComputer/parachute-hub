@@ -117,6 +117,56 @@ describe("resolveIssuer — precedence chain", () => {
     // Pass 3 — back to request origin.
     expect(resolveIssuer(req(baseUrl), db, undefined)).toBe("http://127.0.0.1:1939");
   });
+
+  test("X-Forwarded-Proto: https upgrades the request-origin fallback", () => {
+    // Render / Tailscale Funnel / cloudflared terminate TLS at the edge
+    // and forward plain HTTP. Without honoring the header, hub publishes
+    // `http://...` in OAuth discovery — mixed-content blocked when the
+    // page loaded over https://. See hub#355 (the notes app's
+    // /oauth/register call surfaced this).
+    const r = new Request("http://parachute-hub.onrender.com/.well-known/oauth-authorization-server", {
+      method: "GET",
+      headers: { "X-Forwarded-Proto": "https" },
+    });
+    expect(resolveIssuer(r, db, undefined)).toBe("https://parachute-hub.onrender.com");
+  });
+
+  test("X-Forwarded-Proto with comma-separated values takes the first", () => {
+    // Multi-hop proxies append; the leftmost is the original client → edge
+    // hop. RFC-style parsing (consistent with isHttpsRequest).
+    const r = new Request("http://hub.internal/oauth/token", {
+      method: "GET",
+      headers: { "X-Forwarded-Proto": "https, http" },
+    });
+    expect(resolveIssuer(r, db, undefined)).toBe("https://hub.internal");
+  });
+
+  test("missing X-Forwarded-Proto leaves the URL scheme as-is (localhost dev)", () => {
+    // No reverse proxy → no header → keep http for the local-dev shape.
+    // Operators on plain HTTP localhost depend on this.
+    const r = new Request("http://127.0.0.1:1939/oauth/token", { method: "GET" });
+    expect(resolveIssuer(r, db, undefined)).toBe("http://127.0.0.1:1939");
+  });
+
+  test("X-Forwarded-Proto is IGNORED when hub_settings or env wins", () => {
+    // Precedence guard: X-Forwarded-Proto should only affect the
+    // request-origin fallback branch. Explicit operator config
+    // (settings row, env var) always wins as-is, including its scheme.
+    // Without this guard, a future refactor could accidentally let the
+    // header override an operator's deliberate choice.
+    const r = new Request("http://hub.internal/oauth/token", {
+      method: "GET",
+      headers: { "X-Forwarded-Proto": "https" },
+    });
+
+    // Env layer wins, even though the header says https — the env value
+    // is returned verbatim (preserving whatever scheme the operator set).
+    expect(resolveIssuer(r, db, "http://configured.example")).toBe("http://configured.example");
+
+    // Settings layer wins above env, also verbatim.
+    setHubOrigin(db, "http://settings.example");
+    expect(resolveIssuer(r, db, "https://env.example")).toBe("http://settings.example");
+  });
 });
 
 describe("resolveIssuerSource — attribution for SPA", () => {

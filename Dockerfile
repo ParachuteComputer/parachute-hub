@@ -130,10 +130,12 @@ ENV PARACHUTE_HOME=/parachute \
     NODE_ENV=production
 
 # Pre-create the persistent-disk mount point AND the BUN_INSTALL subdir,
-# then hand both to the non-root `bun` user (uid 1000). The runtime
-# entrypoint script chowns /parachute idempotently to handle disks that
-# were created before this line existed (Render persistent disks
-# preserve ownership across deploys — see hub#349).
+# then hand both to the non-root `bun` user (uid 1000). The image-layer
+# bake is masked by Render's volume mount at runtime — what actually
+# matters is the runtime entrypoint, which recursively chowns
+# /parachute/tmp + /parachute/modules to bun:bun on every start
+# (cheap, idempotent, catches both fresh-disk and broken-state cases —
+# see hub#349 / hub#355).
 RUN mkdir -p /parachute/modules && chown -R bun:bun /parachute
 
 # Render mounts the persistent disk at $PARACHUTE_HOME; declare the volume
@@ -143,7 +145,7 @@ VOLUME ["/parachute"]
 
 EXPOSE 1939
 
-# Copy entrypoint that runs as root → chowns /parachute if needed → drops to bun.
+# Copy entrypoint that runs as root → recursive-chowns bun-write paths → drops to bun.
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
