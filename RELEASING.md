@@ -1,65 +1,74 @@
-# Releasing `@openparachute/hub`
+# Releasing from `parachute-hub`
 
-Releases are automated via [`.github/workflows/release.yml`](./.github/workflows/release.yml). Pushing a git tag triggers CI which:
+This repo publishes TWO npm packages on independent release cadences via [`.github/workflows/release.yml`](./.github/workflows/release.yml):
 
-1. Runs `bun run typecheck` + `bun test ./src`
-2. Publishes to npm (with provenance attestation)
-3. Builds + pushes a container image to `ghcr.io/parachutecomputer/parachute-hub`
+| Package | Tag prefix | Container image |
+|---|---|---|
+| `@openparachute/hub` | `v...` (e.g. `v0.5.13-rc.33`) | yes — `ghcr.io/parachutecomputer/parachute-hub` |
+| `@openparachute/scope-guard` | `scope-guard-v...` (e.g. `scope-guard-v0.4.0`) | no |
+
+Pushing a tag triggers CI which runs `bun run typecheck` + `bun test ./src`, then publishes the package matching the tag prefix.
 
 ## Tag conventions
 
 Per [parachute-patterns governance rule 2](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md):
 
-| Tag shape | Example | npm `dist-tag` | ghcr tags |
+| Tag shape | Example | npm `dist-tag` | ghcr image tags (hub only) |
 |---|---|---|---|
 | `vX.Y.Z-rc.N` | `v0.5.13-rc.33` | `rc` | `:v0.5.13-rc.33`, `:rc` |
 | `vX.Y.Z` | `v0.5.13` | `latest` | `:v0.5.13`, `:stable` |
+| `scope-guard-vX.Y.Z-rc.N` | `scope-guard-v0.4.0-rc.2` | `rc` | — |
+| `scope-guard-vX.Y.Z` | `scope-guard-v0.4.0` | `latest` | — |
 
-The workflow auto-detects rc vs stable from the tag string (`-rc.` substring).
+The workflow auto-detects rc vs stable from the `-rc.` substring in the tag.
 
 ## Release flow
 
-### For an rc bump (each code-touching PR merge)
+Per [governance rule 2 (updated 2026-05-24)](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md), PRs do NOT bump version per-commit. Bump + tag together only when you intend to ship.
 
-After your PR merges to `main` with a bumped `rc.N`:
+### Releasing hub
 
 ```sh
 git fetch && git checkout main && git pull --ff-only
-VERSION="v$(node -p "require('./package.json').version")"
+# Bump the version in ./package.json (rc.N or drop -rc for stable), commit, push.
+VERSION="v$(bun -e "console.log(require('./package.json').version)")"
 git tag "$VERSION"
 git push origin "$VERSION"
 ```
 
-CI takes over from there — watch the run at [Actions](https://github.com/ParachuteComputer/parachute-hub/actions).
+CI takes over — watch the run at [Actions](https://github.com/ParachuteComputer/parachute-hub/actions). On success:
+- npm gets the new version with appropriate dist-tag
+- ghcr gets a new image at `:vX.Y.Z` plus `:rc` or `:stable`
+
+### Releasing scope-guard
+
+```sh
+git fetch && git checkout main && git pull --ff-only
+# Bump the version in ./packages/scope-guard/package.json, commit, push.
+VERSION="scope-guard-v$(bun -e "console.log(require('./packages/scope-guard/package.json').version)")"
+git tag "$VERSION"
+git push origin "$VERSION"
+```
+
+The hub package is NOT republished. scope-guard runs on its own cadence.
 
 ### Promoting an rc chain to stable
 
-When the rc chain is ready to release:
-
-1. Open a PR that drops the `-rc.N` suffix from `package.json` (e.g. `0.5.13-rc.33` → `0.5.13`).
-2. Reviewer + merge as usual.
-3. Tag the merged commit with the bare version: `git tag v0.5.13 && git push origin v0.5.13`.
-4. CI publishes with `dist-tag=latest` and `ghcr` tag `:stable`.
+Open a PR (or commit directly) that drops the `-rc.N` suffix from the relevant `package.json`, merge, then tag the bare version. CI publishes with `dist-tag=latest`.
 
 ### Doc-only PRs
 
-Per governance, doc-only PRs are EXEMPT from rc.N bumping — they merge without a version bump and get picked up by the next code-touching PR's rc bump (or by the stable promotion, whichever comes first). Don't fragment a release into many patch bumps mid-validation.
-
-If you DO need to ship a doc-only fix outside an active rc chain (i.e. main is on a stable version with no rc.N in flight), bump the next patch (`0.5.13` → `0.5.14`), tag, ship.
+Per governance, doc-only PRs DO NOT bump version. They merge straight to main; the changes get folded into whatever the next ship-driven version bump captures.
 
 ## One-time setup (operator)
 
 Before the workflow can publish, this repo needs:
 
-1. **npm Trusted Publisher**: log into npmjs.com → package `@openparachute/hub` → Settings → Trusted Publishers → "Add a new publisher" → choose **GitHub Actions**. Fill:
-   - Organization: `ParachuteComputer`
-   - Repository name: `parachute-hub`
-   - Workflow filename: `release.yml`
-   - Environment name: (leave blank)
+1. **npm Trusted Publishers — one per published package**:
+   - npmjs.com → `@openparachute/hub` → Settings → Trusted Publishers → add GitHub Actions: `ParachuteComputer` / `parachute-hub` / `release.yml` / env blank
+   - npmjs.com → `@openparachute/scope-guard` → same Trusted Publisher (same org/repo/workflow/env)
 
-   No `NPM_TOKEN` secret needed — the workflow uses OIDC.
-
-   `@openparachute/scope-guard` ships from this same repo but **this workflow does not publish it today** — scope-guard's CI publish path is a follow-up (independent release cadence, separate tag-prefix convention). A Trusted Publisher rule for scope-guard pointing at `release.yml` is harmless (it just won't ever fire under this workflow) but unnecessary until that follow-up lands.
+   Both rules point at the SAME workflow file. The jobs gate on tag prefix to decide which package to publish. No `NPM_TOKEN` secret needed — the workflow uses OIDC.
 
 2. **ghcr.io permissions**: no secret needed — the workflow uses the runner's auto-provisioned `GITHUB_TOKEN`. First push of the image will create the package as **private by default**. After that first push, go to [package settings](https://github.com/orgs/ParachuteComputer/packages/container/parachute-hub/settings) → "Change visibility" → **Public**. Until you do this, any deploy target that pulls the image (Render, etc.) will 403 on `docker pull` unless you supply a `GHCR_PAT` read token. Doing it once at first-push time is the simplest path.
 
@@ -69,8 +78,9 @@ Before the workflow can publish, this repo needs:
 # npm
 npm view @openparachute/hub@<version> dist.tarball
 npm view @openparachute/hub dist-tags
+npm view @openparachute/scope-guard dist-tags
 
-# ghcr
+# ghcr (hub only)
 docker pull ghcr.io/parachutecomputer/parachute-hub:<tag>
 docker inspect ghcr.io/parachutecomputer/parachute-hub:<tag> | jq '.[].Config.Labels'
 ```
@@ -91,8 +101,9 @@ There's no "unpublish" path for either npm (npm has a strict 72-hour unpublish p
 
 ## Troubleshooting
 
-- **Workflow doesn't trigger**: confirm the tag matches the workflow's `on.push.tags` pattern (`v[0-9]+.[0-9]+.[0-9]+` or `v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+`).
-- **`version mismatch` error in publish-npm**: package.json version differs from the tag. Re-tag the correct commit.
+- **Workflow doesn't trigger**: confirm the tag matches one of the patterns in `on.push.tags` (hub: `v[0-9]+...`; scope-guard: `scope-guard-v[0-9]+...`).
+- **`version mismatch` error in publish-npm**: the relevant `package.json` version differs from the tag. Re-tag the correct commit, or fix the version in `package.json`.
 - **`npm ERR! 403 You do not have permission to publish`**: Trusted Publisher rule on npm doesn't match this workflow. Verify org/repo/workflow filename are exactly `ParachuteComputer` / `parachute-hub` / `release.yml`. If the workflow file was renamed, the rule needs updating on npm.
 - **`npm ERR! 401 Unauthorized` with no OIDC token**: the workflow is missing `permissions: id-token: write` at the job level. Verify the YAML.
-- **ghcr push fails with 403**: confirm `permissions.packages: write` is in the workflow (it is).
+- **ghcr push fails with 403**: confirm `permissions.packages: write` is in the publish-image job (it is).
+- **Two publish jobs running for the same tag**: the `if:` gates filter by `startsWith(github.ref_name, 'scope-guard-')` — verify the tag matches exactly one prefix.

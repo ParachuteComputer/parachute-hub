@@ -1,38 +1,49 @@
 # Release workflow — triggered by pushing a semver tag.
 #
+# This workflow publishes TWO packages on different tag namespaces:
+#
+#   - @openparachute/hub          ← tag prefix `v...`            (e.g. v0.5.13-rc.33)
+#   - @openparachute/scope-guard  ← tag prefix `scope-guard-v...` (e.g. scope-guard-v0.4.0-rc.2)
+#
+# Both packages have npm Trusted Publisher rules pointing at this workflow
+# file. The jobs below gate on the tag prefix so only one package publishes
+# per tag push. Independent release cadences; hub doesn't have to bump when
+# scope-guard ships and vice versa.
+#
 # Tag conventions (matches parachute-patterns governance rule 2):
 #   - rc:     v<X>.<Y>.<Z>-rc.<N>   (e.g. v0.5.13-rc.33)
+#                                    (scope-guard-v0.4.0-rc.2)
 #   - stable: v<X>.<Y>.<Z>          (e.g. v0.5.13)
+#                                    (scope-guard-v0.4.0)
 #
 # Release flow:
-#   1. Code-touching PR merges to main, bumping `version` in package.json
-#      (rc.N → rc.N+1 for the rc chain; or drop -rc.N suffix for stable).
-#   2. After merge, push a matching tag:
-#        git tag v$(grep '"version"' package.json | cut -d'"' -f4) && git push --tags
-#   3. CI runs tests, then publishes in parallel to:
-#        - npm        (with provenance attestation, dist-tag = rc or latest)
-#        - ghcr.io    (multi-tagged: :rc / :stable / :vX.Y.Z[-rc.N])
+#   1. When ready to ship: bump version in the relevant package.json on main
+#      (root for hub, packages/scope-guard/ for scope-guard).
+#   2. Push a matching tag:
+#        # for hub
+#        git tag v$(bun -e "console.log(require('./package.json').version)") && git push --tags
+#        # for scope-guard
+#        git tag scope-guard-v$(bun -e "console.log(require('./packages/scope-guard/package.json').version)") && git push --tags
+#   3. CI runs tests once (workspace-wide), then publishes the package matching
+#      the tag prefix. Hub also publishes a container image to ghcr.io.
 #
-# Operator setup (one-time) — see RELEASING.md for the full walkthrough:
-#   - npm Trusted Publisher: npmjs.com → @openparachute/hub → Settings →
-#     Trusted Publishers → add GitHub Actions rule (org=ParachuteComputer,
-#     repo=parachute-hub, workflow=release.yml, env blank). OIDC-based;
-#     no NPM_TOKEN secret needed.
+# Operator setup (one-time) — see RELEASING.md:
+#   - npm Trusted Publisher rules: one per package (hub, scope-guard).
+#     Both rules point at: org=ParachuteComputer, repo=parachute-hub,
+#     workflow=release.yml, env blank.
 #   - ghcr.io needs no secret (uses the runner's GITHUB_TOKEN).
-#
-# Why tag-triggered (not push-to-main):
-#   - tag = explicit release signal; main commits without a tag don't publish.
-#   - Preserves a deliberate gate (you push the tag when you mean to ship).
-#   - Tag-as-canonical means the tag itself is the audit trail of what was
-#     released and when.
 
 name: Release
 
 on:
   push:
     tags:
+      # Hub release tags
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+      # scope-guard release tags
+      - 'scope-guard-v[0-9]+.[0-9]+.[0-9]+'
+      - 'scope-guard-v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
 
 concurrency:
   # Don't let two releases race on the same tag.
@@ -55,9 +66,11 @@ jobs:
       - name: hub tests
         run: bun test ./src
 
-  publish-npm:
-    name: publish to npm
+  publish-hub-npm:
+    name: publish hub to npm
     needs: test
+    # Hub-only: skip on scope-guard tags.
+    if: ${{ !startsWith(github.ref_name, 'scope-guard-') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -108,9 +121,58 @@ jobs:
           echo "publishing with dist-tag=$DIST_TAG"
           npm publish --tag "$DIST_TAG" --access public --provenance
 
+  publish-scope-guard-npm:
+    name: publish scope-guard to npm
+    needs: test
+    # scope-guard-only: skip on hub (`v*`) tags.
+    if: ${{ startsWith(github.ref_name, 'scope-guard-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        # All shell steps run from the scope-guard package dir.
+        working-directory: packages/scope-guard
+    steps:
+      - uses: actions/checkout@v4
+        # checkout has no working-directory option; runs from repo root.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: install deps
+        # Install at workspace root so hoisted deps resolve; scope-guard
+        # is a workspace package.
+        working-directory: .
+        run: bun install --frozen-lockfile
+      - name: verify package.json version matches tag
+        run: |
+          PKG_VERSION=$(bun -e "console.log(require('./package.json').version)")
+          # Strip the `scope-guard-v` prefix from the tag.
+          TAG_VERSION="${GITHUB_REF_NAME#scope-guard-v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::packages/scope-guard/package.json version ($PKG_VERSION) doesn't match tag ($TAG_VERSION)"
+            exit 1
+          fi
+      - name: publish
+        run: |
+          if [[ "$GITHUB_REF_NAME" =~ -rc\. ]]; then
+            DIST_TAG=rc
+          else
+            DIST_TAG=latest
+          fi
+          echo "publishing @openparachute/scope-guard with dist-tag=$DIST_TAG"
+          npm publish --tag "$DIST_TAG" --access public --provenance
+
   publish-image:
     name: publish to ghcr.io
     needs: test
+    # Hub-only: scope-guard doesn't ship a container image.
+    if: ${{ !startsWith(github.ref_name, 'scope-guard-') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
