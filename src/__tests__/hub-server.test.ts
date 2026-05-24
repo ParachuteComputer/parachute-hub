@@ -80,13 +80,24 @@ describe("hubFetch routing", () => {
     // hub#259 rc.6: requires an admin row to bypass the fresh-hub
     // funnel redirect to /admin/setup (Bug 2 fix). Seed one so this
     // test continues to exercise the signed-out-but-setup-done branch.
+    //
+    // Hub also funnels to /admin/setup when no vault is installed
+    // (env-seed case). Pass an explicit manifestPath + seed a vault row
+    // so the funnel sees an installed vault and lets the discovery page
+    // render. Without this, the manifestPath default falls back to
+    // `~/.parachute/services.json` — which works on a dev box with an
+    // installed vault but fails in CI with a 302 wizard redirect.
     const h = makeHarness();
     try {
+      writeManifest({ services: [vaultEntry("default")] }, h.manifestPath);
       const db = openHubDb(hubDbPath(h.dir));
       try {
         const { createUser } = await import("../users.ts");
         await createUser(db, "owner", "pw");
-        const res = await hubFetch(h.dir, { getDb: () => db })(req("/"));
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          manifestPath: h.manifestPath,
+        })(req("/"));
         expect(res.status).toBe(200);
         expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
         const body = await res.text();
@@ -102,8 +113,12 @@ describe("hubFetch routing", () => {
   });
 
   test("/ renders 'Signed in as <name>' + sign-out form when session cookie is active (rc.13)", async () => {
+    // Same wizard-funnel bypass as the signed-out test above — seed a
+    // vault row and pass an explicit manifestPath so CI doesn't fall back
+    // to ~/.parachute/services.json.
     const h = makeHarness();
     try {
+      writeManifest({ services: [vaultEntry("default")] }, h.manifestPath);
       const db = openHubDb(hubDbPath(h.dir));
       try {
         const { createUser } = await import("../users.ts");
@@ -113,7 +128,10 @@ describe("hubFetch routing", () => {
         const user = await createUser(db, "aaron", "pw");
         const session = createSession(db, { userId: user.id });
         const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
-        const res = await hubFetch(h.dir, { getDb: () => db })(req("/", { headers: { cookie } }));
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          manifestPath: h.manifestPath,
+        })(req("/", { headers: { cookie } }));
         expect(res.status).toBe(200);
         const body = await res.text();
         expect(body).toContain("Signed in as");
