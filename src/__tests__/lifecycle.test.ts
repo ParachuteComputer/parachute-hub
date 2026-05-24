@@ -342,7 +342,10 @@ describe("parachute start", () => {
         log: () => {},
       });
       expect(code).toBe(0);
+      // PORT is always set by `parachute start` (hub#356) from the
+      // services.json entry. PARACHUTE_HUB_ORIGIN comes from expose-state.
       expect(spawner.calls[0]?.env).toEqual({
+        PORT: "1940",
         PARACHUTE_HUB_ORIGIN: "https://parachute.taildf9ce2.ts.net",
       });
     } finally {
@@ -364,6 +367,7 @@ describe("parachute start", () => {
       });
       expect(code).toBe(0);
       expect(spawner.calls[0]?.env).toEqual({
+        PORT: "1940",
         PARACHUTE_HUB_ORIGIN: "http://127.0.0.1:1939",
       });
     } finally {
@@ -398,6 +402,7 @@ describe("parachute start", () => {
       });
       expect(code).toBe(0);
       expect(spawner.calls[0]?.env).toEqual({
+        PORT: "1940",
         PARACHUTE_HUB_ORIGIN: "https://override.example.com",
       });
     } finally {
@@ -417,7 +422,11 @@ describe("parachute start", () => {
         log: () => {},
       });
       expect(code).toBe(0);
-      expect(spawner.calls[0]?.env).toBeUndefined();
+      // PORT is always set (hub#356) — even with no override, no exposure,
+      // and no hub.port file, the spawn env carries the canonical PORT
+      // from services.json. Test renamed from "omits env" to reflect
+      // the new minimum-env shape.
+      expect(spawner.calls[0]?.env).toEqual({ PORT: "1940" });
     } finally {
       h.cleanup();
     }
@@ -453,6 +462,7 @@ describe("parachute start", () => {
       });
       expect(code).toBe(0);
       expect(spawner.calls[0]?.env).toEqual({
+        PORT: "1943",
         GROQ_API_KEY: "gsk_real_value",
         QUOTED: "quoted_val",
       });
@@ -483,6 +493,7 @@ describe("parachute start", () => {
       });
       expect(code).toBe(0);
       expect(spawner.calls[0]?.env).toEqual({
+        PORT: "1940",
         SCRIBE_AUTH_TOKEN: "secret",
         PARACHUTE_HUB_ORIGIN: "https://live.example.com",
       });
