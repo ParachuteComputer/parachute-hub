@@ -25,7 +25,7 @@ chown bun:bun /parachute/tmp
 # binary symlinks here during `bun add -g`; without this, the first
 # install fails to mkdir and EACCES surfaces. See hub#349.
 mkdir -p /parachute/modules/bin
-chown bun:bun /parachute/modules/bin
+chown -R bun:bun /parachute/modules/bin
 
 # Drop privileges + run hub. gosu does this safely (forwards signals,
 # preserves process tree under tini).

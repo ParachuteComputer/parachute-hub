@@ -66,6 +66,18 @@ services:
       - key: BUN_INSTALL
         value: /parachute/modules
 
+      # BUN_INSTALL_BIN — where bun puts binary symlinks during
+      # `bun add -g`. Bun's BUN_INSTALL only controls PACKAGE location;
+      # bin symlinks default to /usr/local/bin/ (system path, not
+      # writable by the non-root `bun` user). Pinning to
+      # /parachute/modules/bin makes installs land on the persistent
+      # disk + survive container restarts. Without this, every
+      # `bun add -g` fails with EACCES at symlinkat() to /usr/local/bin/.
+      # The Dockerfile also extends PATH to include this dir so hub +
+      # child processes resolve the installed binaries. See hub#349.
+      - key: BUN_INSTALL_BIN
+        value: /parachute/modules/bin
+
       # Modules installed via admin SPA cascade to this channel by
       # default. `latest` is the right default for most operators
       # (stable releases of vault / app / scribe / runner). Flip to
