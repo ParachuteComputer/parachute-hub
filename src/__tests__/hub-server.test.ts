@@ -1493,6 +1493,83 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
     }
   });
 
+  test("synthesizes X-Forwarded-Proto=http when neither edge nor URL signal HTTPS", async () => {
+    // Plain-HTTP path: no edge, no https URL scheme. isHttpsRequest returns
+    // false; proxyRequest synthesizes "http". This is local-dev shape.
+    const h = makeHarness();
+    const upstream = startUpstream("hdr-test");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const incoming = new Request("http://127.0.0.1:1939/vault/default/health", {
+        headers: { host: "127.0.0.1:1939" },
+      });
+      const res = await fetcher(incoming);
+      const body = (await res.json()) as { forwardedProto: string };
+      expect(body.forwardedProto).toBe("http");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("preserves X-Forwarded-Host when edge already set it (nested-proxy chain)", async () => {
+    // Multi-hop chain: client → edge proxy → hub → upstream. Edge captures
+    // the original host as X-Forwarded-Host before its own host-rewrite;
+    // hub MUST preserve that, not overwrite with its own incoming Host
+    // (which may be the edge's hostname). "Don't clobber" semantics.
+    const h = makeHarness();
+    const upstream = startUpstream("hdr-test");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      // Edge already labeled the canonical hop: original-client.example
+      // (this is what an HTTPS termination proxy in front of hub would set).
+      const incoming = new Request("http://edge.local/vault/default/health", {
+        headers: {
+          host: "edge.local",
+          "x-forwarded-host": "original-client.example",
+          "x-forwarded-proto": "https",
+        },
+      });
+      const res = await fetcher(incoming);
+      const body = (await res.json()) as { forwardedHost: string; forwardedProto: string };
+      // Edge's X-Forwarded-Host preserved verbatim, NOT clobbered by the
+      // edge.local Host that hub itself saw.
+      expect(body.forwardedHost).toBe("original-client.example");
+      expect(body.forwardedProto).toBe("https");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
   test("proxies a /vault/<name>/* request to the matching upstream", async () => {
     const h = makeHarness();
     const upstream = startUpstream("default-vault");

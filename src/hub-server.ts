@@ -972,11 +972,16 @@ export function resolveIssuer(
   // The `isHttpsRequest` helper is the canonical place where this trust
   // is established (also used for the Secure cookie attribute).
   //
-  // We do NOT honor X-Forwarded-Host. Render, Tailscale Funnel, and
-  // cloudflared all preserve the Host header end-to-end, so `req.url`'s
-  // host already reflects the public hostname. Operators on a proxy that
-  // rewrites Host (some nginx / Caddy configs) should set hub_origin via
-  // the admin SPA — that path bypasses this fallback entirely.
+  // We do NOT honor X-Forwarded-Host *for hub's own issuer derivation*.
+  // (Note: hub DOES forward X-Forwarded-Host to upstream supervised
+  // modules in `proxyRequest` — that's a separate concern, see #358.
+  // Here we're deriving hub's own canonical origin from the incoming
+  // request, not what to tell downstream services.) Render, Tailscale
+  // Funnel, and cloudflared all preserve the Host header end-to-end,
+  // so `req.url`'s host already reflects the public hostname.
+  // Operators on a proxy that rewrites Host (some nginx / Caddy
+  // configs) should set hub_origin via the admin SPA — that path
+  // bypasses this fallback entirely.
   const url = new URL(req.url);
   if (isHttpsRequest(req)) {
     url.protocol = "https:";
