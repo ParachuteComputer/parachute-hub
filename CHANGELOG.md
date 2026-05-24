@@ -2,6 +2,41 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.34] - 2026-05-24
+
+**fix(hub): Render container deploy now fully functional end-to-end + tag-triggered release CI.**
+
+The rc.29 → rc.34 chain closed the remaining bugs surfaced by live SSH-in-Render-deploy debugging (each fix unblocked the next reachable bug). Versions rc.29–rc.33 never published to npm (some were CI failures, others were intermediate work under the old "every PR bumps rc.N" policy). rc.34 is the published rollup.
+
+### Fixed
+
+- **`/parachute/modules` ownership bug** (hub#355). After all the env-var fixes shipped in rc.28, the wizard install STILL failed with `error: An internal error occurred (AccessDenied)`. Root cause via live SSH: docker-entrypoint.sh ran `mkdir -p /parachute/modules/bin` AS ROOT, creating `/parachute/modules/` parent dir as root-owned. The subsequent `chown -R bun:bun /parachute/modules/bin` only fixed the leaf. The parent stayed `drwxr-sr-x root:bun` permanently. Bun-user couldn't create `/parachute/modules/install/` → AccessDenied. Fix: drop the conditional chown shortcut; always `chown -R bun:bun /parachute/tmp /parachute/modules` on every start.
+
+- **OAuth discovery published `http://` URLs over HTTPS** (hub#355). The notes app's `/oauth/register` call was blocked by browser Mixed Content because hub's discovery doc carried `http://parachute-hub.onrender.com/...` even though the page loaded over HTTPS. Render terminates TLS at the edge and forwards plain HTTP to hub; `req.url.origin` was `http://`. Fix: `resolveIssuer` now uses the existing `isHttpsRequest()` helper (which honors `X-Forwarded-Proto`) and upgrades the URL scheme to https when appropriate.
+
+- **Supervised modules inherited hub's PORT** (hub#356, hub#357). Once the wizard install completed for the first time, vault crashed immediately with `EADDRINUSE on port 1939` (hub's port). Render injects `PORT=1939` into the container env; Bun.spawn's `env: process.env` propagates that PORT to every supervised child. Vault reads `process.env.PORT` first → tries to bind hub's port. Fix: explicit `PORT: String(entry.port)` injection at all three spawn sites — `spawnSupervised`, `lifecycle.start`, `bootSupervisedModules`. Scribe was affected too; app + runner ignored PORT and escaped by coincidence.
+
+- **Reverse proxy didn't forward `X-Forwarded-*` to children** (hub#358). After all PORT fixes landed, vault's OAuth metadata still published loopback URLs as the issuer (`http://127.0.0.1:1940/vault/default`) when fetched via the hub proxy. Vault's `getBaseUrl` correctly honors `X-Forwarded-Host` / `X-Forwarded-Proto` — but hub's `proxyRequest` deleted Host without setting `X-Forwarded-Host`. Fix: capture Host before deleting, then `headers.set('x-forwarded-host', publicHost)`; also synthesize `X-Forwarded-Proto` from `isHttpsRequest` when the edge didn't already set it. Preserve already-set forwarded headers for nested proxy chains.
+
+### Added
+
+- **Tag-triggered release CI** (hub#359, hub#360, hub#361). `.github/workflows/release.yml` ships hub via npm Trusted Publishing (OIDC, no `NPM_TOKEN`) + ghcr.io container image on tag push. Tag patterns: `v[X.Y.Z][-rc.N]` publishes hub; `scope-guard-v[X.Y.Z][-rc.N]` publishes the workspace's scope-guard package on independent cadence. `RELEASING.md` documents both flows + one-time Trusted Publisher setup. Uses node 24 (npm 11.5+ required for OIDC). Image lands on `ghcr.io/parachutecomputer/parachute-hub` with tags `:rc` / `:stable` / `:vX.Y.Z[-rc.N]`.
+
+- **Test hermeticity fix** (hub#362). Two tests in hub-server.test.ts depended on the host machine's `~/.parachute/services.json` having a vault row to bypass the wizard-funnel redirect. CI has no such file → 302 → test fail. Fix: both tests now `writeManifest({ services: [vaultEntry("default")] })` and pass explicit `manifestPath`. Now hermetic in any environment.
+
+### Patterns check
+
+- New cross-cutting pattern doc: [`parachute-patterns/patterns/bun-container-deploy.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/bun-container-deploy.md) — codifies the four env-var requirements + `Bun.spawn` env-inheritance gotcha + the three load-bearing pitfalls (`mkdir`-as-root, platform-injected `PORT`, reverse-proxy header forwarding) for any future bun-based module deployed to a container + persistent-disk setup.
+- New release pattern doc: [`parachute-patterns/patterns/release-ci.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/release-ci.md) — canonical workflow shape used here + rolled out to vault / scribe / app / runner / notes.
+- [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md) Rule 2 updated 2026-05-24: PRs no longer bump rc.N per-commit. Bump + tag together only when shipping.
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src`: 1932 pass / 0 fail (3 new tests added across this chain, 1 test made hermetic).
+- Live verification on Aaron's fresh Render deploy: hub running as bun user (PID 7), vault + app + scribe all spawned, OAuth discovery publishes `https://parachute-hub.onrender.com/...` across all 5 endpoints, `/oauth/register` returns 201, vault's OAuth metadata via hub-proxied URL correctly shows `https://parachute-hub.onrender.com/vault/default` as issuer.
+- First CI publish of rc.34: ✅ test + publish-npm + publish-image all green; npm `@rc` dist-tag now at 0.5.13-rc.34; ghcr image published.
+
 ## [0.5.13-rc.28] - 2026-05-24
 
 **fix(hub): Render install EACCES finally resolved + drop `PARACHUTE_HUB_ORIGIN` prompt + tini `-g` signal forwarding.**
