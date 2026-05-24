@@ -120,9 +120,14 @@ jobs:
           done
 
       - name: smoke /health
+        # Health body shape (as of rc.34):
+        #   {"status":"ok","service":"parachute-hub","version":"0.5.13-rc.34"}
+        # We check the status field is "ok" and the service field identifies hub.
+        # Don't pin the full body — version drifts on every release.
         run: |
           curl -fs http://127.0.0.1:1939/health | tee /tmp/health.json
-          [ "$(cat /tmp/health.json)" = '{"status":"ok"}' ] || (echo "::error::unexpected /health body" && exit 1)
+          grep -q '"status":"ok"' /tmp/health.json || (echo "::error::/health doesn't say status=ok" && exit 1)
+          grep -q '"service":"parachute-hub"' /tmp/health.json || (echo "::error::/health doesn't identify as parachute-hub" && exit 1)
 
       - name: smoke OAuth discovery (HTTPS upgrade via X-Forwarded-Proto)
         # hub#355 (resolveIssuer X-Forwarded-Proto fix). Hub behind a TLS-
