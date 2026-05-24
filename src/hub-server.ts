@@ -418,9 +418,28 @@ async function proxyRequest(
   const path = targetPath ?? url.pathname;
   const upstream = `http://127.0.0.1:${port}${path}${url.search}`;
   const headers = new Headers(req.headers);
+  // Capture the public hostname BEFORE deleting Host so we can forward it
+  // as X-Forwarded-Host (hub#358). Without this, supervised modules like
+  // vault see no X-Forwarded-Host header and fall back to their internal
+  // loopback URL when constructing OAuth metadata — publishing
+  // `http://127.0.0.1:1940/...` as the issuer instead of the public origin.
+  const publicHost = req.headers.get("host");
   // Host comes from the requester (tailnet FQDN); the loopback target wants
   // its own. Bun's fetch fills it in when omitted.
   headers.delete("host");
+  // Forward the public origin so downstream services build their public-
+  // facing URLs (OAuth metadata, redirect URIs) against the same host the
+  // client used. We DON'T overwrite X-Forwarded-Host if already set —
+  // some platforms (Render) set it at the edge.
+  if (publicHost && !headers.has("x-forwarded-host")) {
+    headers.set("x-forwarded-host", publicHost);
+  }
+  // Same for protocol — if the edge set X-Forwarded-Proto we preserve it,
+  // otherwise we set it from isHttpsRequest's signal (direct HTTPS to hub
+  // is unusual on Render, but covers local TLS-terminating proxies too).
+  if (!headers.has("x-forwarded-proto")) {
+    headers.set("x-forwarded-proto", isHttpsRequest(req) ? "https" : "http");
+  }
 
   const init: RequestInit & { duplex?: "half" } = {
     method: req.method,
@@ -953,11 +972,16 @@ export function resolveIssuer(
   // The `isHttpsRequest` helper is the canonical place where this trust
   // is established (also used for the Secure cookie attribute).
   //
-  // We do NOT honor X-Forwarded-Host. Render, Tailscale Funnel, and
-  // cloudflared all preserve the Host header end-to-end, so `req.url`'s
-  // host already reflects the public hostname. Operators on a proxy that
-  // rewrites Host (some nginx / Caddy configs) should set hub_origin via
-  // the admin SPA — that path bypasses this fallback entirely.
+  // We do NOT honor X-Forwarded-Host *for hub's own issuer derivation*.
+  // (Note: hub DOES forward X-Forwarded-Host to upstream supervised
+  // modules in `proxyRequest` — that's a separate concern, see #358.
+  // Here we're deriving hub's own canonical origin from the incoming
+  // request, not what to tell downstream services.) Render, Tailscale
+  // Funnel, and cloudflared all preserve the Host header end-to-end,
+  // so `req.url`'s host already reflects the public hostname.
+  // Operators on a proxy that rewrites Host (some nginx / Caddy
+  // configs) should set hub_origin via the admin SPA — that path
+  // bypasses this fallback entirely.
   const url = new URL(req.url);
   if (isHttpsRequest(req)) {
     url.protocol = "https:";
