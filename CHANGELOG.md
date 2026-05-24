@@ -4,9 +4,11 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 
 ## [0.5.13-rc.28] - 2026-05-24
 
-**fix(hub): drop `PARACHUTE_HUB_ORIGIN` prompt + tini `-g` signal forwarding.**
+**fix(hub): Render install EACCES finally resolved + drop `PARACHUTE_HUB_ORIGIN` prompt + tini `-g` signal forwarding.**
 
-Two coordinated polish fixes to the Render deploy experience. Most operators start by using the Render-assigned `*.onrender.com` URL — surfacing `PARACHUTE_HUB_ORIGIN` as a prompted env var confused operators without a custom domain. Separately, some Render container configurations were emitting `[FATAL tini (1)] Unexpected error when forwarding signal: 'Operation not permitted'` because tini (PID 1, root) couldn't signal the bun child (uid 1000); `tini -g` forwards to the process group instead, which sidesteps the EPERM.
+### Fixed
+
+- **Render install EACCES finally resolved** (closes hub#349 actual root cause). All previous fixes (#350 chown, #351 TMPDIR, #352 spawn env-inheritance, #353 banner) addressed real bugs but missed the load-bearing one: bun's `bun add -g` symlinks binaries to `$BUN_INSTALL_BIN`, which defaults to `/usr/local/bin/` when unset. That system path isn't writable by the non-root `bun` user, so every install failed at `symlinkat()` with EACCES. Fix: `ENV BUN_INSTALL_BIN=/parachute/modules/bin` in the Dockerfile so binaries land on the persistent disk. `PATH` also extended so hub + child processes resolve the installed binaries. Entrypoint pre-creates `/parachute/modules/bin/` and chowns to bun, idempotently. Verified locally by reproducing in a Docker volume mount and stracing the failing syscall — `symlinkat(..., AT_FDCWD, "/usr/local/bin/<binary>") = -1 EACCES`.
 
 ### Changed
 
@@ -15,12 +17,13 @@ Two coordinated polish fixes to the Render deploy experience. Most operators sta
 
 ### Patterns check
 
-- No pattern shifts. Surface polish on the Render deploy first-boot UX (continues the rc.27 arc of "make Render's prompted env vars match what most operators actually need") plus a niche container-config workaround. No changes to hub logic.
+- No pattern shifts. Surface polish on the Render deploy first-boot UX (continues the rc.27 arc of "make Render's prompted env vars match what most operators actually need") plus a niche container-config workaround plus the load-bearing `BUN_INSTALL_BIN` fix that finally closes hub#349. No changes to hub source code.
 
 ### Verification
 
 - `bun run typecheck` clean.
 - `bun test ./src` clean (no `src/` changes).
+- Reproduced the EACCES locally via Docker volume + `bun add -g` + strace; confirmed `BUN_INSTALL_BIN=/parachute/modules/bin` resolves it cleanly for vault, scribe, app, runner.
 
 ## [0.5.13-rc.27] - 2026-05-23
 

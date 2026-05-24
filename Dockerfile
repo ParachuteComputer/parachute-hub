@@ -109,11 +109,24 @@ COPY --from=builder /app/README.md ./README.md
 # EXDEV — the same Render-disk-as-separate-block-device issue that
 # makes operators see "Failed to link: EACCES" on `parachute install`.
 # See hub#349 for the diagnosis trail.
+#
+# BUN_INSTALL_BIN — where bun puts binary symlinks during `bun add -g`.
+# Bun's BUN_INSTALL only controls PACKAGE location; bin symlinks are
+# separate and default to /usr/local/bin/ (system path, not writable
+# by the non-root bun user). Pin to /parachute/modules/bin so binaries
+# land on the persistent disk and survive container restarts. PATH
+# extended so hub + child processes can resolve the installed binaries.
+# Verified locally via `docker volume + strace`: without this var, every
+# `bun add -g` fails with EACCES on symlinkat() to /usr/local/bin/<binary>.
+# Closes hub#349's real root cause (the prior fixes — chown, TMPDIR,
+# env-inheritance — were all real bugs but not THE blocker; this is).
 ENV PARACHUTE_HOME=/parachute \
     PORT=1939 \
     PARACHUTE_BIND_HOST=0.0.0.0 \
     BUN_INSTALL=/parachute/modules \
+    BUN_INSTALL_BIN=/parachute/modules/bin \
     TMPDIR=/parachute/tmp \
+    PATH=/parachute/modules/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     NODE_ENV=production
 
 # Pre-create the persistent-disk mount point AND the BUN_INSTALL subdir,
