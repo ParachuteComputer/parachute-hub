@@ -121,6 +121,27 @@ describe("bootSupervisedModules", () => {
     expect(recorder.calls[0]?.env?.PARACHUTE_HUB_ORIGIN).toBe("https://hub.example");
   });
 
+  test("sets PORT in child env from services.json entry (hub#357)", async () => {
+    // Container deploys (Render etc.) set PORT in hub's process.env via
+    // Dockerfile / platform injection. The supervisor's defaultSpawnFn
+    // passes `env: process.env` so children inherit hub's PORT and try
+    // to bind hub's own port → EADDRINUSE crashloop. This boot path
+    // (called on hub startup to re-spawn supervised modules from
+    // services.json) was missed by hub#356 which only fixed the
+    // install-time + lifecycle paths. Third spawn site, same fix shape.
+    writeManifest({ services: [VAULT_ENTRY] }, h.manifestPath);
+    const recorder = makeRecorder();
+    const sup = new Supervisor({ spawnFn: recorder.spawn });
+
+    await bootSupervisedModules(sup, {
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+    });
+
+    // VAULT_ENTRY's port = 1940 (vault's canonical).
+    expect(recorder.calls[0]?.env?.PORT).toBe("1940");
+  });
+
   test("merges per-module .env file into child env", async () => {
     writeManifest({ services: [VAULT_ENTRY] }, h.manifestPath);
     // Write a per-module .env at <configDir>/<short>/.env — what the
