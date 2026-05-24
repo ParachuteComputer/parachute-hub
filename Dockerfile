@@ -137,7 +137,13 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # DO NOT set USER bun here — the entrypoint runs as root briefly to
 # fix disk ownership, then `exec gosu bun "$@"` drops privileges before
 # hub starts. Tini wraps the whole tree for clean signal forwarding.
-ENTRYPOINT ["/sbin/tini", "--", "docker-entrypoint.sh"]
+#
+# tini -g forwards signals to the process group, not just the immediate
+# child. Works around a Render-specific EPERM where tini (PID 1, root)
+# can't signal the bun child (uid 1000) on some kernel/seccomp configs
+# (`[FATAL tini (1)] Unexpected error when forwarding signal: 'Operation
+# not permitted'`). Group signal forwarding is a common container pattern.
+ENTRYPOINT ["/sbin/tini", "-g", "--", "docker-entrypoint.sh"]
 # `parachute serve` is the container-shape entrypoint: foreground hub, env-
 # driven config, env-driven first-boot admin seed. The bare
 # `bun src/hub-server.ts` path also works (and supports env via parseArgs)

@@ -2,6 +2,26 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.28] - 2026-05-24
+
+**fix(hub): drop `PARACHUTE_HUB_ORIGIN` prompt + tini `-g` signal forwarding.**
+
+Two coordinated polish fixes to the Render deploy experience. Most operators start by using the Render-assigned `*.onrender.com` URL — surfacing `PARACHUTE_HUB_ORIGIN` as a prompted env var confused operators without a custom domain. Separately, some Render container configurations were emitting `[FATAL tini (1)] Unexpected error when forwarding signal: 'Operation not permitted'` because tini (PID 1, root) couldn't signal the bun child (uid 1000); `tini -g` forwards to the process group instead, which sidesteps the EPERM.
+
+### Changed
+
+- Render Blueprint UX: `PARACHUTE_HUB_ORIGIN` no longer surfaces as a prompted env var. Most operators use Render's auto-assigned URL where hub auto-derives the issuer from request origin. Operators with a custom domain set it manually in the Render Environment tab (documented in the render.yaml comment block).
+- Dockerfile: tini gains `-g` flag for process-group signal forwarding. Fixes the `[FATAL tini (1)] Unexpected error when forwarding signal: 'Operation not permitted'` log line operators were seeing on Render — the error was cosmetic for the running container but indicated shutdown signals might not reach hub cleanly on container redeploy.
+
+### Patterns check
+
+- No pattern shifts. Surface polish on the Render deploy first-boot UX (continues the rc.27 arc of "make Render's prompted env vars match what most operators actually need") plus a niche container-config workaround. No changes to hub logic.
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src` clean (no `src/` changes).
+
 ## [0.5.13-rc.27] - 2026-05-23
 
 **fix(hub): drop admin env vars from default Render deploy + make bootstrap token banner prominent.**

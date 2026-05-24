@@ -76,19 +76,12 @@ services:
       - key: PARACHUTE_INSTALL_CHANNEL
         value: latest
 
-      # Canonical public origin baked into the OAuth issuer claim and
-      # token aud claims. MUST match the custom domain you attach to
-      # this service — issued tokens become invalid if the value drifts
-      # from the actual request origin.
-      #
-      # `sync: false` because each operator's Render deploy has a
-      # different hostname; the dashboard prompts on first deploy.
-      #
-      # Leave blank to derive the OAuth issuer claim from request origin on first boot.
-      # Set this to your custom domain BEFORE issuing OAuth tokens to clients — tokens minted
-      # with one issuer claim won't validate against another.
-      - key: PARACHUTE_HUB_ORIGIN
-        sync: false
+      # PARACHUTE_HUB_ORIGIN — only set if attaching a custom domain. Hub
+      # auto-derives the OAuth issuer from the incoming request origin when
+      # unset, which is the right answer for the Render-assigned
+      # *.onrender.com URL. Set this manually in the Render dashboard's
+      # Environment tab if you're using a custom domain (and update it BEFORE
+      # issuing OAuth tokens to clients — tokens are tied to the issuer claim).
 
       # Admin setup: hub generates a one-time bootstrap token on first
       # boot (printed prominently to logs). Visit /admin/setup, paste
