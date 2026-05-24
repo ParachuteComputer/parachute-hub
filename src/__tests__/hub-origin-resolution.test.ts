@@ -147,6 +147,26 @@ describe("resolveIssuer — precedence chain", () => {
     const r = new Request("http://127.0.0.1:1939/oauth/token", { method: "GET" });
     expect(resolveIssuer(r, db, undefined)).toBe("http://127.0.0.1:1939");
   });
+
+  test("X-Forwarded-Proto is IGNORED when hub_settings or env wins", () => {
+    // Precedence guard: X-Forwarded-Proto should only affect the
+    // request-origin fallback branch. Explicit operator config
+    // (settings row, env var) always wins as-is, including its scheme.
+    // Without this guard, a future refactor could accidentally let the
+    // header override an operator's deliberate choice.
+    const r = new Request("http://hub.internal/oauth/token", {
+      method: "GET",
+      headers: { "X-Forwarded-Proto": "https" },
+    });
+
+    // Env layer wins, even though the header says https — the env value
+    // is returned verbatim (preserving whatever scheme the operator set).
+    expect(resolveIssuer(r, db, "http://configured.example")).toBe("http://configured.example");
+
+    // Settings layer wins above env, also verbatim.
+    setHubOrigin(db, "http://settings.example");
+    expect(resolveIssuer(r, db, "https://env.example")).toBe("http://settings.example");
+  });
 });
 
 describe("resolveIssuerSource — attribution for SPA", () => {
