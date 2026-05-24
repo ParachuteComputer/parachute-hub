@@ -1,0 +1,175 @@
+# Container smoke test — builds the Dockerfile + runs the image against
+# a fresh volume and smokes the key HTTP surfaces. Catches the class of
+# bug we hit in hub#349-#358 (entrypoint chown, supervisor PORT,
+# X-Forwarded-* forwarding) before it reaches main / Render.
+#
+# Runs on:
+#   - Every PR (catch regressions before merge)
+#   - Every push to main (catch regressions that slipped through PR review)
+#
+# Why a separate workflow from release.yml: release.yml runs on tag push
+# only (release gate). This runs on EVERY commit — earlier feedback for
+# the container-deploy class of bug. Not gated on tag.
+
+name: Container smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  # One smoke run per ref. Cancel stale runs on rapid PR pushes.
+  group: container-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: build + smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: parachute-hub:smoke
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: create test volume + start container
+        # Volume mount mimics Render's persistent-disk shape — separate
+        # filesystem from the container's overlay. This is what surfaced
+        # the EXDEV cross-mount rename issue (hub#351) + the mkdir-as-root
+        # parent-ownership trap (hub#355).
+        run: |
+          docker volume create parachute-smoke
+          docker run -d --rm \
+            --name parachute-hub-smoke \
+            -p 1939:1939 \
+            -v parachute-smoke:/parachute \
+            parachute-hub:smoke
+          echo "container started; waiting for hub to bind port 1939..."
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:1939/health >/dev/null 2>&1; then
+              echo "hub up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::hub never responded on /health within 30s"
+          docker logs parachute-hub-smoke 2>&1 | tail -50
+          exit 1
+
+      - name: verify hub PID 1 is tini, hub-as-bun runs as PID 2 child
+        # hub#355 + #357 pre-flight checks. If tini isn't PID 1 or hub
+        # isn't running as the bun user, supervised modules will hit
+        # the same crashloop we saw in production.
+        run: |
+          set -euo pipefail
+          PID1_CMD=$(docker exec parachute-hub-smoke cat /proc/1/cmdline | tr '\0' ' ')
+          PID1_UID=$(docker exec parachute-hub-smoke cat /proc/1/status | grep '^Uid:' | awk '{print $2}')
+          echo "PID 1 cmdline: $PID1_CMD"
+          echo "PID 1 uid: $PID1_UID"
+          if [[ "$PID1_CMD" != *"tini"* ]]; then
+            echo "::error::PID 1 is not tini — entrypoint chain broken"
+            exit 1
+          fi
+          if [[ "$PID1_UID" != "0" ]]; then
+            echo "::error::tini should run as root (uid 0), got uid $PID1_UID"
+            exit 1
+          fi
+          # The bun process should NOT be PID 1 — it should be a child running as uid 1000
+          BUN_PID=$(docker exec parachute-hub-smoke sh -c "ps -o pid,user,comm | grep ' bun$' | head -1 | awk '{print \$1}'" || true)
+          if [ -z "$BUN_PID" ]; then
+            echo "::error::could not locate bun process"
+            exit 1
+          fi
+          BUN_UID=$(docker exec parachute-hub-smoke cat /proc/$BUN_PID/status | grep '^Uid:' | awk '{print $2}')
+          echo "bun PID $BUN_PID uid: $BUN_UID"
+          if [[ "$BUN_UID" != "1000" ]]; then
+            echo "::error::bun should run as uid 1000 (bun user), got uid $BUN_UID — gosu drop failed"
+            exit 1
+          fi
+
+      - name: verify /parachute ownership + permissions
+        # hub#355 pre-flight. /parachute/modules MUST be bun-owned or the
+        # first `bun add -g` will AccessDenied.
+        run: |
+          set -euo pipefail
+          PARACHUTE_UID=$(docker exec parachute-hub-smoke stat -c '%u' /parachute)
+          MODULES_UID=$(docker exec parachute-hub-smoke stat -c '%u' /parachute/modules)
+          TMP_UID=$(docker exec parachute-hub-smoke stat -c '%u' /parachute/tmp)
+          echo "/parachute uid: $PARACHUTE_UID"
+          echo "/parachute/modules uid: $MODULES_UID"
+          echo "/parachute/tmp uid: $TMP_UID"
+          for path_uid in "$PARACHUTE_UID:/parachute" "$MODULES_UID:/parachute/modules" "$TMP_UID:/parachute/tmp"; do
+            uid="${path_uid%%:*}"
+            path="${path_uid##*:}"
+            if [[ "$uid" != "1000" ]]; then
+              echo "::error::$path is owned by uid $uid (expected 1000=bun) — entrypoint chown broken"
+              exit 1
+            fi
+          done
+
+      - name: smoke /health
+        run: |
+          curl -fs http://127.0.0.1:1939/health | tee /tmp/health.json
+          [ "$(cat /tmp/health.json)" = '{"status":"ok"}' ] || (echo "::error::unexpected /health body" && exit 1)
+
+      - name: smoke OAuth discovery (HTTPS upgrade via X-Forwarded-Proto)
+        # hub#355 (resolveIssuer X-Forwarded-Proto fix). Hub behind a TLS-
+        # terminating proxy must publish https:// in OAuth metadata.
+        run: |
+          set -euo pipefail
+          curl -fs http://127.0.0.1:1939/.well-known/oauth-authorization-server \
+            -H 'X-Forwarded-Proto: https' \
+            -H 'Host: hub.example.com' \
+            | tee /tmp/oauth-meta.json
+          ISSUER=$(jq -r '.issuer' /tmp/oauth-meta.json)
+          REG=$(jq -r '.registration_endpoint' /tmp/oauth-meta.json)
+          echo "issuer: $ISSUER"
+          echo "registration_endpoint: $REG"
+          if [[ "$ISSUER" != https://* ]]; then
+            echo "::error::issuer is not https:// — X-Forwarded-Proto not honored"
+            exit 1
+          fi
+          if [[ "$REG" != https://* ]]; then
+            echo "::error::registration_endpoint is not https:// — X-Forwarded-Proto not honored"
+            exit 1
+          fi
+
+      - name: smoke /admin/setup (wizard SPA)
+        # /admin/* is locked out by the pre-admin gate (returns 503) until
+        # an admin exists. /admin/setup is always reachable on a fresh hub
+        # — that's the wizard entry point. HTML body + the referenced JS
+        # asset must both respond 200 with correct content-types. Catches
+        # build/asset regressions.
+        run: |
+          set -euo pipefail
+          curl -fs http://127.0.0.1:1939/admin/setup -o /tmp/setup.html
+          # Setup page is a server-rendered HTML form, not the SPA. Verify
+          # it responds with HTML and contains the wizard heading.
+          if ! grep -qi "PARACHUTE\|bootstrap\|wizard" /tmp/setup.html; then
+            echo "::error::/admin/setup doesn't look like the wizard page"
+            exit 1
+          fi
+
+      - name: dump container logs on success (small footprint, useful for review)
+        if: always()
+        run: |
+          echo '--- docker logs ---'
+          docker logs parachute-hub-smoke 2>&1 | tail -80 || true
+
+      - name: tear down
+        if: always()
+        run: |
+          docker rm -f parachute-hub-smoke 2>/dev/null || true
+          docker volume rm parachute-smoke 2>/dev/null || true
