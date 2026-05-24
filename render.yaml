@@ -66,6 +66,18 @@ services:
       - key: BUN_INSTALL
         value: /parachute/modules
 
+      # BUN_INSTALL_BIN — where bun puts binary symlinks during
+      # `bun add -g`. Bun's BUN_INSTALL only controls PACKAGE location;
+      # bin symlinks default to /usr/local/bin/ (system path, not
+      # writable by the non-root `bun` user). Pinning to
+      # /parachute/modules/bin makes installs land on the persistent
+      # disk + survive container restarts. Without this, every
+      # `bun add -g` fails with EACCES at symlinkat() to /usr/local/bin/.
+      # The Dockerfile also extends PATH to include this dir so hub +
+      # child processes resolve the installed binaries. See hub#349.
+      - key: BUN_INSTALL_BIN
+        value: /parachute/modules/bin
+
       # Modules installed via admin SPA cascade to this channel by
       # default. `latest` is the right default for most operators
       # (stable releases of vault / app / scribe / runner). Flip to
@@ -76,19 +88,12 @@ services:
       - key: PARACHUTE_INSTALL_CHANNEL
         value: latest
 
-      # Canonical public origin baked into the OAuth issuer claim and
-      # token aud claims. MUST match the custom domain you attach to
-      # this service — issued tokens become invalid if the value drifts
-      # from the actual request origin.
-      #
-      # `sync: false` because each operator's Render deploy has a
-      # different hostname; the dashboard prompts on first deploy.
-      #
-      # Leave blank to derive the OAuth issuer claim from request origin on first boot.
-      # Set this to your custom domain BEFORE issuing OAuth tokens to clients — tokens minted
-      # with one issuer claim won't validate against another.
-      - key: PARACHUTE_HUB_ORIGIN
-        sync: false
+      # PARACHUTE_HUB_ORIGIN — only set if attaching a custom domain. Hub
+      # auto-derives the OAuth issuer from the incoming request origin when
+      # unset, which is the right answer for the Render-assigned
+      # *.onrender.com URL. Set this manually in the Render dashboard's
+      # Environment tab if you're using a custom domain (and update it BEFORE
+      # issuing OAuth tokens to clients — tokens are tied to the issuer claim).
 
       # Admin setup: hub generates a one-time bootstrap token on first
       # boot (printed prominently to logs). Visit /admin/setup, paste

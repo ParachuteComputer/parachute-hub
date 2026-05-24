@@ -2,6 +2,29 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.28] - 2026-05-24
+
+**fix(hub): Render install EACCES finally resolved + drop `PARACHUTE_HUB_ORIGIN` prompt + tini `-g` signal forwarding.**
+
+### Fixed
+
+- **Render install EACCES finally resolved** (closes hub#349 actual root cause). All previous fixes (#350 chown, #351 TMPDIR, #352 spawn env-inheritance, #353 banner) addressed real bugs but missed the load-bearing one: bun's `bun add -g` symlinks binaries to `$BUN_INSTALL_BIN`, which defaults to `/usr/local/bin/` when unset. That system path isn't writable by the non-root `bun` user, so every install failed at `symlinkat()` with EACCES. Fix: `ENV BUN_INSTALL_BIN=/parachute/modules/bin` in the Dockerfile so binaries land on the persistent disk. `PATH` also extended so hub + child processes resolve the installed binaries. Entrypoint pre-creates `/parachute/modules/bin/` and chowns to bun, idempotently. Verified locally by reproducing in a Docker volume mount and stracing the failing syscall — `symlinkat(..., AT_FDCWD, "/usr/local/bin/<binary>") = -1 EACCES`.
+
+### Changed
+
+- Render Blueprint UX: `PARACHUTE_HUB_ORIGIN` no longer surfaces as a prompted env var. Most operators use Render's auto-assigned URL where hub auto-derives the issuer from request origin. Operators with a custom domain set it manually in the Render Environment tab (documented in the render.yaml comment block).
+- Dockerfile: tini gains `-g` flag for process-group signal forwarding. Fixes the `[FATAL tini (1)] Unexpected error when forwarding signal: 'Operation not permitted'` log line operators were seeing on Render — the error was cosmetic for the running container but indicated shutdown signals might not reach hub cleanly on container redeploy.
+
+### Patterns check
+
+- No pattern shifts. Surface polish on the Render deploy first-boot UX (continues the rc.27 arc of "make Render's prompted env vars match what most operators actually need") plus a niche container-config workaround plus the load-bearing `BUN_INSTALL_BIN` fix that finally closes hub#349. No changes to hub source code.
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src` clean (no `src/` changes).
+- Reproduced the EACCES locally via Docker volume + `bun add -g` + strace; confirmed `BUN_INSTALL_BIN=/parachute/modules/bin` resolves it cleanly for vault, scribe, app, runner.
+
 ## [0.5.13-rc.27] - 2026-05-23
 
 **fix(hub): drop admin env vars from default Render deploy + make bootstrap token banner prominent.**

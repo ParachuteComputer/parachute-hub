@@ -109,11 +109,24 @@ COPY --from=builder /app/README.md ./README.md
 # EXDEV — the same Render-disk-as-separate-block-device issue that
 # makes operators see "Failed to link: EACCES" on `parachute install`.
 # See hub#349 for the diagnosis trail.
+#
+# BUN_INSTALL_BIN — where bun puts binary symlinks during `bun add -g`.
+# Bun's BUN_INSTALL only controls PACKAGE location; bin symlinks are
+# separate and default to /usr/local/bin/ (system path, not writable
+# by the non-root bun user). Pin to /parachute/modules/bin so binaries
+# land on the persistent disk and survive container restarts. PATH
+# extended so hub + child processes can resolve the installed binaries.
+# Verified locally via `docker volume + strace`: without this var, every
+# `bun add -g` fails with EACCES on symlinkat() to /usr/local/bin/<binary>.
+# Closes hub#349's real root cause (the prior fixes — chown, TMPDIR,
+# env-inheritance — were all real bugs but not THE blocker; this is).
 ENV PARACHUTE_HOME=/parachute \
     PORT=1939 \
     PARACHUTE_BIND_HOST=0.0.0.0 \
     BUN_INSTALL=/parachute/modules \
+    BUN_INSTALL_BIN=/parachute/modules/bin \
     TMPDIR=/parachute/tmp \
+    PATH=/parachute/modules/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     NODE_ENV=production
 
 # Pre-create the persistent-disk mount point AND the BUN_INSTALL subdir,
@@ -137,7 +150,13 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # DO NOT set USER bun here — the entrypoint runs as root briefly to
 # fix disk ownership, then `exec gosu bun "$@"` drops privileges before
 # hub starts. Tini wraps the whole tree for clean signal forwarding.
-ENTRYPOINT ["/sbin/tini", "--", "docker-entrypoint.sh"]
+#
+# tini -g forwards signals to the process group, not just the immediate
+# child. Works around a Render-specific EPERM where tini (PID 1, root)
+# can't signal the bun child (uid 1000) on some kernel/seccomp configs
+# (`[FATAL tini (1)] Unexpected error when forwarding signal: 'Operation
+# not permitted'`). Group signal forwarding is a common container pattern.
+ENTRYPOINT ["/sbin/tini", "-g", "--", "docker-entrypoint.sh"]
 # `parachute serve` is the container-shape entrypoint: foreground hub, env-
 # driven config, env-driven first-boot admin seed. The bare
 # `bun src/hub-server.ts` path also works (and supports env via parseArgs)
