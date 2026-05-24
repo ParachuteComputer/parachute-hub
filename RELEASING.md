@@ -51,7 +51,13 @@ If you DO need to ship a doc-only fix outside an active rc chain (i.e. main is o
 
 Before the workflow can publish, this repo needs:
 
-1. **`NPM_TOKEN` secret**: log into npmjs.com → Access Tokens → New Token (type: **Automation**) → scope to `@openparachute/*` packages. Add as `NPM_TOKEN` in [repo settings → Secrets and variables → Actions](https://github.com/ParachuteComputer/parachute-hub/settings/secrets/actions).
+1. **npm Trusted Publisher**: log into npmjs.com → package `@openparachute/hub` → Settings → Trusted Publishers → "Add a new publisher" → choose **GitHub Actions**. Fill:
+   - Organization: `ParachuteComputer`
+   - Repository name: `parachute-hub`
+   - Workflow filename: `release.yml`
+   - Environment name: (leave blank)
+
+   Repeat for `@openparachute/scope-guard` (same workflow, since scope-guard ships from the same repo). No `NPM_TOKEN` secret needed — the workflow uses OIDC.
 
 2. **ghcr.io permissions**: no secret needed — the workflow uses the runner's auto-provisioned `GITHUB_TOKEN`. First push of the image will create the package as **private by default**. After that first push, go to [package settings](https://github.com/orgs/ParachuteComputer/packages/container/parachute-hub/settings) → "Change visibility" → **Public**. Until you do this, any deploy target that pulls the image (Render, etc.) will 403 on `docker pull` unless you supply a `GHCR_PAT` read token. Doing it once at first-push time is the simplest path.
 
@@ -85,5 +91,6 @@ There's no "unpublish" path for either npm (npm has a strict 72-hour unpublish p
 
 - **Workflow doesn't trigger**: confirm the tag matches the workflow's `on.push.tags` pattern (`v[0-9]+.[0-9]+.[0-9]+` or `v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+`).
 - **`version mismatch` error in publish-npm**: package.json version differs from the tag. Re-tag the correct commit.
-- **`npm ERR! 403`**: `NPM_TOKEN` secret missing, expired, or has wrong scope. Regenerate.
+- **`npm ERR! 403 You do not have permission to publish`**: Trusted Publisher rule on npm doesn't match this workflow. Verify org/repo/workflow filename are exactly `ParachuteComputer` / `parachute-hub` / `release.yml`. If the workflow file was renamed, the rule needs updating on npm.
+- **`npm ERR! 401 Unauthorized` with no OIDC token**: the workflow is missing `permissions: id-token: write` at the job level. Verify the YAML.
 - **ghcr push fails with 403**: confirm `permissions.packages: write` is in the workflow (it is).
