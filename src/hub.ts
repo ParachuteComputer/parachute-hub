@@ -496,7 +496,11 @@ const HTML_TEMPLATE = `<!doctype html>
       // firstVaultName() shape.
       let vaultName = 'default';
       if (typeof vault.path === 'string' && vault.path.startsWith('/vault/')) {
-        const tail = vault.path.slice('/vault/'.length).replace(/\/+$/, '');
+        // Character class for the slash so the template literal can't eat
+        // the backslash-escape — \/ collapses to / inside backticks, and
+        // /\/+$/ degenerates to a // line comment that breaks the whole
+        // IIFE. [/]+$ keeps the same semantics with no escape needed.
+        const tail = vault.path.slice('/vault/'.length).replace(/[/]+$/, '');
         if (tail.length > 0) vaultName = tail;
       }
       tiles.push({

@@ -13,6 +13,25 @@ describe("renderHub", () => {
     expect(html).toContain("<script>");
   });
 
+  test("inline <script> body parses as valid JS (regression: hub#366)", () => {
+    // The script lives inside HTML_TEMPLATE — a backtick template literal.
+    // Backslash escapes inside the template silently mangle regex literals:
+    // `/\/+$/` written in the source becomes `//+$/` in the served HTML,
+    // which JS parses as the start of a line comment, killing the entire
+    // IIFE. Every section that renders inside that IIFE (Get started,
+    // Services, Admin) then never paints.
+    //
+    // Content assertions don't catch this — they pass on the broken
+    // string. A parse-check via `new Function(body)` does: it parses
+    // (no execution, no DOM needed) and throws SyntaxError on the bad
+    // regex. Wrap in a try/catch so future template-escaping regressions
+    // surface here with a clear message rather than as a runtime mystery.
+    const m = html.match(/<script>([\s\S]*?)<\/script>/);
+    expect(m).not.toBeNull();
+    const scriptBody = m![1];
+    expect(() => new Function(scriptBody)).not.toThrow();
+  });
+
   test("fetches /.well-known/parachute.json for the Use section", () => {
     expect(html).toContain("/.well-known/parachute.json");
     expect(html).toContain("doc.services");
