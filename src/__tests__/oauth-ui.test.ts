@@ -408,11 +408,41 @@ describe("renderApprovePending unauthenticated CTAs", () => {
     hubOrigin: "https://hub.example.com",
   };
 
-  test("renders Sign in CTA wired to /login?next=/admin/approve-client/<id>", () => {
+  test("without loginNextUrl: Sign in CTA falls back to /admin/approve-client/<id>", () => {
+    // Back-compat fallback for callers that don't have an in-flight OAuth
+    // URL to resume (e.g. direct share-page entry). The SPA approve path
+    // approves the client but discards any OAuth context — fine here
+    // because there's no OAuth flow to discard.
     const html = renderApprovePending(COMMON);
     expect(html).toContain("Sign in as admin to approve");
     const expectedHref = `/login?next=${encodeURIComponent("/admin/approve-client/client-xyz")}`;
     expect(html).toContain(`href="${expectedHref}"`);
+  });
+
+  test("with loginNextUrl set: Sign in CTA preserves the authorize URL through login", () => {
+    // The OAuth-flow entry case (the bug fix): the page is rendered for an
+    // `/oauth/authorize?...` GET, the operator isn't signed in, the CTA
+    // sends them through `/login?next=<authorize URL>` so post-login they
+    // land BACK on the OAuth flow — now authenticated, see the inline
+    // approve form, click once, OAuth flow resumes through consent →
+    // redirect_uri callback. Without this the SPA approves the client but
+    // the calling app (Claude MCP) is never told and the user loops on
+    // retry. Caught when Aaron tested via Claude.ai's MCP connector
+    // against the Render deploy.
+    const authorizeUrl =
+      "/oauth/authorize?client_id=client-xyz&redirect_uri=https%3A%2F%2Fapp.example%2Fcb" +
+      "&response_type=code&code_challenge=abc&code_challenge_method=S256&state=rt";
+    const html = renderApprovePending({ ...COMMON, loginNextUrl: authorizeUrl });
+    expect(html).toContain("Sign in as admin to approve");
+    const expectedHref = `/login?next=${encodeURIComponent(authorizeUrl)}`;
+    expect(html).toContain(`href="${expectedHref}"`);
+    // Sanity: the legacy SPA approve path is NOT what `next` points at.
+    const legacyHref = `/login?next=${encodeURIComponent("/admin/approve-client/client-xyz")}`;
+    expect(html).not.toContain(`href="${legacyHref}"`);
+    // The shareable deep link (secondary CTA, not Sign-in) still uses
+    // the SPA approve path — it's for sharing with another admin who
+    // isn't in an OAuth flow.
+    expect(html).toContain("https://hub.example.com/admin/approve-client/client-xyz");
   });
 
   test("renders fully-qualified shareable deep link + Copy button + clipboard JS", () => {

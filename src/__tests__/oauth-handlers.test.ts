@@ -3970,13 +3970,20 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
     });
   }
 
-  test("session absent → page renders Sign-in CTA + shareable deep link (no CLI message)", async () => {
-    // Approval-UX rc.19: the unauthenticated viewer no longer sees a
-    // "Ask the operator to run `parachute auth approve-client <id>`"
-    // message. The web approval path (#277) is the canonical recovery
-    // now — render a primary Sign-in CTA wired to /login?next=/admin/...
-    // and a shareable deep link the operator can send to whoever runs
-    // the hub.
+  test("session absent → Sign-in CTA preserves the authorize URL through login + shareable deep link", async () => {
+    // Approval-UX rc.19: the unauthenticated viewer sees no CLI hint —
+    // the web approval path (#277) is the canonical recovery now. The
+    // primary Sign-in CTA wires `/login?next=<authorize URL>` so post-
+    // login the operator lands BACK on the same `/oauth/authorize?...`
+    // request — now authenticated, they see the inline approve form, one
+    // click resumes the OAuth flow through consent → redirect_uri. The
+    // shareable secondary deep link still points at the SPA approve page
+    // (it's for sharing with another admin, not for the in-flight flow).
+    //
+    // Pre-fix the Sign-in CTA also pointed at the SPA approve page —
+    // approving the client but discarding the authorize URL params, so
+    // the calling app (e.g. Claude.ai MCP) was never told and the user
+    // looped on retry. Caught by Aaron on the Render deploy.
     const { db, cleanup } = await makeDb();
     try {
       const reg = registerClient(db, {
@@ -3984,19 +3991,34 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
         clientName: "MyApp",
         status: "pending",
       });
-      const req = new Request(pendingAuthorizeUrl(reg.client.clientId));
+      const authorizePath = pendingAuthorizeUrl(reg.client.clientId);
+      const req = new Request(authorizePath);
       const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
       expect(res.status).toBe(403);
       const html = await res.text();
       expect(html).toContain("App not yet approved");
-      // Primary CTA: Sign-in link wired to land the admin directly on
-      // the approval page after authenticating.
+      // Primary CTA: Sign-in link wired to round-trip the operator back
+      // to the original /oauth/authorize?... URL after login (resumes the
+      // OAuth flow rather than dead-ending at the SPA approve page).
       expect(html).toContain("Sign in as admin to approve");
-      const expectedLoginHref = `/login?next=${encodeURIComponent(
+      const requestUrl = new URL(authorizePath);
+      const returnTo = `${requestUrl.pathname}${requestUrl.search}`;
+      const expectedLoginHref = `/login?next=${encodeURIComponent(returnTo)}`;
+      expect(html).toContain(`href="${expectedLoginHref}"`);
+      // Sanity: the next= target carries the authorize path + the
+      // client_id + state so the flow can resume verbatim post-login.
+      expect(returnTo).toContain("/oauth/authorize");
+      expect(returnTo).toContain(encodeURIComponent(reg.client.clientId));
+      expect(returnTo).toContain("state=rt-208");
+      // The legacy SPA approve path is NOT what the Sign-in CTA points
+      // at any more (regression guard for the fix).
+      const legacyHref = `/login?next=${encodeURIComponent(
         `/admin/approve-client/${encodeURIComponent(reg.client.clientId)}`,
       )}`;
-      expect(html).toContain(`href="${expectedLoginHref}"`);
-      // Secondary CTA: shareable, fully-qualified deep link + Copy button.
+      expect(html).not.toContain(`href="${legacyHref}"`);
+      // Secondary CTA: shareable, fully-qualified deep link + Copy button
+      // — still points at the SPA approve page (no OAuth flow context to
+      // preserve for the share-with-another-admin case).
       expect(html).toContain(
         `${ISSUER}/admin/approve-client/${encodeURIComponent(reg.client.clientId)}`,
       );

@@ -417,21 +417,34 @@ function parseAuthorizeFormParams(url: URL): AuthorizeFormParams | { error: stri
  * "App not yet approved" page (#74) for /oauth/authorize. When the request
  * carries a valid operator session AND a same-origin Origin/Referer, render
  * the inline approve form (#208) so one click flips the client to `approved`
- * and the OAuth flow re-enters at consent. Otherwise fall back to the
- * pre-#208 CLI-only message ("ask operator to run `parachute auth
- * approve-client <id>`").
+ * and the OAuth flow re-enters at consent. Otherwise render the unauth CTAs
+ * (Sign-in primary + shareable deep link secondary; the CLI fallback was
+ * retired in rc.19).
  *
  * The session-bound approve gate mirrors the same-origin DCR auto-approve
  * gate on `/oauth/register` (#199, #200): valid session cookie + matching
  * Origin/Referer = trusted operator action. Cross-origin or session-less
- * GETs see the CLI-fallback message; the button never renders for them, so
- * the POST handler can't be tricked into approving via a hand-crafted form
- * either (CSRF token won't match).
+ * GETs see the unauth CTA; the button never renders for them, so the POST
+ * handler can't be tricked into approving via a hand-crafted form either
+ * (CSRF token won't match).
  *
- * The form's `return_to` carries the original `/oauth/authorize?...` URL so
- * the post-approve redirect lands the operator back on the same flow with
- * the now-approved client. The POST handler validates `return_to` is a
- * hub-relative path before following it (open-redirect defense).
+ * BOTH branches plumb the original `/oauth/authorize?...` URL into the
+ * rendered page so the OAuth flow can resume after the operator's action:
+ *
+ *   - Authed branch: form's `return_to` is the authorize URL; the approve
+ *     POST handler 302s there after flipping status (open-redirect defense
+ *     in the POST handler validates `return_to` is hub-relative).
+ *   - Unauth branch: CTA's `next` is the authorize URL; `/login` 302s there
+ *     after sign-in (`safeNext` in admin-handlers.ts gates the target to
+ *     hub-relative paths). The operator lands back on this same page,
+ *     now authenticated → enters the authed branch above → one-click
+ *     approve resumes the OAuth flow.
+ *
+ * Pre-fix the unauth CTA pointed at `/admin/approve-client/<id>` (the SPA
+ * approve page) — which approves the client but discards the in-flight
+ * authorize URL, so the calling app (e.g. Claude MCP via Claude.ai) is
+ * never told and the user loops on retry. Caught when Aaron hit it on the
+ * Render deploy via Claude.ai's MCP connector.
  */
 function pendingClientResponse(
   db: Database,
@@ -453,8 +466,18 @@ function pendingClientResponse(
   const sameOrigin = isSameOriginRequest(req, resolveBoundOrigins(deps));
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
+  // Hub-relative URL of the original `/oauth/authorize?...` request. Used in
+  // BOTH branches so the post-approve path (authed: form's `return_to`) and
+  // the post-login path (unauthed: CTA's `next`) round-trip the operator
+  // back to the same OAuth flow. Without `loginNextUrl` on the unauth
+  // branch, the operator post-login would land on the SPA approve page
+  // with no knowledge of the in-flight authorize URL — the SPA approves
+  // the client but the OAuth flow never completes, the calling app (e.g.
+  // Claude MCP) is never told, and the user loops on retry. Fix lands the
+  // unauth flow on the same authorize URL, post-login the operator hits
+  // the authed branch's inline approve form, and the flow resumes.
+  const returnTo = `${authorizeUrl.pathname}${authorizeUrl.search}`;
   if (session && sameOrigin) {
-    const returnTo = `${authorizeUrl.pathname}${authorizeUrl.search}`;
     return htmlResponse(
       renderApprovePending({
         clientName: client.clientName ?? client.clientId,
@@ -464,6 +487,7 @@ function pendingClientResponse(
         ...(requestedVault !== undefined && { requestedVault }),
         hubOrigin: deps.issuer,
         approveForm: { csrfToken: csrf.token, returnTo },
+        loginNextUrl: returnTo,
       }),
       403,
       extra,
@@ -477,6 +501,7 @@ function pendingClientResponse(
       requestedScopes,
       ...(requestedVault !== undefined && { requestedVault }),
       hubOrigin: deps.issuer,
+      loginNextUrl: returnTo,
     }),
     403,
     extra,
