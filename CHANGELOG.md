@@ -2,6 +2,31 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.36] - 2026-05-25
+
+**fix(hub): home page Get Started + Services + Admin all broken by a SyntaxError in the inline `<script>`.**
+
+After rc.35 landed and the iss-mismatch unstuck the wizard install, the home page at `/` rendered with the Services section stuck at "Loading…" and the Admin section empty. Root cause: a single regex literal inside the IIFE — `/\/+$/` — silently degenerated to `//+$/` in the served HTML, because `\/` inside `HTML_TEMPLATE`'s backtick template literal collapses to `/`. The browser parsed the leading `//` as a line comment, the rest of the regex bled into the comment, the IIFE never executed, and `renderAdmin()` + `renderServices()` + `renderGetStarted()` all silently failed.
+
+### Fixed
+
+- **Home page IIFE no longer breaks at parse time** (hub#366). Switched the regex to a `/[/]+$/` character class — forward-slash inside `[]` needs no escape, so the template literal preserves it intact. Same semantics, no escaping surface. Latent since hub#342 introduced the `renderGetStarted` vault-path slicing (every other regex in the script is escape-free, so this was the first regex to need a forward-slash escape; the bug only surfaced once a vault was installed and the path branch executed).
+
+### Added
+
+- **Inline `<script>` parse-check regression test** (hub#366). `hub.test.ts` now extracts the rendered `<script>` body and parse-checks it with `new Function(scriptBody)`. Content assertions pass on the broken HTML because they only check substrings; only a parse-check catches the SyntaxError that breaks the browser at runtime. Catches any future template-escaping bug at test time.
+
+### Patterns check
+
+- Reinforces "test the bytes you ship": content/snapshot assertions miss execution-level bugs in inline scripts/CSS/template-served code. A parse-check or behavioral test is the right shape when serving executable code from a template literal. Folding into [`feedback_test_round_trip_through_bytes.md`](https://github.com/anthropics/claude-code...) bucket conceptually.
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src`: 1945 pass / 0 fail (+1 from rc.35).
+- Container smoke CI: ✓ on `ac09e17`.
+- Live verify pending on Render redeploy after rc.36 publishes.
+
 ## [0.5.13-rc.35] - 2026-05-25
 
 **fix(hub): Render-injected `RENDER_EXTERNAL_URL` now auto-detected as OAuth issuer + propagates to supervised modules — fixes `unexpected "iss" claim value` after wizard install.**
