@@ -1043,6 +1043,50 @@ describe("well-known regen after module ops", () => {
     expect(spawns[0]?.env?.PORT).toBe("1940");
   });
 
+  test("runInstall sets PARACHUTE_HUB_ORIGIN in child env from deps.issuer (hub#365)", async () => {
+    // Supervised modules (vault, scribe, app) validate the `iss` claim
+    // on hub-minted JWTs against PARACHUTE_HUB_ORIGIN. Without it, they
+    // fall back to a loopback default and reject any token whose iss is
+    // the public Render URL — surfaces as "hub JWT verification failed:
+    // unexpected 'iss' claim value" on the first authed vault call.
+    // Regression guard: install-path spawn carries the hub's resolved
+    // issuer as PARACHUTE_HUB_ORIGIN.
+    const { supervisor, spawns } = makeIdleSupervisor();
+    const { run } = alwaysOkRun();
+    const wkPath = join(h.dir, "well-known.json");
+    const install = fakeInstall("@openparachute/vault", {
+      name: "vault",
+      manifestName: "parachute-vault",
+      port: 1940,
+      paths: ["/vault/default"],
+      health: "/vault/default/health",
+    });
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const deps = {
+      db: h.db,
+      // Use the test's canonical ISSUER (matches the bearer's iss claim
+      // so handleInstall doesn't 401 — mintBearer always uses ISSUER).
+      // The assertion below verifies whatever issuer is on `deps` lands
+      // in the child's PARACHUTE_HUB_ORIGIN env.
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      supervisor,
+      run,
+      findGlobalInstall: install.findGlobalInstall,
+      readModuleManifest: install.readModuleManifest,
+      wellKnownPath: wkPath,
+    };
+    await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      deps,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(spawns.length).toBe(1);
+    expect(spawns[0]?.env?.PARACHUTE_HUB_ORIGIN).toBe(ISSUER);
+  });
+
   test("runInstall failure: bun add fails -> no well-known regen (no partial state)", async () => {
     const { supervisor } = makeIdleSupervisor();
     const wkPath = join(h.dir, "well-known.json");

@@ -2,6 +2,30 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.35] - 2026-05-25
+
+**fix(hub): Render-injected `RENDER_EXTERNAL_URL` now auto-detected as OAuth issuer + propagates to supervised modules — fixes `unexpected "iss" claim value` after wizard install.**
+
+The next bug Aaron hit after rc.34's chain landed: wizard install completed, then the first authed call to vault returned `401: hub JWT verification failed: unexpected "iss" claim value`. Hub minted JWTs with the public Render URL as `iss`; vault's `validateHubJwt` compared against `process.env.PARACHUTE_HUB_ORIGIN` (unset on the spawned child) and fell back to `http://127.0.0.1:1939` — mismatch, reject.
+
+### Fixed
+
+- **Hub auto-detects `RENDER_EXTERNAL_URL` at boot when no explicit issuer is configured** (hub#365). New `resolveStartupIssuer` helper in `commands/serve.ts` formalizes the precedence: `--issuer` flag > `PARACHUTE_HUB_ORIGIN` env > `RENDER_EXTERNAL_URL` env > undefined. Trailing slashes stripped; empty / bare-slash values collapse to undefined. Same precedence mirrored into `hub-server.ts`'s standalone-entrypoint `parseArgs` (the alternate boot path advertised by the Dockerfile comment), so both entry points behave identically on Render.
+
+- **Supervised modules now inherit `PARACHUTE_HUB_ORIGIN` from `deps.issuer`** (hub#365). `spawnSupervised` in `api-modules-ops.ts` (the install/restart spawn path) was missing this env-var propagation — siblings at the boot path (`bootSupervisedModules`) and lifecycle path (`lifecycle.start`) already had it from prior hub#357. Now all three spawn sites are symmetric: child vault/scribe/app processes see the same issuer string the hub itself uses to mint JWTs, so the `iss` claim round-trips correctly.
+
+### Patterns check
+
+- Reinforces the `bun-container-deploy.md` pattern (rc.34): platform-injected env vars (`PORT`, `RENDER_EXTERNAL_URL`, `X-Forwarded-*`) all need explicit propagation/derivation discipline. This is the third such gotcha in the chain (PORT → X-Forwarded-Host → iss origin); each one slipped past the others.
+- No new patterns introduced.
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src`: 1944 pass / 0 fail (+12 from rc.34 — 6 `resolveStartupIssuer` precedence tests in serve.test.ts, 1 `runInstall` propagation regression in api-modules-ops.test.ts, 5 `parseArgs` precedence tests in hub-server.test.ts).
+- Container smoke CI: ✓ on `3ccddf8`.
+- Operator workaround for pre-rc.35 deploys: set `PARACHUTE_HUB_ORIGIN` to the public URL in Render's Environment tab. After rc.35 picks up automatically — no manual config needed for the default Render path.
+
 ## [0.5.13-rc.34] - 2026-05-24
 
 **fix(hub): Render container deploy now fully functional end-to-end + tag-triggered release CI.**

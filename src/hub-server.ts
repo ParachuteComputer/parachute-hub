@@ -213,8 +213,14 @@ interface Args {
  *                                Containers should set 0.0.0.0.
  *   PARACHUTE_HUB_ORIGIN       — canonical https://… origin used as the
  *                                OAuth issuer claim.
+ *   RENDER_EXTERNAL_URL        — Render auto-injects the public https URL;
+ *                                used as fallback issuer so the standalone
+ *                                `bun src/hub-server.ts` boot path works
+ *                                without operator config. Mirrors the
+ *                                precedence in commands/serve.ts's
+ *                                resolveStartupIssuer.
  */
-function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env): Args {
+export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env): Args {
   let port: number | undefined;
   let hostname: string | undefined;
   let wellKnownDir: string | undefined;
@@ -250,8 +256,9 @@ function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env): Args {
   if (port === undefined) port = HUB_DEFAULT_PORT;
   if (hostname === undefined) hostname = env.PARACHUTE_BIND_HOST || "127.0.0.1";
   if (wellKnownDir === undefined) wellKnownDir = WELL_KNOWN_DIR;
-  if (issuer === undefined && env.PARACHUTE_HUB_ORIGIN) {
-    issuer = env.PARACHUTE_HUB_ORIGIN.replace(/\/+$/, "");
+  if (issuer === undefined) {
+    const fromEnv = env.PARACHUTE_HUB_ORIGIN ?? env.RENDER_EXTERNAL_URL;
+    if (fromEnv) issuer = fromEnv.replace(/\/+$/, "") || undefined;
   }
   return { port, hostname, wellKnownDir, dbPath: dbPath ?? hubDbPath(), issuer };
 }

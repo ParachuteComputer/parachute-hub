@@ -5,7 +5,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HUB_SVC, hubPortPath } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { findServiceUpstream, findVaultUpstream, hubFetch, layerOf } from "../hub-server.ts";
+import {
+  findServiceUpstream,
+  findVaultUpstream,
+  hubFetch,
+  layerOf,
+  parseArgs,
+} from "../hub-server.ts";
 import { setNotesRedirectDisabled } from "../hub-settings.ts";
 import { clearNotesRedirectLogState } from "../notes-redirect.ts";
 import { pidPath } from "../process-state.ts";
@@ -3211,4 +3217,45 @@ describe("hub-server.ts startup PID/port registration (#148)", () => {
       rmSync(configDir, { recursive: true, force: true });
     }
   }, 10_000);
+});
+
+describe("parseArgs — issuer env precedence (hub#365)", () => {
+  test("--issuer flag wins over both env vars", () => {
+    const got = parseArgs(["--issuer", "https://flag.example"], {
+      PARACHUTE_HUB_ORIGIN: "https://env.example",
+      RENDER_EXTERNAL_URL: "https://render.example",
+    });
+    expect(got.issuer).toBe("https://flag.example");
+  });
+
+  test("PARACHUTE_HUB_ORIGIN wins over RENDER_EXTERNAL_URL", () => {
+    const got = parseArgs([], {
+      PARACHUTE_HUB_ORIGIN: "https://hub.example",
+      RENDER_EXTERNAL_URL: "https://render.example",
+    });
+    expect(got.issuer).toBe("https://hub.example");
+  });
+
+  test("RENDER_EXTERNAL_URL is used when no override (standalone Render boot)", () => {
+    const got = parseArgs([], { RENDER_EXTERNAL_URL: "https://app.onrender.com" });
+    expect(got.issuer).toBe("https://app.onrender.com");
+  });
+
+  test("trailing slashes are stripped from all three sources", () => {
+    expect(parseArgs(["--issuer", "https://x.example/"], {}).issuer).toBe("https://x.example");
+    expect(parseArgs([], { PARACHUTE_HUB_ORIGIN: "https://x.example///" }).issuer).toBe(
+      "https://x.example",
+    );
+    expect(parseArgs([], { RENDER_EXTERNAL_URL: "https://x.example/" }).issuer).toBe(
+      "https://x.example",
+    );
+  });
+
+  test("issuer is undefined when no source is set", () => {
+    expect(parseArgs([], {}).issuer).toBeUndefined();
+    expect(parseArgs([], { PARACHUTE_HUB_ORIGIN: "" }).issuer).toBeUndefined();
+    expect(parseArgs([], { RENDER_EXTERNAL_URL: "" }).issuer).toBeUndefined();
+    // Bare slash collapses to empty after strip — must not become "" issuer.
+    expect(parseArgs([], { RENDER_EXTERNAL_URL: "/" }).issuer).toBeUndefined();
+  });
 });
