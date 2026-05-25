@@ -18,7 +18,7 @@ After rc.35 landed and the iss-mismatch unstuck the wizard install, the home pag
 
 ### Patterns check
 
-- Reinforces "test the bytes you ship": content/snapshot assertions miss execution-level bugs in inline scripts/CSS/template-served code. A parse-check or behavioral test is the right shape when serving executable code from a template literal. Folding into [`feedback_test_round_trip_through_bytes.md`](https://github.com/anthropics/claude-code...) bucket conceptually.
+- Reinforces "test the bytes you ship": content/snapshot assertions miss execution-level bugs in inline scripts/CSS/template-served code. A parse-check or behavioral test is the right shape when serving executable code from a template literal.
 
 ### Verification
 
