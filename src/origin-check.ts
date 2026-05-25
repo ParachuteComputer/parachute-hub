@@ -43,6 +43,16 @@
  *     typically equal to `issuer` post-`parachute expose`, but kept as an
  *     independent input so a tailnet bring-up after hub start is reflected
  *     without restart.
+ *   - `platformOrigin`: a platform-injected public origin (Render's
+ *     `RENDER_EXTERNAL_URL`, etc.). Always trusted — the platform
+ *     guarantees this is the public URL the operator's browser sees.
+ *     Included independently of `issuer` so a stale `hub_settings.hub_origin`
+ *     stored to a non-public URL (e.g. a loopback value entered during
+ *     setup) doesn't lock the operator out of cookie-POST flows that
+ *     legitimately arrive from the public URL. Caught on a Render deploy
+ *     2026-05-25 when `hub_settings.hub_origin` was loopback but the
+ *     browser POSTed from the public Render URL — Origin mismatch
+ *     rejected legitimate operator-initiated approves.
  *
  * Malformed inputs are dropped silently — the function returns whatever it
  * could parse. Callers should always include the issuer as a baseline so
@@ -52,6 +62,7 @@ export function buildHubBoundOrigins(opts: {
   issuer: string;
   loopbackPort?: number;
   exposeHubOrigin?: string;
+  platformOrigin?: string;
 }): readonly string[] {
   const set = new Set<string>();
   const add = (raw: string | undefined) => {
@@ -65,6 +76,7 @@ export function buildHubBoundOrigins(opts: {
   };
   add(opts.issuer);
   add(opts.exposeHubOrigin);
+  add(opts.platformOrigin);
   if (typeof opts.loopbackPort === "number" && Number.isInteger(opts.loopbackPort)) {
     set.add(`http://localhost:${opts.loopbackPort}`);
     set.add(`http://127.0.0.1:${opts.loopbackPort}`);

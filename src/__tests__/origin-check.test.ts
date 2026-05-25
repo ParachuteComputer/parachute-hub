@@ -48,6 +48,42 @@ describe("buildHubBoundOrigins", () => {
     expect(origins.filter((o) => o === ISSUER).length).toBe(1);
   });
 
+  test("platformOrigin adds the platform-injected public URL independently of issuer (hub#374)", () => {
+    // Render injects RENDER_EXTERNAL_URL=https://<svc>.onrender.com at the
+    // container edge; if hub_settings.hub_origin was stored to a non-public
+    // URL (e.g. loopback during initial setup), the configured issuer would
+    // be loopback. The browser still POSTs from the public Render URL, so
+    // the public URL must independently land in the bound set or the
+    // operator's legitimate POSTs are rejected. Closes the failure caught
+    // on Aaron's deploy 2026-05-25 where Origin was https://...onrender.com
+    // but bound set was loopback-only.
+    const platformOrigin = "https://parachute-hub.onrender.com";
+    const origins = buildHubBoundOrigins({
+      issuer: "http://127.0.0.1:1939",
+      loopbackPort: PORT,
+      platformOrigin,
+    });
+    expect(origins).toContain(platformOrigin);
+    expect(origins).toContain("http://127.0.0.1:1939");
+  });
+
+  test("platformOrigin dedups when it matches issuer", () => {
+    // Normal Render boot path: configuredIssuer was derived from
+    // RENDER_EXTERNAL_URL in serve.ts's resolveStartupIssuer, so the
+    // resolved issuer equals platformOrigin. The set carries one entry.
+    const platformOrigin = "https://parachute-hub.onrender.com";
+    const origins = buildHubBoundOrigins({
+      issuer: platformOrigin,
+      platformOrigin,
+    });
+    expect(origins.filter((o) => o === platformOrigin).length).toBe(1);
+  });
+
+  test("undefined platformOrigin is a no-op (non-Render deploys)", () => {
+    const origins = buildHubBoundOrigins({ issuer: ISSUER });
+    expect(origins).toEqual([ISSUER]);
+  });
+
   test("malformed inputs are silently dropped", () => {
     // No URL parser crash — return whatever could be parsed. The caller
     // (resolveBoundOrigins) keeps the issuer as a baseline anyway.

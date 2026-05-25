@@ -1215,7 +1215,24 @@ export async function handleApproveClientPost(
       401,
     );
   }
-  if (!isSameOriginRequest(req, resolveBoundOrigins(deps))) {
+  const bound = resolveBoundOrigins(deps);
+  if (!isSameOriginRequest(req, bound)) {
+    // Diagnostic: log the headers we saw + the bound set so an operator
+    // chasing a rejection on a real deploy can see exactly what didn't
+    // match. The same-origin check is the most opaque CSRF gate — without
+    // this log, a misconfigured hub_settings.hub_origin or a proxy
+    // stripping Origin/Referer produces a flat 403 with no way to debug.
+    // Headers logged are non-sensitive (Origin/Referer/Host are public);
+    // the bound set is hub's own configuration. Body content not logged.
+    console.warn(
+      `[oauth] approve POST same-origin check failed. headers: ` +
+        `origin=${JSON.stringify(req.headers.get("origin"))} ` +
+        `referer=${JSON.stringify(req.headers.get("referer"))} ` +
+        `host=${JSON.stringify(req.headers.get("host"))} ` +
+        `xff-host=${JSON.stringify(req.headers.get("x-forwarded-host"))} ` +
+        `xff-proto=${JSON.stringify(req.headers.get("x-forwarded-proto"))}. ` +
+        `bound origins: ${JSON.stringify(bound)}`,
+    );
     return htmlError(
       "Cross-origin request rejected",
       "The approve form must be submitted from this hub's own origin.",
