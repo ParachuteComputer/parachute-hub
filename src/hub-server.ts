@@ -1058,6 +1058,13 @@ export function hubFetch(
           issuer,
           loopbackPort,
           exposeHubOrigin: loadExposeHubOrigin(),
+          // Trust the platform-injected public URL independently of the
+          // configured issuer. On Render, an operator who set hub_origin
+          // via the admin SPA (or via a stale db row) to a non-public URL
+          // would otherwise reject legitimate browser POSTs that arrive
+          // with the public Render URL as Origin. See origin-check.ts
+          // jsdoc for the failure case this closes.
+          platformOrigin: process.env.RENDER_EXTERNAL_URL,
         }),
     };
   };
