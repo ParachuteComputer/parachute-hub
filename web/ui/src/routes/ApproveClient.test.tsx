@@ -275,5 +275,20 @@ describe("ApproveClient", () => {
       await waitFor(() => expect(screen.getByText(/already approved/i)).toBeInTheDocument());
       expect(assignSpy).not.toHaveBeenCalled();
     });
+
+    it("auto-redirects to non-authorize same-origin return_to (broader SPA gate is by design)", async () => {
+      // Pin the deliberately-broader SPA gate behaviour: the SPA's
+      // isSafeReturnTo accepts any same-origin path (starts with /, not //),
+      // not just /oauth/authorize?-prefixed targets. The server-side gate is
+      // stricter and only echoes redirect_to for /oauth/authorize? targets —
+      // but the SPA's on-load auto-redirect path doesn't round-trip through
+      // the server, so a future caller could wire ?return_to=/some/other/page.
+      // Today no caller does this; the test exists to document the contract
+      // (per patterns#97 "two cases, one route" + the deliberately-broader
+      // SPA gate notes).
+      vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient({ status: "approved" }));
+      renderRoute("c1", "?return_to=/admin/vaults");
+      await waitFor(() => expect(assignSpy).toHaveBeenCalledWith("/admin/vaults"));
+    });
   });
 });

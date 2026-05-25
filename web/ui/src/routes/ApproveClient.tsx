@@ -119,7 +119,7 @@ export function ApproveClient() {
   async function onApprove(): Promise<void> {
     setAction({ kind: "approving" });
     try {
-      const result = await approveOauthClient(clientId, returnTo ?? undefined);
+      const result = await approveOauthClient(clientId, returnTo || undefined);
       // OAuth-resume case (workstream D): server echoed the same-origin-
       // validated `return_to` back as `redirect_to`. Leave the SPA to
       // resume the parked authorize flow rather than dead-ending on the
