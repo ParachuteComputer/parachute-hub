@@ -120,7 +120,9 @@ describe("injectChromeIntoHtml", () => {
   test("inserts immediately after <body>", () => {
     const html = "<!doctype html><html><body><h1>Hello</h1></body></html>";
     const out = injectChromeIntoHtml(html, chrome);
-    expect(out).toBe("<!doctype html><html><body><header>CHROME</header><h1>Hello</h1></body></html>");
+    expect(out).toBe(
+      "<!doctype html><html><body><header>CHROME</header><h1>Hello</h1></body></html>",
+    );
   });
 
   test("handles <body> with attributes", () => {
@@ -150,7 +152,8 @@ describe("injectChromeIntoHtml", () => {
   });
 
   test("inserts at the first <body> only, not at sub-occurrences in content", () => {
-    const html = "<html><body><p>The body of an email mentions <body>twice</body></p></body></html>";
+    const html =
+      "<html><body><p>The body of an email mentions <body>twice</body></p></body></html>";
     const out = injectChromeIntoHtml(html, chrome);
     // Confirm the first injection happens at the real <body>, content after
     // is preserved literally.
