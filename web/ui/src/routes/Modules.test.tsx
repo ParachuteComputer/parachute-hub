@@ -181,6 +181,7 @@ describe("Modules — catalog rendering", () => {
       modules: [
         moduleRow("vault", { installed: true, supervisor_status: "running" }),
         moduleRow("notes", { installed: true, supervisor_status: "starting" }),
+        moduleRow("runner", { installed: true, supervisor_status: "restarting" }),
         moduleRow("scribe", { installed: true, supervisor_status: "crashed" }),
         moduleRow("app", { installed: true, supervisor_status: "stopped" }),
       ],
@@ -191,6 +192,10 @@ describe("Modules — catalog rendering", () => {
     await waitFor(() => expect(screen.getByTestId("module-status-vault")).toBeInTheDocument());
     expect(screen.getByTestId("module-status-vault")).toHaveClass("status-active");
     expect(screen.getByTestId("module-status-notes")).toHaveClass("status-pending");
+    // `restarting` is a sibling of `starting` in unifiedStateForSupervisor —
+    // both transient supervisor states → `pending`. Pinned independently to
+    // catch a future regression that splits the two arms.
+    expect(screen.getByTestId("module-status-runner")).toHaveClass("status-pending");
     expect(screen.getByTestId("module-status-scribe")).toHaveClass("status-failing");
     expect(screen.getByTestId("module-status-app")).toHaveClass("status-inactive");
   });

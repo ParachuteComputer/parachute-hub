@@ -836,6 +836,17 @@ a.btn:hover {
   background: var(--error-soft);
   color: var(--error);
 }
+/*
+ * `.status-absent` is the catch-all for rows with no supervisor state at
+ * all (uninstalled / unsupervised modules). Pre-F the code emitted
+ * `status-${supervisor_status ?? "absent"}` but no CSS rule backed it;
+ * this rule replaces the unstyled fallback with a muted shape consistent
+ * with `.status-inactive`. Used by `statusBadge` in Modules.tsx.
+ */
+.status-absent {
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+}
 
 /*
  * Back-compat aliases for the pre-F vocabulary. Modules / SDKs that
