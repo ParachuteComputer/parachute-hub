@@ -277,8 +277,20 @@ export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
         if (/^https?:\/\//i.test(uiUrlRaw)) {
           entry.uiUrl = uiUrlRaw;
         } else if (isVault) {
-          const mount = path.replace(/\/$/, "");
-          entry.uiUrl = new URL(`${mount}${uiUrlRaw}`, `${base}/`).toString();
+          // Defensive guard: vault uiUrl MUST start with "/" per the
+          // multi-instance pattern (see module-ui-declaration.md). A bare
+          // "admin/" (no leading slash) would concatenate into
+          // "/vault/defaultadmin/" — a silent malformed URL that 404s.
+          // Warn loudly instead of emitting garbage; the entry just
+          // omits its uiUrl rather than poisoning the well-known doc.
+          if (!uiUrlRaw.startsWith("/")) {
+            console.warn(
+              `[well-known] vault entry "${s.name}" declares uiUrl=${JSON.stringify(uiUrlRaw)} without a leading slash; skipping uiUrl emission. Per module-ui-declaration.md, multi-instance uiUrl must be a path-form starting with "/".`,
+            );
+          } else {
+            const mount = path.replace(/\/$/, "");
+            entry.uiUrl = new URL(`${mount}${uiUrlRaw}`, `${base}/`).toString();
+          }
         } else {
           entry.uiUrl = new URL(uiUrlRaw, `${base}/`).toString();
         }

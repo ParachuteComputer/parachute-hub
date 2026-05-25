@@ -508,13 +508,19 @@ const HTML_TEMPLATE = `<!doctype html>
     // Render one tile per service that declares a uiUrl. Entries without
     // uiUrl are intentionally omitted — API-only modules with no
     // operator surface. The shortName-collapse below picks the first row
-    // per service short-name; for multi-instance services (vault),
-    // services[] is fanned out per-instance but all rows share the
-    // parachute-vault manifest name, so today the operator sees one
-    // Vault tile pointing at the first instance's admin. Same effective
-    // behavior the retired hardcoded "Browse Vault" tile had (workstream
-    // C, 2026-05-25); per-instance tile disambiguation can land if/when
-    // a multi-vault install needs it.
+    // per service short-name; for multi-instance services, this matters
+    // only when the services.json entry name is shared across instances.
+    //
+    // Today: vault registers as parachute-vault with multiple paths[] —
+    // shortName is "vault", one tile points at the first instance's admin.
+    // Same effective behavior the retired hardcoded "Browse Vault" tile
+    // had (workstream C, 2026-05-25).
+    //
+    // If a future multi-vault setup ever uses distinct entry names per
+    // instance (e.g. parachute-vault-default, parachute-vault-techne),
+    // the shortName collapse will yield "vault-default" and "vault-techne"
+    // and the operator gets one tile per named vault automatically — no
+    // disambiguation code needed.
     const byShort = new Map();
     for (const svc of services) {
       if (!svc || !svc.uiUrl) continue;
