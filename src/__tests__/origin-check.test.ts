@@ -48,7 +48,7 @@ describe("buildHubBoundOrigins", () => {
     expect(origins.filter((o) => o === ISSUER).length).toBe(1);
   });
 
-  test("platformOrigin adds the platform-injected public URL independently of issuer (hub#374)", () => {
+  test("platformOrigin adds the platform-injected public URL independently of issuer (hub#375)", () => {
     // Render injects RENDER_EXTERNAL_URL=https://<svc>.onrender.com at the
     // container edge; if hub_settings.hub_origin was stored to a non-public
     // URL (e.g. loopback during initial setup), the configured issuer would
