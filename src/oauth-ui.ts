@@ -169,11 +169,29 @@ export interface ErrorViewProps {
  *     `approved` and re-enters the OAuth flow at consent.
  *   - Unauthenticated viewer — render TWO CTAs (no terminal mention):
  *       1. Primary: "Sign in as admin to approve" → links to
- *          `/login?next=/admin/approve-client/<client_id>` so the admin
- *          lands directly on the approval page after sign-in.
+ *          `/login?next=<loginNextUrl>`. When the page was rendered in
+ *          response to an `/oauth/authorize?...` request, `loginNextUrl`
+ *          is that same authorize URL (pathname+search) so the operator
+ *          lands BACK on the OAuth flow after sign-in — now authenticated,
+ *          they see the inline "Approve and continue" form, click once,
+ *          and the OAuth flow resumes through consent → redirect_uri.
+ *          Without this, post-login the operator lands on the SPA approve
+ *          page, which approves the client but discards the original
+ *          authorize URL and its params — Claude is never told, the user
+ *          retries, and the prompt loop never closes (the bug Aaron hit
+ *          via Claude.ai MCP on the Render deploy).
+ *
+ *          Callers that don't pass `loginNextUrl` (the deep-link share-
+ *          page entry point, or hand-crafted callers) fall back to the
+ *          legacy SPA approve path; that's still useful for the
+ *          "share with another admin" case, just not for resuming an
+ *          in-flight OAuth flow.
  *       2. Secondary: a fully-qualified shareable deep link to
  *          `<hub_origin>/admin/approve-client/<client_id>` with a copy
  *          button — the operator can send it to whoever runs the hub.
+ *          This deep link intentionally stays SPA-routed (it has no
+ *          authorize-URL context to preserve — the recipient isn't in
+ *          an OAuth flow).
  *
  *   The CLI fallback (`parachute auth approve-client <id>`) was retired —
  *   the web path is the path now. Operators who want the CLI still have it
@@ -212,6 +230,24 @@ export interface ApprovePendingViewProps {
     csrfToken: string;
     returnTo: string;
   };
+  /**
+   * Same-origin hub-relative URL (path + search) to send the operator to
+   * after they sign in via the unauthenticated "Sign in as admin to
+   * approve" CTA. When this page is rendered in response to an
+   * `/oauth/authorize?...` GET, the caller should pass that authorize
+   * URL here so post-login the operator lands BACK on the OAuth flow
+   * (now authenticated → sees inline approve form → one click → consent →
+   * redirect_uri callback). Omitted → CTA falls back to the legacy
+   * `/login?next=/admin/approve-client/<id>` path which dead-ends the
+   * OAuth flow at the SPA approve page (kept only for back-compat with
+   * non-authorize callers).
+   *
+   * The path is validated server-side at `/login` via `safeNext`
+   * (`src/admin-handlers.ts`), which only honors hub-relative paths
+   * starting with `/` and excluding `//` — so an attacker-controlled
+   * authorize URL can't be wielded for open-redirect.
+   */
+  loginNextUrl?: string;
 }
 
 export function renderLogin(props: LoginViewProps): string {
@@ -424,6 +460,7 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
     requestedVault,
     hubOrigin,
     approveForm,
+    loginNextUrl,
   } = props;
   const redirectList = redirectUris.map((u) => `<li><code>${escapeHtml(u)}</code></li>`).join("");
   // Substitute unnamed `vault:<verb>` rows with the wildcard display form
@@ -470,7 +507,7 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
         <input type="hidden" name="return_to" value="${escapeHtml(approveForm.returnTo)}" />
         <button type="submit" class="btn btn-primary">Approve and continue</button>
       </form>`
-    : renderUnauthenticatedApproveCtas(hubOrigin, clientId);
+    : renderUnauthenticatedApproveCtas(hubOrigin, clientId, loginNextUrl);
   const body = `
     <div class="card">
       <div class="card-header">
@@ -512,20 +549,41 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
  * Unauthenticated branch of `renderApprovePending`. Two CTAs:
  *
  *   1. Primary: "Sign in as admin to approve" → links to
- *      `/login?next=/admin/approve-client/<client_id>` so the admin lands
- *      on the approval page after sign-in.
+ *      `/login?next=<loginNextUrl>`. When `loginNextUrl` is provided,
+ *      that's the URL the operator lands on after sign-in — for the
+ *      OAuth-flow entry point that's the original `/oauth/authorize?...`
+ *      URL, so the operator resumes the in-flight OAuth flow (now
+ *      authenticated → inline approve form → consent → redirect_uri)
+ *      instead of dead-ending at the SPA approve page with the OAuth
+ *      params discarded. When `loginNextUrl` is absent, fall back to
+ *      `/admin/approve-client/<id>` (the legacy SPA path) — useful for
+ *      non-authorize entry points where there's no OAuth flow to resume.
  *   2. Secondary: a fully-qualified shareable deep-link to
  *      `<hub_origin>/admin/approve-client/<client_id>` with a Copy button
- *      so the operator can send it to whoever runs the hub.
+ *      so the operator can send it to whoever runs the hub. This stays
+ *      SPA-routed because the recipient isn't in an OAuth flow — the
+ *      deep-link is for the share-with-another-admin case where there's
+ *      no in-flight authorize URL context to preserve.
  *
  * Inline JS is scoped to the Copy button only — `navigator.clipboard.writeText`
  * with a brief "Copied!" affordance. The button degrades gracefully when
  * scripting is unavailable (the URL is still selectable + copyable from the
  * `<code>` block via the OS clipboard).
  */
-function renderUnauthenticatedApproveCtas(hubOrigin: string, clientId: string): string {
+function renderUnauthenticatedApproveCtas(
+  hubOrigin: string,
+  clientId: string,
+  loginNextUrl?: string,
+): string {
   const approvalPath = `/admin/approve-client/${encodeURIComponent(clientId)}`;
-  const loginHref = `/login?next=${encodeURIComponent(approvalPath)}`;
+  // Prefer the caller-supplied loginNextUrl (the original authorize URL when
+  // this page was rendered for an OAuth-flow GET) so post-login resumes the
+  // flow. Fall back to the SPA approve path for entry points that don't have
+  // an authorize URL to resume. `/login`'s `safeNext` (admin-handlers.ts)
+  // gates the redirect target to hub-relative paths only — open-redirect is
+  // not reachable here regardless of caller.
+  const loginNext = loginNextUrl ?? approvalPath;
+  const loginHref = `/login?next=${encodeURIComponent(loginNext)}`;
   const trimmedOrigin = hubOrigin.replace(/\/+$/, "");
   const deepLink = `${trimmedOrigin}${approvalPath}`;
   return `
