@@ -2,9 +2,17 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
-## [Unreleased]
+## [0.5.13-rc.40] - 2026-05-25
 
-**feat(hub): unify state vocabulary across CLI + admin SPA + well-known doc (workstream F).**
+**fix(hub) + feat(hub): OAuth approve POST same-origin hotfix (hub#375) + unify state vocabulary across CLI + admin SPA + well-known doc (workstream F, hub#374).**
+
+### Fixed (hub#375 hotfix)
+
+- **OAuth approve POST no longer rejects from the public Render URL when `hub_settings.hub_origin` is stale.** The same-origin gate at `handleApproveClientPost` builds its bound-origin set from `deps.issuer` via `resolveIssuer`, whose precedence is `hub_settings.hub_origin` > `PARACHUTE_HUB_ORIGIN` > request-derived. If an operator stored `hub_origin` to a non-public URL (e.g. a loopback value entered during initial setup via the admin SPA), the bound set excluded the public Render URL — the browser POST from `https://<svc>.onrender.com` got rejected with `Cross-origin request rejected`. Fix: `buildHubBoundOrigins` now accepts an optional `platformOrigin` and `hub-server.ts` passes `process.env.RENDER_EXTERNAL_URL`. The platform-injected URL is trusted independently, so a stale stored config can't lock the operator out of cookie-POST flows arriving from the public URL. Added a diagnostic `console.warn` on same-origin failure logging Origin/Referer/Host/X-Forwarded-Host/X-Forwarded-Proto + the bound set — future opaque rejections leave a trail in Render logs.
+
+### Workstream F — state vocab unification (hub#374)
+
+**feat(hub): unify state vocabulary across CLI + admin SPA + well-known doc.**
 
 The 2026-05-25 UX audit (§2.3, §2.7) flagged three different vocabularies for the same module-supervisor concept: CLI said `running` / `stopped` / `-`; admin SPA said `Active` / `Pending-OAuth` / `Disabled`; the supervisor's internal state model said `active` / `pending-oauth` / `disabled`. Workstream F aligns every user-facing surface on the four canonical states from [parachute-patterns/patterns/design-system.md §6](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/design-system.md): `active` / `pending` / `inactive` / `failing`.
 
