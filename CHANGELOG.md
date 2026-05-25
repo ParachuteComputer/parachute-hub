@@ -2,6 +2,35 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.39] - 2026-05-25
+
+**feat(hub): well-known fan-out reads vault's declared uiUrl + retires the hardcoded Browse Vault tile + `/admin/approve-client` supports OAuth resume (workstreams C/4 + D).**
+
+Two coupled changes from the 2026-05-25 UX audit. Both are hub-side; the vault declaration and patterns docs ship in parallel (vault@0.4.8-rc.9, patterns#96/#97 merged).
+
+### Added
+
+- **Vault uiUrl fan-out** (hub#371, workstream C/4). `loadServiceUiMetadata` no longer skips vault entries; `buildWellKnown` applies the per-instance mount-path prefix (`/vault/<name>` + vault's declared `/admin/` = `/vault/<name>/admin/`) so each vault gets its own discovery tile via the well-known doc, data-driven rather than hardcoded. Includes a defensive guard that warns + skips emission when a vault uiUrl is missing the required leading slash. Three new unit tests pin single-instance prefix, multi-path fan-out, and absolute-URL pass-through.
+
+- **`/admin/approve-client/<id>` supports OAuth resume via `?return_to=<authorize-url>`** (hub#372, workstream D). The SPA approve route now accepts an optional `return_to` query param (same-origin gated). On successful approve, the server echoes `redirect_to` and the SPA `window.location.assign`s back into the parked OAuth flow. Without `return_to`, the route preserves the existing "you may now return to your app" success state for the legitimate share-with-another-admin case. The audit's "two surfaces, one route" model documented in [patterns/oauth-dcr-approval.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/oauth-dcr-approval.md). No callsite is changed today — D opens the seam for future flows.
+
+### Removed
+
+- **Hardcoded "Browse Vault" tile in `renderGetStarted`** (hub#371). The tile added in hub#342 is now redundant — hub's Services section renders vault's admin entry per-vault automatically via the well-known-driven path. The home page's data-driven shape now scales to any future installed module that declares uiUrl.
+
+### Patterns check
+
+- Adopts [patterns/module-ui-declaration.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/module-ui-declaration.md)'s multi-instance form for vault.
+- Implements the resume-affordance side of [patterns/oauth-dcr-approval.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/oauth-dcr-approval.md)'s "two cases, one route" model.
+
+### Verification
+
+- `bun run typecheck` clean (server + web/ui).
+- `bun test ./src`: 1958 pass / 0 fail.
+- `bun run test` (web/ui): 211 pass / 0 fail.
+- Container smoke CI: ✓ on both fix commits.
+- Pending: live verify on Render redeploy + workstream B's app rc.13 + vault rc.9 + scribe rc.8 installed via wizard upgrade.
+
 ## [0.5.13-rc.38] - 2026-05-25
 
 **fix(hub): unauthenticated OAuth approve CTA preserves the in-flight authorize URL through login — closes the MCP-OAuth dead-end loop.**
