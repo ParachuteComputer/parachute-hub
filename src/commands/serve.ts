@@ -111,6 +111,41 @@ function parsePort(raw: string | undefined): number | undefined {
 }
 
 /**
+ * Derive the canonical issuer URL hub uses for JWT iss claims + propagation
+ * to supervised modules' PARACHUTE_HUB_ORIGIN env.
+ *
+ * Precedence (highest first):
+ *   1. Explicit `--issuer` flag (test override too)
+ *   2. `PARACHUTE_HUB_ORIGIN` env (operator-set, typical custom-domain case)
+ *   3. Platform-injected public URL — currently Render's RENDER_EXTERNAL_URL.
+ *      This is the load-bearing tier for container deploys where the
+ *      operator can't know the URL at deploy time. Render generates the
+ *      *.onrender.com hostname after service creation and injects it for
+ *      web services; hub picks it up automatically.
+ *   4. None (returns undefined). Hub falls back to per-request derivation
+ *      via `resolveIssuer` in hub-server.ts — works for `/.well-known`
+ *      discovery but supervised modules with cached iss expectations
+ *      won't have a static value to validate against, so OAuth flows
+ *      through hub-mint → vault-validate will fail with iss-mismatch.
+ *      This is the "no canonical origin known" degraded mode.
+ *
+ * Future platforms (Fly's `FLY_APP_NAME` + region, Railway's
+ * `RAILWAY_PUBLIC_DOMAIN`, etc.) can extend tier 3 as needed.
+ *
+ * Trailing slashes are stripped for canonical-form comparison; empty
+ * strings collapse to undefined.
+ */
+export function resolveStartupIssuer(
+  opts: { issuer?: string },
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  return (
+    (opts.issuer ?? env.PARACHUTE_HUB_ORIGIN ?? env.RENDER_EXTERNAL_URL)?.replace(/\/+$/, "") ||
+    undefined
+  );
+}
+
+/**
  * Seed the initial admin from env vars when no admin exists. Returns the
  * bootstrap state so the caller can log it for operator visibility.
  *
@@ -189,7 +224,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
 
   const envPort = parsePort(env.PORT);
   const port = opts.port ?? envPort ?? DEFAULT_PORT;
-  const issuer = (opts.issuer ?? env.PARACHUTE_HUB_ORIGIN)?.replace(/\/+$/, "") || undefined;
+  const issuer = resolveStartupIssuer(opts, env);
   // Containers default to 0.0.0.0 so the platform's HTTP forwarder can
   // reach us; the `--hostname` flag / PARACHUTE_BIND_HOST is the escape
   // hatch for setups that want loopback-only inside a sidecar.

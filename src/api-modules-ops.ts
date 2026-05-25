@@ -408,9 +408,21 @@ async function spawnSupervised(
   // server.ts:230) tries to bind hub's port and crashes EADDRINUSE.
   // Explicitly override with the child's services.json port so children
   // honor their canonical port assignment regardless of hub's PORT.
+  //
+  // PARACHUTE_HUB_ORIGIN propagation (hub#365): supervised modules
+  // (vault, scribe, app) need to know the canonical hub origin to
+  // validate the `iss` claim on hub-minted JWTs. Without it, they
+  // fall back to a loopback default and reject any token whose iss is
+  // the public Render URL — surfaces as "hub JWT verification failed:
+  // unexpected 'iss' claim value" on the first authed vault call.
+  // `deps.issuer` is per-request, derived via resolveIssuer (which
+  // honors X-Forwarded-Proto / Host). Passing it as PARACHUTE_HUB_ORIGIN
+  // anchors the child's iss expectation to the same value hub mints with.
+  //
   // `deps.spawnEnv` still wins (test seam + first-boot vault-name pass-through).
   const childEnv: Record<string, string> = {
     PORT: String(entry.port),
+    ...(deps.issuer ? { PARACHUTE_HUB_ORIGIN: deps.issuer } : {}),
     ...(deps.spawnEnv ?? {}),
   };
   const req: SpawnRequest = {

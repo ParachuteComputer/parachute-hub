@@ -6,6 +6,7 @@ import { _resetBootstrapTokenForTests, getBootstrapToken } from "../bootstrap-to
 import {
   formatBootstrapTokenBanner,
   formatListeningBanner,
+  resolveStartupIssuer,
   seedInitialAdminIfNeeded,
 } from "../commands/serve.ts";
 import { openHubDb } from "../hub-db.ts";
@@ -243,5 +244,68 @@ describe("bootstrap-token wiring under needs-setup", () => {
     );
     expect(result).toBe("seeded");
     expect(getBootstrapToken()).toBeUndefined();
+  });
+});
+
+describe("resolveStartupIssuer — precedence chain (hub#365)", () => {
+  test("explicit opts.issuer wins over everything", () => {
+    const got = resolveStartupIssuer(
+      { issuer: "https://override.example" },
+      {
+        PARACHUTE_HUB_ORIGIN: "https://env.example",
+        RENDER_EXTERNAL_URL: "https://render.example.onrender.com",
+      },
+    );
+    expect(got).toBe("https://override.example");
+  });
+
+  test("PARACHUTE_HUB_ORIGIN wins over RENDER_EXTERNAL_URL", () => {
+    const got = resolveStartupIssuer(
+      {},
+      {
+        PARACHUTE_HUB_ORIGIN: "https://custom-domain.example",
+        RENDER_EXTERNAL_URL: "https://parachute-hub.onrender.com",
+      },
+    );
+    expect(got).toBe("https://custom-domain.example");
+  });
+
+  test("RENDER_EXTERNAL_URL is used when PARACHUTE_HUB_ORIGIN unset", () => {
+    // The load-bearing case: operator clicks Deploy to Render, container
+    // boots without an explicit PARACHUTE_HUB_ORIGIN (it doesn't yet
+    // appear in render.yaml as a default), Render injects RENDER_EXTERNAL_URL
+    // → hub picks it up automatically → supervised modules get the right
+    // PARACHUTE_HUB_ORIGIN → vault's iss check passes on the first
+    // authenticated request.
+    const got = resolveStartupIssuer(
+      {},
+      { RENDER_EXTERNAL_URL: "https://parachute-hub.onrender.com" },
+    );
+    expect(got).toBe("https://parachute-hub.onrender.com");
+  });
+
+  test("strips trailing slashes from any source for canonical form", () => {
+    expect(resolveStartupIssuer({ issuer: "https://x.example/" }, {})).toBe("https://x.example");
+    expect(resolveStartupIssuer({ issuer: "https://x.example//" }, {})).toBe("https://x.example");
+    expect(
+      resolveStartupIssuer({}, { PARACHUTE_HUB_ORIGIN: "https://x.example/" }),
+    ).toBe("https://x.example");
+    expect(
+      resolveStartupIssuer({}, { RENDER_EXTERNAL_URL: "https://x.example/" }),
+    ).toBe("https://x.example");
+  });
+
+  test("returns undefined when no source has a value", () => {
+    expect(resolveStartupIssuer({}, {})).toBeUndefined();
+    expect(resolveStartupIssuer({}, { RENDER_EXTERNAL_URL: "" })).toBeUndefined();
+    expect(resolveStartupIssuer({}, { PARACHUTE_HUB_ORIGIN: "" })).toBeUndefined();
+  });
+
+  test("empty string after slash-strip collapses to undefined (defensive)", () => {
+    // `/` alone strips to empty string → `||` evaluates false → undefined.
+    // Guards against a misconfigured env where someone sets the var to "/"
+    // expecting it to mean "root" (it doesn't — leaves hub without a usable
+    // origin, which is the same as not setting it at all).
+    expect(resolveStartupIssuer({}, { PARACHUTE_HUB_ORIGIN: "/" })).toBeUndefined();
   });
 });
