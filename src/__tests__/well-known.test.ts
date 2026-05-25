@@ -324,7 +324,7 @@ describe("buildWellKnown", () => {
     expect(svc?.uiUrl).toBe("https://notes.example.com/app");
   });
 
-  test("uiUrl absent when the resolver returns undefined (vault case)", () => {
+  test("uiUrl absent when the resolver returns undefined (API-only service)", () => {
     const doc = buildWellKnown({
       services: [vault, notes],
       canonicalOrigin: "https://x.example",
@@ -334,6 +334,44 @@ describe("buildWellKnown", () => {
     const notesSvc = doc.services.find((s) => s.name === "parachute-notes");
     expect(vaultSvc).not.toHaveProperty("uiUrl");
     expect(notesSvc?.uiUrl).toBe("https://x.example/notes");
+  });
+
+  // Workstream C (patterns#96): vault declares `uiUrl: "/admin/"` as a
+  // per-instance path. buildWellKnown applies the per-instance mount-path
+  // prefix on emission, yielding one tile per vault instance pointing at
+  // `<origin>/vault/<name>/admin/`. Non-vault uiUrl behavior is unchanged.
+  test("vault uiUrl is prefixed with the per-instance mount path (single instance)", () => {
+    const doc = buildWellKnown({
+      services: [vault],
+      canonicalOrigin: "https://x.example",
+      uiUrlFor: () => "/admin/",
+    });
+    const svc = doc.services.find((s) => s.name === "parachute-vault");
+    expect(svc?.uiUrl).toBe("https://x.example/vault/default/admin/");
+  });
+
+  test("vault uiUrl is prefixed per-instance for multi-path vault entries", () => {
+    const multi: ServiceEntry = { ...vault, paths: ["/vault/default", "/vault/techne"] };
+    const doc = buildWellKnown({
+      services: [multi],
+      canonicalOrigin: "https://x.example",
+      uiUrlFor: () => "/admin/",
+    });
+    const rows = doc.services.filter((s) => s.name === "parachute-vault");
+    expect(rows.length).toBe(2);
+    const uiUrls = rows.map((r) => r.uiUrl).sort();
+    expect(uiUrls[0]).toBe("https://x.example/vault/default/admin/");
+    expect(uiUrls[1]).toBe("https://x.example/vault/techne/admin/");
+  });
+
+  test("vault uiUrl absolute URL still passes through verbatim (no prefix)", () => {
+    const doc = buildWellKnown({
+      services: [vault],
+      canonicalOrigin: "https://x.example",
+      uiUrlFor: () => "https://vault.example.com/admin",
+    });
+    const svc = doc.services.find((s) => s.name === "parachute-vault");
+    expect(svc?.uiUrl).toBe("https://vault.example.com/admin");
   });
 
   test("displayName resolver overrides services.json displayName", () => {
