@@ -9,15 +9,17 @@ import { CSRF_FIELD_NAME } from "./csrf.ts";
  * The page is split into two sections, organized by **ownership**:
  *
  *   - **Services** — surfaces provided by the modules running on this
- *     hub. Browse notes (the Notes PWA); transcribe audio (Scribe); run
- *     agents (Agent). Each entry points at the service's own UI; the
- *     service owns what's behind the link (use, config, admin —
- *     whatever it chooses to surface). Entries are dynamic, derived
- *     from `/.well-known/parachute.json`; only installed services show
- *     up. Vault deliberately doesn't have its own Services entry — its
- *     content is browsed via Notes, so a separate "Vault" tile would
- *     just send the operator to the admin SPA, which is exactly the
- *     friction Aaron flagged ("clicked Vault, took me to hub management").
+ *     hub. Browse notes (the Notes PWA); transcribe audio (Scribe);
+ *     administer a vault (Vault admin SPA); run agents (Agent). Each
+ *     entry points at the service's own UI; the service owns what's
+ *     behind the link (use, config, admin — whatever it chooses to
+ *     surface). Entries are dynamic, derived from
+ *     `/.well-known/parachute.json`; only installed services show up.
+ *     Vault declares `uiUrl` per workstream C (patterns#96, 2026-05-25)
+ *     — the earlier "vault has no tile because content browses via
+ *     Notes" rule split: Notes covers end-user content browsing; the
+ *     vault tile covers operator admin (per-vault tokens, config, MCP).
+ *     Both deserve discovery presence.
  *
  *   - **Admin** — hub-owned admin surfaces for cross-cutting host
  *     concerns. Always visible: even with zero vaults installed, an
@@ -455,17 +457,25 @@ const HTML_TEMPLATE = `<!doctype html>
   /**
    * Render the "Get started" section (hub#342) above the Services grid.
    *
-   * Two hardcoded targets, each conditional on its prerequisite being
-   * installed:
+   * One hardcoded target, conditional on its prerequisite being installed:
    *   - "Open Notes" → /app/notes/  (requires parachute-app installed;
    *     App auto-bootstraps Notes-as-UI per parachute-app §17, so the
    *     mere presence of App means /app/notes/ is live)
-   *   - "Browse Vault" → /vault/<first-vault-name>/admin/  (requires
-   *     parachute-vault installed; uses the first vault's name from
-   *     its services.json mount path tail)
    *
-   * If neither prerequisite is met (fresh install pre-wizard) the
-   * section stays hidden. The hardcoded shape mirrors the wizard's
+   * The earlier "Browse Vault" tile retired in workstream C (2026-05-25)
+   * once vault declared uiUrl in its module.json (per patterns#96). With
+   * the multi-instance prefix lifted into buildWellKnown, every vault
+   * instance now renders its own tile in the Services grid below — one
+   * per instance, with the actual instance name in the discovery doc
+   * rather than a hub-side guess at "first vault."
+   *
+   * Notes stays here because Notes is the end-user CTA (the audience
+   * that needs the strongest above-the-fold prompt); the Services grid
+   * positions it equally with admin tiles, which underweights the
+   * "browse my content" path for a returning operator.
+   *
+   * If the prerequisite is not met (fresh install pre-wizard, no app)
+   * the section stays hidden. The hardcoded shape mirrors the wizard's
    * own done-screen "Start using your vault" tile — same architectural
    * shape (single obvious entry point) at a different surface.
    *
@@ -478,35 +488,11 @@ const HTML_TEMPLATE = `<!doctype html>
     if (!getStartedGrid || !getStartedSection) return;
     const tiles = [];
     const hasApp = services.some((s) => s && s.name === 'parachute-app');
-    // services[] is fanned out per-vault for parachute-vault rows (see
-    // well-known.ts emitVaultRows) — "path" is the per-instance mount
-    // "/vault/<name>". Pick the first vault entry; the order matches
-    // services.json's paths[] order, so this is deterministic.
-    const vault = services.find((s) => s && s.name === 'parachute-vault');
     if (hasApp) {
       tiles.push({
         title: 'Open Notes',
         desc: 'Browse + capture in the Notes app — reads from your vault.',
         href: '/app/notes/',
-      });
-    }
-    if (vault) {
-      // vault.path is the per-instance mount "/vault/<name>". Extract
-      // the tail as the display name; mirror the wizard's own
-      // firstVaultName() shape.
-      let vaultName = 'default';
-      if (typeof vault.path === 'string' && vault.path.startsWith('/vault/')) {
-        // Character class for the slash so the template literal can't eat
-        // the backslash-escape — \/ collapses to / inside backticks, and
-        // /\/+$/ degenerates to a // line comment that breaks the whole
-        // IIFE. [/]+$ keeps the same semantics with no escape needed.
-        const tail = vault.path.slice('/vault/'.length).replace(/[/]+$/, '');
-        if (tail.length > 0) vaultName = tail;
-      }
-      tiles.push({
-        title: 'Browse Vault',
-        desc: "Open your vault's admin UI — content, settings, MCP.",
-        href: '/vault/' + encodeURIComponent(vaultName) + '/admin/',
       });
     }
     if (tiles.length === 0) {
@@ -520,11 +506,21 @@ const HTML_TEMPLATE = `<!doctype html>
 
   function renderServices(services) {
     // Render one tile per service that declares a uiUrl. Entries without
-    // uiUrl are intentionally omitted — vault is the canonical example
-    // (its content is browsed via Notes, which has its own uiUrl row).
-    // Multiple entries with the same shortName collapse into one tile;
-    // operators with two scribe instances pick the first arbitrarily,
-    // and they'd know which they meant.
+    // uiUrl are intentionally omitted — API-only modules with no
+    // operator surface. The shortName-collapse below picks the first row
+    // per service short-name; for multi-instance services, this matters
+    // only when the services.json entry name is shared across instances.
+    //
+    // Today: vault registers as parachute-vault with multiple paths[] —
+    // shortName is "vault", one tile points at the first instance's admin.
+    // Same effective behavior the retired hardcoded "Browse Vault" tile
+    // had (workstream C, 2026-05-25).
+    //
+    // If a future multi-vault setup ever uses distinct entry names per
+    // instance (e.g. parachute-vault-default, parachute-vault-techne),
+    // the shortName collapse will yield "vault-default" and "vault-techne"
+    // and the operator gets one tile per named vault automatically — no
+    // disambiguation code needed.
     const byShort = new Map();
     for (const svc of services) {
       if (!svc || !svc.uiUrl) continue;

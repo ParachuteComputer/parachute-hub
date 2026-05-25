@@ -719,12 +719,24 @@ async function loadManagementUrls(
 }
 
 /**
- * For each NON-vault `ServiceEntry` with a known `installDir`, read its
+ * For each `ServiceEntry` with a known `installDir`, read its
  * `.parachute/module.json` and surface the optional `uiUrl` and
  * `displayName`. Returns two `name → value` maps keyed by services.json
- * entry name. Mirrors `loadManagementUrls` (vault is the analog there;
- * non-vault services are the analog here — vaults are user-facing via
- * Notes, not their own UI).
+ * entry name.
+ *
+ * Vaults are NOT skipped — as of patterns#96 (workstream C) vault declares
+ * its own `uiUrl: "/admin/"` (multi-instance form). `buildWellKnown`
+ * applies the per-instance mount-path prefix for vault rows so each
+ * instance gets a discovery tile pointing at `/vault/<name>/admin/`. The
+ * earlier "vaults browse via Notes — no tile" rule retired with PR 1 of
+ * workstream C; operators administer per-vault tokens / config / MCP via
+ * the vault admin SPA, which is a different audience from Notes' content
+ * browse. See [`module-ui-declaration.md` §"Use vs admin"](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/module-ui-declaration.md#use-vs-admin--both-can-be-true).
+ *
+ * `loadManagementUrls` continues to handle vault's `managementUrl` for
+ * the hub admin SPA's vault-list "Manage" link — a different surface
+ * (admin SPA, not discovery), even when the target path happens to
+ * collide (`/admin/` for both).
  *
  * Why read at request time and not from services.json: services own the
  * write side of services.json (`upsertService` replaces the whole entry
@@ -746,9 +758,7 @@ async function loadServiceUiMetadata(
   const displayNames = new Map<string, string>();
   await Promise.all(
     services.map(async (s) => {
-      // Skip vaults — they have their own loadManagementUrls path and no
-      // operator-facing user UI of their own (content browses via Notes).
-      if (isVaultEntry(s) || !s.installDir) return;
+      if (!s.installDir) return;
       try {
         const m = await read(s.installDir);
         if (m?.uiUrl) uiUrls.set(s.name, m.uiUrl);

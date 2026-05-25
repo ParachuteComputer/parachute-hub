@@ -370,14 +370,16 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/.well-known/parachute.json: uiUrl resolver is skipped for vault entries (loadManagementUrls handles vault)", async () => {
+  test("/.well-known/parachute.json: vault entry uiUrl is prefixed with the per-instance mount path", async () => {
     const h = makeHarness();
     try {
       const vaultWithDir: ServiceEntry = { ...vaultEntry("default"), installDir: "/fake/vault" };
       writeManifest({ services: [vaultWithDir] }, h.manifestPath);
-      // The fake module.json declares uiUrl, but vault is supposed to be
-      // skipped by loadServiceUiMetadata (it has its own managementUrl
-      // path). So doc.services[vault] should NOT carry uiUrl.
+      // Workstream C (patterns#96 + vault PR 367): vault declares
+      // `uiUrl: "/admin/"` as a per-instance path. loadServiceUiMetadata
+      // no longer skips vault entries; buildWellKnown prefixes the
+      // declared path with the per-instance mount on emission, yielding
+      // `/vault/default/admin/` for a vault mounted at `/vault/default`.
       const res = await hubFetch(h.dir, {
         manifestPath: h.manifestPath,
         readModuleManifest: async () => ({
@@ -386,12 +388,48 @@ describe("hubFetch routing", () => {
           port: 1940,
           paths: ["/vault/default"],
           health: "/health",
-          uiUrl: "/should-be-ignored",
+          uiUrl: "/admin/",
         }),
       })(req("/.well-known/parachute.json"));
       const body = (await res.json()) as { services: Array<{ name: string; uiUrl?: string }> };
-      const vaultSvc = body.services.find((s) => s.name === "parachute-vault");
-      expect(vaultSvc).not.toHaveProperty("uiUrl");
+      const vaultSvc = body.services.find((s) => s.name === "parachute-vault-default");
+      expect(vaultSvc?.uiUrl).toMatch(/\/vault\/default\/admin\/$/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/.well-known/parachute.json: vault with multiple paths emits one row per instance with its own prefixed uiUrl", async () => {
+    const h = makeHarness();
+    try {
+      const multi: ServiceEntry = {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default", "/vault/techne"],
+        health: "/vault/default/health",
+        version: "0.4.8",
+        installDir: "/fake/vault",
+      };
+      writeManifest({ services: [multi] }, h.manifestPath);
+      const res = await hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        readModuleManifest: async () => ({
+          name: "vault",
+          manifestName: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default", "/vault/techne"],
+          health: "/health",
+          uiUrl: "/admin/",
+        }),
+      })(req("/.well-known/parachute.json"));
+      const body = (await res.json()) as {
+        services: Array<{ name: string; path?: string; uiUrl?: string }>;
+      };
+      const vaultRows = body.services.filter((s) => s.name === "parachute-vault");
+      expect(vaultRows.length).toBe(2);
+      const uiUrls = vaultRows.map((r) => r.uiUrl).sort();
+      expect(uiUrls[0]).toMatch(/\/vault\/default\/admin\/$/);
+      expect(uiUrls[1]).toMatch(/\/vault\/techne\/admin\/$/);
     } finally {
       h.cleanup();
     }

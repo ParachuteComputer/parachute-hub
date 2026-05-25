@@ -78,10 +78,11 @@ describe("renderHub", () => {
     expect(html).not.toContain("['notes', 'scribe', 'agent']");
   });
 
-  test("Services skip rule emerges from data, not name-checks (vault has no uiUrl)", () => {
-    // The previous `isVaultName` hardcoded skip is gone — vault doesn't
-    // declare uiUrl, so it naturally doesn't render. Other API-only
-    // modules (current or future) get the same treatment for free.
+  test("Services skip rule emerges from data, not name-checks (any service without uiUrl skipped)", () => {
+    // The previous `isVaultName` hardcoded skip is gone — vault now
+    // declares uiUrl per workstream C (patterns#96), so it renders too;
+    // API-only modules (current or future) without uiUrl get omitted
+    // for free under the same data-driven rule.
     expect(html).toContain("if (!svc || !svc.uiUrl) continue;");
     // The function definition is gone (the comment may still mention the
     // name as historical context — we only care about the active code).

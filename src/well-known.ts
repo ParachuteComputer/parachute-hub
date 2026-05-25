@@ -168,8 +168,12 @@ export interface BuildWellKnownOpts {
   /**
    * Optional resolver mapping a `ServiceEntry` to its `module.json:uiUrl`,
    * if any. Same shape as `managementUrlFor`. Returning `undefined` means
-   * "no user-facing UI" and discovery omits the Services tile (e.g. vault
-   * has no `uiUrl` — its content browses through Notes).
+   * "no user-facing UI" and discovery omits the Services tile. For vault
+   * entries, the declared `uiUrl` is the per-instance path (e.g. "/admin/")
+   * — `buildWellKnown` prefixes it with the per-instance mount path on
+   * emission, yielding one tile per vault instance pointing at
+   * `<origin>/vault/<name>/admin/`. See patterns#96
+   * `module-ui-declaration.md` §"Multi-instance services (vault)".
    */
   uiUrlFor?: (entry: ServiceEntry) => string | undefined;
   /**
@@ -252,13 +256,44 @@ export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
       // entry — no installDir round-trip needed since it's already
       // persisted server-side and reasonably stable across reboots.
       if (s.tagline !== undefined) entry.tagline = s.tagline;
-      // Resolve uiUrl: relative path → absolute URL against `base`; full
-      // http(s) URL → verbatim. Same rule managementUrl uses.
+      // Resolve uiUrl. Three forms (per patterns#96
+      // `module-ui-declaration.md` §"Shape"):
+      //   - Absolute http(s) URL → verbatim.
+      //   - Path on a non-vault entry → joined onto `base` directly.
+      //   - Path on a vault entry → joined onto `base` AFTER prefixing
+      //     with the per-instance mount path. Vault is the only
+      //     multi-instance service today; its declared `uiUrl: "/admin/"`
+      //     resolves to `<base>/vault/<name>/admin/` (one tile per
+      //     instance). The mount path is whichever `path` we're iterating
+      //     this loop turn (vault's `pathsToEmit` is its `paths[]`,
+      //     fanning one row per instance).
+      //
+      // Path concatenation: `path` is the canonical per-instance mount
+      // ("/vault/default", no trailing slash from services.json). `uiUrlRaw`
+      // starts with "/" per pattern rule. Direct concatenation yields the
+      // correct join ("/vault/default" + "/admin/" → "/vault/default/admin/").
       const uiUrlRaw = opts.uiUrlFor?.(s);
       if (uiUrlRaw !== undefined) {
-        entry.uiUrl = /^https?:\/\//i.test(uiUrlRaw)
-          ? uiUrlRaw
-          : new URL(uiUrlRaw, `${base}/`).toString();
+        if (/^https?:\/\//i.test(uiUrlRaw)) {
+          entry.uiUrl = uiUrlRaw;
+        } else if (isVault) {
+          // Defensive guard: vault uiUrl MUST start with "/" per the
+          // multi-instance pattern (see module-ui-declaration.md). A bare
+          // "admin/" (no leading slash) would concatenate into
+          // "/vault/defaultadmin/" — a silent malformed URL that 404s.
+          // Warn loudly instead of emitting garbage; the entry just
+          // omits its uiUrl rather than poisoning the well-known doc.
+          if (!uiUrlRaw.startsWith("/")) {
+            console.warn(
+              `[well-known] vault entry "${s.name}" declares uiUrl=${JSON.stringify(uiUrlRaw)} without a leading slash; skipping uiUrl emission. Per module-ui-declaration.md, multi-instance uiUrl must be a path-form starting with "/".`,
+            );
+          } else {
+            const mount = path.replace(/\/$/, "");
+            entry.uiUrl = new URL(`${mount}${uiUrlRaw}`, `${base}/`).toString();
+          }
+        } else {
+          entry.uiUrl = new URL(uiUrlRaw, `${base}/`).toString();
+        }
       }
       // Hierarchical sub-units (hub#313 / parachute-app design doc §12). The
       // on-disk shape is a map keyed by short slug; the well-known shape is
@@ -354,9 +389,11 @@ export async function regenerateWellKnown(
   const services = readManifest(opts.manifestPath).services;
   // Build the resolver maps the same way hub-server does — read each
   // module's `.parachute/module.json` from `installDir` and harvest
-  // managementUrl (vault rows) + uiUrl + displayName (non-vault rows).
-  // Per-entry errors land in console.warn so one malformed manifest doesn't
-  // block the regen for everyone else.
+  // managementUrl (vault rows), uiUrl + displayName (all rows). Vaults
+  // declare uiUrl per workstream C / patterns#96 (multi-instance form
+  // — `buildWellKnown` applies the per-instance mount-path prefix on
+  // emission). Per-entry errors land in console.warn so one malformed
+  // manifest doesn't block the regen for everyone else.
   const managementUrls = new Map<string, string>();
   const uiUrls = new Map<string, string>();
   const displayNames = new Map<string, string>();
@@ -366,12 +403,11 @@ export async function regenerateWellKnown(
       try {
         const m = await read(s.installDir);
         if (!m) return;
-        if (isVaultEntry(s)) {
-          if (m.managementUrl) managementUrls.set(s.name, m.managementUrl);
-        } else {
-          if (m.uiUrl) uiUrls.set(s.name, m.uiUrl);
-          if (m.displayName) displayNames.set(s.name, m.displayName);
+        if (isVaultEntry(s) && m.managementUrl) {
+          managementUrls.set(s.name, m.managementUrl);
         }
+        if (m.uiUrl) uiUrls.set(s.name, m.uiUrl);
+        if (m.displayName) displayNames.set(s.name, m.displayName);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`well-known regen: skipping module metadata for ${s.name}: ${msg}`);
