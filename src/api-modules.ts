@@ -97,11 +97,14 @@ export interface ApiModulesDeps {
   manifestPath: string;
   supervisor?: Supervisor;
   /**
-   * NPM @latest probe. Returns the version string or null on failure /
-   * timeout. Default is the real npm registry; tests inject a fake so
-   * they don't hit the network.
+   * NPM dist-tag probe. Returns the version string at the given dist-tag,
+   * or null on failure / timeout / unknown tag. Default is the real npm
+   * registry; tests inject a fake so they don't hit the network. Channel
+   * arg lets the probe respect the operator's configured install channel
+   * (`rc` operators see the rc version as the upgrade target, not the
+   * stable `latest`).
    */
-  fetchLatestVersion?: (pkg: string) => Promise<string | null>;
+  fetchLatestVersion?: (pkg: string, channel: ModuleInstallChannel) => Promise<string | null>;
   /**
    * Module-level cache TTL for `latest_version` probes, in ms. Default
    * 5 minutes — long enough that a tab refresh doesn't slam npm,
@@ -229,15 +232,32 @@ const latestVersionCache = new Map<string, CachedVersion>();
  * tolerates a missing latest_version, so we keep the response shape
  * stable even when the registry is flaky.
  */
-export async function defaultFetchLatestVersion(pkg: string): Promise<string | null> {
+export async function defaultFetchLatestVersion(
+  pkg: string,
+  channel: ModuleInstallChannel,
+): Promise<string | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3_000);
   try {
-    const url = `https://registry.npmjs.org/${encodeURIComponent(pkg)}/latest`;
+    // npm exposes per-package dist-tags at /-/package/<pkg>/dist-tags as a
+    // simple map (e.g. `{"latest": "0.2.0-rc.4", "rc": "0.2.0-rc.13"}`).
+    // Look up the configured channel; fall back to `latest` if the channel
+    // is missing (e.g. a package that hasn't been published with @rc yet).
+    // Previously hit `/${pkg}/latest` directly — that endpoint always
+    // returns the `latest` dist-tag's package doc regardless of channel,
+    // so an operator on @rc saw the @latest version as the "available"
+    // upgrade target (audit caught on Aaron's deploy 2026-05-25: app
+    // showed "rc.4 available" while @rc was actually rc.13).
+    // encodeURIComponent handles scoped packages: @openparachute/vault →
+    // %40openparachute%2Fvault. npm resolves the encoded form correctly.
+    const url = `https://registry.npmjs.org/-/package/${encodeURIComponent(pkg)}/dist-tags`;
     const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) return null;
-    const body = (await res.json()) as { version?: unknown };
-    return typeof body.version === "string" ? body.version : null;
+    const tags = (await res.json()) as Record<string, unknown>;
+    const fromChannel = tags[channel];
+    if (typeof fromChannel === "string") return fromChannel;
+    const fromLatest = tags.latest;
+    return typeof fromLatest === "string" ? fromLatest : null;
   } catch {
     return null;
   } finally {
@@ -378,11 +398,15 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
     }
   }
 
-  // Resolve npm @latest in parallel — short timeout per request, cache
+  // Resolve npm dist-tag in parallel — short timeout per request, cache
   // shared across requests so a fast UI poll doesn't slam the registry.
+  // Channel-aware: an operator on @rc sees the rc-tagged version as the
+  // upgrade target (not the stable @latest which may be older). Cache key
+  // includes channel so a channel-toggle doesn't return a stale value.
   const fetchLatest = deps.fetchLatestVersion ?? defaultFetchLatestVersion;
   const cacheTtl = deps.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
   const now = deps.now ?? Date.now;
+  const channel = getModuleInstallChannel(deps.db);
 
   const latestByShort = new Map<string, string | null>();
   await Promise.all(
@@ -393,13 +417,14 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
         return;
       }
       const pkg = m.package;
-      const cached = latestVersionCache.get(pkg);
+      const cacheKey = `${pkg}@${channel}`;
+      const cached = latestVersionCache.get(cacheKey);
       if (cached && cacheTtl > 0 && now() - cached.fetchedAt < cacheTtl) {
         latestByShort.set(short, cached.value);
         return;
       }
-      const value = await fetchLatest(pkg);
-      latestVersionCache.set(pkg, { value, fetchedAt: now() });
+      const value = await fetchLatest(pkg, channel);
+      latestVersionCache.set(cacheKey, { value, fetchedAt: now() });
       latestByShort.set(short, value);
     }),
   );
