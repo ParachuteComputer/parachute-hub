@@ -519,7 +519,7 @@ describe("GET /api/modules", () => {
             techne: {
               displayName: "Techne",
               path: "/vault/techne",
-              status: "pending-oauth",
+              status: "pending",
             },
           },
         },
@@ -566,7 +566,7 @@ describe("GET /api/modules", () => {
           icon_url: null,
           version: null,
           oauth_client_id: null,
-          status: "pending-oauth",
+          status: "pending",
         },
       ]);
       // Other curated rows stay empty — uis is per-row, not global.
@@ -590,7 +590,7 @@ describe("GET /api/modules", () => {
               iconUrl: "/vault/full/icon.svg",
               version: "0.3.1",
               oauthClientId: "c1",
-              status: "disabled",
+              status: "inactive",
             },
           },
         },
@@ -626,8 +626,60 @@ describe("GET /api/modules", () => {
         icon_url: "/vault/full/icon.svg",
         version: "0.3.1",
         oauth_client_id: "c1",
-        status: "disabled",
+        status: "inactive",
       });
+    });
+
+    test("legacy `pending-oauth` / `disabled` status values normalize to canonical vocab on the wire (workstream F back-compat)", async () => {
+      // Workstream F unifies the SPA / CLI / well-known state vocab onto
+      // `active | pending | inactive | failing`. Old modules / SDKs may
+      // still write the pre-F values to services.json (`pending-oauth`,
+      // `disabled`). `services-manifest.ts` normalizes on read so every
+      // downstream emit (this API, well-known doc) sees the canonical
+      // form. Pins that boundary normalization end-to-end here.
+      writeManifest(h.manifestPath, [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/vault/default/health",
+          version: "0.4.5",
+          uis: {
+            legacy_pending: {
+              displayName: "Legacy Pending",
+              path: "/vault/legacy-pending",
+              // biome-ignore lint/suspicious/noExplicitAny: deliberately
+              // writing the pre-F legacy alias to pin the normalization
+              // boundary; the schema accepts it on read.
+              status: "pending-oauth" as any,
+            },
+            legacy_disabled: {
+              displayName: "Legacy Disabled",
+              path: "/vault/legacy-disabled",
+              // biome-ignore lint/suspicious/noExplicitAny: same as above.
+              status: "disabled" as any,
+            },
+          },
+        },
+      ]);
+      const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+      const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        fetchLatestVersion: async () => null,
+      });
+      const body = (await res.json()) as {
+        modules: Array<{
+          short: string;
+          uis: Array<{ name: string; status: string | null }>;
+        }>;
+      };
+      const vault = body.modules.find((m) => m.short === "vault");
+      const pending = vault?.uis.find((u) => u.name === "legacy_pending");
+      const inactive = vault?.uis.find((u) => u.name === "legacy_disabled");
+      expect(pending?.status).toBe("pending");
+      expect(inactive?.status).toBe("inactive");
     });
   });
 });

@@ -257,7 +257,7 @@ describe("services-manifest", () => {
               displayName: "Unforced Brain",
               path: "/app/unforced-brain",
               oauthClientId: "client_def456",
-              status: "pending-oauth",
+              status: "pending",
             },
           },
         };
@@ -381,6 +381,79 @@ describe("services-manifest", () => {
           },
         };
         expect(() => upsertService(bad, path)).toThrow(/status/);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("normalizes legacy `pending-oauth` → `pending` on read (workstream F back-compat)", () => {
+      // Pre-F services may still write the legacy alias. The schema
+      // accepts it on read + normalizes to the canonical vocab so
+      // downstream emit surfaces (well-known, /api/modules, SPA) always
+      // see the canonical form. Retire after the next rc-chain alias
+      // window per design-system.md §6.
+      const { path, cleanup } = makeTempPath();
+      try {
+        const legacy: ServiceEntry = {
+          ...app,
+          uis: {
+            slug: {
+              displayName: "S",
+              path: "/app/s",
+              // biome-ignore lint/suspicious/noExplicitAny: deliberately
+              // writing the pre-F legacy alias to pin the normalization
+              // boundary; the schema accepts it on read.
+              status: "pending-oauth" as any,
+            },
+          },
+        };
+        upsertService(legacy, path);
+        const got = readManifest(path).services[0]?.uis?.slug;
+        expect(got?.status).toBe("pending");
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("normalizes legacy `disabled` → `inactive` on read (workstream F back-compat)", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        const legacy: ServiceEntry = {
+          ...app,
+          uis: {
+            slug: {
+              displayName: "S",
+              path: "/app/s",
+              // biome-ignore lint/suspicious/noExplicitAny: same as above.
+              status: "disabled" as any,
+            },
+          },
+        };
+        upsertService(legacy, path);
+        const got = readManifest(path).services[0]?.uis?.slug;
+        expect(got?.status).toBe("inactive");
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("accepts new canonical states (`failing`, `inactive`)", () => {
+      // `failing` is new in workstream F (no pre-F equivalent — pre-F
+      // collapsed failing into `disabled`). `inactive` is the new
+      // canonical name for `disabled`. Both must validate.
+      const { path, cleanup } = makeTempPath();
+      try {
+        const entry: ServiceEntry = {
+          ...app,
+          uis: {
+            f: { displayName: "F", path: "/app/f", status: "failing" },
+            i: { displayName: "I", path: "/app/i", status: "inactive" },
+          },
+        };
+        upsertService(entry, path);
+        const got = readManifest(path).services[0]?.uis;
+        expect(got?.f?.status).toBe("failing");
+        expect(got?.i?.status).toBe("inactive");
       } finally {
         cleanup();
       }

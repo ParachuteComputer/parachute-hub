@@ -815,10 +815,35 @@ a.btn:hover {
   font-weight: 500;
   white-space: nowrap;
 }
+/*
+ * Four canonical status classes per design-system.md §6 (workstream F).
+ * Shared across the module-row supervisor badge, sub-unit badges, and
+ * any future status surface (e.g. expose-state, vault sync).
+ */
 .status-active {
   background: var(--success-soft);
   color: var(--success);
 }
+.status-pending {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.status-inactive {
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+}
+.status-failing {
+  background: var(--error-soft);
+  color: var(--error);
+}
+
+/*
+ * Back-compat aliases for the pre-F vocabulary. Modules / SDKs that
+ * render the legacy class names (`status-pending-oauth`, `status-disabled`)
+ * continue to paint correctly for one release window after workstream F
+ * lands; retire after the next rc chain when downstream consumers have
+ * had time to migrate. See design-system.md §6 "CSS classes + colors".
+ */
 .status-pending-oauth {
   background: var(--warn-soft);
   color: var(--warn);

@@ -62,15 +62,21 @@ describe("status", () => {
       expect(code).toBe(0);
       expect(seen).toContain("http://localhost:1940/health");
       expect(seen).toContain("http://localhost:3200/scribe/health");
+      // Header reflects the post-workstream-F column shape:
+      // SERVICE  PORT  VERSION  STATE  PID  UPTIME  LATENCY  SOURCE
       expect(lines[0]).toMatch(/SERVICE/);
+      expect(lines[0]).toMatch(/STATE/);
+      expect(lines[0]).not.toMatch(/PROCESS/);
+      expect(lines[0]).not.toMatch(/HEALTH/);
       expect(lines.some((l) => l.includes("parachute-vault"))).toBe(true);
-      expect(lines.some((l) => l.includes("ok"))).toBe(true);
+      // Healthy probe rolls up to `active` per design-system.md §6.
+      expect(lines.some((l) => /\bactive\b/.test(l))).toBe(true);
     } finally {
       cleanup();
     }
   });
 
-  test("any-failing returns 1", async () => {
+  test("any-failing returns 1 and surfaces probe detail on continuation line", async () => {
     const { path, cleanup } = makeTempPath();
     try {
       upsertService(
@@ -86,13 +92,17 @@ describe("status", () => {
         print: (l) => lines.push(l),
       });
       expect(code).toBe(1);
-      expect(lines.some((l) => l.includes("ECONNREFUSED"))).toBe(true);
+      // STATE column rolls up to `failing`.
+      expect(lines.some((l) => /\bfailing\b/.test(l))).toBe(true);
+      // The pre-F HEALTH column's detail survives on a continuation line
+      // ("  ! probe: ECONNREFUSED") so the operator can still diagnose.
+      expect(lines.some((l) => l.includes("probe:") && l.includes("ECONNREFUSED"))).toBe(true);
     } finally {
       cleanup();
     }
   });
 
-  test("http non-2xx counts as unhealthy with status code", async () => {
+  test("http non-2xx counts as failing and surfaces the code on the probe line", async () => {
     const { path, cleanup } = makeTempPath();
     try {
       upsertService(
@@ -106,13 +116,14 @@ describe("status", () => {
         print: (l) => lines.push(l),
       });
       expect(code).toBe(1);
-      expect(lines.some((l) => l.includes("http 503"))).toBe(true);
+      expect(lines.some((l) => /\bfailing\b/.test(l))).toBe(true);
+      expect(lines.some((l) => l.includes("probe: http 503"))).toBe(true);
     } finally {
       cleanup();
     }
   });
 
-  test("running process shows pid + uptime and still probes", async () => {
+  test("running + healthy probe shows STATE=active, pid + uptime", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       upsertService(
@@ -129,15 +140,19 @@ describe("status", () => {
         print: (l) => lines.push(l),
       });
       expect(code).toBe(0);
-      expect(lines.some((l) => l.includes("running"))).toBe(true);
+      // Pre-F: STATE was a two-column (PROCESS=running, HEALTH=ok) split.
+      // Post-F: collapsed to one column showing `active`.
+      expect(lines.some((l) => /\bactive\b/.test(l))).toBe(true);
       expect(lines.some((l) => l.includes("4242"))).toBe(true);
-      expect(lines.some((l) => l.includes("ok"))).toBe(true);
+      // Probe-detail continuation line is suppressed for active rows
+      // (the rollup is sufficient — no need to repeat "ok").
+      expect(lines.some((l) => l.includes("probe:"))).toBe(false);
     } finally {
       cleanup();
     }
   });
 
-  test("known-stopped process skips probe and doesn't fail exit", async () => {
+  test("known-stopped process renders STATE=inactive, skips probe, exits 0", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       upsertService(
@@ -159,7 +174,8 @@ describe("status", () => {
       });
       expect(code).toBe(0);
       expect(probed).toBe(false);
-      expect(lines.some((l) => l.includes("stopped"))).toBe(true);
+      // Pre-F: PROCESS=stopped. Post-F: STATE=inactive.
+      expect(lines.some((l) => /\binactive\b/.test(l))).toBe(true);
     } finally {
       cleanup();
     }

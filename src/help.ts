@@ -142,21 +142,36 @@ Examples:
 }
 
 export function statusHelp(): string {
-  return `parachute status — show installed services, process state, health, install source
+  return `parachute status — show installed services, run state, install source
 
 Usage:
   parachute status
 
 What it does:
   Reads ~/.parachute/services.json. For each registered service:
-    - checks PID file at ~/.parachute/<svc>/run/<svc>.pid → running/stopped
+    - checks PID file at ~/.parachute/<svc>/run/<svc>.pid
     - probes http://localhost:<port><health> (skipped for known-stopped processes)
     - classifies the install source as bun-linked (local checkout) or npm
 
-  Stopped services show "-" for health and don't count toward the exit
-  code — they're an expected state after fresh install before \`parachute
-  start\`. Running or externally-managed services that fail health checks
-  do exit 1.
+  The STATE column rolls process state + probe result into one of four
+  canonical labels (per parachute-patterns/patterns/design-system.md §6):
+    active    supervised, running, last probe ok
+    pending   supervised, needs operator action (OAuth / config) —
+              not reachable from \`parachute status\` today; surfaces in
+              the admin SPA; kept here for completeness
+    inactive  operator-stopped or never started (no probe attempted)
+    failing   supervised but probe failed (down / non-2xx); a
+              continuation line ("  ! probe: <detail>") prints the
+              underlying probe failure for diagnosis
+
+  Pre-workstream-F this column was two: PROCESS (running / stopped) and
+  HEALTH (ok / down / http <code>). Workstream F collapsed them onto the
+  single STATE column the SPA + well-known doc also speak.
+
+  Stopped services render as STATE=inactive and don't count toward the
+  exit code — they're an expected state after fresh install before
+  \`parachute start\`. Running or externally-managed services that fail
+  health checks render as STATE=failing and exit 1.
 
   A "STALE: services.json cached … live package.json …" continuation line
   appears under a row when a bun-linked service has been rebuilt but the
@@ -169,10 +184,10 @@ Exit codes:
 
 Example:
   $ parachute status
-  SERVICE          PORT  VERSION  PROCESS  PID    UPTIME  HEALTH  LATENCY  SOURCE
-  parachute-vault  1940  0.2.4    running  12345  2h 13m  ok      2ms      bun-linked → parachute-vault @ 8aa167b
+  SERVICE          PORT  VERSION  STATE   PID    UPTIME  LATENCY  SOURCE
+  parachute-vault  1940  0.2.4    active  12345  2h 13m  2ms      bun-linked → parachute-vault @ 8aa167b
     → http://127.0.0.1:1940/vault/default/mcp
-  parachute-app    1946  0.2.0    running  12346  2h 12m  ok      3ms      npm (0.2.0-rc.4)
+  parachute-app    1946  0.2.0    active  12346  2h 12m  3ms      npm (0.2.0-rc.4)
     → http://127.0.0.1:1946/app/notes
 `;
 }
