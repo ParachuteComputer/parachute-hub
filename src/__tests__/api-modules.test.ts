@@ -427,7 +427,10 @@ describe("GET /api/modules", () => {
     // Second back-to-back request must not re-hit the registry. The
     // UI may poll this endpoint; we don't want it to slam npm.
     let calls = 0;
-    const probe = async (_pkg: string): Promise<string | null> => {
+    const probe = async (
+      _pkg: string,
+      _channel: "latest" | "rc",
+    ): Promise<string | null> => {
       calls++;
       return "0.5.0";
     };

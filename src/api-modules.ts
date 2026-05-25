@@ -248,6 +248,8 @@ export async function defaultFetchLatestVersion(
     // so an operator on @rc saw the @latest version as the "available"
     // upgrade target (audit caught on Aaron's deploy 2026-05-25: app
     // showed "rc.4 available" while @rc was actually rc.13).
+    // encodeURIComponent handles scoped packages: @openparachute/vault →
+    // %40openparachute%2Fvault. npm resolves the encoded form correctly.
     const url = `https://registry.npmjs.org/-/package/${encodeURIComponent(pkg)}/dist-tags`;
     const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) return null;
