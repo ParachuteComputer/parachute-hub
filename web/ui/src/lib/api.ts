@@ -597,9 +597,23 @@ export async function approveOauthClient(
 
 /**
  * Status of a hosted UI sub-unit, mirrors `UiSubUnitStatus` server-side.
+ * Workstream F (design-system.md §6) aligned this with the unified
+ * four-state vocabulary; pre-F values (`pending-oauth`, `disabled`) are
+ * still accepted on the wire for one release window and the SPA normalizes
+ * them via `lib/state.ts:unifiedStateForUi` at render time.
+ *
  * Absent (null) → discovery treats as "active".
  */
-export type UiSubUnitStatus = "active" | "pending-oauth" | "disabled";
+export type UiSubUnitStatus =
+  | "active"
+  | "pending"
+  | "inactive"
+  | "failing"
+  // Back-compat aliases — accepted on the wire during the F-landing
+  // release window so rows from a not-yet-restarted older module still
+  // render. Retire after the next rc chain.
+  | "pending-oauth"
+  | "disabled";
 
 /**
  * One sub-unit beneath a module — surfaced on `ModuleListing.uis` when the

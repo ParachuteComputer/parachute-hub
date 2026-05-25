@@ -82,14 +82,41 @@ function formatRow(cells: string[], widths: number[]): string {
     .trimEnd();
 }
 
+/**
+ * Canonical user-facing state vocabulary, per [parachute-patterns/patterns/
+ * design-system.md §6](../parachute-patterns/patterns/design-system.md)
+ * (workstream F). Replaces the pre-F two-column `PROCESS` (running/stopped)
+ * + `HEALTH` (ok/down/http <code>) split with a single rollup column the
+ * SPA, well-known doc, and CLI all share.
+ *
+ *   active   — process supervised, probe ok.
+ *   pending  — supervised, needs operator action (OAuth, config) — not
+ *              reached from `parachute status` today; here for completeness
+ *              so the union matches what the SPA renders.
+ *   inactive — operator-stopped or never started.
+ *   failing  — supervised but probe failed (down / non-2xx).
+ */
+type StateLabel = "active" | "pending" | "inactive" | "failing";
+
 interface StatusRow {
   service: string;
   port: string;
   version: string;
-  processLabel: string;
+  /**
+   * Canonical four-state label per design-system.md §6 — what the operator
+   * reads. Derived from the pre-F (PROCESS, HEALTH) tuple at the emit-time
+   * site so the wider supervisor pipeline doesn't have to change shape.
+   */
+  stateLabel: StateLabel | "-";
   pidLabel: string;
   uptimeLabel: string;
-  healthLabel: string;
+  /**
+   * Pre-F probe-result detail (`ok` / `http 503` / `ECONNREFUSED` / …).
+   * Kept on the row so the continuation-line context is still available
+   * when a row is `failing` and the operator wants to know why. Not a
+   * column; surfaced inline beneath the row only when non-trivial.
+   */
+  healthDetail: string;
   latencyLabel: string;
   sourceLabel: string;
   url: string | undefined;
@@ -137,7 +164,10 @@ function hubRow(
   if (proc.status === "unknown") return undefined;
   const port = readHubPort(configDir);
   const portLabel = port !== undefined ? String(port) : "-";
-  const processLabel = proc.status === "running" ? "running" : "stopped";
+  // Hub doesn't self-probe (it'd be probing itself over loopback). Treat
+  // "running pidfile" as `active` and "stopped" as `inactive` — the same
+  // STATE rollup every other row uses, just without the probe input.
+  const stateLabel: StateLabel = proc.status === "running" ? "active" : "inactive";
   const pidLabel = proc.status === "running" && proc.pid !== undefined ? String(proc.pid) : "-";
   const uptimeLabel =
     proc.status === "running" && proc.startedAt ? formatUptime(proc.startedAt, nowDate) : "-";
@@ -146,10 +176,10 @@ function hubRow(
     service: "parachute-hub (internal)",
     port: portLabel,
     version: source.livePackageVersion ?? "-",
-    processLabel,
+    stateLabel,
     pidLabel,
     uptimeLabel,
-    healthLabel: "-",
+    healthDetail: "-",
     latencyLabel: "-",
     sourceLabel: formatInstallSourceLabel(source),
     url: port !== undefined ? `http://127.0.0.1:${port}` : undefined,
@@ -194,8 +224,6 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
       const short = shortNameForManifest(entry.name) ?? (entry.installDir ? entry.name : undefined);
       const proc = short ? processState(short, configDir, alive) : undefined;
 
-      const processLabel =
-        proc?.status === "running" ? "running" : proc?.status === "stopped" ? "stopped" : "-";
       const pidLabel =
         proc?.status === "running" && proc.pid !== undefined ? String(proc.pid) : "-";
       const uptimeLabel =
@@ -235,10 +263,14 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
           service: entry.name,
           port: String(entry.port),
           version: entry.version,
-          processLabel,
+          // Operator deliberately stopped (or pidfile-but-dead) maps to
+          // `inactive` per design-system.md §6 — same surface as "never
+          // started." No probe is informative when we know the process
+          // is dead.
+          stateLabel: "inactive",
           pidLabel,
           uptimeLabel,
-          healthLabel: "-",
+          healthDetail: "-",
           latencyLabel: "-",
           sourceLabel,
           url,
@@ -250,19 +282,32 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
       }
 
       const p = await probe(entry, fetchImpl, timeoutMs);
-      const healthLabel = p.healthy
+      const healthDetail = p.healthy
         ? "ok"
         : p.statusCode !== undefined
           ? `http ${p.statusCode}`
           : (p.error ?? "down");
+      // STATE rollup per design-system.md §6:
+      //   - probe ok                  → `active`
+      //   - probe failed              → `failing` (the probe ran, so the
+      //                                 process is up enough to answer or
+      //                                 refuse — it's failing, not stopped)
+      //   - no PID file + probe fails → `failing` too (externally-managed
+      //                                 row that's down is still "failing"
+      //                                 from the operator's view)
+      // The `pending` state isn't reachable from `parachute status` today
+      // — pending-OAuth surfaces in the admin SPA, not the CLI. If a
+      // future surface adds it (e.g. supervisor reports `pending-config`
+      // for unconfigured modules), wire it here.
+      const stateLabel: StateLabel = p.healthy ? "active" : "failing";
       return {
         service: entry.name,
         port: String(entry.port),
         version: entry.version,
-        processLabel,
+        stateLabel,
         pidLabel,
         uptimeLabel,
-        healthLabel,
+        healthDetail,
         latencyLabel: `${p.latencyMs}ms`,
         sourceLabel,
         url,
@@ -279,25 +324,20 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
   const hub = hubRow(configDir, alive, nowDate, hubSrcDir, installSourceDeps);
   if (hub) rows.push(hub);
 
-  const header = [
-    "SERVICE",
-    "PORT",
-    "VERSION",
-    "PROCESS",
-    "PID",
-    "UPTIME",
-    "HEALTH",
-    "LATENCY",
-    "SOURCE",
-  ];
+  // Header per design-system.md §6 "CLI status column shape":
+  //   SERVICE  PORT  VERSION  STATE   PID  UPTIME  LATENCY  SOURCE
+  // Pre-F shape was SERVICE PORT VERSION PROCESS PID UPTIME HEALTH LATENCY
+  // SOURCE — workstream F collapses PROCESS + HEALTH into a single STATE
+  // column (both encoded the same rollup in two slots). LATENCY stays as
+  // a separate measurement column.
+  const header = ["SERVICE", "PORT", "VERSION", "STATE", "PID", "UPTIME", "LATENCY", "SOURCE"];
   const textRows = rows.map((r) => [
     r.service,
     r.port,
     r.version,
-    r.processLabel,
+    r.stateLabel,
     r.pidLabel,
     r.uptimeLabel,
-    r.healthLabel,
     r.latencyLabel,
     r.sourceLabel,
   ]);
@@ -305,18 +345,28 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
     Math.max(header[i]?.length ?? 0, ...textRows.map((r) => r[i]?.length ?? 0)),
   );
   print(formatRow(header, widths));
-  // URL, drift, and stale notes stay on continuation lines rather than
-  // columns. URLs are long (vault's MCP path runs ~40 chars); SOURCE labels
-  // can be long for bun-linked rows. Spreading them across columns would
-  // push the table well past 80 cols on every install — continuation lines
-  // keep the table scannable. The "  → " / "  ! " prefixes group visually
-  // with the row above without misleading the table widths.
+  // URL, drift, stale, and probe-failure detail stay on continuation lines
+  // rather than columns. URLs are long (vault's MCP path runs ~40 chars);
+  // SOURCE labels can be long for bun-linked rows. Spreading them across
+  // columns would push the table well past 80 cols on every install —
+  // continuation lines keep the table scannable. The "  → " / "  ! "
+  // prefixes group visually with the row above without misleading the
+  // table widths.
+  //
+  // When STATE collapses to `failing`, the pre-F `HEALTH` column's detail
+  // (`http 503`, `ECONNREFUSED`, etc.) surfaces on a continuation line so
+  // the operator can still see "what kind of failing" without the column
+  // overhead. Skipped on `active` / `inactive` rows (the detail is either
+  // trivial or N/A).
   for (let i = 0; i < textRows.length; i++) {
     const cells = textRows[i];
     const row = rows[i];
     if (!cells || !row) continue;
     print(formatRow(cells, widths));
     if (row.url) print(`  → ${row.url}`);
+    if (row.stateLabel === "failing" && row.healthDetail !== "-" && row.healthDetail.length > 0) {
+      print(`  ! probe: ${row.healthDetail}`);
+    }
     if (row.driftWarning) print(`  ! ${row.driftWarning}`);
     if (row.staleNote) print(`  ! ${row.staleNote}`);
   }

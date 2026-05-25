@@ -447,7 +447,7 @@ describe("buildWellKnown", () => {
             displayName: "Unforced Brain",
             path: "/app/unforced-brain",
             oauthClientId: "client_def456",
-            status: "pending-oauth",
+            status: "pending",
           },
         },
       };
@@ -471,7 +471,7 @@ describe("buildWellKnown", () => {
           path: "/app/unforced-brain",
           url: "https://x.example/app/unforced-brain",
           oauthClientId: "client_def456",
-          status: "pending-oauth",
+          status: "pending",
         },
       ]);
     });
@@ -553,7 +553,7 @@ describe("buildWellKnown", () => {
             version: "0.3.1",
             iconUrl: "/i.svg",
             oauthClientId: "c1",
-            status: "disabled",
+            status: "inactive",
           },
           minimal: { displayName: "Minimal", path: "/app/minimal" },
         },
@@ -568,7 +568,7 @@ describe("buildWellKnown", () => {
       expect(full?.tagline).toBe("Has it all");
       expect(full?.version).toBe("0.3.1");
       expect(full?.oauthClientId).toBe("c1");
-      expect(full?.status).toBe("disabled");
+      expect(full?.status).toBe("inactive");
       // Minimal carries only the required fields — no optional keys.
       expect(minimal).toEqual({
         name: "minimal",

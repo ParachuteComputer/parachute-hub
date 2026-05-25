@@ -24,19 +24,52 @@ import { RETIRED_MODULES } from "./service-spec.ts";
 export type PublicExposure = "allowed" | "loopback" | "auth-required";
 
 /**
- * Visible-to-discovery state of a UI sub-unit. Mirrors parachute-app's
- * `RegisteredUi.status` so hub renders the same label the app's admin SPA
- * shows. Absent → hub treats the sub-unit as "active" (the discovery
- * default).
+ * Visible-to-discovery state of a UI sub-unit. Aligns with the four-state
+ * supervisor vocabulary in [parachute-patterns/patterns/design-system.md
+ * §6](../parachute-patterns/patterns/design-system.md) (workstream F).
+ * Absent → hub treats the sub-unit as "active" (the discovery default).
  *
- *   "active"        — UI is installed, OAuth client is approved, ready to serve.
- *   "pending-oauth" — UI is installed but its OAuth client hasn't been approved
- *                     yet (operator still needs to click through `/admin/oauth-clients`
- *                     or the app's admin SPA gate). Discovery should render the
- *                     row but signal "not yet usable."
- *   "disabled"      — Operator-disabled. Renders greyed-out; no link.
+ *   "active"   — UI is installed, OAuth client is approved, ready to serve.
+ *   "pending"  — UI is installed but needs operator action (OAuth approval,
+ *                config) before it can run. Discovery renders the row but
+ *                signals "not yet usable."
+ *   "inactive" — Operator-disabled. Renders greyed-out; no link.
+ *   "failing"  — UI is installed but the latest health probe failed. Discovery
+ *                renders the row with an error treatment.
+ *
+ * Back-compat aliases accepted on read for one release window (workstream F
+ * landing — retire after the next rc chain): `pending-oauth` → `pending`,
+ * `disabled` → `inactive`. Aliases are normalized to the canonical value on
+ * `readManifest` so downstream emit surfaces (well-known, /api/modules)
+ * always see the new vocabulary. The wire shape emits the canonical value;
+ * parachute-app + other consumers should accept both during the alias
+ * window and pin to the canonical going forward.
  */
-export type UiSubUnitStatus = "active" | "pending-oauth" | "disabled";
+export type UiSubUnitStatus = "active" | "pending" | "inactive" | "failing";
+
+/**
+ * Old-vocabulary alias values still accepted on read for back-compat with
+ * services that haven't yet caught up to workstream F. Normalized to the
+ * canonical `UiSubUnitStatus` on read.
+ */
+const UI_SUB_UNIT_STATUS_ALIASES: Record<string, UiSubUnitStatus> = {
+  "pending-oauth": "pending",
+  disabled: "inactive",
+};
+
+const UI_SUB_UNIT_STATUS_CANONICAL: readonly UiSubUnitStatus[] = [
+  "active",
+  "pending",
+  "inactive",
+  "failing",
+];
+
+function normalizeUiSubUnitStatus(value: string): UiSubUnitStatus | undefined {
+  if ((UI_SUB_UNIT_STATUS_CANONICAL as readonly string[]).includes(value)) {
+    return value as UiSubUnitStatus;
+  }
+  return UI_SUB_UNIT_STATUS_ALIASES[value];
+}
 
 /**
  * A sub-unit beneath a module — used today by parachute-app to surface each
@@ -284,22 +317,27 @@ function validateUiSubUnit(raw: unknown, where: string): UiSubUnit {
   if (oauthClientId !== undefined && typeof oauthClientId !== "string") {
     throw new ServicesManifestError(`${where}: "oauthClientId" must be a string if present`);
   }
-  if (
-    status !== undefined &&
-    status !== "active" &&
-    status !== "pending-oauth" &&
-    status !== "disabled"
-  ) {
-    throw new ServicesManifestError(
-      `${where}: "status" must be "active" | "pending-oauth" | "disabled" if present`,
-    );
+  let normalizedStatus: UiSubUnitStatus | undefined;
+  if (status !== undefined) {
+    if (typeof status !== "string") {
+      throw new ServicesManifestError(
+        `${where}: "status" must be "active" | "pending" | "inactive" | "failing" if present`,
+      );
+    }
+    const norm = normalizeUiSubUnitStatus(status);
+    if (norm === undefined) {
+      throw new ServicesManifestError(
+        `${where}: "status" must be "active" | "pending" | "inactive" | "failing" if present (got ${JSON.stringify(status)})`,
+      );
+    }
+    normalizedStatus = norm;
   }
   const out: UiSubUnit = { displayName, path };
   if (tagline !== undefined) out.tagline = tagline;
   if (iconUrl !== undefined) out.iconUrl = iconUrl;
   if (version !== undefined) out.version = version;
   if (oauthClientId !== undefined) out.oauthClientId = oauthClientId;
-  if (status !== undefined) out.status = status as UiSubUnitStatus;
+  if (normalizedStatus !== undefined) out.status = normalizedStatus;
   return out;
 }
 

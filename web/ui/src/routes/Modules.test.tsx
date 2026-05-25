@@ -144,7 +144,12 @@ describe("Modules — catalog rendering", () => {
     expect(screen.getByTestId("installable-empty")).toBeInTheDocument();
   });
 
-  it("shows 'Running' badge + installed version for an installed+running row", async () => {
+  it("shows 'active' badge + installed version for an installed+running row", async () => {
+    // Post-workstream-F: the module-row status badge collapses the
+    // supervisor's `running` lifecycle onto the unified `active` state
+    // (design-system.md §6). Pre-F the badge text was the raw supervisor
+    // status (`running`); the new vocab is shared with the CLI's
+    // `parachute status` and the well-known doc.
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [
         moduleRow("vault", {
@@ -160,8 +165,39 @@ describe("Modules — catalog rendering", () => {
     });
     renderRoute();
     await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
-    expect(screen.getByText(/running/i)).toBeInTheDocument();
+    const badge = screen.getByTestId("module-status-vault");
+    expect(badge).toHaveTextContent("active");
+    expect(badge).toHaveClass("status-active");
     expect(screen.getByText("v0.4.5")).toBeInTheDocument();
+  });
+
+  it("maps supervisor lifecycle states onto the unified four-state vocab (workstream F)", async () => {
+    // Pins design-system.md §6 mapping at the SPA boundary:
+    //   running                → active
+    //   starting / restarting  → pending (transient)
+    //   crashed                → failing
+    //   stopped                → inactive
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        moduleRow("vault", { installed: true, supervisor_status: "running" }),
+        moduleRow("notes", { installed: true, supervisor_status: "starting" }),
+        moduleRow("runner", { installed: true, supervisor_status: "restarting" }),
+        moduleRow("scribe", { installed: true, supervisor_status: "crashed" }),
+        moduleRow("app", { installed: true, supervisor_status: "stopped" }),
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByTestId("module-status-vault")).toBeInTheDocument());
+    expect(screen.getByTestId("module-status-vault")).toHaveClass("status-active");
+    expect(screen.getByTestId("module-status-notes")).toHaveClass("status-pending");
+    // `restarting` is a sibling of `starting` in unifiedStateForSupervisor —
+    // both transient supervisor states → `pending`. Pinned independently to
+    // catch a future regression that splits the two arms.
+    expect(screen.getByTestId("module-status-runner")).toHaveClass("status-pending");
+    expect(screen.getByTestId("module-status-scribe")).toHaveClass("status-failing");
+    expect(screen.getByTestId("module-status-app")).toHaveClass("status-inactive");
   });
 });
 
@@ -690,7 +726,12 @@ describe("Modules — hierarchical sub-units (hub#313)", () => {
     expect(link?.getAttribute("href")).toBe("/app/gitcoin-brain");
   });
 
-  it("renders per-sub-unit status badges using status-<state> class", async () => {
+  it("renders per-sub-unit status badges using the unified four-state vocab (workstream F)", async () => {
+    // Post-F: sub-unit badges use the canonical
+    // `active | pending | inactive | failing` classes shared with the
+    // module-row supervisor badge and the CLI. Legacy `pending-oauth` /
+    // `disabled` values served from a not-yet-restarted older module are
+    // normalized at render time (the test below pins that path).
     vi.mocked(api.listModules).mockResolvedValue(
       makeCatalog({
         modules: [
@@ -701,9 +742,10 @@ describe("Modules — hierarchical sub-units (hub#313)", () => {
             supervisor_status: "running",
             uis: [
               makeUi({ name: "a", display_name: "A", status: "active" }),
-              makeUi({ name: "b", display_name: "B", status: "pending-oauth" }),
-              makeUi({ name: "c", display_name: "C", status: "disabled" }),
+              makeUi({ name: "b", display_name: "B", status: "pending" }),
+              makeUi({ name: "c", display_name: "C", status: "inactive" }),
               makeUi({ name: "d", display_name: "D", status: null }),
+              makeUi({ name: "e", display_name: "E", status: "failing" }),
             ],
           }),
         ],
@@ -712,10 +754,39 @@ describe("Modules — hierarchical sub-units (hub#313)", () => {
     renderRoute();
     await waitFor(() => expect(screen.getByTestId("module-uis")).toBeInTheDocument());
     expect(screen.getByTestId("ui-status-a")).toHaveClass("status-active");
-    expect(screen.getByTestId("ui-status-b")).toHaveClass("status-pending-oauth");
-    expect(screen.getByTestId("ui-status-c")).toHaveClass("status-disabled");
+    expect(screen.getByTestId("ui-status-b")).toHaveClass("status-pending");
+    expect(screen.getByTestId("ui-status-c")).toHaveClass("status-inactive");
     // Null status falls back to "active" — same default as discovery.
     expect(screen.getByTestId("ui-status-d")).toHaveClass("status-active");
+    expect(screen.getByTestId("ui-status-e")).toHaveClass("status-failing");
+  });
+
+  it("normalizes legacy `pending-oauth` / `disabled` sub-unit statuses at render time (workstream F back-compat)", async () => {
+    // Pins the back-compat alias path. Storage normalizes on read but
+    // the SPA can still receive legacy values from /api/modules if a
+    // module wrote them and the row was cached before workstream F's
+    // services-manifest fold landed. `unifiedStateForUi` covers that
+    // gap so the badge palette stays consistent across the rollout.
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog({
+        modules: [
+          moduleRow("vault", {
+            installed: true,
+            installed_version: "0.1.0",
+            latest_version: "0.1.0",
+            supervisor_status: "running",
+            uis: [
+              makeUi({ name: "legacy-p", display_name: "Legacy P", status: "pending-oauth" }),
+              makeUi({ name: "legacy-d", display_name: "Legacy D", status: "disabled" }),
+            ],
+          }),
+        ],
+      }),
+    );
+    renderRoute();
+    await waitFor(() => expect(screen.getByTestId("module-uis")).toBeInTheDocument());
+    expect(screen.getByTestId("ui-status-legacy-p")).toHaveClass("status-pending");
+    expect(screen.getByTestId("ui-status-legacy-d")).toHaveClass("status-inactive");
   });
 
   it("renders the icon when icon_url is present, skips it when absent", async () => {

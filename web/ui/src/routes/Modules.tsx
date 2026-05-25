@@ -42,6 +42,7 @@ import {
   uninstallModule,
   upgradeModule,
 } from "../lib/api.ts";
+import { type UnifiedState, unifiedStateForSupervisor, unifiedStateForUi } from "../lib/state.ts";
 
 type CatalogState =
   | { kind: "loading" }
@@ -462,9 +463,26 @@ function ModuleRow({
         <h2>
           {mod.display_name} <span className="muted">({mod.short})</span>
         </h2>
-        <span className={`status status-${mod.supervisor_status ?? "absent"}`}>
-          {statusLabel(mod)}
-        </span>
+        {/*
+          Status badge uses the four-state vocabulary from
+          design-system.md §6 (workstream F): active / pending / inactive /
+          failing. `statusBadge` maps the supervisor's lifecycle status
+          (`starting | running | stopped | crashed | restarting`) onto the
+          user-facing rollup at render time — the wire shape on
+          /api/modules is intentionally unchanged.
+        */}
+        {(() => {
+          const badge = statusBadge(mod);
+          return (
+            <span
+              className={`status status-${badge.cssState}`}
+              data-state={badge.cssState}
+              data-testid={`module-status-${mod.short}`}
+            >
+              {badge.label}
+            </span>
+          );
+        })()}
       </header>
       {mod.tagline ? <p className="tagline">{mod.tagline}</p> : null}
 
@@ -589,10 +607,26 @@ function InstallableCard({
   );
 }
 
-function statusLabel(mod: ModuleListing): string {
-  if (!mod.installed) return "not installed";
-  if (!mod.supervisor_status) return "not supervised";
-  return mod.supervisor_status;
+/**
+ * Resolved status badge for a module row. `cssState` is the unified
+ * `status-<state>` class (design-system.md §6); `label` is what the
+ * operator reads. Pre-F the badge text was the raw supervisor status
+ * (`running` / `stopped` / `crashed`); workstream F switches to the
+ * four-state rollup so the SPA, CLI, and well-known doc all read the same
+ * vocabulary. For not-installed / not-supervised rows we keep the
+ * descriptive copy because those rows aren't supervisor lifecycle states
+ * — they're "the supervisor has nothing to say about this row."
+ */
+interface ModuleStatusBadge {
+  cssState: UnifiedState | "absent";
+  label: string;
+}
+
+function statusBadge(mod: ModuleListing): ModuleStatusBadge {
+  if (!mod.installed) return { cssState: "absent", label: "not installed" };
+  if (!mod.supervisor_status) return { cssState: "absent", label: "not supervised" };
+  const cssState = unifiedStateForSupervisor(mod.supervisor_status);
+  return { cssState, label: cssState };
 }
 
 interface UiSubUnitsListProps {
@@ -604,14 +638,22 @@ interface UiSubUnitsListProps {
  * mirrors parachute-app's per-UI registry: each entry surfaces an icon,
  * display name, mount path, and lifecycle status. Status badges follow
  * the same `status-<state>` class convention `ModuleRow` uses for the
- * supervisor badge, so the SPA's existing palette covers active /
- * pending-oauth / disabled without new tokens.
+ * supervisor badge — the four canonical states from design-system.md §6
+ * (`active`, `pending`, `inactive`, `failing`) cover both surfaces from
+ * one palette.
  *
  * `path` is rendered as a same-origin anchor so an operator clicking
  * "Gitcoin Brain" lands on `/app/gitcoin-brain` — not a SPA link
  * (`Link to`) because the sub-unit lives outside the SPA's mount basename
  * and we want the browser to hard-navigate. Aaron's call: keep the SPA
  * itself narrow, let the underlying module own its own UI shell.
+ *
+ * Status badges use the unified four-state vocabulary from
+ * design-system.md §6 (workstream F): `status-active`, `status-pending`,
+ * `status-inactive`, `status-failing`. Sub-units that publish the legacy
+ * `pending-oauth` / `disabled` values pre-F get normalized at render time
+ * via `unifiedStateForUi` so the badge palette stays consistent across
+ * old + new sub-units during the alias window.
  */
 function UiSubUnitsList({ uis }: UiSubUnitsListProps) {
   return (
@@ -621,7 +663,7 @@ function UiSubUnitsList({ uis }: UiSubUnitsListProps) {
       </summary>
       <ul className="ui-sub-units">
         {uis.map((u) => {
-          const status = u.status ?? "active";
+          const cssState = unifiedStateForUi(u.status);
           return (
             <li key={u.name} className="ui-sub-unit" data-name={u.name}>
               {u.icon_url && (
@@ -641,8 +683,12 @@ function UiSubUnitsList({ uis }: UiSubUnitsListProps) {
                 </a>
                 {u.tagline ? <p className="tagline">{u.tagline}</p> : null}
               </div>
-              <span className={`status status-${status}`} data-testid={`ui-status-${u.name}`}>
-                {status}
+              <span
+                className={`status status-${cssState}`}
+                data-state={cssState}
+                data-testid={`ui-status-${u.name}`}
+              >
+                {cssState}
               </span>
             </li>
           );

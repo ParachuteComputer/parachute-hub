@@ -2,6 +2,40 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [Unreleased]
+
+**feat(hub): unify state vocabulary across CLI + admin SPA + well-known doc (workstream F).**
+
+The 2026-05-25 UX audit (§2.3, §2.7) flagged three different vocabularies for the same module-supervisor concept: CLI said `running` / `stopped` / `-`; admin SPA said `Active` / `Pending-OAuth` / `Disabled`; the supervisor's internal state model said `active` / `pending-oauth` / `disabled`. Workstream F aligns every user-facing surface on the four canonical states from [parachute-patterns/patterns/design-system.md §6](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/design-system.md): `active` / `pending` / `inactive` / `failing`.
+
+Wire shapes are stable. The mapping happens at the emit-time site: `services-manifest.ts` normalizes pre-F values (`pending-oauth`, `disabled`) to canonical on read, and the SPA + CLI render-time helpers map supervisor lifecycle states (`running`, `starting`, etc.) onto the rollup vocabulary.
+
+### Changed
+
+- **`parachute status` columns** (`src/commands/status.ts`, `src/help.ts`). Pre-F: `SERVICE PORT VERSION PROCESS PID UPTIME HEALTH LATENCY SOURCE` — `PROCESS` (`running` / `stopped` / `-`) and `HEALTH` (`ok` / `down` / `http <code>`) encoded the same rollup in two columns. Post-F: `SERVICE PORT VERSION STATE PID UPTIME LATENCY SOURCE` — single `STATE` column with one of `active` / `pending` / `inactive` / `failing`. Probe-failure detail (`http 503`, `ECONNREFUSED`) survives on a continuation line (`  ! probe: <detail>`) so operators don't lose the diagnosis.
+
+- **Admin SPA `/admin/modules` status badges** (`web/ui/src/routes/Modules.tsx`, `web/ui/src/styles.css`). Both the module-row supervisor badge and the per-UI sub-unit badge now render the four canonical states. New CSS classes `.status-active`, `.status-pending`, `.status-inactive`, `.status-failing`. Module-row label is now the rollup state (e.g. `active`) rather than the raw supervisor status (`running`). New `web/ui/src/lib/state.ts` houses the supervisor → unified-state mapping in one place.
+
+- **`UiSubUnitStatus` (services.json + wire)** (`src/services-manifest.ts`, `src/__tests__/services-manifest.test.ts`). Canonical values are now `active` / `pending` / `inactive` / `failing`. Pre-F values (`pending-oauth`, `disabled`) are still accepted on read and normalized to canonical so downstream emit surfaces (well-known doc, `/api/modules`) always see the new vocab. New tests pin the normalization boundary in `services-manifest.test.ts` and end-to-end through `/api/modules` in `api-modules.test.ts`.
+
+### Back-compat (retire one rc-chain after this lands)
+
+- **CSS class aliases**: `.status-pending-oauth` and `.status-disabled` continue to paint correctly (mirror the colors of `.status-pending` and `.status-inactive` respectively) so any out-of-tree consumer still rendering legacy class names doesn't lose its palette during the cutover.
+- **services-manifest input aliases**: `pending-oauth` / `disabled` accepted on read; normalized to canonical before persisting.
+- **SPA render-time alias**: `unifiedStateForUi` accepts legacy values so a stale row served before the storage normalizer fold doesn't get an unstyled badge.
+
+### Patterns check
+
+- Adopts [parachute-patterns/patterns/design-system.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/design-system.md) §6 (state vocabulary) and §7 (status badge component).
+- Companion adoption in vault/app/scribe/runner SDKs is a follow-up — they may continue emitting legacy values for one release cycle (hub normalizes at the storage boundary).
+
+### Verification
+
+- `bun run typecheck` clean (server + web/ui).
+- `bun test ./src`: 1962 pass / 0 fail (3 new tests).
+- `bun run test` (web/ui): 213 pass / 0 fail (2 new tests).
+- No version bump per governance Rule 2 — collects into the next rc-chain ship decision.
+
 ## [0.5.13-rc.39] - 2026-05-25
 
 **feat(hub): well-known fan-out reads vault's declared uiUrl + retires the hardcoded Browse Vault tile + `/admin/approve-client` supports OAuth resume (workstreams C/4 + D).**
