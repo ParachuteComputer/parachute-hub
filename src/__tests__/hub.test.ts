@@ -27,9 +27,9 @@ describe("renderHub", () => {
     // regex. Wrap in a try/catch so future template-escaping regressions
     // surface here with a clear message rather than as a runtime mystery.
     const m = html.match(/<script>([\s\S]*?)<\/script>/);
-    expect(m).not.toBeNull();
-    const scriptBody = m![1];
-    expect(() => new Function(scriptBody)).not.toThrow();
+    const scriptBody = m?.[1];
+    expect(scriptBody).toBeDefined();
+    expect(() => new Function(scriptBody as string)).not.toThrow();
   });
 
   test("fetches /.well-known/parachute.json for the Use section", () => {
