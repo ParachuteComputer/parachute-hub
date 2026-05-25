@@ -2,6 +2,28 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.38] - 2026-05-25
+
+**fix(hub): unauthenticated OAuth approve CTA preserves the in-flight authorize URL through login — closes the MCP-OAuth dead-end loop.**
+
+The next bug Aaron hit after rc.37 unstuck the home page: linking a new vault to Claude via MCP showed "App not yet approved", he approved on the SPA, got "Approved. Return to the app and retry" — but never got redirected back to Claude. Returning to Claude and retrying re-showed the approval prompt (loop). Root cause: when the operator wasn't already signed in on the hub origin, the "App not yet approved" page's CTA pointed at `/login?next=/admin/approve-client/<id>`. After login the user landed on the SPA approve route, which discarded the original `/oauth/authorize?<params>` URL — so the OAuth flow never resumed and the `redirect_uri` callback to Claude never fired.
+
+### Fixed
+
+- **Unauthenticated approve CTA now preserves the full OAuth flow context** (hub#369). `pendingClientResponse` (`src/oauth-handlers.ts`) hoists `returnTo = ${authorizeUrl.pathname}${authorizeUrl.search}` out of the authed-only branch and passes it as `loginNextUrl` to `renderApprovePending` for both branches. `renderUnauthenticatedApproveCtas` (`src/oauth-ui.ts`) now builds `loginHref = /login?next=${encodeURIComponent(loginNextUrl)}`. After login the user lands back on the original `/oauth/authorize` URL (now signed in, same-origin), the inline "Approve and continue" form renders, one click triggers `approveClient` + 302 back to the same URL, status is now `approved`, the flow proceeds through consent → `redirect_uri` callback to Claude. The shareable deep link continues to point at `/admin/approve-client/<id>` for the share-with-another-admin path (no in-flight OAuth flow to resume there).
+
+### Patterns check
+
+- Reinforces the round-trip invariant: any flow that detours through `/login` must carry its return target as `?next=` (same-origin gated via `safeNext` in `src/admin-handlers.ts:63`). The authed branch already did this since #208; the unauth branch was the gap.
+- No new pattern; doesn't touch a pattern boundary.
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src`: 1946 pass / 0 fail (+1 from rc.37 — new round-trip assertion in `oauth-ui.test.ts` + regression guard in `oauth-handlers.test.ts`).
+- Container smoke CI: ✓ on the fix commit.
+- Live verify pending on Render redeploy after rc.38 publishes.
+
 ## [0.5.13-rc.37] - 2026-05-25
 
 **fix(hub): home page Get Started + Services + Admin all broken by a SyntaxError in the inline `<script>`.**
