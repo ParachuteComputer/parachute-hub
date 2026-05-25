@@ -2,9 +2,11 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
-## [0.5.13-rc.36] - 2026-05-25
+## [0.5.13-rc.37] - 2026-05-25
 
 **fix(hub): home page Get Started + Services + Admin all broken by a SyntaxError in the inline `<script>`.**
+
+(rc.36 never published — `noUncheckedIndexedAccess` typecheck failure on the new regression test caught by release CI. rc.37 fixes the typecheck and is the published rollup.)
 
 After rc.35 landed and the iss-mismatch unstuck the wizard install, the home page at `/` rendered with the Services section stuck at "Loading…" and the Admin section empty. Root cause: a single regex literal inside the IIFE — `/\/+$/` — silently degenerated to `//+$/` in the served HTML, because `\/` inside `HTML_TEMPLATE`'s backtick template literal collapses to `/`. The browser parsed the leading `//` as a line comment, the rest of the regex bled into the comment, the IIFE never executed, and `renderAdmin()` + `renderServices()` + `renderGetStarted()` all silently failed.
 
@@ -25,7 +27,7 @@ After rc.35 landed and the iss-mismatch unstuck the wizard install, the home pag
 - `bun run typecheck` clean.
 - `bun test ./src`: 1945 pass / 0 fail (+1 from rc.35).
 - Container smoke CI: ✓ on `ac09e17`.
-- Live verify pending on Render redeploy after rc.36 publishes.
+- Live verify pending on Render redeploy after rc.37 publishes.
 
 ## [0.5.13-rc.35] - 2026-05-25
 
