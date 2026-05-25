@@ -536,22 +536,55 @@ export interface ApproveClientResult {
   status: "approved";
   /** True when the row was already approved before this call. Idempotent re-approve. */
   already_approved: boolean;
+  /**
+   * Hub-relative `/oauth/authorize?...` URL the caller passed as
+   * `return_to`, echoed back when it passes the server's same-origin gate
+   * (`isSafeAuthorizeReturnTo` in oauth-handlers.ts). Workstream D — lets
+   * the SPA approve page resume a parked OAuth flow rather than dead-end
+   * on the "return to the app" success state. Absent for the share-link
+   * case (no `return_to` passed, or off-origin value dropped server-side).
+   */
+  redirect_to?: string;
 }
 
 /**
  * POST /api/oauth/clients/<client_id>/approve — flip a pending client to
  * approved. Idempotent: a second call after the row is already approved
  * returns `already_approved: true` with no audit-log line.
+ *
+ * Optional `returnTo` (workstream D): when present and same-origin-safe
+ * (a hub-relative `/oauth/authorize?...` URL), the server echoes it back
+ * as `redirect_to` and the SPA navigates the browser there to resume the
+ * parked OAuth flow. The SPA validates same-origin before passing the
+ * value through; the server runs the same gate again before echoing.
+ * Off-origin or non-authorize values silently drop off the response —
+ * the bad value doesn't fail the approve, the SPA falls back to its
+ * dead-end success state.
  */
-export async function approveOauthClient(clientId: string): Promise<ApproveClientResult> {
+export async function approveOauthClient(
+  clientId: string,
+  returnTo?: string,
+): Promise<ApproveClientResult> {
   const bearer = await getHostAdminToken();
-  const res = await fetch(`/api/oauth/clients/${encodeURIComponent(clientId)}/approve`, {
+  const init: RequestInit = {
     method: "POST",
     headers: {
       accept: "application/json",
       authorization: `Bearer ${bearer}`,
     },
-  });
+  };
+  // Send a JSON body iff the caller supplied `returnTo`. Pre-D callers
+  // (and the share-link case) pass no body; the server treats absent /
+  // empty bodies identically to "no return_to" and returns the dead-end-
+  // compatible shape.
+  if (returnTo !== undefined) {
+    init.headers = {
+      ...init.headers,
+      "content-type": "application/json",
+    };
+    init.body = JSON.stringify({ return_to: returnTo });
+  }
+  const res = await fetch(`/api/oauth/clients/${encodeURIComponent(clientId)}/approve`, init);
   if (res.status === 401 || res.status === 403) {
     clearCachedToken();
     throw new HttpError(res.status, await readError(res));

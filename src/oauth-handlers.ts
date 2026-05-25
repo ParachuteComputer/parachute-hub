@@ -1251,8 +1251,13 @@ export async function handleApproveClientPost(
  * (no scheme, no double-slash) targeting `/oauth/authorize` with a query
  * string — anything else is either an open-redirect attempt or a misuse of
  * the endpoint. Empty string is rejected (the form always supplies one).
+ *
+ * Exported so the SPA approve-client endpoint (`handleApproveClient` in
+ * admin-clients.ts) can apply the same gate when echoing a `return_to` back
+ * to the caller — workstream D. Single helper = single shape of "what's a
+ * valid OAuth-resume target?" for the whole hub.
  */
-function isSafeAuthorizeReturnTo(value: string): boolean {
+export function isSafeAuthorizeReturnTo(value: string): boolean {
   if (!value) return false;
   // Reject scheme-relative ("//evil.example/foo") and absolute URLs. Only
   // single-slash root-relative paths are allowed.

@@ -18,6 +18,33 @@
  * the API path logs because cross-machine "who approved this" is the
  * audit-grade signal we'd want when the operator approves from a browser
  * rather than a terminal they own.
+ *
+ * ## OAuth resume via `return_to` (workstream D, AUDIT-UI-UX.md §5 row D)
+ *
+ * The SPA approve page (`web/ui/src/routes/ApproveClient.tsx`) was a
+ * documented dead-end pre-D: it flipped the client to approved, then told
+ * the operator to "return to the app and retry" — the parked OAuth flow
+ * had no way to resume.
+ *
+ * D adds the affordance, not a behaviour change for existing callers. If
+ * the POST body carries a `return_to` JSON field that's a hub-relative
+ * `/oauth/authorize?...` URL, the response echoes it back as `redirect_to`
+ * and the SPA navigates the browser there to resume the flow. Callers
+ * that don't pass `return_to` (the "share this link with another admin"
+ * case the unauth pending-client CTA renders) get the unchanged response
+ * shape; the SPA renders its dead-end success state and the deep-link
+ * UX is preserved.
+ *
+ * Two cases, one route — `return_to` is the discriminator. The pattern
+ * doc is `parachute-patterns/patterns/oauth-dcr-approval.md` §"SPA
+ * approve page (two cases, one route)".
+ *
+ * Validation reuses `isSafeAuthorizeReturnTo` from oauth-handlers.ts so
+ * the SPA endpoint and the inline `/oauth/authorize/approve` endpoint
+ * apply the same gate — single source of truth for "what's a valid OAuth
+ * resume target?" Off-origin or non-authorize values are silently dropped
+ * (the response omits `redirect_to`) rather than 4xx'ing — a bad
+ * `return_to` shouldn't block an otherwise-legitimate approve.
  */
 import type { Database } from "bun:sqlite";
 import {
@@ -28,6 +55,7 @@ import {
 } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
 import { approveClient, getClient } from "./clients.ts";
+import { isSafeAuthorizeReturnTo } from "./oauth-handlers.ts";
 
 export interface AdminClientsDeps {
   db: Database;
@@ -102,6 +130,11 @@ export async function handleApproveClient(
   } catch (err) {
     return adminAuthErrorResponse(err as AdminAuthError);
   }
+  // Parse the body OPTIONALLY — pre-D callers send no body at all, so a
+  // missing / empty / non-JSON body is fine. Only fish out `return_to` when
+  // the caller actually provided a parseable JSON object; everything else
+  // is treated as "no return_to specified," same as pre-D.
+  const returnTo = await readReturnTo(req);
   const before = getClient(deps.db, clientId);
   if (!before) {
     return jsonError(404, "not_found", `no client registered with id ${clientId}`);
@@ -123,20 +156,63 @@ export async function handleApproveClient(
       `client approved: client_id=${clientId} client_name=${before.clientName ?? ""} approver_sub=${ctx.sub}`,
     );
   }
-  return new Response(
-    JSON.stringify({
-      client_id: clientId,
-      status: "approved",
-      already_approved: !wasPending,
-    }),
-    {
-      status: 200,
-      headers: {
-        "content-type": "application/json",
-        "cache-control": "no-store",
-      },
+  // Only echo `redirect_to` when the caller's `return_to` passed the gate.
+  // Bad / missing values just drop off the response — the SPA falls back
+  // to its dead-end success state. We don't 4xx an otherwise-legitimate
+  // approve over a bad return_to (the client is now approved either way).
+  const body: ApproveClientResponse = {
+    client_id: clientId,
+    status: "approved",
+    already_approved: !wasPending,
+  };
+  if (returnTo !== null && isSafeAuthorizeReturnTo(returnTo)) {
+    body.redirect_to = returnTo;
+  }
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
     },
-  );
+  });
+}
+
+interface ApproveClientResponse {
+  client_id: string;
+  status: "approved";
+  already_approved: boolean;
+  /**
+   * Hub-relative `/oauth/authorize?...` URL the SPA should navigate to
+   * after approving, to resume a parked OAuth flow. Only present when the
+   * POST body's `return_to` passed `isSafeAuthorizeReturnTo`. Absent for
+   * the share-link case (no `return_to` provided) so the SPA's dead-end
+   * success state still renders.
+   */
+  redirect_to?: string;
+}
+
+/**
+ * Pull `return_to` out of the request body if present. Tolerant by design:
+ * pre-D callers (and tests, and curl probes) send no body or a non-JSON
+ * body, and the endpoint MUST continue to work in those shapes. Any parse
+ * failure or missing field returns null; the response omits `redirect_to`
+ * accordingly.
+ *
+ * Only `application/json` bodies are inspected — keeping the format
+ * restricted to JSON matches the existing API conventions (the SPA's
+ * other admin POSTs use JSON throughout) and avoids parser ambiguity
+ * over form-encoded variants on a deliberately optional field.
+ */
+async function readReturnTo(req: Request): Promise<string | null> {
+  const ct = req.headers.get("content-type") ?? "";
+  if (!ct.toLowerCase().includes("application/json")) return null;
+  try {
+    const body = (await req.json()) as { return_to?: unknown };
+    if (typeof body?.return_to !== "string") return null;
+    return body.return_to;
+  } catch {
+    return null;
+  }
 }
 
 function jsonError(status: number, error: string, description: string): Response {

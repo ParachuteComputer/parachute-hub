@@ -26,9 +26,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function renderRoute(clientId = "c1") {
+function renderRoute(clientId = "c1", search = "") {
+  const url = `/approve-client/${clientId}${search}`;
   return render(
-    <MemoryRouter initialEntries={[`/approve-client/${clientId}`]}>
+    <MemoryRouter initialEntries={[url]}>
       <Routes>
         <Route path="/approve-client/:clientId" element={<ApproveClient />} />
       </Routes>
@@ -66,7 +67,9 @@ describe("ApproveClient", () => {
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /approve notes/i }));
     await waitFor(() => expect(screen.getByText(/^approved\.$/i)).toBeInTheDocument());
-    expect(api.approveOauthClient).toHaveBeenCalledWith("c1");
+    // Workstream D added a second arg (returnTo); share-link case passes
+    // undefined.
+    expect(api.approveOauthClient).toHaveBeenCalledWith("c1", undefined);
     expect(screen.getByText(/can now run an OAuth flow/i)).toBeInTheDocument();
   });
 
@@ -132,5 +135,160 @@ describe("ApproveClient", () => {
     // Already-named scopes don't carry the wildcard, so the explanation
     // hint doesn't render.
     expect(screen.queryByText(/a specific vault is selected during sign-in/i)).toBeNull();
+  });
+
+  // Workstream D — the SPA approve page can resume a parked OAuth flow
+  // when given a `return_to` query parameter. The unauth share-link case
+  // (no return_to) still renders the dead-end success state. See
+  // AUDIT-UI-UX.md §5 row D and
+  // parachute-patterns/patterns/oauth-dcr-approval.md "SPA approve page
+  // (two cases, one route)".
+  describe("workstream D — OAuth resume via return_to", () => {
+    // `window.location.assign` doesn't work in jsdom by default; spy on
+    // it so we can assert the redirect was triggered without actually
+    // navigating the test runner away.
+    let originalLocation: Location;
+    let assignSpy: ReturnType<typeof vi.fn>;
+    beforeEach(() => {
+      originalLocation = window.location;
+      assignSpy = vi.fn();
+      // Override `window.location` with a minimal shim that captures
+      // `.assign(url)` calls. Restoring `originalLocation` after each
+      // test keeps suite isolation.
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: { ...originalLocation, assign: assignSpy },
+      });
+    });
+    afterEach(() => {
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: originalLocation,
+      });
+    });
+
+    const authorizeUrl =
+      "/oauth/authorize?client_id=c1&response_type=code&scope=vault%3Awork%3Aread";
+
+    it("approves with return_to and navigates to redirect_to on success", async () => {
+      vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient());
+      vi.mocked(api.approveOauthClient).mockResolvedValue({
+        client_id: "c1",
+        status: "approved",
+        already_approved: false,
+        redirect_to: authorizeUrl,
+      });
+      renderRoute("c1", `?return_to=${encodeURIComponent(authorizeUrl)}`);
+      fireEvent.click(await screen.findByRole("button", { name: /approve notes/i }));
+      await waitFor(() => expect(assignSpy).toHaveBeenCalledWith(authorizeUrl));
+      // Approve API was called WITH the return_to argument — the SPA passes
+      // it through to the server's gate.
+      expect(api.approveOauthClient).toHaveBeenCalledWith("c1", authorizeUrl);
+    });
+
+    it("renders the dead-end success state when no return_to is in the URL", async () => {
+      vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient());
+      vi.mocked(api.approveOauthClient).mockResolvedValue({
+        client_id: "c1",
+        status: "approved",
+        already_approved: false,
+      });
+      renderRoute(); // no search
+      fireEvent.click(await screen.findByRole("button", { name: /approve notes/i }));
+      await waitFor(() => expect(screen.getByText(/^approved\.$/i)).toBeInTheDocument());
+      // SPA called approve with `undefined` for return_to — the share-link
+      // case must not smuggle in a bogus value.
+      expect(api.approveOauthClient).toHaveBeenCalledWith("c1", undefined);
+      expect(assignSpy).not.toHaveBeenCalled();
+    });
+
+    it("rejects an off-origin return_to and falls back to the dead-end state", async () => {
+      vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient());
+      vi.mocked(api.approveOauthClient).mockResolvedValue({
+        client_id: "c1",
+        status: "approved",
+        already_approved: false,
+      });
+      // Scheme-relative URL — points off-origin if the browser follows it.
+      // The SPA's same-origin gate must drop it before the API call.
+      renderRoute("c1", "?return_to=%2F%2Fevil.example%2Foauth%2Fauthorize");
+      fireEvent.click(await screen.findByRole("button", { name: /approve notes/i }));
+      await waitFor(() => expect(screen.getByText(/^approved\.$/i)).toBeInTheDocument());
+      // Critical: api call sees `undefined`, NOT the off-origin value.
+      expect(api.approveOauthClient).toHaveBeenCalledWith("c1", undefined);
+      expect(assignSpy).not.toHaveBeenCalled();
+    });
+
+    it("rejects an absolute URL return_to", async () => {
+      vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient());
+      vi.mocked(api.approveOauthClient).mockResolvedValue({
+        client_id: "c1",
+        status: "approved",
+        already_approved: false,
+      });
+      renderRoute(
+        "c1",
+        `?return_to=${encodeURIComponent("https://evil.example/oauth/authorize")}`,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: /approve notes/i }));
+      await waitFor(() => expect(screen.getByText(/^approved\.$/i)).toBeInTheDocument());
+      expect(api.approveOauthClient).toHaveBeenCalledWith("c1", undefined);
+      expect(assignSpy).not.toHaveBeenCalled();
+    });
+
+    it("re-validates redirect_to client-side as belt-and-suspenders", async () => {
+      // Defense-in-depth: even if the server (bug, or some future change)
+      // echoed back an off-origin value as `redirect_to`, the SPA's own
+      // gate must refuse to navigate there. This test pins that contract.
+      vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient());
+      vi.mocked(api.approveOauthClient).mockResolvedValue({
+        client_id: "c1",
+        status: "approved",
+        already_approved: false,
+        redirect_to: "//evil.example/oauth/authorize",
+      });
+      renderRoute("c1", `?return_to=${encodeURIComponent(authorizeUrl)}`);
+      fireEvent.click(await screen.findByRole("button", { name: /approve notes/i }));
+      await waitFor(() => expect(screen.getByText(/^approved\.$/i)).toBeInTheDocument());
+      expect(assignSpy).not.toHaveBeenCalled();
+    });
+
+    it("auto-redirects on load when the client is already approved AND return_to is set", async () => {
+      // Race-tolerant resume: someone (parallel session, automation) approved
+      // the client between the original /oauth/authorize → /admin/approve-
+      // client navigation and the operator clicking the link. With
+      // return_to set we should resume immediately rather than make the
+      // operator click an Approve button against an already-approved row.
+      vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient({ status: "approved" }));
+      renderRoute("c1", `?return_to=${encodeURIComponent(authorizeUrl)}`);
+      await waitFor(() => expect(assignSpy).toHaveBeenCalledWith(authorizeUrl));
+      // No Approve button rendered — we left the SPA before the success
+      // state could render.
+      expect(screen.queryByRole("button", { name: /approve/i })).toBeNull();
+    });
+
+    it("shows the dead-end already-approved state when no return_to is set", async () => {
+      // Pre-existing behaviour — pin it against the new code path so the
+      // share-link case still works.
+      vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient({ status: "approved" }));
+      renderRoute(); // no return_to
+      await waitFor(() => expect(screen.getByText(/already approved/i)).toBeInTheDocument());
+      expect(assignSpy).not.toHaveBeenCalled();
+    });
+
+    it("auto-redirects to non-authorize same-origin return_to (broader SPA gate is by design)", async () => {
+      // Pin the deliberately-broader SPA gate behaviour: the SPA's
+      // isSafeReturnTo accepts any same-origin path (starts with /, not //),
+      // not just /oauth/authorize?-prefixed targets. The server-side gate is
+      // stricter and only echoes redirect_to for /oauth/authorize? targets —
+      // but the SPA's on-load auto-redirect path doesn't round-trip through
+      // the server, so a future caller could wire ?return_to=/some/other/page.
+      // Today no caller does this; the test exists to document the contract
+      // (per patterns#97 "two cases, one route" + the deliberately-broader
+      // SPA gate notes).
+      vi.mocked(api.getOauthClient).mockResolvedValue(pendingClient({ status: "approved" }));
+      renderRoute("c1", "?return_to=/admin/vaults");
+      await waitFor(() => expect(assignSpy).toHaveBeenCalledWith("/admin/vaults"));
+    });
   });
 });

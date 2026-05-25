@@ -1,27 +1,41 @@
 /**
- * /admin/approve-client/<client_id> — operator landing page for the
- * pending-approval deep link surfaced by `pendingClientJson()` on
- * /oauth/token. An app like Notes gets the JSON error with `approve_url`
- * pointing here; the operator opens the link, sees the client details,
- * and one-click approves without dropping to a terminal.
+ * /admin/approve-client/<client_id> — operator landing page for OAuth
+ * client approval. Two distinct cases land here, distinguished by the
+ * presence of the `return_to` query parameter (workstream D, see
+ * AUDIT-UI-UX.md §5 row D and the
+ * `parachute-patterns/patterns/oauth-dcr-approval.md` "SPA approve page
+ * (two cases, one route)" section).
  *
- * Three-state UI:
- *   - **pending** → render details + Approve button. Approve POSTs and
- *     transitions to "approved".
- *   - **approved** (on load or after click) → render success message
- *     telling the operator they can return to the requesting app and retry.
- *     Deliberately no auto-redirect: the operator opened this from another
- *     tab/app, so the goal is "close this and go back" rather than nav
- *     them around the SPA.
+ * **Case 1 — OAuth resume** (`?return_to=/oauth/authorize?...`). The
+ * caller has a parked OAuth flow and wants the operator to approve the
+ * client AND continue the flow in one click. On success the SPA leaves
+ * itself via `window.location.assign(redirect_to)` to hub-server's
+ * authorize handler, which finishes the OAuth dance against the
+ * now-approved client.
+ *
+ * **Case 2 — share link / direct nav** (no `return_to`). Original shape
+ * from before workstream D: the operator follows a deep-link surfaced by
+ * `pendingClientJson()` on /oauth/token (or browses to the URL directly),
+ * approves the client, then closes the tab and returns to the app that
+ * sent them. Deliberately no auto-redirect — the operator opened this
+ * from another tab / app, so "close this and go back" is the right goal.
+ *
+ * Validation: the `return_to` query param must be a hub-relative URL
+ * starting with `/` and NOT starting with `//` (open-redirect defense,
+ * mirroring `safeNext` in admin-handlers.ts). Off-origin values are
+ * dropped (treated as "no return_to") rather than 4xx'd — the operator
+ * shouldn't be locked out of a legitimate approve because of a malformed
+ * deep link.
+ *
+ * Three-state UI (unchanged from pre-D):
+ *   - **pending** → render details + Approve button.
+ *   - **approved** (on load or after click) → either redirect (case 1)
+ *     or render success message (case 2).
  *   - **unknown** (404 from the API) → render an error explaining the
  *     client_id wasn't found.
- *
- * Why one page instead of a modal in some other route: the OAuth client
- * sends the operator here from a different origin via `approve_url`, so
- * deep-linkable as a discrete route is the right shape.
  */
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { type AdminClientView, HttpError, approveOauthClient, getOauthClient } from "../lib/api.ts";
 
 type LoadState =
@@ -39,6 +53,15 @@ type ActionState =
 export function ApproveClient() {
   const { clientId: rawClientId } = useParams<{ clientId: string }>();
   const clientId = rawClientId ?? "";
+  const [searchParams] = useSearchParams();
+  // Validate the `return_to` query param same-origin-style. Mirrors the
+  // server-side gate (`isSafeAuthorizeReturnTo` in oauth-handlers.ts) and
+  // `safeNext` in admin-handlers.ts — single shape across the codebase for
+  // "is this a hub-relative URL we're willing to navigate to?" Off-origin
+  // or malformed values are silently dropped (treated as "no return_to")
+  // so the page falls back to the share-link / dead-end success state
+  // rather than 4xx'ing.
+  const returnTo = sanitizeReturnTo(searchParams.get("return_to"));
   const [loadState, setLoadState] = useState<LoadState>({ kind: "loading" });
   const [action, setAction] = useState<ActionState>({ kind: "idle" });
   const [reload, setReload] = useState(0);
@@ -60,8 +83,23 @@ export function ApproveClient() {
         // If the row was already approved before the operator arrived,
         // surface the success message rather than the "Approve" button —
         // no point asking them to re-confirm an action that's done.
+        //
+        // Special case for the OAuth-resume flow: if `return_to` is set
+        // and the client is already approved, leave the SPA immediately
+        // — the parked authorize URL can finish the flow with no further
+        // operator action. Saves the operator a redundant manual click
+        // back to the calling app.
         if (client.status === "approved") {
+          // Set action state BEFORE triggering navigation so the
+          // intermediate render (between assign() being called and the
+          // browser actually navigating) doesn't show the pending Approve
+          // button. Real browsers finish the navigation almost instantly
+          // but the SPA must still be in a consistent state for the
+          // intermediate frame.
           setAction({ kind: "approved", alreadyApproved: true });
+          if (returnTo) {
+            window.location.assign(returnTo);
+          }
         }
       })
       .catch((err) => {
@@ -76,12 +114,22 @@ export function ApproveClient() {
     return () => {
       cancelled = true;
     };
-  }, [clientId, reload]);
+  }, [clientId, reload, returnTo]);
 
   async function onApprove(): Promise<void> {
     setAction({ kind: "approving" });
     try {
-      const result = await approveOauthClient(clientId);
+      const result = await approveOauthClient(clientId, returnTo || undefined);
+      // OAuth-resume case (workstream D): server echoed the same-origin-
+      // validated `return_to` back as `redirect_to`. Leave the SPA to
+      // resume the parked authorize flow rather than dead-ending on the
+      // success state. Re-validate same-origin client-side as belt-and-
+      // suspenders — the server already gated this, but the redirect is
+      // a sensitive surface and double-checking is cheap.
+      if (result.redirect_to && isSafeReturnTo(result.redirect_to)) {
+        window.location.assign(result.redirect_to);
+        return;
+      }
       setAction({ kind: "approved", alreadyApproved: result.already_approved });
     } catch (err) {
       const message =
@@ -102,6 +150,30 @@ export function ApproveClient() {
       {renderBody({ loadState, action, onApprove, onRetry: () => setReload((n) => n + 1) })}
     </div>
   );
+}
+
+/**
+ * Validate a `return_to` value as a hub-relative URL we're willing to
+ * navigate to. Must start with `/` and must NOT start with `//`
+ * (otherwise it's a scheme-relative URL pointing off-origin). Mirrors
+ * the server-side `isSafeAuthorizeReturnTo` shape (which additionally
+ * requires `/oauth/authorize?` prefix — the SPA could match that too,
+ * but keeping the SPA's gate slightly broader lets future flows wire
+ * different resume targets without touching the SPA. The server is the
+ * authoritative gate; the SPA's job is to refuse the obvious bad shapes
+ * before round-tripping a useless value).
+ */
+function isSafeReturnTo(value: string): boolean {
+  if (!value) return false;
+  if (!value.startsWith("/")) return false;
+  if (value.startsWith("//")) return false;
+  return true;
+}
+
+/** Sanitize once at the URL-parse boundary; downstream consumers see `string | null`. */
+function sanitizeReturnTo(raw: string | null): string | null {
+  if (raw === null) return null;
+  return isSafeReturnTo(raw) ? raw : null;
 }
 
 interface RenderBodyProps {

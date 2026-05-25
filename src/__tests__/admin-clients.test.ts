@@ -298,4 +298,165 @@ describe("handleApproveClient", () => {
     const res = await handleApproveClient(req, id, { db: harness.db, issuer: ISSUER });
     expect(res.status).toBe(405);
   });
+
+  // Workstream D — OAuth resume via `return_to`. The SPA approve page
+  // can pass a hub-relative authorize URL as JSON body; the response
+  // echoes it as `redirect_to` so the SPA can navigate the browser there
+  // and resume the parked OAuth flow. The pre-D no-body shape continues
+  // to work (no `redirect_to` field, share-link dead-end case).
+  describe("workstream D — return_to / redirect_to", () => {
+    function jsonApproveReq(clientId: string, bearer: string, body: unknown): Request {
+      return new Request(`${ISSUER}/api/oauth/clients/${encodeURIComponent(clientId)}/approve`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+    }
+
+    test("echoes a same-origin /oauth/authorize?... return_to as redirect_to", async () => {
+      const { bearer } = await makeOperatorBearer();
+      const id = regPending();
+      const returnTo =
+        "/oauth/authorize?client_id=" +
+        encodeURIComponent(id) +
+        "&response_type=code&scope=vault%3Awork%3Aread";
+      const res = await handleApproveClient(
+        jsonApproveReq(id, bearer, { return_to: returnTo }),
+        id,
+        { db: harness.db, issuer: ISSUER },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.redirect_to).toBe(returnTo);
+      expect(body.status).toBe("approved");
+      expect(getClient(harness.db, id)?.status).toBe("approved");
+    });
+
+    test("omits redirect_to entirely when return_to is missing (share-link case preserved)", async () => {
+      const { bearer } = await makeOperatorBearer();
+      const id = regPending();
+      // No body — the pre-D shape. The endpoint must continue to work.
+      const res = await handleApproveClient(approveReq(id, bearer), id, {
+        db: harness.db,
+        issuer: ISSUER,
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body).not.toHaveProperty("redirect_to");
+      expect(body.status).toBe("approved");
+    });
+
+    test("drops an off-origin return_to (scheme-relative) silently, still approves", async () => {
+      const { bearer } = await makeOperatorBearer();
+      const id = regPending();
+      const res = await handleApproveClient(
+        jsonApproveReq(id, bearer, { return_to: "//evil.example/oauth/authorize?foo=1" }),
+        id,
+        { db: harness.db, issuer: ISSUER },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      // No redirect_to — server refuses to echo a bad value. The client
+      // is still approved (we don't fail an otherwise-legitimate approve
+      // over a malformed return_to).
+      expect(body).not.toHaveProperty("redirect_to");
+      expect(getClient(harness.db, id)?.status).toBe("approved");
+    });
+
+    test("drops a non-authorize return_to (off-path) silently", async () => {
+      const { bearer } = await makeOperatorBearer();
+      const id = regPending();
+      const res = await handleApproveClient(
+        jsonApproveReq(id, bearer, { return_to: "/admin/vaults" }),
+        id,
+        { db: harness.db, issuer: ISSUER },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      // `/admin/vaults` is same-origin but isn't a `/oauth/authorize?...`
+      // URL — the server-side gate is "authorize URL only" so the SPA
+      // can't be used as a redirect gadget for arbitrary in-SPA navigation.
+      expect(body).not.toHaveProperty("redirect_to");
+    });
+
+    test("drops absolute URL return_to silently", async () => {
+      const { bearer } = await makeOperatorBearer();
+      const id = regPending();
+      const res = await handleApproveClient(
+        jsonApproveReq(id, bearer, {
+          return_to: "https://evil.example/oauth/authorize?foo=1",
+        }),
+        id,
+        { db: harness.db, issuer: ISSUER },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body).not.toHaveProperty("redirect_to");
+    });
+
+    test("non-JSON body is treated as 'no return_to' (no parser explosion)", async () => {
+      const { bearer } = await makeOperatorBearer();
+      const id = regPending();
+      // text/plain body — pre-D / unknown clients send anything. The
+      // endpoint must NOT throw on parse and must NOT echo a redirect_to.
+      const req = new Request(`${ISSUER}/api/oauth/clients/${id}/approve`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          "content-type": "text/plain",
+        },
+        body: "garbage",
+      });
+      const res = await handleApproveClient(req, id, {
+        db: harness.db,
+        issuer: ISSUER,
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body).not.toHaveProperty("redirect_to");
+    });
+
+    test("malformed JSON body is treated as 'no return_to'", async () => {
+      const { bearer } = await makeOperatorBearer();
+      const id = regPending();
+      const req = new Request(`${ISSUER}/api/oauth/clients/${id}/approve`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          "content-type": "application/json",
+        },
+        body: "{not json",
+      });
+      const res = await handleApproveClient(req, id, {
+        db: harness.db,
+        issuer: ISSUER,
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body).not.toHaveProperty("redirect_to");
+    });
+
+    test("re-approve with return_to echoes redirect_to (idempotent path)", async () => {
+      // The OAuth resume flow can legitimately race: operator opens the
+      // approve link, an automated path approves the same client, then
+      // operator clicks. We still want the redirect to fire so the
+      // operator's flow resumes — not dead-end on already_approved.
+      const { bearer } = await makeOperatorBearer();
+      const id = regPending();
+      approveClient(harness.db, id);
+      const returnTo = `/oauth/authorize?client_id=${encodeURIComponent(id)}&response_type=code&scope=vault%3Awork%3Aread`;
+      const res = await handleApproveClient(
+        jsonApproveReq(id, bearer, { return_to: returnTo }),
+        id,
+        { db: harness.db, issuer: ISSUER },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.already_approved).toBe(true);
+      expect(body.redirect_to).toBe(returnTo);
+    });
+  });
 });
