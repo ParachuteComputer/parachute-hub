@@ -590,6 +590,10 @@ async function proxyToService(req: Request, manifestPath: string): Promise<Respo
   // unrelated services keep working. The strict `readManifest` is
   // still used by write paths + admin surfaces that want errors
   // surfaced immediately. See hub#406.
+  //
+  // The default `log` is `console`, which under Render's container
+  // routing surfaces in the Logs panel — operators see the warning
+  // about the skipped entry.
   const services = readManifestLenient(manifestPath).services;
   const url = new URL(req.url);
   const match = findServiceUpstream(services, url.pathname);

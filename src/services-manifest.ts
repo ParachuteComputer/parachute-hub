@@ -431,6 +431,13 @@ function validateManifest(raw: unknown, where: string): ServicesManifest {
  * (instead of bound port). Hub's routing throw on services.json read
  * meant every request to every service 500'd — not just app — because
  * one row's bad shape took out the whole manifest read.
+ *
+ * One behavioral difference from strict `readManifest`: this function
+ * does NOT write cleanup mutations back to disk. The bad row persists
+ * on disk until a write-path call (upsertService, etc.) exercises the
+ * strict path. That's intentional — a hot-path read should not mutate
+ * state — but worth knowing: a fix upstream (e.g. app@rc.13 overwriting
+ * the bad row on its next selfRegister) is what finally clears it.
  */
 export function readManifestLenient(
   path: string = SERVICES_MANIFEST_PATH,
@@ -448,6 +455,8 @@ export function readManifestLenient(
   }
   const afterRetired = dropRetiredModuleRows(raw, path);
   const cleaned = dropLegacyShortNameRows(afterRetired.raw, path);
+  // `typeof null === "object"` in JS, so the `!cleaned.raw` part of this
+  // guard is load-bearing for the null case — not a typo or redundancy.
   if (!cleaned.raw || typeof cleaned.raw !== "object") return { services: [] };
   const services = (cleaned.raw as Record<string, unknown>).services;
   if (!Array.isArray(services)) return { services: [] };
