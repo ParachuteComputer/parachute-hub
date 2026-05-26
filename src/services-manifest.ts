@@ -471,17 +471,21 @@ export function readManifestLenient(
     }
   }
   // Best-effort duplicate-port detection — log + drop the duplicate
-  // rather than throw.
-  const seenPorts = new Set<number>();
+  // rather than throw. Mirrors the strict `assertNoDuplicatePorts`'s
+  // vault-on-vault exception: multiple parachute-vault-<name> rows
+  // legitimately share port 1940 because they're all served by the
+  // single vault module process.
+  const portsSeen = new Map<number, string>();
   const dedup: ServiceEntry[] = [];
   for (const e of valid) {
-    if (seenPorts.has(e.port)) {
+    const prev = portsSeen.get(e.port);
+    if (prev !== undefined && !(isVaultName(prev) && isVaultName(e.name))) {
       log.warn?.(
-        `[services-manifest] dropping duplicate-port entry: name=${JSON.stringify(e.name)} port=${e.port}`,
+        `[services-manifest] dropping duplicate-port entry: name=${JSON.stringify(e.name)} port=${e.port} (already claimed by ${JSON.stringify(prev)})`,
       );
       continue;
     }
-    seenPorts.add(e.port);
+    if (prev === undefined) portsSeen.set(e.port, e.name);
     dedup.push(e);
   }
   return { services: dedup };

@@ -70,7 +70,10 @@ import { isNonRequestableScope, isRequestableScope, scopeIsAdmin } from "./scope
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
 import {
   type ServicesManifest,
-  readManifest as readServicesManifest,
+  // Hot-path OAuth flows use the lenient reader so a single malformed
+  // services.json row (e.g. from a buggy module install) doesn't crash
+  // the entire OAuth dispatch. See hub#406.
+  readManifestLenient as readServicesManifest,
 } from "./services-manifest.ts";
 import {
   SESSION_TTL_MS,

@@ -65,7 +65,7 @@ import {
 import { escapeHtml } from "./oauth-ui.ts";
 import { mintOperatorToken } from "./operator-token.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
-import { findService, readManifest } from "./services-manifest.ts";
+import { findService, readManifestLenient } from "./services-manifest.ts";
 import {
   SESSION_TTL_MS,
   buildSessionCookie,
@@ -1716,7 +1716,7 @@ const INSTALL_TILE_PROPS: ReadonlyArray<{
  * (op status snapshot). Pure-ish — only the registry call is impure.
  */
 function buildInstallTiles(url: URL, deps: SetupWizardDeps): ModuleInstallTileState[] {
-  const manifest = readManifest(deps.manifestPath);
+  const manifest = readManifestLenient(deps.manifestPath);
   return INSTALL_TILE_PROPS.filter((p) =>
     (CURATED_MODULES as readonly string[]).includes(p.short),
   ).map((p) => {
@@ -1874,7 +1874,7 @@ function validateAccountFields(input: {
  * shared with `buildInstallTiles`.
  */
 function isModuleInstalled(short: CuratedModuleShort, manifestPath: string): boolean {
-  const manifest = readManifest(manifestPath);
+  const manifest = readManifestLenient(manifestPath);
   const spec = specFor(short);
   return manifest.services.some((s) => s.name === spec.manifestName);
 }
@@ -1885,7 +1885,7 @@ function isModuleInstalled(short: CuratedModuleShort, manifestPath: string): boo
  * entry's metadata isn't present.
  */
 function firstVaultName(manifestPath: string): string {
-  const manifest = readManifest(manifestPath);
+  const manifest = readManifestLenient(manifestPath);
   // Match on the canonical vault manifestName from the curated spec.
   // (`CURATED_MODULES.includes("vault")` was a dead guard — vault is a
   // tuple-literal member, so the conjunct is always true.)

@@ -40,7 +40,7 @@ import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES } from "./service-spec.ts";
 // still required) and the latter for vault/scribe/runner (post-FALLBACK
 // retirement, hub#310). The local helper hides the split from the rest of
 // this file.
-import { type UiSubUnit, type UiSubUnitStatus, readManifest } from "./services-manifest.ts";
+import { type UiSubUnit, type UiSubUnitStatus, readManifest, readManifestLenient } from "./services-manifest.ts";
 import type { ModuleState, Supervisor } from "./supervisor.ts";
 
 /**
@@ -303,7 +303,9 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   // Load installed state from services.json. Missing file = empty manifest
   // (fresh container), which is the v0.6 hot path — readManifest already
   // returns { services: [] } for a missing file, so no extra branching.
-  const manifest = readManifest(deps.manifestPath);
+  // Lenient read so a single bad row written by a buggy module install
+  // (e.g. app@0.2.0-rc.4) doesn't take down /api/modules — see hub#406.
+  const manifest = readManifestLenient(deps.manifestPath);
   const installedByShort = new Map<
     string,
     {

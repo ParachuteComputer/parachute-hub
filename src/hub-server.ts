@@ -327,7 +327,8 @@ export function findVaultUpstream(
  */
 function hasVaultInstalled(manifestPath: string): boolean {
   try {
-    const services = readManifest(manifestPath).services;
+    // Lenient — see hub#406.
+    const services = readManifestLenient(manifestPath).services;
     return services.some((s) => isVaultEntry(s));
   } catch {
     return false;
@@ -499,16 +500,10 @@ async function proxyRequest(
  * #173 introduced).
  */
 async function proxyToVault(req: Request, manifestPath: string): Promise<Response | undefined> {
-  let services: readonly ServiceEntry[];
-  try {
-    services = readManifest(manifestPath).services;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return new Response(JSON.stringify({ error: `vault routing failed: ${msg}` }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    });
-  }
+  // Lenient — see hub#406. One bad services.json row no longer takes
+  // down vault routing the way it used to take down /admin/setup and
+  // /api/modules (the symptom Aaron hit 2026-05-26).
+  const services = readManifestLenient(manifestPath).services;
   const url = new URL(req.url);
   const match = findVaultUpstream(services, url.pathname);
   if (!match) return undefined;
@@ -1406,7 +1401,8 @@ export function hubFetch(
       // configured public origin (set by `--issuer https://<fqdn>`), else
       // the request's own origin (fine for direct loopback hits).
       try {
-        const manifest = readManifest(manifestPath);
+        // Lenient — see hub#406.
+        const manifest = readManifestLenient(manifestPath);
         // Same precedence as the OAuth issuer (hub#298): hub_settings →
         // env → request origin. The well-known doc embeds this origin
         // in service URLs + the issuer metadata link, so it must follow
@@ -1616,7 +1612,8 @@ export function hubFetch(
       // shape the well-known doc derives. Source from services.json so a
       // freshly-created vault is mintable on the next request without a
       // restart.
-      const manifest = readManifest(manifestPath);
+      // Lenient — see hub#406.
+      const manifest = readManifestLenient(manifestPath);
       const knownVaultNames = new Set<string>();
       for (const s of manifest.services) {
         if (!isVaultEntry(s)) continue;
