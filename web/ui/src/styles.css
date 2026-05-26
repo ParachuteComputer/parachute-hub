@@ -361,6 +361,7 @@ h2 {
   gap: 1rem;
   margin-bottom: 1rem;
 }
+.list-header h1,
 .list-header h2 {
   margin: 0;
 }
