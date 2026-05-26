@@ -253,6 +253,24 @@ code {
   cursor: not-allowed;
 }
 
+/* Heading hierarchy.
+ *
+ *   h1 — page title. Serif (matches oauth-ui.ts's baseDocument), generous
+ *        line-height. Used once per route as the canonical "you are on the
+ *        X page" landmark. Screen readers + keyboard users (Tab + H
+ *        navigation) rely on it.
+ *   h2 — section / list title within a page. Sans, slightly smaller.
+ *   h3 — sub-section within a card.
+ */
+h1 {
+  margin: 0 0 0.5rem;
+  font-family: var(--font-serif);
+  font-size: 1.85rem;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  color: var(--fg);
+}
 h2 {
   margin: 0 0 1rem;
   font-size: 1.4rem;
@@ -294,6 +312,35 @@ h2 {
   background: var(--bg-soft);
   border-radius: 10px;
 }
+
+/* Mobile-safe table container — wraps a wide table so the document doesn't
+ * overflow on narrow viewports. Tables with more columns than fit at 375 px
+ * (e.g. /admin/users with 5 cols) would otherwise force horizontal scroll on
+ * the entire document. With this wrapper, the table scrolls within its own
+ * bounded container; the rest of the page stays inside the viewport.
+ *
+ * Apply by wrapping any admin table: `<div className="table-scroll"><table>…`.
+ * Closes hub#398. */
+.table-scroll {
+  overflow-x: auto;
+  /* Smooth momentum scroll on iOS Safari. */
+  -webkit-overflow-scrolling: touch;
+  /* Render a subtle inner shadow at the right edge when content overflows
+   * so the user has a visual cue that there's more to see. Modern browsers
+   * support background-attachment: local; older fall back to no shadow.
+   * The cream gradient matches the page background. */
+  background:
+    linear-gradient(to right, var(--card-bg), var(--card-bg)) left center / 20px 100% no-repeat,
+    linear-gradient(to right, rgba(44, 42, 38, 0.08), rgba(44, 42, 38, 0)) left center / 8px 100% no-repeat,
+    linear-gradient(to left, var(--card-bg), var(--card-bg)) right center / 20px 100% no-repeat,
+    linear-gradient(to left, rgba(44, 42, 38, 0.08), rgba(44, 42, 38, 0)) right center / 8px 100% no-repeat;
+  background-attachment: local, scroll, local, scroll;
+}
+.table-scroll > table {
+  /* The table itself should take its intrinsic width — the container
+   * handles overflow. width: 100% would shrink columns and break layout. */
+  min-width: 100%;
+}
 .empty-rich {
   text-align: left;
   padding: 2rem 1.75rem;
@@ -314,6 +361,7 @@ h2 {
   gap: 1rem;
   margin-bottom: 1rem;
 }
+.list-header h1,
 .list-header h2 {
   margin: 0;
 }

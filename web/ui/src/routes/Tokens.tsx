@@ -250,7 +250,7 @@ export function Tokens() {
   return (
     <div>
       <div className="list-header">
-        <h2>Tokens</h2>
+        <h1>Tokens</h1>
         <button type="button" onClick={() => setShowForm((s) => !s)}>
           {showForm ? "Hide form" : "Mint new token"}
         </button>
