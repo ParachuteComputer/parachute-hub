@@ -91,7 +91,7 @@ export function Permissions() {
   }
 
   return (
-    <div>
+    <div data-route-content="true">
       <div className="list-header">
         <h1>Permissions</h1>
       </div>

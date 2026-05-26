@@ -520,7 +520,7 @@ function renderList({
   }
 
   return (
-    <div>
+    <div data-route-content="true">
       {list.tokens.map((t) => {
         const status = tokenStatus(t);
         const isRevoking = revoke.kind === "revoking" && revoke.jti === t.jti;
