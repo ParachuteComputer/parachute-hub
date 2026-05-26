@@ -26,7 +26,7 @@ import {
   getSpecFromInstallDir,
   shortNameForManifest,
 } from "../service-spec.ts";
-import { type ServiceEntry, readManifest } from "../services-manifest.ts";
+import { type ServiceEntry, readManifestLenient } from "../services-manifest.ts";
 import type { Supervisor } from "../supervisor.ts";
 
 export interface BootOpts {
@@ -57,7 +57,10 @@ export async function bootSupervisedModules(
   opts: BootOpts,
 ): Promise<BootedModule[]> {
   const log = opts.log ?? (() => {});
-  const manifest = readManifest(opts.manifestPath);
+  // Lenient: a single bad row shouldn't prevent the supervisor from booting
+  // the rest of the services. The container deploy hot path depends on this —
+  // we'd rather have N-1 modules up + one warning than zero modules up.
+  const manifest = readManifestLenient(opts.manifestPath);
   const results: BootedModule[] = [];
 
   for (const entry of manifest.services) {

@@ -48,7 +48,11 @@ import {
   getSpec,
   synthesizeManifestForKnownModule,
 } from "./service-spec.ts";
-import { findService, readManifest, removeService } from "./services-manifest.ts";
+import {
+  findService,
+  readManifestLenient,
+  removeService,
+} from "./services-manifest.ts";
 import type { ModuleState, SpawnRequest, Supervisor } from "./supervisor.ts";
 import { WELL_KNOWN_PATH, type regenerateWellKnown } from "./well-known.ts";
 
@@ -396,7 +400,8 @@ async function spawnSupervised(
   spec: ServiceSpec,
   deps: ApiModulesOpsDeps,
 ): Promise<ModuleState | undefined> {
-  const manifest = readManifest(deps.manifestPath);
+  // Lenient: one bad row elsewhere shouldn't block spawning a valid one.
+  const manifest = readManifestLenient(deps.manifestPath);
   const entry = manifest.services.find((s) => s.name === spec.manifestName);
   if (!entry) return undefined;
   const cmd = spec.startCmd?.(entry);
@@ -785,8 +790,9 @@ export async function handleUninstall(
   const stopped = await deps.supervisor.stop(short);
   log.push(stopped ? `${short} supervisor stopped` : `${short} not supervised`);
 
-  // 2. Drop the services.json row (idempotent — readManifest is empty if missing).
-  const before = readManifest(deps.manifestPath);
+  // 2. Drop the services.json row (idempotent — readManifestLenient is empty if missing).
+  // Lenient so a malformed sibling row doesn't block uninstall of an unrelated module.
+  const before = readManifestLenient(deps.manifestPath);
   if (before.services.some((s) => s.name === spec.manifestName)) {
     removeService(spec.manifestName, deps.manifestPath);
     log.push(`removed ${spec.manifestName} from services.json`);

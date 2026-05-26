@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { type ModuleManifest, validateModuleManifest } from "./module-manifest.ts";
 import { FIRST_PARTY_SCOPES } from "./scope-explanations.ts";
-import { readManifest as readServicesManifest } from "./services-manifest.ts";
+import { readManifestLenient as readServicesManifest } from "./services-manifest.ts";
 
 /**
  * RFC 6749 §3.3: scope strings are 1*( SP scope-token ). We accept any
@@ -143,12 +143,10 @@ export interface LoadDeclaredScopesOpts {
 export function loadDeclaredScopes(opts: LoadDeclaredScopesOpts = {}): Set<string> {
   const declared = new Set<string>(FIRST_PARTY_SCOPES);
   const readModuleScopes = opts.readModuleScopes ?? defaultReadModuleScopes;
-  let services: { name: string; installDir?: string }[];
-  try {
-    services = readServicesManifest(opts.manifestPath).services;
-  } catch {
-    return declared;
-  }
+  // readServicesManifest is the lenient reader: it returns `{ services: [] }`
+  // on missing/unparseable files and skips individual bad rows with a warning.
+  // The for-loop below already degrades gracefully, so no try/catch needed.
+  const services = readServicesManifest(opts.manifestPath).services;
   for (const svc of services) {
     const defined = readModuleScopes(svc.name, svc.installDir);
     if (!defined) continue;

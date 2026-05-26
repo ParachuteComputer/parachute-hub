@@ -6,7 +6,7 @@ import {
   type ServiceEntry,
   type UiSubUnit,
   type UiSubUnitStatus,
-  readManifest,
+  readManifestLenient,
 } from "./services-manifest.ts";
 
 export interface WellKnownServiceEntry {
@@ -386,7 +386,11 @@ export async function regenerateWellKnown(
 ): Promise<{ path: string; doc: WellKnownDocument }> {
   const read = opts.readModuleManifest ?? readModuleManifest;
   const path = opts.wellKnownPath ?? WELL_KNOWN_PATH;
-  const services = readManifest(opts.manifestPath).services;
+  // Lenient: one malformed row shouldn't block well-known regen for everyone
+  // else (downstream consumers — Notes, Scribe, MCP — poll this; if it 500s
+  // they lose discovery). The function below already tolerates per-entry
+  // manifest errors via console.warn, so partial valid set is the right shape.
+  const services = readManifestLenient(opts.manifestPath).services;
   // Build the resolver maps the same way hub-server does — read each
   // module's `.parachute/module.json` from `installDir` and harvest
   // managementUrl (vault rows), uiUrl + displayName (all rows). Vaults
