@@ -156,7 +156,7 @@ import {
   type ModuleManifest,
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
-import { logNotesRedirect, maybeRedirectNotes } from "./notes-redirect.ts";
+import { isLegacyNotesPath, logNotesRedirect, maybeRedirectNotes } from "./notes-redirect.ts";
 import {
   authorizationServerMetadata,
   handleApproveClientPost,
@@ -1178,7 +1178,7 @@ export function hubFetch(
     // Lazy DB read: only consult `getDb` when the path actually matches a
     // legacy notes prefix — every non-notes request must NOT touch the DB
     // here (some tests + the /health route assert getDb is never called).
-    if (pathname === "/notes" || pathname.startsWith("/notes/")) {
+    if (isLegacyNotesPath(pathname)) {
       const notesRedirect = maybeRedirectNotes(pathname, url.search, getDb?.());
       if (notesRedirect !== undefined) {
         logNotesRedirect(pathname, notesRedirect);
