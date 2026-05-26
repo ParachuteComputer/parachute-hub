@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { registerClient } from "../clients.ts";
 import {
   findGrant,
+  findGrantByClientName,
   isCoveredByGrant,
+  isCoveredByGrantForClientName,
   listGrantsForUser,
   recordGrant,
   revokeGrant,
@@ -157,6 +159,147 @@ describe("grants module (#75)", () => {
       expect(grants).toHaveLength(2);
       expect(grants[0]?.clientId).toBe(reg2.client.clientId);
       expect(grants[1]?.clientId).toBe(h.clientId);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () => {
+  test("returns the most recent grant across any client_id with the matching name", async () => {
+    // Closes hub#409: CLI MCP clients re-DCR each session, each landing
+    // fresh client_ids. Operator approves once by name; future DCRs of
+    // the same name should auto-trust.
+    const h = await harness();
+    try {
+      // First DCR: client_name="claude-code", scope a+b
+      const reg1 = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "claude-code",
+      });
+      recordGrant(h.db, h.userId, reg1.client.clientId, ["a", "b"], new Date("2026-04-10T00:00:00Z"));
+      // Second DCR: same client_name="claude-code", fresh client_id, no grant yet
+      const reg2 = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "claude-code",
+      });
+      // findGrantByClientName should return the prior grant
+      const grant = findGrantByClientName(h.db, h.userId, "claude-code");
+      expect(grant).not.toBeNull();
+      expect(grant?.clientId).toBe(reg1.client.clientId);
+      expect(grant?.scopes).toEqual(["a", "b"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("returns null when no client with that name has any grant", async () => {
+    const h = await harness();
+    try {
+      registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "claude-code",
+      });
+      // No grants recorded
+      expect(findGrantByClientName(h.db, h.userId, "claude-code")).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("returns null when client_name is empty string", async () => {
+    const h = await harness();
+    try {
+      expect(findGrantByClientName(h.db, h.userId, "")).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("returns null for a different user (per-user isolation)", async () => {
+    const h = await harness();
+    try {
+      const reg = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "claude-code",
+      });
+      recordGrant(h.db, h.userId, reg.client.clientId, ["a"]);
+      // Another user — should NOT see the grant. (hub is single-user-by-
+      // default; pass allowMulti for the test.)
+      const other = await createUser(h.db, "other-user", "pw", { allowMulti: true });
+      expect(findGrantByClientName(h.db, other.id, "claude-code")).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("picks the most recent when multiple clients share the name", async () => {
+    const h = await harness();
+    try {
+      const reg1 = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "claude-code",
+      });
+      const reg2 = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "claude-code",
+      });
+      const reg3 = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "claude-code",
+      });
+      recordGrant(h.db, h.userId, reg1.client.clientId, ["a"], new Date("2026-04-01T00:00:00Z"));
+      recordGrant(h.db, h.userId, reg3.client.clientId, ["a", "c"], new Date("2026-04-15T00:00:00Z"));
+      recordGrant(h.db, h.userId, reg2.client.clientId, ["a", "b"], new Date("2026-04-10T00:00:00Z"));
+      const grant = findGrantByClientName(h.db, h.userId, "claude-code");
+      // Most recent = reg3's grant (2026-04-15)
+      expect(grant?.clientId).toBe(reg3.client.clientId);
+      expect(grant?.scopes).toEqual(["a", "c"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("isCoveredByGrantForClientName: subset of stored scopes → true", async () => {
+    const h = await harness();
+    try {
+      const reg = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "claude-code",
+      });
+      recordGrant(h.db, h.userId, reg.client.clientId, ["vault:default:read", "vault:default:write"]);
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:read"])).toBe(true);
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:read", "vault:default:write"])).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("isCoveredByGrantForClientName: superset of stored scopes → false", async () => {
+    const h = await harness();
+    try {
+      const reg = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "claude-code",
+      });
+      recordGrant(h.db, h.userId, reg.client.clientId, ["vault:default:read"]);
+      // Asking for write — not previously granted
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:write"])).toBe(false);
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:read", "vault:default:write"])).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("isCoveredByGrantForClientName: empty scopes → false (matches isCoveredByGrant contract)", async () => {
+    const h = await harness();
+    try {
+      const reg = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "claude-code",
+      });
+      recordGrant(h.db, h.userId, reg.client.clientId, ["a"]);
+      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [])).toBe(false);
     } finally {
       h.cleanup();
     }

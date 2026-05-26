@@ -44,7 +44,7 @@ import {
   verifyClientSecret,
 } from "./clients.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { isCoveredByGrant, recordGrant } from "./grants.ts";
+import { isCoveredByGrant, isCoveredByGrantForClientName, recordGrant } from "./grants.ts";
 import { consumeFirstClientAutoApproveWindow } from "./hub-settings.ts";
 import { VAULT_VERBS, inferAudience } from "./jwt-audience.ts";
 import {
@@ -506,6 +506,66 @@ function pendingClientResponse(
   const requestedVault = vaultParam && vaultParam.length > 0 ? vaultParam : undefined;
   const session = findActiveSession(db, req, deps.now ?? (() => new Date()));
   const sameOrigin = isSameOriginRequest(req, resolveBoundOrigins(deps));
+
+  // Trust-by-client_name auto-approve (closes hub#409). When the requesting
+  // user has previously approved a client with the SAME client_name AND the
+  // current request's scopes are covered by that prior grant, auto-promote
+  // this pending client to approved + carry on as if status had been
+  // approved from the start.
+  //
+  // Motivation: CLI MCP clients (Claude Code et al.) re-DCR each session,
+  // each landing a fresh client_id. Strict (user, client_id) approval forces
+  // the operator to click Approve every single time even though they
+  // already approved the same client by name on every prior session. Aaron
+  // 2026-05-26: "once we've approved something like claude once it should
+  // not need admin approval every other time."
+  //
+  // Constraints (security guardrails kept):
+  //   1. Requires an active operator session — anonymous DCR can't ride
+  //      another operator's prior trust.
+  //   2. Requires same-origin — defends against an attacker registering a
+  //      malicious "claude-code" client on a different hub and tricking
+  //      the operator into authorizing it.
+  //   3. Requires a non-empty client_name — DCR allows omitting it, in
+  //      which case the prior-grant lookup has nothing to match against.
+  //   4. Requires scope coverage — a strict superset (the new request asks
+  //      for scopes the prior grant didn't cover) falls through to the
+  //      approve-pending screen so the operator explicitly approves the
+  //      addition.
+  //   5. Non-admin scopes only — `*:admin` scopes (hub:admin, vault:*:admin
+  //      if it ever becomes requestable) require explicit per-session
+  //      consent. This guard mirrors the same-hub-auto-trust gate's
+  //      treatment of admin scopes (handleAuthorizeGet ~line 854).
+  if (
+    session &&
+    sameOrigin &&
+    client.clientName &&
+    requestedScopes.length > 0 &&
+    !requestedScopes.some(scopeIsAdmin) &&
+    isCoveredByGrantForClientName(db, session.userId, client.clientName, requestedScopes)
+  ) {
+    console.log(
+      `[oauth] auto-approved pending client by prior client_name trust client_id=${client.clientId} client_name=${JSON.stringify(client.clientName)} user_id=${session.userId} scopes=${requestedScopes.join(" ")} (hub#409)`,
+    );
+    approveClient(db, client.clientId);
+    // Re-record the grant for this fresh client_id so the standard
+    // (user, client_id) consent-skip path also fires on the IMMEDIATE
+    // continuation below — without this, the very next /oauth/authorize
+    // dispatch would re-enter the "is grant covered?" check against the
+    // new client_id, find nothing (we matched by name, not id), and
+    // render the consent screen anyway.
+    recordGrant(db, session.userId, client.clientId, requestedScopes, deps.now?.() ?? new Date());
+    // Fall through to the standard approved-client flow: re-fetch the
+    // refreshed row + let handleAuthorizeGet continue past the
+    // status-check + into the consent-skip / same-hub auto-trust path.
+    const refreshed = getClient(db, client.clientId);
+    if (refreshed && refreshed.status === "approved") {
+      return handleAuthorizeGet(db, req, deps);
+    }
+    // If for some reason the refresh failed, fall through to render the
+    // approve-pending page (defensive — should never happen given the
+    // approveClient call just above).
+  }
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
   // Hub-relative URL of the original `/oauth/authorize?...` request. Used in
