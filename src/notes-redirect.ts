@@ -89,6 +89,8 @@ export function maybeRedirectNotes(
  * helper resets it between test runs.
  */
 const RATE_LIMIT_WINDOW_MS = 60_000;
+// Bounded by O(distinct legacy notes paths bookmarked by operators) —
+// operator-owned input set, not attacker-controlled. No eviction needed.
 const lastLogAt = new Map<string, number>();
 
 export interface LogNotesRedirectOpts {
