@@ -590,6 +590,19 @@ function pendingClientResponse(
   // the authed branch's inline approve form, and the flow resumes.
   const returnTo = `${authorizeUrl.pathname}${authorizeUrl.search}`;
   if (session && sameOrigin) {
+    // Plumb redirect_uri + state for the Deny path (hub#390): an operator
+    // who clicks Deny gets routed back to the client's redirect_uri with
+    // an RFC 6749 §4.1.2.1 error response. redirect_uri is required by
+    // the spec on /oauth/authorize so it's reliably present; state is
+    // optional per the spec, so undefined-passes-through.
+    //
+    // We round-trip both values through hidden form inputs rather than
+    // re-parsing them from `return_to` in the handler. Reason: keeps the
+    // handler stateless about authorize-URL shape — it just reads the
+    // form. State is also not stored server-side (it never was; OAuth
+    // state lives in the query string by design).
+    const requestRedirectUri = authorizeUrl.searchParams.get("redirect_uri") ?? "";
+    const requestState = authorizeUrl.searchParams.get("state") ?? undefined;
     return htmlResponse(
       renderApprovePending({
         clientName: client.clientName ?? client.clientId,
@@ -598,7 +611,12 @@ function pendingClientResponse(
         requestedScopes,
         ...(requestedVault !== undefined && { requestedVault }),
         hubOrigin: deps.issuer,
-        approveForm: { csrfToken: csrf.token, returnTo },
+        approveForm: {
+          csrfToken: csrf.token,
+          returnTo,
+          redirectUri: requestRedirectUri,
+          ...(requestState !== undefined && { state: requestState }),
+        },
         loginNextUrl: returnTo,
       }),
       403,
@@ -1359,10 +1377,64 @@ export async function handleApproveClientPost(
   if (!client) {
     return htmlError("Unknown application", "This client_id is not registered with this hub.", 404);
   }
-  // Validate return_to BEFORE the DB mutation: if an authenticated operator
-  // submits a hand-crafted form with a bad return_to, we refuse without
-  // committing the client to `approved`. Practical risk is low (all three
-  // belts already passed), but ordering matters — validate, then mutate.
+
+  // Deny branch (hub#390): RFC 6749 §4.1.2.1 — when the resource owner
+  // denies an access request, the AS bounces back to the client's
+  // redirect_uri with `error=access_denied` (+ original state). Validate
+  // redirect_uri against the client's registered URIs to prevent open
+  // redirect via a hand-crafted form; refuse with 400 if it doesn't match.
+  // Deny does NOT mutate the client row — the client stays `pending` and
+  // the operator can revisit later from /admin/permissions or re-trigger
+  // OAuth from the calling app.
+  //
+  // The decision default is `"approve"` — that covers both back-compat
+  // (older forms that don't carry the field at all) AND any unexpected
+  // value (e.g. `decision="garbage"`). The reasoning: only the literal
+  // string `"deny"` triggers the destructive-from-the-client's-perspective
+  // path; everything else is treated as the safe, prior behavior. A user
+  // can't accidentally land on the error redirect by clicking a malformed
+  // button.
+  const decision = String(form.get("decision") ?? "approve");
+  if (decision === "deny") {
+    const denyRedirectUri = String(form.get("redirect_uri") ?? "");
+    if (!denyRedirectUri || !client.redirectUris.includes(denyRedirectUri)) {
+      return htmlError(
+        "Invalid form submission",
+        "The redirect_uri does not match any URI registered for this app.",
+        400,
+      );
+    }
+    const stateRaw = form.get("state");
+    const denyState = typeof stateRaw === "string" && stateRaw.length > 0 ? stateRaw : undefined;
+    // `new URL()` could in principle throw if a legacy code path bypassed
+    // `isValidRedirectUri` at registration and wrote a non-http(s) URI.
+    // Current DCR enforces validity at write time, so this catch is
+    // belt-and-suspenders, but cost is near-zero.
+    let target: URL;
+    try {
+      target = new URL(denyRedirectUri);
+    } catch {
+      return htmlError(
+        "Invalid form submission",
+        "The registered redirect_uri for this app is not a valid URL.",
+        400,
+      );
+    }
+    target.searchParams.set("error", "access_denied");
+    target.searchParams.set(
+      "error_description",
+      "The user denied the authorization request.",
+    );
+    if (denyState !== undefined) target.searchParams.set("state", denyState);
+    return redirectResponse(target.toString());
+  }
+
+  // Approve branch (default — also the back-compat path for any form that
+  // doesn't carry an explicit `decision` field). Validate return_to BEFORE
+  // the DB mutation: if an authenticated operator submits a hand-crafted
+  // form with a bad return_to, we refuse without committing the client to
+  // `approved`. Practical risk is low (all three belts already passed),
+  // but ordering matters — validate, then mutate.
   const returnTo = String(form.get("return_to") ?? "");
   if (!isSafeAuthorizeReturnTo(returnTo)) {
     return htmlError(
