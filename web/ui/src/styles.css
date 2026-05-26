@@ -145,6 +145,9 @@ code {
 }
 .nav .brand-mark-icon {
   flex-shrink: 0;
+  /* `line-height: 0` cancels the inline-block ghost-baseline that
+   * would otherwise inflate the flex row's height. Don't remove —
+   * the SVG renders fine without it but the brand link grows by ~4px. */
   line-height: 0;
 }
 .nav .brand-wordmark {
