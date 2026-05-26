@@ -639,6 +639,68 @@ describe("hubFetch routing", () => {
     }
   });
 
+  test("/.well-known/oauth-protected-resource returns RFC 9728 metadata + CORS (closes hub#393)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          issuer: "https://hub.example",
+        })(req("/.well-known/oauth-protected-resource"));
+        expect(res.status).toBe(200);
+        expect(res.headers.get("access-control-allow-origin")).toBe("*");
+        const body = (await res.json()) as Record<string, unknown>;
+        expect(body.resource).toBe("https://hub.example");
+        expect(body.authorization_servers).toEqual(["https://hub.example"]);
+        expect(body.bearer_methods_supported).toEqual(["header"]);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("unknown path returns branded HTML 404 when Accept includes text/html (closes hub#392)", async () => {
+    const h = makeHarness();
+    try {
+      const r = new Request("https://hub.example/this-page-does-not-exist", {
+        headers: { accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
+      });
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(r);
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type")).toMatch(/text\/html/);
+      const body = await res.text();
+      expect(body).toContain("Not found");
+      expect(body).toContain("/this-page-does-not-exist");
+      expect(body).toContain("Go to hub home");
+      // Brand mark present so it's clearly a Parachute page
+      expect(body).toContain("pc-brand-mark-clip-not-found");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("unknown path returns plain-text 404 when client doesn't accept HTML (curl-style)", async () => {
+    const h = makeHarness();
+    try {
+      // curl default Accept is "*/*" — no explicit text/html.
+      const r = new Request("https://hub.example/this-page-does-not-exist", {
+        headers: { accept: "*/*" },
+      });
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(r);
+      expect(res.status).toBe(404);
+      // Plain-text fallback has no explicit content-type header — that's
+      // fine, it's the absence of `text/html` we care about.
+      const ct = res.headers.get("content-type") ?? "";
+      expect(ct).not.toContain("text/html");
+      expect(await res.text()).toBe("not found");
+    } finally {
+      h.cleanup();
+    }
+  });
+
   // SPA mount after hub#231: single `/admin/*` mount serves vault
   // provisioning + permissions + tokens. Pre-rename `/vault` and `/hub/*`
   // SPA URLs are 301-redirected; the per-vault content proxy at
