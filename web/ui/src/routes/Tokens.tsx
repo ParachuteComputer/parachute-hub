@@ -382,7 +382,16 @@ export function Tokens() {
         </div>
       ) : null}
 
-      <div style={{ marginTop: "1rem", marginBottom: "0.5rem", display: "flex", gap: "0.5rem" }}>
+      <div
+        style={{
+          marginTop: "1rem",
+          marginBottom: "0.5rem",
+          display: "flex",
+          flexWrap: "wrap",
+          gap: "0.5rem",
+          alignItems: "center",
+        }}
+      >
         <span className="muted" style={{ marginRight: "0.5rem", minWidth: "4rem" }}>
           Status:
         </span>
@@ -404,7 +413,15 @@ export function Tokens() {
           </button>
         ))}
       </div>
-      <div style={{ marginBottom: "1rem", display: "flex", gap: "0.5rem" }}>
+      <div
+        style={{
+          marginBottom: "1rem",
+          display: "flex",
+          flexWrap: "wrap",
+          gap: "0.5rem",
+          alignItems: "center",
+        }}
+      >
         <span className="muted" style={{ marginRight: "0.5rem", minWidth: "4rem" }}>
           Source:
         </span>
