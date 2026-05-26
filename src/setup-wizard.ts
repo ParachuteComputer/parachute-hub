@@ -147,6 +147,12 @@ export const FIRST_VAULT_SHORT: CuratedModuleShort = "vault";
 export function deriveWizardState(deps: {
   db: Database;
   manifestPath: string;
+  /**
+   * Optional env-override. When undefined, falls through to `process.env`.
+   * Used by tests + by handleSetupGet which threads through the full
+   * SetupWizardDeps.env.
+   */
+  env?: Record<string, string | undefined>;
 }): DerivedWizardState {
   const hasAdmin = userCount(deps.db) > 0;
   // The wizard's first-vault provisioning uses the curated `vault` short,
@@ -156,7 +162,19 @@ export function deriveWizardState(deps: {
   const hasVault = vaultEntry !== undefined;
   // Expose-mode is the operator's "how will this hub be reached?" answer
   // (hub#268 Item 2). Stored as a hub_setting; the wizard's expose step
-  // sets it; absence means we should still ask.
+  // sets it; absence means we should still ask. EXCEPT — if we're
+  // running on a platform where the answer is pre-determined (e.g.
+  // Render exposes the service at $RENDER_EXTERNAL_URL automatically),
+  // auto-seed `setup_expose_mode = "public"` so the wizard skips the
+  // expose step entirely. The operator landed here through a deploy
+  // path that already answered the question; asking again wastes a
+  // click and surfaces irrelevant options (localhost, tailnet).
+  if (
+    getSetting(deps.db, "setup_expose_mode") === undefined &&
+    detectAutoExposeMode(deps.env ?? process.env) === "public"
+  ) {
+    setSetting(deps.db, "setup_expose_mode", "public");
+  }
   const hasExposeMode = getSetting(deps.db, "setup_expose_mode") !== undefined;
   let step: WizardStep;
   // Note: `"account"` is a visual-only step in the progress header —
@@ -200,6 +218,37 @@ export interface SetupWizardDeps {
   registry?: OperationsRegistry;
   /** Test seam: stub `bun add` / `bun remove` runner. */
   run?: (cmd: readonly string[]) => Promise<number>;
+  /**
+   * Test seam: override the process env that `detectAutoExposeMode`
+   * consults. Production omits this and the helper reads `process.env`
+   * directly. Setting in tests lets the auto-skip branch be exercised
+   * without mutating the real process env.
+   */
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * Returns `"public"` when the runtime env indicates the hub is deployed
+ * on a platform where the "how will this hub be reached?" answer is
+ * pre-determined by the platform. Today: Render (sets RENDER_EXTERNAL_URL
+ * for any web service). Returns `undefined` otherwise — the wizard's
+ * expose step asks the operator.
+ *
+ * Why this matters: on Render, none of the three radio options
+ * (localhost, tailnet, public-with-custom-domain) match the actual
+ * setup. The hub is reached at `*.onrender.com` automatically. Asking
+ * the operator wastes a click and surfaces three options that don't
+ * speak to their situation. Auto-pinning `public` skips the step.
+ *
+ * Add more platforms here when we encounter them — e.g. Fly.io
+ * (FLY_APP_NAME), Railway (RAILWAY_ENVIRONMENT), etc. Each only auto-
+ * detects when the platform clearly owns the public URL.
+ */
+export function detectAutoExposeMode(env: Record<string, string | undefined>): "public" | undefined {
+  if (env.RENDER_EXTERNAL_URL && env.RENDER_EXTERNAL_URL.startsWith("http")) {
+    return "public";
+  }
+  return undefined;
 }
 
 // --- rendering -----------------------------------------------------------

@@ -172,6 +172,62 @@ describe("deriveWizardState", () => {
     }
   });
 
+  test("auto-skips expose step when RENDER_EXTERNAL_URL is set (hub#406 follow-up)", async () => {
+    // Aaron's UX concern: on Render the "How will this hub be reached?"
+    // step asks the operator to pick between localhost / tailnet /
+    // public-with-custom-domain — none of which describe the actual
+    // setup. The platform owns the public URL via RENDER_EXTERNAL_URL.
+    // deriveWizardState now auto-seeds `setup_expose_mode = "public"`
+    // when that env var is present, so the wizard skips straight to
+    // the done screen instead of surfacing an irrelevant choice.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      // Simulate Render env. detectAutoExposeMode reads RENDER_EXTERNAL_URL.
+      const renderEnv = { RENDER_EXTERNAL_URL: "https://parachute-hub.onrender.com" };
+      const s = deriveWizardState({ db, manifestPath: h.manifestPath, env: renderEnv });
+      expect(s.step).toBe("done");
+      expect(s.hasExposeMode).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("does NOT auto-skip expose when RENDER_EXTERNAL_URL is unset (local install path)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            { name: "parachute-vault", version: "0.1.0", port: 1940, paths: ["/vault/default"], health: "/health" },
+          ],
+        },
+        h.manifestPath,
+      );
+      const s = deriveWizardState({ db, manifestPath: h.manifestPath, env: {} });
+      // Local install path — the operator still gets to choose
+      expect(s.step).toBe("expose");
+      expect(s.hasExposeMode).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
   test("done step once admin + vault + expose mode all exist", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
