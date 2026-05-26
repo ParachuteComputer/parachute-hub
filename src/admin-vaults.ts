@@ -50,7 +50,7 @@
 import type { Database } from "bun:sqlite";
 import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
-import { findService, readManifest } from "./services-manifest.ts";
+import { findService, readManifest, readManifestLenient } from "./services-manifest.ts";
 import { type WellKnownVaultEntry, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 /** Scope required to call POST /vaults. */
@@ -172,7 +172,8 @@ function findExistingVault(
 ): { url: string; version: string; path: string } | null {
   let manifest: ReturnType<typeof readManifest>;
   try {
-    manifest = readManifest(manifestPath);
+    // Lenient read — see hub#406.
+    manifest = readManifestLenient(manifestPath);
   } catch {
     return null;
   }

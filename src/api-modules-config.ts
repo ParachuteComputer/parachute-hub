@@ -48,7 +48,7 @@ import type { Database } from "bun:sqlite";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import { signAccessToken, validateAccessToken } from "./jwt-sign.ts";
 import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES } from "./service-spec.ts";
-import { readManifest } from "./services-manifest.ts";
+import { readManifestLenient } from "./services-manifest.ts";
 
 /**
  * Resolve a curated short to its services.json `manifestName` key. Consults
@@ -154,7 +154,8 @@ function resolveUpstream(
   | { installed: false } {
   const manifestName = manifestNameForShort(short);
   if (!manifestName) return { installed: false };
-  const manifest = readManifest(manifestPath);
+  // Lenient — see hub#406.
+  const manifest = readManifestLenient(manifestPath);
   const entry = manifest.services.find((s) => s.name === manifestName);
   if (!entry) return { installed: false };
   // Mount = the first path the service registers (canonical convention

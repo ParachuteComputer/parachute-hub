@@ -510,17 +510,26 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("malformed services.json returns 500 + CORS, not a crash", async () => {
+  test("malformed services.json yields empty doc (lenient read) + CORS, not a crash (hub#406)", async () => {
+    // Pre-#406 behavior: strict readManifest threw → /.well-known/parachute.json
+    // returned 500. That cascaded into broken discovery for operators who
+    // had any kind of services.json corruption.
+    //
+    // Post-#406: readManifestLenient catches the parse error + logs +
+    // returns {services: []}. Well-known builds successfully with an empty
+    // services list, so discovery clients get a valid (empty) doc and the
+    // operator sees "no services here" rather than a generic 500.
     const h = makeHarness();
     try {
       writeFileSync(h.manifestPath, "{ not json");
       const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(
         req("/.well-known/parachute.json"),
       );
-      expect(res.status).toBe(500);
+      expect(res.status).toBe(200);
       expect(res.headers.get("access-control-allow-origin")).toBe("*");
-      const body = (await res.json()) as { error: string };
-      expect(body.error).toContain("well-known build failed");
+      const body = (await res.json()) as { vaults: unknown[]; services: unknown[] };
+      expect(body.vaults).toEqual([]);
+      expect(body.services).toEqual([]);
     } finally {
       h.cleanup();
     }
