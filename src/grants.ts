@@ -117,6 +117,77 @@ export function isCoveredByGrant(
   return true;
 }
 
+/**
+ * Find the most-recent grant for a user across any client matching the
+ * given client_name. Used to support "trust an app by name" — once a
+ * user approves a `client_name` like `"claude-code"`, future DCRs with
+ * the same name auto-trust without re-asking. Returns null when no
+ * grant exists for any client of this name.
+ *
+ * Why: CLI MCP clients (Claude Code et al.) re-DCR on every `mcp add`
+ * (or every session), each landing a fresh `client_id`. Strict
+ * (user, client_id) grants force re-approval every time even though
+ * the operator has approved the same app many times before. Matching
+ * by client_name reflects the operator's actual mental model — "I
+ * approved Claude" — not the protocol's mental model — "I approved
+ * this specific client_id."
+ *
+ * Tradeoff: an attacker who can register a client with a known-trusted
+ * name (e.g. `"claude-code"`) gets auto-trust on first authorize. The
+ * defenses we kept:
+ *   1. Admin-scope flows still show consent (handled by the caller,
+ *      not this helper).
+ *   2. The audit log records each auto-trust event with both client_ids
+ *      (the original trusted one + the freshly auto-trusted one).
+ *   3. The Permissions admin SPA shows trusted client_names so the
+ *      operator can revoke trust by name.
+ *
+ * Closes hub#409 (Aaron 2026-05-26: "asking for approval every time…
+ * once we've approved something like Claude once it should not need
+ * admin approval every other time").
+ */
+export function findGrantByClientName(
+  db: Database,
+  userId: string,
+  clientName: string,
+): Grant | null {
+  if (!clientName) return null;
+  const row = db
+    .prepare(
+      `SELECT g.user_id, g.client_id, g.scopes, g.granted_at
+       FROM grants g
+       JOIN clients c ON g.client_id = c.client_id
+       WHERE g.user_id = ? AND c.client_name = ?
+       ORDER BY g.granted_at DESC
+       LIMIT 1`,
+    )
+    .get(userId, clientName) as GrantRow | undefined;
+  return row ? rowToGrant(row) : null;
+}
+
+/**
+ * Test whether `requestedScopes` is covered by ANY grant for the given
+ * client_name + user. The client_name-keyed counterpart to
+ * `isCoveredByGrant`. Used by /oauth/authorize to skip BOTH the
+ * approve-pending screen + the consent screen when the operator has
+ * previously approved a same-named client with sufficient scopes.
+ */
+export function isCoveredByGrantForClientName(
+  db: Database,
+  userId: string,
+  clientName: string,
+  requestedScopes: readonly string[],
+): boolean {
+  if (requestedScopes.length === 0) return false;
+  const grant = findGrantByClientName(db, userId, clientName);
+  if (!grant) return false;
+  const granted = new Set(grant.scopes);
+  for (const s of requestedScopes) {
+    if (!granted.has(s)) return false;
+  }
+  return true;
+}
+
 /** All grants for a user, ordered most-recent first. Used by `parachute auth list-grants`. */
 export function listGrantsForUser(db: Database, userId: string): Grant[] {
   const rows = db

@@ -13,6 +13,7 @@ import {
   setSetting,
 } from "../hub-settings.ts";
 import { findTokenRowByJti, validateAccessToken } from "../jwt-sign.ts";
+import { findGrant, recordGrant } from "../grants.ts";
 import {
   authorizationServerMetadata,
   buildServicesCatalog,
@@ -6387,6 +6388,201 @@ describe("handleAuthorizeGet — stale assignment gates both fast-paths (hub#284
       expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
       expect(loc.searchParams.get("code")?.length).toBeGreaterThan(20);
       expect(loc.searchParams.get("state")).toBe("same-hub-fast");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("handleAuthorizeGet — trust-by-client_name auto-approve (hub#409)", () => {
+  test("happy path: session + same-origin + prior grant for client_name → 302 to redirect_uri with code", async () => {
+    // The exact scenario hub#409 closes: operator approved "claude-code"
+    // last session; this session, Claude re-DCRs a fresh client_id with
+    // the same client_name; operator should NOT see the approve-pending
+    // screen — the flow goes straight to the authorize-code redirect.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      // 1. Prior client + grant (the "previously approved" state)
+      const prior = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        clientName: "claude-code",
+      });
+      recordGrant(db, user.id, prior.client.clientId, ["vault:default:read"]);
+      // 2. Fresh DCR — same client_name, fresh client_id, status=pending
+      const fresh = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+        clientName: "claude-code",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: fresh.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+          state: "trust-by-name",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            origin: ISSUER,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // 302 to redirect_uri with code — NOT a 403 with approve-pending HTML.
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("code")?.length).toBeGreaterThan(20);
+      expect(loc.searchParams.get("state")).toBe("trust-by-name");
+      // The fresh client_id is now approved
+      const after = getClient(db, fresh.client.clientId);
+      expect(after?.status).toBe("approved");
+      // A grant was recorded for the new client_id
+      expect(findGrant(db, user.id, fresh.client.clientId)).not.toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("falls through to approve-pending when requested scope is NOT covered by prior grant (superset)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const prior = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        clientName: "claude-code",
+      });
+      // Prior grant covers READ only
+      recordGrant(db, user.id, prior.client.clientId, ["vault:default:read"]);
+      const fresh = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+        clientName: "claude-code",
+      });
+      const { challenge } = makePkce();
+      // Asking for WRITE — not in prior grant
+      const req = new Request(
+        authorizeUrl({
+          client_id: fresh.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:write",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            origin: ISSUER,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // Approve-pending render — 403 — because the new scope wasn't trusted
+      expect(res.status).toBe(403);
+      expect(await res.text()).toContain("App not yet approved");
+      // The fresh client_id stays pending
+      expect(getClient(db, fresh.client.clientId)?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("falls through when no session (unauthenticated client re-DCR can't ride a session's trust)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const prior = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        clientName: "claude-code",
+      });
+      recordGrant(db, user.id, prior.client.clientId, ["vault:default:read"]);
+      const fresh = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+        clientName: "claude-code",
+      });
+      const { challenge } = makePkce();
+      // No session cookie
+      const req = new Request(
+        authorizeUrl({
+          client_id: fresh.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+        }),
+        { headers: { origin: ISSUER } },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(403);
+      expect(await res.text()).toContain("App not yet approved");
+      expect(getClient(db, fresh.client.clientId)?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("falls through when client_name is missing/empty (can't match a prior grant)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const prior = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        clientName: "claude-code",
+      });
+      recordGrant(db, user.id, prior.client.clientId, ["vault:default:read"]);
+      // Fresh DCR omits client_name
+      const fresh = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: fresh.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            origin: ISSUER,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(403);
+      expect(getClient(db, fresh.client.clientId)?.status).toBe("pending");
     } finally {
       cleanup();
     }
