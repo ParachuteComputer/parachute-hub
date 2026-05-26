@@ -287,6 +287,12 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   const server = Bun.serve({
     port,
     hostname,
+    // Hold idle keep-alive connections for Bun's maximum 255s so reverse-
+    // proxy edges (Render, Cloudflare, fly.io) don't race us when reusing
+    // pooled connections. See `src/hub-server.ts` for the full rationale —
+    // this is the active code path for `bun src/cli.ts serve` (the Docker
+    // CMD), so the fix has to land here too. Closes hub#399.
+    idleTimeout: 255,
     fetch: hubFetch(WELL_KNOWN_DIR, {
       getDb: () => db,
       issuer,

@@ -2052,6 +2052,18 @@ if (import.meta.main) {
   Bun.serve({
     port,
     hostname,
+    // Hold idle connections open for 255 seconds (Bun's max) instead of
+    // the 10-second default. When the hub sits behind a reverse-proxy edge
+    // that pools keep-alive connections (Render, Cloudflare, fly proxy,
+    // etc.), the edge's idle timeout is longer than our default — so the
+    // proxy reaches into the pool, sends a request on a connection we
+    // just closed, and returns 502 (Bad Gateway) to the client. The bug
+    // is invisible to us (no log, no restart, deployStatus=live) and
+    // manifests as a 5–15% "random" 502 rate under steady probing.
+    // Canonical fix on Node is `keepAliveTimeout > edge.idle_timeout`;
+    // Bun's equivalent is this. 255s comfortably exceeds Render's edge
+    // pool TTL (community-observed ~120s). Closes hub#399.
+    idleTimeout: 255,
     fetch: hubFetch(wellKnownDir, { getDb, issuer, loopbackPort: port }),
   });
   // Register PID + port from the running hub itself so any startup path
