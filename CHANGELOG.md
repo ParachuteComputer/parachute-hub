@@ -2,6 +2,18 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.46] - 2026-05-26
+
+**Defense in depth + Render UX polish.** Caught when Aaron walked a fresh wizard + Install App + click Notes and hit `service routing failed: services[2]: "port" must be an integer 1..65535` — one bad row in services.json (written by an older `@openparachute/app` install) was cascading into 500s for every route.
+
+### Fixed
+
+- **`proxyToService` no longer 500s every route when one services.json row is malformed** (closes #406). New `readManifestLenient(path, log)` validates each row independently, skips bad rows with a logged warning, drops duplicate-port rows with a warning instead of throwing. Strict `readManifest` is preserved for write paths (admin SPA, init flows) where bugs should surface immediately. Operators see the rest of their services keep working + a warning in the logs naming the offending entry. Caught when an old `@openparachute/app` install wrote a row with `name: "app"` (instead of `parachute-app`) + `port: 0`; the lenient reader now skips the bad row and Notes 404s instead of every route 500ing.
+
+### Changed
+
+- **Wizard auto-skips the expose step on Render** (#407). `RENDER_EXTERNAL_URL`-detected platforms pre-determine "how is this hub reached?" — none of the three radio options (localhost, tailnet, public-with-custom-domain) describe a Render deploy. Auto-seeds `setup_expose_mode = "public"` so the wizard skips straight to the done screen. Extension point ready for more platforms (Fly.io, Railway) — add detection branches in `detectAutoExposeMode` as needed.
+
 ## [0.5.13-rc.45] - 2026-05-26
 
 **Brand consolidation across surfaces + the Render edge keep-alive 502 fix + a session-long UI polish sweep on the admin SPA.**
