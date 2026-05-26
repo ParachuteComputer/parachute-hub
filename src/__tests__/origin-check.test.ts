@@ -159,6 +159,45 @@ describe("isSameOriginRequest", () => {
       const req = reqWithHeaders({ origin: "not a valid url" });
       expect(isSameOriginRequest(req, BOUND)).toBe(false);
     });
+
+    test('Origin "null" falls through to Host fallback (hub#386 — no-referrer pages)', () => {
+      // Browsers send the literal string "null" as Origin when the form
+      // POST comes from a page with a restrictive referrer policy
+      // (`<meta name="referrer" content="no-referrer">` on hub's OAuth
+      // pages), from a sandboxed iframe, or from certain cross-origin
+      // redirect chains. The "null" signal means "I'm intentionally not
+      // telling you where this came from" — not "the origin is the literal
+      // string null." Previously the code returned false at tier 1 for
+      // this case, blocking legitimate operator POSTs. Caught 2026-05-26
+      // on Aaron's Render deploy via the rc.40 diagnostic warn.
+      //
+      // Fix: skip tier 1 when Origin is literal "null", fall through to
+      // Referer/Host. Host with the public Render URL is in the bound set
+      // → tier 3 accepts.
+      const req = reqWithHeaders({
+        origin: "null",
+        host: new URL(ISSUER).host,
+      });
+      expect(isSameOriginRequest(req, BOUND)).toBe(true);
+    });
+
+    test('Origin "null" + Host mismatch still rejects (no security regression)', () => {
+      // The Origin: null fall-through doesn't weaken the defense — if the
+      // Host header also doesn't match a bound origin, the request is
+      // still rejected at tier 3.
+      const req = reqWithHeaders({
+        origin: "null",
+        host: "attacker.example",
+      });
+      expect(isSameOriginRequest(req, BOUND)).toBe(false);
+    });
+
+    test('Origin "null" + no Host header rejects (defense-fails-closed)', () => {
+      // If Origin is null AND no Referer AND no Host, the request has no
+      // useful provenance signal at all — fail closed.
+      const req = reqWithHeaders({ origin: "null" });
+      expect(isSameOriginRequest(req, BOUND)).toBe(false);
+    });
   });
 
   describe("Referer header (fallback when Origin is absent)", () => {
