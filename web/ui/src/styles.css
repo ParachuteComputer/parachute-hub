@@ -130,6 +130,26 @@ code {
   font-family: var(--font-serif);
   font-size: 1.15rem;
   margin-right: auto;
+  /* Brand-mark SVG sits to the left of the wordmark + subtitle. flex
+   * lets the wordmark + subtitle inherit the brand's color, while the
+   * mark uses currentColor to follow. */
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--accent);
+  text-decoration: none;
+}
+.nav .brand:hover {
+  color: var(--accent-hover);
+  text-decoration: none;
+}
+.nav .brand-mark-icon {
+  flex-shrink: 0;
+  line-height: 0;
+}
+.nav .brand-wordmark {
+  color: var(--fg);
+  letter-spacing: -0.005em;
 }
 .nav .brand .sub {
   color: var(--fg-dim);

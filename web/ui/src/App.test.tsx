@@ -93,7 +93,10 @@ describe("App — nav structure", () => {
     const links = within(nav).getAllByRole("link");
     const labels = links.map((a) => a.textContent?.trim());
     expect(labels).toEqual([
-      expect.stringMatching(/parachute admin/i),
+      // Brand cluster: SVG mark + "Parachute" wordmark + subtitle (the
+      // route's name, e.g. "vaults"). The mark renders as an svg child
+      // with no text, so textContent is just wordmark + subtitle.
+      expect.stringMatching(/parachute/i),
       "Sign in", // AuthIndicator slot, sits between brand and Vaults
       "Vaults",
       "Modules",
@@ -117,9 +120,20 @@ describe("App — nav structure", () => {
     }
   });
 
-  it("brand label is 'Parachute Admin' (renamed from 'Parachute Hub' in #231)", () => {
+  it("brand cluster renders the canonical wordmark + route subtitle", () => {
+    // Renamed from 'Parachute Hub' in #231 → 'Parachute Admin'. Then the
+    // post-#401 polish split the cluster into a brand mark + wordmark
+    // ("Parachute") + subtitle ("vaults" / "modules" / etc.). The
+    // canonical wordmark text comes from `src/components/BrandMark.tsx`
+    // → `WORDMARK_TEXT` so this assertion will follow the constant if
+    // the wordmark ever changes.
     renderAt("/vaults");
-    expect(screen.getByText(/parachute admin/i)).toBeInTheDocument();
+    const brand = screen.getByRole("link", { name: /parachute/i });
+    expect(brand).toBeInTheDocument();
+    // Wordmark + subtitle live in distinct spans inside the brand link.
+    expect(brand.querySelector(".brand-wordmark")?.textContent).toBe("Parachute");
+    expect(brand.querySelector(".sub")?.textContent?.toLowerCase()).toMatch(/vaults/);
+    // No stale "Parachute Hub" label from pre-#231.
     expect(screen.queryByText(/^parachute hub/i)).toBeNull();
   });
 });
