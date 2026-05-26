@@ -50,7 +50,6 @@ import {
 } from "./service-spec.ts";
 import {
   findService,
-  readManifest,
   readManifestLenient,
   removeService,
 } from "./services-manifest.ts";

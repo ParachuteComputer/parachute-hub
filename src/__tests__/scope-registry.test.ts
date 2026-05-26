@@ -217,4 +217,49 @@ describe("loadDeclaredScopes", () => {
       cleanup();
     }
   });
+
+  test("one bad row in services.json — valid siblings' scopes still declared", () => {
+    // Regression for hub#411/#413/#415 lenient sweep: pre-sweep the reader
+    // threw on any bad row, the catch fired in loadDeclaredScopes, and we
+    // returned just FIRST_PARTY_SCOPES — dropping declared scopes from
+    // every VALID third-party module installed alongside the bad row.
+    // After the sweep we keep valid rows and skip the bad one with a warning.
+    const { manifestPath, cleanup } = tmp();
+    try {
+      writeFileSync(
+        manifestPath,
+        JSON.stringify({
+          services: [
+            // Bad row: port=0 violates the integer 1..65535 rule (the exact
+            // shape app@0.2.0-rc.4 wrote to operators' manifests).
+            {
+              name: "broken-module",
+              port: 0,
+              paths: ["/broken"],
+              health: "/healthz",
+              version: "0.0.1",
+            },
+            // Valid sibling.
+            {
+              name: "@acme/widget",
+              port: 1950,
+              paths: ["/widget"],
+              health: "/healthz",
+              version: "0.0.0-linked",
+            },
+          ],
+        }),
+      );
+      const declared = loadDeclaredScopes({
+        manifestPath,
+        readModuleScopes: (pkg) =>
+          pkg === "@acme/widget" ? ["widget:read", "widget:write"] : null,
+      });
+      expect(declared.has("vault:read")).toBe(true); // baseline
+      expect(declared.has("widget:read")).toBe(true); // valid sibling's scope survives
+      expect(declared.has("widget:write")).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
 });
