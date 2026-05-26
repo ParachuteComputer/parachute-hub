@@ -117,11 +117,13 @@ function parsePort(raw: string | undefined): number | undefined {
  * Precedence (highest first):
  *   1. Explicit `--issuer` flag (test override too)
  *   2. `PARACHUTE_HUB_ORIGIN` env (operator-set, typical custom-domain case)
- *   3. Platform-injected public URL — currently Render's RENDER_EXTERNAL_URL.
+ *   3. Platform-injected public URL:
+ *      - Render: `RENDER_EXTERNAL_URL` (auto-injected on web services)
+ *      - Fly.io: `FLY_APP_NAME` → `https://<app>.fly.dev` (patterns#100)
  *      This is the load-bearing tier for container deploys where the
- *      operator can't know the URL at deploy time. Render generates the
- *      *.onrender.com hostname after service creation and injects it for
- *      web services; hub picks it up automatically.
+ *      operator can't know the URL at deploy time. Without this, supervised
+ *      modules' iss-validation breaks on hub-minted tokens (iss-mismatch
+ *      every time).
  *   4. None (returns undefined). Hub falls back to per-request derivation
  *      via `resolveIssuer` in hub-server.ts — works for `/.well-known`
  *      discovery but supervised modules with cached iss expectations
@@ -129,8 +131,8 @@ function parsePort(raw: string | undefined): number | undefined {
  *      through hub-mint → vault-validate will fail with iss-mismatch.
  *      This is the "no canonical origin known" degraded mode.
  *
- * Future platforms (Fly's `FLY_APP_NAME` + region, Railway's
- * `RAILWAY_PUBLIC_DOMAIN`, etc.) can extend tier 3 as needed.
+ * Future platforms (Railway's `RAILWAY_PUBLIC_DOMAIN`, etc.) can extend
+ * tier 3 as needed.
  *
  * Trailing slashes are stripped for canonical-form comparison; empty
  * strings collapse to undefined.
@@ -139,10 +141,28 @@ export function resolveStartupIssuer(
   opts: { issuer?: string },
   env: NodeJS.ProcessEnv,
 ): string | undefined {
+  const flyOrigin = flyDefaultOriginFromEnv(env);
   return (
-    (opts.issuer ?? env.PARACHUTE_HUB_ORIGIN ?? env.RENDER_EXTERNAL_URL)?.replace(/\/+$/, "") ||
-    undefined
+    (opts.issuer ?? env.PARACHUTE_HUB_ORIGIN ?? env.RENDER_EXTERNAL_URL ?? flyOrigin)?.replace(
+      /\/+$/,
+      "",
+    ) || undefined
   );
+}
+
+/**
+ * Compose `https://${FLY_APP_NAME}.fly.dev` when FLY_APP_NAME is a plausible
+ * Fly app slug. Mirrors the validation in detectAutoExposeMode (no slashes —
+ * Fly slugs don't contain them). Kept local to this file (vs imported from
+ * hub-server.ts) because serve.ts boots before hub-server.ts is loaded and
+ * we want to avoid a cross-module dependency cycle at startup.
+ */
+function flyDefaultOriginFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  const app = env.FLY_APP_NAME;
+  if (typeof app !== "string" || app.length === 0 || app.includes("/")) {
+    return undefined;
+  }
+  return `https://${app}.fly.dev`;
 }
 
 /**

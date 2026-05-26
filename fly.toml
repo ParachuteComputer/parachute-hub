@@ -24,7 +24,11 @@
 # `fly secrets set PARACHUTE_HUB_ORIGIN=https://<your-domain>` so the
 # OAuth issuer claim is baked from your canonical URL.
 
-app = "parachute-hub"
+# NOTE: `app` is intentionally NOT set in this file. `fly launch` generates
+# a unique app name on first run (or honors the operator's `--name` override).
+# Setting a hardcoded value here would collide for every operator who forks
+# this repo. After first launch, flyctl writes the chosen name back to
+# fly.toml on disk — re-runs against the same checkout pick it up correctly.
 primary_region = "iad"
 
 [build]

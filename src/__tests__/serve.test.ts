@@ -308,4 +308,44 @@ describe("resolveStartupIssuer — precedence chain (hub#365)", () => {
     // origin, which is the same as not setting it at all).
     expect(resolveStartupIssuer({}, { PARACHUTE_HUB_ORIGIN: "/" })).toBeUndefined();
   });
+
+  // Fly.io self-host path (patterns#100). resolveStartupIssuer is the
+  // function that injects PARACHUTE_HUB_ORIGIN into every supervised module's
+  // env. Without a Fly branch here, vault/scribe/app on Fly without a custom
+  // domain get undefined → OAuth iss-mismatch on every token hub mints.
+  test("FLY_APP_NAME composes https://<app>.fly.dev as fallback issuer", () => {
+    const got = resolveStartupIssuer({}, { FLY_APP_NAME: "my-parachute" });
+    expect(got).toBe("https://my-parachute.fly.dev");
+  });
+
+  test("PARACHUTE_HUB_ORIGIN wins over FLY_APP_NAME (operator with custom domain)", () => {
+    const got = resolveStartupIssuer(
+      {},
+      {
+        PARACHUTE_HUB_ORIGIN: "https://hub.example",
+        FLY_APP_NAME: "my-parachute",
+      },
+    );
+    expect(got).toBe("https://hub.example");
+  });
+
+  test("RENDER_EXTERNAL_URL wins over FLY_APP_NAME (pathological co-set)", () => {
+    const got = resolveStartupIssuer(
+      {},
+      {
+        RENDER_EXTERNAL_URL: "https://app.onrender.com",
+        FLY_APP_NAME: "my-parachute",
+      },
+    );
+    expect(got).toBe("https://app.onrender.com");
+  });
+
+  test("FLY_APP_NAME with slash rejected (defensive — Fly slugs don't contain /)", () => {
+    expect(resolveStartupIssuer({}, { FLY_APP_NAME: "a/b" })).toBeUndefined();
+    expect(resolveStartupIssuer({}, { FLY_APP_NAME: "../etc/passwd" })).toBeUndefined();
+  });
+
+  test("FLY_APP_NAME empty string → no fallback", () => {
+    expect(resolveStartupIssuer({}, { FLY_APP_NAME: "" })).toBeUndefined();
+  });
 });

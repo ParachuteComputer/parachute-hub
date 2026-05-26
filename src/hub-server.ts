@@ -290,7 +290,12 @@ export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
  */
 function flyDefaultOrigin(env: NodeJS.ProcessEnv): string | undefined {
   const app = env.FLY_APP_NAME;
-  if (!app || app.length === 0) return undefined;
+  // Mirror detectAutoExposeMode's slash-rejection — Fly slugs don't contain
+  // `/`, so anything with one is either spoofed or malformed. The composed
+  // URL is the OAuth issuer claim, so consistency in validation matters.
+  if (typeof app !== "string" || app.length === 0 || app.includes("/")) {
+    return undefined;
+  }
   return `https://${app}.fly.dev`;
 }
 
