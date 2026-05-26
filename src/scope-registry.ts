@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { type ModuleManifest, validateModuleManifest } from "./module-manifest.ts";
 import { FIRST_PARTY_SCOPES } from "./scope-explanations.ts";
-import { readManifest as readServicesManifest } from "./services-manifest.ts";
+import { readManifestLenient as readServicesManifest } from "./services-manifest.ts";
 
 /**
  * RFC 6749 §3.3: scope strings are 1*( SP scope-token ). We accept any

@@ -26,7 +26,7 @@
  * `vaultInstanceNameFor`. Entries with no paths still resolve to a name via
  * the helper's manifest-suffix fallback (hub#143).
  */
-import { type ServicesManifest, readManifest } from "./services-manifest.ts";
+import { type ServicesManifest, readManifestLenient } from "./services-manifest.ts";
 import { isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 /**
@@ -53,5 +53,5 @@ export function listVaultNames(manifest: ServicesManifest): string[] {
  * `listVaultNames(readManifest(manifestPath))`.
  */
 export function listVaultNamesFromPath(manifestPath: string): string[] {
-  return listVaultNames(readManifest(manifestPath));
+  return listVaultNames(readManifestLenient(manifestPath));
 }
