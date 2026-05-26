@@ -1464,6 +1464,7 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
             body,
             forwardedHost: req.headers.get("x-forwarded-host"),
             forwardedProto: req.headers.get("x-forwarded-proto"),
+            acceptEncoding: req.headers.get("accept-encoding"),
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
@@ -1501,12 +1502,15 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
       // Simulate Render-shape: page came in over HTTPS at parachute-hub.onrender.com
       // Render terminates TLS and sets X-Forwarded-Proto: https; the Host
       // header is preserved as the public hostname.
-      const incoming = new Request("http://parachute-hub.onrender.com/vault/default/.well-known/oauth-authorization-server", {
-        headers: {
-          host: "parachute-hub.onrender.com",
-          "x-forwarded-proto": "https",
+      const incoming = new Request(
+        "http://parachute-hub.onrender.com/vault/default/.well-known/oauth-authorization-server",
+        {
+          headers: {
+            host: "parachute-hub.onrender.com",
+            "x-forwarded-proto": "https",
+          },
         },
-      });
+      );
       const res = await fetcher(incoming);
       expect(res.status).toBe(200);
       const body = (await res.json()) as { forwardedHost: string; forwardedProto: string };
@@ -1626,6 +1630,53 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
       // edge.local Host that hub itself saw.
       expect(body.forwardedHost).toBe("original-client.example");
       expect(body.forwardedProto).toBe("https");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("strips Accept-Encoding from proxied requests (chrome-strip prerequisite, hub#377)", async () => {
+    // Workstream G's chrome-strip injector buffers + TextDecoders the HTML
+    // response to inject the persistent chrome. A gzip- or br-compressed
+    // upstream reply would get UTF-8-decoded as raw compressed bytes
+    // (garbage) — body becomes unrenderable while Content-Encoding still
+    // says gzip → browser fails silently. proxyRequest strips
+    // Accept-Encoding so upstreams respond uncompressed, sidestepping the
+    // decode problem entirely. Trade-off: loopback bandwidth on
+    // owner-operated single-host deploys is negligible.
+    const h = makeHarness();
+    const upstream = startUpstream("hdr-test");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const incoming = new Request("http://hub.local/vault/default/health", {
+        headers: {
+          host: "hub.local",
+          // Browser-like Accept-Encoding — what a real client would send.
+          "accept-encoding": "gzip, deflate, br, zstd",
+        },
+      });
+      const res = await fetcher(incoming);
+      const body = (await res.json()) as { acceptEncoding: string | null };
+      // Upstream sees "identity" (no encoding) — hub overrode the browser's
+      // "gzip, deflate, br, zstd" before forwarding. We can't just delete
+      // the header: Bun's fetch implementation auto-injects compression
+      // when absent. Explicit "identity" overrides that default.
+      expect(body.acceptEncoding).toBe("identity");
     } finally {
       upstream.stop();
       h.cleanup();
@@ -3295,5 +3346,437 @@ describe("parseArgs — issuer env precedence (hub#365)", () => {
     expect(parseArgs([], { RENDER_EXTERNAL_URL: "" }).issuer).toBeUndefined();
     // Bare slash collapses to empty after strip — must not become "" issuer.
     expect(parseArgs([], { RENDER_EXTERNAL_URL: "/" }).issuer).toBeUndefined();
+  });
+});
+
+describe("hubFetch persistent chrome strip injection (workstream G)", () => {
+  // Pins the proxy-side wiring of the chrome strip from
+  // `parachute-patterns/patterns/design-system.md` §7 — every proxied
+  // text/html response gets the strip injected after the first `<body>`,
+  // with opt-outs for `/app/notes/*` (the Notes PWA owns its own chrome).
+  // The pure rewrite + opt-out logic is covered in chrome-strip.test.ts;
+  // here we exercise the dispatch integration end-to-end through hubFetch.
+
+  function startHtmlUpstream(body: string): { port: number; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () =>
+        new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+    });
+    return { port: server.port as number, stop: () => server.stop(true) };
+  }
+
+  function startJsonUpstream(payload: unknown): { port: number; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () =>
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    return { port: server.port as number, stop: () => server.stop(true) };
+  }
+
+  test("injects the chrome strip into proxied text/html responses (signed-out)", async () => {
+    const h = makeHarness();
+    const upstream = startHtmlUpstream("<!doctype html><html><body><h1>scribe</h1></body></html>");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/admin"));
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      // Strip present right after the upstream's <body>.
+      expect(body).toContain("<body><style>");
+      expect(body).toContain('class="pc-chrome"');
+      // Signed-out cluster.
+      expect(body).toContain("Sign in");
+      expect(body).not.toContain("Signed in as");
+      // Mark + wordmark from design-system.md §2.
+      expect(body).toContain("pc-chrome-mark-clip");
+      expect(body).toContain(">Parachute<");
+      // Home link.
+      expect(body).toContain('<a href="/">Home</a>');
+      // Upstream content preserved verbatim.
+      expect(body).toContain("<h1>scribe</h1>");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("injects 'Signed in as <name>' + Sign out form when the request carries an active session", async () => {
+    const h = makeHarness();
+    const upstream = startHtmlUpstream("<html><body>protected</body></html>");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { createSession, buildSessionCookie, SESSION_TTL_MS } = await import(
+          "../sessions.ts"
+        );
+        const user = await createUser(db, "aaron", "pw");
+        const session = createSession(db, { userId: user.id });
+        const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+        const fetcher = hubFetch(h.dir, {
+          manifestPath: h.manifestPath,
+          getDb: () => db,
+        });
+        const res = await fetcher(req("/scribe/admin", { headers: { cookie } }));
+        expect(res.status).toBe(200);
+        const body = await res.text();
+        expect(body).toContain("Signed in as <strong>aaron</strong>");
+        expect(body).toContain('action="/logout"');
+        expect(body).toContain('name="__csrf"');
+        expect(body).not.toContain("Sign in</a>");
+        // Fresh CSRF cookie minted on the way back so the sign-out POST verifies.
+        const setCookie = res.headers.get("set-cookie") ?? "";
+        expect(setCookie).toContain("parachute_hub_csrf=");
+      } finally {
+        db.close();
+      }
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("passes through non-HTML proxied responses unchanged (no injection on JSON / assets)", async () => {
+    const h = makeHarness();
+    const upstream = startJsonUpstream({ ok: true, msg: "raw" });
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/api/something"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("application/json");
+      const body = await res.text();
+      // No HTML, no chrome.
+      expect(body).not.toContain("pc-chrome");
+      // Original JSON preserved verbatim.
+      expect(JSON.parse(body)).toEqual({ ok: true, msg: "raw" });
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("does NOT inject chrome on /app/notes/* (Notes PWA owns its own chrome)", async () => {
+    const h = makeHarness();
+    const upstream = startHtmlUpstream("<html><body><h1>Notes</h1></body></html>");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-app",
+              port: upstream.port,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/app/notes/"));
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toBe("<html><body><h1>Notes</h1></body></html>");
+      expect(body).not.toContain("pc-chrome");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("DOES inject chrome on /app/admin/* (parachute-app admin, not Notes)", async () => {
+    const h = makeHarness();
+    const upstream = startHtmlUpstream("<html><body>app admin</body></html>");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-app",
+              port: upstream.port,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/app/admin/"));
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toContain("pc-chrome");
+      expect(body).toContain("app admin");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("does NOT inject on /app/notes/ sub-paths (asset requests)", async () => {
+    const h = makeHarness();
+    const upstream = startHtmlUpstream("<html><body>asset shell</body></html>");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-app",
+              port: upstream.port,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/app/notes/index.html"));
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).not.toContain("pc-chrome");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("injects chrome into proxied vault content responses (/vault/<name>/admin/)", async () => {
+    const h = makeHarness();
+    const upstream = startHtmlUpstream("<html><body><h1>vault admin</h1></body></html>");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-default",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/vault/default/admin/"));
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toContain("pc-chrome");
+      expect(body).toContain("vault admin");
+      expect(body).toContain("Sign in");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("preserves upstream cache-control + custom headers on rewritten responses", async () => {
+    const h = makeHarness();
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () =>
+        new Response("<html><body>x</body></html>", {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "cache-control": "private, max-age=60",
+            "x-upstream": "scribe",
+          },
+        }),
+    });
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: server.port as number,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/admin"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("private, max-age=60");
+      expect(res.headers.get("x-upstream")).toBe("scribe");
+      // Content-Length is stripped (we rewrote the body — let Bun recompute).
+      expect(res.headers.get("content-length")).toBeNull();
+    } finally {
+      server.stop(true);
+      h.cleanup();
+    }
+  });
+
+  test("passes through large HTML responses (>cap) without injection", async () => {
+    // Build a response that DECLARES content-length above the 256 KB cap so
+    // the helper short-circuits before draining. The declared length doesn't
+    // need to match the body byte-count for the short-circuit path (we trust
+    // the upstream's hint).
+    const big = `<html><body>${"x".repeat(300_000)}</body></html>`;
+    const h = makeHarness();
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () =>
+        new Response(big, {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "content-length": String(big.length),
+          },
+        }),
+    });
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: server.port as number,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/admin"));
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toBe(big);
+      expect(body).not.toContain("pc-chrome");
+    } finally {
+      server.stop(true);
+      h.cleanup();
+    }
+  });
+
+  test("does not inject chrome on proxied 5xx upstream errors", async () => {
+    const h = makeHarness();
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () =>
+        new Response("<html><body>upstream 500</body></html>", {
+          status: 500,
+          headers: { "content-type": "text/html" },
+        }),
+    });
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: server.port as number,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/admin"));
+      expect(res.status).toBe(500);
+      const body = await res.text();
+      expect(body).not.toContain("pc-chrome");
+    } finally {
+      server.stop(true);
+      h.cleanup();
+    }
+  });
+
+  test("login link's next= reflects the path the operator hit (so they return after signing in)", async () => {
+    const h = makeHarness();
+    const upstream = startHtmlUpstream("<html><body>x</body></html>");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: upstream.port,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/scribe/admin?show=all"));
+      const body = await res.text();
+      expect(body).toContain('href="/login?next=%2Fscribe%2Fadmin%3Fshow%3Dall"');
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
   });
 });

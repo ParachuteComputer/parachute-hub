@@ -142,6 +142,7 @@ import {
   handleListUsers,
   handleListVaults,
 } from "./api-users.ts";
+import { buildChromeForRequest, injectChromeIntoResponse } from "./chrome-strip.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
 import { applyCorsHeaders, corsPreflightResponse, isCorsAllowedRoute } from "./cors.ts";
 import { ensureCsrfToken } from "./csrf.ts";
@@ -434,6 +435,23 @@ async function proxyRequest(
   // Host comes from the requester (tailnet FQDN); the loopback target wants
   // its own. Bun's fetch fills it in when omitted.
   headers.delete("host");
+  // Force upstreams to reply with uncompressed bodies. The chrome-strip
+  // injector (workstream G) buffers + TextDecoders the HTML response to
+  // inject the persistent chrome; without this, a gzip- or br-compressed
+  // upstream reply gets UTF-8-decoded as raw compressed bytes (garbage) —
+  // the body becomes unrenderable while Content-Encoding still says "gzip",
+  // so the browser fails silently.
+  //
+  // We set "identity" (RFC 9110 §12.5.3 — explicitly no encoding) rather
+  // than deleting Accept-Encoding because Bun's fetch implementation
+  // auto-injects "gzip, deflate, br, zstd" when the header is absent. The
+  // explicit "identity" overrides that default.
+  //
+  // Trade-off: on a single-host owner-operated deploy the loopback bandwidth
+  // is negligible. If a future deployment shape adds long-haul links between
+  // hub and modules, prefer either (a) re-enable compression + decode in the
+  // chrome injector, or (b) flip per-route based on Accept header.
+  headers.set("accept-encoding", "identity");
   // Forward the public origin so downstream services build their public-
   // facing URLs (OAuth metadata, redirect URIs) against the same host the
   // client used. We DON'T overwrite X-Forwarded-Host if already set —
@@ -1906,7 +1924,7 @@ export function hubFetch(
     // mask a backend 404 with HTML.
     if (pathname.startsWith("/vault/")) {
       const proxied = await proxyToVault(req, manifestPath);
-      if (proxied) return proxied;
+      if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
       return new Response("not found", { status: 404 });
     }
 
@@ -1933,10 +1951,64 @@ export function hubFetch(
     // `/`, `/admin/*`, `/oauth/*`, `/.well-known/*`, `/hub/*`, `/vault/*`,
     // `/api/*` are excluded by ordering, not by an explicit denylist (#182).
     const proxied = await proxyToService(req, manifestPath);
-    if (proxied) return proxied;
+    if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
 
     return new Response("not found", { status: 404 });
   };
+}
+
+/**
+ * Inject the persistent chrome strip (workstream G) into a proxied response.
+ *
+ * Skips the rewrite when the response is non-200, non-HTML, on an opt-out
+ * path (e.g. `/app/notes/*`), or larger than `MAX_INJECT_SIZE_BYTES`.
+ * `injectChromeIntoResponse` is the no-side-effects implementation; this
+ * wrapper threads in the session-aware chrome HTML and a `set-cookie`
+ * append when a fresh CSRF cookie was minted.
+ *
+ * When `getDb` isn't wired (hubFetch instantiated without state — tests,
+ * cold-start hub minus DB), we still inject — the signed-out variant.
+ */
+async function decorateWithChrome(
+  res: Response,
+  req: Request,
+  pathname: string,
+  getDb: HubFetchDeps["getDb"],
+): Promise<Response> {
+  // Build chrome HTML lazily — `buildChromeForRequest` already opens the DB
+  // for the session lookup; calling it on a response that won't be rewritten
+  // (e.g. JSON 200, or a 502 from `proxyRequest`) is needless work. We
+  // could inline the same content-type / status / opt-out check here, but
+  // `injectChromeIntoResponse` does it canonically — so build the chrome
+  // and let the helper short-circuit on the cheap headers-only paths.
+  //
+  // The expensive part is buffering the body; `injectChromeIntoResponse`
+  // short-circuits before that on non-HTML / non-200 / oversize-declared
+  // responses. Building chrome is a synchronous string concat (~2 KB out)
+  // plus at most one DB query — cheap.
+  const db = getDb?.();
+  const { chromeHtml, setCookie } = buildChromeForRequest(req, {
+    findActiveSession: db ? (r) => findActiveSession(db, r) : () => null,
+    getUsername: db ? (userId) => getUserById(db, userId)?.username ?? null : () => null,
+  });
+  const out = await injectChromeIntoResponse(res, {
+    chromeHtml,
+    pathname,
+  });
+  // Append set-cookie if a CSRF was minted AND the chrome was actually
+  // injected (we know that by checking out !== res — pass-through preserves
+  // identity). Otherwise the cookie is wasted on a 502/JSON/asset response
+  // that didn't get a sign-out form.
+  if (setCookie && out !== res) {
+    const headers = new Headers(out.headers);
+    headers.append("set-cookie", setCookie);
+    return new Response(out.body, {
+      status: out.status,
+      statusText: out.statusText,
+      headers,
+    });
+  }
+  return out;
 }
 
 if (import.meta.main) {
