@@ -4545,6 +4545,194 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       cleanup();
     }
   });
+
+  // Deny path tests (hub#390). The shared describe block above pins the
+  // approve path's security model; these tests pin that the deny path
+  // honors the same guards AND constructs a spec-shaped error redirect.
+
+  test("deny POST happy path: valid redirect_uri + state → 302 to client with access_denied", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: `/oauth/authorize?client_id=${reg.client.clientId}`,
+        decision: "deny",
+        redirect_uri: "https://app.example/cb",
+        state: "deny-state-abc",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      const loc = res.headers.get("location") ?? "";
+      const target = new URL(loc);
+      expect(target.origin).toBe("https://app.example");
+      expect(target.pathname).toBe("/cb");
+      expect(target.searchParams.get("error")).toBe("access_denied");
+      expect(target.searchParams.get("state")).toBe("deny-state-abc");
+      // Client row stays pending — deny does not mutate.
+      expect(getClient(db, reg.client.clientId)?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("deny POST: no state in form → redirect omits state param (spec-compliant)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: `/oauth/authorize?client_id=${reg.client.clientId}`,
+        decision: "deny",
+        redirect_uri: "https://app.example/cb",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      const target = new URL(res.headers.get("location") ?? "");
+      expect(target.searchParams.get("error")).toBe("access_denied");
+      expect(target.searchParams.has("state")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("deny POST: redirect_uri not in client's registered URIs → 400 (open-redirect defense)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: `/oauth/authorize?client_id=${reg.client.clientId}`,
+        decision: "deny",
+        // attacker-controlled redirect_uri
+        redirect_uri: "https://attacker.example/grab",
+        state: "x",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(400);
+      // No mutation, no redirect to attacker.
+      expect(res.headers.get("location")).toBeNull();
+      expect(getClient(db, reg.client.clientId)?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("deny POST: CSRF + session + same-origin guards apply to deny path too", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: `/oauth/authorize?client_id=${reg.client.clientId}`,
+        decision: "deny",
+        redirect_uri: "https://app.example/cb",
+        state: "x",
+      });
+      // Cross-origin Origin header — same defense as approve path.
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: "https://attacker.example",
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(403);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("approve POST: explicit decision=approve still works (no regression)", async () => {
+    // Back-compat: forms that explicitly carry decision=approve should
+    // continue to flip the client to approved + redirect to return_to.
+    // Pre-deny PR the field didn't exist; the new form sends it explicitly.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+      });
+      const returnTo = `/oauth/authorize?client_id=${reg.client.clientId}&state=rt-208`;
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: returnTo,
+        decision: "approve",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe(returnTo);
+      expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 // DCR first-client auto-approve window (hub#268 Item 3). The wizard's

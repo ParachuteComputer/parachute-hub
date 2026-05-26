@@ -226,10 +226,19 @@ export interface ApprovePendingViewProps {
    * server will redirect to after the approve commits — the original
    * `/oauth/authorize?...` URL so the OAuth flow re-enters with the now-
    * approved client and lands on the consent screen.
+   *
+   * Deny path (closes hub#390): the same form also surfaces a Deny button.
+   * `redirectUri` + `state` are plumbed through as hidden inputs so the deny
+   * handler can construct an RFC 6749 §4.1.2.1 error redirect back to the
+   * calling client (`<redirect_uri>?error=access_denied&state=<state>`).
+   * `redirectUri` is required because deny must signal back to the client;
+   * `state` may be undefined (OAuth clients sometimes omit it).
    */
   approveForm?: {
     csrfToken: string;
     returnTo: string;
+    redirectUri: string;
+    state?: string;
   };
   /**
    * Same-origin hub-relative URL (path + search) to send the operator to
@@ -506,7 +515,12 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
         ${renderCsrfHiddenInput(approveForm.csrfToken)}
         <input type="hidden" name="client_id" value="${escapeHtml(clientId)}" />
         <input type="hidden" name="return_to" value="${escapeHtml(approveForm.returnTo)}" />
-        <button type="submit" class="btn btn-primary">Approve</button>
+        <input type="hidden" name="redirect_uri" value="${escapeHtml(approveForm.redirectUri)}" />
+        ${approveForm.state !== undefined ? `<input type="hidden" name="state" value="${escapeHtml(approveForm.state)}" />` : ""}
+        <div class="approve-actions">
+          <button type="submit" name="decision" value="approve" class="btn btn-primary">Approve</button>
+          <button type="submit" name="decision" value="deny" class="btn btn-secondary">Deny</button>
+        </div>
       </form>`
     : renderUnauthenticatedApproveCtas(hubOrigin, clientId, loginNextUrl);
   const body = `

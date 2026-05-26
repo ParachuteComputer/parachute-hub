@@ -511,7 +511,11 @@ describe("renderApprovePending unauthenticated CTAs", () => {
   test("admin-authenticated branch hides the unauth CTAs and renders the inline approve form", () => {
     const html = renderApprovePending({
       ...COMMON,
-      approveForm: { csrfToken: CSRF, returnTo: "/oauth/authorize?client_id=client-xyz" },
+      approveForm: {
+        csrfToken: CSRF,
+        returnTo: "/oauth/authorize?client_id=client-xyz",
+        redirectUri: "https://client.example/cb",
+      },
     });
     expect(html).toContain('action="/oauth/authorize/approve"');
     // Workstream I, 2026-05-25 — button label "Approve and continue"
@@ -521,6 +525,39 @@ describe("renderApprovePending unauthenticated CTAs", () => {
     expect(html).not.toContain("Sign in as admin to approve");
     expect(html).not.toContain("Or send this link to your hub admin");
     expect(html).not.toContain("parachute auth approve-client");
+  });
+
+  test("authed branch renders Deny button + hidden inputs for redirect_uri / state (hub#390)", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      approveForm: {
+        csrfToken: CSRF,
+        returnTo: "/oauth/authorize?client_id=client-xyz",
+        redirectUri: "https://client.example/cb",
+        state: "abc-state",
+      },
+    });
+    // Both buttons present, distinguished by decision value.
+    expect(html).toContain('name="decision" value="approve"');
+    expect(html).toContain('name="decision" value="deny"');
+    expect(html).toContain(">Deny</button>");
+    // Hidden inputs carry redirect_uri + state for the deny handler.
+    expect(html).toContain('name="redirect_uri" value="https://client.example/cb"');
+    expect(html).toContain('name="state" value="abc-state"');
+  });
+
+  test("authed branch omits state hidden input when state is undefined (spec-allowed)", () => {
+    const html = renderApprovePending({
+      ...COMMON,
+      approveForm: {
+        csrfToken: CSRF,
+        returnTo: "/oauth/authorize?client_id=client-xyz",
+        redirectUri: "https://client.example/cb",
+        // state intentionally absent
+      },
+    });
+    expect(html).toContain('name="redirect_uri" value="https://client.example/cb"');
+    expect(html).not.toContain('name="state"');
   });
 });
 
@@ -612,7 +649,11 @@ describe("renderApprovePending scope display (wildcard substitution)", () => {
     const html = renderApprovePending({
       ...COMMON,
       requestedScopes: ["vault:read", "vault:write"],
-      approveForm: { csrfToken: CSRF, returnTo: "/oauth/authorize?client_id=client-xyz" },
+      approveForm: {
+        csrfToken: CSRF,
+        returnTo: "/oauth/authorize?client_id=client-xyz",
+        redirectUri: "https://client.example/cb",
+      },
     });
     expect(html).toContain('action="/oauth/authorize/approve"');
     expect(html).toMatch(/<code class="scope-name">vault:\*:read<\/code>/);
