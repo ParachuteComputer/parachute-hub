@@ -20,6 +20,7 @@
  *     module scopes that the hub doesn't know about) render verbatim.
  *   - **No JavaScript.** Entirely form-based. Submit is the only interaction.
  */
+import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import { type ScopeExplanation, explainScope } from "./scope-explanations.ts";
 
@@ -257,8 +258,8 @@ export function renderLogin(props: LoginViewProps): string {
     <div class="card">
       <div class="card-header">
         <div class="brand">
-          <span class="brand-mark">⌬</span>
-          <span class="brand-name">Parachute</span>
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
         </div>
         <h1>Sign in</h1>
         <p class="subtitle">to continue to your hub</p>
@@ -345,8 +346,8 @@ export function renderConsent(props: ConsentViewProps): string {
     <div class="card">
       <div class="card-header">
         <div class="brand">
-          <span class="brand-mark">⌬</span>
-          <span class="brand-name">Parachute</span>
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
         </div>
         <h1>Approve <span class="client-name">${escapeHtml(clientName)}</span>?</h1>
         <p class="subtitle">
@@ -512,8 +513,8 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
     <div class="card">
       <div class="card-header">
         <div class="brand">
-          <span class="brand-mark">⌬</span>
-          <span class="brand-name">Parachute</span>
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
         </div>
         <h1>App not yet approved</h1>
         <p class="subtitle">
@@ -683,8 +684,8 @@ export function renderError(props: ErrorViewProps): string {
     <div class="card">
       <div class="card-header">
         <div class="brand">
-          <span class="brand-mark">⌬</span>
-          <span class="brand-name">Parachute</span>
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
         </div>
         <h1 class="error-title">${escapeHtml(props.title)}</h1>
         <p class="subtitle">${escapeHtml(props.message)}</p>
@@ -795,8 +796,8 @@ export function renderUnknownClient(props: UnknownClientViewProps): string {
     <div class="card">
       <div class="card-header">
         <div class="brand">
-          <span class="brand-mark">⌬</span>
-          <span class="brand-name">Parachute</span>
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "oauth")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
         </div>
         <h1 class="error-title">Unknown application</h1>
         <p class="subtitle">
@@ -928,7 +929,8 @@ const STYLES = `
     font-size: 0.95rem;
     margin-bottom: 1.25rem;
   }
-  .brand-mark { font-size: 1.1rem; line-height: 1; }
+  .brand-mark { display: inline-flex; line-height: 0; }
+  .brand-mark svg { width: 20px; height: 20px; }
   .brand-name { letter-spacing: 0.01em; }
   h1 {
     font-family: ${FONT_SERIF};

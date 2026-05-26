@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { brandMarkSvg, CANONICAL_TAGLINE, WORDMARK_TEXT } from "./brand.ts";
 import { CONFIG_DIR } from "./config.ts";
 import { CSRF_FIELD_NAME } from "./csrf.ts";
 
@@ -221,6 +222,15 @@ const HTML_TEMPLATE = `<!doctype html>
        color/decoration. */
     border-bottom: none;
   }
+  .brand-mark {
+    display: inline-flex;
+    color: var(--accent);
+    margin: 0 0 1.25rem;
+  }
+  .brand-mark svg {
+    width: clamp(48px, 7vw, 64px);
+    height: auto;
+  }
   h1 {
     font-family: var(--serif);
     font-weight: 400;
@@ -232,7 +242,9 @@ const HTML_TEMPLATE = `<!doctype html>
   .tagline {
     color: var(--fg-muted);
     font-size: 1.1rem;
+    line-height: 1.5;
     margin: 0;
+    max-width: 28rem;
   }
   .section {
     margin-bottom: 3rem;
@@ -355,8 +367,9 @@ const HTML_TEMPLATE = `<!doctype html>
 <main>
   <header>
     <!--AUTH-INDICATOR-->
-    <h1>Parachute</h1>
-    <p class="tagline">Your personal-computing modules.</p>
+    <span class="brand-mark" aria-hidden="true">${brandMarkSvg(56, "hub-home")}</span>
+    <h1>${WORDMARK_TEXT}</h1>
+    <p class="tagline">${CANONICAL_TAGLINE}</p>
   </header>
 
   <section class="section" id="get-started-section" hidden>
