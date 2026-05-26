@@ -46,12 +46,14 @@ export type HubSettingKey =
   // (`bun add -g <pkg>@<channel>`). `"latest"` (default) tracks the
   // stable channel; `"rc"` follows the release-candidate chain so
   // operators on the rc cadence can pull pre-release builds without
-  // hand-editing the install command. Seeded from
-  // `PARACHUTE_MODULE_CHANNEL` on first read (operator can ship a fresh
-  // box with the env var set and have the row land with their preferred
-  // channel); after the first seed the row is source of truth and the
-  // env var is ignored — admin must use the SPA toggle (or
-  // `PUT /api/modules/channel`) to change channel.
+  // hand-editing the install command.
+  //
+  // Precedence (hub#381, 2026-05-25 — flipped from "DB after first
+  // seed"): env > DB > default. Env vars recognized:
+  // `PARACHUTE_INSTALL_CHANNEL` (canonical), `PARACHUTE_MODULE_CHANNEL`
+  // (legacy alias). When env is set it wins on every read; the SPA
+  // toggle still writes to this row as the fallback for when env is
+  // later unset.
   | "module_install_channel"
   // hub#298: operator-settable canonical hub URL. The value (when set)
   // is the OAuth issuer claim stamped into every JWT minted by hub.
@@ -248,9 +250,9 @@ export const DEFAULT_MODULE_INSTALL_CHANNEL: ModuleInstallChannel = "latest";
 
 /**
  * Resolve the env-set channel, if any. Returns the channel value or
- * `null` if no env var is set; throws via `warn()` if a value is set
- * but invalid (still returns null in that case, so caller falls
- * through to DB/default).
+ * `null` when no env var is set or only invalid values are present.
+ * Invalid values call `warn()` and are skipped (caller falls through
+ * to DB/default). Never throws.
  */
 function resolveChannelFromEnv(
   env: NodeJS.ProcessEnv,

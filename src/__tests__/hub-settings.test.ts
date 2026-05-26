@@ -353,17 +353,22 @@ describe("hub-settings — module install channel bootstrap", () => {
     // at first boot before he set the env var).
     const db = openHubDb(hubDbPath(dir));
     try {
-      // First read with rc — DB seeds with rc.
-      getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } });
-      // Second read with a different env value returns the NEW env value
-      // (env wins over the previously-seeded DB row).
+      // First read with env=rc — env wins, returns "rc". DB stays empty
+      // (no auto-write to DB when env is set, per the design that
+      // preserves the SPA's last-write as the env-unset fallback).
+      expect(
+        getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } }),
+      ).toBe("rc");
+      // Second read with env=latest — env wins again (would have returned
+      // "rc" under the old DB-after-first-seed behavior).
       expect(
         getModuleInstallChannel(db, {
           env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "latest" },
         }),
       ).toBe("latest");
-      // With env unset, DB falls through and returns whatever was last
-      // written (latest from the previous call's idempotent sync).
+      // With env unset, DB takes over. DB is still empty (neither prior
+      // call wrote to it), so the "neither env nor DB" branch fires and
+      // seeds the default ("latest").
       expect(getModuleInstallChannel(db, { env: {} })).toBe("latest");
     } finally {
       db.close();
