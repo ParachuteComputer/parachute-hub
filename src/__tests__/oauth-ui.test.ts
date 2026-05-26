@@ -95,7 +95,9 @@ describe("renderConsent", () => {
       clientName: "MyApp",
       scopes: ["vault:read", "vault:admin"],
     });
-    expect(html).toContain("Authorize");
+    // Page h1: "Approve <client>?" per design-system.md §5 verb canon
+    // (Workstream I, 2026-05-25 — was "Authorize <client>?").
+    expect(html).toContain("Approve");
     expect(html).toContain("MyApp");
     expect(html).toContain("client-abc");
     expect(html).toContain("vault:read");
@@ -485,7 +487,10 @@ describe("renderApprovePending unauthenticated CTAs", () => {
       approveForm: { csrfToken: CSRF, returnTo: "/oauth/authorize?client_id=client-xyz" },
     });
     expect(html).toContain('action="/oauth/authorize/approve"');
-    expect(html).toContain("Approve and continue");
+    // Workstream I, 2026-05-25 — button label "Approve and continue"
+    // → "Approve" per design-system.md §5 (Approve is canon; the suffix
+    // was verbal noise implying optionality where there is none).
+    expect(html).toContain(">Approve</button>");
     expect(html).not.toContain("Sign in as admin to approve");
     expect(html).not.toContain("Or send this link to your hub admin");
     expect(html).not.toContain("parachute auth approve-client");

@@ -173,7 +173,7 @@ export interface ErrorViewProps {
  *          response to an `/oauth/authorize?...` request, `loginNextUrl`
  *          is that same authorize URL (pathname+search) so the operator
  *          lands BACK on the OAuth flow after sign-in — now authenticated,
- *          they see the inline "Approve and continue" form, click once,
+ *          they see the inline "Approve" form, click once,
  *          and the OAuth flow resumes through consent → redirect_uri.
  *          Without this, post-login the operator lands on the SPA approve
  *          page, which approves the client but discards the original
@@ -348,7 +348,7 @@ export function renderConsent(props: ConsentViewProps): string {
           <span class="brand-mark">⌬</span>
           <span class="brand-name">Parachute</span>
         </div>
-        <h1>Authorize <span class="client-name">${escapeHtml(clientName)}</span>?</h1>
+        <h1>Approve <span class="client-name">${escapeHtml(clientName)}</span>?</h1>
         <p class="subtitle">
           This app is requesting access to your Parachute account.
         </p>
@@ -373,7 +373,7 @@ export function renderConsent(props: ConsentViewProps): string {
         </div>
       </form>
     </div>`;
-  return baseDocument(`Authorize ${clientName}`, body);
+  return baseDocument(`Approve ${clientName}`, body);
 }
 
 function renderVaultPicker(picker: VaultPicker): string {
@@ -505,7 +505,7 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
         ${renderCsrfHiddenInput(approveForm.csrfToken)}
         <input type="hidden" name="client_id" value="${escapeHtml(clientId)}" />
         <input type="hidden" name="return_to" value="${escapeHtml(approveForm.returnTo)}" />
-        <button type="submit" class="btn btn-primary">Approve and continue</button>
+        <button type="submit" class="btn btn-primary">Approve</button>
       </form>`
     : renderUnauthenticatedApproveCtas(hubOrigin, clientId, loginNextUrl);
   const body = `
