@@ -40,6 +40,7 @@
 import type { Database } from "bun:sqlite";
 import { type OperationsRegistry, runInstall, specFor } from "./api-modules-ops.ts";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
+import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
 import {
   BOOTSTRAP_TOKEN_PREFIX,
   consumeBootstrapToken,
@@ -246,8 +247,8 @@ function header(currentStep: WizardStep): string {
     .join("");
   return `
         <div class="brand">
-          <span class="brand-mark">⌬</span>
-          <span class="brand-name">Parachute</span>
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "setup-wizard")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
           <span class="brand-tag">first-boot setup</span>
         </div>
         <ol class="steps">${items}</ol>`;
@@ -1925,7 +1926,8 @@ const STYLES = `
     font-size: 0.95rem;
     margin-bottom: 0.5rem;
   }
-  .brand-mark { font-size: 1.1rem; line-height: 1; }
+  .brand-mark { display: inline-flex; line-height: 0; }
+  .brand-mark svg { width: 20px; height: 20px; }
   .brand-name { letter-spacing: 0.01em; }
   .brand-tag {
     text-transform: uppercase;

@@ -48,6 +48,18 @@ describe("renderHub", () => {
     expect(html).toContain("prefers-color-scheme: dark");
   });
 
+  test("renders the canonical brand mark + wordmark + tagline in the header", () => {
+    // The brand mark is the shared SVG from src/brand.ts, rendered with the
+    // `hub-home` clipPath id suffix to keep it namespaced from the chrome
+    // strip's own mark (which uses `chrome-1`).
+    expect(html).toContain("pc-brand-mark-clip-hub-home");
+    // Wordmark string lives in src/brand.ts as the canonical form.
+    expect(html).toContain("<h1>Parachute</h1>");
+    // Canonical tagline (picked 2026-05-25). If this fails, src/brand.ts
+    // CANONICAL_TAGLINE drifted from what the home actually renders.
+    expect(html).toContain("Truly personal computing. Your knowledge belongs with you.");
+  });
+
   test("renders two sections: Services and Admin, each with its own heading + grid", () => {
     expect(html).toContain('id="services-section"');
     expect(html).toContain('id="admin-section"');

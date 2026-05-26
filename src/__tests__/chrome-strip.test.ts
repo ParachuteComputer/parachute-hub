@@ -53,7 +53,9 @@ describe("renderChromeStrip", () => {
   test("includes the inlined SVG brand mark + Parachute wordmark", () => {
     const html = renderChromeStrip({});
     expect(html).toContain("<svg");
-    expect(html).toContain("pc-chrome-mark-clip");
+    // Mark is rendered via the shared `src/brand.ts` helper; the chrome strip
+    // uses the `"chrome-1"` id suffix to namespace its `<clipPath>` id.
+    expect(html).toContain("pc-brand-mark-clip-chrome-1");
     expect(html).toContain(">Parachute<");
   });
 

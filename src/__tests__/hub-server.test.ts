@@ -3411,8 +3411,10 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
       // Signed-out cluster.
       expect(body).toContain("Sign in");
       expect(body).not.toContain("Signed in as");
-      // Mark + wordmark from design-system.md §2.
-      expect(body).toContain("pc-chrome-mark-clip");
+      // Mark + wordmark from design-system.md §2. Brand mark renders via the
+      // shared `src/brand.ts` helper — the SVG carries the namespaced clipPath
+      // id `pc-brand-mark-clip-chrome-1`.
+      expect(body).toContain("pc-brand-mark-clip-chrome-1");
       expect(body).toContain(">Parachute<");
       // Home link.
       expect(body).toContain('<a href="/">Home</a>');
