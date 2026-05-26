@@ -435,6 +435,23 @@ async function proxyRequest(
   // Host comes from the requester (tailnet FQDN); the loopback target wants
   // its own. Bun's fetch fills it in when omitted.
   headers.delete("host");
+  // Force upstreams to reply with uncompressed bodies. The chrome-strip
+  // injector (workstream G) buffers + TextDecoders the HTML response to
+  // inject the persistent chrome; without this, a gzip- or br-compressed
+  // upstream reply gets UTF-8-decoded as raw compressed bytes (garbage) —
+  // the body becomes unrenderable while Content-Encoding still says "gzip",
+  // so the browser fails silently.
+  //
+  // We set "identity" (RFC 9110 §12.5.3 — explicitly no encoding) rather
+  // than deleting Accept-Encoding because Bun's fetch implementation
+  // auto-injects "gzip, deflate, br, zstd" when the header is absent. The
+  // explicit "identity" overrides that default.
+  //
+  // Trade-off: on a single-host owner-operated deploy the loopback bandwidth
+  // is negligible. If a future deployment shape adds long-haul links between
+  // hub and modules, prefer either (a) re-enable compression + decode in the
+  // chrome injector, or (b) flip per-route based on Accept header.
+  headers.set("accept-encoding", "identity");
   // Forward the public origin so downstream services build their public-
   // facing URLs (OAuth metadata, redirect URIs) against the same host the
   // client used. We DON'T overwrite X-Forwarded-Host if already set —

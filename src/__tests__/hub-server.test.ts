@@ -1464,6 +1464,7 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
             body,
             forwardedHost: req.headers.get("x-forwarded-host"),
             forwardedProto: req.headers.get("x-forwarded-proto"),
+            acceptEncoding: req.headers.get("accept-encoding"),
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
@@ -1629,6 +1630,53 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
       // edge.local Host that hub itself saw.
       expect(body.forwardedHost).toBe("original-client.example");
       expect(body.forwardedProto).toBe("https");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("strips Accept-Encoding from proxied requests (chrome-strip prerequisite, hub#377)", async () => {
+    // Workstream G's chrome-strip injector buffers + TextDecoders the HTML
+    // response to inject the persistent chrome. A gzip- or br-compressed
+    // upstream reply would get UTF-8-decoded as raw compressed bytes
+    // (garbage) — body becomes unrenderable while Content-Encoding still
+    // says gzip → browser fails silently. proxyRequest strips
+    // Accept-Encoding so upstreams respond uncompressed, sidestepping the
+    // decode problem entirely. Trade-off: loopback bandwidth on
+    // owner-operated single-host deploys is negligible.
+    const h = makeHarness();
+    const upstream = startUpstream("hdr-test");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const incoming = new Request("http://hub.local/vault/default/health", {
+        headers: {
+          host: "hub.local",
+          // Browser-like Accept-Encoding — what a real client would send.
+          "accept-encoding": "gzip, deflate, br, zstd",
+        },
+      });
+      const res = await fetcher(incoming);
+      const body = (await res.json()) as { acceptEncoding: string | null };
+      // Upstream sees "identity" (no encoding) — hub overrode the browser's
+      // "gzip, deflate, br, zstd" before forwarding. We can't just delete
+      // the header: Bun's fetch implementation auto-injects compression
+      // when absent. Explicit "identity" overrides that default.
+      expect(body.acceptEncoding).toBe("identity");
     } finally {
       upstream.stop();
       h.cleanup();
