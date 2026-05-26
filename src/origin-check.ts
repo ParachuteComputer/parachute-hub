@@ -104,7 +104,21 @@ export function isSameOriginRequest(req: Request, boundOrigins: readonly string[
   const boundOriginSet = new Set(boundOrigins);
 
   const origin = req.headers.get("origin");
-  if (origin) {
+  // "null" is the browser's opaque-origin signal — sent on form POSTs from
+  // pages with restrictive referrer policies (`<meta name="referrer"
+  // content="no-referrer">`), sandboxed iframes, or certain cross-origin
+  // redirect chains. The browser is saying "I'm intentionally not telling
+  // you where this came from" rather than "this is from origin null".
+  // Treat as "Origin not informative" and fall through to Referer/Host —
+  // the CSRF token check upstream is still the real authentication;
+  // same-origin is belt-and-suspenders, not the only defense.
+  //
+  // Caught 2026-05-26 on Aaron's Render deploy: hub's OAuth pages set
+  // `referrer-policy: no-referrer` for privacy, which made browsers
+  // send `Origin: null` on the approve POST. The strict-reject behavior
+  // here blocked the legitimate operator action; the Host fallback (tier
+  // 3 below) would have correctly accepted the request.
+  if (origin && origin !== "null") {
     try {
       return boundOriginSet.has(new URL(origin).origin);
     } catch {
