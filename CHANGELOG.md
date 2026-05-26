@@ -2,6 +2,27 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.45] - 2026-05-26
+
+**Brand consolidation across surfaces + the Render edge keep-alive 502 fix + a session-long UI polish sweep on the admin SPA.**
+
+### Fixed
+
+- **`Bun.serve({ idleTimeout: 255 })` on every hub-facing server** — defeats the Render edge keep-alive 502 race (closes #399). Bun's default `idleTimeout` is 10 seconds; Render's edge proxy pools keep-alive connections with a longer TTL (community-observed ~120s). When the upstream closes a connection a tick before the edge sends the next request on it, the edge returns 502. Bug is invisible to the app (no log, no restart, `deployStatus: live` throughout). Manifests as a 5–15% "random" 502 rate under steady probing. Caught on a no-delay Render rebuild walkthrough; root-caused via SSH (hub healthy locally, external probes flapping). 255s is Bun's max idleTimeout — comfortably exceeds Render's edge pool TTL. Applied to both `src/hub-server.ts:2052` (the `import.meta.main` entry) and `src/commands/serve.ts:287` (the active Docker CMD path — `bun src/cli.ts serve`). See PR #400. References: [Bun docs](https://bun.com/docs/runtime/http/server) (idleTimeout default 10s, max 255), [TCP mechanics writeup](https://iximiuz.com/en/posts/reverse-proxy-http-keep-alive-and-502s/), [Render community report](https://render.discourse.group/t/502-error-randomly-occurs-on-established-service/6200).
+- **Branded HTML 404 page replaces the empty-body fallback** (closes #392). The catch-all 404 in `hub-server.ts` returned `new Response("not found")` with no body — a confused operator who mistyped a URL saw the browser's default not-found chrome, not a Parachute page. New `renderNotFoundPage(pathname)` in `src/oauth-ui.ts` produces a branded HTML 404 with the canonical mark, the requested path echoed back, and a "Go to hub home" CTA. The catch-all sniffs `Accept` so HTML clients get the rendered page while curl + API probes still see plain text (low log noise). PR #396.
+- **`/admin/*` no longer overflows on mobile** (closes #391). The admin SPA nav rendered 10 nav links + brand + auth indicator in a single non-wrapping flex row; on a 375 px viewport the row's intrinsic min-content width set the document to 787 px (2.1× overflow). `web/ui/src/styles.css` `.nav` gains `flex-wrap: wrap` + asymmetric `gap: 0.6rem 1rem`. PR #396.
+- **`/admin/tokens` no longer overflows on mobile** (closes #398 — the second-order overflow after #391). The Tokens filter rows had `display: flex; gap: 0.5rem` with no wrap; the four Source buttons chained past the viewport. Same shape of fix. PR #397.
+
+### Added
+
+- **RFC 9728 `/.well-known/oauth-protected-resource`** (closes #393). Companion to oauth-authorization-server; MCP clients (since the 2025-06-18 spec draft) probe this to discover the resource indicator, the authorization server, and the scope set. New `protectedResourceMetadata()` in `src/oauth-handlers.ts` mirrors the AS-metadata shape + scope filter. Same wildcard CORS posture. PR #396.
+- **Canonical brand mark + tagline source-of-truth** in `src/brand.ts`. The 37-path SVG mark, the canonical tagline ("Truly personal computing. Your knowledge belongs with you." — Aaron picked 2026-05-25), and the wordmark text live in one place. Eight surfaces consolidated to consume from it: chrome strip, hub home, OAuth login/consent/approve-pending/error/unknown-client, setup wizard, admin login, account change-password. The placeholder `⌬` Unicode mark is retired from every OAuth surface. Replaces ~18 KB of duplicated inline SVG with one shared call. PR #389.
+- **Admin SPA brand mark** in the nav (PR #402). The SPA was the last surface without the canonical mark. New `web/ui/src/components/BrandMark.tsx` React component vendors the SVG paths from `src/brand.ts`; a `BrandMark.drift.test.ts` makes drift between the two files a hard CI failure.
+- **`.table-scroll` utility** for mobile-safe admin tables (PR #401). Wraps wide tables in a horizontal-scroll container so the document stays bounded.
+- **Proper `<h1>` page-title hierarchy** on every admin SPA route (PR #401). VaultsList, Permissions, Tokens, Users used `<h2>` for their page title — screen readers + keyboard users lose the canonical "you are on the X page" landmark. New serif `h1` rule matches the OAuth/setup surfaces.
+- **Subtle UI polish** across the admin SPA (PR #403): row-hover affordance on tables, loading-state pulse on `Loading…` placeholders, route-content fade-up on initial render. All respect `prefers-reduced-motion: reduce`.
+- **Anchor-as-button visual fix** (PR #404): `.btn` applied to anchors (e.g. the 404 page's "Go to hub home" CTA) no longer renders with the default underline.
+
 ## [0.5.13-rc.44] - 2026-05-26
 
 **fix(hub): same-origin check no longer rejects on `Origin: "null"` — root cause of Aaron's 24h OAuth approve blocker.**
