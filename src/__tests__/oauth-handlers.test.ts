@@ -209,7 +209,9 @@ describe("handleAuthorizeGet", () => {
       const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
       expect(res.status).toBe(200);
       const html = await res.text();
-      expect(html).toContain("Authorize");
+      // Page h1: "Approve <client>?" per design-system.md §5 verb canon
+      // (Workstream I, 2026-05-25 — was "Authorize <client>?").
+      expect(html).toContain("Approve");
       expect(html).toContain("MyApp");
       expect(html).toContain("vault:read");
       expect(html).toContain('name="__action" value="consent"');
@@ -4498,8 +4500,9 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       expect(reentryRes.status).toBe(200);
       const consentHtml = await reentryRes.text();
       // Consent screen markers (renderConsent uses these).
+      // Page h1: "Approve <client>?" per design-system.md §5 (was "Authorize").
       expect(consentHtml).toContain('name="__action" value="consent"');
-      expect(consentHtml).toContain("Authorize");
+      expect(consentHtml).toContain("Approve");
       expect(consentHtml).toContain("RoundTrip");
     } finally {
       cleanup();
