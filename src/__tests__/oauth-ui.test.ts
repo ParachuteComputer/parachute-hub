@@ -7,6 +7,7 @@ import {
   renderError,
   renderHiddenInputs,
   renderLogin,
+  renderNotFoundPage,
   renderUnknownClient,
   substituteVaultDisplay,
 } from "../oauth-ui.ts";
@@ -233,6 +234,32 @@ describe("renderError", () => {
     });
     expect(html).not.toContain("<script>1</script>");
     expect(html).not.toContain('"><img>');
+    expect(html).toContain("&lt;script&gt;");
+  });
+});
+
+describe("renderNotFoundPage (closes hub#392)", () => {
+  test("renders a branded full-page HTML doc with a path back to /", () => {
+    const html = renderNotFoundPage("/some-missing-route");
+    expect(html).toStartWith("<!doctype html>");
+    expect(html).toContain("<title>Not found");
+    expect(html).toContain("Not found");
+    // Brand mark — the operator sees this is a Parachute page, not just a generic 404
+    expect(html).toContain("pc-brand-mark-clip-not-found");
+    expect(html).toContain("Parachute");
+    // The CTA back to hub home
+    expect(html).toContain('href="/"');
+    expect(html).toContain("Go to hub home");
+  });
+
+  test("echoes + escapes the requested pathname in the message", () => {
+    const html = renderNotFoundPage("/this-page-does-not-exist");
+    expect(html).toContain("/this-page-does-not-exist");
+  });
+
+  test("escapes hostile pathnames", () => {
+    const html = renderNotFoundPage('/"><script>alert(1)</script>');
+    expect(html).not.toContain('"><script>alert(1)</script>');
     expect(html).toContain("&lt;script&gt;");
   });
 });

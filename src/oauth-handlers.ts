@@ -348,6 +348,40 @@ function oauthErrorRedirect(
   return redirectResponse(u.toString());
 }
 
+// --- /.well-known/oauth-protected-resource ---------------------------------
+
+/**
+ * RFC 9728 (April 2025) — OAuth 2.0 Protected Resource Metadata. The
+ * resource-server-side companion to `authorizationServerMetadata`. MCP
+ * clients (since the 2025-06-18 spec draft) probe this endpoint to
+ * discover which authorization server signs tokens for the resource,
+ * which scopes the resource accepts, and how tokens are presented.
+ *
+ * Hub-as-resource posture: hub itself is the protected resource. The
+ * authorization server is also hub (the issuer). The advertised scopes
+ * mirror `authorizationServerMetadata.scopes_supported` — same set, same
+ * filtering (operator-only scopes hidden per RFC 8414 §2 framing).
+ *
+ * Per-vault metadata could also live at
+ * `/vault/<name>/.well-known/oauth-protected-resource` to scope the
+ * advertised resource indicator and scope subset to one vault. Deferred
+ * until an MCP client actually probes that path — today the spec
+ * accepts the hub-level form for the resource indicator.
+ *
+ * Closes hub#393.
+ */
+export function protectedResourceMetadata(deps: OAuthDeps): Response {
+  const iss = deps.issuer;
+  const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
+  return jsonResponse({
+    resource: iss,
+    authorization_servers: [iss],
+    scopes_supported: Array.from(declared).filter(isRequestableScope),
+    bearer_methods_supported: ["header"],
+    resource_documentation: "https://parachute.computer",
+  });
+}
+
 // --- /.well-known/oauth-authorization-server -------------------------------
 
 export function authorizationServerMetadata(deps: OAuthDeps): Response {

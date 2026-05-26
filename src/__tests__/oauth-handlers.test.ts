@@ -22,6 +22,7 @@ import {
   handleRegister,
   handleRevoke,
   handleToken,
+  protectedResourceMetadata,
 } from "../oauth-handlers.ts";
 import type { ServicesManifest } from "../services-manifest.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
@@ -148,6 +149,41 @@ describe("authorizationServerMetadata", () => {
     expect(scopesSupported).toContain("hub:admin");
     // NON_REQUESTABLE filter still applies even when the scope is declared
     expect(scopesSupported).not.toContain("parachute:host:admin");
+  });
+});
+
+describe("protectedResourceMetadata (RFC 9728, closes hub#393)", () => {
+  test("emits the required RFC 9728 fields rooted at the issuer", async () => {
+    const res = protectedResourceMetadata({ issuer: ISSUER });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/application\/json/);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.resource).toBe(ISSUER);
+    expect(body.authorization_servers).toEqual([ISSUER]);
+    expect(body.bearer_methods_supported).toEqual(["header"]);
+    expect(Array.isArray(body.scopes_supported)).toBe(true);
+    expect(body.resource_documentation).toMatch(/parachute\.computer/);
+  });
+
+  test("scopes_supported mirrors authorizationServerMetadata after the same operator-only filter", async () => {
+    // Same declared-scope set as the authorizationServerMetadata test; the
+    // resource-server view should advertise the same shape.
+    const declared = new Set<string>([
+      "vault:read",
+      "vault:admin",
+      "hub:admin",
+      "parachute:host:admin",
+      "agent:read",
+    ]);
+    const res = protectedResourceMetadata({
+      issuer: ISSUER,
+      loadDeclaredScopes: () => declared,
+    });
+    const body = (await res.json()) as Record<string, unknown>;
+    const scopes = body.scopes_supported as string[];
+    expect(scopes).toContain("vault:read");
+    expect(scopes).toContain("agent:read");
+    expect(scopes).not.toContain("parachute:host:admin");
   });
 });
 
