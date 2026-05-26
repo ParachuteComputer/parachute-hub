@@ -2,6 +2,10 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.48] - 2026-05-26
+
+**Hotfix.** /admin/setup + /api/modules + every other hot-path read site now uses readManifestLenient (#411). #406 only patched ONE call site; Aaron hit 500s when a stale services.json row from an old @openparachute/app@0.2.0-rc.4 install threw the strict validator on /admin/setup. Now: one bad row in services.json no longer 500s the entire admin SPA + wizard.
+
 ## [0.5.13-rc.47] - 2026-05-26
 
 **OAuth approval friction relaxed — trust by client_name (#409).**
