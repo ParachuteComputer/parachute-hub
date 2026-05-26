@@ -365,7 +365,7 @@ describe("GET /api/modules", () => {
     expect(vault?.management_url).toBe("/vault/default/admin");
   });
 
-  test("management_url does not double-prepend mount when managementUrl is already mount-prefixed (hub#XXX)", async () => {
+  test("management_url does not double-prepend mount when managementUrl is already mount-prefixed (hub#380)", async () => {
     // Audit caught 2026-05-25: app declares `managementUrl: "/app/admin/"`
     // (full hub-origin path) and `paths: ["/app", "/.parachute"]`. The
     // SPA's Services dropdown was navigating to `/app/app/admin/` (404)
@@ -416,6 +416,104 @@ describe("GET /api/modules", () => {
     const app = body.modules.find((m) => m.short === "app");
     // Single `/app/`, not `/app/app/`.
     expect(app?.management_url).toBe("/app/admin/");
+  });
+
+  test("management_url prefix-ish names don't collide (hub#380 — /app vs /app-foo)", async () => {
+    // The detection uses `tail.startsWith(\`${mount}/\`)` with the trailing
+    // slash specifically to avoid a false positive when a candidate
+    // path looks like a sibling name (e.g. `/app-foo/admin` shouldn't be
+    // treated as "already prefixed by /app"). Without the slash gate,
+    // a future module named `app-foo` would silently inherit the
+    // pass-through behavior and `/app` mount would skip its prepend.
+    // Tests the trailing-slash discriminator stays load-bearing.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/app"], // mount is /app (using vault as a stand-in installable)
+        health: "/app/health",
+        version: "0.4.5",
+        installDir: "/install/dir/contrived",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+      readModuleManifest: async (installDir) => {
+        if (installDir === "/install/dir/contrived") {
+          return {
+            name: "parachute-vault",
+            manifestName: "parachute-vault",
+            displayName: "Vault",
+            tagline: "",
+            port: 1940,
+            paths: ["/app"],
+            health: "/app/health",
+            // candidate looks like a sibling-name prefix but is NOT a
+            // mount-prefix of /app — should still get prepended.
+            managementUrl: "/app-foo/admin",
+          } as unknown as Awaited<
+            ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
+          >;
+        }
+        return null;
+      },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      modules: Array<{ short: string; management_url: string | null }>;
+    };
+    const vault = body.modules.find((m) => m.short === "vault");
+    // /app + /app-foo/admin → /app/app-foo/admin (prepend fires; not treated
+    // as already-mount-prefixed because /app-foo/ doesn't start with /app/).
+    expect(vault?.management_url).toBe("/app/app-foo/admin");
+  });
+
+  test("management_url equality edge: tail equals mount exactly (hub#380)", async () => {
+    // mount=/foo, candidate=/foo → tail === mount → pass through unchanged.
+    // Not a "real" config but pins the equality branch of the detection.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/foo"],
+        health: "/foo/health",
+        version: "0.4.5",
+        installDir: "/install/dir/equality",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+      readModuleManifest: async (installDir) => {
+        if (installDir === "/install/dir/equality") {
+          return {
+            name: "parachute-vault",
+            manifestName: "parachute-vault",
+            displayName: "Vault",
+            tagline: "",
+            port: 1940,
+            paths: ["/foo"],
+            health: "/foo/health",
+            managementUrl: "/foo",
+          } as unknown as Awaited<
+            ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
+          >;
+        }
+        return null;
+      },
+    });
+    const body = (await res.json()) as {
+      modules: Array<{ short: string; management_url: string | null }>;
+    };
+    const vault = body.modules.find((m) => m.short === "vault");
+    expect(vault?.management_url).toBe("/foo");
   });
 
   test("management_url is null when the module declares neither managementUrl nor uiUrl (hub#342)", async () => {
