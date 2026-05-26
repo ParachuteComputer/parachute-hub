@@ -2,6 +2,25 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.41] - 2026-05-25
+
+**fix(hub): upgrade-available version respects `module_install_channel` (hub#378).**
+
+### Fixed
+
+- **`/api/modules` `latest_version` field now reads the configured channel's npm dist-tag, not always `@latest`.** Previously `defaultFetchLatestVersion` hit `https://registry.npmjs.org/<pkg>/latest` which always returned the `@latest` tag value regardless of the operator's configured install channel. Operators on `rc` saw the `@latest` version surface as the "upgrade available" target (e.g. app showed `0.2.0-rc.4 available` while the configured `@rc` channel was actually at `0.2.0-rc.13` — confirmed on Aaron's Render deploy 2026-05-25). Cosmetic-only: the install ACTION (`api-modules-ops.ts:540`) already used the configured channel correctly via `bun add -g <pkg>@${channel}`, so clicking Upgrade still pulled the right version. The bug was just the displayed target. Fix swaps to npm's `/-/package/<pkg>/dist-tags` endpoint (returns the full tag map) + reads `tags[channel]` with `tags.latest` fallback for packages that haven't published `@rc` yet. Cache key now includes channel so a runtime channel toggle returns fresh values without TTL expiry.
+
+### Patterns check
+
+- No new patterns; reinforces "operator-facing version displays must reflect the operator's configured posture, not the package default."
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src`: 1967 pass / 0 fail (+5 from rc.40 baseline of 1962).
+- Container smoke CI: ✓ on the fix commit.
+- Pending: live verify on Render redeploy — admin SPA's "upgrade available" should show `rc.X` where X matches `npm view @openparachute/<pkg>@rc version`.
+
 ## [0.5.13-rc.40] - 2026-05-25
 
 **fix(hub) + feat(hub): OAuth approve POST same-origin hotfix (hub#375) + unify state vocabulary across CLI + admin SPA + well-known doc (workstream F, hub#374).**

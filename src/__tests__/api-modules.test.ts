@@ -427,7 +427,10 @@ describe("GET /api/modules", () => {
     // Second back-to-back request must not re-hit the registry. The
     // UI may poll this endpoint; we don't want it to slam npm.
     let calls = 0;
-    const probe = async (_pkg: string): Promise<string | null> => {
+    const probe = async (
+      _pkg: string,
+      _channel: "latest" | "rc",
+    ): Promise<string | null> => {
       calls++;
       return "0.5.0";
     };
@@ -444,6 +447,68 @@ describe("GET /api/modules", () => {
     await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), deps);
     expect(callsAfterFirst).toBeGreaterThan(0);
     expect(calls).toBe(callsAfterFirst);
+  });
+
+  test("fetchLatestVersion receives the configured install channel (hub#377 dist-tag fix)", async () => {
+    // The audit caught the bug 2026-05-25 on Aaron's deploy: operators
+    // on the `rc` channel saw the @latest dist-tag value as their upgrade
+    // target (e.g. app showed "rc.4 available" while the rc channel was
+    // actually at rc.13). The fix threads the configured channel into
+    // fetchLatestVersion so the probe targets the right dist-tag.
+    setModuleInstallChannel(h.db, "rc");
+    const callsByChannel: string[] = [];
+    const probe = async (_pkg: string, channel: "latest" | "rc"): Promise<string | null> => {
+      callsByChannel.push(channel);
+      return channel === "rc" ? "0.5.0-rc.13" : "0.5.0-rc.4";
+    };
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: probe,
+      cacheTtlMs: 0, // disable cache for this test
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      modules: Array<{ short: string; latest_version: string | null }>;
+    };
+    // Every probe call received the configured channel.
+    expect(callsByChannel.every((c) => c === "rc")).toBe(true);
+    expect(callsByChannel.length).toBeGreaterThan(0);
+    // The latest_version reflects the rc dist-tag.
+    for (const m of body.modules) {
+      expect(m.latest_version).toBe("0.5.0-rc.13");
+    }
+  });
+
+  test("cache key includes channel — toggling channel returns fresh value, not stale (hub#377)", async () => {
+    // The cache key includes channel so a runtime toggle between latest
+    // and rc surfaces the right version immediately, not after TTL expiry.
+    let callCount = 0;
+    const probe = async (_pkg: string, channel: "latest" | "rc"): Promise<string | null> => {
+      callCount++;
+      return channel === "rc" ? "1.0.0-rc.5" : "1.0.0";
+    };
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const deps = {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: probe,
+      cacheTtlMs: 60_000,
+    };
+    setModuleInstallChannel(h.db, "latest");
+    const r1 = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), deps);
+    const b1 = (await r1.json()) as { modules: Array<{ latest_version: string | null }> };
+    expect(b1.modules[0]?.latest_version).toBe("1.0.0");
+    const callsAfterLatest = callCount;
+    setModuleInstallChannel(h.db, "rc");
+    const r2 = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), deps);
+    const b2 = (await r2.json()) as { modules: Array<{ latest_version: string | null }> };
+    expect(b2.modules[0]?.latest_version).toBe("1.0.0-rc.5");
+    // Per-channel cache miss → fresh probe calls fired for the rc lookup.
+    expect(callCount).toBeGreaterThan(callsAfterLatest);
   });
 
   test("surfaces module_install_channel in the response (hub#275)", async () => {
