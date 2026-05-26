@@ -30,6 +30,7 @@ import { writeManifest } from "../services-manifest.ts";
 import { SESSION_COOKIE_NAME } from "../sessions.ts";
 import {
   deriveWizardState,
+  detectAutoExposeMode,
   handleSetupAccountPost,
   handleSetupExposePost,
   handleSetupGet,
@@ -2998,5 +2999,33 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+describe("detectAutoExposeMode — Render env detection edge cases (hub#407 nit)", () => {
+  test("returns 'public' for a real https Render URL", () => {
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "https://parachute-hub.onrender.com" })).toBe("public");
+  });
+
+  test("returns 'public' for an http:// URL (defensive — if Render ever emits one)", () => {
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "http://local.test:1939" })).toBe("public");
+  });
+
+  test("returns undefined when RENDER_EXTERNAL_URL is absent", () => {
+    expect(detectAutoExposeMode({})).toBeUndefined();
+  });
+
+  test("returns undefined when RENDER_EXTERNAL_URL is empty", () => {
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "" })).toBeUndefined();
+  });
+
+  test("returns undefined for a non-http scheme (httpx://, ftp://, etc.)", () => {
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "httpx://foo.example" })).toBeUndefined();
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "ftp://foo.example" })).toBeUndefined();
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "javascript:alert(1)" })).toBeUndefined();
+  });
+
+  test("returns undefined when value is non-string (defensive)", () => {
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: undefined })).toBeUndefined();
   });
 });

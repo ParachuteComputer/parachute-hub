@@ -141,8 +141,11 @@ export const FIRST_VAULT_SHORT: CuratedModuleShort = "vault";
 
 /**
  * Read DB + services.json to decide which step the wizard should render.
- * Pure, idempotent — re-running the wizard after partial setup picks up
- * where it left off.
+ * Idempotent — re-running after partial setup picks up where it left
+ * off. Mostly read-only, with one specific write: on Render (or any
+ * platform `detectAutoExposeMode` recognizes), the first call auto-
+ * seeds `setup_expose_mode = "public"` so the wizard skips the expose
+ * step. Subsequent calls find the setting present and are read-only.
  */
 export function deriveWizardState(deps: {
   db: Database;
@@ -245,7 +248,13 @@ export interface SetupWizardDeps {
  * detects when the platform clearly owns the public URL.
  */
 export function detectAutoExposeMode(env: Record<string, string | undefined>): "public" | undefined {
-  if (env.RENDER_EXTERNAL_URL && env.RENDER_EXTERNAL_URL.startsWith("http")) {
+  // Render always sets `RENDER_EXTERNAL_URL` to a real `https://` URL on
+  // any web service. `startsWith("https://")` is the precise shape; we
+  // also accept `http://` as a defensive fallback in case Render ever
+  // changes the scheme on some plan tier. Anything else (empty, weird,
+  // not a URL) → don't auto-skip; let the operator choose.
+  const url = env.RENDER_EXTERNAL_URL;
+  if (typeof url === "string" && (url.startsWith("https://") || url.startsWith("http://"))) {
     return "public";
   }
   return undefined;
