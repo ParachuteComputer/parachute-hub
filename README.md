@@ -16,24 +16,48 @@ bun add -g @openparachute/hub
 
 Prereqs: [Bun](https://bun.sh) 1.3.0 or later. `parachute expose` also requires [Tailscale](https://tailscale.com/download) **1.82 or newer** (installed + `tailscale up` run once); the `expose` path is under active polish for launch, so expect rough edges.
 
-### Hosted (Render)
+### Hosted self-deploy
+
+Hub runs as a single container with one persistent disk. Two equally-supported platforms; pick the one you prefer.
+
+#### Render
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/ParachuteComputer/parachute-hub)
 
-One-click Render deploy via the `render.yaml` Blueprint in this repo. Provisions a $7/mo Starter service + 1 GiB persistent disk + auto-deploys from `main`. Comes pre-configured with `PARACHUTE_INSTALL_CHANNEL=latest` so modules you install via the admin SPA (vault, app, scribe, runner) pull stable releases by default.
-
-**Want pre-release / rc modules?** Set `PARACHUTE_INSTALL_CHANNEL=rc` in your Render dashboard env vars (useful for dev/testing against the rc release line).
+One-click Render deploy via the `render.yaml` Blueprint in this repo. Provisions a $7/mo Starter service + 1 GiB persistent disk + auto-deploys from `main`. GUI-first ops; click-and-go for operators who don't want to install a CLI.
 
 After deploy completes:
 
-1. Open Render Logs → search for `parachute-bootstrap-` to find your one-time admin setup token (printed in a prominent banner on first boot).
+1. Open Render Logs → search for `parachute-bootstrap-` to find your one-time admin setup token.
 2. Visit your Render service URL's `/admin/setup` → paste the token → create your admin account.
 3. Set custom domain (optional) → set `PARACHUTE_HUB_ORIGIN` env to match.
-4. Install modules via the admin SPA at `/admin/modules` (or via the wizard).
-
-Operators who want env-var-driven seeding (CI, scripted deploys) can still set `PARACHUTE_INITIAL_ADMIN_USERNAME` + `PARACHUTE_INITIAL_ADMIN_PASSWORD` manually in the Render dashboard — hub honors them when present.
+4. Install modules via the admin SPA at `/admin/modules`.
 
 Render's docs on Blueprints: <https://render.com/docs/blueprint-spec>
+
+#### Fly.io
+
+```sh
+gh repo fork ParachuteComputer/parachute-hub --clone && cd parachute-hub
+./scripts/deploy-to-fly.sh
+```
+
+The script installs `flyctl` if missing, runs `fly launch --copy-config`, and prints the URL. Provisions a shared-cpu-1x 512MB machine in `iad` (override with `--region` if your operators are elsewhere) + 1 GiB persistent volume at `/parachute`. Cost: ~$3.34/mo all-in.
+
+After deploy:
+
+1. `fly logs --app <your-app> | grep parachute-bootstrap-` to find your one-time admin token.
+2. Visit `https://<your-app>.fly.dev/admin/setup` → paste the token → create your admin account.
+3. Custom domain: `fly certs add <your-domain> --app <your-app>` then `fly secrets set PARACHUTE_HUB_ORIGIN=https://<your-domain>`.
+4. Install modules via the admin SPA at `/admin/modules`.
+
+Config in `fly.toml`. CLI-first ops; bring your own `flyctl`.
+
+#### Both platforms
+
+Pre-configured with `PARACHUTE_INSTALL_CHANNEL=latest` so modules you install via the admin SPA (vault, app, scribe, runner) pull stable releases by default. Flip to `rc` in your platform's env vars for the pre-release cascade.
+
+Operators who want env-var-driven seeding (CI, scripted deploys) can still set `PARACHUTE_INITIAL_ADMIN_USERNAME` + `PARACHUTE_INITIAL_ADMIN_PASSWORD` manually — hub honors them on both platforms.
 
 ## First 5 minutes
 

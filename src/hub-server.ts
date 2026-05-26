@@ -222,6 +222,12 @@ interface Args {
  *                                without operator config. Mirrors the
  *                                precedence in commands/serve.ts's
  *                                resolveStartupIssuer.
+ *   FLY_APP_NAME               — Fly.io sets this to the app name; we compose
+ *                                `https://${FLY_APP_NAME}.fly.dev` as a peer
+ *                                of RENDER_EXTERNAL_URL for the self-host-on-Fly
+ *                                path (patterns#100). Operators with custom
+ *                                domains attached set PARACHUTE_HUB_ORIGIN
+ *                                explicitly to override.
  */
 export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env): Args {
   let port: number | undefined;
@@ -260,10 +266,37 @@ export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
   if (hostname === undefined) hostname = env.PARACHUTE_BIND_HOST || "127.0.0.1";
   if (wellKnownDir === undefined) wellKnownDir = WELL_KNOWN_DIR;
   if (issuer === undefined) {
-    const fromEnv = env.PARACHUTE_HUB_ORIGIN ?? env.RENDER_EXTERNAL_URL;
+    const fromEnv =
+      env.PARACHUTE_HUB_ORIGIN ??
+      env.RENDER_EXTERNAL_URL ??
+      flyDefaultOrigin(env);
     if (fromEnv) issuer = fromEnv.replace(/\/+$/, "") || undefined;
   }
   return { port, hostname, wellKnownDir, dbPath: dbPath ?? hubDbPath(), issuer };
+}
+
+/**
+ * Compose the default Fly.io public origin from FLY_APP_NAME. Mirrors what
+ * `RENDER_EXTERNAL_URL` provides on Render — without an operator-set
+ * PARACHUTE_HUB_ORIGIN, we need *some* fallback so OAuth issuance + same-
+ * origin checks work out of the box. Fly doesn't auto-set a public-URL env
+ * var the way Render does, but every Fly app on the free shared TLS tier
+ * is reachable at `<app>.fly.dev` — composing it from FLY_APP_NAME is the
+ * canonical default.
+ *
+ * Operators on Fly with a custom domain attached should set
+ * PARACHUTE_HUB_ORIGIN explicitly via `fly secrets set` — that wins over
+ * this fallback (precedence in `parseArgs` above).
+ */
+function flyDefaultOrigin(env: NodeJS.ProcessEnv): string | undefined {
+  const app = env.FLY_APP_NAME;
+  // Mirror detectAutoExposeMode's slash-rejection — Fly slugs don't contain
+  // `/`, so anything with one is either spoofed or malformed. The composed
+  // URL is the OAuth issuer claim, so consistency in validation matters.
+  if (typeof app !== "string" || app.length === 0 || app.includes("/")) {
+    return undefined;
+  }
+  return `https://${app}.fly.dev`;
 }
 
 function parsePort(v: string): number {
@@ -1080,9 +1113,13 @@ export function hubFetch(
           // configured issuer. On Render, an operator who set hub_origin
           // via the admin SPA (or via a stale db row) to a non-public URL
           // would otherwise reject legitimate browser POSTs that arrive
-          // with the public Render URL as Origin. See origin-check.ts
+          // with the public Render URL as Origin. Same defense on Fly:
+          // the public <app>.fly.dev URL is the canonical Origin for
+          // browser POSTs and must be trusted even when the operator's
+          // configured issuer points elsewhere. See origin-check.ts
           // jsdoc for the failure case this closes.
-          platformOrigin: process.env.RENDER_EXTERNAL_URL,
+          platformOrigin:
+            process.env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(process.env),
         }),
     };
   };

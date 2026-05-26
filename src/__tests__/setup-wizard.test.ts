@@ -3029,3 +3029,35 @@ describe("detectAutoExposeMode — Render env detection edge cases (hub#407 nit)
     expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: undefined })).toBeUndefined();
   });
 });
+
+describe("detectAutoExposeMode — Fly env detection (patterns#100)", () => {
+  test("returns 'public' when FLY_APP_NAME is a plausible app slug", () => {
+    expect(detectAutoExposeMode({ FLY_APP_NAME: "my-parachute" })).toBe("public");
+  });
+
+  test("returns 'public' when FLY_APP_NAME is the only platform var set", () => {
+    expect(detectAutoExposeMode({ FLY_APP_NAME: "demo-hub" })).toBe("public");
+  });
+
+  test("returns undefined when FLY_APP_NAME is absent", () => {
+    expect(detectAutoExposeMode({})).toBeUndefined();
+  });
+
+  test("returns undefined when FLY_APP_NAME is empty", () => {
+    expect(detectAutoExposeMode({ FLY_APP_NAME: "" })).toBeUndefined();
+  });
+
+  test("rejects FLY_APP_NAME with a slash (defensive — Fly slugs don't contain /)", () => {
+    expect(detectAutoExposeMode({ FLY_APP_NAME: "../etc/passwd" })).toBeUndefined();
+    expect(detectAutoExposeMode({ FLY_APP_NAME: "a/b" })).toBeUndefined();
+  });
+
+  test("Render takes precedence when both are set (pathological co-set)", () => {
+    expect(
+      detectAutoExposeMode({
+        RENDER_EXTERNAL_URL: "https://app.onrender.com",
+        FLY_APP_NAME: "my-parachute",
+      }),
+    ).toBe("public");
+  });
+});

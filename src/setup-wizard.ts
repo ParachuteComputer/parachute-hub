@@ -233,19 +233,19 @@ export interface SetupWizardDeps {
 /**
  * Returns `"public"` when the runtime env indicates the hub is deployed
  * on a platform where the "how will this hub be reached?" answer is
- * pre-determined by the platform. Today: Render (sets RENDER_EXTERNAL_URL
- * for any web service). Returns `undefined` otherwise — the wizard's
- * expose step asks the operator.
+ * pre-determined by the platform. Today: Render (sets RENDER_EXTERNAL_URL)
+ * and Fly.io (sets FLY_APP_NAME, reachable at `<app>.fly.dev`). Returns
+ * `undefined` otherwise — the wizard's expose step asks the operator.
  *
- * Why this matters: on Render, none of the three radio options
+ * Why this matters: on a managed PaaS, none of the three radio options
  * (localhost, tailnet, public-with-custom-domain) match the actual
- * setup. The hub is reached at `*.onrender.com` automatically. Asking
- * the operator wastes a click and surfaces three options that don't
- * speak to their situation. Auto-pinning `public` skips the step.
+ * setup. The hub is reached at the platform-assigned URL automatically.
+ * Asking the operator wastes a click and surfaces three options that
+ * don't speak to their situation. Auto-pinning `public` skips the step.
  *
- * Add more platforms here when we encounter them — e.g. Fly.io
- * (FLY_APP_NAME), Railway (RAILWAY_ENVIRONMENT), etc. Each only auto-
- * detects when the platform clearly owns the public URL.
+ * Add more platforms here when we encounter them — e.g. Railway
+ * (RAILWAY_ENVIRONMENT), DigitalOcean App Platform (DIGITALOCEAN_APP_*),
+ * etc. Each only auto-detects when the platform clearly owns the public URL.
  */
 export function detectAutoExposeMode(env: Record<string, string | undefined>): "public" | undefined {
   // Render always sets `RENDER_EXTERNAL_URL` to a real `https://` URL on
@@ -253,8 +253,21 @@ export function detectAutoExposeMode(env: Record<string, string | undefined>): "
   // also accept `http://` as a defensive fallback in case Render ever
   // changes the scheme on some plan tier. Anything else (empty, weird,
   // not a URL) → don't auto-skip; let the operator choose.
-  const url = env.RENDER_EXTERNAL_URL;
-  if (typeof url === "string" && (url.startsWith("https://") || url.startsWith("http://"))) {
+  const renderUrl = env.RENDER_EXTERNAL_URL;
+  if (
+    typeof renderUrl === "string" &&
+    (renderUrl.startsWith("https://") || renderUrl.startsWith("http://"))
+  ) {
+    return "public";
+  }
+  // Fly.io sets FLY_APP_NAME (the app slug) on every machine. Unlike
+  // Render, Fly doesn't auto-inject a public-URL env var — but every
+  // Fly app on shared TLS is reachable at `<app>.fly.dev`, so the
+  // presence of FLY_APP_NAME is the canonical "we're on Fly with a
+  // public URL" signal. Validate it's a plausible slug (non-empty,
+  // no scheme weirdness) before trusting it.
+  const flyApp = env.FLY_APP_NAME;
+  if (typeof flyApp === "string" && flyApp.length > 0 && !flyApp.includes("/")) {
     return "public";
   }
   return undefined;
