@@ -23,6 +23,7 @@
  */
 import { type ReactNode, useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
+import { BrandMark, WORDMARK_TEXT } from "./components/BrandMark.tsx";
 import { HubVersionBadge } from "./components/HubVersionBadge.tsx";
 import { type MeResponse, type ModuleListing, getMe, listModules, signOut } from "./lib/api.ts";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
@@ -141,7 +142,9 @@ export function App() {
     <div className="page">
       <nav className="nav">
         <Link to="/vaults" className="brand">
-          Parachute Admin <span className="sub">{subtitle}</span>
+          <BrandMark size={18} idSuffix="spa-nav" className="brand-mark-icon" />
+          <span className="brand-wordmark">{WORDMARK_TEXT}</span>
+          <span className="sub">{subtitle}</span>
         </Link>
         <AuthIndicator me={me} signingOut={signingOut} onSignOut={onSignOut} />
         <Link to="/vaults">Vaults</Link>
