@@ -2,6 +2,14 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.47] - 2026-05-26
+
+**OAuth approval friction relaxed — trust by client_name (#409).**
+
+### Added
+
+- **Trust-by-client_name** auto-approves DCR clients when the operator has previously approved a same-named client (#409). CLI MCP clients (Claude Code et al.) re-DCR each session, each landing a fresh `client_id` with `status: pending`. Strict `(user, client_id)` approval forced the operator to click "Approve" + "Approve consent" every single session even though they'd approved the same app many times. Now: once you approve "claude-code" once, subsequent re-DCRs with that client_name + scopes already-trusted auto-promote to approved + skip consent. Zero clicks after the first time. Verified locally — `[oauth] auto-approved pending client by prior client_name trust` + `consent skipped: existing grant covers requested scope` log entries fire on round 2 of the same `claude mcp add` flow. Five guardrails kept: operator session required, same-origin enforced, non-empty client_name, non-admin scopes only, scope subset check.
+
 ## [0.5.13-rc.46] - 2026-05-26
 
 **Defense in depth + Render UX polish.** Caught when Aaron walked a fresh wizard + Install App + click Notes and hit `service routing failed: services[2]: "port" must be an integer 1..65535` — one bad row in services.json (written by an older `@openparachute/app` install) was cascading into 500s for every route.
