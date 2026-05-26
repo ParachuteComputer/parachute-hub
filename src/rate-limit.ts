@@ -36,6 +36,13 @@
  * the map, so an attacker cycling through keys can't grow the map
  * without also leaving timestamps in each.
  *
+ * One edge case worth naming: a per-stable-key limiter (e.g. /change-password
+ * keyed by user.id) can leave an empty bucket for a user who hit the limit
+ * once and never returned — the prune only fires on `checkAndRecord` for
+ * that same key. Real-world scale is tiny (hundreds of users → hundreds of
+ * empty bucket entries at worst), so this is a documentation note, not a
+ * leak. Per-IP limiters (e.g. /login) self-prune as attackers cycle keys.
+ *
  * Auth-stage independence: callers MUST gate via `checkAndRecord` *before*
  * the credential check. A 2FA (or password) failure should count toward
  * the same bucket as a wrong password — an attacker who knows the
