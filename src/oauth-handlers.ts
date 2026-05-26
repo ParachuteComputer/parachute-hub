@@ -536,6 +536,13 @@ function pendingClientResponse(
   //      if it ever becomes requestable) require explicit per-session
   //      consent. This guard mirrors the same-hub-auto-trust gate's
   //      treatment of admin scopes (handleAuthorizeGet ~line 854).
+  //      NOTE: `scopeIsAdmin` has a documented blind spot for
+  //      module-declared admin scopes (e.g. a hypothetical `runner:admin`
+  //      registered via a module manifest's scopes.defines). See
+  //      `src/scope-explanations.ts:191`. A future module that makes a
+  //      module-admin scope requestable via public DCR would silently
+  //      bypass this guard. Worth a tighter scope-classification helper
+  //      when that becomes a real risk.
   if (
     session &&
     sameOrigin &&
