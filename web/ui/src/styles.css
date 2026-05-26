@@ -105,7 +105,21 @@ code {
 
 .nav {
   display: flex;
-  gap: 1rem;
+  /* Wrap on narrow viewports so the nav reflows instead of forcing
+     horizontal overflow on the document. At 375 px the document was
+     measuring 787 px — every nav child (10 links + brand + auth) lined
+     up in a single flex row whose intrinsic min-content width exceeded
+     the viewport. `.page`'s `max-width: 880px` doesn't help here:
+     max-width caps the box's layout size but does not prevent overflow
+     from a flex row's intrinsic content width. Only `flex-wrap`,
+     `overflow: hidden`, or `min-width: 0` on flex children can. We pick
+     `flex-wrap: wrap` because the nav reflowing naturally on narrow
+     viewports is the desired UX. Closes hub#391. */
+  flex-wrap: wrap;
+  /* Tighter vertical gap (row-gap 0.6rem) than horizontal (column-gap
+     1rem) so a wrapped second/third row reads as continuation, not a
+     new section. */
+  gap: 0.6rem 1rem;
   align-items: center;
   padding-bottom: 1rem;
   border-bottom: 1px solid var(--border);

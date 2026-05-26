@@ -698,6 +698,40 @@ export function renderError(props: ErrorViewProps): string {
   return baseDocument(props.title, body);
 }
 
+/**
+ * Generic "Not found" page rendered when no other route matches. Replaces
+ * the `new Response("not found", { status: 404 })` plaintext fallback
+ * (closes hub#392) with a branded HTML page that:
+ *
+ *   1. Tells the operator they took a wrong turn (vs. "the hub is broken").
+ *   2. Offers one clear CTA back to the hub home.
+ *
+ * Status code stays 404 — no soft-redirect to `/`. The Response is built
+ * by the caller in `hub-server.ts`; this function returns only the HTML
+ * body so a future caller can use it from other 404 surfaces (per-vault
+ * 404, per-module 404) without going through Response construction here.
+ */
+export function renderNotFoundPage(pathname: string): string {
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "not-found")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
+        </div>
+        <h1 class="error-title">Not found</h1>
+        <p class="subtitle">
+          We don't have anything at <code>${escapeHtml(pathname)}</code>. The link
+          may have changed, or the page never existed.
+        </p>
+      </div>
+      <p class="error-help">
+        <a href="/" class="btn btn-primary">Go to hub home</a>
+      </p>
+    </div>`;
+  return baseDocument("Not found", body);
+}
+
 export interface UnknownClientViewProps {
   /** The unknown client_id the request carried. Surfaced verbatim for debugging. */
   clientId: string;

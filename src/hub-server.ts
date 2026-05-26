@@ -165,7 +165,9 @@ import {
   handleRegister,
   handleRevoke,
   handleToken,
+  protectedResourceMetadata,
 } from "./oauth-handlers.ts";
+import { renderNotFoundPage } from "./oauth-ui.ts";
 import { buildHubBoundOrigins } from "./origin-check.ts";
 import { clearPid, writePid } from "./process-state.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
@@ -1512,6 +1514,23 @@ export function hubFetch(
       return new Response(res.body, { status: res.status, headers: merged });
     }
 
+    if (pathname === "/.well-known/oauth-protected-resource") {
+      // RFC 9728 — companion to oauth-authorization-server. MCP clients
+      // (since 2025-06-18 spec) probe this to discover scopes + the
+      // authorization server. Same wildcard CORS shape. Closes hub#393.
+      const corsHeaders = {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, OPTIONS",
+      };
+      if (req.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders });
+      }
+      const res = protectedResourceMetadata(oauthDeps(req));
+      const merged = new Headers(res.headers);
+      for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
+      return new Response(res.body, { status: res.status, headers: merged });
+    }
+
     // OAuth surface — every handler return is wrapped in `applyCorsHeaders`
     // so third-party SPAs can fetch these endpoints cross-origin (the entire
     // point of OAuth DCR: arbitrary SPAs register → authorize → exchange
@@ -1953,6 +1972,18 @@ export function hubFetch(
     const proxied = await proxyToService(req, manifestPath);
     if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
 
+    // Branded fall-through 404 (closes hub#392) — the operator who mistyped
+    // a URL sees a clear "not found" page with a path back home, not the
+    // browser's default empty-body chrome. Only HTML clients get the
+    // rendered page; non-HTML callers (curl, API probes) still see the
+    // shorter "not found" text so log noise stays low.
+    const wantsHtml = (req.headers.get("accept") ?? "").includes("text/html");
+    if (wantsHtml) {
+      return new Response(renderNotFoundPage(pathname), {
+        status: 404,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
     return new Response("not found", { status: 404 });
   };
 }
