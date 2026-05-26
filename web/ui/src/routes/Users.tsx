@@ -193,7 +193,7 @@ export function Users() {
   return (
     <div>
       <div className="list-header">
-        <h2>Users</h2>
+        <h1>Users</h1>
       </div>
 
       <p className="muted">
@@ -287,7 +287,8 @@ function ListRendered({
 }: ListRenderedProps): React.ReactNode {
   return (
     <div className="user-list" style={{ marginTop: "1rem" }}>
-      <table className="user-table">
+      <div className="table-scroll">
+        <table className="user-table">
         <thead>
           <tr>
             <th scope="col">Username</th>
@@ -411,6 +412,7 @@ function ListRendered({
           })}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }

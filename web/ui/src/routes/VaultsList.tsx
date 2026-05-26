@@ -90,7 +90,7 @@ export function VaultsList() {
     return (
       <div>
         <div className="list-header">
-          <h2>Vaults</h2>
+          <h1>Vaults</h1>
         </div>
         <p className="muted">Loading…</p>
       </div>
@@ -101,7 +101,7 @@ export function VaultsList() {
     return (
       <div>
         <div className="list-header">
-          <h2>Vaults</h2>
+          <h1>Vaults</h1>
           <Link to="/vaults/new">
             <button type="button">New vault</button>
           </Link>
@@ -125,7 +125,7 @@ export function VaultsList() {
   return (
     <div>
       <div className="list-header">
-        <h2>Vaults ({state.vaults.length})</h2>
+        <h1>Vaults ({state.vaults.length})</h1>
         {moduleMissing ? (
           // Cross-SPA-route navigation stays inside the SPA basename, so
           // react-router's <Link> resolves to /admin/modules. Plain

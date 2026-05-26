@@ -93,7 +93,7 @@ export function Permissions() {
   return (
     <div>
       <div className="list-header">
-        <h2>Permissions</h2>
+        <h1>Permissions</h1>
       </div>
 
       <p className="muted">
