@@ -2,6 +2,32 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.42] - 2026-05-25
+
+**feat(hub): persistent cross-surface chrome strip (workstream G) + two operator-facing bug fixes flagged on Aaron's live Render deploy.**
+
+### Added
+
+- **Persistent cross-surface chrome strip (workstream G, hub#377).** Hub's proxy middleware now injects a 32px sticky top bar onto every proxied module HTML surface, carrying brand + Home link + signed-in cluster. Modules opt in by being proxied through hub; the Notes PWA opts out via a hub-side path-prefix deny-list. Implementation includes a load-bearing token-fallback shim (`--pc-chrome-*` defaults to canonical palette hex) so the strip renders correctly even on surfaces that haven't yet declared design-system tokens at `:root`. Spec lifted into [parachute-patterns design-system.md §7](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/design-system.md) (patterns#98). Includes a `proxyRequest` `Accept-Encoding: identity` strip so chrome injection sees uncompressed upstream bodies — without it gzip-compressed module responses would corrupt silently. 49 new tests pin injection / opt-out / oversize-skip / idempotence / display-name-XSS-escape.
+
+### Fixed
+
+- **`/api/modules` `management_url` no longer double-prepends mount (hub#380).** Audit bug #140 caught on Aaron's deploy: clicking Services → App in the admin SPA navigated to `/app/app/admin/` (404). The well-known emission was already correct; this fix is in `/api/modules`'s management_url resolution. Single-instance modules (app, scribe, runner) declare full hub-origin paths (e.g. `/app/admin/`) that already include the mount — the old code unconditionally prepended again. New detection passes through when `tail === mount || tail.startsWith(\`${mount}/\`)`. 3 new tests pin the multi-instance / single-instance / prefix-collision boundaries.
+
+- **`PARACHUTE_INSTALL_CHANNEL` env var now authoritative over DB on every read (hub#381).** Audit bug #137 caught on Aaron's deploy: set env=rc but admin SPA showed `latest` until manually toggled. Two issues: hub-settings only read `PARACHUTE_MODULE_CHANNEL` (historical name) while everywhere else used `PARACHUTE_INSTALL_CHANNEL` (documented name); and DB-after-first-seed precedence ignored later env changes. Fix: env > DB > default, both env names honored (INSTALL canonical, MODULE back-compat). When env is set, env wins on every read; SPA toggle still writes to DB as the env-unset fallback.
+
+### Patterns check
+
+- Adopts [design-system.md §7](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/design-system.md) (persistent chrome strip spec).
+- Reinforces the multi-instance vs single-instance `uiUrl`/`managementUrl` convention from [module-ui-declaration.md](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/module-ui-declaration.md).
+
+### Verification
+
+- `bun run typecheck` (server + web/ui) clean.
+- `bun test ./src`: 2018 pass / 0 fail (+57 from rc.41 baseline of 1961).
+- `bun run test` (web/ui): 213 pass / 0 fail.
+- Container smoke CI ✓ on each constituent merge commit.
+
 ## [0.5.13-rc.41] - 2026-05-25
 
 **fix(hub): upgrade-available version respects `module_install_channel` (hub#378).**
