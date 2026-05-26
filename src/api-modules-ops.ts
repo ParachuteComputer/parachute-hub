@@ -363,8 +363,8 @@ function resolveApiInstallChannel(
       );
     }
   }
-  // 3. Admin-toggle setting (hub#275). Seeds from `PARACHUTE_MODULE_CHANNEL`
-  // on first read; after that the row is source of truth.
+  // 3. Admin-toggle setting (hub#275). Default for the OS process when no env
+  // override (#2) is set — see `getModuleInstallChannel` for the DB seed/read.
   return getModuleInstallChannel(deps.db);
 }
 
