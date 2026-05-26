@@ -379,6 +379,14 @@ export function protectedResourceMetadata(deps: OAuthDeps): Response {
     scopes_supported: Array.from(declared).filter(isRequestableScope),
     bearer_methods_supported: ["header"],
     resource_documentation: "https://parachute.computer",
+    // Intentional omission: `resource_signing_alg_values_supported` +
+    // `signed_metadata`. Hub serves the resource metadata document
+    // unsigned today — MCP clients that probe for a signed metadata
+    // JWT will fall back to verifying the resource via the
+    // authorization-server's JWKS-signed access tokens. When the signed
+    // metadata path lands here (likely once a downstream MCP client
+    // requires it for offline verification), add the alg list + the
+    // `signed_metadata` JWT alongside.
   });
 }
 
