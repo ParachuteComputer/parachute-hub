@@ -595,6 +595,12 @@ function pendingClientResponse(
     // an RFC 6749 §4.1.2.1 error response. redirect_uri is required by
     // the spec on /oauth/authorize so it's reliably present; state is
     // optional per the spec, so undefined-passes-through.
+    //
+    // We round-trip both values through hidden form inputs rather than
+    // re-parsing them from `return_to` in the handler. Reason: keeps the
+    // handler stateless about authorize-URL shape — it just reads the
+    // form. State is also not stored server-side (it never was; OAuth
+    // state lives in the query string by design).
     const requestRedirectUri = authorizeUrl.searchParams.get("redirect_uri") ?? "";
     const requestState = authorizeUrl.searchParams.get("state") ?? undefined;
     return htmlResponse(
@@ -1380,6 +1386,14 @@ export async function handleApproveClientPost(
   // Deny does NOT mutate the client row — the client stays `pending` and
   // the operator can revisit later from /admin/permissions or re-trigger
   // OAuth from the calling app.
+  //
+  // The decision default is `"approve"` — that covers both back-compat
+  // (older forms that don't carry the field at all) AND any unexpected
+  // value (e.g. `decision="garbage"`). The reasoning: only the literal
+  // string `"deny"` triggers the destructive-from-the-client's-perspective
+  // path; everything else is treated as the safe, prior behavior. A user
+  // can't accidentally land on the error redirect by clicking a malformed
+  // button.
   const decision = String(form.get("decision") ?? "approve");
   if (decision === "deny") {
     const denyRedirectUri = String(form.get("redirect_uri") ?? "");
@@ -1392,7 +1406,20 @@ export async function handleApproveClientPost(
     }
     const stateRaw = form.get("state");
     const denyState = typeof stateRaw === "string" && stateRaw.length > 0 ? stateRaw : undefined;
-    const target = new URL(denyRedirectUri);
+    // `new URL()` could in principle throw if a legacy code path bypassed
+    // `isValidRedirectUri` at registration and wrote a non-http(s) URI.
+    // Current DCR enforces validity at write time, so this catch is
+    // belt-and-suspenders, but cost is near-zero.
+    let target: URL;
+    try {
+      target = new URL(denyRedirectUri);
+    } catch {
+      return htmlError(
+        "Invalid form submission",
+        "The registered redirect_uri for this app is not a valid URL.",
+        400,
+      );
+    }
     target.searchParams.set("error", "access_denied");
     target.searchParams.set(
       "error_description",
