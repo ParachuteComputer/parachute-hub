@@ -14,6 +14,7 @@ import {
   DEFAULT_MODULE_INSTALL_CHANNEL,
   FIRST_CLIENT_AUTO_APPROVE_WINDOW_MS,
   MODULE_INSTALL_CHANNELS,
+  PARACHUTE_INSTALL_CHANNEL_ENV,
   PARACHUTE_MODULE_CHANNEL_ENV,
   SETUP_EXPOSE_MODES,
   consumeFirstClientAutoApproveWindow,
@@ -276,27 +277,31 @@ describe("hub-settings — module install channel bootstrap", () => {
     }
   });
 
-  test("first read with PARACHUTE_MODULE_CHANNEL=rc seeds with rc", () => {
+  test("env=rc returns rc (env shadows DB; no auto-write to DB per #137 redesign)", () => {
     const db = openHubDb(hubDbPath(dir));
     try {
       const channel = getModuleInstallChannel(db, {
         env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "rc" },
       });
       expect(channel).toBe("rc");
-      expect(getSetting(db, "module_install_channel")).toBe("rc");
+      // DB stays empty — env wins on read without persisting (so a later
+      // SPA toggle can hold a different value as the "DB authoritative
+      // when env is unset" fallback). Pre-#137 the env value was written
+      // to DB; the new behavior preserves operator-write intent.
+      expect(getSetting(db, "module_install_channel")).toBeUndefined();
     } finally {
       db.close();
     }
   });
 
-  test("first read with PARACHUTE_MODULE_CHANNEL=latest seeds with latest", () => {
+  test("env=latest returns latest (env shadows DB; no auto-write)", () => {
     const db = openHubDb(hubDbPath(dir));
     try {
       const channel = getModuleInstallChannel(db, {
         env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "latest" },
       });
       expect(channel).toBe("latest");
-      expect(getSetting(db, "module_install_channel")).toBe("latest");
+      expect(getSetting(db, "module_install_channel")).toBeUndefined();
     } finally {
       db.close();
     }
@@ -311,6 +316,9 @@ describe("hub-settings — module install channel bootstrap", () => {
         warn: (msg) => warns.push(msg),
       });
       expect(channel).toBe("latest");
+      // Invalid env value → warn fires, env contribution is discarded, falls
+      // through to DB (none) → default. DB seeded with default since neither
+      // env nor DB had a usable value.
       expect(getSetting(db, "module_install_channel")).toBe("latest");
       expect(warns.length).toBe(1);
       expect(warns[0]).toMatch(/PARACHUTE_MODULE_CHANNEL="stable"/);
@@ -335,34 +343,100 @@ describe("hub-settings — module install channel bootstrap", () => {
     }
   });
 
-  test("once seeded, env var is ignored on subsequent reads", () => {
+  test("env wins on every read — DB no longer authoritative when env is set (bug #137)", () => {
+    // Updated 2026-05-25: precedence flipped from "DB after first seed" to
+    // "env always wins when set." Operator on a container platform expects
+    // setting PARACHUTE_INSTALL_CHANNEL to take effect on the next request,
+    // not require an admin SPA toggle to "reset" the DB. Aaron caught the
+    // prior behavior on his Render deploy (set env=rc, container restarted,
+    // UI still showed `latest` because DB had been seeded with the default
+    // at first boot before he set the env var).
     const db = openHubDb(hubDbPath(dir));
     try {
-      // First read seeds with rc.
-      getModuleInstallChannel(db, { env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "rc" } });
-      // Second read with a different env value still returns the seeded value.
-      const channel = getModuleInstallChannel(db, {
-        env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "latest" },
-      });
-      expect(channel).toBe("rc");
-      // And with no env at all.
-      expect(getModuleInstallChannel(db, { env: {} })).toBe("rc");
+      // First read with rc — DB seeds with rc.
+      getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } });
+      // Second read with a different env value returns the NEW env value
+      // (env wins over the previously-seeded DB row).
+      expect(
+        getModuleInstallChannel(db, {
+          env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "latest" },
+        }),
+      ).toBe("latest");
+      // With env unset, DB falls through and returns whatever was last
+      // written (latest from the previous call's idempotent sync).
+      expect(getModuleInstallChannel(db, { env: {} })).toBe("latest");
     } finally {
       db.close();
     }
   });
 
-  test("setModuleInstallChannel persists the new value, subsequent reads return it", () => {
+  test("both env var names honored — PARACHUTE_INSTALL_CHANNEL preferred, PARACHUTE_MODULE_CHANNEL back-compat (bug #137)", () => {
     const db = openHubDb(hubDbPath(dir));
     try {
-      // Seed with rc via env.
-      getModuleInstallChannel(db, { env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "rc" } });
-      // Admin toggles to latest.
-      setModuleInstallChannel(db, "latest");
-      expect(getModuleInstallChannel(db, { env: {} })).toBe("latest");
-      // And back to rc — no env needed.
+      // PARACHUTE_INSTALL_CHANNEL — canonical name (matches install.ts).
+      expect(
+        getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } }),
+      ).toBe("rc");
+      // PARACHUTE_MODULE_CHANNEL — legacy alias, still recognized.
+      const db2 = openHubDb(join(mkdtempSync(join(tmpdir(), "phub-hsalt-")), "hub.db"));
+      try {
+        expect(
+          getModuleInstallChannel(db2, { env: { [PARACHUTE_MODULE_CHANNEL_ENV]: "rc" } }),
+        ).toBe("rc");
+      } finally {
+        db2.close();
+      }
+      // When both are set, INSTALL_CHANNEL wins (operator-facing canonical).
+      const db3 = openHubDb(join(mkdtempSync(join(tmpdir(), "phub-hsalt-")), "hub.db"));
+      try {
+        expect(
+          getModuleInstallChannel(db3, {
+            env: {
+              [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc",
+              [PARACHUTE_MODULE_CHANNEL_ENV]: "latest",
+            },
+          }),
+        ).toBe("rc");
+      } finally {
+        db3.close();
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  test("setModuleInstallChannel persists; reads return it when env unset", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      // No env: write via setModuleInstallChannel, read returns it.
       setModuleInstallChannel(db, "rc");
       expect(getModuleInstallChannel(db, { env: {} })).toBe("rc");
+      setModuleInstallChannel(db, "latest");
+      expect(getModuleInstallChannel(db, { env: {} })).toBe("latest");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("SPA toggle is shadowed when env is set (env-wins trade-off)", () => {
+    // When the operator sets PARACHUTE_INSTALL_CHANNEL in their platform
+    // env, the admin SPA's channel-toggle effectively no-ops on the read
+    // path — writes still go through (so the DB stays in sync if env is
+    // later unset), but the env-set value wins on read. This trade-off is
+    // intentional: container env is the canonical source for operators on
+    // platforms like Render. Operators who want SPA-driven channel should
+    // unset the env.
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      // Env says rc.
+      const env = { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" };
+      expect(getModuleInstallChannel(db, { env })).toBe("rc");
+      // SPA "toggles" to latest. Write succeeds.
+      setModuleInstallChannel(db, "latest");
+      // Read still returns rc — env wins.
+      expect(getModuleInstallChannel(db, { env })).toBe("rc");
+      // If env is later unset, the DB value (latest) takes over.
+      expect(getModuleInstallChannel(db, { env: {} })).toBe("latest");
     } finally {
       db.close();
     }

@@ -218,24 +218,65 @@ export function isModuleInstallChannel(s: unknown): s is ModuleInstallChannel {
 }
 
 /**
- * Env var that seeds `module_install_channel` on first read. Read only
- * when the hub_settings row is absent — once the row exists, the env
- * var is ignored on subsequent boots (admin must use the SPA toggle or
- * the API to change channel). Lets Aaron's fresh-machine deploys ship
- * with `PARACHUTE_MODULE_CHANNEL=rc` baked into the platform's env
- * config without baking the channel into the binary or first-boot.
+ * Env vars consulted by `getModuleInstallChannel`. Both names are
+ * recognized; `PARACHUTE_INSTALL_CHANNEL` (the operator-facing name
+ * documented in `parachute --help` and used by `src/commands/install.ts`
+ * + `src/api-modules-ops.ts`) is preferred. `PARACHUTE_MODULE_CHANNEL`
+ * is the legacy name kept for back-compat with deploys that already
+ * baked it into their env config; it's a back-compat alias and may
+ * be retired one rc-chain after this lands.
+ *
+ * **Precedence (changed 2026-05-25 — was DB-first):** env > DB > default.
+ * An operator who sets the env var in their platform dashboard expects
+ * that value to be authoritative on every boot — the prior "DB always
+ * wins after first seed" behavior produced the failure mode Aaron hit
+ * (set env=rc, container restarted, UI still showed `latest` because
+ * DB had been seeded with the default at first boot before the env was
+ * set). Bug #137 in the audit.
+ *
+ * When the env is set, the SPA's channel toggle is shadowed (writes go
+ * through to the DB but the env-set value still wins on read). That
+ * trade-off is acceptable for container deploys where env is the
+ * canonical source; operators who want SPA-driven control should unset
+ * the env var.
  */
-export const PARACHUTE_MODULE_CHANNEL_ENV = "PARACHUTE_MODULE_CHANNEL";
+export const PARACHUTE_INSTALL_CHANNEL_ENV = "PARACHUTE_INSTALL_CHANNEL";
+export const PARACHUTE_MODULE_CHANNEL_ENV = "PARACHUTE_MODULE_CHANNEL"; // legacy alias
 
 /** Fallback when nothing else is set — the stable channel. */
 export const DEFAULT_MODULE_INSTALL_CHANNEL: ModuleInstallChannel = "latest";
 
 /**
- * Read the configured module install channel. On first call (no row in
- * hub_settings), seeds from `process.env.PARACHUTE_MODULE_CHANNEL` if
- * valid, otherwise defaults to `"latest"` (an invalid env value warns
- * + still falls back to "latest"). After that first seed, the
- * hub_settings row is source of truth.
+ * Resolve the env-set channel, if any. Returns the channel value or
+ * `null` if no env var is set; throws via `warn()` if a value is set
+ * but invalid (still returns null in that case, so caller falls
+ * through to DB/default).
+ */
+function resolveChannelFromEnv(
+  env: NodeJS.ProcessEnv,
+  warn: (msg: string) => void,
+): ModuleInstallChannel | null {
+  for (const name of [PARACHUTE_INSTALL_CHANNEL_ENV, PARACHUTE_MODULE_CHANNEL_ENV]) {
+    const raw = env[name];
+    if (typeof raw !== "string" || raw.length === 0) continue;
+    if (isModuleInstallChannel(raw)) return raw;
+    warn(
+      `[hub-settings] ${name}="${raw}" is not a valid channel — expected one of ${MODULE_INSTALL_CHANNELS.join(", ")}. Falling back to "${DEFAULT_MODULE_INSTALL_CHANNEL}".`,
+    );
+  }
+  return null;
+}
+
+/**
+ * Read the configured module install channel.
+ *
+ * Precedence: env (PARACHUTE_INSTALL_CHANNEL > PARACHUTE_MODULE_CHANNEL)
+ * > DB (hub_settings) > default ("latest").
+ *
+ * The DB is still seeded with the resolved value on first read so the
+ * SPA shows a stable "current channel" even when env is set — but the
+ * env always wins on read, so a platform-level env change takes effect
+ * immediately without operator intervention.
  *
  * The `env` + `warn` knobs are test seams — production uses
  * `process.env` + `console.warn`. Tests inject a deterministic shape so
@@ -248,30 +289,34 @@ export function getModuleInstallChannel(
     warn?: (msg: string) => void;
   } = {},
 ): ModuleInstallChannel {
-  const existing = getSetting(db, "module_install_channel");
-  if (existing !== undefined) {
-    // Row already seeded — trust it. If somehow corrupted (manual sqlite
-    // edit, schema drift), fall back to "latest" silently rather than
-    // crashing the install path. Re-seeding the row is left to the
-    // admin's explicit setModuleInstallChannel call.
-    if (isModuleInstallChannel(existing)) return existing;
-    return DEFAULT_MODULE_INSTALL_CHANNEL;
-  }
   const env = opts.env ?? process.env;
   const warn = opts.warn ?? ((msg: string) => console.warn(msg));
-  const fromEnv = env[PARACHUTE_MODULE_CHANNEL_ENV];
-  let seed: ModuleInstallChannel = DEFAULT_MODULE_INSTALL_CHANNEL;
-  if (typeof fromEnv === "string" && fromEnv.length > 0) {
-    if (isModuleInstallChannel(fromEnv)) {
-      seed = fromEnv;
-    } else {
-      warn(
-        `[hub-settings] ${PARACHUTE_MODULE_CHANNEL_ENV}="${fromEnv}" is not a valid channel — expected one of ${MODULE_INSTALL_CHANNELS.join(", ")}. Falling back to "${DEFAULT_MODULE_INSTALL_CHANNEL}".`,
-      );
-    }
+
+  // Env wins.
+  const fromEnv = resolveChannelFromEnv(env, warn);
+  if (fromEnv !== null) {
+    // Do NOT write to DB — that would overwrite a separate operator-driven
+    // value (e.g. an SPA toggle while env was unset). The DB tracks the
+    // last operator-written value as a fallback for when env is later
+    // unset; env just shadows on read. Cost: the SPA's "current channel"
+    // indicator may show the DB value while env is shadowing it. Future
+    // work (#137 follow-up) can expose a `source` field so the SPA can
+    // surface "shadowed by env" UX.
+    return fromEnv;
   }
-  setSetting(db, "module_install_channel", seed);
-  return seed;
+
+  // Env unset → DB next.
+  const existing = getSetting(db, "module_install_channel");
+  if (existing !== undefined) {
+    if (isModuleInstallChannel(existing)) return existing;
+    // Corrupted value (manual sqlite edit, schema drift) — fall through
+    // to default silently rather than crashing the install path.
+    return DEFAULT_MODULE_INSTALL_CHANNEL;
+  }
+
+  // Neither env nor DB → seed default + return.
+  setSetting(db, "module_install_channel", DEFAULT_MODULE_INSTALL_CHANNEL);
+  return DEFAULT_MODULE_INSTALL_CHANNEL;
 }
 
 /**
