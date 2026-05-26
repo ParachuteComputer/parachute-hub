@@ -249,7 +249,7 @@ export async function handleAccountChangePasswordPost(
   // grind window against argon2id. Same 429 + Retry-After shape as
   // /login (admin-handlers.ts), with the re-rendered form body so the
   // signed-in user sees a coherent page rather than a bare error chrome.
-  const rlNow = deps.now ? deps.now() : new Date();
+  const rlNow = (deps.now ?? (() => new Date()))();
   const gate = changePasswordRateLimiter.checkAndRecord(user.id, rlNow);
   if (!gate.allowed) {
     return htmlResponse(

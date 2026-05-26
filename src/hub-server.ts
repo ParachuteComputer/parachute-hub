@@ -1915,6 +1915,9 @@ export function hubFetch(
     // password (design §"Direct navigation").
     if (pathname === "/account/change-password") {
       if (!getDb) return dbNotConfigured();
+      // `now` deliberately omitted — handlers fall through to `new Date()` in
+      // production; the seam exists only so tests can advance the rate-limiter
+      // clock deterministically.
       const accountDeps = { db: getDb() };
       if (req.method === "GET") return handleAccountChangePasswordGet(req, accountDeps);
       if (req.method === "POST") return handleAccountChangePasswordPost(req, accountDeps);
