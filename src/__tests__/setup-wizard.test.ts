@@ -30,6 +30,7 @@ import { writeManifest } from "../services-manifest.ts";
 import { SESSION_COOKIE_NAME } from "../sessions.ts";
 import {
   deriveWizardState,
+  detectAutoExposeMode,
   handleSetupAccountPost,
   handleSetupExposePost,
   handleSetupGet,
@@ -166,6 +167,62 @@ describe("deriveWizardState", () => {
       expect(s.step).toBe("expose");
       expect(s.hasAdmin).toBe(true);
       expect(s.hasVault).toBe(true);
+      expect(s.hasExposeMode).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("auto-skips expose step when RENDER_EXTERNAL_URL is set (hub#406 follow-up)", async () => {
+    // Aaron's UX concern: on Render the "How will this hub be reached?"
+    // step asks the operator to pick between localhost / tailnet /
+    // public-with-custom-domain — none of which describe the actual
+    // setup. The platform owns the public URL via RENDER_EXTERNAL_URL.
+    // deriveWizardState now auto-seeds `setup_expose_mode = "public"`
+    // when that env var is present, so the wizard skips straight to
+    // the done screen instead of surfacing an irrelevant choice.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      // Simulate Render env. detectAutoExposeMode reads RENDER_EXTERNAL_URL.
+      const renderEnv = { RENDER_EXTERNAL_URL: "https://parachute-hub.onrender.com" };
+      const s = deriveWizardState({ db, manifestPath: h.manifestPath, env: renderEnv });
+      expect(s.step).toBe("done");
+      expect(s.hasExposeMode).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("does NOT auto-skip expose when RENDER_EXTERNAL_URL is unset (local install path)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            { name: "parachute-vault", version: "0.1.0", port: 1940, paths: ["/vault/default"], health: "/health" },
+          ],
+        },
+        h.manifestPath,
+      );
+      const s = deriveWizardState({ db, manifestPath: h.manifestPath, env: {} });
+      // Local install path — the operator still gets to choose
+      expect(s.step).toBe("expose");
       expect(s.hasExposeMode).toBe(false);
     } finally {
       db.close();
@@ -2942,5 +2999,33 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+describe("detectAutoExposeMode — Render env detection edge cases (hub#407 nit)", () => {
+  test("returns 'public' for a real https Render URL", () => {
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "https://parachute-hub.onrender.com" })).toBe("public");
+  });
+
+  test("returns 'public' for an http:// URL (defensive — if Render ever emits one)", () => {
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "http://local.test:1939" })).toBe("public");
+  });
+
+  test("returns undefined when RENDER_EXTERNAL_URL is absent", () => {
+    expect(detectAutoExposeMode({})).toBeUndefined();
+  });
+
+  test("returns undefined when RENDER_EXTERNAL_URL is empty", () => {
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "" })).toBeUndefined();
+  });
+
+  test("returns undefined for a non-http scheme (httpx://, ftp://, etc.)", () => {
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "httpx://foo.example" })).toBeUndefined();
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "ftp://foo.example" })).toBeUndefined();
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "javascript:alert(1)" })).toBeUndefined();
+  });
+
+  test("returns undefined when value is non-string (defensive)", () => {
+    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: undefined })).toBeUndefined();
   });
 });
