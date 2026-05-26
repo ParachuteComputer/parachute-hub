@@ -405,6 +405,88 @@ function validateManifest(raw: unknown, where: string): ServicesManifest {
   return { services: entries };
 }
 
+/**
+ * Lenient counterpart to `readManifest` — used by hub's hot-path service
+ * routing (`proxyToService`). The strict `readManifest` throws when ANY
+ * entry fails validation; an entire bad row (e.g. an installed module
+ * that wrote `port: 0` to its services.json row before the module's
+ * own selfRegister gained validation) takes down ALL routing because
+ * the routing call site catches the throw and returns 500.
+ *
+ * This lenient reader:
+ *   - parses the file the same way (JSON parse + cleanup passes)
+ *   - validates each entry independently
+ *   - skips entries that fail validation, logging a warning per skip
+ *   - returns the validated remainder
+ *
+ * The trade-off: strict callers (admin SPA write paths, init flows,
+ * tests) keep the throw — they want bugs surfaced immediately. The
+ * routing path uses this so a single bad row doesn't cascade into
+ * "the whole hub appears broken to users." Operators see the rest
+ * of their services keep working + a warning in the logs pointing at
+ * the offending entry.
+ *
+ * Caught 2026-05-26 (hub#406) when @openparachute/app@0.2.0-rc.4 wrote
+ * a row with `name: "app"` (instead of `parachute-app`) + `port: 0`
+ * (instead of bound port). Hub's routing throw on services.json read
+ * meant every request to every service 500'd — not just app — because
+ * one row's bad shape took out the whole manifest read.
+ *
+ * One behavioral difference from strict `readManifest`: this function
+ * does NOT write cleanup mutations back to disk. The bad row persists
+ * on disk until a write-path call (upsertService, etc.) exercises the
+ * strict path. That's intentional — a hot-path read should not mutate
+ * state — but worth knowing: a fix upstream (e.g. app@rc.13 overwriting
+ * the bad row on its next selfRegister) is what finally clears it.
+ */
+export function readManifestLenient(
+  path: string = SERVICES_MANIFEST_PATH,
+  log: { warn?: (msg: string) => void } = console,
+): ServicesManifest {
+  if (!existsSync(path)) return { services: [] };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    log.warn?.(
+      `[services-manifest] failed to parse ${path}: ${err instanceof Error ? err.message : String(err)} — treating as empty`,
+    );
+    return { services: [] };
+  }
+  const afterRetired = dropRetiredModuleRows(raw, path);
+  const cleaned = dropLegacyShortNameRows(afterRetired.raw, path);
+  // `typeof null === "object"` in JS, so the `!cleaned.raw` part of this
+  // guard is load-bearing for the null case — not a typo or redundancy.
+  if (!cleaned.raw || typeof cleaned.raw !== "object") return { services: [] };
+  const services = (cleaned.raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return { services: [] };
+  const valid: ServiceEntry[] = [];
+  for (let i = 0; i < services.length; i++) {
+    try {
+      valid.push(validateEntry(services[i], `${path} services[${i}]`));
+    } catch (err) {
+      log.warn?.(
+        `[services-manifest] skipping bad entry: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  // Best-effort duplicate-port detection — log + drop the duplicate
+  // rather than throw.
+  const seenPorts = new Set<number>();
+  const dedup: ServiceEntry[] = [];
+  for (const e of valid) {
+    if (seenPorts.has(e.port)) {
+      log.warn?.(
+        `[services-manifest] dropping duplicate-port entry: name=${JSON.stringify(e.name)} port=${e.port}`,
+      );
+      continue;
+    }
+    seenPorts.add(e.port);
+    dedup.push(e);
+  }
+  return { services: dedup };
+}
+
 export function readManifest(path: string = SERVICES_MANIFEST_PATH): ServicesManifest {
   if (!existsSync(path)) return { services: [] };
   let raw: unknown;

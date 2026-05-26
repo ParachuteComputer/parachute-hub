@@ -8,6 +8,7 @@ import {
   type UiSubUnit,
   findService,
   readManifest,
+  readManifestLenient,
   removeService,
   upsertService,
   writeManifest,
@@ -1390,6 +1391,98 @@ describe("retired-module row de-dupe (hub#334)", () => {
       const m = readManifest(path);
       const names = m.services.map((s) => s.name).sort();
       expect(names).toEqual(["parachute-runner"]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("readManifestLenient — skips bad entries instead of throwing (hub#406)", () => {
+  test("returns the healthy entries when one row has port=0 (the rc.4 app bug)", () => {
+    // Reproduces what hub saw 2026-05-26: a fresh deploy installed
+    // @openparachute/app@0.2.0-rc.4 which wrote a row with name="app"
+    // (wrong) + port=0 (wrong). Strict readManifest threw on the bad
+    // entry — every request to every service 500'd, not just app.
+    // Lenient reader skips the bad row + keeps routing healthy ones.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            { name: "parachute-vault", port: 1940, paths: ["/vault/default"], health: "/vault/default/health", version: "0.4.8-rc.10" },
+            { name: "parachute-app", port: 1946, paths: ["/app"], health: "/app/healthz", version: "0.2.0-rc.13" },
+            { name: "app", port: 0, paths: ["/app"], health: "/app/healthz", version: "0.2.0-rc.4" },
+          ],
+        }),
+      );
+      const warnings: string[] = [];
+      const log = { warn: (m: string) => warnings.push(m) };
+      const m = readManifestLenient(path, log);
+      const names = m.services.map((s) => s.name).sort();
+      expect(names).toEqual(["parachute-app", "parachute-vault"]);
+      expect(warnings.some((w) => w.includes("port") && w.includes("integer"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("returns empty services when the file is malformed JSON, logs the parse error", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(path, "{not valid json");
+      const warnings: string[] = [];
+      const m = readManifestLenient(path, { warn: (msg) => warnings.push(msg) });
+      expect(m.services).toEqual([]);
+      expect(warnings.some((w) => w.includes("failed to parse"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("returns empty services when the file is missing", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      // path not yet written
+      const m = readManifestLenient(path, { warn: () => {} });
+      expect(m.services).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("drops duplicate-port entries with a warning instead of throwing", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            { name: "first", port: 1940, paths: ["/x"], health: "/x/health", version: "1.0.0" },
+            { name: "second", port: 1940, paths: ["/y"], health: "/y/health", version: "1.0.0" },
+          ],
+        }),
+      );
+      const warnings: string[] = [];
+      const m = readManifestLenient(path, { warn: (msg) => warnings.push(msg) });
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.name).toBe("first");
+      expect(warnings.some((w) => w.includes("duplicate-port"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("strict readManifest still throws on the same bad entry (contract preserved)", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [{ name: "app", port: 0, paths: ["/app"], health: "/app/healthz", version: "0.2.0-rc.4" }],
+        }),
+      );
+      expect(() => readManifest(path)).toThrow(ServicesManifestError);
     } finally {
       cleanup();
     }

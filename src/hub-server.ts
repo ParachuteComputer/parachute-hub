@@ -177,7 +177,7 @@ import {
   effectivePublicExposure,
   shortNameForManifest,
 } from "./service-spec.ts";
-import { type ServiceEntry, readManifest } from "./services-manifest.ts";
+import { type ServiceEntry, readManifest, readManifestLenient } from "./services-manifest.ts";
 import { findActiveSession } from "./sessions.ts";
 import {
   type SetupWizardDeps,
@@ -582,16 +582,19 @@ export function findServiceUpstream(
  * Returns `undefined` when no service claims the pathname; caller 404s.
  */
 async function proxyToService(req: Request, manifestPath: string): Promise<Response | undefined> {
-  let services: readonly ServiceEntry[];
-  try {
-    services = readManifest(manifestPath).services;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return new Response(JSON.stringify({ error: `service routing failed: ${msg}` }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    });
-  }
+  // Lenient read on the hot-path — a single malformed services.json
+  // entry (e.g. a module installed at a buggy version that wrote
+  // `port: 0`) used to cascade into 500s for every route on this hub
+  // because the strict throw bailed BEFORE we could dispatch to the
+  // healthy entries. `readManifestLenient` skips + logs bad rows so
+  // unrelated services keep working. The strict `readManifest` is
+  // still used by write paths + admin surfaces that want errors
+  // surfaced immediately. See hub#406.
+  //
+  // The default `log` is `console`, which under Render's container
+  // routing surfaces in the Logs panel — operators see the warning
+  // about the skipped entry.
+  const services = readManifestLenient(manifestPath).services;
   const url = new URL(req.url);
   const match = findServiceUpstream(services, url.pathname);
   if (!match) return undefined;
