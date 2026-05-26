@@ -22,6 +22,7 @@
  * client-side validation is a fast-feedback layer on top of the server-
  * side `validatePassword` + match-confirm + current-≠-new checks.
  */
+import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 import { PASSWORD_MIN_LEN } from "./users.ts";
@@ -81,8 +82,8 @@ ${body}
 function header(): string {
   return `
         <div class="brand">
-          <span class="brand-mark">⌬</span>
-          <span class="brand-name">Parachute</span>
+          <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "account-pw")}</span>
+          <span class="brand-name">${WORDMARK_TEXT}</span>
           <span class="brand-tag">account</span>
         </div>`;
 }
@@ -261,7 +262,8 @@ const STYLES = `
     font-size: 0.95rem;
     margin-bottom: 1.25rem;
   }
-  .brand-mark { font-size: 1.1rem; line-height: 1; }
+  .brand-mark { display: inline-flex; line-height: 0; }
+  .brand-mark svg { width: 20px; height: 20px; }
   .brand-name { letter-spacing: 0.01em; }
   .brand-tag {
     text-transform: uppercase;

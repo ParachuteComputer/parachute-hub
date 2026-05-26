@@ -6,8 +6,14 @@
  * injector (workstream G) share the same source of truth. Updating the
  * mark or the tagline copy happens in ONE place; every consumer follows.
  *
- * See parachute-patterns/patterns/design-system.md §2 (brand mark) +
- * §2 (tagline). Aaron picked the tagline 2026-05-25.
+ * Source of truth for the brand mark + tagline lives in the design-system
+ * pattern doc (`parachute-patterns/patterns/design-system.md` §2). This file
+ * is the hub's vendored copy of that mark so the chrome injector + the
+ * server-rendered surfaces can render without fetching anything at runtime.
+ * Keep this file's SVG path corpus in sync with the design-system doc; the
+ * doc is canonical, this is a consuming copy.
+ *
+ * Aaron picked the current tagline copy on 2026-05-25.
  *
  * The mark itself — 37 paths, `fill="currentColor"`, viewBox 0 0 24 24.
  * Renders correctly at any text color, in light + dark mode, against
