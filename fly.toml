@@ -1,0 +1,113 @@
+# Fly.io deploy config for @openparachute/hub.
+#
+# Layout: one Fly app running hub-as-supervisor (vault/scribe/app spawn
+# as child processes per the v0.6 deploy architecture). One persistent
+# volume mounted at /parachute holds the hub's DB, services.json, and
+# the BUN_INSTALL root where runtime-installed modules live.
+#
+# This file is a peer to render.yaml — operators pick the platform they
+# prefer. Same image, same code, same disk layout. See
+# parachute-patterns/migrations/2026-05-26-render-to-fly-self-host.md.
+#
+# To use: install flyctl (https://fly.io/docs/flyctl/install/), then:
+#
+#     fly launch --copy-config --yes
+#
+# That provisions the app + volume + initial deploy. After deploy:
+#
+#     fly logs --app <your-app>   # find the parachute-bootstrap-<token> line
+#     open https://<your-app>.fly.dev/admin/setup
+#
+# Paste the token, create your admin account, install vault, you're set.
+#
+# Custom domains: `fly certs add <your-domain>` after deploy, then
+# `fly secrets set PARACHUTE_HUB_ORIGIN=https://<your-domain>` so the
+# OAuth issuer claim is baked from your canonical URL.
+
+app = "parachute-hub"
+primary_region = "iad"
+
+[build]
+  # Uses the same Dockerfile as the Render path. No fly.io-specific
+  # build customization needed — hub's image is platform-agnostic.
+  dockerfile = "Dockerfile"
+
+[env]
+  # Persistent disk mount — hub honors PARACHUTE_HOME for ~/.parachute/,
+  # so hub.db, services.json, well-known/, and per-service dirs all
+  # land on the mounted volume rather than the ephemeral container fs.
+  PARACHUTE_HOME = "/parachute"
+
+  # Container listens on whatever port Fly's proxy forwards to. The
+  # Dockerfile defaults to 1939; Fly's [[services]] block below routes
+  # public 443/80 → internal_port (1939).
+  PORT = "1939"
+
+  # Bind to all interfaces inside the container so Fly's proxy can reach
+  # us. (The on-box `parachute expose` default of 127.0.0.1 is for the
+  # local-install path behind a same-host reverse proxy.)
+  PARACHUTE_BIND_HOST = "0.0.0.0"
+
+  # Pin Bun's global-install root to the persistent volume so modules
+  # installed at runtime via /admin/modules survive container restarts.
+  # Without this, `bun add @openparachute/<svc>` writes to bun's per-user
+  # prefix on the ephemeral layer and every redeploy nukes them. See
+  # hub#349 for the equivalent Render-side issue.
+  BUN_INSTALL = "/parachute/modules"
+  BUN_INSTALL_BIN = "/parachute/modules/bin"
+
+  # Modules installed via admin SPA cascade to this channel by default.
+  # Flip to "rc" via `fly secrets set` for the rc cascade. Per-call
+  # --channel / --tag still override on the install command.
+  PARACHUTE_INSTALL_CHANNEL = "latest"
+
+  # Bun honors NODE_ENV for libraries that branch on it.
+  NODE_ENV = "production"
+
+  # PARACHUTE_HUB_ORIGIN — only set if attaching a custom domain. Hub
+  # auto-derives the OAuth issuer from FLY_APP_NAME (composed as
+  # https://<app>.fly.dev) when unset, which is the right answer for
+  # the Fly-assigned URL. Set this manually via `fly secrets set
+  # PARACHUTE_HUB_ORIGIN=https://<your-domain>` if you've attached a
+  # custom domain (and update it BEFORE issuing OAuth tokens to
+  # clients — tokens are tied to the issuer claim).
+  #
+  # Admin setup: hub generates a one-time bootstrap token on first boot
+  # (printed prominently to logs). Visit /admin/setup, paste the token,
+  # create your admin account. No env-var passwords by default —
+  # cleaner secret hygiene. Operators who need env-var-driven setup can
+  # `fly secrets set PARACHUTE_INITIAL_ADMIN_USERNAME=... PARACHUTE_INITIAL_ADMIN_PASSWORD=...`
+  # (the same env vars the Render path honors).
+
+[http_service]
+  internal_port = 1939
+  force_https = true
+  # Keep the machine warm: hub holds session state in-memory + serves
+  # an admin SPA that benefits from sub-second response. The cost
+  # delta (~$1/mo) vs aggressive auto-stop is worth the latency.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/health"
+
+[[vm]]
+  # shared-cpu-1x 512MB is the sweet spot for hub + supervised
+  # vault/notes/scribe. 256MB would be tight once vault is up; 1GB is
+  # over-provisioned. Operators with heavy workloads can resize via
+  # `fly scale memory 1024` (online, no redeploy).
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"
+
+[[mounts]]
+  source = "parachute_home"
+  destination = "/parachute"
+  # 1 GiB covers hub.db + per-vault data for a single operator. Resize
+  # via `fly volumes extend <vol-id> --size 5` (online, no redeploy).
+  initial_size = "1gb"

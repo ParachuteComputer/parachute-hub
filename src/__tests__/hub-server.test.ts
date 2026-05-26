@@ -3418,6 +3418,35 @@ describe("parseArgs — issuer env precedence (hub#365)", () => {
     // Bare slash collapses to empty after strip — must not become "" issuer.
     expect(parseArgs([], { RENDER_EXTERNAL_URL: "/" }).issuer).toBeUndefined();
   });
+
+  // Fly.io self-host path (patterns#100 / parachute.computer#62).
+  test("FLY_APP_NAME composes https://<app>.fly.dev as fallback issuer", () => {
+    const got = parseArgs([], { FLY_APP_NAME: "my-parachute" });
+    expect(got.issuer).toBe("https://my-parachute.fly.dev");
+  });
+
+  test("PARACHUTE_HUB_ORIGIN wins over FLY_APP_NAME (operator with custom domain)", () => {
+    const got = parseArgs([], {
+      PARACHUTE_HUB_ORIGIN: "https://hub.example",
+      FLY_APP_NAME: "my-parachute",
+    });
+    expect(got.issuer).toBe("https://hub.example");
+  });
+
+  test("RENDER_EXTERNAL_URL wins over FLY_APP_NAME (pathological co-set)", () => {
+    // Both Render and Fly are unlikely to be set in the same env, but if a
+    // weird container ever passes both, the existing Render branch wins.
+    // Documents the precedence rather than asserting any product behavior.
+    const got = parseArgs([], {
+      RENDER_EXTERNAL_URL: "https://app.onrender.com",
+      FLY_APP_NAME: "my-parachute",
+    });
+    expect(got.issuer).toBe("https://app.onrender.com");
+  });
+
+  test("FLY_APP_NAME empty string → no fallback (treat as unset)", () => {
+    expect(parseArgs([], { FLY_APP_NAME: "" }).issuer).toBeUndefined();
+  });
 });
 
 describe("hubFetch persistent chrome strip injection (workstream G)", () => {
