@@ -147,7 +147,7 @@ interface RenderBodyProps {
 
 function renderBody({ state, revoke, setRevoke, onConfirm, onRetry }: RenderBodyProps) {
   if (state.kind === "loading") {
-    return <p className="muted">Loading…</p>;
+    return <p className="muted" data-loading="true">Loading…</p>;
   }
   if (state.kind === "error") {
     return (

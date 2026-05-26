@@ -1,5 +1,7 @@
+/// <reference types="node" />
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -18,7 +20,12 @@ import { describe, expect, it } from "vitest";
  * vendored copy if a build-time codegen lands).
  */
 describe("BrandMark drift guard", () => {
-  const REPO_ROOT = join(__dirname, "..", "..", "..", "..");
+  // ESM-friendly path resolution — `__dirname` doesn't exist under
+  // Vitest's ESM run; derive it from `import.meta.url`. The `/// reference`
+  // above wires node types into THIS file only without polluting the
+  // SPA's wider tsconfig (which intentionally limits types to vite/client).
+  const HERE = dirname(fileURLToPath(import.meta.url));
+  const REPO_ROOT = join(HERE, "..", "..", "..", "..");
 
   function extractPaths(filePath: string): string {
     const src = readFileSync(filePath, "utf8");
