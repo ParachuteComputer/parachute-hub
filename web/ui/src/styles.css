@@ -336,6 +336,55 @@ h2 {
   border-radius: 10px;
 }
 
+/* Loading state — subtle ellipsis pulse so "Loading…" feels alive
+ * without being noisy. Used everywhere `<p className="muted">Loading…</p>`
+ * appears today. Applied via the existing `.muted` class as a sibling
+ * condition would be intrusive; instead any element containing "Loading…"
+ * (we detect via [data-loading="true"] when authors want it) pulses.
+ *
+ * Default cadence: 1.4s breath. Subtle enough to recede if the load
+ * finishes within 100–200ms; recognizable on slow connections. */
+@keyframes pc-loading-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+[data-loading="true"] {
+  animation: pc-loading-pulse 1.4s ease-in-out infinite;
+}
+
+/* Table row hover — subtle warm-cream tint so admin tables feel
+ * navigable rather than static. Matches the .module-row hover affordance
+ * (lines ~799) so the visual language is consistent across SPA list
+ * shapes (rows of cards AND rows of cells). */
+.user-table tbody tr,
+.tokens-table tbody tr {
+  transition: background-color 0.12s ease;
+}
+.user-table tbody tr:hover,
+.tokens-table tbody tr:hover {
+  background: var(--bg-soft);
+}
+
+/* List content entrance — fade-up so freshly-loaded routes feel
+ * settled rather than slammed. Mirrors the hub home's `.card` fade.
+ * Apply via `[data-route-content]` on the root of any route's main
+ * area (opt-in — tests / specific routes can omit if they care about
+ * deterministic paint timing). */
+@keyframes pc-route-fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+[data-route-content] {
+  animation: pc-route-fade-up 0.32s ease forwards;
+}
+/* Respect users who prefer no motion. */
+@media (prefers-reduced-motion: reduce) {
+  [data-loading="true"],
+  [data-route-content] {
+    animation: none;
+  }
+}
+
 /* Mobile-safe table container — wraps a wide table so the document doesn't
  * overflow on narrow viewports. Tables with more columns than fit at 375 px
  * (e.g. /admin/users with 5 cols) would otherwise force horizontal scroll on

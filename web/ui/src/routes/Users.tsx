@@ -191,7 +191,7 @@ export function Users() {
   }
 
   return (
-    <div>
+    <div data-route-content="true">
       <div className="list-header">
         <h1>Users</h1>
       </div>

@@ -91,7 +91,7 @@ export function Permissions() {
   }
 
   return (
-    <div>
+    <div data-route-content="true">
       <div className="list-header">
         <h1>Permissions</h1>
       </div>
@@ -147,7 +147,7 @@ interface RenderBodyProps {
 
 function renderBody({ state, revoke, setRevoke, onConfirm, onRetry }: RenderBodyProps) {
   if (state.kind === "loading") {
-    return <p className="muted">Loading…</p>;
+    return <p className="muted" data-loading="true">Loading…</p>;
   }
   if (state.kind === "error") {
     return (

@@ -185,7 +185,7 @@ interface RenderBodyProps {
 
 function renderBody({ loadState, action, onApprove, onRetry }: RenderBodyProps) {
   if (loadState.kind === "loading") {
-    return <p className="muted">Loading…</p>;
+    return <p className="muted" data-loading="true">Loading…</p>;
   }
   if (loadState.kind === "not_found") {
     return (

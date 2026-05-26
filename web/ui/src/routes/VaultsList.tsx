@@ -123,7 +123,7 @@ export function VaultsList() {
   const moduleMissing = state.vaults.length === 0 && !state.moduleInstalled;
 
   return (
-    <div>
+    <div data-route-content="true">
       <div className="list-header">
         <h1>Vaults ({state.vaults.length})</h1>
         {moduleMissing ? (
