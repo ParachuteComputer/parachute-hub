@@ -83,11 +83,11 @@ const BRAND_MARK_SVG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="no
  */
 const CHROME_STYLE = `
 .pc-chrome {
-  --pc-chrome-bg-soft: var(--bg-soft, #f5efe0);
-  --pc-chrome-border: var(--border, #d8cfb8);
-  --pc-chrome-fg: var(--fg, #2a2723);
-  --pc-chrome-fg-muted: var(--fg-muted, #6b6760);
-  --pc-chrome-accent: var(--accent, #6b8f5e);
+  --pc-chrome-bg-soft: var(--bg-soft, #f3f0ea);
+  --pc-chrome-border: var(--border, #e4e0d8);
+  --pc-chrome-fg: var(--fg, #2c2a26);
+  --pc-chrome-fg-muted: var(--fg-muted, #6b6860);
+  --pc-chrome-accent: var(--accent, #4a7c59);
   --pc-chrome-serif: var(--serif, var(--font-serif, Georgia, "Times New Roman", serif));
   --pc-chrome-sans: var(--sans, var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif));
   position: sticky;
