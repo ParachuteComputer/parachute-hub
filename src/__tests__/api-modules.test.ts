@@ -365,6 +365,59 @@ describe("GET /api/modules", () => {
     expect(vault?.management_url).toBe("/vault/default/admin");
   });
 
+  test("management_url does not double-prepend mount when managementUrl is already mount-prefixed (hub#XXX)", async () => {
+    // Audit caught 2026-05-25: app declares `managementUrl: "/app/admin/"`
+    // (full hub-origin path) and `paths: ["/app", "/.parachute"]`. The
+    // SPA's Services dropdown was navigating to `/app/app/admin/` (404)
+    // because api-modules unconditionally prepended the mount onto the
+    // candidate. Fix: detect already-mount-prefixed paths and pass through.
+    //
+    // Single-instance modules conventionally declare the full path; only
+    // multi-instance modules (vault) use the per-instance relative form.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-app",
+        port: 1946,
+        paths: ["/app", "/.parachute"],
+        health: "/app/healthz",
+        version: "0.2.0-rc.13",
+        installDir: "/install/dir/app",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+      readModuleManifest: async (installDir) => {
+        if (installDir === "/install/dir/app") {
+          return {
+            name: "app",
+            manifestName: "parachute-app",
+            displayName: "App",
+            tagline: "",
+            port: 1946,
+            paths: ["/app", "/.parachute"],
+            health: "/app/healthz",
+            uiUrl: "/app/admin/",
+            managementUrl: "/app/admin/",
+          } as unknown as Awaited<
+            ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
+          >;
+        }
+        return null;
+      },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      modules: Array<{ short: string; management_url: string | null }>;
+    };
+    const app = body.modules.find((m) => m.short === "app");
+    // Single `/app/`, not `/app/app/`.
+    expect(app?.management_url).toBe("/app/admin/");
+  });
+
   test("management_url is null when the module declares neither managementUrl nor uiUrl (hub#342)", async () => {
     // Scribe + runner today: no managementUrl declared yet. The SPA's
     // "Open" button renders disabled with a follow-up tooltip in that
