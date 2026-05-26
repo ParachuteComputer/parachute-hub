@@ -377,11 +377,20 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
           // disabled-tooltip state in the SPA is the right surface.
           return;
         }
-        // Join mount + candidate path. Both pieces have leading slashes
-        // already (mount per services.json convention; candidate per
-        // managementUrl validation). Drop one to avoid `//`.
+        // Resolution rule (per module-ui-declaration.md):
+        //   - Multi-instance modules (vault) declare a per-instance
+        //     relative path (e.g. `/admin/`); hub prepends the mount
+        //     (e.g. `/vault/default` + `/admin/` → `/vault/default/admin/`).
+        //   - Single-instance modules (app, scribe, runner) declare a
+        //     full hub-origin path that ALREADY includes the mount
+        //     (e.g. `/app/admin/`, `/scribe/admin`); the mount must NOT
+        //     be prepended again or the result is `/app/app/admin/`
+        //     (the audit bug caught 2026-05-25 on the SPA's Services
+        //     dropdown).
+        // Detect by checking if candidate is already mount-prefixed.
         const tail = candidate.startsWith("/") ? candidate : `/${candidate}`;
-        managementUrlByShort.set(short, `${mount}${tail}`);
+        const alreadyMountPrefixed = tail === mount || tail.startsWith(`${mount}/`);
+        managementUrlByShort.set(short, alreadyMountPrefixed ? tail : `${mount}${tail}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`api-modules: skipping managementUrl for ${short}: ${msg}`);
