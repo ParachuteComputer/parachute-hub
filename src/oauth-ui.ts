@@ -1037,7 +1037,17 @@ const STYLES = `
     cursor: pointer;
     transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
     min-height: 2.5rem;
+    /* When the .btn class is applied to an anchor (e.g. the 404 page's
+     * "Go to hub home" link), suppress the default anchor underline +
+     * make it a layout block so padding behaves consistently with the
+     * <button> variant. Without this, anchor-buttons render with an
+     * underlined label which looks broken. */
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
   }
+  a.btn:hover { text-decoration: none; }
   .btn-primary {
     background: ${PALETTE.accent};
     color: ${PALETTE.cardBg};
