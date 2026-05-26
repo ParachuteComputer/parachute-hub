@@ -2,6 +2,25 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.44] - 2026-05-26
+
+**fix(hub): same-origin check no longer rejects on `Origin: "null"` — root cause of Aaron's 24h OAuth approve blocker.**
+
+### Fixed
+
+- **`/oauth/authorize/approve` POST no longer rejects when the browser sends `Origin: "null"`** (hub#386). The rc.40 diagnostic warn (added by hub#375) finally surfaced the failure shape on Aaron's Render deploy: `Origin: "null"`, `Referer: null`, `Host: parachute-hub.onrender.com`, bound set correct. Hub's OAuth pages set `<meta name="referrer" content="no-referrer">` for privacy; browsers respond by sending the literal string `"null"` as Origin on form POSTs from those pages (the opaque-origin signal per Fetch spec). The pre-fix tier 1 logic threw on `new URL("null")` → returned false without falling through to Host (tier 3), which would have matched the public Render URL in the bound set. Fix: skip tier 1 when Origin is literal `"null"`, fall through to Referer/Host. CSRF token at `oauth-handlers.ts:1203` remains the authoritative defense; same-origin is belt-and-suspenders. 3 new tests pin: null Origin + Host match → accept; null Origin + Host mismatch → reject; null Origin + no Host → reject.
+
+### Patterns check
+
+- No new patterns. Reinforces the existing "CSRF is the primary defense; same-origin is defense-in-depth" framing in `oauth-handlers.ts`'s three-belt model.
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src`: 2024 pass / 0 fail (+3 new tests).
+- Container smoke CI: ✓ on the fix commit.
+- Pending: live verify on Render redeploy — the OAuth approve POST should now succeed where it previously returned 403 "Cross-origin request rejected" for Aaron.
+
 ## [0.5.13-rc.43] - 2026-05-25
 
 **fix(oauth-ui): adopt canonical verb vocabulary on consent + approve-pending pages (workstream I, hub#384).**
