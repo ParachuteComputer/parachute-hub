@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/hub",
-  "version": "0.5.13-rc.48",
+  "version": "0.5.13-rc.49",
   "description": "parachute — the local hub for the Parachute ecosystem (discovery, ports, lifecycle, soon OAuth).",
   "license": "AGPL-3.0",
   "publishConfig": {
@@ -11,8 +11,15 @@
   "bin": {
     "parachute": "src/cli.ts"
   },
-  "workspaces": ["packages/*"],
-  "files": ["src", "web/ui/dist", "README.md", "LICENSE"],
+  "workspaces": [
+    "packages/*"
+  ],
+  "files": [
+    "src",
+    "web/ui/dist",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/ParachuteComputer/parachute-hub.git"
