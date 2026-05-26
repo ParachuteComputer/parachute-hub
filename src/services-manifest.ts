@@ -755,5 +755,11 @@ export function findService(
   path: string = SERVICES_MANIFEST_PATH,
 ): ServiceEntry | undefined {
   if (!existsSync(path)) return undefined;
-  return readManifest(path).services.find((s) => s.name === name);
+  // Lenient read on this read-side helper too — see hub#406. Without
+  // this, every caller that uses findService to check "is X installed?"
+  // crashes when ANY other row in services.json is malformed. Caught
+  // 2026-05-26 when /admin/setup's `isModuleInstalled(vault, ...)` call
+  // still 500'd after the bulk lenient-sweep because findService was
+  // missed.
+  return readManifestLenient(path).services.find((s) => s.name === name);
 }
