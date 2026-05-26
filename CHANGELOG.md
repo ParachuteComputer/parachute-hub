@@ -2,6 +2,26 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+## [0.5.13-rc.43] - 2026-05-25
+
+**fix(oauth-ui): adopt canonical verb vocabulary on consent + approve-pending pages (workstream I, hub#384).**
+
+### Fixed
+
+- **Consent page h1 + page title use "Approve" rather than "Authorize"** (hub#384). The audit at design-system.md §5 settled the OAuth approval flow's verb canon (Sign in / Sign out / Approve / Deny / Continue); the consent page drifted with "Authorize <client>?" / `<title>Authorize <client></title>`. Now reads "Approve <client>?" / `<title>Approve <client></title>` — same flow, same behavior, canonical vocabulary.
+
+- **Inline approve-pending button label "Approve and continue" → "Approve"** (hub#384). The "and continue" suffix was verbal noise implying optionality where there is none — per design-system.md §5 the canon is bare "Approve". Behavior unchanged; just clearer copy.
+
+### Patterns check
+
+- Adopts design-system.md §5 (verb vocab). Sister change: parachute-patterns#99 extended `audit-canonical-refs.sh` with verb-drift detection blocks that surface non-canonical labels (catches drift before it ships). After hub#384 + patterns#99 land, the audit reports zero verb-drift hits in hub.
+
+### Verification
+
+- `bun run typecheck` clean.
+- `bun test ./src`: 2021 pass / 0 fail.
+- Container smoke CI: ✓ on hub#384 commit.
+
 ## [0.5.13-rc.42] - 2026-05-25
 
 **feat(hub): persistent cross-surface chrome strip (workstream G) + two operator-facing bug fixes flagged on Aaron's live Render deploy.**
