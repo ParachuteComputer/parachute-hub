@@ -45,14 +45,81 @@ export function isCloudflaredLoggedIn(cloudflaredHome: string = DEFAULT_CLOUDFLA
   return existsSync(join(cloudflaredHome, "cert.pem"));
 }
 
-export function cloudflaredInstallHint(platform: NodeJS.Platform = process.platform): string {
-  const url =
-    "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/";
+/**
+ * Cloudflare's "Downloads" page (developers.cloudflare.com/cloudflare-one/
+ * connections/connect-networks/downloads/) churns markdown anchors; pkg.cloudflare.com
+ * paths the older instructions referenced now serve HTML / 404. Aaron hit
+ * the failure mode on a fresh Amazon Linux 2023 EC2 install (2026-05-27):
+ * `sudo dnf install cloudflared` returned 'No match for argument:
+ * cloudflared'. The reliable cross-distro path is grabbing the static
+ * binary from Cloudflare's GitHub releases.
+ *
+ * Canonical install paths:
+ *
+ *   macOS  → `brew install cloudflared` (homebrew is the documented path)
+ *   Linux  → architecture-specific binary from GitHub releases
+ *   other  → the binary-download path is still the best generic answer
+ *
+ * The `arch` parameter is the architecture string in `process.arch`
+ * shape (`x64`, `arm64`, `arm`). Mapped to the suffix cloudflared uses
+ * in its release artifacts (`amd64`, `arm64`, `arm`). Unknown arches
+ * fall through to a generic pointer at the releases page.
+ */
+export function cloudflaredInstallHint(
+  platform: NodeJS.Platform = process.platform,
+  arch: NodeJS.Architecture = process.arch,
+): string {
   if (platform === "darwin") {
-    return `Install cloudflared:\n  brew install cloudflared\n(or see ${url})`;
+    return [
+      "Install cloudflared:",
+      "  brew install cloudflared",
+      "",
+      "(or download a static binary from",
+      "  https://github.com/cloudflare/cloudflared/releases/latest)",
+    ].join("\n");
   }
   if (platform === "linux") {
-    return `Install cloudflared: ${url}`;
+    const suffix = linuxArtifactSuffix(arch);
+    if (suffix) {
+      return [
+        "Install cloudflared (static binary — works across distros):",
+        `  curl -L -o /usr/local/bin/cloudflared \\`,
+        `    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${suffix}`,
+        "  sudo chmod +x /usr/local/bin/cloudflared",
+        "  cloudflared --version",
+        "",
+        "(distro packages are unreliable across versions; the GitHub release is the canonical path.)",
+      ].join("\n");
+    }
+    return [
+      "Install cloudflared from the official binary release:",
+      "  https://github.com/cloudflare/cloudflared/releases/latest",
+      `(pick the linux-* artifact matching your architecture; your arch is "${arch}")`,
+    ].join("\n");
   }
-  return `Install cloudflared: ${url}`;
+  return [
+    "Install cloudflared from the official binary release:",
+    "  https://github.com/cloudflare/cloudflared/releases/latest",
+  ].join("\n");
+}
+
+/**
+ * Map a Node `process.arch` to the suffix Cloudflare uses for its
+ * cloudflared-linux-* release artifacts. Returns undefined for arches
+ * that don't have a published artifact (we surface a generic pointer
+ * in that case instead of fabricating a download URL that 404s).
+ */
+function linuxArtifactSuffix(arch: NodeJS.Architecture): string | undefined {
+  switch (arch) {
+    case "x64":
+      return "amd64";
+    case "arm64":
+      return "arm64";
+    case "arm":
+      return "arm";
+    case "ia32":
+      return "386";
+    default:
+      return undefined;
+  }
 }
