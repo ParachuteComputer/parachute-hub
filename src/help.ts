@@ -5,7 +5,11 @@ export function topLevelHelp(): string {
   const services = knownServices().join(" | ");
   return `parachute ${pkg.version} — top-level CLI for the Parachute ecosystem
 
+Fresh install? Start here:
+  parachute init                    one quick step → admin wizard in your browser
+
 Usage:
+  parachute init                    bring hub up + open admin wizard (idempotent)
   parachute setup                   interactive walk-through: install services + configure
   parachute install <service>       install and register a service
                                     services: ${services}
@@ -97,6 +101,38 @@ Aliases:
   lens → notes                      # accepted for one release cycle after
                                     # the brief Lens rebrand was reverted on
                                     # 2026-04-22; prints a rename notice.
+`;
+}
+
+export function initHelp(): string {
+  return `parachute init — get the admin wizard open in one step
+
+Usage:
+  parachute init [--no-browser]
+
+What it does:
+  Fresh-install front door. The admin SPA already walks operators through
+  the rest (install vault, set up the admin user, install scribe / runner
+  / app); this command's only job is to get you to that wizard with one
+  command.
+
+  Idempotent — every re-run is safe:
+    1. If the hub isn't running, start it.
+    2. Print the canonical admin URL (loopback when not exposed, the
+       tailnet / cloudflare FQDN when exposure is active).
+    3. In a terminal, offer to open the URL in your browser
+       (macOS \`open\`, Linux \`xdg-open\`). Skip with --no-browser or
+       run from a non-TTY shell.
+
+  If your hub is up and a vault is already configured, init just
+  confirms "looks good — here's your URL" and exits 0.
+
+Flags:
+  --no-browser     just print the URL; don't offer to launch a browser
+
+Examples:
+  parachute init                    bring up hub + open the wizard
+  parachute init --no-browser       same, but don't shell out to open / xdg-open
 `;
 }
 

@@ -10,6 +10,7 @@ import pkg from "../package.json" with { type: "json" };
 import { CloudflaredStateError } from "./cloudflare/state.ts";
 import { auth } from "./commands/auth.ts";
 import { exposePublic, exposeTailnet } from "./commands/expose.ts";
+import { init } from "./commands/init.ts";
 import { install } from "./commands/install.ts";
 import { logs, restart, start, stop } from "./commands/lifecycle.ts";
 import { migrate } from "./commands/migrate.ts";
@@ -21,6 +22,7 @@ import { dispatchVault } from "./commands/vault.ts";
 import { ExposeStateError } from "./expose-state.ts";
 import {
   exposeHelp,
+  initHelp,
   installHelp,
   logsHelp,
   migrateHelp,
@@ -303,6 +305,23 @@ async function main(argv: string[]): Promise<number> {
       if (tagExtract.tag) setupOpts.tag = tagExtract.tag;
       if (noStart) setupOpts.noStart = true;
       return await setup(setupOpts);
+    }
+
+    case "init": {
+      if (isHelpFlag(rest[0])) {
+        console.log(initHelp());
+        return 0;
+      }
+      const noBrowser = rest.includes("--no-browser");
+      const unknown = rest.find((a) => a !== "--no-browser");
+      if (unknown !== undefined) {
+        console.error(`parachute init: unknown argument "${unknown}"`);
+        console.error("usage: parachute init [--no-browser]");
+        return 1;
+      }
+      const initOpts: Parameters<typeof init>[0] = {};
+      if (noBrowser) initOpts.noBrowser = true;
+      return await init(initOpts);
     }
 
     case "install": {
@@ -700,7 +719,12 @@ async function main(argv: string[]): Promise<number> {
 
     default:
       console.error(`parachute: unknown command "${command}"`);
-      console.error("run `parachute --help` for usage");
+      console.error("");
+      console.error("If this is a fresh install, start here:");
+      console.error("  parachute init        # get the admin wizard going");
+      console.error("");
+      console.error("Or see all commands:");
+      console.error("  parachute --help");
       return 1;
   }
 }
