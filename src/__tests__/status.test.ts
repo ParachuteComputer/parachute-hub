@@ -123,6 +123,45 @@ describe("status", () => {
     }
   });
 
+  test("http 401 counts as HEALTHY (auth-gated endpoint is responsive)", async () => {
+    // Vault's canonical health path `/vault/<name>/health` returns 401
+    // without an API key — that's the server replying "I'm up but you
+    // need auth," not "I'm down." `parachute status` used to roll 401
+    // into the failing bucket via `res.ok`, surfacing "failing" on every
+    // fresh install (vault was fine — the probe was just confused).
+    // Now: 401 specifically counts as healthy. Other 4xx (404, 400) stay
+    // unhealthy — those mean the configured health path is misshapen.
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      upsertService(
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/"],
+          health: "/vault/default/health",
+          version: "0.2.4",
+        },
+        path,
+      );
+      writePid("vault", 4242, configDir);
+      const lines: string[] = [];
+      const code = await status({
+        manifestPath: path,
+        configDir,
+        alive: () => true,
+        fetchImpl: async () => new Response(null, { status: 401 }),
+        print: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      expect(lines.some((l) => /\bactive\b/.test(l))).toBe(true);
+      // No "failing" rollup, no `! probe: http 401` continuation line.
+      expect(lines.some((l) => /\bfailing\b/.test(l))).toBe(false);
+      expect(lines.some((l) => l.includes("probe: http 401"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("running + healthy probe shows STATE=active, pid + uptime", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
