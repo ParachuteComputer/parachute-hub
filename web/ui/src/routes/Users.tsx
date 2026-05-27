@@ -283,8 +283,9 @@ export function Users() {
       <p className="muted">
         Hub user accounts. Each user can be a member of one or more vaults — the OAuth issuer
         narrows their tokens to <code>vault:&lt;assigned&gt;:*</code> scopes for any vault in their
-        list. Users with no assignments have admin-level vault access. Admin-created users land with
-        a default password and are prompted to change it on first sign-in.
+        list. Users with no assignments can't authorize any vault yet — assign at least one above.
+        The first admin is unrestricted (admin posture). Admin-created users land with a default
+        password and are prompted to change it on first sign-in.
       </p>
 
       {renderListSection(
@@ -470,7 +471,14 @@ function ListRendered({
                         ))}
                       </span>
                     ) : (
-                      <span className="muted" title="No per-vault restriction (admin-level access)">
+                      <span
+                        className="muted"
+                        title={
+                          isFirstAdmin
+                            ? "First admin is unrestricted (admin posture)"
+                            : "No vaults assigned — user can't authorize any vault yet"
+                        }
+                      >
                         —
                       </span>
                     )}

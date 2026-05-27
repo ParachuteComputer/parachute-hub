@@ -153,6 +153,15 @@ export interface VaultPicker {
    * full dropdown — existing behavior.
    */
   lockedVault?: string;
+  /**
+   * Phase 2 PR 2 reviewer fold: set when the empty `availableVaults` is the
+   * "non-admin user has no vault assignments yet" shape (not "no vaults
+   * exist on the hub"). Swaps the picker empty-state copy from the admin-
+   * remediation hint (`parachute-vault create ...`) to a user-facing
+   * "ask your admin to assign you a vault" message. Only meaningful when
+   * `availableVaults.length === 0`.
+   */
+  emptyReason?: "no-assignments" | "no-vaults-on-hub";
 }
 
 export interface ErrorViewProps {
@@ -415,12 +424,19 @@ function renderVaultPicker(picker: VaultPicker): string {
   }
 
   if (picker.availableVaults.length === 0) {
+    // Phase 2 PR 2 reviewer fold: differentiate "no vaults on the hub"
+    // (admin-fixable) from "non-admin user has no vault assignments yet"
+    // (user has to wait for an admin to assign them). Default to the
+    // admin-remediation copy when unset — preserves Phase 1 behavior.
+    const noAssignments = picker.emptyReason === "no-assignments";
+    const helpHtml = noAssignments
+      ? `${verbList} need to be bound to a specific vault, but you have no vaults assigned on this hub yet. Ask the hub admin to assign you a vault via <code>/admin/users</code>, then try again.`
+      : `${verbList} need to be bound to a specific vault, but no vaults exist on this host yet. Create one with <code>parachute-vault create &lt;name&gt;</code> and try again.`;
     return `
         <section class="vault-picker vault-picker-empty">
           <h2 class="scopes-title">Pick a vault</h2>
           <p class="picker-help">
-            ${verbList} need to be bound to a specific vault, but no vaults exist on this host yet.
-            Create one with <code>parachute-vault create &lt;name&gt;</code> and try again.
+            ${helpHtml}
           </p>
         </section>`;
   }

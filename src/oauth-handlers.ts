@@ -948,16 +948,32 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   //      still want explicit consent as a sanity gate.
   //   3. No unnamed vault verbs are requested — those need the picker to
   //      narrow `vault:<verb>` → `vault:<name>:<verb>` before mint.
-  //   4. The user's assigned_vault is not stale (hub#284 reviewer fold) —
-  //      otherwise the same-hub gate would silently mint a token for a
-  //      removed vault before the consent-render path's stale detection
-  //      ever runs.
+  //   4. The user's assigned_vaults list is not stale (hub#284 reviewer
+  //      fold) — otherwise the same-hub gate would silently mint a token
+  //      for a removed vault before the consent-render path's stale
+  //      detection ever runs.
+  //   5. The user is admin OR has at least one assigned vault (Phase 2
+  //      PR 2 reviewer fold). A zero-vault non-admin has
+  //      `hasStaleAssignment=false` (length===0 short-circuits the stale
+  //      predicate above) and would otherwise sail through the auto-
+  //      trust gate. The resulting `vault_scope: []` claim is the admin
+  //      "unrestricted" sentinel — minting it for a non-admin grants
+  //      hub-wide vault access. Force fall-through to the consent
+  //      render where the zero-vault gate in `handleConsentSubmit` also
+  //      refuses (defense in depth).
   //
   // The grant is also recorded so subsequent flows with the same scopes
   // hit the standard skip-consent gate above. Logged so an operator
   // auditing "who did this" can trace it back to a same-hub DCR.
   const hasAdminScope = requestedScopes.some(scopeIsAdmin);
-  if (client.sameHub && !hasAdminScope && !hasUnnamedVault && !hasStaleAssignment) {
+  const userHasVaultPosture = userIsAdmin || assignedVaults.length > 0;
+  if (
+    client.sameHub &&
+    !hasAdminScope &&
+    !hasUnnamedVault &&
+    !hasStaleAssignment &&
+    userHasVaultPosture
+  ) {
     console.log(
       `[oauth] auto-approved same-hub client client_id=${client.clientId} user_id=${session.userId} scopes=${requestedScopes.join(" ")} (hub#312)`,
     );
@@ -969,7 +985,9 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   }
 
   return htmlResponse(
-    renderConsent(consentProps(client, parsed, vaultNames, csrf.token, assignedVaults)),
+    renderConsent(
+      consentProps(client, parsed, vaultNames, csrf.token, assignedVaults, userIsAdmin),
+    ),
     200,
     extra,
   );
@@ -1169,6 +1187,34 @@ async function handleConsentSubmit(
   const sessionUser = getUserById(db, session.userId);
   const assignedVaults: string[] = userIsAdmin ? [] : (sessionUser?.assignedVaults ?? []);
   const isPinned = assignedVaults.length > 0;
+
+  // Zero-vault non-admin gate (Phase 2 PR 2 reviewer fold). A non-admin
+  // user with no `user_vaults` rows is a known-but-not-yet-assigned
+  // posture — they can sign in to /account/, change their password, and
+  // see the home page, but they have no vaults to authorize against.
+  // Block any vault-scoped consent at the submit boundary so an OAuth
+  // client can't trick them into minting a token: an empty `vault_scope`
+  // claim is the admin "unrestricted" sentinel (see `vaultScopeForUser`),
+  // and we must keep that sentinel reserved for true admins. Non-vault
+  // scopes (`scribe:transcribe`, etc.) still consent normally — only
+  // `vault:...` scopes are gated here. The defense pairs with the GET-
+  // path same-hub-auto-trust gate below (which falls through to the
+  // consent render that would otherwise show the picker).
+  if (!userIsAdmin && assignedVaults.length === 0) {
+    const submittedScopes = params.scope.split(" ").filter((s) => s.length > 0);
+    const hasVaultScope = submittedScopes.some((s) => {
+      if (s === "vault:read" || s === "vault:write" || s === "vault:admin") return true;
+      const parts = s.split(":");
+      return parts.length === 3 && parts[0] === "vault" && parts[2] && VAULT_VERBS.has(parts[2]);
+    });
+    if (hasVaultScope) {
+      return htmlError(
+        "No vaults assigned",
+        "vault_scope_mismatch: you have no assigned vaults on this hub yet, so you can't authorize an app for vault access. Ask the hub admin to assign you at least one vault via /admin/users, then try again.",
+        400,
+      );
+    }
+  }
 
   // Vault picker (Q1 of the vault-config-and-scopes design): an unnamed
   // `vault:<verb>` scope is ambiguous about which vault it grants access to.
@@ -1676,11 +1722,17 @@ async function handleTokenAuthorizationCode(
     audience,
     clientId: redeemed.clientId,
     issuer: deps.issuer,
-    // vault_scope claim — Phase 1 per-user vault pin. Non-empty list for
-    // non-admin users with `assigned_vault` set; empty for admin / unpinned.
-    // The narrowing in `handleConsentSubmit` already rewrote `vault:<verb>` →
-    // `vault:<assigned_vault>:<verb>` for non-admin users, so the auth code's
-    // scopes are pre-aligned; this claim is the explicit "owned vault"
+    // vault_scope claim — Phase 2 per-user vault pin (Phase 1 had a single
+    // `assigned_vault` column; Phase 2 PR 2 generalized to `assigned_vaults`
+    // via `user_vaults`). Non-empty list for non-admin users with at least
+    // one assigned vault; empty for first-admin (unrestricted sentinel).
+    // Zero-vault non-admin is also empty by `vaultScopeForUser`, but the
+    // OAuth flow refuses to mint a vault-scoped token for them upstream
+    // (see the zero-vault gate in `handleConsentSubmit` + the same-hub
+    // auto-trust posture check), so we never reach here with that user
+    // posture. The narrowing in `handleConsentSubmit` already rewrote
+    // `vault:<verb>` → `vault:<assigned>:<verb>`, so the auth code's
+    // scopes are pre-aligned; this claim is the explicit "owned vaults"
     // signal PR 5 consumes downstream.
     vaultScope: vaultScopeForUser(db, redeemed.userId),
     now: deps.now,
@@ -1797,12 +1849,12 @@ async function handleTokenRefresh(
     clientId: row.clientId,
     issuer: deps.issuer,
     // vault_scope claim — re-derived from the user's *current*
-    // `assigned_vault` at refresh time (not snapshotted onto the refresh-
-    // token row). An admin who changes a user's `assigned_vault` between
+    // `assigned_vaults` at refresh time (not snapshotted onto the refresh-
+    // token row). An admin who changes a user's vault assignments between
     // mint and refresh sees the new value on the next refresh; existing
     // access tokens carry their original claim until their 15-minute TTL
     // elapses. Same posture as the design's "OAuth issuer reads
-    // `assigned_vault` at mint time, not at session-creation time" pin.
+    // `assigned_vaults` at mint time, not at session-creation time" pin.
     vaultScope: vaultScopeForUser(db, refreshUserId),
     now: deps.now,
   });
@@ -2173,6 +2225,7 @@ function consentProps(
   vaultNames: string[],
   csrfToken: string,
   assignedVaults: readonly string[],
+  userIsAdmin: boolean,
 ) {
   const scopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(scopes);
@@ -2220,7 +2273,7 @@ function consentProps(
     });
 
   // Multi-user Phase 2 PR 2: non-admin users see the picker narrowed to
-  // their assigned vault list. Three shapes emerge:
+  // their assigned vault list. Four shapes emerge:
   //
   //   - Single assigned vault (still valid) → render locked to that name
   //     (same shape as Phase 1).
@@ -2229,8 +2282,15 @@ function consentProps(
   //   - Stale-assigned (all vaults gone) → render no-vaults-available so
   //     the form gracefully rejects an Approve click instead of silently
   //     submitting a missing name.
-  //
-  // Admin users (empty `assignedVaults`) see the full hub-wide dropdown.
+  //   - First admin (admin posture, empty `assignedVaults`) → full hub-
+  //     wide dropdown of every vault on the hub.
+  //   - Zero-vault non-admin (Phase 2 PR 2 reviewer fold) → no-vaults-
+  //     available so the form gracefully rejects an Approve click. The
+  //     prior shape rendered the full hub-wide list for non-admins with
+  //     zero assignments, which let them pick a vault they had no
+  //     business consenting to. The consent-submit gate refuses any
+  //     vault-scoped POST from a zero-vault non-admin (defense in depth);
+  //     this branch keeps the picker UI honest.
   let vaultPicker: VaultPickerProps | undefined;
   if (unnamedVerbs.length > 0) {
     if (hasStaleAssignment) {
@@ -2242,9 +2302,17 @@ function consentProps(
       }
     } else if (remainingValidAssigned.length > 1) {
       vaultPicker = { unnamedVerbs, availableVaults: remainingValidAssigned };
-    } else {
+    } else if (userIsAdmin) {
       // Admin posture (no assignments) → full hub-wide list.
       vaultPicker = { unnamedVerbs, availableVaults: vaultNames };
+    } else {
+      // Zero-vault non-admin → no-vaults-available picker with the
+      // "ask your admin to assign you" copy. The Approve button renders
+      // disabled (same shape as the empty-services-json case) so the
+      // form can't post a hand-picked name. The consent-submit gate
+      // refuses any vault-scoped POST from this user too (defense in
+      // depth — see `handleConsentSubmit`).
+      vaultPicker = { unnamedVerbs, availableVaults: [], emptyReason: "no-assignments" };
     }
   }
   // Named-scope display: substitute unnamed `vault:<verb>` rows with the
@@ -2293,4 +2361,5 @@ interface VaultPickerProps {
   unnamedVerbs: string[];
   availableVaults: string[];
   lockedVault?: string;
+  emptyReason?: "no-assignments" | "no-vaults-on-hub";
 }
