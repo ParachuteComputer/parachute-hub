@@ -3,10 +3,12 @@
  *
  * Combines three sources into a single per-module row:
  *
- *   - **Curated availability** — vault, notes, scribe, runner (the v0.6
- *     release bar). The Phase-2 marketplace will broaden this; for now
- *     it's hardcoded so the admin UI has a stable "what can I install?"
- *     list even on a fresh container where services.json is empty.
+ *   - **Curated availability** — vault, scribe (the launch focus per
+ *     Aaron 2026-05-27). The list was previously broader; trimmed for
+ *     the launch arc. The Phase-2 marketplace will broaden this; for
+ *     now it's hardcoded so the admin UI has a stable "what can I
+ *     install?" list even on a fresh container where services.json is
+ *     empty.
  *   - **Installed state** — services.json reads (version, installDir).
  *   - **Supervisor state** — per-module run status (`running` / `stopped`
  *     / `crashed` / `starting` / `restarting`) + pid. Absent when the

@@ -237,6 +237,14 @@ describe("GET /api/modules", () => {
     });
     const body = (await res.json()) as { modules: Array<{ short: string }> };
     const shorts = body.modules.map((m) => m.short);
+    // Positive shape assertion — stronger than `not.toContain` because
+    // it also catches "we accidentally added a new uncurated entry"
+    // and "we accidentally removed an existing curated entry." Update
+    // this assertion intentionally when CURATED_MODULES changes.
+    expect(shorts).toEqual(["vault", "scribe"]);
+    // Belt + suspenders: explicit negatives for the modules dropped
+    // 2026-05-27, so a developer regressing the curated list sees both
+    // the shape failure AND the named-module failure messages.
     expect(shorts).not.toContain("notes");
     expect(shorts).not.toContain("runner");
     expect(shorts).not.toContain("surface");
