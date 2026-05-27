@@ -1231,6 +1231,16 @@ describe("handleSetupVaultPost", () => {
     const cfg = readScribeConfig(h.dir);
     expect(cfg?.cleanup).toEqual({ provider: "anthropic", default: true });
     expect(cfg?.cleanupProviders).toEqual({ anthropic: { apiKey: "sk-ant-test123" } });
+    // The config file holds API keys; verify it's written 0o600 so
+    // other users on a shared box can't read the operator's keys.
+    // (Mac/Linux only — Windows reports 0o666; skip on win32.)
+    if (process.platform !== "win32") {
+      const fs = require("node:fs") as typeof import("node:fs");
+      const path = require("node:path") as typeof import("node:path");
+      const cfgPath = path.join(h.dir, "scribe", "config.json");
+      const mode = fs.statSync(cfgPath).mode & 0o777;
+      expect(mode).toBe(0o600);
+    }
   });
 
   test("scribe cleanup: transcribe=none + cleanup=anthropic still installs scribe + writes cleanup block", async () => {

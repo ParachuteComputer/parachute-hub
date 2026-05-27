@@ -630,7 +630,7 @@ function renderScribeSubForm(cloudHost: boolean): string {
             </div>
             <label class="field scribe-api-key-field" data-shows-on="cloud">
               <span class="field-label">API key</span>
-              <input type="text" name="scribe_api_key" autocomplete="off" placeholder="gsk_… or sk-…" />
+              <input type="password" name="scribe_api_key" autocomplete="off" placeholder="gsk_… or sk-…" />
               <span class="field-hint">Pasted directly into <code>~/.parachute/scribe/config.json</code> on this hub (file mode 0o600). Leave blank to skip and set later in the admin SPA.</span>
             </label>
             <fieldset class="scribe-cleanup-block">
@@ -662,7 +662,7 @@ function renderScribeSubForm(cloudHost: boolean): string {
               </div>
               <label class="field scribe-cleanup-api-key-field" style="display: none;">
                 <span class="field-label">Cleanup API key</span>
-                <input type="text" name="scribe_cleanup_api_key" autocomplete="off" placeholder="sk-ant-… or sk-… or gsk-…" />
+                <input type="password" name="scribe_cleanup_api_key" autocomplete="off" placeholder="sk-ant-… or sk-… or gsk-…" />
                 <span class="field-hint">Pasted directly into <code>~/.parachute/scribe/config.json</code> on this hub (file mode 0o600). Leave blank to skip and paste later in the admin SPA.</span>
               </label>
             </fieldset>
@@ -2007,8 +2007,10 @@ function persistScribeConfig(configDir: string, update: Record<string, unknown>)
       existing = {};
     }
   }
-  // Shallow merge at top level, deep merge for the two known sub-blocks
-  // we touch (transcribe + transcribeProviders).
+  // Shallow merge at top level, deep merge for the sub-blocks we touch
+  // (transcribe + transcribeProviders + cleanup + cleanupProviders). The
+  // merge logic is generic and handles any nested object — it doesn't
+  // hard-code the block names.
   const merged: Record<string, unknown> = { ...existing };
   for (const [key, value] of Object.entries(update)) {
     if (
