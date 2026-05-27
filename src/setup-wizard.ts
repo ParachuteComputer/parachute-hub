@@ -586,6 +586,25 @@ function renderScribeSubForm(cloudHost: boolean): string {
           <span class="provider-name">Local <small>(Mac MLX or ONNX — no API key needed)</small></span>
         </label>`;
   const groqDefault = cloudHost ? " checked" : "";
+  // Cleanup providers that need a host-side binary or local server
+  // (claude-code → `claude` CLI + `claude setup-token`; ollama → local
+  // Ollama server) are hidden on cloud hosts (Render / Fly). The
+  // remaining cloud-friendly choices (anthropic / openai / groq /
+  // gemini) stay visible — they only need an API key.
+  const claudeCodeCleanupBlock = cloudHost
+    ? ""
+    : `
+              <label class="scribe-provider-option">
+                <input type="radio" name="scribe_cleanup_provider" value="claude-code" data-needs-key="false" />
+                <span class="provider-name">Claude Code <small>(subscription auth — run <code>claude setup-token</code> on this host)</small></span>
+              </label>`;
+  const ollamaCleanupBlock = cloudHost
+    ? ""
+    : `
+              <label class="scribe-provider-option">
+                <input type="radio" name="scribe_cleanup_provider" value="ollama" data-needs-key="false" />
+                <span class="provider-name">Ollama <small>(local LLM — requires Ollama running on this machine)</small></span>
+              </label>`;
   return `
         <details class="scribe-suboptions" open>
           <summary class="cursor-pointer">
@@ -614,19 +633,56 @@ function renderScribeSubForm(cloudHost: boolean): string {
               <input type="text" name="scribe_api_key" autocomplete="off" placeholder="gsk_… or sk-…" />
               <span class="field-hint">Pasted directly into <code>~/.parachute/scribe/config.json</code> on this hub (file mode 0o600). Leave blank to skip and set later in the admin SPA.</span>
             </label>
+            <fieldset class="scribe-cleanup-block">
+              <legend class="field-label">Cleanup <small>(optional LLM polish pass on transcripts)</small></legend>
+              <p class="field-hint">After transcription, scribe can run a cleanup pass to fix punctuation, capitalization, and obvious transcription glitches. Pick a provider, or skip.</p>
+              <div class="scribe-provider-list">
+                <label class="scribe-provider-option">
+                  <input type="radio" name="scribe_cleanup_provider" value="none" checked data-needs-key="false" />
+                  <span class="provider-name">Skip cleanup <small>(default — raw transcripts only)</small></span>
+                </label>
+                ${claudeCodeCleanupBlock}
+                <label class="scribe-provider-option">
+                  <input type="radio" name="scribe_cleanup_provider" value="anthropic" data-needs-key="true" />
+                  <span class="provider-name">Anthropic API <small>(needs ANTHROPIC_API_KEY)</small></span>
+                </label>
+                ${ollamaCleanupBlock}
+                <label class="scribe-provider-option">
+                  <input type="radio" name="scribe_cleanup_provider" value="openai" data-needs-key="true" />
+                  <span class="provider-name">OpenAI <small>(needs OPENAI_API_KEY)</small></span>
+                </label>
+                <label class="scribe-provider-option">
+                  <input type="radio" name="scribe_cleanup_provider" value="groq" data-needs-key="true" />
+                  <span class="provider-name">Groq <small>(needs GROQ_API_KEY)</small></span>
+                </label>
+                <label class="scribe-provider-option">
+                  <input type="radio" name="scribe_cleanup_provider" value="gemini" data-needs-key="true" />
+                  <span class="provider-name">Google Gemini <small>(needs GOOGLE_API_KEY)</small></span>
+                </label>
+              </div>
+              <label class="field scribe-cleanup-api-key-field" style="display: none;">
+                <span class="field-label">Cleanup API key</span>
+                <input type="text" name="scribe_cleanup_api_key" autocomplete="off" placeholder="sk-ant-… or sk-… or gsk-…" />
+                <span class="field-hint">Pasted directly into <code>~/.parachute/scribe/config.json</code> on this hub (file mode 0o600). Leave blank to skip and paste later in the admin SPA.</span>
+              </label>
+            </fieldset>
           </div>
         </details>
         <script>
           (function () {
-            var radios = document.querySelectorAll('input[name="scribe_provider"]');
-            var keyField = document.querySelector('.scribe-api-key-field');
-            function sync() {
-              var selected = document.querySelector('input[name="scribe_provider"]:checked');
-              var needsKey = selected && selected.dataset.needsKey === "true";
-              if (keyField) keyField.style.display = needsKey ? "" : "none";
+            function toggle(radioName, keySelector) {
+              var radios = document.querySelectorAll('input[name="' + radioName + '"]');
+              var keyField = document.querySelector(keySelector);
+              function sync() {
+                var selected = document.querySelector('input[name="' + radioName + '"]:checked');
+                var needsKey = selected && selected.dataset.needsKey === "true";
+                if (keyField) keyField.style.display = needsKey ? "" : "none";
+              }
+              radios.forEach(function (r) { r.addEventListener("change", sync); });
+              sync();
             }
-            radios.forEach(function (r) { r.addEventListener("change", sync); });
-            sync();
+            toggle("scribe_provider", ".scribe-api-key-field");
+            toggle("scribe_cleanup_provider", ".scribe-cleanup-api-key-field");
           })();
         </script>
   `;
@@ -1794,23 +1850,40 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
     );
   }
   // Scribe sub-form fold (2026-05-27). The vault step's form lets
-  // the operator answer "do you also want voice transcription?" in
-  // the same submission. If they did, we (a) write the provider +
-  // API key to `~/.parachute/surface/config.json` so scribe finds
+  // the operator answer "do you also want voice transcription?" +
+  // "do you also want LLM cleanup?" in the same submission. If they
+  // asked for either, we (a) write the chosen provider(s) + API
+  // key(s) to `~/.parachute/scribe/config.json` so scribe finds
   // them on first boot, and (b) kick a scribe install op in
   // parallel with vault install. The vault op-poll page threads the
   // scribe op_id through its success-redirect so the done step can
   // poll scribe progress via the existing per-tile mechanism.
+  //
+  // Cleanup-without-transcribe is a valid combo: the operator can
+  // hit scribe's REST cleanup endpoint directly with their own raw
+  // text. We install scribe + write the cleanup block in that case.
   const scribeProvider = String(form.get("scribe_provider") ?? "").trim();
+  const scribeCleanupProvider = String(form.get("scribe_cleanup_provider") ?? "").trim();
+  const wantsTranscribe = scribeProvider !== "" && scribeProvider !== "none";
+  const wantsCleanup = scribeCleanupProvider !== "" && scribeCleanupProvider !== "none";
   let scribeOpId: string | undefined;
-  if (scribeProvider !== "" && scribeProvider !== "none") {
+  if (wantsTranscribe || wantsCleanup) {
     const scribeApiKey = String(form.get("scribe_api_key") ?? "").trim();
+    const scribeCleanupApiKey = String(form.get("scribe_cleanup_api_key") ?? "").trim();
     // Write scribe config FIRST so scribe's first boot picks up the
-    // provider + key without a second config edit. We don't fail the
-    // wizard on a config-write error — log it + carry on; scribe will
-    // boot with defaults + the operator can fix via /scribe/admin.
+    // provider(s) + key(s) without a second config edit. We don't
+    // fail the wizard on a config-write error — log it + carry on;
+    // scribe will boot with defaults + the operator can fix via
+    // /scribe/admin.
     try {
-      writeScribeConfigForWizard(deps.configDir, scribeProvider, scribeApiKey);
+      writeScribeConfigForWizard(deps.configDir, {
+        ...(wantsTranscribe
+          ? { transcribe: { provider: scribeProvider, apiKey: scribeApiKey } }
+          : {}),
+        ...(wantsCleanup
+          ? { cleanup: { provider: scribeCleanupProvider, apiKey: scribeCleanupApiKey } }
+          : {}),
+      });
     } catch (err) {
       console.warn(
         `[setup-wizard] failed to write scribe config: ${err instanceof Error ? err.message : String(err)} — kicking install anyway, operator can configure later.`,
@@ -1848,36 +1921,71 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
 
 /**
  * Write a minimal scribe config that selects the operator's chosen
- * transcribe provider + API key (when applicable). Idempotent: reads
- * any existing config, merges, writes back. File mode 0o600 — the
- * config holds API keys, owner-only.
+ * transcribe + cleanup providers + API keys (when applicable).
+ * Idempotent: reads any existing config, merges, writes back. File
+ * mode 0o600 — the config holds API keys, owner-only.
  *
  * Lives in setup-wizard.ts (not scribe's own config-write.ts) because
  * (a) it's a one-time wizard write — the SPA's PUT /.parachute/config
  * surface is the canonical post-setup path, and (b) hub doesn't
  * import scribe-internal modules. The shape of `scribe-config.json`
  * is documented in parachute-scribe/src/config.ts; the fields we set
- * (transcribe.provider + transcribeProviders.<name>.apiKey) are
- * stable.
+ * (`transcribe.provider`, `transcribeProviders.<name>.apiKey`,
+ * `cleanup.provider`, `cleanup.default`, `cleanupProviders.<name>.apiKey`)
+ * are stable. Cleanup block extended 2026-05-27 — scribe boots with
+ * `cleanup: none` otherwise, so first-install operators got "raw
+ * transcript only" until they hand-edited the config.
+ *
+ * Signature changed 2026-05-27 from `(configDir, provider, apiKey)` to
+ * the options-object shape so the caller can express "cleanup only,
+ * no transcribe" without smuggling sentinel strings.
  */
-function writeScribeConfigForWizard(
-  configDir: string,
-  provider: string,
-  apiKey: string,
-): void {
-  // For `local` (Mac MLX / cross-platform ONNX), just set the
-  // provider name — no key needed.
-  if (provider === "local") {
-    persistScribeConfig(configDir, { transcribe: { provider: "parakeet-mlx" } });
-    return;
+interface WizardScribeConfig {
+  /** Set when the operator chose a transcription provider (anything other than "none"). */
+  transcribe?: { provider: string; apiKey: string };
+  /** Set when the operator chose a cleanup provider (anything other than "none"). */
+  cleanup?: { provider: string; apiKey: string };
+}
+function writeScribeConfigForWizard(configDir: string, config: WizardScribeConfig): void {
+  const update: Record<string, unknown> = {};
+
+  if (config.transcribe) {
+    const { provider, apiKey } = config.transcribe;
+    // For `local` (Mac MLX / cross-platform ONNX), just set the
+    // provider name — no key needed.
+    if (provider === "local") {
+      update.transcribe = { provider: "parakeet-mlx" };
+    } else {
+      // Cloud providers need a key. Empty key → just set provider;
+      // the operator can paste the key later via /scribe/admin
+      // without a restart (per provider-config.ts's per-request
+      // precedence).
+      update.transcribe = { provider };
+      if (apiKey !== "") {
+        update.transcribeProviders = { [provider]: { apiKey } };
+      }
+    }
   }
-  // Cloud providers need a key. Empty key → just set provider; the
-  // operator can paste the key later via /scribe/admin without a
-  // restart (per provider-config.ts's per-request precedence).
-  const update: Record<string, unknown> = { transcribe: { provider } };
-  if (apiKey !== "") {
-    update.transcribeProviders = { [provider]: { apiKey } };
+
+  if (config.cleanup) {
+    const { provider, apiKey } = config.cleanup;
+    // Always set `cleanup.default: true` when the operator opted in to
+    // cleanup — they want polished output as the default; the per-
+    // request `cleanup` flag on each transcribe request can still
+    // opt out individually.
+    update.cleanup = { provider, default: true };
+    // `claude-code` (host CLI auth) and `ollama` (local server)
+    // don't need an API key. Everything else (anthropic, openai,
+    // groq, gemini) takes a key. Empty key → just set the provider;
+    // the operator can paste the key later via the admin SPA without
+    // a restart.
+    const needsKey = provider !== "claude-code" && provider !== "ollama";
+    if (needsKey && apiKey !== "") {
+      update.cleanupProviders = { [provider]: { apiKey } };
+    }
   }
+
+  if (Object.keys(update).length === 0) return;
   persistScribeConfig(configDir, update);
 }
 
