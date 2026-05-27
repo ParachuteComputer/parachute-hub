@@ -82,7 +82,7 @@ Environment:
 
 Examples:
   parachute install vault                                   # installs, runs init, starts vault
-  parachute install app                                     # installs app (auto-bootstraps Notes)
+  parachute install surface                                 # installs surface (auto-bootstraps Notes)
   parachute install notes                                   # back-compat: legacy notes-daemon (Phase 2 deprecating)
   parachute install scribe                                  # installs, prompts for provider, starts scribe
   parachute install scribe --scribe-provider groq --scribe-key gsk_…
