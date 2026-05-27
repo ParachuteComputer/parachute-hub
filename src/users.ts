@@ -299,16 +299,19 @@ export async function resetUserPassword(
   // Hash outside the tx — see note above.
   const passwordHash = await argonHash(newPassword);
   const stamp = now().toISOString();
+  // Track whether the tx actually applied the update — `result.changes === 0`
+  // means the row vanished between the pre-check and the tx body (concurrent
+  // delete race). The outer caller needs to know so its 200/{ok,user} response
+  // isn't a lie when the user is gone. Reviewer fold on hub#427.
+  let updated = false;
   db.transaction(() => {
     const result = db
       .prepare(
         "UPDATE users SET password_hash = ?, password_changed = 0, updated_at = ? WHERE id = ?",
       )
       .run(passwordHash, stamp, userId);
-    // Race-tolerant: row may have vanished between the pre-check and the
-    // tx body. Treat as "no longer there" — same shape as `deleteUser`'s
-    // race handling. The caller's pre-check above is the common path.
     if (result.changes === 0) return;
+    updated = true;
     // Revoke still-active tokens. Audit trail stays on the user row —
     // we don't null `user_id` because the parent users row sticks
     // around (unlike `deleteUser` where the parent vanishes).
@@ -317,7 +320,7 @@ export async function resetUserPassword(
       userId,
     );
   })();
-  return true;
+  return updated;
 }
 
 /**

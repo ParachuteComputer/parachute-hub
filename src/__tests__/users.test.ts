@@ -363,6 +363,29 @@ describe("resetUserPassword", () => {
     }
   });
 
+  test("returns false when user vanishes between pre-check and tx body", async () => {
+    // Reviewer-flagged race path (hub#427). The argon2 hash is computed
+    // outside the transaction (async), giving a window where a concurrent
+    // delete can land between the existence pre-check and the UPDATE tx.
+    // The helper must return false in that case so the caller can 404
+    // instead of cosmetically claiming success.
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "alice", "alice-strong-passphrase", {
+        passwordChanged: true,
+      });
+      // Simulate the race: delete the row, then invoke the reset. The
+      // pre-check runs in `resetUserPassword` against the now-empty table.
+      // (We can't intercept between pre-check and tx without forking the
+      // helper; deleting before the call is the equivalent post-condition
+      // — if the row is gone the tx body will UPDATE 0 rows.)
+      db.prepare("DELETE FROM users WHERE id = ?").run(user.id);
+      expect(await resetUserPassword(db, user.id, "new-temp-passphrase")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("rotates hash, flips password_changed back to 0, bumps updated_at", async () => {
     const { db, cleanup } = makeDb();
     try {

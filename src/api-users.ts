@@ -53,6 +53,7 @@ import {
   getFirstAdminId,
   getUserById,
   getUserByUsernameCI,
+  isFirstAdmin,
   listUsers,
   resetUserPassword,
   validatePassword,
@@ -508,7 +509,7 @@ export async function handleResetUserPassword(
   // `/account/change-password` rotate flow instead, which requires
   // knowing the current password (genuine credential rotation, not a
   // recovery reset). Pairs with the first-admin-undeletable rail above.
-  if (isFirstAdminTarget(deps.db, userId)) {
+  if (isFirstAdmin(deps.db, userId)) {
     return jsonError(
       403,
       "cannot_reset_first_admin",
@@ -539,16 +540,6 @@ export async function handleResetUserPassword(
     status: 200,
     headers: { "content-type": "application/json", "cache-control": "no-store" },
   });
-}
-
-/**
- * Local sugar over `getFirstAdminId` — the helper-imported predicate is
- * `isFirstAdmin(db, id)` in users.ts, but we import via `getFirstAdminId`
- * for the delete path. Wrapping here keeps the call site readable and
- * matches `handleDeleteUser`'s phrasing without a second import.
- */
-function isFirstAdminTarget(db: ApiUsersDeps["db"], userId: string): boolean {
-  return getFirstAdminId(db) === userId;
 }
 
 function describeUsernameReason(reason: "format" | "length" | "reserved"): string {
