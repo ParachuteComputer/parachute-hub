@@ -35,15 +35,20 @@ export interface User {
    */
   passwordChanged: boolean;
   /**
-   * The vault instance name this user is pinned to (Phase 1 multi-user is
-   * single-vault-per-user). `null` means "no per-vault restriction" — the
-   * default for admin accounts, where the OAuth issuer mints tokens for
-   * any requested vault. Non-null pins the issuer to narrow scopes to
-   * `vault:<assigned_vault>:<verb>`. No FK; vault names resolve through
-   * `services.json` at mint time. Stored as `users.assigned_vault TEXT`
-   * (added in migration v8).
+   * The vault instance names this user has access to (multi-user Phase 2
+   * PR 2 — many-to-many via the `user_vaults` table; design
+   * 2026-05-20-multi-user-phase-1.md §Phase 2). Empty `[]` means "no per-
+   * vault restriction" for admin accounts (where `isFirstAdmin` is true
+   * and the OAuth issuer mints tokens for any requested vault). Empty
+   * `[]` for a non-admin means "no access" — distinct semantics that the
+   * consent picker enforces. A non-empty array lists every vault the
+   * user is assigned to; the OAuth issuer narrows tokens to
+   * `vault:<name>:<verb>` for any name in the list. No FK; vault names
+   * resolve through `services.json` at mint time. Replaces the v8 single
+   * `assigned_vault` column (dropped in migration v10). Sorted in
+   * `created_at ASC` insert-order for deterministic iteration.
    */
-  assignedVault: string | null;
+  assignedVaults: string[];
 }
 
 export class SingleUserModeError extends Error {
@@ -76,10 +81,44 @@ interface Row {
   created_at: string;
   updated_at: string;
   password_changed: number;
-  assigned_vault: string | null;
 }
 
-function rowToUser(r: Row): User {
+/**
+ * Read every (user_id → vault_name list) tuple in one shot. Cheaper than
+ * issuing one SELECT per row when callers (listUsers, etc.) hydrate
+ * several rows. Returns a Map keyed by user_id with the vault names
+ * sorted by `created_at ASC` for stable iteration. Users with no
+ * `user_vaults` rows are absent from the map; rowToUser substitutes
+ * an empty array.
+ */
+function loadVaultMap(db: Database, userIds?: readonly string[]): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  let rows: { user_id: string; vault_name: string }[];
+  if (userIds && userIds.length > 0) {
+    const placeholders = userIds.map(() => "?").join(",");
+    rows = db
+      .query<{ user_id: string; vault_name: string }, string[]>(
+        `SELECT user_id, vault_name FROM user_vaults
+         WHERE user_id IN (${placeholders})
+         ORDER BY user_id ASC, created_at ASC, vault_name ASC`,
+      )
+      .all(...userIds);
+  } else {
+    rows = db
+      .query<{ user_id: string; vault_name: string }, []>(
+        "SELECT user_id, vault_name FROM user_vaults ORDER BY user_id ASC, created_at ASC, vault_name ASC",
+      )
+      .all();
+  }
+  for (const r of rows) {
+    const list = map.get(r.user_id);
+    if (list) list.push(r.vault_name);
+    else map.set(r.user_id, [r.vault_name]);
+  }
+  return map;
+}
+
+function rowToUser(r: Row, assignedVaults: string[]): User {
   return {
     id: r.id,
     username: r.username,
@@ -87,8 +126,22 @@ function rowToUser(r: Row): User {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     passwordChanged: r.password_changed === 1,
-    assignedVault: r.assigned_vault,
+    assignedVaults,
   };
+}
+
+/**
+ * Hydrate a single user's `assignedVaults` list directly. Single
+ * SELECT against `user_vaults` ordered by insertion time. Used by the
+ * single-row helpers (`getUserById`, `getUserByUsername`, etc.).
+ */
+function readVaultsForUser(db: Database, userId: string): string[] {
+  return db
+    .query<{ vault_name: string }, [string]>(
+      "SELECT vault_name FROM user_vaults WHERE user_id = ? ORDER BY created_at ASC, vault_name ASC",
+    )
+    .all(userId)
+    .map((r) => r.vault_name);
 }
 
 export interface CreateUserOpts {
@@ -105,13 +158,15 @@ export interface CreateUserOpts {
    */
   passwordChanged?: boolean;
   /**
-   * Vault instance name to pin the user to (Phase 1 single-vault). `null`
-   * (default) means "no restriction" — admin posture. The OAuth issuer
-   * (PR 4) reads this at mint time to narrow scopes. No validation here:
-   * the API endpoint (PR 2) is responsible for checking against
-   * `services.json` before passing through.
+   * Vault instance names this user should be granted access to (multi-
+   * user Phase 2 PR 2 — many-to-many via `user_vaults`). Default `[]`
+   * (no entries) means "no restriction" for admins / "no access" for
+   * non-admins. Each name is inserted into `user_vaults` within the same
+   * transaction as the `users` row so creation is atomic. No validation
+   * here: the API endpoint (`api-users.ts`) is responsible for checking
+   * each name against `services.json` before passing through.
    */
-  assignedVault?: string | null;
+  assignedVaults?: string[];
 }
 
 export async function createUser(
@@ -128,13 +183,35 @@ export async function createUser(
   const passwordHash = await argonHash(password);
   const stamp = (opts.now?.() ?? new Date()).toISOString();
   const passwordChanged = opts.passwordChanged === true ? 1 : 0;
-  const assignedVault = opts.assignedVault ?? null;
+  // De-dupe + preserve insert order so the returned array matches what
+  // `getUserById` would load right after (which sorts by created_at +
+  // vault_name). Empty array is "no vaults" — admin posture or a non-
+  // admin who'll have vaults added later via `setUserVaults`.
+  const assignedVaults: string[] = [];
+  const seen = new Set<string>();
+  for (const v of opts.assignedVaults ?? []) {
+    if (!seen.has(v)) {
+      seen.add(v);
+      assignedVaults.push(v);
+    }
+  }
   try {
-    db.prepare(
-      `INSERT INTO users
-         (id, username, password_hash, created_at, updated_at, password_changed, assigned_vault)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, username, passwordHash, stamp, stamp, passwordChanged, assignedVault);
+    db.transaction(() => {
+      db.prepare(
+        `INSERT INTO users
+           (id, username, password_hash, created_at, updated_at, password_changed)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(id, username, passwordHash, stamp, stamp, passwordChanged);
+      if (assignedVaults.length > 0) {
+        const insertVault = db.prepare(
+          `INSERT INTO user_vaults (user_id, vault_name, role, created_at)
+           VALUES (?, ?, 'write', ?)`,
+        );
+        for (const vaultName of assignedVaults) {
+          insertVault.run(id, vaultName, stamp);
+        }
+      }
+    })();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("UNIQUE") && msg.includes("users.username")) {
@@ -149,13 +226,13 @@ export async function createUser(
     createdAt: stamp,
     updatedAt: stamp,
     passwordChanged: passwordChanged === 1,
-    assignedVault,
+    assignedVaults,
   };
 }
 
 export function getUserByUsername(db: Database, username: string): User | null {
   const row = db.query<Row, [string]>("SELECT * FROM users WHERE username = ?").get(username);
-  return row ? rowToUser(row) : null;
+  return row ? rowToUser(row, readVaultsForUser(db, row.id)) : null;
 }
 
 /**
@@ -171,17 +248,24 @@ export function getUserByUsernameCI(db: Database, username: string): User | null
   const row = db
     .query<Row, [string]>("SELECT * FROM users WHERE username = ? COLLATE NOCASE")
     .get(username);
-  return row ? rowToUser(row) : null;
+  return row ? rowToUser(row, readVaultsForUser(db, row.id)) : null;
 }
 
 export function getUserById(db: Database, id: string): User | null {
   const row = db.query<Row, [string]>("SELECT * FROM users WHERE id = ?").get(id);
-  return row ? rowToUser(row) : null;
+  return row ? rowToUser(row, readVaultsForUser(db, row.id)) : null;
 }
 
 export function listUsers(db: Database): User[] {
   const rows = db.query<Row, []>("SELECT * FROM users ORDER BY created_at ASC").all();
-  return rows.map(rowToUser);
+  if (rows.length === 0) return [];
+  // One JOIN-ish read for everyone — single SELECT against user_vaults
+  // beats N+1 single-user reads.
+  const vaultMap = loadVaultMap(
+    db,
+    rows.map((r) => r.id),
+  );
+  return rows.map((r) => rowToUser(r, vaultMap.get(r.id) ?? []));
 }
 
 export function userCount(db: Database): number {
@@ -225,6 +309,72 @@ export function isFirstAdmin(db: Database, userId: string): boolean {
 
 export async function verifyPassword(user: User, password: string): Promise<boolean> {
   return argonVerify(user.passwordHash, password);
+}
+
+/**
+ * Replace a user's vault assignments atomically (multi-user Phase 2 PR 2).
+ *
+ * Two writes inside one transaction:
+ *   1. DELETE every existing `user_vaults` row for `userId`.
+ *   2. INSERT one row per name in `vaultNames`.
+ *
+ * Returns `false` when the user doesn't exist (idempotent — the API layer
+ * translates that to 404); `true` when the assignments were updated.
+ * Passing an empty array clears every existing assignment (non-admin
+ * non-empty array = "no vault access"). Duplicates are silently
+ * collapsed (de-duped at the array level before INSERT). No vault-name
+ * validation here — `api-users.ts` is responsible for checking each
+ * name against `services.json`. No FK on `vault_name` (matches the
+ * pre-existing schema contract — vault names resolve through
+ * `services.json`, not a DB row).
+ *
+ * Caller responsibilities:
+ *   - First-admin protection — admin "membership" is unrestricted by
+ *     design (see `isFirstAdmin`); `api-users.ts` refuses to call this
+ *     for the first admin's row.
+ *   - Vault-name validation against the live services manifest.
+ */
+export function setUserVaults(
+  db: Database,
+  userId: string,
+  vaultNames: readonly string[],
+  now: () => Date = () => new Date(),
+): boolean {
+  const exists = db
+    .query<{ id: string }, [string]>("SELECT id FROM users WHERE id = ?")
+    .get(userId);
+  if (!exists) return false;
+  // De-dupe before INSERT — duplicate names from a misbehaving client
+  // would trip the (user_id, vault_name) PRIMARY KEY constraint and
+  // abort the whole transaction. Silently collapse the dupes; the
+  // operator's intent is "this user has access to these vaults"
+  // regardless of how many times the same name appears.
+  const seen = new Set<string>();
+  const uniques: string[] = [];
+  for (const v of vaultNames) {
+    if (!seen.has(v)) {
+      seen.add(v);
+      uniques.push(v);
+    }
+  }
+  const stamp = now().toISOString();
+  db.transaction(() => {
+    db.prepare("DELETE FROM user_vaults WHERE user_id = ?").run(userId);
+    if (uniques.length > 0) {
+      const insertVault = db.prepare(
+        `INSERT INTO user_vaults (user_id, vault_name, role, created_at)
+         VALUES (?, ?, 'write', ?)`,
+      );
+      for (const vaultName of uniques) {
+        insertVault.run(userId, vaultName, stamp);
+      }
+    }
+    // Bump the user's updated_at so downstream observers (SPA row,
+    // /account/) reflect the change without us having to bake a
+    // separate "vault assignments changed" timestamp.
+    db.prepare("UPDATE users SET updated_at = ? WHERE id = ?").run(stamp, userId);
+  })();
+  return true;
 }
 
 /**
@@ -326,7 +476,7 @@ export async function resetUserPassword(
 /**
  * Hard-delete a user row and clean up FK-dependent rows.
  *
- * Schema reality at v8:
+ * Schema reality at v10:
  *   - `tokens.user_id` is nullable (made nullable in migration v6). The
  *     plan from the design doc is "tokens stay with `revoked_at` set so
  *     the audit trail of 'this user existed and held these tokens'
@@ -337,6 +487,9 @@ export async function resetUserPassword(
  *     `created_at`, `scopes`, `client_id`, `revoked_at` fields.
  *   - `sessions.user_id` and `grants.user_id` are NOT NULL with a
  *     non-cascading FK. Both are deleted before the users row drops.
+ *   - `user_vaults.user_id` has `ON DELETE CASCADE` (migration v10), so
+ *     vault assignments are dropped automatically when the parent row
+ *     goes. No explicit cleanup needed.
  *
  * Returns false when no user matches the id (idempotent — the API
  * layer translates that to 404). Returns true on a successful delete.

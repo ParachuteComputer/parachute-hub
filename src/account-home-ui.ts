@@ -78,12 +78,13 @@ function header(): string {
 export interface RenderAccountHomeOpts {
   username: string;
   /**
-   * Assigned vault instance name, or `null` for users with no per-vault
-   * restriction. In Phase 1 a `null` assigned vault means "admin posture"
-   * (the OAuth issuer mints tokens for any requested vault) — combined
-   * with `isFirstAdmin: true` this is the hub administrator's account.
+   * Vault instance names this user has access to (multi-user Phase 2
+   * PR 2). Empty `[]` for admin posture (combined with `isFirstAdmin:
+   * true` this is the hub administrator's account, whose vault access
+   * is unrestricted). One or more entries for non-admin users — the
+   * page renders one Notes-CTA tile per vault.
    */
-  assignedVault: string | null;
+  assignedVaults: string[];
   /** Force-change-password completion flag. Currently informational only. */
   passwordChanged: boolean;
   /**
@@ -111,14 +112,14 @@ export interface RenderAccountHomeOpts {
 }
 
 export function renderAccountHome(opts: RenderAccountHomeOpts): string {
-  const { username, assignedVault, hubOrigin, isFirstAdmin, csrfToken } = opts;
+  const { username, assignedVaults, hubOrigin, isFirstAdmin, csrfToken } = opts;
   const safeUsername = escapeHtml(username);
   // Origin is already canonicalized by the handler (trailing slash stripped),
   // but defensively re-trim so a stray slash here doesn't break the CTA href.
   const trimmedOrigin = hubOrigin.replace(/\/+$/, "");
 
   const vaultCard = renderVaultCard({
-    assignedVault,
+    assignedVaults,
     trimmedOrigin,
     isFirstAdmin,
   });
@@ -142,31 +143,45 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
 }
 
 interface VaultCardOpts {
-  assignedVault: string | null;
+  assignedVaults: string[];
   trimmedOrigin: string;
   isFirstAdmin: boolean;
 }
 
 function renderVaultCard(opts: VaultCardOpts): string {
-  const { assignedVault, trimmedOrigin, isFirstAdmin } = opts;
+  const { assignedVaults, trimmedOrigin, isFirstAdmin } = opts;
 
-  if (assignedVault !== null) {
-    const safeVault = escapeHtml(assignedVault);
-    // Mirror setup-wizard.ts:renderStartUsingTile — vault URLs are
-    // `${hubOrigin}/vault/<name>`. URL-encode defensively even though
-    // current vault-name validation rules mean it's a no-op.
-    const vaultUrlForAdd = encodeURIComponent(`${trimmedOrigin}/vault/${assignedVault}`);
+  if (assignedVaults.length > 0) {
+    // One vault tile per assignment (multi-user Phase 2 PR 2). Each
+    // tile carries its own Notes "Open" CTA and the hub-origin code
+    // block. The disclosure ("Use a custom client") lives at the
+    // section level, not per-tile, because the hub origin is the same
+    // regardless of which vault the user picks.
     const hubOriginDisplay = escapeHtml(trimmedOrigin);
+    const heading = assignedVaults.length === 1 ? "<h2>Your vault</h2>" : "<h2>Your vaults</h2>";
+    const tiles = assignedVaults
+      .map((vaultName) => {
+        const safeVault = escapeHtml(vaultName);
+        const vaultUrlForAdd = encodeURIComponent(`${trimmedOrigin}/vault/${vaultName}`);
+        return `
+        <div class="vault-tile" data-testid="vault-tile" data-vault-name="${safeVault}">
+          <p class="vault-name"><strong>${safeVault}</strong></p>
+          <p>
+            <a class="btn btn-primary" href="https://notes.parachute.computer/add?url=${vaultUrlForAdd}"
+               target="_blank" rel="noopener" data-testid="open-notes-cta">Open Notes ↗</a>
+          </p>
+        </div>`;
+      })
+      .join("");
     return `
       <section class="section" data-testid="vault-card">
-        <h2>Your vault</h2>
-        <p class="vault-name"><strong>${safeVault}</strong></p>
-        <p>Open Notes — the canonical browser UI for your vault. It connects to your
-          hub over HTTPS and remembers your URL after the first OAuth.</p>
-        <p>
-          <a class="btn btn-primary" href="https://notes.parachute.computer/add?url=${vaultUrlForAdd}"
-             target="_blank" rel="noopener" data-testid="open-notes-cta">Open Notes ↗</a>
-        </p>
+        ${heading}
+        <p>Open Notes — the canonical browser UI for your vault${
+          assignedVaults.length === 1 ? "" : "s"
+        }. It connects to your hub
+          over HTTPS and remembers your URL after the first OAuth.</p>
+        <div class="vault-tiles">${tiles}
+        </div>
         <details class="custom-client">
           <summary>Use a custom client</summary>
           <p>To connect a custom Surface or MCP client running on your own machine,
@@ -184,10 +199,11 @@ function renderVaultCard(opts: VaultCardOpts): string {
           <a href="/admin/">the admin surface</a> to manage vaults, users, and clients.</p>
       </section>`;
   }
-  // Defensive third branch — non-admin with no assigned vault. PR 2's
-  // /api/users path always assigns a vault on create, so a friend reaching
-  // this state would have to come from a hand-edited row or a migration
-  // race. Surface a clear message instead of a blank card.
+  // Defensive third branch — non-admin with no assigned vault. The
+  // /api/users path doesn't require a vault on create (admins can leave
+  // a new friend's vault list empty and fill it in later), so this
+  // state is reachable through normal flows — surface a clear "ask
+  // your admin" message.
   return `
     <section class="section" data-testid="no-vault-card">
       <h2>Your vault</h2>
@@ -307,6 +323,20 @@ const STYLES = `
     margin: 0 0 0.6rem;
   }
   .vault-name strong { color: ${PALETTE.fg}; font-weight: 600; }
+  .vault-tiles {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin: 0.75rem 0 0.4rem;
+  }
+  .vault-tile {
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    background: ${PALETTE.bgSoft};
+  }
+  .vault-tile p { margin: 0.2rem 0; }
+  .vault-tile p:last-child { margin-top: 0.5rem; }
 
   .custom-client { margin-top: 0.8rem; }
   .custom-client summary {

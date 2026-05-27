@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getClient, registerClient } from "../clients.ts";
 import { CSRF_COOKIE_NAME } from "../csrf.ts";
+import { findGrant, recordGrant } from "../grants.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
   FIRST_CLIENT_AUTO_APPROVE_WINDOW_MS,
@@ -13,7 +14,6 @@ import {
   setSetting,
 } from "../hub-settings.ts";
 import { findTokenRowByJti, validateAccessToken } from "../jwt-sign.ts";
-import { findGrant, recordGrant } from "../grants.ts";
 import {
   authorizationServerMetadata,
   buildServicesCatalog,
@@ -24,10 +24,11 @@ import {
   handleRevoke,
   handleToken,
   protectedResourceMetadata,
+  vaultScopeForUser,
 } from "../oauth-handlers.ts";
 import type { ServicesManifest } from "../services-manifest.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
-import { createUser } from "../users.ts";
+import { createUser, setUserVaults } from "../users.ts";
 
 const ISSUER = "https://hub.example";
 const TEST_CSRF = "csrf-test-token";
@@ -4880,6 +4881,66 @@ describe("DCR first-client auto-approve window (hub#268 Item 3)", () => {
 // non-admin users (with `assigned_vault` non-null) see the consent picker
 // locked, and the OAuth issuer mints tokens carrying `vault_scope: [<assigned>]`.
 // Server-side defense refuses any mint whose picked vault disagrees.
+describe("vaultScopeForUser (multi-user Phase 2 PR 2 — many-to-many)", () => {
+  test("first admin returns [] regardless of any user_vaults rows", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin-aaron", "pw");
+      expect(vaultScopeForUser(db, admin.id)).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin with zero vault assignments returns []", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", { allowMulti: true });
+      expect(vaultScopeForUser(db, bob.id)).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin with one assigned vault returns [name]", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
+      expect(vaultScopeForUser(db, bob.id)).toEqual(["default"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin with multiple assigned vaults returns each name", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["personal", "family"],
+      });
+      expect(new Set(vaultScopeForUser(db, bob.id))).toEqual(new Set(["personal", "family"]));
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("unknown user id returns [] defensively", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      expect(vaultScopeForUser(db, "no-such-id")).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 describe("handleAuthorizeGet — multi-user assigned vault picker lock (PR 4)", () => {
   test("admin user (assigned_vault null) sees the free dropdown", async () => {
     const { db, cleanup } = await makeDb();
@@ -4918,13 +4979,131 @@ describe("handleAuthorizeGet — multi-user assigned vault picker lock (PR 4)", 
     }
   });
 
+  test("non-admin user with 2+ assigned vaults sees a free dropdown filtered to those (Phase 2 PR 2)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        // Only "default" is in the fixture manifest; non-admins with a
+        // mix of valid + invalid vaults effectively get the intersection.
+        assignedVaults: ["default", "personal"],
+      });
+      // Add a second vault to the manifest so the dropdown has two
+      // valid choices to filter to.
+      const multiVaultManifest: ServicesManifest = {
+        services: [
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/default", "/vault/personal", "/vault/family"],
+            health: "/health",
+            version: "0.3.0",
+          },
+        ],
+      };
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: () => multiVaultManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // NOT the locked picker section — two vaults is a dropdown.
+      expect(html).not.toContain('class="vault-picker vault-picker-locked"');
+      // No locked-vault hidden input.
+      expect(html).not.toContain('<input type="hidden" name="vault_pick"');
+      // Two radios — for the two assigned vaults, in order.
+      expect(html).toContain('name="vault_pick" value="default"');
+      expect(html).toContain('name="vault_pick" value="personal"');
+      // NOT the third hub-wide vault (`family`) — filtered out.
+      expect(html).not.toContain('name="vault_pick" value="family"');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin requesting a named vault outside their list → 400 vault_scope_mismatch (Phase 2 PR 2)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["personal", "family"],
+      });
+      const multiVaultManifest: ServicesManifest = {
+        services: [
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/personal", "/vault/family", "/vault/work"],
+            health: "/health",
+            version: "0.3.0",
+          },
+        ],
+      };
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        // Asking for "work" which exists on the hub but is NOT in
+        // bob's assigned list.
+        scope: "vault:work:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+      });
+      const consentRes = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+          },
+        }),
+        { issuer: ISSUER, loadServicesManifest: () => multiVaultManifest },
+      );
+      expect(consentRes.status).toBe(400);
+      const body = await consentRes.text();
+      expect(body).toContain("vault_scope_mismatch");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("non-admin user (assigned_vault set) sees the locked picker with admin-managed note", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const admin = await createUser(db, "admin-aaron", "pw");
       const bob = await createUser(db, "bob", "pw", {
         allowMulti: true,
-        assignedVault: "default",
+        assignedVaults: ["default"],
       });
       void admin;
       const session = createSession(db, { userId: bob.id });
@@ -4974,7 +5153,12 @@ describe("handleAuthorizeGet — resolved scope display (approval-UX rc.19)", ()
   test("non-admin user (assigned_vault set) sees vault:<assigned>:read on consent, not raw vault:read", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { challenge } = makePkce();
@@ -5050,7 +5234,12 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
   test("non-admin happy path: token carries vault_scope=[assigned] and narrowed scope", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { verifier, challenge } = makePkce();
@@ -5164,7 +5353,12 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
   test("non-admin with disagreeing vault_pick → 400 vault_scope_mismatch", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { challenge } = makePkce();
@@ -5223,7 +5417,12 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
   test("non-admin requesting named scope for the wrong vault → 400 vault_scope_mismatch", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { challenge } = makePkce();
@@ -5263,7 +5462,12 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
   test("non-admin requesting named scope for the assigned vault → happy path", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { verifier, challenge } = makePkce();
@@ -5320,7 +5524,12 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
   test("refresh flow re-derives vault_scope from current assigned_vault", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { verifier, challenge } = makePkce();
@@ -5407,7 +5616,12 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
   test("refresh flow picks up a mid-session assigned_vault change", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "vault-a" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["vault-a"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { verifier, challenge } = makePkce();
@@ -5477,12 +5691,15 @@ describe("handleAuthorizePost — multi-user assigned vault defense (PR 4)", () 
       expect(initial.payload.vault_scope).toEqual(["vault-a"]);
       expect(initial.payload.scope).toBe("vault:vault-a:read");
 
-      // Step 2: admin updates bob's assigned_vault to vault-b. Direct UPDATE
-      // because Phase 1 has no PATCH endpoint; same effect a future admin
-      // path would have. The refresh path reads the live row at mint time
-      // (`vaultScopeForUser`), so the next refresh should pick up the new
-      // value.
-      db.prepare("UPDATE users SET assigned_vault = ? WHERE id = ?").run("vault-b", bob.id);
+      // Step 2: admin updates bob's vault assignments to ["vault-b"].
+      // Direct DB writes against user_vaults — same effect as the PATCH
+      // /api/users/:id/vaults endpoint. The refresh path reads the live
+      // row at mint time (`vaultScopeForUser`), so the next refresh
+      // should pick up the new value.
+      db.prepare("DELETE FROM user_vaults WHERE user_id = ?").run(bob.id);
+      db.prepare(
+        "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, 'write', ?)",
+      ).run(bob.id, "vault-b", new Date().toISOString());
 
       // Step 3: refresh the token. vault_scope should be ["vault-b"] (the
       // new live value); the `scope` claim stays narrowed to the original
@@ -5982,7 +6199,12 @@ describe("handleAuthorizeGet — stale assigned_vault surfaces banner (hub#284)"
   test("unnamed vault scope + stale assignment → banner + no-vaults picker + disabled Approve", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { challenge } = makePkce();
@@ -6026,7 +6248,12 @@ describe("handleAuthorizeGet — stale assigned_vault surfaces banner (hub#284)"
   test("named vault scope targeting stale assignment → banner + disabled Approve", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { challenge } = makePkce();
@@ -6065,7 +6292,12 @@ describe("handleAuthorizeGet — stale assigned_vault surfaces banner (hub#284)"
   test("non-vault scope + stale assignment → informational banner + Approve stays enabled", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { challenge } = makePkce();
@@ -6143,7 +6375,12 @@ describe("handleAuthorizeGet — stale assigned_vault surfaces banner (hub#284)"
   test("user with intact assignment → no banner (pre-#284 happy path stays clean)", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { challenge } = makePkce();
@@ -6195,7 +6432,12 @@ describe("handleAuthorizePost — stale assigned_vault clean 400 (hub#284)", () 
   test("hand-crafted POST with stale vault_pick → 'Assigned vault was removed' 400 (not generic Unknown vault)", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { challenge } = makePkce();
@@ -6241,7 +6483,12 @@ describe("handleAuthorizePost — stale assigned_vault clean 400 (hub#284)", () 
   test("hand-crafted POST with vault_pick naming a never-existed vault → still hits generic Unknown vault 400", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { challenge } = makePkce();
@@ -6289,7 +6536,12 @@ describe("handleAuthorizePost — stale assigned_vault clean 400 (hub#284)", () 
   test("named scope vault:<stale>:read → POST refuses with 'Assigned vault was removed' 400", async () => {
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { challenge } = makePkce();
@@ -6361,7 +6613,12 @@ describe("handleAuthorizeGet — stale assignment gates both fast-paths (hub#284
     // Post-fold the gate skips, the consent screen renders, banner shows.
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { recordGrant } = await import("../grants.ts");
@@ -6409,7 +6666,12 @@ describe("handleAuthorizeGet — stale assignment gates both fast-paths (hub#284
     // consent screen renders.
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, {
         redirectUris: ["https://app.example/cb"],
@@ -6456,7 +6718,12 @@ describe("handleAuthorizeGet — stale assignment gates both fast-paths (hub#284
     // enabled — the user can still consent to scribe access.
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, {
         redirectUris: ["https://app.example/cb"],
@@ -6501,7 +6768,12 @@ describe("handleAuthorizeGet — stale assignment gates both fast-paths (hub#284
     // the fast-path so the fold doesn't break the existing UX.
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
       const { recordGrant } = await import("../grants.ts");
@@ -6543,7 +6815,12 @@ describe("handleAuthorizeGet — stale assignment gates both fast-paths (hub#284
     // non-admin vault scope, user's assignment is intact, gate fires.
     const { db, cleanup } = await makeDb();
     try {
-      const bob = await createUser(db, "bob", "pw", { assignedVault: "default" });
+      const admin = await createUser(db, "admin-aaron", "pw");
+      void admin;
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
       const session = createSession(db, { userId: bob.id });
       const reg = registerClient(db, {
         redirectUris: ["https://app.example/cb"],
@@ -6771,6 +7048,423 @@ describe("handleAuthorizeGet — trust-by-client_name auto-approve (hub#409)", (
       });
       expect(res.status).toBe(403);
       expect(getClient(db, fresh.client.clientId)?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Phase 2 PR 2 reviewer fold (hub#429 reviewer): a non-admin user with
+// ZERO `user_vaults` rows is a known-but-not-yet-assigned posture. They can
+// sign in to /account/, change their password, and see the home page, but
+// they have no vaults to authorize against. The original Phase 2 PR 2 left
+// three OAuth privilege-escalation paths open:
+//
+//   1. Named scope consent submit: handleConsentSubmit's vault-validation
+//      gates ran only when `isPinned = assignedVaults.length > 0`. Zero-
+//      vault non-admin slipped past every gate, minted a token with the
+//      admin "unrestricted" vault_scope sentinel ([]).
+//
+//   2. Same-hub auto-trust gate (hub#312): zero-vault non-admin satisfied
+//      every condition (no admin scope, no unnamed verb, no stale-
+//      assignment — length === 0 short-circuits the stale predicate).
+//      Silently minted a token, no consent screen.
+//
+//   3. Unnamed-scope picker: the empty-`assignedVaults` branch of
+//      `consentProps` rendered the FULL hub-wide vault list, letting a
+//      zero-vault non-admin pick any vault on the hub.
+//
+// The fix gates all three paths. These tests pin each one + verify the
+// first-admin happy path (`vaultScopeForUser` returns [] for first admin
+// too, and that posture must NOT regress to "no access").
+describe("zero-vault non-admin privesc gate (hub#429 reviewer)", () => {
+  test("named scope consent submit → blocked with vault_scope_mismatch (path 1)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      // First admin exists so `bob` is a non-admin.
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        // No assigned vaults — the "known but not yet assigned" posture.
+      });
+      expect(bob.assignedVaults).toEqual([]);
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      // Hand-crafted POST naming a vault bob has no business consenting to.
+      const form = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        scope: "vault:default:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        state: "zv-1",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // NOT a 302 redirect (which would mean the auth code was issued).
+      expect(res.status).not.toBe(302);
+      expect(res.status).toBe(400);
+      const html = await res.text();
+      expect(html).toContain("vault_scope_mismatch");
+      expect(html).toContain("No vaults assigned");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("same-hub auto-trust GET with named vault scope → consent shown, not silent grant (path 2)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+      });
+      const session = createSession(db, { userId: bob.id });
+      // Same-hub client (DCR'd by the operator, sameHub=true).
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "zv-2",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // Pre-fix: 302 with auth code (silent mint). Post-fix: 200 HTML
+      // consent screen — falls through the same-hub gate to the consent
+      // render.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("unnamed vault scope GET → empty-state picker with no-assignments copy, not hub-wide list (path 3)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+      });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          // Unnamed `vault:read` — needs the picker to narrow.
+          scope: "vault:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        // Manifest with TWO vaults — pre-fix the picker would render BOTH
+        // as a free dropdown for bob (the "admin posture" empty-vaults
+        // branch).
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // No-assignments empty-state picker. Approve disabled.
+      expect(html).toContain("you have no vaults assigned on this hub yet");
+      expect(html).toContain("/admin/users");
+      // NO hub-wide vault picker options rendered (the `default` and any
+      // other vault from the fixture must not appear as radio options).
+      expect(html).not.toMatch(/<input type="radio" name="vault_pick"/);
+      // Approve button disabled.
+      expect(html).toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("token endpoint cannot mint with empty vault_scope for zero-vault non-admin (defense in depth, path 4)", async () => {
+    // If the auth-code path is fully blocked above, the user can never
+    // get an auth code in the first place — this verifies the auth-code
+    // path stays blocked at the consent-submit boundary so no code is
+    // issued (the token endpoint never sees one for this user posture).
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+      });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const form = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        scope: "vault:default:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // No 302 — no auth code redirect, no `code` param ever issued.
+      expect(res.status).toBe(400);
+      expect(res.headers.get("location")).toBeNull();
+      // Belt-and-suspenders: `vaultScopeForUser` would return [] for
+      // bob (the very sentinel the OAuth flow refuses to mint into a
+      // token for non-admin users). Pin the helper's behavior so a
+      // future change can't silently lift it to "include all vaults".
+      expect(vaultScopeForUser(db, bob.id)).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("stale grant survives setUserVaults([]) → skip-consent gate fires consent screen, not silent code (path 5)", async () => {
+    // The 4th attack the prior fold didn't cover. Sequence:
+    //   1. bob has assignedVaults=["default"] (legitimate).
+    //   2. bob consents to a vault-scoped client → grants row recorded.
+    //   3. Admin clears bob's assignments via setUserVaults(_, []).
+    //   4. Grants table has no FK cascade from user_vaults, so the
+    //      grant row survives the assignment delete.
+    //   5. bob re-hits /oauth/authorize?scope=vault:default:read for
+    //      the same client. Pre-fix: skip-consent gate fires
+    //      (isCoveredByGrant=true), silent 302 with auth code and
+    //      vault_scope=[] (the admin "unrestricted" sentinel).
+    //   Post-fix: userHasVaultPosture=false → fall through to
+    //   consent render where the zero-vault gate also refuses.
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
+      expect(bob.assignedVaults).toEqual(["default"]);
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      // Record the grant while bob still has the assignment.
+      recordGrant(db, bob.id, reg.client.clientId, ["vault:default:read"]);
+      // Admin clears bob's assignments. Grant row is NOT cascaded.
+      expect(setUserVaults(db, bob.id, [])).toBe(true);
+      expect(findGrant(db, bob.id, reg.client.clientId)).not.toBeNull();
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "stale-grant",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // Post-fix: 200 HTML consent screen, NOT 302 with code.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      expect(res.headers.get("location")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("trust-by-client_name auto-promote → recursive re-entry hits skip-consent gate (path 6)", async () => {
+    // The trust-by-client_name path (hub#409, ~line 554) recursively
+    // calls handleAuthorizeGet after approveClient + recordGrant on
+    // the fresh client_id. That recursive call now passes through
+    // the skip-consent gate with our new userHasVaultPosture check.
+    //
+    // Sequence:
+    //   1. bob has assignedVaults=["default"], consents to "claude-code"
+    //      (prior client_id) for vault:default:read.
+    //   2. Admin clears bob's assignments.
+    //   3. Claude re-DCRs a fresh "claude-code" with a new client_id
+    //      (status=pending).
+    //   4. bob hits /oauth/authorize on the fresh client_id.
+    //   5. Pre-fix: trust-by-client_name matches by name+scope,
+    //      approves the fresh client, records grant, recurses into
+    //      handleAuthorizeGet — which now finds a covering grant and
+    //      silently mints the auth code with vault_scope=[].
+    //   Post-fix: the recursive call's skip-consent gate sees
+    //   userHasVaultPosture=false and falls through to the consent
+    //   render. Same-hub gate also refuses (sameHub=false here, but
+    //   the posture check is the load-bearing constraint).
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
+      const session = createSession(db, { userId: bob.id });
+      // Prior approved client_name="claude-code" + grant.
+      const prior = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        clientName: "claude-code",
+      });
+      recordGrant(db, bob.id, prior.client.clientId, ["vault:default:read"]);
+      // Admin clears bob's assignments. Prior grant survives.
+      expect(setUserVaults(db, bob.id, [])).toBe(true);
+      // Fresh DCR — same client_name, fresh client_id, status=pending.
+      const fresh = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+        clientName: "claude-code",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: fresh.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+          state: "trust-by-name-zero",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            origin: ISSUER,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // Post-fix: 200 HTML consent screen, NOT 302 with code. The
+      // fresh client_id IS approved (the auto-promote ran), and a
+      // grant IS recorded — that's the design of hub#409. The
+      // load-bearing assertion is that the recursive re-entry into
+      // handleAuthorizeGet did NOT issue an auth code, because the
+      // zero-vault posture failed our gate.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      expect(res.headers.get("location")).toBeNull();
+      expect(getClient(db, fresh.client.clientId)?.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("first admin with no vault assignments still gets unrestricted access (regression guard)", async () => {
+    // First admin's `assignedVaults` is empty by design — that's the
+    // admin "unrestricted" sentinel. The zero-vault gate must NOT
+    // catch the first admin: they're not "non-admin with no
+    // assignments," they're "admin posture, empty list is the signal."
+    const { db, cleanup } = await makeDb();
+    try {
+      // Only one user — the first admin. No `user_vaults` rows.
+      const admin = await createUser(db, "admin-aaron", "pw");
+      expect(admin.assignedVaults).toEqual([]);
+      const session = createSession(db, { userId: admin.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "first-admin-ok",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // Silent grant — same-hub auto-trust fires for the first admin
+      // exactly as it did pre-fix.
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("code")?.length).toBeGreaterThan(20);
+      expect(loc.searchParams.get("state")).toBe("first-admin-ok");
     } finally {
       cleanup();
     }

@@ -1045,20 +1045,21 @@ export async function getModuleOperation(opId: string): Promise<ModuleOperation>
 }
 
 /**
- * Wire shape from `GET /api/users` — multi-user Phase 1.
+ * Wire shape from `GET /api/users` — multi-user Phase 2 PR 2.
  *
  * `password_hash` is intentionally absent — the hub never returns it
  * over the wire. `password_changed: false` means the user was created
  * via the admin path and hasn't yet completed the force-change-password
- * flow on first sign-in (PR 3 of the multi-user chain).
- * `assigned_vault: null` means "no per-vault restriction" — the admin
- * posture; non-null pins the user to that vault.
+ * flow on first sign-in. `assigned_vaults` lists every vault this user
+ * has access to (empty array = "no narrowing" for admin posture, or
+ * "no access" for non-admins). Replaces the Phase 1 single-vault
+ * `assigned_vault: string | null` shape.
  */
 export interface UserListing {
   id: string;
   username: string;
   password_changed: boolean;
-  assigned_vault: string | null;
+  assigned_vaults: string[];
   created_at: string;
 }
 
@@ -1066,8 +1067,8 @@ export interface UserListing {
 export interface CreateUserInput {
   username: string;
   password: string;
-  /** Vault to pin the user to. `null` = no restriction (admin-level). */
-  assignedVault: string | null;
+  /** Vault names to grant the user access to. Empty array = no narrowing. */
+  assignedVaults: string[];
 }
 
 /**
@@ -1167,6 +1168,31 @@ export async function resetUserPassword(userId: string, newPassword: string): Pr
       authorization: `Bearer ${bearer}`,
     },
     body: JSON.stringify({ new_password: newPassword }),
+  });
+  if (res.status === 401 || res.status === 403) {
+    if (res.status === 401) clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+/**
+ * PATCH /api/users/:id/vaults — replace a user's vault assignments
+ * (multi-user Phase 2 PR 2). Empty array clears every grant. Server
+ * validates each name against services.json and refuses for the first
+ * admin (403 `cannot_edit_first_admin_vaults`). Same Bearer pattern as
+ * `resetUserPassword`.
+ */
+export async function updateUserVaults(userId: string, assignedVaults: string[]): Promise<void> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/users/${encodeURIComponent(userId)}/vaults`, {
+    method: "PATCH",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify({ assigned_vaults: assignedVaults }),
   });
   if (res.status === 401 || res.status === 403) {
     if (res.status === 401) clearCachedToken();

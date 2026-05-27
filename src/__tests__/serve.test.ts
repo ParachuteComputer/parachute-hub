@@ -52,11 +52,11 @@ describe("seedInitialAdminIfNeeded", () => {
     expect(log.mock.calls[0]?.[0] ?? "").toContain("ops");
     // Multi-user Phase 1 (design 2026-05-20-multi-user-phase-1.md §wizard
     // interaction): env-seeded admin chose their password via env vars, so
-    // skip the force-change-password redirect. `assignedVault` stays null
-    // — admin posture.
+    // skip the force-change-password redirect. `assignedVaults` stays []
+    // — admin posture (multi-user Phase 2 PR 2 lifted single → array).
     const seeded = getUserByUsername(db, "ops");
     expect(seeded?.passwordChanged).toBe(true);
-    expect(seeded?.assignedVault).toBeNull();
+    expect(seeded?.assignedVaults).toEqual([]);
   });
 
   test("returns 'exists' when an admin already exists, even with env vars set", async () => {
@@ -287,12 +287,12 @@ describe("resolveStartupIssuer — precedence chain (hub#365)", () => {
   test("strips trailing slashes from any source for canonical form", () => {
     expect(resolveStartupIssuer({ issuer: "https://x.example/" }, {})).toBe("https://x.example");
     expect(resolveStartupIssuer({ issuer: "https://x.example//" }, {})).toBe("https://x.example");
-    expect(
-      resolveStartupIssuer({}, { PARACHUTE_HUB_ORIGIN: "https://x.example/" }),
-    ).toBe("https://x.example");
-    expect(
-      resolveStartupIssuer({}, { RENDER_EXTERNAL_URL: "https://x.example/" }),
-    ).toBe("https://x.example");
+    expect(resolveStartupIssuer({}, { PARACHUTE_HUB_ORIGIN: "https://x.example/" })).toBe(
+      "https://x.example",
+    );
+    expect(resolveStartupIssuer({}, { RENDER_EXTERNAL_URL: "https://x.example/" })).toBe(
+      "https://x.example",
+    );
   });
 
   test("returns undefined when no source has a value", () => {

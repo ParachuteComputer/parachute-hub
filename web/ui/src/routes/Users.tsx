@@ -1,35 +1,31 @@
 /**
- * /admin/users — multi-user Phase 1 admin surface (Phase 2 PR 1
- * adds admin password reset).
+ * /admin/users — multi-user admin surface (Phase 1 list/create/delete,
+ * Phase 2 PR 1 admin password reset, Phase 2 PR 2 multi-vault membership).
  *
  * Design: `parachute.computer/design/2026-05-20-multi-user-phase-1.md`.
- * Tracker: hub#252. PR 2 of 5 in the original multi-user chain shipped
- * list + create + delete; Phase 2 PR 1 layers admin-initiated password
- * reset for non-admin users on top.
+ * Tracker: hub#252. Phase 2 PR 2 lifts the single-vault `assignedVault`
+ * shape to N-vault membership via the `user_vaults` join table — a user
+ * can have access to multiple vaults (e.g. personal + family).
  *
  * Surface:
  *
- *   1. **Users list table.** Username · Assigned vault · Password set ·
+ *   1. **Users list table.** Username · Assigned vaults · Password set ·
  *      Created · Actions. First admin (the wizard / env-seeded
- *      bootstrap row) has Delete + Reset Password disabled with a
- *      tooltip; the server enforces both rails
- *      (`first_admin_undeletable`, `cannot_reset_first_admin`).
+ *      bootstrap row) has every row action disabled with a tooltip; the
+ *      server enforces every rail (`first_admin_undeletable`,
+ *      `cannot_reset_first_admin`, `cannot_edit_first_admin_vaults`).
  *   2. **Create user form.** Collapsible section below the table.
- *      Username + password + assigned-vault dropdown (fetched on mount
- *      from `/api/users/vaults`). The dropdown's first option is the
- *      synthetic "No restriction (admin-level access)" → maps to
- *      `assignedVault: null`. Subsequent options are vault names from
- *      services.json.
- *   3. **Delete confirmation.** Inline confirm dialog mirroring the
- *      `Permissions.tsx` pattern — click → confirm dialog → DELETE →
- *      refresh.
- *   4. **Reset Password (Phase 2 PR 1).** Per-row inline form (mirrors
- *      Create User's collapse-then-form shape). Single password field;
- *      submit POSTs to `/api/users/:id/reset-password`; success collapses
- *      and surfaces a row-scoped banner with the "hand them the new
- *      password" copy. The server flips `password_changed=0` and revokes
- *      the friend's still-active tokens — leaked-password recovery
- *      shouldn't leave the attacker holding valid bearers.
+ *      Username + password + assigned-vaults multi-select (fetched on
+ *      mount from `/api/users/vaults`). `<select multiple>` with shift-
+ *      click semantics; selected names render as chips above the
+ *      control. Empty selection → no narrowing.
+ *   3. **Edit vaults (Phase 2 PR 2).** Per-row inline form mirroring the
+ *      reset-password inline shape. Multi-select pre-populated with the
+ *      user's current assignments; submit PATCHes /api/users/:id/vaults.
+ *   4. **Delete confirmation.** Inline confirm dialog mirroring the
+ *      `Permissions.tsx` pattern.
+ *   5. **Reset Password (Phase 2 PR 1).** Per-row inline form. Single
+ *      password field; success surfaces a row-scoped banner.
  *
  * Optimistic-update + rollback-on-error: the create + reset flows follow
  * the `Modules.tsx`-style "fire-and-recover" shape. On submit, the form
@@ -58,6 +54,7 @@ import {
   listUserVaults,
   listUsers,
   resetUserPassword,
+  updateUserVaults,
 } from "../lib/api.ts";
 
 /**
@@ -115,15 +112,27 @@ type ResetState =
 interface FormFields {
   username: string;
   password: string;
-  /** Empty string = the synthetic "No restriction" sentinel. */
-  assignedVault: string;
+  /** Selected vault names. Empty array = no narrowing (admin posture). */
+  assignedVaults: string[];
 }
 
 const EMPTY_FORM: FormFields = {
   username: "",
   password: "",
-  assignedVault: "",
+  assignedVaults: [],
 };
+
+/**
+ * Per-row Edit-vaults state. Same one-row-at-a-time pattern as the
+ * Delete + Reset password flows — only one row can have an open form
+ * at any time.
+ */
+type EditVaultsState =
+  | { kind: "idle" }
+  | { kind: "open"; userId: string; selected: string[] }
+  | { kind: "submitting"; userId: string; selected: string[] }
+  | { kind: "done"; userId: string; username: string }
+  | { kind: "error"; userId: string; selected: string[]; message: string };
 
 export function Users() {
   const [state, setState] = useState<ListState>({ kind: "loading" });
@@ -133,6 +142,7 @@ export function Users() {
   const [createState, setCreateState] = useState<CreateState>({ kind: "idle" });
   const [deleteSt, setDeleteSt] = useState<DeleteState>({ kind: "idle" });
   const [resetSt, setResetSt] = useState<ResetState>({ kind: "idle" });
+  const [editVaultsSt, setEditVaultsSt] = useState<EditVaultsState>({ kind: "idle" });
 
   useEffect(() => {
     void reload;
@@ -177,7 +187,7 @@ export function Users() {
     const input: CreateUserInput = {
       username: form.username,
       password: form.password,
-      assignedVault: form.assignedVault === "" ? null : form.assignedVault,
+      assignedVaults: form.assignedVaults,
     };
     try {
       const created = await createUser(input);
@@ -212,6 +222,23 @@ export function Users() {
             ? err.message
             : String(err);
       setDeleteSt({ kind: "error", userId: user.id, message });
+    }
+  }
+
+  async function onSubmitEditVaults(user: UserListing, selected: string[]): Promise<void> {
+    setEditVaultsSt({ kind: "submitting", userId: user.id, selected });
+    try {
+      await updateUserVaults(user.id, selected);
+      setEditVaultsSt({ kind: "done", userId: user.id, username: user.username });
+      setReload((n) => n + 1);
+    } catch (err) {
+      const message =
+        err instanceof HttpError
+          ? `Edit vaults failed (${err.status}): ${err.message}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      setEditVaultsSt({ kind: "error", userId: user.id, selected, message });
     }
   }
 
@@ -254,10 +281,11 @@ export function Users() {
       </div>
 
       <p className="muted">
-        Hub user accounts. Each user can be pinned to a single vault (Phase 1) — the OAuth issuer
-        narrows their tokens to <code>vault:&lt;assigned&gt;:*</code> scopes. Users with no
-        assignment have admin-level vault access. Admin-created users land with a default password
-        and are prompted to change it on first sign-in.
+        Hub user accounts. Each user can be a member of one or more vaults — the OAuth issuer
+        narrows their tokens to <code>vault:&lt;assigned&gt;:*</code> scopes for any vault in their
+        list. Users with no assignments can't authorize any vault yet — assign at least one above.
+        The first admin is unrestricted (admin posture). Admin-created users land with a default
+        password and are prompted to change it on first sign-in.
       </p>
 
       {renderListSection(
@@ -268,6 +296,10 @@ export function Users() {
         resetSt,
         setResetSt,
         onSubmitReset,
+        editVaultsSt,
+        setEditVaultsSt,
+        onSubmitEditVaults,
+        state.kind === "ok" ? state.data.vaults : [],
         () => setReload((n) => n + 1),
       )}
 
@@ -295,6 +327,10 @@ function renderListSection(
   resetSt: ResetState,
   setResetSt: (s: ResetState) => void,
   onSubmitReset: (user: UserListing, password: string) => Promise<void>,
+  editVaultsSt: EditVaultsState,
+  setEditVaultsSt: (s: EditVaultsState) => void,
+  onSubmitEditVaults: (user: UserListing, selected: string[]) => Promise<void>,
+  availableVaults: string[],
   onRetry: () => void,
 ): React.ReactNode {
   if (state.kind === "loading") {
@@ -337,6 +373,10 @@ function renderListSection(
       resetSt={resetSt}
       setResetSt={setResetSt}
       onSubmitReset={onSubmitReset}
+      editVaultsSt={editVaultsSt}
+      setEditVaultsSt={setEditVaultsSt}
+      onSubmitEditVaults={onSubmitEditVaults}
+      availableVaults={availableVaults}
     />
   );
 }
@@ -350,6 +390,10 @@ interface ListRenderedProps {
   resetSt: ResetState;
   setResetSt: (s: ResetState) => void;
   onSubmitReset: (user: UserListing, password: string) => Promise<void>;
+  editVaultsSt: EditVaultsState;
+  setEditVaultsSt: (s: EditVaultsState) => void;
+  onSubmitEditVaults: (user: UserListing, selected: string[]) => Promise<void>;
+  availableVaults: string[];
 }
 
 function ListRendered({
@@ -361,6 +405,10 @@ function ListRendered({
   resetSt,
   setResetSt,
   onSubmitReset,
+  editVaultsSt,
+  setEditVaultsSt,
+  onSubmitEditVaults,
+  availableVaults,
 }: ListRenderedProps): React.ReactNode {
   return (
     <div className="user-list" style={{ marginTop: "1rem" }}>
@@ -369,7 +417,7 @@ function ListRendered({
           <thead>
             <tr>
               <th scope="col">Username</th>
-              <th scope="col">Assigned vault</th>
+              <th scope="col">Assigned vaults</th>
               <th scope="col">Password set</th>
               <th scope="col">Created</th>
               <th scope="col">Actions</th>
@@ -390,6 +438,15 @@ function ListRendered({
                   ? resetSt
                   : null;
               const resetDone = resetSt.kind === "done" && resetSt.userId === u.id ? resetSt : null;
+              const editVaultsForRow =
+                (editVaultsSt.kind === "open" ||
+                  editVaultsSt.kind === "submitting" ||
+                  editVaultsSt.kind === "error") &&
+                editVaultsSt.userId === u.id
+                  ? editVaultsSt
+                  : null;
+              const editVaultsDone =
+                editVaultsSt.kind === "done" && editVaultsSt.userId === u.id ? editVaultsSt : null;
               return (
                 <tr key={u.id} data-user-id={u.id}>
                   <td>
@@ -401,10 +458,27 @@ function ListRendered({
                     )}
                   </td>
                   <td>
-                    {u.assigned_vault ? (
-                      <code>{u.assigned_vault}</code>
+                    {u.assigned_vaults.length > 0 ? (
+                      <span
+                        style={{
+                          display: "inline-flex",
+                          flexWrap: "wrap",
+                          gap: "0.25rem",
+                        }}
+                      >
+                        {u.assigned_vaults.map((v) => (
+                          <code key={v}>{v}</code>
+                        ))}
+                      </span>
                     ) : (
-                      <span className="muted" title="No per-vault restriction (admin-level access)">
+                      <span
+                        className="muted"
+                        title={
+                          isFirstAdmin
+                            ? "First admin is unrestricted (admin posture)"
+                            : "No vaults assigned — user can't authorize any vault yet"
+                        }
+                      >
                         —
                       </span>
                     )}
@@ -458,8 +532,38 @@ function ListRendered({
                             <span id={`first-admin-reset-tooltip-${u.id}`} className="sr-only">
                               First admin uses /account/change-password directly
                             </span>
+                            <span id={`first-admin-vaults-tooltip-${u.id}`} className="sr-only">
+                              First admin's vault membership is unrestricted by design
+                            </span>
                           </>
                         )}
+                        <button
+                          type="button"
+                          className="secondary"
+                          disabled={
+                            isFirstAdmin ||
+                            editVaultsForRow !== null ||
+                            (editVaultsSt.kind === "submitting" && editVaultsSt.userId === u.id)
+                          }
+                          title={
+                            isFirstAdmin
+                              ? "First admin's vault membership is unrestricted by design"
+                              : undefined
+                          }
+                          aria-describedby={
+                            isFirstAdmin ? `first-admin-vaults-tooltip-${u.id}` : undefined
+                          }
+                          onClick={() =>
+                            setEditVaultsSt({
+                              kind: "open",
+                              userId: u.id,
+                              selected: [...u.assigned_vaults],
+                            })
+                          }
+                          aria-label={`Edit vaults for ${u.username}`}
+                        >
+                          Edit vaults
+                        </button>
                         <button
                           type="button"
                           className="secondary"
@@ -570,6 +674,37 @@ function ListRendered({
                         </div>
                       </output>
                     )}
+                    {editVaultsForRow && (
+                      <EditVaultsRowForm
+                        user={u}
+                        state={editVaultsForRow}
+                        availableVaults={availableVaults}
+                        onCancel={() => setEditVaultsSt({ kind: "idle" })}
+                        onSelectedChange={(selected) =>
+                          setEditVaultsSt({ kind: "open", userId: u.id, selected })
+                        }
+                        onSubmit={(selected) => {
+                          void onSubmitEditVaults(u, selected);
+                        }}
+                      />
+                    )}
+                    {editVaultsDone && (
+                      <output
+                        className="success-banner"
+                        style={{ marginTop: "0.25rem", display: "block" }}
+                      >
+                        Vault assignments updated for <code>{editVaultsDone.username}</code>.
+                        <div style={{ marginTop: "0.5rem" }}>
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => setEditVaultsSt({ kind: "idle" })}
+                          >
+                            Dismiss
+                          </button>
+                        </div>
+                      </output>
+                    )}
                   </td>
                 </tr>
               );
@@ -653,6 +788,107 @@ function ResetPasswordRowForm({
   );
 }
 
+interface EditVaultsRowFormProps {
+  user: UserListing;
+  state:
+    | { kind: "open"; userId: string; selected: string[] }
+    | { kind: "submitting"; userId: string; selected: string[] }
+    | { kind: "error"; userId: string; selected: string[]; message: string };
+  availableVaults: string[];
+  onCancel: () => void;
+  onSelectedChange: (selected: string[]) => void;
+  onSubmit: (selected: string[]) => void;
+}
+
+function EditVaultsRowForm({
+  user,
+  state,
+  availableVaults,
+  onCancel,
+  onSelectedChange,
+  onSubmit,
+}: EditVaultsRowFormProps): React.ReactNode {
+  const submitting = state.kind === "submitting";
+  const errorMsg = state.kind === "error" ? state.message : null;
+  const selectId = `edit-vaults-select-${user.id}`;
+  function handleChange(e: React.ChangeEvent<HTMLSelectElement>): void {
+    const next = Array.from(e.target.selectedOptions).map((o) => o.value);
+    onSelectedChange(next);
+  }
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSubmit(state.selected);
+      }}
+      aria-label={`Edit vaults for ${user.username}`}
+      style={{
+        marginTop: "0.5rem",
+        padding: "0.5rem",
+        background: "var(--bg-soft, #f5f5f5)",
+        borderRadius: "4px",
+      }}
+    >
+      <p style={{ margin: 0 }}>
+        <label htmlFor={selectId}>
+          Vault assignments for <code>{user.username}</code>{" "}
+          <span className="muted">(empty = no narrowing; shift-click to multi-select)</span>
+        </label>
+      </p>
+      {state.selected.length > 0 && (
+        <div
+          data-testid={`edit-vaults-chips-${user.id}`}
+          style={{
+            marginTop: "0.4rem",
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "0.25rem",
+          }}
+        >
+          {state.selected.map((v) => (
+            <code key={v} style={{ padding: "0.1rem 0.4rem", borderRadius: "4px" }}>
+              {v}
+            </code>
+          ))}
+        </div>
+      )}
+      <select
+        id={selectId}
+        multiple
+        value={state.selected}
+        onChange={handleChange}
+        disabled={submitting}
+        size={Math.min(Math.max(availableVaults.length, 3), 8)}
+        style={{ marginTop: "0.4rem", minWidth: "12rem" }}
+      >
+        {availableVaults.map((v) => (
+          <option key={v} value={v}>
+            {v}
+          </option>
+        ))}
+      </select>
+      {availableVaults.length === 0 && (
+        <p className="muted" style={{ marginTop: "0.25rem" }}>
+          No vaults registered on this hub yet.
+        </p>
+      )}
+      {errorMsg && (
+        <div className="error-banner" style={{ marginTop: "0.25rem" }}>
+          <code>{errorMsg}</code>
+        </div>
+      )}
+      <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+        <button type="submit" disabled={submitting}>
+          {submitting ? "Saving…" : "Save vault assignments"}
+        </button>
+        <button type="button" className="secondary" onClick={onCancel} disabled={submitting}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
 interface CreateUserSectionProps {
   show: boolean;
   setShow: (s: boolean) => void;
@@ -721,20 +957,53 @@ function CreateUserSection({
             />
           </p>
           <p>
-            <label htmlFor="new-user-vault">Assigned vault</label>
+            <label htmlFor="new-user-vaults">
+              Assigned vaults{" "}
+              <span className="muted">
+                (empty = no restriction; shift-click to select multiple)
+              </span>
+            </label>
+            <br />
+            {form.assignedVaults.length > 0 && (
+              <span
+                data-testid="new-user-vault-chips"
+                style={{
+                  display: "inline-flex",
+                  flexWrap: "wrap",
+                  gap: "0.25rem",
+                  marginBottom: "0.25rem",
+                }}
+              >
+                {form.assignedVaults.map((v) => (
+                  <code key={v}>{v}</code>
+                ))}
+              </span>
+            )}
             <br />
             <select
-              id="new-user-vault"
-              value={form.assignedVault}
-              onChange={(e) => setForm({ ...form, assignedVault: e.target.value })}
+              id="new-user-vaults"
+              multiple
+              value={form.assignedVaults}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  assignedVaults: Array.from(e.target.selectedOptions).map((o) => o.value),
+                })
+              }
+              size={Math.min(Math.max(vaults.length, 3), 8)}
+              style={{ minWidth: "12rem" }}
             >
-              <option value="">No restriction (admin-level access)</option>
               {vaults.map((v) => (
                 <option key={v} value={v}>
                   {v}
                 </option>
               ))}
             </select>
+            {vaults.length === 0 && (
+              <span className="muted" style={{ marginLeft: "0.5rem" }}>
+                No vaults registered on this hub yet.
+              </span>
+            )}
           </p>
 
           {createState.kind === "error" && (

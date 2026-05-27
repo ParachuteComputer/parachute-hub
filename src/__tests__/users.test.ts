@@ -20,6 +20,7 @@ import {
   listUsers,
   resetUserPassword,
   setPassword,
+  setUserVaults,
   userCount,
   validatePassword,
   validateUsername,
@@ -56,7 +57,7 @@ describe("createUser", () => {
       expect(userCount(db)).toBe(1);
       // Default multi-user-Phase-1 shape: unchanged password, no vault pin.
       expect(u.passwordChanged).toBe(false);
-      expect(u.assignedVault).toBeNull();
+      expect(u.assignedVaults).toEqual([]);
     } finally {
       cleanup();
     }
@@ -76,28 +77,63 @@ describe("createUser", () => {
     }
   });
 
-  test("assignedVault opt-in persists the column (admin-creates-user path)", async () => {
+  test("assignedVaults opt-in persists each vault (admin-creates-user path)", async () => {
     const { db, cleanup } = makeDb();
     try {
       const u = await createUser(db, "alice", "pw1", {
         allowMulti: true,
-        assignedVault: "alice",
+        assignedVaults: ["alice"],
       });
-      expect(u.assignedVault).toBe("alice");
+      expect(u.assignedVaults).toEqual(["alice"]);
       const fresh = getUserById(db, u.id);
-      expect(fresh?.assignedVault).toBe("alice");
+      expect(fresh?.assignedVaults).toEqual(["alice"]);
     } finally {
       cleanup();
     }
   });
 
-  test("assignedVault explicit null is treated the same as omitted", async () => {
+  test("assignedVaults with multiple entries — all persist (multi-vault Phase 2)", async () => {
     const { db, cleanup } = makeDb();
     try {
-      const u = await createUser(db, "admin1", "pw1", { assignedVault: null });
-      expect(u.assignedVault).toBeNull();
+      const u = await createUser(db, "alice", "pw1", {
+        allowMulti: true,
+        assignedVaults: ["personal", "family"],
+      });
+      expect(u.assignedVaults).toEqual(["personal", "family"]);
       const fresh = getUserById(db, u.id);
-      expect(fresh?.assignedVault).toBeNull();
+      // Loaded via the user_vaults JOIN — order matches insertion order
+      // because rows share the same `created_at` timestamp and tie-break
+      // on `vault_name` ASC. `family` precedes `personal` alphabetically.
+      expect(fresh?.assignedVaults.length).toBe(2);
+      expect(new Set(fresh?.assignedVaults)).toEqual(new Set(["personal", "family"]));
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("assignedVaults omitted defaults to empty array (admin posture)", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "admin1", "pw1");
+      expect(u.assignedVaults).toEqual([]);
+      const fresh = getUserById(db, u.id);
+      expect(fresh?.assignedVaults).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("assignedVaults de-duplicates repeated names", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "pw1", {
+        allowMulti: true,
+        assignedVaults: ["personal", "personal", "family"],
+      });
+      // De-dupe is silent; user gets one row per distinct name.
+      expect(u.assignedVaults).toEqual(["personal", "family"]);
+      const fresh = getUserById(db, u.id);
+      expect(fresh?.assignedVaults.length).toBe(2);
     } finally {
       cleanup();
     }
@@ -541,6 +577,96 @@ describe("resetUserPassword", () => {
         )
         .get(bobToken.jti);
       expect(bobRow?.revoked_at).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("setUserVaults (multi-user Phase 2 PR 2)", () => {
+  test("returns false when user does not exist", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      expect(setUserVaults(db, "no-such-id", ["a"])).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("replaces a user's vault list atomically", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase", {
+        assignedVaults: ["personal"],
+      });
+      expect(setUserVaults(db, u.id, ["family", "work"])).toBe(true);
+      const fresh = getUserById(db, u.id);
+      // Old vault dropped; new ones present.
+      expect(new Set(fresh?.assignedVaults)).toEqual(new Set(["family", "work"]));
+      expect(fresh?.assignedVaults).not.toContain("personal");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("empty array clears every existing assignment (non-admin = no access)", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase", {
+        assignedVaults: ["a", "b", "c"],
+      });
+      expect(setUserVaults(db, u.id, [])).toBe(true);
+      const fresh = getUserById(db, u.id);
+      expect(fresh?.assignedVaults).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("de-duplicates repeated names without throwing", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase");
+      expect(setUserVaults(db, u.id, ["a", "a", "b"])).toBe(true);
+      const fresh = getUserById(db, u.id);
+      expect(new Set(fresh?.assignedVaults)).toEqual(new Set(["a", "b"]));
+      expect(fresh?.assignedVaults.length).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("bumps updated_at so the SPA row reflects the change", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase", {
+        now: () => new Date(1000),
+      });
+      const before = getUserById(db, u.id);
+      expect(setUserVaults(db, u.id, ["a"], () => new Date(2000))).toBe(true);
+      const after = getUserById(db, u.id);
+      expect(after?.updatedAt).not.toBe(before?.updatedAt);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("vault assignments cascade-delete with the user row", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "alice", "alice-strong-passphrase", {
+        assignedVaults: ["a", "b"],
+      });
+      // Sanity: rows exist in user_vaults.
+      const before = db
+        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM user_vaults WHERE user_id = ?")
+        .get(u.id);
+      expect(before?.n).toBe(2);
+      deleteUser(db, u.id);
+      const after = db
+        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM user_vaults WHERE user_id = ?")
+        .get(u.id);
+      expect(after?.n).toBe(0);
     } finally {
       cleanup();
     }

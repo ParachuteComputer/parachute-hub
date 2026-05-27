@@ -160,7 +160,7 @@ describe("handleVaultAdminToken", () => {
     // whole reason this gate exists.
     await createUser(harness.db, "operator", "hunter2-admin");
     const friend = await createUser(harness.db, "friend", "hunter2-friend", {
-      assignedVault: "work",
+      assignedVaults: ["work"],
       allowMulti: true,
     });
     const session = createSession(harness.db, { userId: friend.id });
@@ -182,7 +182,7 @@ describe("handleVaultAdminToken", () => {
     // happy path when there are friends in the DB.
     const admin = await createUser(harness.db, "operator", "hunter2-admin");
     await createUser(harness.db, "friend", "hunter2-friend", {
-      assignedVault: "work",
+      assignedVaults: ["work"],
       allowMulti: true,
     });
     const session = createSession(harness.db, { userId: admin.id });
