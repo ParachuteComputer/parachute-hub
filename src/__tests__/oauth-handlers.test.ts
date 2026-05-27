@@ -28,7 +28,7 @@ import {
 } from "../oauth-handlers.ts";
 import type { ServicesManifest } from "../services-manifest.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
-import { createUser } from "../users.ts";
+import { createUser, setUserVaults } from "../users.ts";
 
 const ISSUER = "https://hub.example";
 const TEST_CSRF = "csrf-test-token";
@@ -7274,6 +7274,148 @@ describe("zero-vault non-admin privesc gate (hub#429 reviewer)", () => {
       // token for non-admin users). Pin the helper's behavior so a
       // future change can't silently lift it to "include all vaults".
       expect(vaultScopeForUser(db, bob.id)).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("stale grant survives setUserVaults([]) → skip-consent gate fires consent screen, not silent code (path 5)", async () => {
+    // The 4th attack the prior fold didn't cover. Sequence:
+    //   1. bob has assignedVaults=["default"] (legitimate).
+    //   2. bob consents to a vault-scoped client → grants row recorded.
+    //   3. Admin clears bob's assignments via setUserVaults(_, []).
+    //   4. Grants table has no FK cascade from user_vaults, so the
+    //      grant row survives the assignment delete.
+    //   5. bob re-hits /oauth/authorize?scope=vault:default:read for
+    //      the same client. Pre-fix: skip-consent gate fires
+    //      (isCoveredByGrant=true), silent 302 with auth code and
+    //      vault_scope=[] (the admin "unrestricted" sentinel).
+    //   Post-fix: userHasVaultPosture=false → fall through to
+    //   consent render where the zero-vault gate also refuses.
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
+      expect(bob.assignedVaults).toEqual(["default"]);
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      // Record the grant while bob still has the assignment.
+      recordGrant(db, bob.id, reg.client.clientId, ["vault:default:read"]);
+      // Admin clears bob's assignments. Grant row is NOT cascaded.
+      expect(setUserVaults(db, bob.id, [])).toBe(true);
+      expect(findGrant(db, bob.id, reg.client.clientId)).not.toBeNull();
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "stale-grant",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // Post-fix: 200 HTML consent screen, NOT 302 with code.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      expect(res.headers.get("location")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("trust-by-client_name auto-promote → recursive re-entry hits skip-consent gate (path 6)", async () => {
+    // The trust-by-client_name path (hub#409, ~line 554) recursively
+    // calls handleAuthorizeGet after approveClient + recordGrant on
+    // the fresh client_id. That recursive call now passes through
+    // the skip-consent gate with our new userHasVaultPosture check.
+    //
+    // Sequence:
+    //   1. bob has assignedVaults=["default"], consents to "claude-code"
+    //      (prior client_id) for vault:default:read.
+    //   2. Admin clears bob's assignments.
+    //   3. Claude re-DCRs a fresh "claude-code" with a new client_id
+    //      (status=pending).
+    //   4. bob hits /oauth/authorize on the fresh client_id.
+    //   5. Pre-fix: trust-by-client_name matches by name+scope,
+    //      approves the fresh client, records grant, recurses into
+    //      handleAuthorizeGet — which now finds a covering grant and
+    //      silently mints the auth code with vault_scope=[].
+    //   Post-fix: the recursive call's skip-consent gate sees
+    //   userHasVaultPosture=false and falls through to the consent
+    //   render. Same-hub gate also refuses (sameHub=false here, but
+    //   the posture check is the load-bearing constraint).
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", {
+        allowMulti: true,
+        assignedVaults: ["default"],
+      });
+      const session = createSession(db, { userId: bob.id });
+      // Prior approved client_name="claude-code" + grant.
+      const prior = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        clientName: "claude-code",
+      });
+      recordGrant(db, bob.id, prior.client.clientId, ["vault:default:read"]);
+      // Admin clears bob's assignments. Prior grant survives.
+      expect(setUserVaults(db, bob.id, [])).toBe(true);
+      // Fresh DCR — same client_name, fresh client_id, status=pending.
+      const fresh = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+        clientName: "claude-code",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: fresh.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:default:read",
+          state: "trust-by-name-zero",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            origin: ISSUER,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // Post-fix: 200 HTML consent screen, NOT 302 with code. The
+      // fresh client_id IS approved (the auto-promote ran), and a
+      // grant IS recorded — that's the design of hub#409. The
+      // load-bearing assertion is that the recursive re-entry into
+      // handleAuthorizeGet did NOT issue an auth code, because the
+      // zero-vault posture failed our gate.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      expect(res.headers.get("location")).toBeNull();
+      expect(getClient(db, fresh.client.clientId)?.status).toBe("approved");
     } finally {
       cleanup();
     }

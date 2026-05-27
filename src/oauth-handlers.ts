@@ -910,7 +910,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   const hasStaleAssignment = assignedVaults.length > 0 && remainingValidVaults.length === 0;
 
   // Skip-consent gate (#75). If the user has previously granted every
-  // requested scope to this client, mint the auth code immediately. Two
+  // requested scope to this client, mint the auth code immediately. Three
   // important constraints:
   //   - Unnamed vault verbs (`vault:read`) need the picker even if a prior
   //     grant exists, because the operator's vault choice isn't recorded
@@ -922,10 +922,25 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   //   - Stale-assignment (above) also forces the consent render so the
   //     banner explains the broken state rather than silently minting a
   //     token against the missing vault.
+  //   - The user is admin OR has at least one assigned vault (hub#429
+  //     reviewer fold, follow-up). A zero-vault non-admin whose prior
+  //     grants survived a `setUserVaults(_, [])` admin action would
+  //     otherwise silently re-mint a token against the now-revoked
+  //     vault assignment — the grants table has no FK cascade from
+  //     `user_vaults`, so deleting assignments doesn't revoke grants.
+  //     Same privesc shape as the same-hub auto-trust gate below;
+  //     identical guard (`userHasVaultPosture`). Force fall-through to
+  //     the consent render where the zero-vault gate in
+  //     `handleConsentSubmit` also refuses (defense in depth). This
+  //     also transitively defends the trust-by-client_name auto-
+  //     promote path (~line 554) which recursively re-enters
+  //     `handleAuthorizeGet` after promoting the pending client.
   const hasUnnamedVault = unnamedVaultVerbs(requestedScopes).length > 0;
+  const userHasVaultPosture = userIsAdmin || assignedVaults.length > 0;
   if (
     !hasStaleAssignment &&
     !hasUnnamedVault &&
+    userHasVaultPosture &&
     isCoveredByGrant(db, session.userId, client.clientId, requestedScopes)
   ) {
     console.log(
@@ -966,7 +981,6 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // hit the standard skip-consent gate above. Logged so an operator
   // auditing "who did this" can trace it back to a same-hub DCR.
   const hasAdminScope = requestedScopes.some(scopeIsAdmin);
-  const userHasVaultPosture = userIsAdmin || assignedVaults.length > 0;
   if (
     client.sameHub &&
     !hasAdminScope &&
