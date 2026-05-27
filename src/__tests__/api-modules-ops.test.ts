@@ -126,6 +126,19 @@ function alwaysOkRun(): {
   };
 }
 
+/**
+ * Test default for `isLinked`: assume the package is NOT bun-linked so
+ * `runInstall` exercises the `bun add -g` path (which the stubbed runner
+ * captures into `calls`). The production default at
+ * `src/bun-link.ts` reads the contributor's real `~/.bun/install/global/`
+ * symlinks; on Aaron's machine vault/scribe/notes/hub are all linked
+ * (the canonical local-dev shape — smoke 2026-05-27 finding 1 caps the
+ * fix). Tests asserting "bun add WAS called" must opt out of that leakage
+ * by passing this stub. Tests specifically exercising the skip path use
+ * an inline `isLinked: () => true` or a per-pkg discriminator.
+ */
+const TEST_DEFAULT_NOT_LINKED = (_pkg: string): boolean => false;
+
 describe("parseModulesPath", () => {
   test("recognizes curated short + action", () => {
     expect(parseModulesPath("/api/modules/vault/install")).toEqual({
@@ -231,6 +244,7 @@ describe("POST /api/modules/:short/install", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     expect(res.status).toBe(202);
@@ -280,6 +294,7 @@ describe("POST /api/modules/:short/install", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     expect(res.status).toBe(202);
@@ -301,6 +316,7 @@ describe("POST /api/modules/:short/install", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     const op = (await opRes.json()) as { status: string };
@@ -324,6 +340,7 @@ describe("POST /api/modules/:short/install", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     expect(res.status).toBe(202);
@@ -348,6 +365,7 @@ describe("POST /api/modules/:short/install", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     await new Promise((r) => setTimeout(r, 10));
@@ -379,6 +397,7 @@ describe("POST /api/modules/:short/install", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     expect(res.status).toBe(202);
@@ -406,6 +425,7 @@ describe("POST /api/modules/:short/install", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     await new Promise((r) => setTimeout(r, 10));
@@ -433,6 +453,7 @@ describe("POST /api/modules/:short/install", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     expect(res.status).toBe(400);
@@ -458,6 +479,7 @@ describe("POST /api/modules/:short/install", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     await new Promise((r) => setTimeout(r, 10));
@@ -487,6 +509,7 @@ describe("POST /api/modules/:short/install", () => {
           configDir: h.dir,
           supervisor,
           run,
+          isLinked: TEST_DEFAULT_NOT_LINKED,
         },
       );
       await new Promise((r) => setTimeout(r, 10));
@@ -524,6 +547,7 @@ describe("POST /api/modules/:short/install", () => {
           configDir: h.dir,
           supervisor,
           run,
+          isLinked: TEST_DEFAULT_NOT_LINKED,
         },
       );
       await new Promise((r) => setTimeout(r, 10));
@@ -557,6 +581,7 @@ describe("POST /api/modules/:short/install", () => {
           configDir: h.dir,
           supervisor,
           run,
+          isLinked: TEST_DEFAULT_NOT_LINKED,
         },
       );
       expect(res.status).toBe(202);
@@ -583,6 +608,7 @@ describe("POST /api/modules/:short/install", () => {
       supervisor,
       run: async () => 1,
       findGlobalInstall: () => null,
+      isLinked: TEST_DEFAULT_NOT_LINKED,
     };
     const res = await handleInstall(
       postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
@@ -601,6 +627,71 @@ describe("POST /api/modules/:short/install", () => {
     const op = (await opRes.json()) as { status: string; error?: string };
     expect(op.status).toBe("failed");
     expect(op.error).toMatch(/bun add -g exited 1/);
+  });
+
+  test("skips bun add -g when package is already bun-linked (smoke 2026-05-27 finding 1)", async () => {
+    // Smoke finding 1: the wizard's parallel install path was unconditionally
+    // invoking `bun add -g <pkg>` even when the package was already linked
+    // via `bun link <abspath>` (the standard local-dev shape). At best a
+    // wasted ~3s npm round-trip per install; at worst the global bun.lock
+    // had unrelated noise and the install failed outright, taking the
+    // wizard's vault step with it. Fix: mirror the CLI install path's
+    // `isLinked` short-circuit. Regression guard.
+    const { supervisor, spawns } = makeIdleSupervisor();
+    const { run, calls } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+        // The bug shape: package IS linked locally. Without the
+        // short-circuit, runInstall would still call bun add -g.
+        isLinked: (pkg) => pkg === "@openparachute/vault",
+      },
+    );
+    expect(res.status).toBe(202);
+    await new Promise((r) => setTimeout(r, 10));
+
+    // The fix: bun add -g was NOT invoked for the linked package.
+    expect(calls).not.toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+    // Downstream of the skip, the seed + spawn still happen — the install
+    // op completes successfully against the locally-linked checkout.
+    const manifest = JSON.parse(readFileSync(h.manifestPath, "utf8")) as {
+      services: Array<{ name: string }>;
+    };
+    expect(manifest.services.some((s) => s.name === "parachute-vault")).toBe(true);
+    expect(spawns.find((s) => s.short === "vault")?.cmd).toEqual(["parachute-vault", "serve"]);
+  });
+
+  test("still runs bun add -g when package is NOT bun-linked", async () => {
+    // Companion to the above — confirms the short-circuit doesn't
+    // unconditionally skip. On a friend's fresh machine (no bun link),
+    // bun add -g IS what installs the package from npm. `isLinked: () => false`
+    // is the production default behavior for a non-linked package.
+    const { supervisor } = makeIdleSupervisor();
+    const { run, calls } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+        isLinked: () => false,
+      },
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
   });
 });
 
@@ -682,6 +773,7 @@ describe("POST /api/modules/:short/upgrade", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     expect(res.status).toBe(202);
@@ -706,6 +798,7 @@ describe("POST /api/modules/:short/upgrade", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     expect(res.status).toBe(202);
@@ -736,6 +829,7 @@ describe("POST /api/modules/:short/upgrade", () => {
           configDir: h.dir,
           supervisor,
           run,
+          isLinked: TEST_DEFAULT_NOT_LINKED,
         },
       );
       await new Promise((r) => setTimeout(r, 10));
@@ -846,6 +940,7 @@ describe("POST /api/modules/:short/uninstall", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     expect(res.status).toBe(200);
@@ -878,6 +973,7 @@ describe("POST /api/modules/:short/uninstall", () => {
         configDir: h.dir,
         supervisor,
         run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
       },
     );
     expect(res.status).toBe(200);
@@ -1099,6 +1195,7 @@ describe("well-known regen after module ops", () => {
       supervisor,
       run: async () => 1,
       findGlobalInstall: () => null,
+      isLinked: TEST_DEFAULT_NOT_LINKED,
       wellKnownPath: wkPath,
     };
     const res = await handleInstall(

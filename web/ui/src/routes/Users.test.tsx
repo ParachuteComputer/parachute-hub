@@ -203,7 +203,7 @@ describe("Users — admin password reset (Phase 2 PR 1)", () => {
     // server flips it and the SPA re-reads). Round-trip through the mock.
     listMock.mockResolvedValueOnce([user("operator"), user("alice", { password_changed: false })]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
-    vi.mocked(api.resetUserPassword).mockResolvedValue();
+    vi.mocked(api.resetUserPassword).mockResolvedValue({ revocationLagSeconds: 60 });
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /reset password for alice/i }));
     fireEvent.change(screen.getByLabelText(/new temporary password for alice/i), {

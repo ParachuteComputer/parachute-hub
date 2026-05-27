@@ -884,6 +884,15 @@ describe("handleSetupVaultPost", () => {
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
           run: stubbedRun,
+          // Force the test to exercise the bun-add path; production
+          // `defaultIsLinked` reads the real ~/.bun globals which on
+          // a contributor's machine returns true (Aaron's vault is
+          // linked locally) and the runInstall short-circuit fires.
+          // For tests asserting "bun add WAS called," opt out of the
+          // skip explicitly. (Smoke 2026-05-27 finding 1 — the skip
+          // is the production behavior we want; tests assert both
+          // branches.)
+          isLinked: () => false,
         },
       );
       expect(post.status).toBe(303);
@@ -954,6 +963,7 @@ describe("handleSetupVaultPost", () => {
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
           run: stubbedRun,
+          isLinked: () => false,
         },
       );
       // 303 redirect with both op + op_scribe params.
@@ -1021,6 +1031,7 @@ describe("handleSetupVaultPost", () => {
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
           run: stubbedRun,
+          isLinked: () => false,
         },
       );
       expect(post.status).toBe(303);
@@ -1164,6 +1175,10 @@ describe("handleSetupVaultPost", () => {
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
           run: stubbedRun,
+          // Test default: assume nothing is bun-linked so `bun add -g`
+          // fires and runCmds reflects the real install commands.
+          // (Smoke 2026-05-27 finding 1.)
+          isLinked: () => false,
         },
       );
       // Yield long enough for background runInstall promises to call
@@ -2295,6 +2310,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
           run: stubbedRun,
+          isLinked: () => false,
         },
       );
       expect(post.status).toBe(303);
@@ -2647,6 +2663,15 @@ describe("typed vault name (hub#267)", () => {
   });
 
   test("done screen surfaces the typed name in the MCP command", async () => {
+    // Happy-path shape: operator typed `my-personal-vault`, vault
+    // first-boot wrote it through to services.json. Both sources
+    // agree, the done page renders the operator-typed name verbatim.
+    // (Pre-smoke-2026-05-27 this test used a mismatched fixture —
+    // services.json said `/vault/default` while the typed setting was
+    // `my-personal-vault`. The DB-priority shape that test was pinning
+    // is itself the smoke finding 2 bug; the fixture has been
+    // realigned to match the actual end-to-end flow where vault's
+    // first-boot honors PARACHUTE_VAULT_NAME.)
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -2657,7 +2682,7 @@ describe("typed vault name (hub#267)", () => {
               name: "parachute-vault",
               version: "0.1.0",
               port: 1940,
-              paths: ["/vault/default"],
+              paths: ["/vault/my-personal-vault"],
               health: "/health",
             },
           ],
@@ -2683,6 +2708,108 @@ describe("typed vault name (hub#267)", () => {
       const html = await res.text();
       expect(html).toContain("parachute-my-personal-vault");
       expect(html).toContain("/vault/my-personal-vault/mcp");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done screen renders LIVE vault name when services.json disagrees with the DB-cached value (smoke 2026-05-27 finding 2)", async () => {
+    // Scenario: operator typed `test` into the wizard, install failed
+    // (smoke finding 1), operator worked around it by installing vault
+    // via CLI which created it under the canonical `default` name. The
+    // DB's `setup_vault_name` is stale; services.json is the source of
+    // truth. Done page must render the LIVE name, not the stale typed
+    // one, or the operator's "Open Notes" CTA links to a 404 vault.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"], // LIVE vault is "default"
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      // DB cache says "test" — what the operator typed before the
+      // workaround. This is the bug shape: stale DB value vs live
+      // services.json.
+      setSetting(db, "setup_vault_name", "test");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?just_finished=1", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      const html = await res.text();
+      // The rendered name MUST be the live "default", not the
+      // operator-typed "test" cached in `setup_vault_name`.
+      expect(html).toContain("/vault/default");
+      expect(html).not.toContain("/vault/test");
+      // And the MCP service-namespace stamp should mirror it.
+      expect(html).toContain("parachute-default");
+      expect(html).not.toContain("parachute-test");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done screen renders LIVE name even when it matches the DB value (happy path regression)", async () => {
+    // Sanity check: the priority swap (live > stored) must NOT
+    // break the happy path where both agree. The vault was installed
+    // under the typed name, services.json reflects that, both sources
+    // say the same thing.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/my-vault"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      setSetting(db, "setup_vault_name", "my-vault");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?just_finished=1", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      const html = await res.text();
+      expect(html).toContain("/vault/my-vault");
+      expect(html).toContain("parachute-my-vault");
     } finally {
       db.close();
     }

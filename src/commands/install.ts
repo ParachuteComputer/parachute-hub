@@ -1,8 +1,8 @@
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { createConnection } from "node:net";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { autoWireScribeAuth } from "../auto-wire.ts";
+import { bunGlobalPrefixes, isLinked as defaultIsLinkedShared } from "../bun-link.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import {
   type ModuleManifest,
@@ -260,25 +260,12 @@ async function defaultRunner(cmd: readonly string[]): Promise<number> {
   return await proc.exited;
 }
 
-function bunGlobalPrefixes(): string[] {
-  const prefixes: string[] = [];
-  const fromEnv = process.env.BUN_INSTALL;
-  if (fromEnv) prefixes.push(join(fromEnv, "install", "global", "node_modules"));
-  prefixes.push(join(homedir(), ".bun", "install", "global", "node_modules"));
-  return prefixes;
-}
-
-function defaultIsLinked(pkg: string): boolean {
-  for (const prefix of bunGlobalPrefixes()) {
-    const path = join(prefix, ...pkg.split("/"));
-    try {
-      if (lstatSync(path).isSymbolicLink()) return true;
-    } catch {
-      // Not present at this prefix; try the next.
-    }
-  }
-  return false;
-}
+// `bunGlobalPrefixes` + `defaultIsLinked` were extracted to `src/bun-link.ts`
+// so the wizard's parallel install path (`api-modules-ops.ts:runInstall`) can
+// reuse the same detection — the two paths diverging is the bug class hub#433
+// fixed (smoke 2026-05-27, finding 1). `defaultIsLinkedShared` is imported at
+// module scope; alias kept for the in-function local-shadow convention below.
+const defaultIsLinked = defaultIsLinkedShared;
 
 function defaultLinkedPath(pkg: string): string | null {
   // bun has two install shapes for "linked-style" globals:

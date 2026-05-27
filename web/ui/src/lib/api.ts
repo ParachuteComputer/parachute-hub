@@ -1158,7 +1158,10 @@ export async function deleteUser(id: string): Promise<void> {
  * that case — same posture as `deleteUser` for the
  * first_admin_undeletable rail.
  */
-export async function resetUserPassword(userId: string, newPassword: string): Promise<void> {
+export async function resetUserPassword(
+  userId: string,
+  newPassword: string,
+): Promise<{ revocationLagSeconds: number }> {
   const bearer = await getHostAdminToken();
   const res = await fetch(`/api/users/${encodeURIComponent(userId)}/reset-password`, {
     method: "POST",
@@ -1174,6 +1177,15 @@ export async function resetUserPassword(userId: string, newPassword: string): Pr
     throw new HttpError(res.status, await readError(res));
   }
   if (!res.ok) throw new HttpError(res.status, await readError(res));
+  // The server returns `revocation_lag_seconds: 60` reflecting the
+  // scope-guard cache TTL on resource servers. Surface it to the caller
+  // so the UI banner stays in sync with the server's constant — one
+  // source of truth, not a third hardcoded copy in the SPA.
+  // Default to 60 if the field is missing (older server or unparseable
+  // response — better than failing the whole reset flow).
+  const body = (await res.json().catch(() => ({}))) as { revocation_lag_seconds?: number };
+  const lag = typeof body.revocation_lag_seconds === "number" ? body.revocation_lag_seconds : 60;
+  return { revocationLagSeconds: lag };
 }
 
 /**
