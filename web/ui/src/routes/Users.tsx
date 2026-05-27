@@ -1,15 +1,19 @@
 /**
- * /admin/users — multi-user Phase 1 admin surface.
+ * /admin/users — multi-user Phase 1 admin surface (Phase 2 PR 1
+ * adds admin password reset).
  *
  * Design: `parachute.computer/design/2026-05-20-multi-user-phase-1.md`.
- * Tracker: hub#252. PR 2 of 5 in the multi-user chain.
+ * Tracker: hub#252. PR 2 of 5 in the original multi-user chain shipped
+ * list + create + delete; Phase 2 PR 1 layers admin-initiated password
+ * reset for non-admin users on top.
  *
  * Surface:
  *
  *   1. **Users list table.** Username · Assigned vault · Password set ·
  *      Created · Actions. First admin (the wizard / env-seeded
- *      bootstrap row) has the Delete button disabled with a tooltip;
- *      the server enforces the same rail (`first_admin_undeletable`).
+ *      bootstrap row) has Delete + Reset Password disabled with a
+ *      tooltip; the server enforces both rails
+ *      (`first_admin_undeletable`, `cannot_reset_first_admin`).
  *   2. **Create user form.** Collapsible section below the table.
  *      Username + password + assigned-vault dropdown (fetched on mount
  *      from `/api/users/vaults`). The dropdown's first option is the
@@ -19,9 +23,16 @@
  *   3. **Delete confirmation.** Inline confirm dialog mirroring the
  *      `Permissions.tsx` pattern — click → confirm dialog → DELETE →
  *      refresh.
+ *   4. **Reset Password (Phase 2 PR 1).** Per-row inline form (mirrors
+ *      Create User's collapse-then-form shape). Single password field;
+ *      submit POSTs to `/api/users/:id/reset-password`; success collapses
+ *      and surfaces a row-scoped banner with the "hand them the new
+ *      password" copy. The server flips `password_changed=0` and revokes
+ *      the friend's still-active tokens — leaked-password recovery
+ *      shouldn't leave the attacker holding valid bearers.
  *
- * Optimistic-update + rollback-on-error: the create flow follows the
- * `Modules.tsx`-style "fire-and-recover" shape. On submit, the form
+ * Optimistic-update + rollback-on-error: the create + reset flows follow
+ * the `Modules.tsx`-style "fire-and-recover" shape. On submit, the form
  * locks, posts; on success the table refreshes from the server (which
  * is the source of truth for `created_at` ordering); on failure the
  * inline error banner surfaces the server's `error_description` and
@@ -32,11 +43,10 @@
  * A 401 surfaces verbatim and the lib helper handles the redirect-to-
  * login on the next mint attempt.
  *
- * Force-change-password redirect copy: when the admin creates a user,
- * the success banner says "they'll be prompted to change their
- * password on first sign-in" — telegraphs PR 3's flow without
- * pretending it exists yet (the bit is persisted now; the redirect
- * lands in PR 3).
+ * Force-change-password redirect copy: when the admin creates a user
+ * OR resets one, the success banner says "they'll be prompted to
+ * change it on first sign-in" — same wording across both flows so the
+ * operator builds a consistent mental model.
  */
 import { type FormEvent, useEffect, useState } from "react";
 import {
@@ -47,6 +57,7 @@ import {
   deleteUser,
   listUserVaults,
   listUsers,
+  resetUserPassword,
 } from "../lib/api.ts";
 
 /**
@@ -88,6 +99,19 @@ type DeleteState =
   | { kind: "deleting"; userId: string }
   | { kind: "error"; userId: string; message: string };
 
+/**
+ * Per-row reset-password state. Only one row can be in the "open form"
+ * state at a time (matches Delete's confirm-dialog discipline) — the
+ * row's userId carries the open form, all other rows render the
+ * collapsed Reset Password button.
+ */
+type ResetState =
+  | { kind: "idle" }
+  | { kind: "open"; userId: string; password: string }
+  | { kind: "submitting"; userId: string; password: string }
+  | { kind: "done"; userId: string; username: string }
+  | { kind: "error"; userId: string; password: string; message: string };
+
 interface FormFields {
   username: string;
   password: string;
@@ -108,6 +132,7 @@ export function Users() {
   const [form, setForm] = useState<FormFields>(EMPTY_FORM);
   const [createState, setCreateState] = useState<CreateState>({ kind: "idle" });
   const [deleteSt, setDeleteSt] = useState<DeleteState>({ kind: "idle" });
+  const [resetSt, setResetSt] = useState<ResetState>({ kind: "idle" });
 
   useEffect(() => {
     void reload;
@@ -190,6 +215,38 @@ export function Users() {
     }
   }
 
+  async function onSubmitReset(user: UserListing, password: string): Promise<void> {
+    // Client-side password floor — same shape as the create form's
+    // validator. Server is authoritative; this is the fast-feedback
+    // copy so the operator doesn't burn a roundtrip on an obvious typo.
+    if (password.length < PASSWORD_MIN_LEN) {
+      setResetSt({
+        kind: "error",
+        userId: user.id,
+        password,
+        message: `Password must be at least ${PASSWORD_MIN_LEN} characters.`,
+      });
+      return;
+    }
+    setResetSt({ kind: "submitting", userId: user.id, password });
+    try {
+      await resetUserPassword(user.id, password);
+      setResetSt({ kind: "done", userId: user.id, username: user.username });
+      // Refresh so the row's "Password set" cell flips back to
+      // "pending first login" — the server flipped password_changed
+      // back to false, and the table needs to mirror that.
+      setReload((n) => n + 1);
+    } catch (err) {
+      const message =
+        err instanceof HttpError
+          ? `Reset failed (${err.status}): ${err.message}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      setResetSt({ kind: "error", userId: user.id, password, message });
+    }
+  }
+
   return (
     <div data-route-content="true">
       <div className="list-header">
@@ -203,8 +260,15 @@ export function Users() {
         and are prompted to change it on first sign-in.
       </p>
 
-      {renderListSection(state, deleteSt, setDeleteSt, onConfirmDelete, () =>
-        setReload((n) => n + 1),
+      {renderListSection(
+        state,
+        deleteSt,
+        setDeleteSt,
+        onConfirmDelete,
+        resetSt,
+        setResetSt,
+        onSubmitReset,
+        () => setReload((n) => n + 1),
       )}
 
       {state.kind === "ok" && (
@@ -227,7 +291,10 @@ function renderListSection(
   state: ListState,
   deleteSt: DeleteState,
   setDeleteSt: (s: DeleteState) => void,
-  onConfirm: (user: UserListing) => Promise<void>,
+  onConfirmDelete: (user: UserListing) => Promise<void>,
+  resetSt: ResetState,
+  setResetSt: (s: ResetState) => void,
+  onSubmitReset: (user: UserListing, password: string) => Promise<void>,
   onRetry: () => void,
 ): React.ReactNode {
   if (state.kind === "loading") {
@@ -255,9 +322,10 @@ function renderListSection(
     );
   }
   // The first row by `created_at ASC` is the wizard / env-seeded admin
-  // — the server enforces "first admin can't be deleted." The SPA
-  // disables the row's Delete button as a UX hint; the server check
-  // is authoritative.
+  // — the server enforces "first admin can't be deleted" AND "first
+  // admin password reset goes through /account/change-password
+  // directly." The SPA disables both row actions as a UX hint; the
+  // server checks are authoritative.
   const firstAdminId = users[0]?.id;
   return (
     <ListRendered
@@ -265,7 +333,10 @@ function renderListSection(
       firstAdminId={firstAdminId}
       deleteSt={deleteSt}
       setDeleteSt={setDeleteSt}
-      onConfirm={onConfirm}
+      onConfirmDelete={onConfirmDelete}
+      resetSt={resetSt}
+      setResetSt={setResetSt}
+      onSubmitReset={onSubmitReset}
     />
   );
 }
@@ -275,7 +346,10 @@ interface ListRenderedProps {
   firstAdminId: string | undefined;
   deleteSt: DeleteState;
   setDeleteSt: (s: DeleteState) => void;
-  onConfirm: (user: UserListing) => Promise<void>;
+  onConfirmDelete: (user: UserListing) => Promise<void>;
+  resetSt: ResetState;
+  setResetSt: (s: ResetState) => void;
+  onSubmitReset: (user: UserListing, password: string) => Promise<void>;
 }
 
 function ListRendered({
@@ -283,137 +357,299 @@ function ListRendered({
   firstAdminId,
   deleteSt,
   setDeleteSt,
-  onConfirm,
+  onConfirmDelete,
+  resetSt,
+  setResetSt,
+  onSubmitReset,
 }: ListRenderedProps): React.ReactNode {
   return (
     <div className="user-list" style={{ marginTop: "1rem" }}>
       <div className="table-scroll">
         <table className="user-table">
-        <thead>
-          <tr>
-            <th scope="col">Username</th>
-            <th scope="col">Assigned vault</th>
-            <th scope="col">Password set</th>
-            <th scope="col">Created</th>
-            <th scope="col">Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          {users.map((u) => {
-            const isFirstAdmin = u.id === firstAdminId;
-            const isDeleting = deleteSt.kind === "deleting" && deleteSt.userId === u.id;
-            const isConfirming = deleteSt.kind === "confirming" && deleteSt.user.id === u.id;
-            const rowError =
-              deleteSt.kind === "error" && deleteSt.userId === u.id ? deleteSt : null;
-            return (
-              <tr key={u.id} data-user-id={u.id}>
-                <td>
-                  <code>{u.username}</code>
-                  {isFirstAdmin && (
-                    <span className="badge" style={{ marginLeft: "0.5rem" }}>
-                      first admin
-                    </span>
-                  )}
-                </td>
-                <td>
-                  {u.assigned_vault ? (
-                    <code>{u.assigned_vault}</code>
-                  ) : (
-                    <span className="muted" title="No per-vault restriction (admin-level access)">
-                      —
-                    </span>
-                  )}
-                </td>
-                <td>
-                  {u.password_changed ? (
-                    <span aria-label="changed">✓</span>
-                  ) : (
-                    <span className="muted">pending first login</span>
-                  )}
-                </td>
-                <td>
-                  <span title={u.created_at}>{formatCreatedAt(u.created_at)}</span>
-                </td>
-                <td>
-                  {isConfirming ? null : (
-                    <>
-                      {/*
-                        Screen-reader description for the disabled
-                        first-admin Delete button. `title` is
+          <thead>
+            <tr>
+              <th scope="col">Username</th>
+              <th scope="col">Assigned vault</th>
+              <th scope="col">Password set</th>
+              <th scope="col">Created</th>
+              <th scope="col">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {users.map((u) => {
+              const isFirstAdmin = u.id === firstAdminId;
+              const isDeleting = deleteSt.kind === "deleting" && deleteSt.userId === u.id;
+              const isConfirming = deleteSt.kind === "confirming" && deleteSt.user.id === u.id;
+              const rowDeleteError =
+                deleteSt.kind === "error" && deleteSt.userId === u.id ? deleteSt : null;
+              const resetForRow =
+                (resetSt.kind === "open" ||
+                  resetSt.kind === "submitting" ||
+                  resetSt.kind === "error") &&
+                resetSt.userId === u.id
+                  ? resetSt
+                  : null;
+              const resetDone = resetSt.kind === "done" && resetSt.userId === u.id ? resetSt : null;
+              return (
+                <tr key={u.id} data-user-id={u.id}>
+                  <td>
+                    <code>{u.username}</code>
+                    {isFirstAdmin && (
+                      <span className="badge" style={{ marginLeft: "0.5rem" }}>
+                        first admin
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    {u.assigned_vault ? (
+                      <code>{u.assigned_vault}</code>
+                    ) : (
+                      <span className="muted" title="No per-vault restriction (admin-level access)">
+                        —
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    {u.password_changed ? (
+                      <span aria-label="changed">✓</span>
+                    ) : (
+                      // Pending-first-login badge (Phase 2 PR 1 polish).
+                      // Same `.status status-pending` shape Modules.tsx
+                      // uses for its supervisor "pending" rows — keeps
+                      // the visual vocabulary consistent across admin
+                      // surfaces. The wrapper `span.muted` preserves the
+                      // pre-PR-1 prose (`pending first login`) for
+                      // accessible-text + existing test selectors; the
+                      // status pill draws the operator's eye.
+                      <span
+                        className="status status-pending"
+                        title="User hasn't completed first-sign-in change-password yet"
+                      >
+                        pending first login
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    <span title={u.created_at}>{formatCreatedAt(u.created_at)}</span>
+                  </td>
+                  <td>
+                    {isConfirming ? null : (
+                      <div
+                        style={{
+                          display: "flex",
+                          flexWrap: "wrap",
+                          gap: "0.5rem",
+                          alignItems: "center",
+                        }}
+                      >
+                        {/*
+                        Screen-reader description nodes for both
+                        first-admin-disabled buttons. `title` is
                         unreliable on disabled buttons in assistive
                         tech; `aria-describedby` to a visually-hidden
                         node is the canonical WAI-ARIA shape. We keep
                         `title` too for sighted hover users.
                       */}
-                      {isFirstAdmin && (
-                        <span id={`first-admin-tooltip-${u.id}`} className="sr-only">
-                          First admin can't be deleted (would self-lock the hub)
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        className="secondary"
-                        disabled={isFirstAdmin || isDeleting}
-                        title={
-                          isFirstAdmin
-                            ? "First admin can't be deleted (would self-lock the hub)"
-                            : undefined
-                        }
-                        aria-describedby={isFirstAdmin ? `first-admin-tooltip-${u.id}` : undefined}
-                        onClick={() => setDeleteSt({ kind: "confirming", user: u })}
-                        aria-label={`Delete ${u.username}`}
-                      >
-                        {isDeleting ? "Deleting…" : "Delete"}
-                      </button>
-                    </>
-                  )}
-                  {isConfirming && (
-                    <dialog
-                      open
-                      className="error-banner"
-                      style={{ marginTop: "0.25rem", background: "var(--bg-warn, #fffbe6)" }}
-                      aria-label={`Confirm delete ${u.username}`}
-                    >
-                      <p>
-                        Delete <code>{u.username}</code>? This revokes their tokens, drops their
-                        sessions and grants, and removes the account. The audit trail is preserved —
-                        tokens stay with <code>revoked_at</code> set, anonymised.
-                      </p>
-                      <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+                        {isFirstAdmin && (
+                          <>
+                            <span id={`first-admin-tooltip-${u.id}`} className="sr-only">
+                              First admin can't be deleted (would self-lock the hub)
+                            </span>
+                            <span id={`first-admin-reset-tooltip-${u.id}`} className="sr-only">
+                              First admin uses /account/change-password directly
+                            </span>
+                          </>
+                        )}
                         <button
                           type="button"
-                          className="destructive"
-                          onClick={() => {
-                            void onConfirm(u);
-                          }}
-                          disabled={isDeleting}
+                          className="secondary"
+                          disabled={
+                            isFirstAdmin ||
+                            resetForRow !== null ||
+                            (resetSt.kind === "submitting" && resetSt.userId === u.id)
+                          }
+                          title={
+                            isFirstAdmin
+                              ? "First admin uses /account/change-password directly"
+                              : undefined
+                          }
+                          aria-describedby={
+                            isFirstAdmin ? `first-admin-reset-tooltip-${u.id}` : undefined
+                          }
+                          onClick={() => setResetSt({ kind: "open", userId: u.id, password: "" })}
+                          aria-label={`Reset password for ${u.username}`}
                         >
-                          {isDeleting ? "Deleting…" : "Delete"}
+                          Reset password
                         </button>
                         <button
                           type="button"
                           className="secondary"
-                          onClick={() => setDeleteSt({ kind: "idle" })}
-                          disabled={isDeleting}
+                          disabled={isFirstAdmin || isDeleting}
+                          title={
+                            isFirstAdmin
+                              ? "First admin can't be deleted (would self-lock the hub)"
+                              : undefined
+                          }
+                          aria-describedby={
+                            isFirstAdmin ? `first-admin-tooltip-${u.id}` : undefined
+                          }
+                          onClick={() => setDeleteSt({ kind: "confirming", user: u })}
+                          aria-label={`Delete ${u.username}`}
                         >
-                          Cancel
+                          {isDeleting ? "Deleting…" : "Delete"}
                         </button>
                       </div>
-                    </dialog>
-                  )}
-                  {rowError && (
-                    <div className="error-banner" style={{ marginTop: "0.25rem" }}>
-                      <code>{rowError.message}</code>
-                    </div>
-                  )}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+                    )}
+                    {isConfirming && (
+                      <dialog
+                        open
+                        className="error-banner"
+                        style={{ marginTop: "0.25rem", background: "var(--bg-warn, #fffbe6)" }}
+                        aria-label={`Confirm delete ${u.username}`}
+                      >
+                        <p>
+                          Delete <code>{u.username}</code>? This revokes their tokens, drops their
+                          sessions and grants, and removes the account. The audit trail is preserved
+                          — tokens stay with <code>revoked_at</code> set, anonymised.
+                        </p>
+                        <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+                          <button
+                            type="button"
+                            className="destructive"
+                            onClick={() => {
+                              void onConfirmDelete(u);
+                            }}
+                            disabled={isDeleting}
+                          >
+                            {isDeleting ? "Deleting…" : "Delete"}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => setDeleteSt({ kind: "idle" })}
+                            disabled={isDeleting}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </dialog>
+                    )}
+                    {rowDeleteError && (
+                      <div className="error-banner" style={{ marginTop: "0.25rem" }}>
+                        <code>{rowDeleteError.message}</code>
+                      </div>
+                    )}
+                    {resetForRow && (
+                      <ResetPasswordRowForm
+                        user={u}
+                        state={resetForRow}
+                        onCancel={() => setResetSt({ kind: "idle" })}
+                        onPasswordChange={(password) =>
+                          setResetSt({ kind: "open", userId: u.id, password })
+                        }
+                        onSubmit={(password) => {
+                          void onSubmitReset(u, password);
+                        }}
+                      />
+                    )}
+                    {resetDone && (
+                      <output
+                        className="success-banner"
+                        style={{ marginTop: "0.25rem", display: "block" }}
+                      >
+                        Password reset for <code>{resetDone.username}</code>. Hand them the new
+                        password and tell them they'll be prompted to change it on first sign-in.
+                        <div style={{ marginTop: "0.5rem" }}>
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => setResetSt({ kind: "idle" })}
+                          >
+                            Dismiss
+                          </button>
+                        </div>
+                      </output>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
+  );
+}
+
+interface ResetPasswordRowFormProps {
+  user: UserListing;
+  state:
+    | { kind: "open"; userId: string; password: string }
+    | { kind: "submitting"; userId: string; password: string }
+    | { kind: "error"; userId: string; password: string; message: string };
+  onCancel: () => void;
+  onPasswordChange: (password: string) => void;
+  onSubmit: (password: string) => void;
+}
+
+function ResetPasswordRowForm({
+  user,
+  state,
+  onCancel,
+  onPasswordChange,
+  onSubmit,
+}: ResetPasswordRowFormProps): React.ReactNode {
+  const submitting = state.kind === "submitting";
+  const errorMsg = state.kind === "error" ? state.message : null;
+  // Stable input id per row — the lookup-by-label test queries
+  // "New temporary password for alice" so each row's input is
+  // disambiguated even when multiple rows render forms in test.
+  const inputId = `reset-password-input-${user.id}`;
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSubmit(state.password);
+      }}
+      aria-label={`Reset password for ${user.username}`}
+      style={{
+        marginTop: "0.5rem",
+        padding: "0.5rem",
+        background: "var(--bg-soft, #f5f5f5)",
+        borderRadius: "4px",
+      }}
+    >
+      <p style={{ margin: 0 }}>
+        <label htmlFor={inputId}>
+          New temporary password for <code>{user.username}</code>{" "}
+          <span className="muted">(min {PASSWORD_MIN_LEN} chars)</span>
+        </label>
+        <br />
+        <input
+          id={inputId}
+          type="password"
+          required
+          autoComplete="new-password"
+          minLength={PASSWORD_MIN_LEN}
+          value={state.password}
+          disabled={submitting}
+          onChange={(e) => onPasswordChange(e.target.value)}
+        />
+      </p>
+      {errorMsg && (
+        <div className="error-banner" style={{ marginTop: "0.25rem" }}>
+          <code>{errorMsg}</code>
+        </div>
+      )}
+      <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+        <button type="submit" disabled={submitting}>
+          {submitting ? "Setting…" : "Set new password"}
+        </button>
+        <button type="button" className="secondary" onClick={onCancel} disabled={submitting}>
+          Cancel
+        </button>
+      </div>
+    </form>
   );
 }
 

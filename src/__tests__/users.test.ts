@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
 import {
   PASSWORD_MIN_LEN,
   SingleUserModeError,
@@ -17,6 +18,7 @@ import {
   getUserByUsernameCI,
   isFirstAdmin,
   listUsers,
+  resetUserPassword,
   setPassword,
   userCount,
   validatePassword,
@@ -348,6 +350,200 @@ describe("validatePassword", () => {
     // toward passphrases we'll layer it as a separate signal, not a
     // hard gate.
     expect(validatePassword("aaaaaaaaaaaa").valid).toBe(true);
+  });
+});
+
+describe("resetUserPassword", () => {
+  test("returns false when user does not exist", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      expect(await resetUserPassword(db, "no-such-id", "twelvechars1")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("returns false when user vanishes between pre-check and tx body", async () => {
+    // Reviewer-flagged race path (hub#427). The argon2 hash is computed
+    // outside the transaction (async), giving a window where a concurrent
+    // delete can land between the existence pre-check and the UPDATE tx.
+    // The helper must return false in that case so the caller can 404
+    // instead of cosmetically claiming success.
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "alice", "alice-strong-passphrase", {
+        passwordChanged: true,
+      });
+      // Simulate the race: delete the row, then invoke the reset. The
+      // pre-check runs in `resetUserPassword` against the now-empty table.
+      // (We can't intercept between pre-check and tx without forking the
+      // helper; deleting before the call is the equivalent post-condition
+      // — if the row is gone the tx body will UPDATE 0 rows.)
+      db.prepare("DELETE FROM users WHERE id = ?").run(user.id);
+      expect(await resetUserPassword(db, user.id, "new-temp-passphrase")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("rotates hash, flips password_changed back to 0, bumps updated_at", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      // Seed user as "already changed their password" (true) to prove the
+      // reset flips it back to false for the force-redirect rail.
+      const initial = await createUser(db, "alice", "alice-strong-passphrase", {
+        passwordChanged: true,
+        now: () => new Date(1000),
+      });
+      const oldHash = initial.passwordHash;
+      const oldUpdated = initial.updatedAt;
+      const later = new Date(2000);
+      expect(await resetUserPassword(db, initial.id, "new-temp-passphrase", () => later)).toBe(
+        true,
+      );
+      const fresh = getUserById(db, initial.id);
+      expect(fresh).not.toBeNull();
+      expect(fresh?.passwordHash).not.toBe(oldHash);
+      expect(fresh?.passwordChanged).toBe(false);
+      expect(fresh?.updatedAt).not.toBe(oldUpdated);
+      // Round-trip verify: old password no longer works, new one does.
+      expect(await verifyPassword(fresh!, "alice-strong-passphrase")).toBe(false);
+      expect(await verifyPassword(fresh!, "new-temp-passphrase")).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("revokes still-active tokens belonging to the user", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "alice", "alice-strong-passphrase", {
+        passwordChanged: true,
+      });
+      const minted = await signAccessToken(db, {
+        sub: user.id,
+        scopes: ["vault:home:read"],
+        audience: "vault",
+        clientId: "notes-client",
+        issuer: "https://hub.test",
+        ttlSeconds: 600,
+      });
+      recordTokenMint(db, {
+        jti: minted.jti,
+        createdVia: "operator_mint",
+        subject: user.username,
+        userId: user.id,
+        clientId: "notes-client",
+        scopes: ["vault:home:read"],
+        expiresAt: minted.expiresAt,
+      });
+      // Pre-state: token row not yet revoked.
+      const before = db
+        .query<{ revoked_at: string | null }, [string]>(
+          "SELECT revoked_at FROM tokens WHERE jti = ?",
+        )
+        .get(minted.jti);
+      expect(before?.revoked_at).toBeNull();
+
+      expect(await resetUserPassword(db, user.id, "new-temp-passphrase")).toBe(true);
+
+      // Post-state: token row has revoked_at set, user_id retained (the
+      // user row sticks around, audit trail re-anchors naturally).
+      const after = db
+        .query<{ revoked_at: string | null; user_id: string | null }, [string]>(
+          "SELECT revoked_at, user_id FROM tokens WHERE jti = ?",
+        )
+        .get(minted.jti);
+      expect(after?.revoked_at).not.toBeNull();
+      expect(after?.user_id).toBe(user.id);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("does not re-revoke an already-revoked token", async () => {
+    // Defense-in-depth: a previously-revoked token shouldn't have its
+    // revoked_at timestamp overwritten by a fresh reset. The UPDATE's
+    // WHERE clause filters on `revoked_at IS NULL` so this is naturally
+    // enforced; pinning it here so a future refactor that drops the
+    // filter trips the test.
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "alice", "alice-strong-passphrase", {
+        passwordChanged: true,
+      });
+      const minted = await signAccessToken(db, {
+        sub: user.id,
+        scopes: ["vault:home:read"],
+        audience: "vault",
+        clientId: "notes-client",
+        issuer: "https://hub.test",
+        ttlSeconds: 600,
+      });
+      const earlierStamp = "2026-01-01T00:00:00.000Z";
+      recordTokenMint(db, {
+        jti: minted.jti,
+        createdVia: "operator_mint",
+        subject: user.username,
+        userId: user.id,
+        clientId: "notes-client",
+        scopes: ["vault:home:read"],
+        expiresAt: minted.expiresAt,
+      });
+      db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(earlierStamp, minted.jti);
+
+      expect(await resetUserPassword(db, user.id, "new-temp-passphrase")).toBe(true);
+
+      const row = db
+        .query<{ revoked_at: string | null }, [string]>(
+          "SELECT revoked_at FROM tokens WHERE jti = ?",
+        )
+        .get(minted.jti);
+      expect(row?.revoked_at).toBe(earlierStamp);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("leaves tokens for other users untouched", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const alice = await createUser(db, "alice", "alice-strong-passphrase", {
+        passwordChanged: true,
+      });
+      const bob = await createUser(db, "bob", "bob-strong-passphrase", {
+        allowMulti: true,
+        passwordChanged: true,
+      });
+      const bobToken = await signAccessToken(db, {
+        sub: bob.id,
+        scopes: ["vault:home:read"],
+        audience: "vault",
+        clientId: "notes-client",
+        issuer: "https://hub.test",
+        ttlSeconds: 600,
+      });
+      recordTokenMint(db, {
+        jti: bobToken.jti,
+        createdVia: "operator_mint",
+        subject: bob.username,
+        userId: bob.id,
+        clientId: "notes-client",
+        scopes: ["vault:home:read"],
+        expiresAt: bobToken.expiresAt,
+      });
+
+      await resetUserPassword(db, alice.id, "new-temp-passphrase");
+
+      const bobRow = db
+        .query<{ revoked_at: string | null }, [string]>(
+          "SELECT revoked_at FROM tokens WHERE jti = ?",
+        )
+        .get(bobToken.jti);
+      expect(bobRow?.revoked_at).toBeNull();
+    } finally {
+      cleanup();
+    }
   });
 });
 

@@ -65,6 +65,7 @@
  *   /api/users                    (GET + POST) → list / create user (host:admin)
  *   /api/users/vaults             (GET)        → vault-name list for assigned-vault picker (host:admin)
  *   /api/users/<id>               (DELETE)     → hard-delete user + revoke tokens (host:admin)
+ *   /api/users/<id>/reset-password (POST)      → admin-initiated password reset (host:admin)
  *   /login                        (GET + POST) → operator password login
  *   /logout                       (POST)       → end admin session
  *   /account/change-password      (GET + POST) → user self-service change-password
@@ -145,6 +146,7 @@ import {
   handleDeleteUser,
   handleListUsers,
   handleListVaults,
+  handleResetUserPassword,
 } from "./api-users.ts";
 import { buildChromeForRequest, injectChromeIntoResponse } from "./chrome-strip.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
@@ -1907,6 +1909,26 @@ export function hubFetch(
         issuer: oauthDeps(req).issuer,
         manifestPath,
       });
+    }
+    // Phase 2 PR 1 — `/api/users/:id/reset-password` (admin-initiated
+    // password reset for non-admin users). Routed BEFORE the per-id DELETE
+    // catch-all so the trailing `/reset-password` segment isn't mistaken
+    // for part of a user id. Same `host:admin` Bearer gate as the other
+    // /api/users surfaces.
+    {
+      const resetMatch = pathname.match(/^\/api\/users\/([^/]+)\/reset-password$/);
+      if (resetMatch) {
+        if (!getDb) return dbNotConfigured();
+        const id = decodeURIComponent(resetMatch[1] ?? "");
+        if (!id) {
+          return new Response("not found", { status: 404 });
+        }
+        return handleResetUserPassword(req, id, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          manifestPath,
+        });
+      }
     }
     if (pathname.startsWith("/api/users/")) {
       if (!getDb) return dbNotConfigured();
