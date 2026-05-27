@@ -23,7 +23,13 @@ import {
   deleteSession,
   parseSessionCookie,
 } from "./sessions.ts";
-import { PASSWORD_MAX_LEN, type User, getUserByUsername, verifyPassword } from "./users.ts";
+import {
+  PASSWORD_MAX_LEN,
+  type User,
+  getUserByUsername,
+  isFirstAdmin,
+  verifyPassword,
+} from "./users.ts";
 
 function htmlResponse(body: string, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(body, {
@@ -75,22 +81,44 @@ function safeNext(raw: string | null): string {
  * boundary — once changed, no per-request scope check is needed and
  * no token claim carries the bit forward.
  *
- * When `password_changed === false`:
- *   - redirect to `/account/change-password`
- *   - preserve the user's intended `next` as a query param so the
- *     change-password POST can finish the trip
+ * Three precedence rules, in order:
  *
- * When `password_changed === true`: return `next` (today's behavior).
+ *   1. `password_changed === false` → `/account/change-password`
+ *      (preserves `next` as a query param so the change-password POST
+ *      finishes the trip).
+ *   2. Non-admin user (friend) whose `next` targets `/admin/*` → rewrite
+ *      to `/account/`. Friends have no business on admin SPA URLs —
+ *      `/admin/host-admin-token` would 403 (first-admin gate) and the
+ *      SPA would bounce them to `/account/` anyway. Doing the rewrite
+ *      at the login boundary avoids the bouncing-around UX. Other `next`
+ *      paths (`/`, `/oauth/authorize/...`, `/vault/...`) are legitimate
+ *      destinations for non-admin users and pass through unchanged.
+ *   3. Otherwise return `next` (the today's-default behavior).
+ *
+ * `db` is required for the non-admin check (it consults `getFirstAdminId`).
+ * Wizard-only test fixtures that pre-existed the `db` plumbing pass the
+ * harness DB through; the parameter is non-optional to make the
+ * "did you remember the gate?" review check explicit.
  */
-export function loginRedirectTarget(user: User, next: string): string {
-  if (user.passwordChanged) return next;
-  // Preserve the operator's intended destination; the change-password
-  // POST will read this and 302 there after the change lands.
-  // Only encode `next` if it isn't already the post-change default —
-  // keeps the URL clean for the common case (no `next` param specified
-  // at login time → no `?next=` on the change-password URL).
-  if (next === POST_LOGIN_DEFAULT) return FORCE_CHANGE_PASSWORD_PATH;
-  return `${FORCE_CHANGE_PASSWORD_PATH}?next=${encodeURIComponent(next)}`;
+export function loginRedirectTarget(db: Database, user: User, next: string): string {
+  if (!user.passwordChanged) {
+    // Preserve the operator's intended destination; the change-password
+    // POST will read this and 302 there after the change lands.
+    // Only encode `next` if it isn't already the post-change default —
+    // keeps the URL clean for the common case (no `next` param specified
+    // at login time → no `?next=` on the change-password URL).
+    if (next === POST_LOGIN_DEFAULT) return FORCE_CHANGE_PASSWORD_PATH;
+    return `${FORCE_CHANGE_PASSWORD_PATH}?next=${encodeURIComponent(next)}`;
+  }
+  // Non-admin friend aiming at admin SPA: rewrite to /account/. We check
+  // both the literal `/admin` and the `/admin/...` prefix; safeNext has
+  // already normalized to a leading-`/` same-origin path, so a plain
+  // string prefix check is sufficient (no `//admin.evil.com/` shape can
+  // reach here).
+  if (!isFirstAdmin(db, user.id) && (next === "/admin" || next.startsWith("/admin/"))) {
+    return "/account/";
+  }
+  return next;
 }
 
 // --- /login ---------------------------------------------------------------
@@ -193,7 +221,7 @@ export async function handleAdminLoginPost(
   // to change the admin-typed default before continuing. Their original
   // `next` rides along on the change-password URL so the post-change
   // POST can land them at their intended destination.
-  const target = loginRedirectTarget(user, next);
+  const target = loginRedirectTarget(db, user, next);
   return redirect(target, { "set-cookie": cookie });
 }
 

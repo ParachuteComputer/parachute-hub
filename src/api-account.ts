@@ -48,6 +48,7 @@
 import type { Database } from "bun:sqlite";
 import { hash as argonHash } from "@node-rs/argon2";
 import { type ChangePasswordMode, renderChangePassword } from "./account-change-password-ui.ts";
+import { renderAccountHome } from "./account-home-ui.ts";
 import { renderAdminError } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { changePasswordRateLimiter } from "./rate-limit.ts";
@@ -57,6 +58,7 @@ import {
   PASSWORD_MAX_LEN,
   UserNotFoundError,
   getUserById,
+  isFirstAdmin,
   validatePassword,
   verifyPassword,
 } from "./users.ts";
@@ -435,6 +437,58 @@ export async function handleAccountChangePasswordPost(
     "cache-control": "no-store",
     "x-secure-context": isHttpsRequest(req) ? "https" : "http",
   });
+}
+
+/**
+ * GET /account/ — friend-facing user home (multi-user Phase 1 follow-up).
+ *
+ * Companion surface to the first-admin gate on
+ * `/admin/host-admin-token`: friend users who can't reach the admin
+ * SPA need a coherent landing page that shows their assigned vault, a
+ * sign-out form, and a link to rotate their password. The admin lands
+ * here too (via the SPA's 403 redirect path) but mostly bounces back
+ * to `/admin/` immediately — for admins this is a "wait, what?" exit
+ * ramp.
+ *
+ * Auth: requires an active session. Session-less requests 302 to
+ * `/login?next=/account/` — same posture as `handleAccountChangePasswordGet`.
+ *
+ * `hubOrigin` is passed in by the route handler (resolved per-request
+ * via `resolveIssuer` in `hub-server.ts`). The page uses it to build
+ * the canonical Notes "Open" CTA URL and to show as inline code in
+ * the "use a custom client" disclosure.
+ */
+export interface AccountHomeDeps extends ApiAccountDeps {
+  /** Canonical hub origin for this request (e.g. `https://my-hub.example`). */
+  hubOrigin: string;
+}
+
+export function handleAccountHomeGet(req: Request, deps: AccountHomeDeps): Response {
+  const session = findActiveSession(deps.db, req);
+  if (!session) {
+    return redirect(`/login?next=${encodeURIComponent("/account/")}`);
+  }
+  const user = getUserById(deps.db, session.userId);
+  if (!user) {
+    // Stale session pointing at a deleted user — hand back to /login;
+    // the orphaned session row will time out on its own.
+    return redirect("/login");
+  }
+  const adminFlag = isFirstAdmin(deps.db, user.id);
+  const csrf = ensureCsrfToken(req);
+  const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
+  return htmlResponse(
+    renderAccountHome({
+      username: user.username,
+      assignedVault: user.assignedVault,
+      passwordChanged: user.passwordChanged,
+      hubOrigin: deps.hubOrigin,
+      isFirstAdmin: adminFlag,
+      csrfToken: csrf.token,
+    }),
+    200,
+    extra,
+  );
 }
 
 /**

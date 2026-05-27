@@ -25,6 +25,7 @@ import { join } from "node:path";
 import {
   handleAccountChangePasswordGet,
   handleAccountChangePasswordPost,
+  handleAccountHomeGet,
   markPasswordChanged,
 } from "../api-account.ts";
 import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
@@ -626,5 +627,91 @@ describe("markPasswordChanged", () => {
     markPasswordChanged(harness.db, user.id);
     const after = getUserById(harness.db, user.id);
     expect(after?.passwordChanged).toBe(true);
+  });
+});
+
+describe("handleAccountHomeGet", () => {
+  // Integration smoke for `GET /account/` — verifies session gating
+  // (302 → /login when missing) and the happy path (200 + rendered HTML
+  // with the user's vault). The pure-renderer assertions live in
+  // `account-home-ui.test.ts`; this suite pins handler-level wiring.
+
+  const HUB_ORIGIN = "https://hub.test";
+
+  test("302 → /login when no session cookie is present", async () => {
+    const req = new Request(`${HUB_ORIGIN}/account/`);
+    const res = handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    expect(res.status).toBe(302);
+    const location = res.headers.get("location") ?? "";
+    // Round-trip /account/ as the `next` param so post-login lands back.
+    expect(location).toBe(`/login?next=${encodeURIComponent("/account/")}`);
+  });
+
+  test("200 + HTML for a signed-in friend with an assigned vault", async () => {
+    // Create the admin first (so the friend is NOT the first admin),
+    // then a friend with an assigned vault.
+    await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
+    const friend = await createUser(harness.db, "alice", "alice-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVault: "alice",
+    });
+    const session = createSession(harness.db, { userId: friend.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const html = await res.text();
+    expect(html).toContain("Welcome, alice");
+    // Vault name visible.
+    expect(html).toContain("<strong>alice</strong>");
+    // Notes CTA carries the hub-origin-encoded vault URL.
+    const encoded = encodeURIComponent(`${HUB_ORIGIN}/vault/alice`);
+    expect(html).toContain(`https://notes.parachute.computer/add?url=${encoded}`);
+  });
+
+  test("200 + admin branch when the first-admin signs in (assignedVault=null)", async () => {
+    // The first-created user with no vault pin is the admin posture.
+    const admin = await createUser(harness.db, "admin", "admin-passphrase", {
+      passwordChanged: true,
+    });
+    const session = createSession(harness.db, { userId: admin.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Welcome, admin");
+    expect(html).toContain("hub administrator");
+    expect(html).toContain('href="/admin/"');
+  });
+
+  test("302 → /login when the session points at a deleted user", async () => {
+    // Stale-session shape: a session row outlives its user. The handler
+    // hands back to /login rather than rendering against null.
+    //
+    // Construction note: `deleteUser` drops the session as part of its
+    // cleanup transaction, and the sessions.user_id FK is RESTRICT, so
+    // we briefly drop FK enforcement to fabricate the orphan-session
+    // shape. The handler's job is robustness against an externally-
+    // induced orphan (e.g. a race between session-read and user-delete
+    // on a different connection); the test exercises that defensive
+    // branch directly.
+    const user = await createUser(harness.db, "ghost", "ghost-passphrase", {
+      passwordChanged: true,
+    });
+    const session = createSession(harness.db, { userId: user.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    harness.db.exec("PRAGMA foreign_keys = OFF");
+    try {
+      harness.db.prepare("DELETE FROM users WHERE id = ?").run(user.id);
+    } finally {
+      harness.db.exec("PRAGMA foreign_keys = ON");
+    }
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/login");
   });
 });

@@ -426,6 +426,80 @@ describe("loginRedirectTarget — force-change-password (multi-user PR 3)", () =
     expect(res.headers.get("location")).toBe("/admin/tokens");
   });
 
+  test("non-admin (friend) targeting /admin/* gets rewritten to /account/", async () => {
+    // Multi-user follow-up: a signed-in friend account hitting an /admin/*
+    // URL via post-login `next=` would otherwise land on the admin SPA,
+    // which 403s on `/admin/host-admin-token` (first-admin gate) and
+    // bounces them back via the SPA-side 403 handler. Rewriting at the
+    // login boundary skips the bouncing-around UX. Friend has
+    // passwordChanged=true so the force-change path doesn't pre-empt.
+    await createUser(harness.db, "admin", "admin-pw", { passwordChanged: true });
+    await createUser(harness.db, "alice", "alice-pw", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "alice",
+      password: "alice-pw",
+      next: "/admin/users",
+    });
+    const req = new Request("http://hub.test/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/account/");
+  });
+
+  test("admin targeting /admin/* still lands at the original next= (rewrite doesn't fire for admin)", async () => {
+    // Belt-and-suspenders for the friend rewrite above: the same next=
+    // for the admin user must NOT redirect to /account/.
+    await createUser(harness.db, "admin", "admin-pw", { passwordChanged: true });
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "admin",
+      password: "admin-pw",
+      next: "/admin/users",
+    });
+    const req = new Request("http://hub.test/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/admin/users");
+  });
+
+  test("non-admin (friend) keeps non-/admin next= intact (e.g. /oauth/authorize, /vault/...)", async () => {
+    // Legitimate user destinations — OAuth consent + per-vault routes —
+    // must pass through unchanged. Friends sign in through /login as part
+    // of the OAuth user-consent flow; rewriting their next= to /account/
+    // would break that.
+    await createUser(harness.db, "admin", "admin-pw", { passwordChanged: true });
+    await createUser(harness.db, "alice", "alice-pw", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "alice",
+      password: "alice-pw",
+      next: "/oauth/authorize?client_id=abc",
+    });
+    const req = new Request("http://hub.test/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/oauth/authorize?client_id=abc");
+  });
+
   test("password_changed=false defense-in-depth: unsafe next= is sanitized before encoding", async () => {
     // safeNext rewrites unsafe next values to /admin/vaults BEFORE the
     // redirect-target helper runs. The change-password URL should never

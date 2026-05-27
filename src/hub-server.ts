@@ -117,7 +117,11 @@ import {
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
-import { handleAccountChangePasswordGet, handleAccountChangePasswordPost } from "./api-account.ts";
+import {
+  handleAccountChangePasswordGet,
+  handleAccountChangePasswordPost,
+  handleAccountHomeGet,
+} from "./api-account.ts";
 import { handleApiHub } from "./api-hub.ts";
 import { handleApiMe } from "./api-me.ts";
 import { handleApiMintToken } from "./api-mint-token.ts";
@@ -266,10 +270,7 @@ export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
   if (hostname === undefined) hostname = env.PARACHUTE_BIND_HOST || "127.0.0.1";
   if (wellKnownDir === undefined) wellKnownDir = WELL_KNOWN_DIR;
   if (issuer === undefined) {
-    const fromEnv =
-      env.PARACHUTE_HUB_ORIGIN ??
-      env.RENDER_EXTERNAL_URL ??
-      flyDefaultOrigin(env);
+    const fromEnv = env.PARACHUTE_HUB_ORIGIN ?? env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(env);
     if (fromEnv) issuer = fromEnv.replace(/\/+$/, "") || undefined;
   }
   return { port, hostname, wellKnownDir, dbPath: dbPath ?? hubDbPath(), issuer };
@@ -1118,8 +1119,7 @@ export function hubFetch(
           // browser POSTs and must be trusted even when the operator's
           // configured issuer points elsewhere. See origin-check.ts
           // jsdoc for the failure case this closes.
-          platformOrigin:
-            process.env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(process.env),
+          platformOrigin: process.env.RENDER_EXTERNAL_URL ?? flyDefaultOrigin(process.env),
         }),
     };
   };
@@ -1959,6 +1959,24 @@ export function hubFetch(
       if (req.method === "GET") return handleAccountChangePasswordGet(req, accountDeps);
       if (req.method === "POST") return handleAccountChangePasswordPost(req, accountDeps);
       return new Response("method not allowed", { status: 405 });
+    }
+
+    // /account/ — friend-facing user home (multi-user Phase 1 follow-up).
+    // Companion to the first-admin gate on `/admin/host-admin-token`: a
+    // signed-in non-admin (friend) lands here instead of bouncing against
+    // a 403 wall on the admin SPA. Admin users also land here when they
+    // hit `/account/` directly, with a "you're the administrator → /admin/"
+    // exit ramp. Bare `/account` 301-redirects to `/account/` so links
+    // without the trailing slash work.
+    if (pathname === "/account" || pathname === "/account/") {
+      if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+      if (pathname === "/account") {
+        return new Response(null, { status: 301, headers: { location: "/account/" } });
+      }
+      if (!getDb) return dbNotConfigured();
+      const db = getDb();
+      const hubOrigin = resolveIssuer(req, db, configuredIssuer);
+      return handleAccountHomeGet(req, { db, hubOrigin });
     }
 
     // Legacy `/admin/config` (server-rendered module-config portal, #46)

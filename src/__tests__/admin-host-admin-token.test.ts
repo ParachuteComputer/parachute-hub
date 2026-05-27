@@ -56,6 +56,31 @@ async function withSession(): Promise<{ cookie: string; userId: string }> {
   return { cookie, userId: user.id };
 }
 
+/**
+ * Seed an admin (first-created user) + a second non-admin "friend"
+ * account, return cookies + ids for both. Used by the first-admin-gate
+ * tests.
+ */
+async function withAdminAndFriend(): Promise<{
+  adminCookie: string;
+  adminId: string;
+  friendCookie: string;
+  friendId: string;
+}> {
+  const admin = await createUser(harness.db, "admin", "admin-passphrase");
+  const friend = await createUser(harness.db, "alice", "alice-passphrase", {
+    allowMulti: true,
+  });
+  const adminSession = createSession(harness.db, { userId: admin.id });
+  const friendSession = createSession(harness.db, { userId: friend.id });
+  return {
+    adminCookie: buildSessionCookie(adminSession.id, Math.floor(SESSION_TTL_MS / 1000)),
+    adminId: admin.id,
+    friendCookie: buildSessionCookie(friendSession.id, Math.floor(SESSION_TTL_MS / 1000)),
+    friendId: friend.id,
+  };
+}
+
 describe("handleHostAdminToken", () => {
   test("401 when no session cookie is present", async () => {
     const req = new Request(`${ISSUER}/admin/host-admin-token`);
@@ -122,6 +147,43 @@ describe("handleHostAdminToken", () => {
     const scopes = scopeClaim.split(/\s+/);
     expect(scopes).toContain("parachute:host:admin");
     expect(scopes).toContain("parachute:host:auth");
+  });
+
+  test("403 not_admin when a signed-in non-first-admin (friend) hits the endpoint", async () => {
+    // Privesc closure: without the first-admin gate, any signed-in
+    // friend account could mint a JWT carrying parachute:host:admin +
+    // parachute:host:auth — the SPA bearer that gates vault provisioning,
+    // grants, and the token registry. The friend's session is valid;
+    // the endpoint must refuse because the session.userId doesn't match
+    // the first-admin row.
+    const { friendCookie } = await withAdminAndFriend();
+    rotateSigningKey(harness.db);
+    const req = new Request(`${ISSUER}/admin/host-admin-token`, {
+      headers: { cookie: friendCookie },
+    });
+    const res = await handleHostAdminToken(req, { db: harness.db, issuer: ISSUER });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("not_admin");
+    // The wire description steers the SPA-side handler toward /account/.
+    expect(body.error_description).toContain("/account/");
+  });
+
+  test("first-admin path still succeeds when a friend exists alongside", async () => {
+    // Belt-and-suspenders for the gate above: adding a second user must
+    // not break the admin's own happy path. Same DB, same query — the
+    // admin's session.userId matches the earliest-created row, so the
+    // gate passes.
+    const { adminCookie, adminId } = await withAdminAndFriend();
+    rotateSigningKey(harness.db);
+    const req = new Request(`${ISSUER}/admin/host-admin-token`, {
+      headers: { cookie: adminCookie },
+    });
+    const res = await handleHostAdminToken(req, { db: harness.db, issuer: ISSUER });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { token: string };
+    const validated = await validateAccessToken(harness.db, body.token, ISSUER);
+    expect(validated.payload.sub).toBe(adminId);
   });
 
   // Regression for the end-to-end bug that motivated adding `:host:auth`
