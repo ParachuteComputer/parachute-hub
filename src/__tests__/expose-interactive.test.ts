@@ -469,10 +469,16 @@ describe("exposePublicInteractive — neither ready", () => {
       expect(interactiveCalled).toBe(false);
       expect(cloudflareCalled).toBe(false);
       const joined = logs.join("\n");
-      expect(joined).toMatch(/apt-get|dnf/);
-      expect(joined).toContain(
-        "developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads",
-      );
+      // Post 2026-05-27 cloudflared-URL refresh: the install hint moved
+      // off apt-get / dnf / developers.cloudflare.com (all unreliable —
+      // Aaron hit `No match for argument: cloudflared` on AL2023 and
+      // 404s from the docs URL on the same box) onto the static binary
+      // from GitHub releases.
+      expect(joined).toContain("github.com/cloudflare/cloudflared/releases/latest");
+      expect(joined).toContain("curl -L -o /usr/local/bin/cloudflared");
+      expect(joined).not.toContain("developers.cloudflare.com");
+      expect(joined).not.toContain("pkg.cloudflare.com");
+      expect(joined).not.toContain("sudo dnf install cloudflared");
     } finally {
       env.cleanup();
     }

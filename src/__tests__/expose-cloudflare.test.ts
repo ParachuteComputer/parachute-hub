@@ -14,7 +14,12 @@ import {
   exposeCloudflareOff,
   exposeCloudflareUp,
 } from "../commands/expose-cloudflare.ts";
+import { writeHubPort } from "../hub-control.ts";
 import type { CommandResult, Runner } from "../tailscale/run.ts";
+
+// Default seeded hub port used by tests with `skipHub: true`. The cloudflared
+// path reads `<configDir>/hub/run/hub.port` instead of spawning a real hub.
+const TEST_HUB_PORT = 1939;
 
 interface TestEnv {
   configDir: string;
@@ -40,6 +45,11 @@ function makeEnv(opts: { includeVault?: boolean; loggedIn?: boolean } = {}): Tes
 
   require("node:fs").mkdirSync(configDir, { recursive: true });
   require("node:fs").mkdirSync(cloudflaredHome, { recursive: true });
+
+  // Seed the hub port so `skipHub: true` invocations can resolve a port
+  // without spawning the actual hub process. Matches the seam pattern used
+  // by expose.test.ts (which threads `hubEnsureOpts` for the same purpose).
+  writeHubPort(TEST_HUB_PORT, configDir);
 
   if (loggedIn) {
     writeFileSync(join(cloudflaredHome, "cert.pem"), "---");
@@ -128,6 +138,8 @@ describe("exposeCloudflareUp", () => {
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
         now: () => new Date("2026-04-22T12:00:00Z"),
       });
 
@@ -170,7 +182,12 @@ describe("exposeCloudflareUp", () => {
       const yaml = readFileSync(env.configPath, "utf8");
       expect(yaml).toContain(`tunnel: ${uuid}`);
       expect(yaml).toContain("- hostname: vault.example.com");
-      expect(yaml).toContain("service: http://localhost:1940");
+      // Routes through the hub (not directly at vault). The hub dispatches
+      // discovery / admin / OAuth / per-vault proxy / generic /<svc>/* —
+      // same shape Tailscale Funnel uses. Pre-2026-05-27 this was
+      // http://localhost:1940 (vault's port), which served vault's own 404
+      // page on every request that wasn't /vault/<name>/...
+      expect(yaml).toContain(`service: http://localhost:${TEST_HUB_PORT}`);
 
       // Security copy surfaces both paths plus a pointer to the auth doc.
       const joined = logs.join("\n");
@@ -209,6 +226,8 @@ describe("exposeCloudflareUp", () => {
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
       });
       expect(code).toBe(0);
       // No `tunnel create` — only list + route.
@@ -236,6 +255,8 @@ describe("exposeCloudflareUp", () => {
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
       });
 
       expect(code).toBe(1);
@@ -262,6 +283,8 @@ describe("exposeCloudflareUp", () => {
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
         tunnelName: "bad name with spaces",
       });
 
@@ -291,6 +314,8 @@ describe("exposeCloudflareUp", () => {
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
       });
 
       expect(code).toBe(1);
@@ -317,6 +342,8 @@ describe("exposeCloudflareUp", () => {
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
       });
 
       expect(code).toBe(1);
@@ -342,6 +369,8 @@ describe("exposeCloudflareUp", () => {
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
       });
 
       expect(code).toBe(1);
@@ -376,6 +405,8 @@ describe("exposeCloudflareUp", () => {
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
       });
 
       expect(code).toBe(1);
@@ -425,6 +456,8 @@ describe("exposeCloudflareUp", () => {
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
       });
 
       expect(code).toBe(0);
@@ -462,6 +495,8 @@ describe("exposeCloudflareUp", () => {
         manifestPath: env.manifestPath,
         statePath: env.statePath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
         // Use defaults for configPath/logPath so they're per-tunnel-derived.
       });
       expect(code1).toBe(0);
@@ -487,6 +522,8 @@ describe("exposeCloudflareUp", () => {
         manifestPath: env.manifestPath,
         statePath: env.statePath,
         cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
         tunnelName: "second",
       });
       expect(code2).toBe(0);
@@ -544,6 +581,8 @@ describe("exposeCloudflareUp", () => {
           configPath: env.configPath,
           logPath: env.logPath,
           cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
           // No password, no 2FA — fully wide open. The warning should still
           // fire; password-recovery copy already lives in `printAuthGuidance`.
           vaultAuthStatus: {
@@ -592,6 +631,8 @@ describe("exposeCloudflareUp", () => {
           configPath: env.configPath,
           logPath: env.logPath,
           cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
           vaultAuthStatus: {
             hasOwnerPassword: true,
             hasTotp: true,
@@ -607,6 +648,68 @@ describe("exposeCloudflareUp", () => {
         // to the new contextual warning and stays in place — assert it on a
         // shape that doesn't collide with the warning text.
         expect(joined).toContain("(recommended) TOTP + backup codes");
+      } finally {
+        env.cleanup();
+      }
+    });
+  });
+
+  describe("routes through hub, not vault", () => {
+    test("config.yml targets the hub port; success log mentions Admin + OAuth URLs", async () => {
+      // Regression guard for the 2026-05-27 cut. Aaron ran `parachute expose
+      // public` on a fresh EC2 box, configured Cloudflare with a custom
+      // domain, and hit it — and got vault's 404 page rather than the hub's
+      // discovery / admin. The pre-fix cloudflared config routed straight at
+      // vault's port; the fix routes at the hub, mirroring the Tailscale
+      // Funnel shape (single mount → hub catchall; hub dispatches per-request).
+      const env = makeEnv();
+      try {
+        // Re-seed hub port to a non-default value so the assertion is
+        // unambiguous about *which* port got into the yaml.
+        writeHubPort(1949, env.configDir);
+
+        const uuid = "ffff0000-0000-0000-0000-00000000beef";
+        const { runner } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+          { code: 0, stdout: "[]", stderr: "" },
+          {
+            code: 0,
+            stdout: `Created tunnel parachute with id ${uuid}\n`,
+            stderr: "",
+          },
+          { code: 0, stdout: "", stderr: "" },
+        ]);
+        const { spawner } = fakeSpawner(60001);
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("gitcoin.parachute.computer", {
+          runner,
+          spawner,
+          alive: () => false,
+          kill: () => {},
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+        });
+
+        expect(code).toBe(0);
+        const yaml = readFileSync(env.configPath, "utf8");
+        // Routes through the hub on its loopback port.
+        expect(yaml).toContain("service: http://localhost:1949");
+        // Does NOT route directly at vault's port (1940 per makeEnv default).
+        expect(yaml).not.toContain("service: http://localhost:1940");
+
+        const joined = logs.join("\n");
+        // Discoverable surfaces: open / admin / vault / OAuth all surfaced.
+        expect(joined).toContain("https://gitcoin.parachute.computer/");
+        expect(joined).toContain("Admin:   https://gitcoin.parachute.computer/admin/");
+        expect(joined).toContain("Vault:   https://gitcoin.parachute.computer/vault/default");
+        expect(joined).toContain("OAuth:   https://gitcoin.parachute.computer");
       } finally {
         env.cleanup();
       }

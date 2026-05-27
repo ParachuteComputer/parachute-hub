@@ -11,7 +11,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { migrate, migrateNotice, planArchive, safelistEntries } from "../commands/migrate.ts";
+import {
+  KNOWN_ARCHIVABLE_DIRS,
+  listRunningServices,
+  migrate,
+  migrateNotice,
+  planArchive,
+  safelistEntries,
+} from "../commands/migrate.ts";
+import { writePid } from "../process-state.ts";
 
 interface Harness {
   configDir: string;
@@ -42,27 +50,42 @@ function seedSafelist(configDir: string): void {
 }
 
 describe("safelistEntries", () => {
-  test("covers service dirs, hub, state files, and well-known", () => {
+  test("covers service dirs, hub, state files, hub.db family, well-known, cloudflared", () => {
     const s = safelistEntries();
     // Service dirs from SERVICE_SPECS
     expect(s.has("vault")).toBe(true);
     expect(s.has("notes")).toBe(true);
     expect(s.has("scribe")).toBe(true);
     expect(s.has("channel")).toBe(true);
-    // Legacy — kept across the Notes→Lens→Notes rename round-trip
-    // (Apr 19 → Apr 22) so existing ~/.parachute/lens/ dirs from the
-    // brief Lens window don't get archived on upgrade.
-    expect(s.has("lens")).toBe(true);
     // Internal
     expect(s.has("hub")).toBe(true);
     // CLI state
     expect(s.has("services.json")).toBe(true);
     expect(s.has("expose-state.json")).toBe(true);
+    expect(s.has("cloudflared-state.json")).toBe(true);
     expect(s.has("well-known")).toBe(true);
+    // hub.db family — the trigger for the 2026-05-27 redesign was hub.db
+    // not being recognized; the allowlist now defaults to "leave unknown
+    // alone," but hub.db is explicitly safelisted so it doesn't even show
+    // up as "unknown" in the plan.
+    expect(s.has("hub.db")).toBe(true);
+    expect(s.has("hub.db-wal")).toBe(true);
+    expect(s.has("hub.db-shm")).toBe(true);
+    // cloudflared per-tunnel config dir
+    expect(s.has("cloudflared")).toBe(true);
+  });
+
+  test("`lens` is in the archivable-dirs set (not safelist) — sweep, don't preserve", () => {
+    // The Notes→Lens→Notes rename round-trip (Apr 19 → Apr 22) left some
+    // installs with `~/.parachute/lens/`. Under the new allowlist model,
+    // lens/ is explicitly archivable rather than safelisted — we want
+    // operators upgrading to the post-rename world to actually clean it up.
+    expect(KNOWN_ARCHIVABLE_DIRS.has("lens")).toBe(true);
+    expect(safelistEntries().has("lens")).toBe(false);
   });
 });
 
-describe("planArchive", () => {
+describe("planArchive — allowlist behavior", () => {
   test("clean ecosystem root produces an empty plan", () => {
     const h = makeHarness();
     try {
@@ -71,31 +94,83 @@ describe("planArchive", () => {
       expect(plan.items).toEqual([]);
       expect(plan.totalBytes).toBe(0);
       expect(plan.archiveDirName).toBe(".archive-2026-04-19");
+      expect(plan.hasLiveDb).toBe(false);
     } finally {
       h.cleanup();
     }
   });
 
-  test("pre-restructure cruft is identified and sized", () => {
+  test("known-cruft is archived, unknowns are recorded but not archived", () => {
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
+      // Known cruft — archives.
       touch(join(h.configDir, "daily.db"), "X".repeat(100));
       touch(join(h.configDir, "daily.db-shm"), "S");
       touch(join(h.configDir, "server.yaml"), "port: 1940\n");
       mkdirSync(join(h.configDir, "logs"), { recursive: true });
       touch(join(h.configDir, "logs", "old.log"), "old-entry\n");
+      // Unknown — left alone (under old shape this would have been swept).
       touch(join(h.configDir, "random-note.txt"), "mystery content");
+      mkdirSync(join(h.configDir, "future-module"), { recursive: true });
+      touch(join(h.configDir, "future-module", "state.json"), "{}");
 
       const plan = planArchive(h.configDir, APRIL_19);
-      const names = plan.items.map((i) => i.name).sort();
-      expect(names).toEqual(["daily.db", "daily.db-shm", "logs", "random-note.txt", "server.yaml"]);
+      const archivable = plan.items.filter((i) => i.archive).map((i) => i.name);
+      const skipped = plan.items.filter((i) => !i.archive).map((i) => i.name);
+
+      expect(archivable.sort()).toEqual(["daily.db", "daily.db-shm", "logs", "server.yaml"]);
+      expect(skipped.sort()).toEqual(["future-module", "random-note.txt"]);
+
+      // Archivable totals reflect known-cruft only — unknowns contribute 0.
       expect(plan.totalBytes).toBeGreaterThan(100);
-      // known-cruft annotation is attached
+
+      // Known-cruft has a friendly annotation; unknowns have none.
       expect(plan.items.find((i) => i.name === "daily.db")?.annotation).toMatch(/daily/i);
       expect(plan.items.find((i) => i.name === "logs")?.annotation).toMatch(/logs/i);
-      // unknown files get no annotation
       expect(plan.items.find((i) => i.name === "random-note.txt")?.annotation).toBeUndefined();
+      expect(plan.items.find((i) => i.name === "future-module")?.annotation).toBeUndefined();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("`lens` directory is archivable per KNOWN_ARCHIVABLE_DIRS", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      mkdirSync(join(h.configDir, "lens"), { recursive: true });
+      touch(join(h.configDir, "lens", "config.json"), "{}");
+
+      const plan = planArchive(h.configDir, APRIL_19);
+      const lens = plan.items.find((i) => i.name === "lens");
+      expect(lens?.archive).toBe(true);
+      expect(lens?.risk).toBe("safe");
+      expect(lens?.annotation).toMatch(/legacy/i);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("SQLite-shape files carry the live-db risk label", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      touch(join(h.configDir, "daily.db"), "X".repeat(50));
+      touch(join(h.configDir, "daily.db-wal"), "W");
+      touch(join(h.configDir, "daily.db-shm"), "S");
+      touch(join(h.configDir, "server.yaml"), "p: 1\n");
+
+      const plan = planArchive(h.configDir, APRIL_19);
+      const db = plan.items.find((i) => i.name === "daily.db");
+      const wal = plan.items.find((i) => i.name === "daily.db-wal");
+      const shm = plan.items.find((i) => i.name === "daily.db-shm");
+      const yaml = plan.items.find((i) => i.name === "server.yaml");
+      expect(db?.risk).toBe("live-db");
+      expect(wal?.risk).toBe("live-db");
+      expect(shm?.risk).toBe("live-db");
+      expect(yaml?.risk).toBe("safe");
+      expect(plan.hasLiveDb).toBe(true);
     } finally {
       h.cleanup();
     }
@@ -117,20 +192,41 @@ describe("planArchive", () => {
     }
   });
 
-  test("directory sizes are summed recursively", () => {
+  test("directory sizes for archivable entries are summed recursively", () => {
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
-      const nested = join(h.configDir, "old-tree", "a", "b");
+      // `logs` is known cruft — its size should be summed.
+      const nested = join(h.configDir, "logs", "a", "b");
       mkdirSync(nested, { recursive: true });
       touch(join(nested, "inner.dat"), "Z".repeat(500));
-      touch(join(h.configDir, "old-tree", "top.dat"), "Q".repeat(300));
+      touch(join(h.configDir, "logs", "top.dat"), "Q".repeat(300));
 
       const plan = planArchive(h.configDir, APRIL_19);
-      const oldTree = plan.items.find((i) => i.name === "old-tree");
-      expect(oldTree).toBeDefined();
-      expect(oldTree?.kind).toBe("dir");
-      expect(oldTree?.bytes).toBe(800);
+      const logsItem = plan.items.find((i) => i.name === "logs");
+      expect(logsItem?.archive).toBe(true);
+      expect(logsItem?.kind).toBe("dir");
+      expect(logsItem?.bytes).toBe(800);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("unknown directories do not pay the recursive sizeOf cost", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      const deep = join(h.configDir, "future-module", "a", "b");
+      mkdirSync(deep, { recursive: true });
+      touch(join(deep, "inner.dat"), "Z".repeat(500));
+
+      const plan = planArchive(h.configDir, APRIL_19);
+      const item = plan.items.find((i) => i.name === "future-module");
+      expect(item?.archive).toBe(false);
+      // Unknowns get bytes=0 even when the directory tree is non-empty —
+      // we don't walk something we're not going to touch.
+      expect(item?.bytes).toBe(0);
+      expect(plan.totalBytes).toBe(0);
     } finally {
       h.cleanup();
     }
@@ -156,6 +252,8 @@ describe("planArchive", () => {
       const plan = planArchive(h.configDir, APRIL_19);
       const item = plan.items.find((i) => i.name === "external-backup");
       expect(item).toBeDefined();
+      // It's an unknown name — left alone.
+      expect(item?.archive).toBe(false);
       expect(item?.bytes).toBe(0);
       expect(item?.kind).toBe("file");
       expect(plan.totalBytes).toBe(0);
@@ -164,9 +262,27 @@ describe("planArchive", () => {
       targetHarness.cleanup();
     }
   });
+
+  test("plan sort order — archivable first, then skipped, alphabetical within each group", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      // Mix known-cruft and unknowns; assert ordering.
+      touch(join(h.configDir, "zzz-unknown"), "");
+      touch(join(h.configDir, "aaa-unknown"), "");
+      touch(join(h.configDir, "server.yaml"), "");
+      touch(join(h.configDir, "daily.db"), "");
+
+      const plan = planArchive(h.configDir, APRIL_19);
+      const names = plan.items.map((i) => i.name);
+      expect(names).toEqual(["daily.db", "server.yaml", "aaa-unknown", "zzz-unknown"]);
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
-describe("migrate", () => {
+describe("migrate — interactive + flag behavior", () => {
   test("no-op on a clean root with exit 0", async () => {
     const h = makeHarness();
     try {
@@ -179,6 +295,7 @@ describe("migrate", () => {
         prompt: async () => {
           throw new Error("prompt must not be called");
         },
+        isTty: true,
       });
       expect(code).toBe(0);
       expect(logs.join("\n")).toMatch(/nothing to archive/i);
@@ -188,12 +305,15 @@ describe("migrate", () => {
     }
   });
 
-  test("dry-run prints plan, makes no changes, no prompt", async () => {
+  test("--list prints plan, makes no changes, no prompt, no running-service check", async () => {
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
       touch(join(h.configDir, "daily.db"), "X");
       touch(join(h.configDir, "random"), "Y");
+      // A running vault should NOT block a read-only --list.
+      mkdirSync(join(h.configDir, "vault", "run"), { recursive: true });
+      writePid("vault", process.pid, h.configDir);
 
       const logs: string[] = [];
       const code = await migrate({
@@ -203,10 +323,11 @@ describe("migrate", () => {
         prompt: async () => {
           throw new Error("prompt must not be called");
         },
-        dryRun: true,
+        list: true,
+        isTty: true,
       });
       expect(code).toBe(0);
-      expect(logs.join("\n")).toMatch(/dry-run/i);
+      expect(logs.join("\n")).toMatch(/--list — no changes made/);
       expect(existsSync(join(h.configDir, "daily.db"))).toBe(true);
       expect(existsSync(join(h.configDir, "random"))).toBe(true);
       expect(existsSync(join(h.configDir, ".archive-2026-04-19"))).toBe(false);
@@ -215,14 +336,42 @@ describe("migrate", () => {
     }
   });
 
-  test("--yes archives without prompting, safelist untouched", async () => {
+  test("--dry-run is a synonym for --list (back-compat)", async () => {
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
+      touch(join(h.configDir, "daily.db"), "X");
+      const logs: string[] = [];
+      const code = await migrate({
+        configDir: h.configDir,
+        now: () => APRIL_19,
+        log: (l) => logs.push(l),
+        prompt: async () => {
+          throw new Error("prompt must not be called");
+        },
+        dryRun: true,
+        isTty: true,
+      });
+      expect(code).toBe(0);
+      expect(logs.join("\n")).toMatch(/dry-run/);
+      expect(existsSync(join(h.configDir, ".archive-2026-04-19"))).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--yes archives known cruft; unknowns are preserved", async () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      // Known cruft (archives)
       touch(join(h.configDir, "daily.db"), "X".repeat(50));
       touch(join(h.configDir, "server.yaml"), "port: 1\n");
       mkdirSync(join(h.configDir, "logs"), { recursive: true });
       touch(join(h.configDir, "logs", "a.log"), "a");
+      // Unknown (must NOT move)
+      touch(join(h.configDir, "my-notes.txt"), "operator-owned content");
+      mkdirSync(join(h.configDir, "future-module"), { recursive: true });
 
       const logs: string[] = [];
       const code = await migrate({
@@ -233,6 +382,7 @@ describe("migrate", () => {
           throw new Error("prompt must not be called");
         },
         yes: true,
+        isTty: false,
       });
       expect(code).toBe(0);
       const archive = join(h.configDir, ".archive-2026-04-19");
@@ -245,22 +395,132 @@ describe("migrate", () => {
       expect(existsSync(join(h.configDir, "services.json"))).toBe(true);
       expect(existsSync(join(h.configDir, "well-known"))).toBe(true);
       expect(existsSync(join(h.configDir, "hub"))).toBe(true);
-      // originals gone
+      // archivable originals gone
       expect(existsSync(join(h.configDir, "daily.db"))).toBe(false);
       expect(existsSync(join(h.configDir, "server.yaml"))).toBe(false);
       expect(existsSync(join(h.configDir, "logs"))).toBe(false);
+      // unknowns preserved!
+      expect(existsSync(join(h.configDir, "my-notes.txt"))).toBe(true);
+      expect(existsSync(join(h.configDir, "future-module"))).toBe(true);
     } finally {
       h.cleanup();
     }
   });
 
-  test("--yes archives a symlink by moving the link, not the target", async () => {
+  test("refuses while a service is running", async () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      // Seed a running hub (use the current test process pid — guaranteed alive).
+      mkdirSync(join(h.configDir, "hub", "run"), { recursive: true });
+      writePid("hub", process.pid, h.configDir);
+      touch(join(h.configDir, "daily.db"), "X");
+
+      const logs: string[] = [];
+      const code = await migrate({
+        configDir: h.configDir,
+        now: () => APRIL_19,
+        log: (l) => logs.push(l),
+        prompt: async () => {
+          throw new Error("prompt must not be called");
+        },
+        yes: true,
+        isTty: true,
+      });
+      expect(code).toBe(1);
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/services are currently running/i);
+      expect(joined).toMatch(/- hub/);
+      // No archive happened.
+      expect(existsSync(join(h.configDir, ".archive-2026-04-19"))).toBe(false);
+      expect(existsSync(join(h.configDir, "daily.db"))).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("refuses non-TTY without --yes (CI / pipe safety)", async () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      touch(join(h.configDir, "daily.db"), "X");
+
+      const logs: string[] = [];
+      const code = await migrate({
+        configDir: h.configDir,
+        now: () => APRIL_19,
+        log: (l) => logs.push(l),
+        prompt: async () => {
+          throw new Error("prompt must not be called");
+        },
+        isTty: false,
+      });
+      expect(code).toBe(1);
+      expect(logs.join("\n")).toMatch(/refusing to sweep without a TTY/i);
+      expect(existsSync(join(h.configDir, "daily.db"))).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("live-db items pull an extra confirmation; declining aborts", async () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      touch(join(h.configDir, "daily.db"), "X");
+      touch(join(h.configDir, "daily.db-wal"), "W");
+
+      const answers = ["y", "n"]; // first y to proceed, then n on the live-db gate.
+      const code = await migrate({
+        configDir: h.configDir,
+        now: () => APRIL_19,
+        log: () => {},
+        prompt: async () => answers.shift() ?? "n",
+        isTty: true,
+      });
+      expect(code).toBe(1);
+      // Aborted before any rename — daily.db still there.
+      expect(existsSync(join(h.configDir, "daily.db"))).toBe(true);
+      expect(existsSync(join(h.configDir, ".archive-2026-04-19"))).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("live-db items pull an extra confirmation; accepting both proceeds", async () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      touch(join(h.configDir, "daily.db"), "X");
+      touch(join(h.configDir, "daily.db-wal"), "W");
+
+      const answers = ["y", "y"];
+      const code = await migrate({
+        configDir: h.configDir,
+        now: () => APRIL_19,
+        log: () => {},
+        prompt: async () => answers.shift() ?? "y",
+        isTty: true,
+      });
+      expect(code).toBe(0);
+      const archive = join(h.configDir, ".archive-2026-04-19");
+      expect(existsSync(join(archive, "daily.db"))).toBe(true);
+      expect(existsSync(join(archive, "daily.db-wal"))).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--yes archives a symlink (if known-archivable name) by moving the link, not the target", async () => {
+    // Reorient the symlink regression test against the new shape: only
+    // archivable names actually move. We synthesize a known-cruft symlink:
+    // `logs` (directory cruft) pointed at an external target.
     const targetHarness = makeHarness();
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
       touch(join(targetHarness.configDir, "huge.bin"), "X".repeat(10_000));
-      const linkPath = join(h.configDir, "external-backup");
+      const linkPath = join(h.configDir, "logs");
       symlinkSync(targetHarness.configDir, linkPath);
 
       const code = await migrate({
@@ -271,14 +531,48 @@ describe("migrate", () => {
           throw new Error("prompt must not be called");
         },
         yes: true,
+        isTty: false,
       });
       expect(code).toBe(0);
-      const archivedLink = join(h.configDir, ".archive-2026-04-19", "external-backup");
+      const archivedLink = join(h.configDir, ".archive-2026-04-19", "logs");
       expect(lstatSync(archivedLink).isSymbolicLink()).toBe(true);
       // Target tree untouched
       expect(existsSync(join(targetHarness.configDir, "huge.bin"))).toBe(true);
       // Original link site is empty
       expect(existsSync(linkPath)).toBe(false);
+    } finally {
+      h.cleanup();
+      targetHarness.cleanup();
+    }
+  });
+
+  test("unknown symlink is preserved (under new allowlist)", async () => {
+    const targetHarness = makeHarness();
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      touch(join(targetHarness.configDir, "huge.bin"), "X".repeat(10_000));
+      const linkPath = join(h.configDir, "external-backup");
+      symlinkSync(targetHarness.configDir, linkPath);
+
+      const logs: string[] = [];
+      const code = await migrate({
+        configDir: h.configDir,
+        now: () => APRIL_19,
+        log: (l) => logs.push(l),
+        prompt: async () => {
+          throw new Error("prompt must not be called");
+        },
+        yes: true,
+        isTty: false,
+      });
+      expect(code).toBe(0);
+      // The "nothing recognized" exit branch — no archive directory created.
+      expect(existsSync(join(h.configDir, ".archive-2026-04-19"))).toBe(false);
+      // The unknown symlink stays at the root.
+      expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
+      // Plan was still printed.
+      expect(logs.join("\n")).toMatch(/Leaving alone/);
     } finally {
       h.cleanup();
       targetHarness.cleanup();
@@ -296,6 +590,7 @@ describe("migrate", () => {
         now: () => APRIL_19,
         log: (l) => logs.push(l),
         prompt: async () => "n",
+        isTty: true,
       });
       expect(code).toBe(1);
       expect(logs.join("\n")).toMatch(/aborted/i);
@@ -306,19 +601,20 @@ describe("migrate", () => {
     }
   });
 
-  test("prompt 'y' (and 'yes') proceeds", async () => {
+  test("prompt 'y' proceeds for non-live-db items", async () => {
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
-      touch(join(h.configDir, "cruft.txt"), "Z");
+      touch(join(h.configDir, "server.yaml"), "Z"); // known cruft, not live-db
       const code = await migrate({
         configDir: h.configDir,
         now: () => APRIL_19,
         log: () => {},
         prompt: async () => "y",
+        isTty: true,
       });
       expect(code).toBe(0);
-      expect(existsSync(join(h.configDir, ".archive-2026-04-19", "cruft.txt"))).toBe(true);
+      expect(existsSync(join(h.configDir, ".archive-2026-04-19", "server.yaml"))).toBe(true);
     } finally {
       h.cleanup();
     }
@@ -328,24 +624,26 @@ describe("migrate", () => {
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
-      touch(join(h.configDir, "first.txt"), "1");
+      touch(join(h.configDir, "server.yaml"), "1");
       await migrate({
         configDir: h.configDir,
         now: () => APRIL_19,
         log: () => {},
         yes: true,
+        isTty: false,
       });
       // Add more cruft and sweep again the same day
-      touch(join(h.configDir, "second.txt"), "2");
+      touch(join(h.configDir, "channel.log"), "2");
       await migrate({
         configDir: h.configDir,
         now: () => APRIL_19,
         log: () => {},
         yes: true,
+        isTty: false,
       });
       const archive = join(h.configDir, ".archive-2026-04-19");
-      expect(existsSync(join(archive, "first.txt"))).toBe(true);
-      expect(existsSync(join(archive, "second.txt"))).toBe(true);
+      expect(existsSync(join(archive, "server.yaml"))).toBe(true);
+      expect(existsSync(join(archive, "channel.log"))).toBe(true);
       // Only one archive dir at root
       const archiveDirs = readdirSync(h.configDir).filter((n) => n.startsWith(".archive-"));
       expect(archiveDirs).toEqual([".archive-2026-04-19"]);
@@ -358,12 +656,24 @@ describe("migrate", () => {
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
-      touch(join(h.configDir, "day1.txt"), "1");
-      await migrate({ configDir: h.configDir, now: () => APRIL_19, log: () => {}, yes: true });
-      touch(join(h.configDir, "day2.txt"), "2");
-      await migrate({ configDir: h.configDir, now: () => APRIL_20, log: () => {}, yes: true });
-      expect(existsSync(join(h.configDir, ".archive-2026-04-19", "day1.txt"))).toBe(true);
-      expect(existsSync(join(h.configDir, ".archive-2026-04-20", "day2.txt"))).toBe(true);
+      touch(join(h.configDir, "server.yaml"), "1");
+      await migrate({
+        configDir: h.configDir,
+        now: () => APRIL_19,
+        log: () => {},
+        yes: true,
+        isTty: false,
+      });
+      touch(join(h.configDir, "channel.log"), "2");
+      await migrate({
+        configDir: h.configDir,
+        now: () => APRIL_20,
+        log: () => {},
+        yes: true,
+        isTty: false,
+      });
+      expect(existsSync(join(h.configDir, ".archive-2026-04-19", "server.yaml"))).toBe(true);
+      expect(existsSync(join(h.configDir, ".archive-2026-04-20", "channel.log"))).toBe(true);
     } finally {
       h.cleanup();
     }
@@ -373,21 +683,89 @@ describe("migrate", () => {
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
-      // Pre-existing archive with a same-name entry.
+      // Pre-existing archive with a same-name entry. server.yaml is known cruft.
       mkdirSync(join(h.configDir, ".archive-2026-04-19"), { recursive: true });
-      touch(join(h.configDir, ".archive-2026-04-19", "notes.md"), "old");
-      // New cruft with the same name.
-      touch(join(h.configDir, "notes.md"), "new");
+      touch(join(h.configDir, ".archive-2026-04-19", "server.yaml"), "old");
+      touch(join(h.configDir, "server.yaml"), "new");
       await migrate({
         configDir: h.configDir,
         now: () => APRIL_19,
         log: () => {},
         yes: true,
+        isTty: false,
       });
       const archive = join(h.configDir, ".archive-2026-04-19");
       const contents = readdirSync(archive);
-      expect(contents).toContain("notes.md");
-      expect(contents.some((n) => n.startsWith("notes.md.dup-"))).toBe(true);
+      expect(contents).toContain("server.yaml");
+      expect(contents.some((n) => n.startsWith("server.yaml.dup-"))).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("listRunningServices", () => {
+  test("empty when no pidfiles exist", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      const running = listRunningServices(
+        h.configDir,
+        join(h.configDir, "services.json"),
+        () => false,
+      );
+      expect(running).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("reports hub when its PID is live", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      mkdirSync(join(h.configDir, "hub", "run"), { recursive: true });
+      writePid("hub", 12345, h.configDir);
+      const running = listRunningServices(
+        h.configDir,
+        join(h.configDir, "services.json"),
+        () => true,
+      );
+      expect(running).toContain("hub");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("reports services from services.json when pidfiles are live", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      writeFileSync(
+        join(h.configDir, "services.json"),
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.5.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+              icon: "/icon.svg",
+              auth: { type: "none" },
+              mcp: {},
+            },
+          ],
+        }),
+      );
+      mkdirSync(join(h.configDir, "vault", "run"), { recursive: true });
+      writePid("vault", 23456, h.configDir);
+      const running = listRunningServices(
+        h.configDir,
+        join(h.configDir, "services.json"),
+        () => true,
+      );
+      expect(running).toContain("vault");
     } finally {
       h.cleanup();
     }
@@ -395,26 +773,30 @@ describe("migrate", () => {
 });
 
 describe("migrateNotice", () => {
-  test("undefined when nothing to archive", () => {
+  test("undefined when nothing archivable", () => {
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
+      // Even with unknowns at the root, no notice — unknowns aren't candidates.
+      touch(join(h.configDir, "operator-owned.md"), "hi");
       expect(migrateNotice(h.configDir, APRIL_19)).toBeUndefined();
     } finally {
       h.cleanup();
     }
   });
 
-  test("returns a single line with the count when cruft exists", () => {
+  test("returns a single line with the count when archivable cruft exists", () => {
     const h = makeHarness();
     try {
       seedSafelist(h.configDir);
       touch(join(h.configDir, "daily.db"), "x");
-      touch(join(h.configDir, "stray"), "y");
+      touch(join(h.configDir, "server.yaml"), "y");
+      // An unknown — must NOT count.
+      touch(join(h.configDir, "stray"), "z");
       const notice = migrateNotice(h.configDir, APRIL_19);
       expect(notice).toBeDefined();
       expect(notice).toMatch(/parachute migrate/);
-      expect(notice).toMatch(/2 unrecognized/);
+      expect(notice).toMatch(/2 archivable/);
     } finally {
       h.cleanup();
     }

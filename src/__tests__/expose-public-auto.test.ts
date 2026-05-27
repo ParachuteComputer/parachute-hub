@@ -126,7 +126,11 @@ describe("exposePublicAutoPick — neither ready", () => {
     expect(code).toBe(1);
     const joined = logs.join("\n");
     expect(joined).toContain("tailscale.com/download");
-    expect(joined).toContain("developers.cloudflare.com");
+    // Post 2026-05-27 cloudflared-URL refresh: the install hint now points
+    // at GitHub releases (developers.cloudflare.com / pkg.cloudflare.com
+    // both returned HTML/404 on Aaron's fresh AL2023 EC2 box).
+    expect(joined).toContain("github.com/cloudflare/cloudflared/releases/latest");
+    expect(joined).not.toContain("developers.cloudflare.com");
     expect(joined).toContain("--skip-provider-check");
   });
 

@@ -28,7 +28,7 @@
  * tailscale/cloudflared.
  */
 
-import { DEFAULT_CLOUDFLARED_HOME } from "../cloudflare/detect.ts";
+import { DEFAULT_CLOUDFLARED_HOME, cloudflaredInstallHint } from "../cloudflare/detect.ts";
 import {
   type DetectProvidersOpts,
   type ProviderAvailability,
@@ -109,9 +109,11 @@ function reportNeitherReady(r: Resolved, p: ProviderAvailability): number {
   r.log("");
   r.log("  Option B — Cloudflare Tunnel (your own domain, Cloudflare DNS):");
   if (!p.cloudflare.available) {
-    r.log(
-      "    1. Install cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
-    );
+    // 2026-05-27 refresh: defer to the shared install-hint helper so the
+    // canonical install path stays in one place. Pre-refresh this surface
+    // hard-coded a developers.cloudflare.com URL that now serves HTML/404.
+    r.log("    1. Install cloudflared:");
+    for (const line of cloudflaredInstallHint().split("\n")) r.log(`         ${line}`);
     r.log("    2. Log in:              cloudflared tunnel login");
     r.log("    3. Re-run with --domain: parachute expose public --cloudflare --domain <hostname>");
   } else {

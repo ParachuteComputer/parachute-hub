@@ -59,10 +59,65 @@ describe("cloudflare detect", () => {
     }
   });
 
-  test("install hint names brew on darwin and a URL elsewhere", () => {
-    expect(cloudflaredInstallHint("darwin")).toContain("brew install cloudflared");
-    expect(cloudflaredInstallHint("linux")).toContain(
-      "developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads",
-    );
+  describe("cloudflaredInstallHint", () => {
+    test("darwin: names brew + points at GitHub releases as fallback", () => {
+      const hint = cloudflaredInstallHint("darwin", "arm64");
+      expect(hint).toContain("brew install cloudflared");
+      expect(hint).toContain("https://github.com/cloudflare/cloudflared/releases/latest");
+    });
+
+    test("linux x64: writes the curl line with the amd64 artifact suffix", () => {
+      // Refresh of stale URLs (2026-05-27). Aaron hit this on a fresh
+      // Amazon Linux 2023 install — `sudo dnf install cloudflared`
+      // returned 'No match for argument: cloudflared', and the hub's
+      // hint pointed at developers.cloudflare.com paths that 404. The
+      // GitHub release is the reliable cross-distro path.
+      const hint = cloudflaredInstallHint("linux", "x64");
+      expect(hint).toContain("curl -L -o /usr/local/bin/cloudflared");
+      expect(hint).toContain(
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+      );
+      expect(hint).toContain("sudo chmod +x /usr/local/bin/cloudflared");
+    });
+
+    test("linux arm64: writes the arm64 artifact suffix", () => {
+      const hint = cloudflaredInstallHint("linux", "arm64");
+      expect(hint).toContain("cloudflared-linux-arm64");
+    });
+
+    test("linux arm (32-bit): writes the arm artifact suffix", () => {
+      const hint = cloudflaredInstallHint("linux", "arm");
+      expect(hint).toContain("cloudflared-linux-arm");
+    });
+
+    test("linux exotic arch: falls back to a generic GitHub releases pointer", () => {
+      // riscv64 / ppc64 / mips64 — no cloudflared artifact published, so
+      // we don't fabricate a 404-bound download URL; we point the user at
+      // the releases page and surface what their arch is so they can pick.
+      const hint = cloudflaredInstallHint("linux", "riscv64");
+      expect(hint).toContain("https://github.com/cloudflare/cloudflared/releases/latest");
+      expect(hint).toContain("riscv64");
+      expect(hint).not.toContain("curl -L -o /usr/local/bin/cloudflared");
+    });
+
+    test("no stale developers.cloudflare.com or pkg.cloudflare.com paths anywhere", () => {
+      // Aaron caught both URL shapes returning HTML/404 on 2026-05-27 —
+      // they had been the hub's installer instructions for months.
+      // Hard-assert they're gone so they don't regress.
+      for (const platform of ["darwin", "linux"] as const) {
+        for (const arch of ["x64", "arm64"] as const) {
+          const hint = cloudflaredInstallHint(platform, arch);
+          expect(hint).not.toContain("developers.cloudflare.com");
+          expect(hint).not.toContain("pkg.cloudflare.com");
+        }
+      }
+    });
+
+    test("non-Linux, non-darwin platform: GitHub releases pointer with no curl line", () => {
+      const hint = cloudflaredInstallHint("win32", "x64");
+      expect(hint).toContain("https://github.com/cloudflare/cloudflared/releases/latest");
+      expect(hint).not.toContain("brew install");
+      expect(hint).not.toContain("curl -L -o");
+    });
   });
 });

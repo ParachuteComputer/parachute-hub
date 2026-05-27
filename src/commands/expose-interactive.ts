@@ -13,6 +13,7 @@
 import { createInterface } from "node:readline/promises";
 import {
   DEFAULT_CLOUDFLARED_HOME,
+  cloudflaredInstallHint,
   isCloudflaredInstalled,
   isCloudflaredLoggedIn,
 } from "../cloudflare/detect.ts";
@@ -273,19 +274,17 @@ async function guideCloudflareSetup(
         return false;
       }
     } else {
+      // 2026-05-27 refresh: distro-package paths (`apt-get`, `dnf`) are
+      // unreliable across versions — Aaron hit `No match for argument:
+      // cloudflared` on Amazon Linux 2023 — and the
+      // pkg.cloudflare.com / developers.cloudflare.com paths the old hint
+      // pointed at now serve HTML/404. Defer to `cloudflaredInstallHint`,
+      // which writes the canonical GitHub-release static-binary path
+      // matching the host's architecture.
       r.log("");
       r.log("Cloudflare Tunnel uses the `cloudflared` binary, which isn't installed yet.");
-      r.log("Install one way:");
-      r.log("  Debian / Ubuntu:");
-      r.log(
-        "    curl -L https://pkg.cloudflare.com/install.sh | sudo bash && sudo apt-get install -y cloudflared",
-      );
-      r.log("  RHEL / Fedora:");
-      r.log("    sudo dnf install cloudflared");
-      r.log("  Tarball / other:");
-      r.log(
-        "    https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
-      );
+      r.log("");
+      for (const line of cloudflaredInstallHint(r.platform).split("\n")) r.log(line);
       r.log("");
       r.log("After install, re-run: parachute expose public");
       return false;
