@@ -1104,6 +1104,181 @@ describe("handleSetupVaultPost", () => {
       db.close();
     }
   });
+
+  // --- scribe cleanup sub-form (2026-05-27) -----------------------------
+  //
+  // The vault step's scribe sub-form was extended with a second radio
+  // group for cleanup-provider. The POST handler reads
+  // `scribe_cleanup_provider` + `scribe_cleanup_api_key` and writes a
+  // `cleanup` block + optional `cleanupProviders.<name>.apiKey` into
+  // `<configDir>/scribe/config.json` alongside the existing transcribe
+  // block. The combos exercised here:
+  //   1. cleanup=none → no cleanup block written
+  //   2. cleanup=claude-code (no key) → block written, no apiKey,
+  //      cleanup.default: true
+  //   3. cleanup=anthropic + key → block + apiKey written
+  //   4. transcribe=none + cleanup=anthropic → scribe still installs
+  //      (cleanup endpoint works standalone), no transcribe block
+  //   5. transcribe=groq + cleanup=anthropic + both keys → full
+  //      happy-path: both blocks + both keys end up in config
+
+  async function postVaultWithFields(
+    h: Harness,
+    fields: Record<string, string>,
+  ): Promise<{ response: Response; runCmds: string[]; csrf: string }> {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession, SESSION_COOKIE_NAME: SC } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const runCalls: string[][] = [];
+      const stubbedRun = async (cmd: readonly string[]) => {
+        runCalls.push([...cmd]);
+        return 0;
+      };
+      const response = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          body: new URLSearchParams({
+            [CSRF_FIELD_NAME]: csrf,
+            ...fields,
+          }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SC}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          supervisor: makeSupervisor(),
+          registry: getDefaultOperationsRegistry(),
+          run: stubbedRun,
+        },
+      );
+      // Yield long enough for background runInstall promises to call
+      // through to the stubbed runner.
+      await new Promise((r) => setTimeout(r, 50));
+      return { response, runCmds: runCalls.map((c) => c.join(" ")), csrf };
+    } finally {
+      db.close();
+    }
+  }
+
+  function readScribeConfig(dir: string): Record<string, unknown> | undefined {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const path = require("node:path") as typeof import("node:path");
+    const p = path.join(dir, "scribe", "config.json");
+    if (!fs.existsSync(p)) return undefined;
+    return JSON.parse(fs.readFileSync(p, "utf8")) as Record<string, unknown>;
+  }
+
+  test("scribe cleanup: provider=none writes no cleanup block + no cleanupDefault", async () => {
+    // Skip-cleanup is the radio default. When the operator leaves it
+    // alone, the config writer shouldn't emit a cleanup block at all
+    // — leaves scribe's first-boot default (`cleanup.provider: "none"`)
+    // alone. Belt-and-braces: also assert no `cleanupProviders` block.
+    const { response } = await postVaultWithFields(h, {
+      scribe_provider: "groq",
+      scribe_api_key: "gsk_test_xyz",
+      scribe_cleanup_provider: "none",
+    });
+    expect(response.status).toBe(303);
+    const cfg = readScribeConfig(h.dir);
+    expect(cfg).toBeDefined();
+    expect(cfg?.transcribe).toEqual({ provider: "groq" });
+    expect(cfg?.transcribeProviders).toEqual({ groq: { apiKey: "gsk_test_xyz" } });
+    expect(cfg?.cleanup).toBeUndefined();
+    expect(cfg?.cleanupProviders).toBeUndefined();
+  });
+
+  test("scribe cleanup: provider=claude-code writes block with cleanupDefault:true + no apiKey", async () => {
+    // Claude Code path is subscription-funded — no API key field, auth
+    // is via `claude setup-token` on the host. The wizard should write
+    // `cleanup.provider: "claude-code"` + `cleanup.default: true`,
+    // and NOT a cleanupProviders block (there's nothing to store).
+    const { response } = await postVaultWithFields(h, {
+      scribe_provider: "local",
+      scribe_cleanup_provider: "claude-code",
+    });
+    expect(response.status).toBe(303);
+    const cfg = readScribeConfig(h.dir);
+    expect(cfg?.cleanup).toEqual({ provider: "claude-code", default: true });
+    expect(cfg?.cleanupProviders).toBeUndefined();
+  });
+
+  test("scribe cleanup: provider=anthropic + api_key writes cleanupProviders.anthropic.apiKey", async () => {
+    // Cloud cleanup provider with a key. Expect both the `cleanup`
+    // block (provider + default:true) AND the `cleanupProviders`
+    // block carrying the apiKey, mirroring the transcribe shape.
+    const { response } = await postVaultWithFields(h, {
+      scribe_provider: "groq",
+      scribe_api_key: "gsk_test",
+      scribe_cleanup_provider: "anthropic",
+      scribe_cleanup_api_key: "sk-ant-test123",
+    });
+    expect(response.status).toBe(303);
+    const cfg = readScribeConfig(h.dir);
+    expect(cfg?.cleanup).toEqual({ provider: "anthropic", default: true });
+    expect(cfg?.cleanupProviders).toEqual({ anthropic: { apiKey: "sk-ant-test123" } });
+    // The config file holds API keys; verify it's written 0o600 so
+    // other users on a shared box can't read the operator's keys.
+    // (Mac/Linux only — Windows reports 0o666; skip on win32.)
+    if (process.platform !== "win32") {
+      const fs = require("node:fs") as typeof import("node:fs");
+      const path = require("node:path") as typeof import("node:path");
+      const cfgPath = path.join(h.dir, "scribe", "config.json");
+      const mode = fs.statSync(cfgPath).mode & 0o777;
+      expect(mode).toBe(0o600);
+    }
+  });
+
+  test("scribe cleanup: transcribe=none + cleanup=anthropic still installs scribe + writes cleanup block", async () => {
+    // Edge case: operator skips transcription but wants the cleanup
+    // endpoint anyway (they'll feed raw text to scribe's REST cleanup
+    // route from elsewhere). Scribe should still install + the
+    // cleanup block lands without a transcribe block.
+    const { response, runCmds } = await postVaultWithFields(h, {
+      scribe_provider: "none",
+      scribe_cleanup_provider: "anthropic",
+      scribe_cleanup_api_key: "sk-ant-cleanup-only",
+    });
+    expect(response.status).toBe(303);
+    const location = response.headers.get("location") ?? "";
+    expect(location).toMatch(/op_scribe=/);
+    expect(runCmds.some((c) => c.includes("bun add -g @openparachute/scribe"))).toBe(true);
+    const cfg = readScribeConfig(h.dir);
+    expect(cfg?.transcribe).toBeUndefined();
+    expect(cfg?.cleanup).toEqual({ provider: "anthropic", default: true });
+    expect(cfg?.cleanupProviders).toEqual({ anthropic: { apiKey: "sk-ant-cleanup-only" } });
+  });
+
+  test("scribe cleanup: transcribe=groq + cleanup=anthropic + both keys writes both blocks", async () => {
+    // Full happy-path. Two separate providers, two separate keys,
+    // both blocks should land independently in the config.
+    const { response } = await postVaultWithFields(h, {
+      scribe_provider: "groq",
+      scribe_api_key: "gsk_transcribe_key",
+      scribe_cleanup_provider: "anthropic",
+      scribe_cleanup_api_key: "sk-ant-cleanup-key",
+    });
+    expect(response.status).toBe(303);
+    const cfg = readScribeConfig(h.dir);
+    expect(cfg?.transcribe).toEqual({ provider: "groq" });
+    expect(cfg?.transcribeProviders).toEqual({ groq: { apiKey: "gsk_transcribe_key" } });
+    expect(cfg?.cleanup).toEqual({ provider: "anthropic", default: true });
+    expect(cfg?.cleanupProviders).toEqual({ anthropic: { apiKey: "sk-ant-cleanup-key" } });
+  });
 });
 
 // --- end-to-end through hubFetch -----------------------------------------
@@ -2523,6 +2698,26 @@ describe("typed vault name (hub#267)", () => {
     expect(html).toContain('value="BAD"');
     expect(html).toContain("lowercase alphanumeric");
     expect(html).toContain('id="preview-vault-name">BAD<');
+  });
+
+  test("vault step cloudHost=true hides local cleanup options (ollama + claude-code)", async () => {
+    // The cleanup sub-form (added 2026-05-27) offers seven providers
+    // total. Two of them require host-side resources that don't exist
+    // on a cloud container (Render / Fly): claude-code needs the
+    // `claude` CLI + `claude setup-token` on the host; ollama needs a
+    // local Ollama server. Hide those on cloudHost=true so operators
+    // don't pick a provider that'd silently fail at first boot.
+    const { renderVaultStep } = await import("../setup-wizard.ts");
+    const cloudHtml = renderVaultStep({ csrfToken: "csrf-test", cloudHost: true });
+    expect(cloudHtml).not.toContain('value="claude-code"');
+    expect(cloudHtml).not.toContain('value="ollama"');
+    // Cloud-friendly options stay visible.
+    expect(cloudHtml).toContain('value="anthropic"');
+    expect(cloudHtml).toContain('value="gemini"');
+    // And on the local self-host path they're all there.
+    const localHtml = renderVaultStep({ csrfToken: "csrf-test", cloudHost: false });
+    expect(localHtml).toContain('value="claude-code"');
+    expect(localHtml).toContain('value="ollama"');
   });
 });
 
