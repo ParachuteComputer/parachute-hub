@@ -49,6 +49,7 @@ import type { Database } from "bun:sqlite";
 import { hash as argonHash } from "@node-rs/argon2";
 import { type ChangePasswordMode, renderChangePassword } from "./account-change-password-ui.ts";
 import { renderAccountHome } from "./account-home-ui.ts";
+import { POST_LOGIN_DEFAULT } from "./admin-handlers.ts";
 import { renderAdminError } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { changePasswordRateLimiter } from "./rate-limit.ts";
@@ -71,12 +72,10 @@ export interface ApiAccountDeps {
 
 /**
  * Where to land after a successful password change when no `next` param
- * is present. Matches `POST_LOGIN_DEFAULT` in `admin-handlers.ts` — the
- * admin SPA's vault list. Kept as a local const (not imported) so this
- * file doesn't accidentally couple to admin-handlers' internals; if the
- * default ever diverges the two should reconcile via a shared config.
+ * is present. Re-exported from `admin-handlers.ts` so login + change-
+ * password share a single source of truth (reviewer fold on hub#425).
  */
-const POST_CHANGE_DEFAULT = "/admin/vaults";
+const POST_CHANGE_DEFAULT = POST_LOGIN_DEFAULT;
 
 function safeNext(raw: string | null | undefined): string {
   if (!raw) return POST_CHANGE_DEFAULT;

@@ -46,10 +46,6 @@ const FONT_SERIF = `Georgia, "Times New Roman", serif`;
 const FONT_SANS = `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
 const FONT_MONO = `ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace`;
 
-function escapeAttr(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-}
-
 function baseDocument(title: string, body: string): string {
   return `<!doctype html>
 <html lang="en">
@@ -406,9 +402,3 @@ const STYLES = `
     .btn-secondary:hover { background: #1f1c18; border-color: ${PALETTE.accent}; }
   }
 `;
-
-// Silence "unused" warnings for tokens the renderer pulls in conditionally
-// — `escapeAttr` is reserved for a forthcoming "use a custom client"
-// payload that wants attribute-safe strings; keeping the helper resident
-// matches the pattern in account-change-password-ui.ts.
-export const __internal = { escapeAttr };

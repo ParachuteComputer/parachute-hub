@@ -47,8 +47,12 @@ function redirect(location: string, extra: Record<string, string> = {}): Respons
  * `/admin/vaults` as its home (vault list, the default tab). Anywhere else
  * would either bounce the operator out of the SPA shell or land on a
  * legacy server-rendered page — `/admin/vaults` is the canonical entry.
+ *
+ * Exported because `api-account.ts` consumes the same constant for its
+ * change-password landing. Single source of truth so a future "default
+ * landing changed to /admin/dashboard" PR doesn't drift across two files.
  */
-const POST_LOGIN_DEFAULT = "/admin/vaults";
+export const POST_LOGIN_DEFAULT = "/admin/vaults";
 
 /**
  * Force-change-password landing. Multi-user Phase 1 PR 3: when a user

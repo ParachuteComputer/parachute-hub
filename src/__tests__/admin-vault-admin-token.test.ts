@@ -152,6 +152,50 @@ describe("handleVaultAdminToken", () => {
     expect(scopeClaim.split(/\s+/)).toContain("vault:work:admin");
   });
 
+  test("403 not_admin when the session belongs to a non-first-admin user", async () => {
+    // Multi-user Phase 1 privesc gate (mirrors host-admin-token). The first-
+    // created user is the hub admin; subsequent users are friends pinned to
+    // a single vault and must NOT be able to mint vault:<name>:admin via
+    // this endpoint. The session check alone would let them — that's the
+    // whole reason this gate exists.
+    await createUser(harness.db, "operator", "hunter2-admin");
+    const friend = await createUser(harness.db, "friend", "hunter2-friend", {
+      assignedVault: "work",
+      allowMulti: true,
+    });
+    const session = createSession(harness.db, { userId: friend.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${ISSUER}/admin/vault-admin-token/work`, { headers: { cookie } });
+    const res = await handleVaultAdminToken(req, "work", {
+      db: harness.db,
+      issuer: ISSUER,
+      knownVaultNames: known("work", "default"),
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("not_admin");
+    expect(body.error_description).toContain("/account/");
+  });
+
+  test("first admin still mints when other users exist", async () => {
+    // Regression: the first-admin gate must not regress the operator's
+    // happy path when there are friends in the DB.
+    const admin = await createUser(harness.db, "operator", "hunter2-admin");
+    await createUser(harness.db, "friend", "hunter2-friend", {
+      assignedVault: "work",
+      allowMulti: true,
+    });
+    const session = createSession(harness.db, { userId: admin.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${ISSUER}/admin/vault-admin-token/work`, { headers: { cookie } });
+    const res = await handleVaultAdminToken(req, "work", {
+      db: harness.db,
+      issuer: ISSUER,
+      knownVaultNames: known("work"),
+    });
+    expect(res.status).toBe(200);
+  });
+
   test("audience is per-vault — different vaults get different aud claims", async () => {
     // Regression for PR #173 follow-up: a single shared audience constant
     // meant a token minted for vault `boulder` carried `aud: "hub"` and
