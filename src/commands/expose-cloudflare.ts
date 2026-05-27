@@ -26,11 +26,19 @@ import {
   findTunnelByName,
   routeDns,
 } from "../cloudflare/tunnel.ts";
-import { SERVICES_MANIFEST_PATH } from "../config.ts";
+import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
+import {
+  type EnsureHubOpts,
+  HUB_DEFAULT_PORT,
+  ensureHubRunning,
+  readHubPort,
+} from "../hub-control.ts";
+import { deriveHubOrigin } from "../hub-origin.ts";
 import { type AliveFn, defaultAlive } from "../process-state.ts";
 import { readManifest } from "../services-manifest.ts";
 import { type Runner, defaultRunner } from "../tailscale/run.ts";
 import type { VaultAuthStatus } from "../vault/auth-status.ts";
+import { WELL_KNOWN_DIR } from "../well-known.ts";
 import { printPublic2FAWarning } from "./expose-2fa-warning.ts";
 
 const AUTH_DOC_URL =
@@ -112,6 +120,37 @@ export interface ExposeCloudflareOpts {
   logPath?: string;
   /** Override `~/.cloudflared` for tests and `$HOME`-free environments. */
   cloudflaredHome?: string;
+  /**
+   * Config root for hub PID / port / log files. Defaults to `~/.parachute`.
+   * Threaded into `ensureHubRunning` so cloudflared's ingress target stays
+   * in sync with where the hub actually bound.
+   */
+  configDir?: string;
+  /**
+   * Override the public hub origin (the `iss` claim baked into the OAuth
+   * issuer). Mirrors the Tailscale path — when set, this URL is what the
+   * hub advertises rather than the cloudflared hostname.
+   */
+  hubOrigin?: string;
+  /**
+   * Overrides for hub lifecycle — primarily for tests. Tests pass
+   * `skipHubLifecycle: true` (above) plus a seeded `hub.port` file so the
+   * cloudflare path can resolve a port without actually spawning a hub.
+   */
+  hubEnsureOpts?: Omit<EnsureHubOpts, "configDir" | "wellKnownDir" | "log">;
+  /**
+   * Directory holding hub.html (passed through to the hub server on first
+   * spawn). Defaults to the same `well-known/` resolution the Tailscale
+   * path uses.
+   */
+  wellKnownDir?: string;
+  /**
+   * Skip spawning the hub server. Tests flip this on and pre-seed
+   * `<configDir>/hub/run/hub.port` so `readHubPort` can resolve the
+   * cloudflared target without a live process. Production always leaves
+   * this off so the bringup self-heals a missing hub.
+   */
+  skipHub?: boolean;
   now?: () => Date;
   /**
    * Override `~/.parachute/vault` for the 2FA-enrollment probe. Tests
@@ -139,6 +178,11 @@ interface Resolved {
   configPath: string;
   logPath: string;
   cloudflaredHome: string;
+  configDir: string;
+  hubOrigin: string | undefined;
+  hubEnsureOpts: Omit<EnsureHubOpts, "configDir" | "wellKnownDir" | "log">;
+  wellKnownDir: string;
+  skipHub: boolean;
   now: () => Date;
   vaultHome: string | undefined;
   vaultAuthStatus: VaultAuthStatus | undefined;
@@ -159,6 +203,11 @@ function resolve(opts: ExposeCloudflareOpts): Resolved {
     configPath: opts.configPath ?? paths.configPath,
     logPath: opts.logPath ?? paths.logPath,
     cloudflaredHome: opts.cloudflaredHome ?? DEFAULT_CLOUDFLARED_HOME,
+    configDir: opts.configDir ?? CONFIG_DIR,
+    hubOrigin: opts.hubOrigin,
+    hubEnsureOpts: opts.hubEnsureOpts ?? {},
+    wellKnownDir: opts.wellKnownDir ?? WELL_KNOWN_DIR,
+    skipHub: opts.skipHub ?? false,
     now: opts.now ?? (() => new Date()),
     vaultHome: opts.vaultHome,
     vaultAuthStatus: opts.vaultAuthStatus,
@@ -239,6 +288,46 @@ export async function exposeCloudflareUp(
     return 1;
   }
 
+  // Resolve the public hub origin before spawning the hub server — it gets
+  // baked into the OAuth `iss` claim via the `--issuer` flag. For Cloudflare
+  // ingress the canonical origin is the user-supplied hostname (mirrors the
+  // Tailscale Funnel path which uses the tailnet FQDN). Falling back to the
+  // request origin would put `http://127.0.0.1:<port>` in tokens, which any
+  // client following RFC 8414 would reject.
+  const canonicalOrigin = `https://${hostname}`;
+  const hubOrigin =
+    deriveHubOrigin({ override: r.hubOrigin, exposeFqdn: hostname }) ?? canonicalOrigin;
+
+  // Ensure the hub is running and figure out the loopback port cloudflared
+  // should target. The hub does all internal routing (discovery, admin,
+  // OAuth, well-known, per-vault proxy, generic /<svc>/* dispatch) — same
+  // shape the Tailscale Funnel path uses (see `planEntries` in expose.ts).
+  // Pre-2026-05-27 the cloudflared config routed straight at vault's port,
+  // so a public URL like https://gitcoin.parachute.computer/ returned 404
+  // from vault itself instead of the hub's discovery page; admin / OAuth
+  // were unreachable. Aaron hit this on a fresh EC2 install.
+  let hubPort: number;
+  if (r.skipHub) {
+    const existing = readHubPort(r.configDir);
+    if (existing === undefined) {
+      throw new Error("skipHub set but no hub.port on disk — tests must seed one");
+    }
+    hubPort = existing;
+  } else {
+    const hub = await ensureHubRunning({
+      reservedPorts: manifest.services.map((s) => s.port),
+      ...r.hubEnsureOpts,
+      configDir: r.configDir,
+      wellKnownDir: r.wellKnownDir,
+      issuer: hubOrigin,
+      log: r.log,
+    });
+    hubPort = hub.port;
+    if (hub.started) r.log(`✓ hub started (pid ${hub.pid}, port ${hub.port}).`);
+    else r.log(`✓ hub already running (pid ${hub.pid}, port ${hub.port}).`);
+  }
+  if (hubPort === 0) hubPort = HUB_DEFAULT_PORT;
+
   let tunnel: Tunnel | undefined;
   try {
     tunnel = await findTunnelByName(r.runner, r.tunnelName);
@@ -282,7 +371,13 @@ export async function exposeCloudflareUp(
       tunnelUuid: tunnel.id,
       credentialsFile: credsFile,
       hostname,
-      servicePort: vaultEntry.port,
+      // Route into the hub, not vault directly. The hub dispatches
+      // discovery / admin / OAuth / per-vault proxy / generic /<svc>/*
+      // — same shape Tailscale Funnel uses (single mount → hub catchall).
+      // Pre-fix this was `vaultEntry.port`, which served vault's own 404
+      // page on every request that wasn't /vault/<name>/… — admin SPA and
+      // OAuth surfaces were unreachable from the public URL.
+      servicePort: hubPort,
     },
     r.configPath,
   );
@@ -329,9 +424,11 @@ export async function exposeCloudflareUp(
 
   r.log("");
   r.log(`✓ Cloudflare tunnel up (pid ${pid}).`);
-  r.log(`  URL:    ${baseUrl}`);
-  r.log(`  Vault:  ${vaultUrl}`);
-  r.log(`  Logs:   ${r.logPath}`);
+  r.log(`  Open:    ${baseUrl}/`);
+  r.log(`  Admin:   ${baseUrl}/admin/`);
+  r.log(`  Vault:   ${vaultUrl}`);
+  r.log(`  OAuth:   ${hubOrigin}`);
+  r.log(`  Logs:    ${r.logPath}`);
   r.log("");
   r.log("Point a claude.ai / ChatGPT connector at:");
   r.log(`  ${vaultUrl}`);
