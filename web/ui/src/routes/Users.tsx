@@ -106,7 +106,7 @@ type ResetState =
   | { kind: "idle" }
   | { kind: "open"; userId: string; password: string }
   | { kind: "submitting"; userId: string; password: string }
-  | { kind: "done"; userId: string; username: string }
+  | { kind: "done"; userId: string; username: string; revocationLagSeconds: number }
   | { kind: "error"; userId: string; password: string; message: string };
 
 interface FormFields {
@@ -257,8 +257,13 @@ export function Users() {
     }
     setResetSt({ kind: "submitting", userId: user.id, password });
     try {
-      await resetUserPassword(user.id, password);
-      setResetSt({ kind: "done", userId: user.id, username: user.username });
+      const { revocationLagSeconds } = await resetUserPassword(user.id, password);
+      setResetSt({
+        kind: "done",
+        userId: user.id,
+        username: user.username,
+        revocationLagSeconds,
+      });
       // Refresh so the row's "Password set" cell flips back to
       // "pending first login" — the server flipped password_changed
       // back to false, and the table needs to mirror that.
@@ -665,7 +670,8 @@ function ListRendered({
                         password and tell them they'll be prompted to change it on first sign-in.
                         <div className="muted" style={{ marginTop: "0.5rem", fontSize: "0.85em" }}>
                           Their existing tokens are revoked. Resource servers (vault, scribe, etc.)
-                          cache the revocation list for up to 60 seconds — if you're resetting
+                          cache the revocation list for up to {resetDone.revocationLagSeconds}{" "}
+                          seconds — if you're resetting
                           because of a suspected compromise, also restart the affected services
                           (e.g. <code>parachute restart vault</code>) to flush their cache
                           immediately.

@@ -10,7 +10,7 @@
  *
  * Both install paths gate the `bun add -g` call on `isLinked(pkg) === false`.
  * Centralizing the detection here keeps the CLI and wizard in lockstep — diverging
- * (as the wizard did pre-hub#XXX) is the bug class this module exists to prevent.
+ * (as the wizard did pre-hub#433) is the bug class this module exists to prevent.
  */
 
 import { lstatSync } from "node:fs";

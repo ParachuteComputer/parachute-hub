@@ -262,7 +262,7 @@ async function defaultRunner(cmd: readonly string[]): Promise<number> {
 
 // `bunGlobalPrefixes` + `defaultIsLinked` were extracted to `src/bun-link.ts`
 // so the wizard's parallel install path (`api-modules-ops.ts:runInstall`) can
-// reuse the same detection — the two paths diverging is the bug class hub#XXX
+// reuse the same detection — the two paths diverging is the bug class hub#433
 // fixed (smoke 2026-05-27, finding 1). `defaultIsLinkedShared` is imported at
 // module scope; alias kept for the in-function local-shadow convention below.
 const defaultIsLinked = defaultIsLinkedShared;
