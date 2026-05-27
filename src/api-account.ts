@@ -235,7 +235,20 @@ export async function handleAccountChangePasswordPost(
   const currentPassword = String(form.get("current_password") ?? "");
   const newPassword = String(form.get("new_password") ?? "");
   const confirmPassword = String(form.get("new_password_confirm") ?? "");
-  const next = safeNext(String(form.get("next") ?? ""));
+  // Friend-facing redirect: non-admin users who would otherwise land in the
+  // admin SPA (because POST_CHANGE_DEFAULT = /admin/vaults) get bounced to
+  // /account/ directly. Without this, the SPA loads, hits 403 on its host-
+  // admin-token mint, then redirects to /account/ via the SPA's auth.ts —
+  // a visible two-hop flash for the friend. The login-redirect path
+  // (admin-handlers.ts:118) does the same rewrite at sign-in time; this
+  // mirrors it for the change-password POST. (hub#425 reviewer fold —
+  // operator runbook accuracy: the doc said "lands at /account/", but
+  // without this fix the user briefly sees the admin shell.)
+  const rawNext = safeNext(String(form.get("next") ?? ""));
+  const next =
+    !isFirstAdmin(deps.db, user.id) && (rawNext === "/admin" || rawNext.startsWith("/admin/"))
+      ? "/account/"
+      : rawNext;
   const mode = modeFor(user.passwordChanged);
 
   // Rate-limit gate (hub#282). Fires *after* CSRF (so a junk cross-site
