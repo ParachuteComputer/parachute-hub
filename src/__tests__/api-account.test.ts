@@ -306,6 +306,58 @@ describe("POST /account/change-password", () => {
     expect(res.headers.get("location")).toBe("/account/");
   });
 
+  test("non-admin user with non-admin next= passes through unchanged", async () => {
+    // Friends with a legitimate non-admin destination (e.g. /oauth/authorize
+    // mid-flow) should land where they intended — the rewrite only catches
+    // /admin/* targets.
+    await createUser(harness.db, "operator", "operator-strong-passphrase");
+    const { cookie } = await sessionCookieFor(harness.db, "friend", "old-default-pw", {
+      passwordChanged: false,
+      allowMulti: true,
+    });
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      current_password: "old-default-pw",
+      new_password: "user-chosen-strong-passphrase",
+      new_password_confirm: "user-chosen-strong-passphrase",
+      next: "/oauth/authorize?client_id=abc",
+    });
+    const req = new Request("http://hub.test/account/change-password", {
+      method: "POST",
+      headers: { ...headers, cookie },
+      body,
+    });
+    const res = await handleAccountChangePasswordPost(req, { db: harness.db });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/oauth/authorize?client_id=abc");
+  });
+
+  test("non-admin with exact next=/admin (no trailing slash) rewrites to /account/", async () => {
+    // Pins the exact-match arm of the prefix gate. Tests in #426 cover
+    // /admin/users (prefix match) and the no-next case (POST_CHANGE_DEFAULT
+    // → rewrite). This is the third arm.
+    await createUser(harness.db, "operator", "operator-strong-passphrase");
+    const { cookie } = await sessionCookieFor(harness.db, "friend", "old-default-pw", {
+      passwordChanged: false,
+      allowMulti: true,
+    });
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      current_password: "old-default-pw",
+      new_password: "user-chosen-strong-passphrase",
+      new_password_confirm: "user-chosen-strong-passphrase",
+      next: "/admin",
+    });
+    const req = new Request("http://hub.test/account/change-password", {
+      method: "POST",
+      headers: { ...headers, cookie },
+      body,
+    });
+    const res = await handleAccountChangePasswordPost(req, { db: harness.db });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/account/");
+  });
+
   test("first admin with no next still defaults to /admin/vaults", async () => {
     // Existing behavior — preserved by the non-admin gate. The first user
     // is the admin under Phase 1; admin SPA is the intended landing.
