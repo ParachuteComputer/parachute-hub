@@ -757,7 +757,7 @@ describe("handleAccountHomeGet", () => {
     const friend = await createUser(harness.db, "alice", "alice-passphrase", {
       allowMulti: true,
       passwordChanged: true,
-      assignedVault: "alice",
+      assignedVaults: ["alice"],
     });
     const session = createSession(harness.db, { userId: friend.id });
     const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
@@ -774,7 +774,7 @@ describe("handleAccountHomeGet", () => {
     expect(html).toContain(`https://notes.parachute.computer/add?url=${encoded}`);
   });
 
-  test("200 + admin branch when the first-admin signs in (assignedVault=null)", async () => {
+  test("200 + admin branch when the first-admin signs in (no vault assignments)", async () => {
     // The first-created user with no vault pin is the admin posture.
     const admin = await createUser(harness.db, "admin", "admin-passphrase", {
       passwordChanged: true,

@@ -21,6 +21,7 @@ vi.mock("../lib/api.ts", async (orig) => {
     createUser: vi.fn(),
     deleteUser: vi.fn(),
     resetUserPassword: vi.fn(),
+    updateUserVaults: vi.fn(),
   };
 });
 
@@ -45,7 +46,7 @@ function user(username: string, overrides: Partial<api.UserListing> = {}): api.U
     id: `id-${username}`,
     username,
     password_changed: true,
-    assigned_vault: null,
+    assigned_vaults: [],
     created_at: "2026-05-01T12:00:00.000Z",
     ...overrides,
   };
@@ -68,8 +69,8 @@ describe("Users — list rendering", () => {
 
   it("renders one row per user with assigned vault + password status", async () => {
     vi.mocked(api.listUsers).mockResolvedValue([
-      user("operator", { password_changed: true, assigned_vault: null }),
-      user("alice", { password_changed: false, assigned_vault: "home" }),
+      user("operator", { password_changed: true, assigned_vaults: [] }),
+      user("alice", { password_changed: false, assigned_vaults: ["home"] }),
     ]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
     renderRoute();
@@ -283,27 +284,30 @@ describe("Users — create form", () => {
     expect(screen.queryByLabelText(/^password/i)).toBeNull();
   });
 
-  it("clicking Create User reveals the form with vault dropdown + No restriction option", async () => {
+  it("clicking Create User reveals the form with multi-select vault listing", async () => {
     vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home", "work"]);
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
     expect(await screen.findByLabelText(/username/i)).toBeInTheDocument();
-    const select = screen.getByLabelText(/assigned vault/i) as HTMLSelectElement;
+    const select = screen.getByLabelText(/assigned vaults/i) as HTMLSelectElement;
+    expect(select.multiple).toBe(true);
     const optionTexts = Array.from(select.options).map((o) => o.text);
-    expect(optionTexts).toEqual(["No restriction (admin-level access)", "home", "work"]);
+    // Multi-select: no synthetic "No restriction" option — empty selection
+    // implicitly means no narrowing.
+    expect(optionTexts).toEqual(["home", "work"]);
   });
 
-  it("submits createUser with the assigned vault and refreshes the list on success", async () => {
+  it("submits createUser with the assigned vaults and refreshes the list on success", async () => {
     const listMock = vi.mocked(api.listUsers);
     listMock.mockResolvedValueOnce([user("operator")]);
     listMock.mockResolvedValueOnce([
       user("operator"),
-      user("alice", { password_changed: false, assigned_vault: "home" }),
+      user("alice", { password_changed: false, assigned_vaults: ["home"] }),
     ]);
     vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
     vi.mocked(api.createUser).mockResolvedValue(
-      user("alice", { password_changed: false, assigned_vault: "home" }),
+      user("alice", { password_changed: false, assigned_vaults: ["home"] }),
     );
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
@@ -311,13 +315,17 @@ describe("Users — create form", () => {
     fireEvent.change(screen.getByLabelText(/^password/i), {
       target: { value: "alice-strong-passphrase" },
     });
-    fireEvent.change(screen.getByLabelText(/assigned vault/i), { target: { value: "home" } });
+    // Multi-select: pick "home" via selectedOptions handling.
+    const vaultsSelect = screen.getByLabelText(/assigned vaults/i) as HTMLSelectElement;
+    const homeOption = Array.from(vaultsSelect.options).find((o) => o.value === "home");
+    if (homeOption) homeOption.selected = true;
+    fireEvent.change(vaultsSelect);
     fireEvent.click(screen.getByRole("button", { name: /^create user$/i }));
     await waitFor(() =>
       expect(api.createUser).toHaveBeenCalledWith({
         username: "alice",
         password: "alice-strong-passphrase",
-        assignedVault: "home",
+        assignedVaults: ["home"],
       }),
     );
     // Success banner copy matches the design's "force-change on first login" wording.
@@ -362,5 +370,115 @@ describe("Users — create form", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /^create user$/i }));
     await waitFor(() => expect(screen.getByText(/create failed \(409\)/i)).toBeInTheDocument());
+  });
+});
+
+describe("Users — multi-vault membership (Phase 2 PR 2)", () => {
+  it("renders multiple assigned vaults as separate code chips in the row", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([
+      user("operator"),
+      user("alice", { assigned_vaults: ["personal", "family"] }),
+    ]);
+    vi.mocked(api.listUserVaults).mockResolvedValue(["personal", "family"]);
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
+    // Both vault names appear as <code> chips in the alice row.
+    const aliceRow = screen.getByText("alice").closest("tr");
+    expect(aliceRow).not.toBeNull();
+    expect(within(aliceRow!).getByText("personal")).toBeInTheDocument();
+    expect(within(aliceRow!).getByText("family")).toBeInTheDocument();
+  });
+
+  it("disables Edit vaults for the first admin with a /design/ tooltip", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
+    renderRoute();
+    const operatorBtn = await screen.findByRole("button", { name: /edit vaults for operator/i });
+    expect(operatorBtn).toBeDisabled();
+    expect(operatorBtn).toHaveAttribute("title", expect.stringMatching(/unrestricted by design/i));
+    const aliceBtn = screen.getByRole("button", { name: /edit vaults for alice/i });
+    expect(aliceBtn).not.toBeDisabled();
+  });
+
+  it("clicking Edit vaults reveals an inline multi-select pre-populated with current vaults", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([
+      user("operator"),
+      user("alice", { assigned_vaults: ["home"] }),
+    ]);
+    vi.mocked(api.listUserVaults).mockResolvedValue(["home", "work"]);
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /edit vaults for alice/i }));
+    const select = (await screen.findByLabelText(
+      /vault assignments for alice/i,
+    )) as HTMLSelectElement;
+    expect(select.multiple).toBe(true);
+    const selected = Array.from(select.selectedOptions).map((o) => o.value);
+    expect(selected).toEqual(["home"]);
+    // Available options match the listUserVaults set.
+    const optionTexts = Array.from(select.options).map((o) => o.value);
+    expect(optionTexts).toEqual(["home", "work"]);
+  });
+
+  it("happy path — PATCHes new vault list, shows success banner, refreshes the list", async () => {
+    const listMock = vi.mocked(api.listUsers);
+    listMock.mockResolvedValueOnce([
+      user("operator"),
+      user("alice", { assigned_vaults: ["home"] }),
+    ]);
+    listMock.mockResolvedValueOnce([
+      user("operator"),
+      user("alice", { assigned_vaults: ["home", "work"] }),
+    ]);
+    vi.mocked(api.listUserVaults).mockResolvedValue(["home", "work"]);
+    vi.mocked(api.updateUserVaults).mockResolvedValue();
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /edit vaults for alice/i }));
+    const select = (await screen.findByLabelText(
+      /vault assignments for alice/i,
+    )) as HTMLSelectElement;
+    // Add "work" — keep "home" selected.
+    const workOption = Array.from(select.options).find((o) => o.value === "work");
+    if (workOption) workOption.selected = true;
+    fireEvent.change(select);
+    fireEvent.click(screen.getByRole("button", { name: /save vault assignments/i }));
+    await waitFor(() =>
+      expect(api.updateUserVaults).toHaveBeenCalledWith(
+        "id-alice",
+        expect.arrayContaining(["home", "work"]),
+      ),
+    );
+    // Success banner copy.
+    await waitFor(() => expect(screen.getByText(/vault assignments updated/i)).toBeInTheDocument());
+    await waitFor(() => expect(api.listUsers).toHaveBeenCalledTimes(2));
+  });
+
+  it("surfaces server error_description from a 400 assigned_vault_not_found", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([
+      user("operator"),
+      user("alice", { assigned_vaults: ["home"] }),
+    ]);
+    vi.mocked(api.listUserVaults).mockResolvedValue(["home", "work"]);
+    vi.mocked(api.updateUserVaults).mockRejectedValue(
+      new api.HttpError(400, 'vault "ghost" not registered'),
+    );
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /edit vaults for alice/i }));
+    await screen.findByLabelText(/vault assignments for alice/i);
+    fireEvent.click(screen.getByRole("button", { name: /save vault assignments/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/edit vaults failed \(400\)/i)).toBeInTheDocument(),
+    );
+  });
+
+  it("Cancel closes the inline edit form without posting", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /edit vaults for alice/i }));
+    expect(await screen.findByLabelText(/vault assignments for alice/i)).toBeInTheDocument();
+    const form = screen.getByRole("form", { name: /edit vaults for alice/i });
+    fireEvent.click(within(form).getByRole("button", { name: /cancel/i }));
+    await waitFor(() => expect(screen.queryByLabelText(/vault assignments for alice/i)).toBeNull());
+    expect(api.updateUserVaults).not.toHaveBeenCalled();
   });
 });

@@ -22,7 +22,7 @@ describe("renderAccountHome", () => {
   test("assigned-vault branch — Notes CTA carries the encoded hub+vault URL", () => {
     const html = renderAccountHome({
       username: "alice",
-      assignedVault: "alice",
+      assignedVaults: ["alice"],
       passwordChanged: true,
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: false,
@@ -49,7 +49,7 @@ describe("renderAccountHome", () => {
     // renderer must produce a clean `/vault/<name>` join either way.
     const html = renderAccountHome({
       username: "alice",
-      assignedVault: "alice",
+      assignedVaults: ["alice"],
       passwordChanged: true,
       hubOrigin: `${HUB_ORIGIN}/`,
       isFirstAdmin: false,
@@ -65,7 +65,7 @@ describe("renderAccountHome", () => {
   test("admin branch — null assignedVault + isFirstAdmin renders an /admin/ link", () => {
     const html = renderAccountHome({
       username: "admin",
-      assignedVault: null,
+      assignedVaults: [],
       passwordChanged: true,
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: true,
@@ -85,7 +85,7 @@ describe("renderAccountHome", () => {
     // state via hand-edit or migration race.
     const html = renderAccountHome({
       username: "ghost",
-      assignedVault: null,
+      assignedVaults: [],
       passwordChanged: true,
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: false,
@@ -102,7 +102,7 @@ describe("renderAccountHome", () => {
   test("account card — change-password link and sign-out form are present", () => {
     const html = renderAccountHome({
       username: "alice",
-      assignedVault: "alice",
+      assignedVaults: ["alice"],
       passwordChanged: true,
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: false,
@@ -120,6 +120,29 @@ describe("renderAccountHome", () => {
     expect(html).toContain("<code>alice</code>");
   });
 
+  test("multi-vault branch — renders one tile per assigned vault (Phase 2 PR 2)", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["personal", "family"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+    });
+    // Plural heading.
+    expect(html).toContain("Your vaults");
+    // Each vault name appears.
+    expect(html).toContain("<strong>personal</strong>");
+    expect(html).toContain("<strong>family</strong>");
+    // One CTA per vault with the right encoded URL.
+    const personalEncoded = encodeURIComponent(`${HUB_ORIGIN}/vault/personal`);
+    const familyEncoded = encodeURIComponent(`${HUB_ORIGIN}/vault/family`);
+    expect(html).toContain(`https://notes.parachute.computer/add?url=${personalEncoded}`);
+    expect(html).toContain(`https://notes.parachute.computer/add?url=${familyEncoded}`);
+    // Hub origin block appears once at the section level, not per tile.
+    expect(html.split(`<code>${HUB_ORIGIN}</code>`).length - 1).toBe(1);
+  });
+
   test("escapes hostile content in username and vault name", () => {
     // Defense-in-depth: usernames pass validateUsername (lowercase alnum
     // + `_-`), so HTML metacharacters won't normally make it through. But
@@ -127,7 +150,7 @@ describe("renderAccountHome", () => {
     // escape is load-bearing if the validator ever loosens.
     const html = renderAccountHome({
       username: "<script>",
-      assignedVault: "<vault>",
+      assignedVaults: ["<vault>"],
       passwordChanged: true,
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: false,

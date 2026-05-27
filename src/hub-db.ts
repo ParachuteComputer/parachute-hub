@@ -278,6 +278,48 @@ const MIGRATIONS: readonly Migration[] = [
       UPDATE clients SET same_hub = 0;
     `,
   },
+  {
+    version: 10,
+    sql: `
+      -- Multi-user Phase 2 PR 2 (hub#252 follow-up, design
+      -- 2026-05-20-multi-user-phase-1.md §Phase 2). Lifts the single
+      -- \`users.assigned_vault TEXT\` column into a many-to-many
+      -- \`user_vaults\` table so one user can have access to multiple
+      -- vaults (e.g. a personal vault + a family-shared vault).
+      --
+      -- Schema:
+      --   * (user_id, vault_name) composite PK — one row per (user, vault).
+      --     ON DELETE CASCADE on user_id so user deletion drops the
+      --     assignments without us having to clean up manually.
+      --   * \`role\` TEXT DEFAULT 'write' — reserved for forward-compat per-
+      --     vault role granularity. Phase 1 had no role model; this column
+      --     gives later PRs a column to land scope-narrowing in without a
+      --     second migration. All backfilled rows default to 'write'.
+      --   * index on \`vault_name\` for the inverse lookup ("who has access
+      --     to vault X?") — useful when admin removes a vault and we want
+      --     to warn about pinned users.
+      --
+      -- Backfill: every existing row in \`users\` with a non-null
+      -- \`assigned_vault\` becomes a single (user_id, vault_name) row in
+      -- \`user_vaults\`. Rows with NULL \`assigned_vault\` (admin posture)
+      -- get no \`user_vaults\` entry — they remain "no narrowing" per
+      -- vaultScopeForUser semantics. After backfill the \`assigned_vault\`
+      -- column is dropped.
+      CREATE TABLE user_vaults (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        vault_name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'write',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, vault_name)
+      );
+      CREATE INDEX user_vaults_vault ON user_vaults (vault_name);
+      INSERT INTO user_vaults (user_id, vault_name, role, created_at)
+      SELECT id, assigned_vault, 'write', created_at
+      FROM users
+      WHERE assigned_vault IS NOT NULL;
+      ALTER TABLE users DROP COLUMN assigned_vault;
+    `,
+  },
 ];
 
 export function openHubDb(path: string = hubDbPath()): Database {

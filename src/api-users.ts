@@ -1,11 +1,13 @@
 /**
  * `/api/users*` — admin endpoints for managing hub user accounts.
  *
- * Multi-user Phase 1, PR 2 of 5. Design:
+ * Multi-user Phase 2 PR 2 (per-user multi-vault membership). Design:
  * [`parachute.computer/design/2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/).
- * Tracker: hub#252. Builds on PR 1 (hub#279) which shipped migration v8 +
- * the `validateUsername` / `validatePassword` validators this layer wires
- * through.
+ * Tracker: hub#252. Builds on PR 1 (hub#279) which shipped migration v8
+ * + the `validateUsername` / `validatePassword` validators, and Phase 2
+ * PR 1 (admin password reset). PR 2 lifts the single `assigned_vault`
+ * column into the `user_vaults` many-to-many table (migration v10) so a
+ * user can have access to multiple vaults.
  *
  * Surfaces:
  *
@@ -13,6 +15,7 @@
  *   POST   /api/users                       create user (host:admin)
  *   DELETE /api/users/:id                   hard-delete user (host:admin)
  *   POST   /api/users/:id/reset-password    admin password reset (host:admin)
+ *   PATCH  /api/users/:id/vaults            edit a user's vault list (host:admin)
  *   GET    /api/users/vaults                vault-name list for the
  *                                           assigned-vault dropdown
  *                                           (host:admin)
@@ -56,6 +59,7 @@ import {
   isFirstAdmin,
   listUsers,
   resetUserPassword,
+  setUserVaults,
   validatePassword,
   validateUsername,
 } from "./users.ts";
@@ -70,16 +74,21 @@ export interface ApiUsersDeps {
 }
 
 /**
- * Wire shape for a user row. Mirrors the DB columns but renames for
- * snake_case-on-the-wire camelCase-in-TS: `password_changed`,
- * `assigned_vault`, `created_at`. **`password_hash` is never present**
+ * Wire shape for a user row. Mirrors the schema but renames for snake_
+ * case-on-the-wire / camelCase-in-TS: `password_changed`,
+ * `assigned_vaults`, `created_at`. **`password_hash` is never present**
  * — it's the one column that must not leak.
+ *
+ * `assigned_vaults` replaces the Phase 1 `assigned_vault: string | null`
+ * shape (multi-user Phase 2 PR 2). Empty array = "no vault narrowing"
+ * for admin posture; a non-empty array lists every vault the user has
+ * access to.
  */
 export interface UserWireShape {
   id: string;
   username: string;
   password_changed: boolean;
-  assigned_vault: string | null;
+  assigned_vaults: string[];
   created_at: string;
 }
 
@@ -88,7 +97,7 @@ function toWire(u: User): UserWireShape {
     id: u.id,
     username: u.username,
     password_changed: u.passwordChanged,
-    assigned_vault: u.assignedVault,
+    assigned_vaults: [...u.assignedVaults],
     created_at: u.createdAt,
   };
 }
@@ -120,7 +129,7 @@ export async function handleListUsers(req: Request, deps: ApiUsersDeps): Promise
 interface CreateUserBody {
   username: string;
   password: string;
-  assignedVault: string | null;
+  assignedVaults: string[];
 }
 
 interface ParseOk {
@@ -198,27 +207,50 @@ async function parseCreateBody(req: Request): Promise<ParseOk | ParseErr> {
       description: `password length must be ≤ ${PASSWORD_MAX_LEN} characters`,
     };
   }
-  // `assigned_vault` is optional — omitted (undefined) or explicit null
-  // both mean "no restriction (admin-level access)." Empty string is
-  // rejected as a confused client send (would otherwise persist as ""
-  // and never resolve in services.json).
-  let assignedVault: string | null = null;
-  if (Object.hasOwn(obj, "assignedVault")) {
-    const v = obj.assignedVault;
-    if (v === null) {
-      assignedVault = null;
-    } else if (typeof v === "string" && v.length > 0) {
-      assignedVault = v;
-    } else if (typeof v !== "undefined") {
-      return {
-        ok: false,
-        status: 400,
-        error: "invalid_request",
-        description: '"assignedVault" must be a non-empty string or null',
-      };
+  // `assigned_vaults` is optional — omitted, explicit null, or empty
+  // array all mean "no vault narrowing." Multi-user Phase 2 PR 2: the
+  // wire shape moved from `assigned_vault: string | null` (single name)
+  // to `assigned_vaults: string[]` (array). We accept both camelCase
+  // `assignedVaults` (current SPA send) and snake_case `assigned_vaults`
+  // (defensive — matches the response wire shape). Empty strings in the
+  // array are rejected; the validation against services.json runs in
+  // the handler.
+  let assignedVaults: string[] = [];
+  const rawVaults =
+    Object.hasOwn(obj, "assignedVaults") && obj.assignedVaults !== undefined
+      ? obj.assignedVaults
+      : Object.hasOwn(obj, "assigned_vaults") && obj.assigned_vaults !== undefined
+        ? obj.assigned_vaults
+        : undefined;
+  if (rawVaults === null || rawVaults === undefined) {
+    assignedVaults = [];
+  } else if (Array.isArray(rawVaults)) {
+    const result: string[] = [];
+    const seen = new Set<string>();
+    for (const v of rawVaults) {
+      if (typeof v !== "string" || v.length === 0) {
+        return {
+          ok: false,
+          status: 400,
+          error: "invalid_request",
+          description: '"assigned_vaults" must be an array of non-empty strings',
+        };
+      }
+      if (!seen.has(v)) {
+        seen.add(v);
+        result.push(v);
+      }
     }
+    assignedVaults = result;
+  } else {
+    return {
+      ok: false,
+      status: 400,
+      error: "invalid_request",
+      description: '"assigned_vaults" must be an array of strings (or omitted / null for none)',
+    };
   }
-  return { ok: true, body: { username, password, assignedVault } };
+  return { ok: true, body: { username, password, assignedVaults } };
 }
 
 /** POST /api/users — create user. */
@@ -235,7 +267,7 @@ export async function handleCreateUser(req: Request, deps: ApiUsersDeps): Promis
   if (!parsed.ok) {
     return jsonError(parsed.status, parsed.error, parsed.description);
   }
-  const { username, password, assignedVault } = parsed.body;
+  const { username, password, assignedVaults } = parsed.body;
 
   // PR 1's username validator — charset + length + reserved-word check.
   const u = validateUsername(username);
@@ -260,34 +292,34 @@ export async function handleCreateUser(req: Request, deps: ApiUsersDeps): Promis
     return jsonError(409, "username_taken", `username "${username}" is already in use`);
   }
 
-  // Validate `assigned_vault` against the live services.json vault list.
-  // A stale name (vault since removed) is rejected at create time per
-  // design §security/`assigned_vault validation`. NULL means "no
-  // restriction" and skips the check.
-  if (assignedVault !== null) {
+  // Validate every `assigned_vaults` entry against the live services.json
+  // vault list. A stale name (vault since removed) is rejected at create
+  // time. Empty list = "no narrowing" and skips the manifest read.
+  if (assignedVaults.length > 0) {
     const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
     const known = new Set(listVaultNamesFromPath(manifestPath));
-    if (!known.has(assignedVault)) {
+    const unknown = assignedVaults.filter((v) => !known.has(v));
+    if (unknown.length > 0) {
       return jsonError(
         400,
         "assigned_vault_not_found",
-        `assigned_vault "${assignedVault}" is not registered in services.json`,
+        `assigned vault(s) ${unknown.map((n) => `"${n}"`).join(", ")} not registered in services.json`,
       );
     }
   }
 
   // Persist. The admin-created path lands `passwordChanged: false` so the
   // user gets force-redirected through `/account/change-password` on
-  // first sign-in (PR 3). The wizard's first-admin path and the env-
-  // seed path both set `passwordChanged: true` explicitly — neither of
-  // those touches this endpoint. `allowMulti: true` because Phase 1 is
-  // the whole point — `createUser`'s single-user guard would otherwise
-  // 500 here once the first admin exists.
+  // first sign-in. The wizard's first-admin path and the env-seed path
+  // both set `passwordChanged: true` explicitly — neither touches this
+  // endpoint. `allowMulti: true` because multi-user is the whole point —
+  // `createUser`'s single-user guard would otherwise 500 once the first
+  // admin exists.
   try {
     const created = await createUser(deps.db, username, password, {
       allowMulti: true,
       passwordChanged: false,
-      assignedVault,
+      assignedVaults,
     });
     return new Response(JSON.stringify({ user: toWire(created) }), {
       status: 201,
@@ -387,6 +419,176 @@ export async function handleListVaults(req: Request, deps: ApiUsersDeps): Promis
   const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
   const vaults = listVaultNamesFromPath(manifestPath);
   return new Response(JSON.stringify({ vaults }), {
+    status: 200,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /api/users/:id/vaults — replace a user's vault assignments
+// ---------------------------------------------------------------------------
+
+interface UpdateVaultsBody {
+  assigned_vaults: string[];
+}
+
+async function parseUpdateVaultsBody(
+  req: Request,
+): Promise<{ ok: true; body: UpdateVaultsBody } | ParseErr> {
+  const ctype = req.headers.get("content-type") ?? "";
+  if (!ctype.toLowerCase().includes("application/json")) {
+    return {
+      ok: false,
+      status: 400,
+      error: "invalid_request",
+      description: "Content-Type must be application/json",
+    };
+  }
+  let raw: unknown;
+  try {
+    raw = await req.json();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      status: 400,
+      error: "invalid_request",
+      description: `invalid JSON body: ${msg}`,
+    };
+  }
+  if (!raw || typeof raw !== "object") {
+    return {
+      ok: false,
+      status: 400,
+      error: "invalid_request",
+      description: "request body must be a JSON object",
+    };
+  }
+  const obj = raw as Record<string, unknown>;
+  // Accept both `assigned_vaults` (snake_case, primary) and
+  // `assignedVaults` (camelCase, defensive) — same shape as parseCreateBody.
+  const rawVaults =
+    Object.hasOwn(obj, "assigned_vaults") && obj.assigned_vaults !== undefined
+      ? obj.assigned_vaults
+      : Object.hasOwn(obj, "assignedVaults") && obj.assignedVaults !== undefined
+        ? obj.assignedVaults
+        : undefined;
+  if (rawVaults === undefined) {
+    return {
+      ok: false,
+      status: 400,
+      error: "invalid_request",
+      description: '"assigned_vaults" is required (array of strings; pass [] to clear)',
+    };
+  }
+  if (!Array.isArray(rawVaults)) {
+    return {
+      ok: false,
+      status: 400,
+      error: "invalid_request",
+      description: '"assigned_vaults" must be an array of strings',
+    };
+  }
+  const seen = new Set<string>();
+  const list: string[] = [];
+  for (const v of rawVaults) {
+    if (typeof v !== "string" || v.length === 0) {
+      return {
+        ok: false,
+        status: 400,
+        error: "invalid_request",
+        description: '"assigned_vaults" entries must be non-empty strings',
+      };
+    }
+    if (!seen.has(v)) {
+      seen.add(v);
+      list.push(v);
+    }
+  }
+  return { ok: true, body: { assigned_vaults: list } };
+}
+
+/**
+ * PATCH /api/users/:id/vaults — replace the user's vault assignments
+ * atomically (multi-user Phase 2 PR 2).
+ *
+ * Body: `{ "assigned_vaults": ["maya", "family"] }`. Pass `[]` to clear
+ * every assignment (the user retains their account but loses every per-
+ * vault grant — no narrowing for admins; "no access" for non-admins).
+ *
+ * Order of checks (mirrors `handleResetUserPassword`):
+ *
+ *   1. Method gate (405 on non-PATCH).
+ *   2. Bearer carries `parachute:host:admin` (401 / 403 via `requireScope`).
+ *   3. Parse body (400 on shape).
+ *   4. Target user exists (404 `not_found`).
+ *   5. Target is NOT the first admin (403 `cannot_edit_first_admin_vaults`)
+ *      — admin posture is unrestricted by design (`isFirstAdmin`); the
+ *      first admin's "vault membership" is implicit and shouldn't be
+ *      mutated. Mirrors the first-admin-undeletable rail.
+ *   6. Every requested vault name is registered in services.json
+ *      (400 `assigned_vault_not_found`).
+ *   7. `setUserVaults` — atomic DELETE+INSERT inside one transaction.
+ *
+ * Response on success: `200 { ok: true, user: <wire shape> }` with the
+ * updated `assigned_vaults` reflected.
+ */
+export async function handleUpdateUserVaults(
+  req: Request,
+  userId: string,
+  deps: ApiUsersDeps,
+): Promise<Response> {
+  if (req.method !== "PATCH") {
+    return jsonError(405, "method_not_allowed", "use PATCH");
+  }
+  try {
+    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+  } catch (err) {
+    return adminAuthErrorResponse(err as AdminAuthError);
+  }
+  const parsed = await parseUpdateVaultsBody(req);
+  if (!parsed.ok) {
+    return jsonError(parsed.status, parsed.error, parsed.description);
+  }
+  const target = getUserById(deps.db, userId);
+  if (!target) {
+    return jsonError(404, "not_found", `no user with id "${userId}"`);
+  }
+  // First-admin protection — admin posture is "unrestricted" by design
+  // (`isFirstAdmin` short-circuits `vaultScopeForUser` to `[]`). Pinning
+  // the first admin to a vault list would muddy that semantic. The SPA
+  // disables this row's button as a UX hint; the server check is
+  // authoritative.
+  if (isFirstAdmin(deps.db, userId)) {
+    return jsonError(
+      403,
+      "cannot_edit_first_admin_vaults",
+      "the first admin's vault membership is unrestricted by design — no vault list to edit",
+    );
+  }
+  // Validate every vault name against the live services.json list.
+  const assignedVaults = parsed.body.assigned_vaults;
+  if (assignedVaults.length > 0) {
+    const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
+    const known = new Set(listVaultNamesFromPath(manifestPath));
+    const unknown = assignedVaults.filter((v) => !known.has(v));
+    if (unknown.length > 0) {
+      return jsonError(
+        400,
+        "assigned_vault_not_found",
+        `assigned vault(s) ${unknown.map((n) => `"${n}"`).join(", ")} not registered in services.json`,
+      );
+    }
+  }
+  const ok = setUserVaults(deps.db, userId, assignedVaults);
+  if (!ok) {
+    return jsonError(404, "not_found", `no user with id "${userId}"`);
+  }
+  console.log(
+    `user vaults updated: id=${userId} username=${target.username} vaults=${assignedVaults.join(",")}`,
+  );
+  const fresh = getUserById(deps.db, userId);
+  return new Response(JSON.stringify({ ok: true, user: fresh ? toWire(fresh) : null }), {
     status: 200,
     headers: { "content-type": "application/json", "cache-control": "no-store" },
   });

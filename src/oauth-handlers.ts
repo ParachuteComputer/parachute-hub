@@ -83,7 +83,7 @@ import {
   findSession,
   parseSessionCookie,
 } from "./sessions.ts";
-import { getUserById, getUserByUsername, verifyPassword } from "./users.ts";
+import { getUserById, getUserByUsername, isFirstAdmin, verifyPassword } from "./users.ts";
 import { listVaultNames } from "./vault-names.ts";
 import { isVaultEntry, shortName, vaultInstanceNameFor } from "./well-known.ts";
 
@@ -114,30 +114,35 @@ function narrowVaultScopes(scopes: string[], pickedVault: string): string[] {
 
 /**
  * Derive the `vault_scope` claim value for a given hub user. Multi-user
- * Phase 1 (design
- * [`2026-05-20-multi-user-phase-1.md`](https://parachute.computer/design/2026-05-20-multi-user-phase-1/),
- * §oauth-claim-shape).
+ * Phase 2 PR 2 (design 2026-05-20-multi-user-phase-1.md §Phase 2 —
+ * many-to-many membership via the `user_vaults` table).
  *
  *   - `userId` resolves to no row → `[]`. Defensive: the caller already
  *     validated the user existed (auth-code redemption / refresh row's
- *     user_id), but a delete-between-mint-and-now race shouldn't 500. Empty
- *     is the safe sentinel — the scope-bearing `scope` claim is still the
- *     gate.
- *   - User exists with `assignedVault === null` → `[]`. Admin / unpinned
- *     posture; the consent picker is the source of truth.
- *   - User exists with `assignedVault === "name"` → `["name"]`. The Phase 1
- *     single-vault pin; PR 5's scope-guard at vault/notes/scribe consumes
- *     this to enforce that an assigned user can't request scope against any
- *     vault other than their assigned one.
+ *     user_id), but a delete-between-mint-and-now race shouldn't 500.
+ *     Empty is the safe sentinel — the scope-bearing `scope` claim is
+ *     still the gate.
+ *   - First admin → `[]`. Admin posture is unrestricted by design (see
+ *     `isFirstAdmin`). The consent picker is the source of truth and
+ *     the scope-guard reads an empty `vault_scope` claim as "no
+ *     narrowing" — first admin can request scope against any vault.
+ *   - Non-admin user → the list of vault names from `user_vaults`. The
+ *     scope-guard at vault/notes/scribe enforces that the user can
+ *     only request scope against vaults in their list (Phase 1 pinned
+ *     to a single vault; Phase 2 lifts that to N). A non-admin with
+ *     zero assignments returns `[]` — distinct semantics from the
+ *     admin's `[]` because the consent picker plus the picked-must-
+ *     match-assignment defense in `handleConsentSubmit` enforces that
+ *     non-admin tokens carry a non-empty `vault_scope`.
  *
  * Always returns an array (never undefined) so the JWT carries the claim
  * unconditionally — readers don't have to distinguish "absent" from "empty."
  */
 export function vaultScopeForUser(db: Database, userId: string): string[] {
+  if (isFirstAdmin(db, userId)) return [];
   const user = getUserById(db, userId);
   if (!user) return [];
-  if (user.assignedVault === null) return [];
-  return [user.assignedVault];
+  return [...user.assignedVaults];
 }
 
 export interface OAuthDeps {
@@ -862,12 +867,20 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     return htmlResponse(renderLogin({ params: parsed, csrfToken: csrf.token }), 200, extra);
   }
 
-  // Multi-user Phase 1: non-admin users (with `assigned_vault !== null`) see
-  // the picker locked to their assigned vault — they can't pick a different
-  // one. Admin users (assigned_vault === null) see the full dropdown.
-  // Defensive null-coalesce: the session points at a deleted user shouldn't
-  // 500; treat as admin posture (the broader scope-validation gate will
-  // catch any actual privilege issue).
+  // Multi-user Phase 2 PR 2: non-admin users see the picker narrowed to
+  // their assigned vault list — they can't pick a vault they don't own.
+  // First admin (admin posture) sees the full dropdown of every vault on
+  // the hub.
+  //
+  // Two shapes for non-admin users emerge:
+  //   - exactly one assigned vault → picker renders locked to that name
+  //     (same shape as Phase 1; smallest diff for the common case).
+  //   - two or more assigned vaults → picker renders a free dropdown
+  //     filtered to those names — user picks one per consent.
+  //
+  // Defensive null-coalesce: the session points at a deleted user
+  // shouldn't 500; treat as admin posture (the broader scope-validation
+  // gate will catch any actual privilege issue).
   //
   // Resolved here (before the fast-paths) because the stale-assignment
   // predicate below — which gates both skip-consent (#75) and same-hub
@@ -876,21 +889,25 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   // closing the silent-mint-on-stale-vault gap; the read is one JSON parse
   // off-disk per /authorize.
   const user = getUserById(db, session.userId);
-  const lockedVault = user?.assignedVault ?? null;
+  const userIsAdmin = isFirstAdmin(db, session.userId);
+  // Non-admin user's assigned vaults; admin posture (or no row) → empty.
+  const assignedVaults: string[] = userIsAdmin ? [] : (user?.assignedVaults ?? []);
   const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
   const vaultNames = listVaultNames(manifest);
 
-  // Stale-assignment predicate (hub#284 reviewer fold). The user has an
-  // `assigned_vault` pinned on their row but the named vault is no longer
-  // in services.json. Both fast-paths below (#75 skip-consent, hub#312
-  // same-hub auto-trust) would otherwise silently mint a token for a vault
-  // that doesn't exist — the user thinks consent succeeded but the
-  // downstream API calls fail with no actionable signal. Fall through to
-  // the consent render in either case so the banner UX (and the disabled
-  // Approve when the requested scope depends on a vault) surfaces the
-  // condition + admin-remediation path. Admin users (`lockedVault === null`)
-  // are never stale.
-  const hasStaleAssignment = lockedVault !== null && !vaultNames.includes(lockedVault);
+  // Stale-assignment predicate (hub#284, generalized in Phase 2 PR 2 from
+  // single-vault to N-vault). For a non-admin user, "stale" means at
+  // least one of their assigned vaults no longer exists in services.json
+  // AND no vault in their list still exists — i.e. they have *zero*
+  // valid vaults to consent against. The banner surfaces this state with
+  // an admin-remediation hint instead of silently minting a token
+  // against a missing vault. If at least one of their vaults still
+  // exists, the consent flow proceeds normally — the missing ones drop
+  // out of the picker without ceremony.
+  //
+  // Admin users are never stale (they aren't pinned to any vault list).
+  const remainingValidVaults = assignedVaults.filter((v) => vaultNames.includes(v));
+  const hasStaleAssignment = assignedVaults.length > 0 && remainingValidVaults.length === 0;
 
   // Skip-consent gate (#75). If the user has previously granted every
   // requested scope to this client, mint the auth code immediately. Two
@@ -952,7 +969,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   }
 
   return htmlResponse(
-    renderConsent(consentProps(client, parsed, vaultNames, csrf.token, lockedVault)),
+    renderConsent(consentProps(client, parsed, vaultNames, csrf.token, assignedVaults)),
     200,
     extra,
   );
@@ -1140,18 +1157,18 @@ async function handleConsentSubmit(
       params.state,
     );
   }
-  // Multi-user Phase 1 (design 2026-05-20-multi-user-phase-1.md): non-admin
-  // users (`assigned_vault !== null`) are pinned to a single vault. The
-  // consent screen renders the picker locked to that vault and any named
-  // scopes (`vault:<name>:<verb>`) requested by the client must match. The
-  // server-side defense here refuses any mint where the user's submission
-  // disagrees — Aaron pinned this as "server-side defense refuses mints
-  // whose picked vault disagrees with assigned_vault" rather than silent
-  // overwrite, so a hand-crafted POST or a misbehaving SPA can't bypass the
-  // lock. Admin users (`assigned_vault === null`) keep the existing picker-
-  // as-source-of-truth behavior.
+  // Multi-user Phase 2 PR 2: non-admin users are pinned to a list of one
+  // or more vaults via `user_vaults`. The consent screen renders the
+  // picker narrowed to that list and any named scopes (`vault:<name>:
+  // <verb>`) requested by the client must target a vault in the list.
+  // The server-side defense here refuses any mint where the user's
+  // submission disagrees, so a hand-crafted POST or a misbehaving SPA
+  // can't bypass the narrowing. First admin (admin posture) keeps the
+  // existing picker-as-source-of-truth behavior (empty `assignedVaults`).
+  const userIsAdmin = isFirstAdmin(db, session.userId);
   const sessionUser = getUserById(db, session.userId);
-  const assignedVault = sessionUser?.assignedVault ?? null;
+  const assignedVaults: string[] = userIsAdmin ? [] : (sessionUser?.assignedVaults ?? []);
+  const isPinned = assignedVaults.length > 0;
 
   // Vault picker (Q1 of the vault-config-and-scopes design): an unnamed
   // `vault:<verb>` scope is ambiguous about which vault it grants access to.
@@ -1171,24 +1188,17 @@ async function handleConsentSubmit(
     const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
     const validNames = listVaultNames(manifest);
     if (!validNames.includes(pickedVault)) {
-      // Stale-assignment branch (hub#284). Surfaced during hub#283
-      // reviewer pass — the pre-rc.11 path 400'd with the generic
-      // "Unknown vault" copy when a user whose assigned_vault was
-      // removed by the admin landed back on consent and submitted the
-      // stale name. The locked picker rendered the missing name, the
-      // form posted it, the user saw "vault X is not registered" and
-      // had no path forward. The new copy names the actual condition
-      // (assignment removed) and points at the admin remediation
-      // surface (/admin/users) instead of leaving the user wondering
-      // whether hub itself is broken.
+      // Stale-assignment branch (hub#284, generalized Phase 2 PR 2). The
+      // user is consenting via an assignment that points at a vault no
+      // longer in services.json. The new copy names the actual condition
+      // (assignment removed) and points at the admin remediation surface.
       //
-      // The check fires only when the user's `assigned_vault` claim
-      // matches the picked vault — narrows the special-case to the
-      // "user is consenting via their locked assignment that's now
-      // stale" shape rather than swallowing every Unknown-vault. A
-      // hand-crafted POST naming a never-existed vault still hits the
-      // generic branch.
-      if (assignedVault !== null && pickedVault === assignedVault) {
+      // The check fires when the picked vault is in the user's assigned
+      // list — narrows the special-case to the "user is consenting via
+      // a now-stale assignment" shape rather than swallowing every
+      // Unknown-vault. A hand-crafted POST naming a never-existed vault
+      // still hits the generic branch.
+      if (isPinned && assignedVaults.includes(pickedVault)) {
         return htmlError(
           "Assigned vault was removed",
           `Your assigned vault "${pickedVault}" is no longer registered on this hub. Ask the hub admin to reassign you to an existing vault via /admin/users, then try again.`,
@@ -1201,16 +1211,16 @@ async function handleConsentSubmit(
         400,
       );
     }
-    // Server-side defense: non-admin user submitted a vault that disagrees
-    // with their `assigned_vault`. The picker rendered as locked, so a UI-
-    // path user couldn't reach this — but a hand-crafted form bypassing the
-    // locked input lands here. Refuse the mint instead of silently
-    // overwriting; the explicit error tells the operator the assignment is
-    // load-bearing.
-    if (assignedVault !== null && pickedVault !== assignedVault) {
+    // Server-side defense: non-admin user submitted a vault that's not in
+    // their assigned list. The picker rendered as narrowed, so a UI-path
+    // user couldn't reach this — but a hand-crafted form bypassing the
+    // narrowed input lands here. Refuse the mint instead of silently
+    // overwriting; the explicit error tells the operator the assignment
+    // is load-bearing.
+    if (isPinned && !assignedVaults.includes(pickedVault)) {
       return htmlError(
         "Vault assignment mismatch",
-        `vault_scope_mismatch: the picked vault "${pickedVault}" does not match your vault assignment. Ask the hub admin to update your assignment, or pick the vault shown on the consent screen.`,
+        `vault_scope_mismatch: the picked vault "${pickedVault}" is not in your vault assignment. Ask the hub admin to update your assignment, or pick a vault shown on the consent screen.`,
         400,
       );
     }
@@ -1218,12 +1228,12 @@ async function handleConsentSubmit(
   }
 
   // Server-side defense for named-vault scopes (`vault:<name>:<verb>`) too.
-  // A non-admin user can't request scope against any vault other than their
-  // assigned one — same invariant as the picker check above, applied to
-  // scopes that arrived already-named (e.g. a client that knows the user's
-  // vault and asked for `vault:bob:read` directly). Admins (assigned_vault
-  // null) skip this check.
-  if (assignedVault !== null) {
+  // A non-admin user can't request scope against any vault outside their
+  // assignment list — same invariant as the picker check above, applied
+  // to scopes that arrived already-named (e.g. a client that knows the
+  // user's vault and asked for `vault:bob:read` directly). Admin posture
+  // (`isPinned === false`) skips this check.
+  if (isPinned) {
     const mismatched: string[] = [];
     for (const s of scopes) {
       const parts = s.split(":");
@@ -1233,7 +1243,7 @@ async function handleConsentSubmit(
         parts[1] &&
         parts[2] &&
         VAULT_VERBS.has(parts[2]) &&
-        parts[1] !== assignedVault
+        !assignedVaults.includes(parts[1])
       ) {
         mismatched.push(s);
       }
@@ -1241,29 +1251,29 @@ async function handleConsentSubmit(
     if (mismatched.length > 0) {
       return htmlError(
         "Vault assignment mismatch",
-        `vault_scope_mismatch: requested scopes ${mismatched.join(", ")} target a vault other than your vault assignment.`,
+        `vault_scope_mismatch: requested scopes ${mismatched.join(", ")} target a vault outside your assignment.`,
         400,
       );
     }
 
-    // Stale-assignment defense (hub#284) for named-vault scopes. A scope
-    // shaped `vault:<assigned>:<verb>` passes the mismatch check above but
-    // points at a vault that no longer exists in services.json. Minting a
-    // token here would silently issue scope against a vault the resource
-    // server can't find — the user thinks consent succeeded but the
-    // subsequent API calls fail with no actionable signal. Refuse the mint
-    // and surface the same admin-remediation hint the GET path's banner
-    // uses, so the picker-bypass POST and the natural form-render arrive at
-    // the same recovery story.
+    // Stale-assignment defense (hub#284, generalized Phase 2 PR 2). A
+    // named scope shaped `vault:<assigned>:<verb>` passes the mismatch
+    // check above but points at a vault that no longer exists in
+    // services.json. Minting a token here would silently issue scope
+    // against a vault the resource server can't find — the user thinks
+    // consent succeeded but the subsequent API calls fail with no
+    // actionable signal. Refuse the mint and surface the same admin-
+    // remediation hint the GET path's banner uses.
     const namedStaleScopes: string[] = [];
     for (const s of scopes) {
       const parts = s.split(":");
       if (
         parts.length === 3 &&
         parts[0] === "vault" &&
-        parts[1] === assignedVault &&
+        parts[1] !== undefined &&
         parts[2] &&
-        VAULT_VERBS.has(parts[2])
+        VAULT_VERBS.has(parts[2]) &&
+        assignedVaults.includes(parts[1])
       ) {
         namedStaleScopes.push(s);
       }
@@ -1273,10 +1283,19 @@ async function handleConsentSubmit(
       // the no-vault-scope hot path off-disk for the common admin flows.
       const manifest = (deps.loadServicesManifest ?? readServicesManifest)();
       const validNames = listVaultNames(manifest);
-      if (!validNames.includes(assignedVault)) {
+      // Collect the stale vault names embedded in the named scopes.
+      const staleNames = new Set<string>();
+      for (const s of namedStaleScopes) {
+        const parts = s.split(":");
+        if (parts[1] !== undefined && !validNames.includes(parts[1])) {
+          staleNames.add(parts[1]);
+        }
+      }
+      if (staleNames.size > 0) {
+        const exemplar = [...staleNames][0];
         return htmlError(
           "Assigned vault was removed",
-          `Your assigned vault "${assignedVault}" is no longer registered on this hub. Ask the hub admin to reassign you to an existing vault via /admin/users, then try again.`,
+          `Your assigned vault "${exemplar}" is no longer registered on this hub. Ask the hub admin to reassign you to an existing vault via /admin/users, then try again.`,
           400,
         );
       }
@@ -1421,10 +1440,7 @@ export async function handleApproveClientPost(
       );
     }
     target.searchParams.set("error", "access_denied");
-    target.searchParams.set(
-      "error_description",
-      "The user denied the authorization request.",
-    );
+    target.searchParams.set("error_description", "The user denied the authorization request.");
     if (denyState !== undefined) target.searchParams.set("state", denyState);
     return redirectResponse(target.toString());
   }
@@ -2156,95 +2172,101 @@ function consentProps(
   params: AuthorizeFormParams,
   vaultNames: string[],
   csrfToken: string,
-  lockedVault: string | null,
+  assignedVaults: readonly string[],
 ) {
   const scopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(scopes);
-  // Multi-user Phase 1, stale-assignment branch (hub#284). The user has an
-  // `assigned_vault` pinned on their row but the named vault is no longer
-  // in services.json — admin removed / renamed it without reassigning the
-  // user. Pre-hub#284 this fell through to the locked picker, posted the
-  // stale name, and `handleConsentSubmit` rejected it with a generic
-  // "Unknown vault" 400. The user couldn't tell what happened or how to
-  // recover.
+  // Multi-user Phase 2 PR 2 stale-assignment branch (hub#284 generalized
+  // from one vault to N). A non-admin user whose entire vault list has
+  // been removed from services.json — admin removed / renamed the vaults
+  // without reassigning. The banner surfaces this state with an admin-
+  // remediation hint instead of silently minting against a missing vault.
   //
-  // Detect it here and surface the banner on the consent screen explaining
-  // the state and pointing at admin remediation. The banner is informational
-  // for non-vault-scoped flows (the user can still consent to e.g.
-  // `scribe:transcribe` without a working vault assignment), but the picker
-  // section + Approve button are gated when the requested scope actually
-  // depends on a vault — see the `vaultPicker` + `approveDisabled` logic
-  // below.
+  // The user-facing surface is "your assigned vault(s) were removed" —
+  // the banner names the first stale vault as the canonical example. The
+  // exact list is unimportant for the recovery path (operator goes to
+  // /admin/users either way), and pluralizing the banner copy doesn't
+  // change the action.
   //
-  // Security posture: we deliberately do NOT relax the picked-must-match-
-  // assigned check or let the user pick any other vault. Doing so would
-  // let assignment-binding be circumvented by getting an admin to remove
-  // the assigned vault. Stale-assignment is an admin-remediated state.
+  // Security posture: we deliberately do NOT relax the picked-must-be-in-
+  // assigned-list check. Stale-assignment is admin-remediated.
+  const remainingValidAssigned = assignedVaults.filter((v) => vaultNames.includes(v));
+  const hasStaleAssignment = assignedVaults.length > 0 && remainingValidAssigned.length === 0;
   const staleAssignedVault =
-    lockedVault !== null && !vaultNames.includes(lockedVault) ? lockedVault : undefined;
-  // A named scope like `vault:<old>:read` requested by the client where
-  // <old> is the user's stale assigned_vault. The server-side named-scope
-  // defense (`handleConsentSubmit`) allows this through because the scope
-  // matches `assignedVault`, but the token it mints would point at a vault
-  // that doesn't exist. Gate Approve on this case too so the user doesn't
-  // burn a consent into a token that fails at the resource server.
+    hasStaleAssignment && assignedVaults[0] !== undefined ? assignedVaults[0] : undefined;
+  // A named scope like `vault:<old>:<verb>` requested by the client where
+  // <old> is one of the user's stale vaults. The server-side named-scope
+  // defense allows this through because the scope matches an assigned
+  // vault, but the token it mints would point at a vault that no longer
+  // exists. Gate Approve on this case too so the user doesn't burn a
+  // consent into a token that fails at the resource server.
   const hasNamedStaleVaultScope =
-    staleAssignedVault !== undefined &&
+    hasStaleAssignment &&
     scopes.some((s) => {
       const parts = s.split(":");
-      return (
-        parts.length === 3 &&
-        parts[0] === "vault" &&
-        parts[1] === staleAssignedVault &&
-        parts[2] !== undefined &&
-        VAULT_VERBS.has(parts[2])
-      );
+      if (
+        parts.length !== 3 ||
+        parts[0] !== "vault" ||
+        parts[1] === undefined ||
+        parts[2] === undefined ||
+        !VAULT_VERBS.has(parts[2])
+      ) {
+        return false;
+      }
+      // Named for one of the user's vaults — and given hasStaleAssignment,
+      // none of the user's vaults exist on this hub, so this scope points
+      // at a stale name.
+      return assignedVaults.includes(parts[1]);
     });
 
-  // Multi-user Phase 1 (design 2026-05-20-multi-user-phase-1.md, decision-pin
-  // "consent picker for non-admin users"): non-admin users (assigned_vault
-  // non-null) see the picker locked to their `assigned_vault` rather than a
-  // free dropdown. Phase 2 will hide other vaults entirely; Phase 1 ships
-  // lock-the-picker (the smallest diff that satisfies "user can't pick a
-  // vault they don't own"). Server-side defense in `handleConsentSubmit`
-  // refuses mints whose POST disagrees regardless of how the picker is
-  // rendered.
+  // Multi-user Phase 2 PR 2: non-admin users see the picker narrowed to
+  // their assigned vault list. Three shapes emerge:
   //
-  // Stale-assignment shape (hub#284): when the user's assigned_vault no
-  // longer exists, the picker renders as no-vaults-available rather than
-  // locking onto a missing name — the banner above the scope list explains
-  // why and the disabled Approve prevents a form submit that would fail
-  // server-side anyway.
+  //   - Single assigned vault (still valid) → render locked to that name
+  //     (same shape as Phase 1).
+  //   - Two-or-more assigned vaults → render a dropdown filtered to the
+  //     user's list. Same control as the admin dropdown but narrowed.
+  //   - Stale-assigned (all vaults gone) → render no-vaults-available so
+  //     the form gracefully rejects an Approve click instead of silently
+  //     submitting a missing name.
+  //
+  // Admin users (empty `assignedVaults`) see the full hub-wide dropdown.
   let vaultPicker: VaultPickerProps | undefined;
   if (unnamedVerbs.length > 0) {
-    if (staleAssignedVault !== undefined) {
+    if (hasStaleAssignment) {
       vaultPicker = { unnamedVerbs, availableVaults: [] };
-    } else if (lockedVault !== null) {
-      vaultPicker = { unnamedVerbs, availableVaults: vaultNames, lockedVault };
+    } else if (remainingValidAssigned.length === 1) {
+      const only = remainingValidAssigned[0];
+      if (only !== undefined) {
+        vaultPicker = { unnamedVerbs, availableVaults: [only], lockedVault: only };
+      }
+    } else if (remainingValidAssigned.length > 1) {
+      vaultPicker = { unnamedVerbs, availableVaults: remainingValidAssigned };
     } else {
+      // Admin posture (no assignments) → full hub-wide list.
       vaultPicker = { unnamedVerbs, availableVaults: vaultNames };
     }
   }
   // Named-scope display: substitute unnamed `vault:<verb>` rows with the
   // resolved form the operator will actually consent to.
-  //   - Non-admin (lockedVault set, NOT stale) → render `vault:<lockedVault>:<verb>`.
-  //   - Stale-assigned (hub#284) → null; the scope row carries the
-  //     `<TBD>` placeholder. The banner explains why a name isn't bound.
-  //   - Admin with exactly one vault available → render that vault's name;
-  //     the picker pre-checks it and a default-Approve mints scope against
-  //     it, so the displayed scope matches the next state of the form.
-  //   - Admin with multiple vaults / no vaults → null sentinel; render with
-  //     a `<TBD>` placeholder + a hint pointing at the picker. Once the
-  //     operator clicks a radio the JS-free form still posts the chosen
-  //     name; the displayed scope only changes after the next page render.
+  //   - Non-admin with exactly one valid assigned vault → render that name.
+  //   - Stale-assigned → null; the row carries the `<TBD>` placeholder.
+  //     The banner explains why a name isn't bound.
+  //   - Non-admin with multiple assigned vaults → null sentinel (the user
+  //     hasn't picked yet).
+  //   - Admin with exactly one vault available → render that name.
+  //   - Admin with multiple / no vaults → null sentinel.
   let displayVault: string | null = null;
-  if (staleAssignedVault === undefined && lockedVault !== null) {
-    displayVault = lockedVault;
+  if (!hasStaleAssignment && remainingValidAssigned.length === 1) {
+    const only = remainingValidAssigned[0];
+    if (only !== undefined) displayVault = only;
   } else if (
-    staleAssignedVault === undefined &&
+    !hasStaleAssignment &&
+    assignedVaults.length === 0 &&
     unnamedVerbs.length > 0 &&
     vaultNames.length === 1
   ) {
+    // Admin with a single vault on the hub: pre-check pattern from Phase 1.
     const only = vaultNames[0];
     if (only) displayVault = only;
   }

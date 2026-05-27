@@ -215,7 +215,13 @@ describe("deriveWizardState", () => {
       writeManifest(
         {
           services: [
-            { name: "parachute-vault", version: "0.1.0", port: 1940, paths: ["/vault/default"], health: "/health" },
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
           ],
         },
         h.manifestPath,
@@ -636,11 +642,11 @@ describe("handleSetupAccountPost", () => {
       expect(userCount(db)).toBe(1);
       // Multi-user Phase 1: the wizard's first admin chose their password
       // via this very form, so skip the force-change-password redirect on
-      // first sign-in (`password_changed=1`). `assigned_vault` stays NULL
-      // — admin posture (no per-vault restriction).
+      // first sign-in (`password_changed=1`). `assignedVaults` stays empty
+      // — admin posture (no per-vault restriction; Phase 2 PR 2 array shape).
       const created = getUserByUsername(db, "ops");
       expect(created?.passwordChanged).toBe(true);
-      expect(created?.assignedVault).toBeNull();
+      expect(created?.assignedVaults).toEqual([]);
     } finally {
       db.close();
     }
@@ -3142,7 +3148,9 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
 
 describe("detectAutoExposeMode — Render env detection edge cases (hub#407 nit)", () => {
   test("returns 'public' for a real https Render URL", () => {
-    expect(detectAutoExposeMode({ RENDER_EXTERNAL_URL: "https://parachute-hub.onrender.com" })).toBe("public");
+    expect(
+      detectAutoExposeMode({ RENDER_EXTERNAL_URL: "https://parachute-hub.onrender.com" }),
+    ).toBe("public");
   });
 
   test("returns 'public' for an http:// URL (defensive — if Render ever emits one)", () => {

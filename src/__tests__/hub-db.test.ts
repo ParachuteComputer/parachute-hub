@@ -151,7 +151,7 @@ describe("openHubDb + migrate", () => {
     }
   });
 
-  test("v8 adds password_changed + assigned_vault columns on a fresh DB", () => {
+  test("v8 added password_changed column (still present at v10)", () => {
     const h = makeHarness();
     try {
       const db = openHubDb(h.dbPath);
@@ -160,8 +160,9 @@ describe("openHubDb + migrate", () => {
           db.query<{ version: number }, []>("SELECT version FROM schema_version").all() ?? []
         ).map((r) => r.version);
         expect(versions).toContain(8);
-        // PRAGMA table_info returns the column shape; we want both new
-        // columns present with the right defaults / nullability.
+        // PRAGMA table_info returns the column shape; password_changed
+        // should still be on users at v10 (only assigned_vault was
+        // dropped in v10's recreate).
         interface ColInfo {
           name: string;
           type: string;
@@ -180,10 +181,8 @@ describe("openHubDb + migrate", () => {
         expect(pc?.notnull).toBe(1);
         // Default literal — SQLite returns it as a string "0".
         expect(pc?.dflt_value).toBe("0");
-        const av = byName.get("assigned_vault");
-        expect(av).toBeDefined();
-        expect(av?.type).toBe("TEXT");
-        expect(av?.notnull).toBe(0);
+        // v10 dropped assigned_vault — verify the column is gone.
+        expect(byName.has("assigned_vault")).toBe(false);
       } finally {
         db.close();
       }
@@ -195,21 +194,13 @@ describe("openHubDb + migrate", () => {
   test("v8 backfills password_changed=1 for users that pre-date the migration", () => {
     const h = makeHarness();
     try {
-      // Stand up a DB at the v7 state by partially-applying migrations:
-      // open Database directly, call migrate after stripping the v8 entry
-      // would be invasive. Instead, drive the same migration shape by hand
-      // for v1-v7 then insert a row, then call migrate() to apply v8.
-      // Cleanest path: openHubDb runs everything, but we want a v7 snapshot.
-      // Approach: open with openHubDb (runs all migrations), drop the v8
-      // changes, mark v8 unapplied, insert a user with password_changed=0
-      // (simulating a row from before the backfill), then re-run migrate.
-      // SQLite doesn't have DROP COLUMN pre-3.35 universally, so we do the
-      // recreate-and-rename: drop v8's columns by recreating users without
-      // them, then delete the v8 schema_version row, then call migrate().
+      // Stand up a DB at the v7 state by recreating the users table
+      // without the v8/v10 columns and re-running migrate().
       const db = openHubDb(h.dbPath);
       try {
         // Build a v7-shape users table and copy the v8-shape rows.
         db.exec(`
+          DROP TABLE IF EXISTS user_vaults;
           CREATE TABLE users_v7 (
             id TEXT PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
@@ -222,26 +213,26 @@ describe("openHubDb + migrate", () => {
           DROP TABLE users;
           ALTER TABLE users_v7 RENAME TO users;
         `);
-        db.exec("DELETE FROM schema_version WHERE version = 8");
+        db.exec("DELETE FROM schema_version WHERE version IN (8, 10)");
         // Insert a row that pre-dates v8 (no password_changed column yet).
         db.prepare(
           `INSERT INTO users (id, username, password_hash, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?)`,
         ).run("legacy-user", "owner", "h", "2026-01-01", "2026-01-01");
-        // Now re-run migrations — v8 should ALTER the table and backfill.
+        // Now re-run migrations — v8 + v10 apply.
         migrate(db);
         const row = db
-          .query<{ password_changed: number; assigned_vault: string | null }, [string]>(
-            "SELECT password_changed, assigned_vault FROM users WHERE id = ?",
+          .query<{ password_changed: number }, [string]>(
+            "SELECT password_changed FROM users WHERE id = ?",
           )
           .get("legacy-user");
         expect(row).not.toBeNull();
         expect(row?.password_changed).toBe(1);
-        expect(row?.assigned_vault).toBeNull();
         const versions = (
           db.query<{ version: number }, []>("SELECT version FROM schema_version").all() ?? []
         ).map((r) => r.version);
         expect(versions).toContain(8);
+        expect(versions).toContain(10);
       } finally {
         db.close();
       }
@@ -250,24 +241,198 @@ describe("openHubDb + migrate", () => {
     }
   });
 
-  test("v8 — fresh inserts default password_changed=0 and assigned_vault NULL", () => {
+  test("v8 — fresh inserts default password_changed=0 (v10 dropped assigned_vault)", () => {
     const h = makeHarness();
     try {
       const db = openHubDb(h.dbPath);
       try {
-        // Insert via the bare-columns SQL (mirrors what a pre-v8 caller
-        // would emit) to confirm the column DEFAULTs work.
+        // Insert via the bare-columns SQL to confirm the column DEFAULTs work.
         db.prepare(
           `INSERT INTO users (id, username, password_hash, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?)`,
         ).run("u-default", "owner", "h", "2026-01-01", "2026-01-01");
         const row = db
-          .query<{ password_changed: number; assigned_vault: string | null }, [string]>(
-            "SELECT password_changed, assigned_vault FROM users WHERE id = ?",
+          .query<{ password_changed: number }, [string]>(
+            "SELECT password_changed FROM users WHERE id = ?",
           )
           .get("u-default");
         expect(row?.password_changed).toBe(0);
-        expect(row?.assigned_vault).toBeNull();
+        // user_vaults table is empty for a default insert.
+        const vaultCount = db
+          .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM user_vaults WHERE user_id = ?")
+          .get("u-default");
+        expect(vaultCount?.n).toBe(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // v10 — user_vaults many-to-many membership (multi-user Phase 2 PR 2)
+  // ---------------------------------------------------------------------------
+
+  test("v10 creates user_vaults table with the expected shape", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        const versions = (
+          db.query<{ version: number }, []>("SELECT version FROM schema_version").all() ?? []
+        ).map((r) => r.version);
+        expect(versions).toContain(10);
+        const tables = (
+          db
+            .query<{ name: string }, []>(
+              "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            )
+            .all() ?? []
+        ).map((r) => r.name);
+        expect(tables).toContain("user_vaults");
+        interface ColInfo {
+          name: string;
+          type: string;
+          notnull: number;
+          dflt_value: string | null;
+        }
+        const cols = db
+          .query<ColInfo, []>(
+            "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('user_vaults')",
+          )
+          .all();
+        const names = cols.map((c) => c.name);
+        expect(names).toContain("user_id");
+        expect(names).toContain("vault_name");
+        expect(names).toContain("role");
+        expect(names).toContain("created_at");
+        const role = cols.find((c) => c.name === "role");
+        expect(role?.notnull).toBe(1);
+        // SQLite represents the default literal verbatim — `'write'`.
+        expect(role?.dflt_value).toBe("'write'");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("v10 backfills user_vaults from v9 assigned_vault column", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        // Rebuild a v9-shape users table (with assigned_vault column),
+        // mark v10 unapplied, drop user_vaults, populate fixture rows,
+        // then re-run migrate to apply v10's backfill.
+        db.exec(`
+          DROP TABLE IF EXISTS user_vaults;
+          CREATE TABLE users_v9 (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            password_changed INTEGER NOT NULL DEFAULT 0,
+            assigned_vault TEXT
+          );
+          INSERT INTO users_v9 (id, username, password_hash, created_at, updated_at, password_changed, assigned_vault)
+          VALUES
+            ('u-admin', 'admin', 'h', '2026-01-01', '2026-01-01', 1, NULL),
+            ('u-alice', 'alice', 'h', '2026-01-02', '2026-01-02', 1, 'personal'),
+            ('u-bob',   'bob',   'h', '2026-01-03', '2026-01-03', 1, 'family');
+          DROP TABLE users;
+          ALTER TABLE users_v9 RENAME TO users;
+        `);
+        db.exec("DELETE FROM schema_version WHERE version = 10");
+        migrate(db);
+        // Expect 2 rows in user_vaults (admin had NULL → no row).
+        const rows = db
+          .query<{ user_id: string; vault_name: string; role: string }, []>(
+            "SELECT user_id, vault_name, role FROM user_vaults ORDER BY user_id ASC",
+          )
+          .all();
+        expect(rows.length).toBe(2);
+        expect(rows[0]).toMatchObject({
+          user_id: "u-alice",
+          vault_name: "personal",
+          role: "write",
+        });
+        expect(rows[1]).toMatchObject({ user_id: "u-bob", vault_name: "family", role: "write" });
+        // No row for the admin.
+        const adminRows = db
+          .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM user_vaults WHERE user_id = ?")
+          .get("u-admin");
+        expect(adminRows?.n).toBe(0);
+        // assigned_vault column should be gone.
+        interface ColInfo {
+          name: string;
+        }
+        const cols = db.query<ColInfo, []>("SELECT name FROM pragma_table_info('users')").all();
+        expect(cols.map((c) => c.name)).not.toContain("assigned_vault");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("v10 FK cascade: deleting a user drops their user_vaults rows", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        const stamp = "2026-05-27T00:00:00.000Z";
+        db.prepare(
+          "INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed) VALUES (?, ?, ?, ?, ?, ?)",
+        ).run("u1", "alice", "h", stamp, stamp, 1);
+        db.prepare(
+          "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, ?, ?)",
+        ).run("u1", "personal", "write", stamp);
+        db.prepare(
+          "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, ?, ?)",
+        ).run("u1", "family", "write", stamp);
+        // sanity
+        const before = db
+          .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM user_vaults WHERE user_id = ?")
+          .get("u1");
+        expect(before?.n).toBe(2);
+        // Delete the user — ON DELETE CASCADE should drop the user_vaults rows.
+        db.prepare("DELETE FROM users WHERE id = ?").run("u1");
+        const after = db
+          .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM user_vaults WHERE user_id = ?")
+          .get("u1");
+        expect(after?.n).toBe(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("v10 (user_id, vault_name) PRIMARY KEY blocks duplicate (user, vault) pairs", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        const stamp = "2026-05-27T00:00:00.000Z";
+        db.prepare(
+          "INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed) VALUES (?, ?, ?, ?, ?, ?)",
+        ).run("u1", "alice", "h", stamp, stamp, 1);
+        db.prepare(
+          "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, ?, ?)",
+        ).run("u1", "personal", "write", stamp);
+        expect(() =>
+          db
+            .prepare(
+              "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, ?, ?)",
+            )
+            .run("u1", "personal", "write", stamp),
+        ).toThrow();
       } finally {
         db.close();
       }

@@ -492,7 +492,7 @@ export function handleAccountHomeGet(req: Request, deps: AccountHomeDeps): Respo
   return htmlResponse(
     renderAccountHome({
       username: user.username,
-      assignedVault: user.assignedVault,
+      assignedVaults: user.assignedVaults,
       passwordChanged: user.passwordChanged,
       hubOrigin: deps.hubOrigin,
       isFirstAdmin: adminFlag,

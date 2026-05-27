@@ -31,6 +31,7 @@ import {
   handleListUsers,
   handleListVaults,
   handleResetUserPassword,
+  handleUpdateUserVaults,
 } from "../api-users.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { findTokenRowByJti, recordTokenMint, signAccessToken } from "../jwt-sign.ts";
@@ -176,7 +177,7 @@ describe("handleListUsers", () => {
       expect(u).toHaveProperty("id");
       expect(u).toHaveProperty("username");
       expect(u).toHaveProperty("password_changed");
-      expect(u).toHaveProperty("assigned_vault");
+      expect(u).toHaveProperty("assigned_vaults");
       expect(u).toHaveProperty("created_at");
     }
   });
@@ -220,13 +221,13 @@ describe("handleCreateUser", () => {
     const res = await post(bearer, {
       username: "alice",
       password: "alice-strong-passphrase",
-      assignedVault: null,
+      assignedVaults: [],
     });
     expect(res.status).toBe(201);
     const body = (await res.json()) as { user: Record<string, unknown> };
     expect(body.user.username).toBe("alice");
     expect(body.user.password_changed).toBe(false);
-    expect(body.user.assigned_vault).toBeNull();
+    expect(body.user.assigned_vaults).toEqual([]);
     expect(body.user).not.toHaveProperty("password_hash");
   });
 
@@ -331,9 +332,9 @@ describe("handleCreateUser", () => {
     const stamp = "2026-05-20T00:00:00.000Z";
     harness.db
       .prepare(
-        "INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed, assigned_vault) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at, password_changed) VALUES (?, ?, ?, ?, ?, ?)",
       )
-      .run("legacy-id", "Alice", "$argon2id$fake", stamp, stamp, 1, null);
+      .run("legacy-id", "Alice", "$argon2id$fake", stamp, stamp, 1);
     const { bearer } = await makeAdminBearer();
     const res = await post(bearer, {
       username: "alice",
@@ -349,25 +350,55 @@ describe("handleCreateUser", () => {
     const res = await post(bearer, {
       username: "alice",
       password: "alice-strong-passphrase",
-      assignedVault: "ghost-vault",
+      assignedVaults: ["ghost-vault"],
     });
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("assigned_vault_not_found");
   });
 
-  test("happy path with assigned_vault that exists in services.json", async () => {
+  test("happy path with single assigned_vaults that exists in services.json", async () => {
     harness.cleanup();
     harness = makeHarness(manifestWithVaults("home"));
     const { bearer } = await makeAdminBearer();
     const res = await post(bearer, {
       username: "alice",
       password: "alice-strong-passphrase",
-      assignedVault: "home",
+      assignedVaults: ["home"],
     });
     expect(res.status).toBe(201);
     const body = (await res.json()) as { user: Record<string, unknown> };
-    expect(body.user.assigned_vault).toBe("home");
+    expect(body.user.assigned_vaults).toEqual(["home"]);
+  });
+
+  test("happy path with multiple assigned_vaults (Phase 2 PR 2)", async () => {
+    harness.cleanup();
+    harness = makeHarness(manifestWithVaults("personal", "family"));
+    const { bearer } = await makeAdminBearer();
+    const res = await post(bearer, {
+      username: "alice",
+      password: "alice-strong-passphrase",
+      assignedVaults: ["personal", "family"],
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { user: Record<string, unknown> };
+    const list = body.user.assigned_vaults as string[];
+    expect(new Set(list)).toEqual(new Set(["personal", "family"]));
+  });
+
+  test("400 assigned_vault_not_found when ANY vault in the array is unknown", async () => {
+    harness.cleanup();
+    harness = makeHarness(manifestWithVaults("home"));
+    const { bearer } = await makeAdminBearer();
+    const res = await post(bearer, {
+      username: "alice",
+      password: "alice-strong-passphrase",
+      assignedVaults: ["home", "ghost"],
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("assigned_vault_not_found");
+    expect(body.error_description).toContain("ghost");
   });
 });
 
@@ -708,5 +739,132 @@ describe("handleListVaults", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { vaults: string[] };
     expect(body.vaults).toEqual(["home", "scratch", "work"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /api/users/:id/vaults — edit vault assignments (Phase 2 PR 2)
+// ---------------------------------------------------------------------------
+
+describe("handleUpdateUserVaults", () => {
+  async function patch(
+    bearer: string,
+    userId: string,
+    body: Record<string, unknown> | string,
+    headers: Record<string, string> = {},
+  ): Promise<Response> {
+    const init: RequestInit = {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${bearer}`,
+        ...headers,
+      },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    };
+    return await handleUpdateUserVaults(req(`/api/users/${userId}/vaults`, init), userId, deps());
+  }
+
+  test("401 with no Authorization header", async () => {
+    const res = await handleUpdateUserVaults(
+      req("/api/users/some-id/vaults", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ assigned_vaults: [] }),
+      }),
+      "some-id",
+      deps(),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("405 on non-PATCH", async () => {
+    const { bearer } = await makeAdminBearer();
+    const res = await handleUpdateUserVaults(
+      withBearer("/api/users/x/vaults", bearer, { method: "POST" }),
+      "x",
+      deps(),
+    );
+    expect(res.status).toBe(405);
+  });
+
+  test("404 when target user does not exist", async () => {
+    const { bearer } = await makeAdminBearer();
+    const res = await patch(bearer, "no-such-id", { assigned_vaults: [] });
+    expect(res.status).toBe(404);
+  });
+
+  test("403 cannot_edit_first_admin_vaults for the first admin", async () => {
+    // The bearer-minting helper creates the first admin already; mint
+    // again returns the same admin's id.
+    const { bearer, userId } = await makeAdminBearer();
+    const res = await patch(bearer, userId, { assigned_vaults: ["home"] });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("cannot_edit_first_admin_vaults");
+  });
+
+  test("400 when assigned_vaults is missing", async () => {
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+    });
+    const res = await patch(bearer, friend.id, {});
+    expect(res.status).toBe(400);
+  });
+
+  test("400 when assigned_vaults entry is not a string", async () => {
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+    });
+    const res = await patch(bearer, friend.id, { assigned_vaults: ["ok", 7] });
+    expect(res.status).toBe(400);
+  });
+
+  test("400 assigned_vault_not_found when a vault doesn't exist in services.json", async () => {
+    harness.cleanup();
+    harness = makeHarness(manifestWithVaults("home"));
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+    });
+    const res = await patch(bearer, friend.id, { assigned_vaults: ["home", "ghost"] });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("assigned_vault_not_found");
+  });
+
+  test("happy path — replaces the user's vault list and bumps updated_at", async () => {
+    harness.cleanup();
+    harness = makeHarness(manifestWithVaults("home", "work", "family"));
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      assignedVaults: ["home"],
+    });
+    const res = await patch(bearer, friend.id, { assigned_vaults: ["work", "family"] });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      user: { id: string; assigned_vaults: string[]; updated_at: string };
+    };
+    expect(body.ok).toBe(true);
+    expect(new Set(body.user.assigned_vaults)).toEqual(new Set(["work", "family"]));
+    expect(body.user.assigned_vaults).not.toContain("home");
+  });
+
+  test("empty array clears every assignment", async () => {
+    harness.cleanup();
+    harness = makeHarness(manifestWithVaults("home", "work"));
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      assignedVaults: ["home", "work"],
+    });
+    const res = await patch(bearer, friend.id, { assigned_vaults: [] });
+    expect(res.status).toBe(200);
+    const fresh = getUserById(harness.db, friend.id);
+    expect(fresh?.assignedVaults).toEqual([]);
   });
 });

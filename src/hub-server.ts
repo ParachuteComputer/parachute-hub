@@ -147,6 +147,7 @@ import {
   handleListUsers,
   handleListVaults,
   handleResetUserPassword,
+  handleUpdateUserVaults,
 } from "./api-users.ts";
 import { buildChromeForRequest, injectChromeIntoResponse } from "./chrome-strip.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
@@ -1924,6 +1925,24 @@ export function hubFetch(
           return new Response("not found", { status: 404 });
         }
         return handleResetUserPassword(req, id, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          manifestPath,
+        });
+      }
+    }
+    // Phase 2 PR 2 — `/api/users/:id/vaults` (replace a user's vault
+    // assignments). Routed before the per-id DELETE catch-all so the
+    // trailing `/vaults` segment isn't mistaken for part of a user id.
+    {
+      const vaultsMatch = pathname.match(/^\/api\/users\/([^/]+)\/vaults$/);
+      if (vaultsMatch) {
+        if (!getDb) return dbNotConfigured();
+        const id = decodeURIComponent(vaultsMatch[1] ?? "");
+        if (!id) {
+          return new Response("not found", { status: 404 });
+        }
+        return handleUpdateUserVaults(req, id, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
           manifestPath,
