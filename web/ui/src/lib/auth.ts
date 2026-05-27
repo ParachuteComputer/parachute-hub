@@ -69,6 +69,20 @@ export function redirectToLoginAndHang<T>(): Promise<T> {
 }
 
 /**
+ * Navigate to `/account/` (the friend-facing user home) and hang. Mirrors
+ * `redirectToLoginAndHang`'s tear-down posture: returning a never-resolving
+ * promise so SPA-route continuations don't render against a missing token.
+ *
+ * Fired on a 403 from `/admin/host-admin-token` — the hub's first-admin
+ * gate. A non-admin signed-in user landing on the admin SPA URL gets
+ * bounced to their own home rather than seeing a broken admin shell.
+ */
+export function redirectToAccountAndHang<T>(): Promise<T> {
+  window.location.replace("/account/");
+  return new Promise<T>(() => {});
+}
+
+/**
  * Returns the cached host-admin JWT, refreshing it if it's about to expire
  * (or if we don't have one yet). Concurrent callers share the in-flight
  * fetch — we don't want a burst of API calls to mint a token each.
@@ -98,6 +112,13 @@ async function fetchToken(): Promise<string> {
   if (res.status === 401) {
     cached = null;
     return redirectToLoginAndHang<string>();
+  }
+  if (res.status === 403) {
+    // First-admin gate: a signed-in non-admin (friend) is on an /admin/*
+    // URL they can't use. Send them to their account home rather than
+    // letting the SPA render an authenticated-but-broken shell.
+    cached = null;
+    return redirectToAccountAndHang<string>();
   }
   if (!res.ok) {
     throw new Error(`/admin/host-admin-token failed: ${res.status} ${await res.text()}`);

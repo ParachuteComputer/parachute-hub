@@ -25,6 +25,16 @@
  *   - this endpoint requires a valid `parachute_hub_session` cookie, which
  *     was set by `/login` after a password check.
  *
+ * **First-admin gate (multi-user Phase 1 follow-up).** A valid session is
+ * necessary but NOT sufficient. The session must belong to the hub admin
+ * (the earliest-created user row, per `getFirstAdminId` in users.ts).
+ * Without this gate, any signed-in friend account created via PR 2's
+ * `/api/users` could hit this endpoint and walk away with a JWT carrying
+ * `parachute:host:admin` + `parachute:host:auth` — a full-admin privesc,
+ * since both scopes are the SPA's gate-bypass into vault provisioning,
+ * grant management, and the token registry. The SPA-side mirror is in
+ * `web/ui/src/lib/auth.ts`: 403 → redirect to `/account/`.
+ *
  * Tokens minted here are deliberately NOT persisted in the `tokens` table
  * (no refresh, no revocation tracking). They expire on their own; the SPA
  * re-fetches when the JWT is about to lapse.
@@ -39,6 +49,7 @@
 import type { Database } from "bun:sqlite";
 import { signAccessToken } from "./jwt-sign.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
+import { isFirstAdmin } from "./users.ts";
 
 /** Short TTL — page-snapshot threats can't carry the token forever. */
 export const HOST_ADMIN_TOKEN_TTL_SECONDS = 10 * 60;
@@ -63,6 +74,20 @@ export async function handleHostAdminToken(
   const session = sid ? findSession(deps.db, sid) : null;
   if (!session) {
     return jsonError(401, "unauthenticated", "no admin session — sign in at /login first");
+  }
+  // First-admin gate. A friend account (non-first-admin user created via
+  // `/api/users`) holds a valid session but must not be able to mint
+  // host-admin scopes. Without this check, any signed-in friend hitting
+  // `GET /admin/host-admin-token` would walk away with a JWT carrying
+  // `parachute:host:admin` + `parachute:host:auth` — full admin access.
+  // The 403 here is mirrored on the SPA side in `web/ui/src/lib/auth.ts`:
+  // 403 → redirect to `/account/` (the friend's home).
+  if (!isFirstAdmin(deps.db, session.userId)) {
+    return jsonError(
+      403,
+      "not_admin",
+      "host-admin token mint is restricted to the hub admin — your account home is at /account/",
+    );
   }
   const minted = await signAccessToken(deps.db, {
     sub: session.userId,

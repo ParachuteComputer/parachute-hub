@@ -188,6 +188,41 @@ export function userCount(db: Database): number {
   return (db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM users").get() ?? { n: 0 }).n;
 }
 
+/**
+ * Single source of truth for "who is *the* admin in Phase 1." The
+ * earliest-created user row is the wizard or env-seeded admin by
+ * construction — Phase 1 has no role model, so the first row is the
+ * hub administrator. Used by:
+ *
+ *   - `api-users.ts` for the first-admin-undeletable rail (the only
+ *     user who can't be deleted, since deleting them would self-lock
+ *     the hub).
+ *   - `admin-host-admin-token.ts` to gate the SPA-bearer mint endpoint
+ *     to the admin only — any signed-in non-admin friend hitting it
+ *     would otherwise get a JWT carrying `parachute:host:admin` +
+ *     `parachute:host:auth`, a full-admin privesc (multi-user Phase 1
+ *     friend-account follow-up).
+ *   - `admin-handlers.ts` for the login-redirect default — non-admin
+ *     users targeting `/admin/*` get redirected to `/account/` instead
+ *     of a 403 wall.
+ *
+ * Returns `null` only when the users table is empty (pre-wizard state).
+ */
+export function getFirstAdminId(db: Database): string | null {
+  const row = db
+    .query<{ id: string }, []>("SELECT id FROM users ORDER BY created_at ASC LIMIT 1")
+    .get();
+  return row?.id ?? null;
+}
+
+/**
+ * Convenience predicate over `getFirstAdminId`. Caller sites read
+ * cleaner as `isFirstAdmin(db, userId)` than `getFirstAdminId(db) === userId`.
+ */
+export function isFirstAdmin(db: Database, userId: string): boolean {
+  return getFirstAdminId(db) === userId;
+}
+
 export async function verifyPassword(user: User, password: string): Promise<boolean> {
   return argonVerify(user.passwordHash, password);
 }

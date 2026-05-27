@@ -11,9 +11,11 @@ import {
   UsernameTakenError,
   createUser,
   deleteUser,
+  getFirstAdminId,
   getUserById,
   getUserByUsername,
   getUserByUsernameCI,
+  isFirstAdmin,
   listUsers,
   setPassword,
   userCount,
@@ -346,5 +348,68 @@ describe("validatePassword", () => {
     // toward passphrases we'll layer it as a separate signal, not a
     // hard gate.
     expect(validatePassword("aaaaaaaaaaaa").valid).toBe(true);
+  });
+});
+
+describe("getFirstAdminId / isFirstAdmin", () => {
+  test("getFirstAdminId returns null on an empty users table", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      expect(getFirstAdminId(db)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("getFirstAdminId returns the earliest-created user id", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const admin = await createUser(db, "admin", "pw1", { now: () => new Date(1000) });
+      await createUser(db, "alice", "pw2", {
+        allowMulti: true,
+        now: () => new Date(2000),
+      });
+      await createUser(db, "bob", "pw3", {
+        allowMulti: true,
+        now: () => new Date(3000),
+      });
+      expect(getFirstAdminId(db)).toBe(admin.id);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("isFirstAdmin matches earliest user, false for everyone else", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const admin = await createUser(db, "admin", "pw1", { now: () => new Date(1000) });
+      const friend = await createUser(db, "alice", "pw2", {
+        allowMulti: true,
+        now: () => new Date(2000),
+      });
+      expect(isFirstAdmin(db, admin.id)).toBe(true);
+      expect(isFirstAdmin(db, friend.id)).toBe(false);
+      expect(isFirstAdmin(db, "no-such-id")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("isFirstAdmin tracks the admin even after a later user is deleted", async () => {
+    // Deleting a non-first user doesn't promote anyone — the original
+    // admin still holds the "first" slot.
+    const { db, cleanup } = makeDb();
+    try {
+      const admin = await createUser(db, "admin", "pw1", { now: () => new Date(1000) });
+      const friend = await createUser(db, "alice", "pw2", {
+        allowMulti: true,
+        now: () => new Date(2000),
+      });
+      deleteUser(db, friend.id);
+      expect(getFirstAdminId(db)).toBe(admin.id);
+      expect(isFirstAdmin(db, admin.id)).toBe(true);
+    } finally {
+      cleanup();
+    }
   });
 });

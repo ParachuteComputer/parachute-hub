@@ -45,6 +45,7 @@ import {
   UsernameTakenError,
   createUser,
   deleteUser,
+  getFirstAdminId,
   getUserById,
   getUserByUsernameCI,
   listUsers,
@@ -324,10 +325,13 @@ export async function handleDeleteUser(
   // by a state conflict — RFC 7231 §6.5.3 fits cleaner than §6.5.8.
   // Either is defensible; the wire `error` string is the part the SPA
   // matches on for the "first admin can't be deleted" surface).
-  const firstAdminRow = deps.db
-    .query<{ id: string }, []>("SELECT id FROM users ORDER BY created_at ASC LIMIT 1")
-    .get();
-  if (firstAdminRow && firstAdminRow.id === userId) {
+  //
+  // The `getFirstAdminId` helper (users.ts) is the single source of
+  // truth for "who is the admin" — same SELECT also gates the SPA
+  // bearer-mint endpoint (admin-host-admin-token.ts) and drives the
+  // non-admin login-redirect default.
+  const firstAdminId = getFirstAdminId(deps.db);
+  if (firstAdminId && firstAdminId === userId) {
     return jsonError(
       403,
       "first_admin_undeletable",
