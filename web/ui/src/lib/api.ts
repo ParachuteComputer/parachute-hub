@@ -1143,6 +1143,39 @@ export async function deleteUser(id: string): Promise<void> {
 }
 
 /**
+ * POST /api/users/:id/reset-password — admin sets a new temp password
+ * for a non-admin user (multi-user Phase 2 PR 1). The server flips
+ * `password_changed` back to false so the user is force-redirected
+ * through `/account/change-password` on their next sign-in. The first
+ * admin can't be reset this way (server returns 403
+ * `cannot_reset_first_admin` — admin self-service uses
+ * `/account/change-password` directly).
+ *
+ * Same `host:admin` Bearer pattern as the other /api/users surfaces.
+ * 403 here is NOT always an auth failure (the cannot_reset_first_admin
+ * rail also surfaces as 403); we don't clear the cached bearer in
+ * that case — same posture as `deleteUser` for the
+ * first_admin_undeletable rail.
+ */
+export async function resetUserPassword(userId: string, newPassword: string): Promise<void> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/users/${encodeURIComponent(userId)}/reset-password`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify({ new_password: newPassword }),
+  });
+  if (res.status === 401 || res.status === 403) {
+    if (res.status === 401) clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+/**
  * GET /api/users/vaults — vault-name list for the assigned-vault
  * dropdown. Same `host:admin` gate. Sorted server-side; the SPA renders
  * options in that order plus a synthetic "No restriction" entry.

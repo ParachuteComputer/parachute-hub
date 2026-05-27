@@ -1,5 +1,6 @@
 /**
- * Tests for `/api/users*` (multi-user Phase 1, PR 2). Covers:
+ * Tests for `/api/users*` (multi-user Phase 1 PR 2 + Phase 2 PR 1).
+ * Covers:
  *
  *   - Auth boundary: every endpoint requires a bearer carrying
  *     `parachute:host:admin`.
@@ -11,6 +12,10 @@
  *     400 `assigned_vault_not_found`).
  *   - DELETE happy path with token revocation; first-admin-undeletable
  *     returns 403; 404 on unknown id.
+ *   - POST /:id/reset-password (Phase 2 PR 1) happy path with token
+ *     revocation, first-admin protection (403 cannot_reset_first_admin),
+ *     password-validation branches (too-short 400, too-long 413 before
+ *     argon2id), missing target (404), auth boundary.
  *   - GET /api/users/vaults returns the same name set the OAuth issuer
  *     would resolve against.
  *   - 405 on wrong methods.
@@ -25,10 +30,11 @@ import {
   handleDeleteUser,
   handleListUsers,
   handleListVaults,
+  handleResetUserPassword,
 } from "../api-users.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { findTokenRowByJti, recordTokenMint, signAccessToken } from "../jwt-sign.ts";
-import { createUser } from "../users.ts";
+import { createUser, getUserById, verifyPassword } from "../users.ts";
 
 const ISSUER = "https://hub.test";
 const HOST_ADMIN_SCOPE = "parachute:host:admin";
@@ -474,6 +480,190 @@ describe("handleDeleteUser", () => {
     expect(row?.revokedAt).not.toBeNull();
     expect(row?.userId).toBeNull();
     expect(row?.subject).toBe("alice");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/users/:id/reset-password — admin-initiated password reset
+// (multi-user Phase 2 PR 1)
+// ---------------------------------------------------------------------------
+
+describe("handleResetUserPassword", () => {
+  async function post(
+    bearer: string | null,
+    id: string,
+    body: Record<string, unknown> | string | null,
+    headers: Record<string, string> = {},
+  ): Promise<Response> {
+    const init: RequestInit = {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+        ...headers,
+      },
+      body: body === null ? undefined : typeof body === "string" ? body : JSON.stringify(body),
+    };
+    return await handleResetUserPassword(req(`/api/users/${id}/reset-password`, init), id, deps());
+  }
+
+  test("401 with no Authorization header", async () => {
+    const res = await post(null, "some-id", { new_password: "twelvechars1" });
+    expect(res.status).toBe(401);
+  });
+
+  test("403 when bearer lacks parachute:host:admin", async () => {
+    const { bearer } = await makeAdminBearer(["other:scope"]);
+    const res = await post(bearer, "some-id", { new_password: "twelvechars1" });
+    expect(res.status).toBe(403);
+  });
+
+  test("405 on GET", async () => {
+    const { bearer } = await makeAdminBearer();
+    const res = await handleResetUserPassword(
+      withBearer("/api/users/some-id/reset-password", bearer, { method: "GET" }),
+      "some-id",
+      deps(),
+    );
+    expect(res.status).toBe(405);
+  });
+
+  test("404 when target user does not exist", async () => {
+    const { bearer } = await makeAdminBearer();
+    const res = await post(bearer, "no-such-id", { new_password: "twelvechars1" });
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("not_found");
+  });
+
+  test("403 cannot_reset_first_admin when targeting the first admin", async () => {
+    const { bearer, userId } = await makeAdminBearer();
+    const res = await post(bearer, userId, { new_password: "twelvechars1" });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("cannot_reset_first_admin");
+    // First-admin row's hash + password_changed bit untouched.
+    const fresh = getUserById(harness.db, userId);
+    expect(fresh?.passwordChanged).toBe(true);
+  });
+
+  test("400 invalid_password when new_password is too short (< 12 chars)", async () => {
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    const res = await post(bearer, friend.id, { new_password: "short" });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("invalid_password");
+    expect(body.error_description).toMatch(/12 characters/);
+  });
+
+  test("413 password_too_long when new_password > 256 chars (before argon2id touches it)", async () => {
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    const huge = "a".repeat(300);
+    const t0 = Date.now();
+    const res = await post(bearer, friend.id, { new_password: huge });
+    const elapsed = Date.now() - t0;
+    expect(res.status).toBe(413);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("password_too_long");
+    // Same liveness check as the create-user path: 300-char argon2id is
+    // hundreds of ms; cap-and-reject should complete in <200ms.
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  test("400 invalid_request when content-type is not application/json", async () => {
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    const res = await post(bearer, friend.id, "new_password=twelvechars1", {
+      "content-type": "application/x-www-form-urlencoded",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("400 invalid_request when new_password missing", async () => {
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    const res = await post(bearer, friend.id, {});
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_request");
+  });
+
+  test("happy path — rotates hash, flips password_changed=false, returns user shape", async () => {
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    const oldHash = friend.passwordHash;
+    const res = await post(bearer, friend.id, { new_password: "new-temp-passphrase" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      user: { id: string; password_changed: boolean; username: string };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.user.id).toBe(friend.id);
+    expect(body.user.username).toBe("alice");
+    expect(body.user.password_changed).toBe(false);
+    // Echo body never carries the hash (or the new password).
+    expect(body.user).not.toHaveProperty("password_hash");
+    expect(body).not.toHaveProperty("new_password");
+    // Round-trip on the user row: new password works, old does not, hash
+    // moved, password_changed is now false (force-redirect on next login).
+    const fresh = getUserById(harness.db, friend.id);
+    expect(fresh).not.toBeNull();
+    expect(fresh?.passwordHash).not.toBe(oldHash);
+    expect(fresh?.passwordChanged).toBe(false);
+    expect(await verifyPassword(fresh!, "new-temp-passphrase")).toBe(true);
+    expect(await verifyPassword(fresh!, "alice-strong-passphrase")).toBe(false);
+  });
+
+  test("revokes the friend's existing tokens (pre-reset token row has revoked_at after)", async () => {
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    const minted = await signAccessToken(harness.db, {
+      sub: friend.id,
+      scopes: ["vault:home:read"],
+      audience: "vault",
+      clientId: "notes-client",
+      issuer: ISSUER,
+      ttlSeconds: 600,
+    });
+    recordTokenMint(harness.db, {
+      jti: minted.jti,
+      createdVia: "operator_mint",
+      subject: friend.username,
+      userId: friend.id,
+      clientId: "notes-client",
+      scopes: ["vault:home:read"],
+      expiresAt: minted.expiresAt,
+    });
+    expect(findTokenRowByJti(harness.db, minted.jti)?.revokedAt).toBeNull();
+
+    const res = await post(bearer, friend.id, { new_password: "new-temp-passphrase" });
+    expect(res.status).toBe(200);
+
+    const row = findTokenRowByJti(harness.db, minted.jti);
+    expect(row?.revokedAt).not.toBeNull();
+    // User row sticks around (unlike delete), so user_id is NOT NULLed.
+    expect(row?.userId).toBe(friend.id);
   });
 });
 

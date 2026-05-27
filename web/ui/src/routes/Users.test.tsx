@@ -1,8 +1,9 @@
 /**
  * Users route smoke tests — loading, list with sample data,
  * empty state, create-form happy path + client-side validation,
- * delete confirm flow, first-admin Delete disabled with tooltip,
- * load error.
+ * delete confirm flow, first-admin Delete + Reset disabled with
+ * tooltips, admin password reset happy path + cancel + client/server
+ * validation, load error.
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -19,6 +20,7 @@ vi.mock("../lib/api.ts", async (orig) => {
     listUserVaults: vi.fn(),
     createUser: vi.fn(),
     deleteUser: vi.fn(),
+    resetUserPassword: vi.fn(),
   };
 });
 
@@ -117,6 +119,26 @@ describe("Users — first-admin protection", () => {
     expect(aliceBtn).not.toBeDisabled();
     expect(aliceBtn).not.toHaveAttribute("aria-describedby");
   });
+
+  it("disables the Reset password button for the first admin with a /account/change-password tooltip", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    renderRoute();
+    const operatorReset = await screen.findByRole("button", {
+      name: /reset password for operator/i,
+    });
+    expect(operatorReset).toBeDisabled();
+    expect(operatorReset).toHaveAttribute("title", expect.stringMatching(/change-password/i));
+    const describedById = operatorReset.getAttribute("aria-describedby");
+    expect(describedById).toMatch(/^first-admin-reset-tooltip-/);
+    const tooltipSpan = describedById ? document.getElementById(describedById) : null;
+    expect(tooltipSpan?.className).toContain("sr-only");
+    expect(tooltipSpan?.textContent).toMatch(/change-password directly/i);
+    // Non-first user Reset password is enabled.
+    const aliceReset = screen.getByRole("button", { name: /reset password for alice/i });
+    expect(aliceReset).not.toBeDisabled();
+    expect(aliceReset).not.toHaveAttribute("aria-describedby");
+  });
 });
 
 describe("Users — delete confirm flow", () => {
@@ -159,6 +181,96 @@ describe("Users — delete confirm flow", () => {
     await waitFor(() =>
       expect(screen.getByText(/delete failed \(500\): boom/i)).toBeInTheDocument(),
     );
+  });
+});
+
+describe("Users — admin password reset (Phase 2 PR 1)", () => {
+  it("clicking Reset password reveals an inline form scoped to that row", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /reset password for alice/i }));
+    expect(await screen.findByLabelText(/new temporary password for alice/i)).toBeInTheDocument();
+    // Submit button label is the canonical action.
+    expect(screen.getByRole("button", { name: /set new password/i })).toBeInTheDocument();
+  });
+
+  it("happy path — POSTs new password, shows success banner, refreshes the list", async () => {
+    const listMock = vi.mocked(api.listUsers);
+    listMock.mockResolvedValueOnce([user("operator"), user("alice")]);
+    // After the reset the row flips back to password_changed=false (the
+    // server flips it and the SPA re-reads). Round-trip through the mock.
+    listMock.mockResolvedValueOnce([user("operator"), user("alice", { password_changed: false })]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    vi.mocked(api.resetUserPassword).mockResolvedValue();
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /reset password for alice/i }));
+    fireEvent.change(screen.getByLabelText(/new temporary password for alice/i), {
+      target: { value: "new-temp-passphrase" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /set new password/i }));
+    await waitFor(() =>
+      expect(api.resetUserPassword).toHaveBeenCalledWith("id-alice", "new-temp-passphrase"),
+    );
+    // Success banner copy mirrors the design's "hand them the password +
+    // change on first sign-in" wording. The banner-scoped query is
+    // intentional — the page-level header copy also includes "change
+    // it on first sign-in" prose, so we scope to the success-banner
+    // element to avoid duplicate matches.
+    await waitFor(() => expect(screen.getByText(/password reset for/i)).toBeInTheDocument());
+    const banner = screen.getByText(/password reset for/i).closest("output");
+    expect(banner).not.toBeNull();
+    expect(banner?.textContent).toMatch(/prompted to change it on first sign-in/i);
+    // List refresh fired so the password-set badge can flip.
+    await waitFor(() => expect(api.listUsers).toHaveBeenCalledTimes(2));
+  });
+
+  it("client-side rejects a too-short password before calling the API", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /reset password for alice/i }));
+    fireEvent.change(screen.getByLabelText(/new temporary password for alice/i), {
+      target: { value: "tooshortpw1" }, // 11 chars
+    });
+    fireEvent.submit(screen.getByRole("form", { name: /reset password for alice/i }));
+    await waitFor(() => expect(screen.getByText(/at least 12 characters/i)).toBeInTheDocument());
+    expect(api.resetUserPassword).not.toHaveBeenCalled();
+  });
+
+  it("surfaces server error_description from a 403 cannot_reset_first_admin", async () => {
+    // Defense in depth: the SPA disables the button for the first admin,
+    // but if the server's 403 surfaces anyway (e.g. the operator hits a
+    // race or someone POSTs from curl), the error banner should render
+    // verbatim in the row.
+    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    vi.mocked(api.resetUserPassword).mockRejectedValue(
+      new api.HttpError(403, "the first admin must use /account/change-password directly"),
+    );
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /reset password for alice/i }));
+    fireEvent.change(screen.getByLabelText(/new temporary password for alice/i), {
+      target: { value: "new-temp-passphrase" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /set new password/i }));
+    await waitFor(() => expect(screen.getByText(/reset failed \(403\)/i)).toBeInTheDocument());
+  });
+
+  it("Cancel closes the inline form without posting", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([user("operator"), user("alice")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /reset password for alice/i }));
+    expect(screen.getByLabelText(/new temporary password for alice/i)).toBeInTheDocument();
+    // There are two Cancel buttons possible (delete confirm + reset form);
+    // scope by the form's accessible name to grab the reset one.
+    const form = screen.getByRole("form", { name: /reset password for alice/i });
+    fireEvent.click(within(form).getByRole("button", { name: /cancel/i }));
+    await waitFor(() =>
+      expect(screen.queryByLabelText(/new temporary password for alice/i)).toBeNull(),
+    );
+    expect(api.resetUserPassword).not.toHaveBeenCalled();
   });
 });
 

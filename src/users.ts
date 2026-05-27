@@ -247,6 +247,80 @@ export async function setPassword(
 }
 
 /**
+ * Reset a user's password to an admin-chosen value (multi-user Phase 2
+ * PR 1, hub#252 follow-up). Used by the `POST /api/users/:id/reset-password`
+ * admin endpoint when a friend forgets their password — the operator's
+ * only Phase-1 recovery was delete+recreate, which is destructive-feeling
+ * even though it's safe (vaults are independent of accounts).
+ *
+ * Three writes inside one transaction:
+ *
+ *   1. Rotate `password_hash` to the new argon2id hash and flip
+ *      `password_changed` back to 0 so the user is force-redirected
+ *      through `/account/change-password` on next sign-in (same posture
+ *      as the admin-created-user default — the operator hands the temp
+ *      password out-of-band, the user picks their own immediately).
+ *   2. Revoke every still-active token row owned by the user
+ *      (`tokens.revoked_at = now WHERE user_id = ? AND revoked_at IS NULL`).
+ *      The reset is a "the old password leaked" recovery shape — leaving
+ *      pre-reset tokens valid for an attacker who knew the old password
+ *      would defeat the purpose. We keep the rows (don't NULL `user_id`
+ *      like `deleteUser` does) because the audit trail naturally re-
+ *      anchors to the still-existing user row.
+ *   3. Bump `updated_at` so the SPA's row reflects the rotation.
+ *
+ * Hash OUTSIDE the transaction — argon2id is async and `db.transaction()`
+ * on bun:sqlite is sync; doing it inside silently breaks atomicity (same
+ * constraint api-account.ts:399 documents for the change-password POST).
+ *
+ * Caller responsibilities (not enforced here):
+ *   - Validate `newPassword` first (`validatePassword`) — this helper
+ *     trusts the input and runs argon2id over whatever it gets.
+ *   - First-admin protection — admin password reset is restricted to
+ *     non-first-admin users per design §7. The first admin uses the
+ *     normal `/account/change-password` flow for themselves.
+ *
+ * Returns true on success, false if the user doesn't exist (idempotent —
+ * the API layer translates that to 404).
+ */
+export async function resetUserPassword(
+  db: Database,
+  userId: string,
+  newPassword: string,
+  now: () => Date = () => new Date(),
+): Promise<boolean> {
+  // Existence pre-check OUTSIDE the tx. The argon2id hash below is the
+  // expensive step; hashing for a non-existent user is wasted CPU and
+  // also leaks "was this id valid" timing. Cheap SELECT first.
+  const exists = db
+    .query<{ id: string }, [string]>("SELECT id FROM users WHERE id = ?")
+    .get(userId);
+  if (!exists) return false;
+  // Hash outside the tx — see note above.
+  const passwordHash = await argonHash(newPassword);
+  const stamp = now().toISOString();
+  db.transaction(() => {
+    const result = db
+      .prepare(
+        "UPDATE users SET password_hash = ?, password_changed = 0, updated_at = ? WHERE id = ?",
+      )
+      .run(passwordHash, stamp, userId);
+    // Race-tolerant: row may have vanished between the pre-check and the
+    // tx body. Treat as "no longer there" — same shape as `deleteUser`'s
+    // race handling. The caller's pre-check above is the common path.
+    if (result.changes === 0) return;
+    // Revoke still-active tokens. Audit trail stays on the user row —
+    // we don't null `user_id` because the parent users row sticks
+    // around (unlike `deleteUser` where the parent vanishes).
+    db.prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").run(
+      stamp,
+      userId,
+    );
+  })();
+  return true;
+}
+
+/**
  * Hard-delete a user row and clean up FK-dependent rows.
  *
  * Schema reality at v8:
