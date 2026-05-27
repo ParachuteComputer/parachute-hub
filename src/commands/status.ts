@@ -56,9 +56,18 @@ export async function probe(
   try {
     const res = await fetchImpl(url, { signal: controller.signal });
     const latencyMs = Math.round(performance.now() - start);
+    // A 401 is the service replying "I'm up but this endpoint requires auth"
+    // — that's strictly healthy from a liveness perspective. Vault's
+    // canonical health path `/vault/<name>/health` is auth-gated; without
+    // this carve-out, `parachute status` shows vault as "failing" on every
+    // fresh install (first impression UX disaster despite vault being fine).
+    // 5xx → unhealthy; 200-class → healthy; 401 → healthy + auth-gated.
+    // Other 4xx (404 / 400 / etc.) still count as unhealthy — those mean
+    // the configured health path doesn't exist or is shaped wrong.
+    const healthy = res.ok || res.status === 401;
     return {
       entry,
-      healthy: res.ok,
+      healthy,
       statusCode: res.status,
       latencyMs,
     };
