@@ -38,6 +38,8 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { type OperationsRegistry, runInstall, specFor } from "./api-modules-ops.ts";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
@@ -450,6 +452,14 @@ export interface RenderVaultStepProps {
   /** Pre-fill the vault name input after a validation failure. */
   vaultName?: string;
   /**
+   * When the runtime is a hosted container (Render / Fly), the scribe
+   * sub-form hides the "local provider" option — Whisper / parakeet
+   * don't run usefully in the constrained container. Defaults to false
+   * (treat as self-host, show local option) — production wizard renders
+   * always pass an explicit value via detectAutoExposeMode.
+   */
+  cloudHost?: boolean;
+  /**
    * When an install op is in progress, render the polling shape: no
    * form, just the op log + auto-refresh.
    */
@@ -458,11 +468,18 @@ export interface RenderVaultStepProps {
     status: "pending" | "running" | "succeeded" | "failed";
     log: readonly string[];
     error?: string;
+    /**
+     * Optional scribe install op_id, threaded through so the success
+     * redirect carries `&op_scribe=<id>` and the done step picks up the
+     * in-flight scribe install via the existing per-tile op-poll
+     * mechanism (`buildInstallTiles` reads `op_<short>` query param).
+     */
+    scribeOpId?: string;
   };
 }
 
 export function renderVaultStep(props: RenderVaultStepProps): string {
-  const { csrfToken, errorMessage, operation, vaultName } = props;
+  const { csrfToken, errorMessage, operation, vaultName, cloudHost } = props;
   if (operation) return renderVaultOpStep({ operation });
   const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
   // hub#267: the typed name now flows end-to-end via
@@ -523,10 +540,96 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
           <span class="field-hint">lowercase letters, digits, <code>-</code>, <code>_</code>;
             2–32 chars. Leave blank for <code>${DEFAULT_VAULT_NAME}</code>.</span>
         </label>
+        ${renderScribeSubForm(cloudHost === true)}
         <button type="submit" class="btn btn-primary">Create vault & finish</button>
       </form>
     </div>`;
   return baseDocument("Set up your Parachute hub — vault", body);
+}
+
+/**
+ * Scribe install sub-form embedded in the vault step (folded in
+ * 2026-05-27 per Aaron's team-meeting directive: "folding the scribe
+ * question into the vault step is a good idea"). Operator answers
+ * scribe-related questions in the same form as vault name, the POST
+ * handler kicks both installs in parallel, and the done screen polls
+ * scribe's progress via the existing per-tile op-poll mechanism.
+ *
+ * The provider list adapts to the runtime context:
+ *   - Cloud container (Render / Fly): local transcribers (parakeet,
+ *     whisper) don't fit in 512MB + can't reach hardware acceleration.
+ *     We hide them. Groq is the default (fast cloud Whisper, ~$0.04/hr
+ *     of audio); OpenAI is the alternative.
+ *   - Local (Mac / Linux): parakeet-mlx is the default on Mac (silicon
+ *     MLX); falls back to onnx-asr cross-platform. Cloud providers
+ *     stay available as choices for operators who'd rather pay than
+ *     run local inference.
+ *
+ * The API key input shows conditionally — only when a cloud provider
+ * is selected. It's a plain text input (no `type=password`) because
+ * (a) the operator just pasted it from their provider's dashboard, and
+ * (b) showing it lets them verify they pasted correctly before submit.
+ * Mode-switching between providers via the radio is handled by an
+ * inline `<script>` block — no SPA bundle, no module deps.
+ *
+ * The "Skip — no transcription" option is third and unchecked by
+ * default. Most operators want voice transcription once they know
+ * they can; the default-on posture matches the auto-transcribe default
+ * flip that landed in vault#373.
+ */
+function renderScribeSubForm(cloudHost: boolean): string {
+  const localBlock = cloudHost
+    ? ""
+    : `
+        <label class="scribe-provider-option">
+          <input type="radio" name="scribe_provider" value="local"${cloudHost ? "" : " checked"} data-needs-key="false" />
+          <span class="provider-name">Local <small>(Mac MLX or ONNX — no API key needed)</small></span>
+        </label>`;
+  const groqDefault = cloudHost ? " checked" : "";
+  return `
+        <details class="scribe-suboptions" open>
+          <summary class="cursor-pointer">
+            <span class="field-label">Enable voice transcription</span>
+            <span class="field-hint"> · Scribe installs alongside vault, transcribes audio attachments automatically</span>
+          </summary>
+          <div class="scribe-provider-block">
+            <p class="field-hint">Pick a transcription provider. You can change this later in <code>/admin/modules</code>.</p>
+            <div class="scribe-provider-list">
+              ${localBlock}
+              <label class="scribe-provider-option">
+                <input type="radio" name="scribe_provider" value="groq"${groqDefault} data-needs-key="true" />
+                <span class="provider-name">Groq <small>(~\$0.04/hr of audio, fast)</small></span>
+              </label>
+              <label class="scribe-provider-option">
+                <input type="radio" name="scribe_provider" value="openai" data-needs-key="true" />
+                <span class="provider-name">OpenAI Whisper <small>(~\$0.36/hr of audio)</small></span>
+              </label>
+              <label class="scribe-provider-option">
+                <input type="radio" name="scribe_provider" value="none" data-needs-key="false" />
+                <span class="provider-name">Skip — no transcription</span>
+              </label>
+            </div>
+            <label class="field scribe-api-key-field" data-shows-on="cloud">
+              <span class="field-label">API key</span>
+              <input type="text" name="scribe_api_key" autocomplete="off" placeholder="gsk_… or sk-…" />
+              <span class="field-hint">Pasted directly into <code>~/.parachute/scribe/config.json</code> on this hub (file mode 0o600). Leave blank to skip and set later in the admin SPA.</span>
+            </label>
+          </div>
+        </details>
+        <script>
+          (function () {
+            var radios = document.querySelectorAll('input[name="scribe_provider"]');
+            var keyField = document.querySelector('.scribe-api-key-field');
+            function sync() {
+              var selected = document.querySelector('input[name="scribe_provider"]:checked');
+              var needsKey = selected && selected.dataset.needsKey === "true";
+              if (keyField) keyField.style.display = needsKey ? "" : "none";
+            }
+            radios.forEach(function (r) { r.addEventListener("change", sync); });
+            sync();
+          })();
+        </script>
+  `;
 }
 
 function renderVaultOpStep(props: {
@@ -567,7 +670,7 @@ function renderVaultOpStep(props: {
       </section>
       ${
         operation.status === "succeeded"
-          ? '<meta http-equiv="refresh" content="1; url=/admin/setup?just_finished=1" />'
+          ? `<meta http-equiv="refresh" content="1; url=/admin/setup?just_finished=1${operation.scribeOpId ? `&op_scribe=${encodeURIComponent(operation.scribeOpId)}` : ""}" />`
           : ""
       }
     </div>`;
@@ -738,7 +841,7 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
   const mcpTile = renderMcpTile(vaultName, hubOrigin, mintedToken);
   const tiles = installTiles && installTiles.length > 0 ? installTiles : [];
   const installSection = tiles.length > 0 ? renderInstallTiles(tiles) : "";
-  const startTile = renderStartUsingTile(vaultName, appInstalled === true);
+  const startTile = renderStartUsingTile(vaultName, appInstalled === true, hubOrigin);
   // The done-grid hosts the MCP-connect tile + the admin-UI fallback.
   // The install tiles sit above it as a "what's next?" surface (curated
   // catalog of modules an operator might want next). The "Start using
@@ -762,6 +865,7 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
       </div>
       ${reachable}
       ${startTile}
+      ${renderStarterPromptsSection()}
       ${installSection}
       <section class="done-grid">
         ${mcpTile}
@@ -953,26 +1057,98 @@ function renderMcpTile(
  * "start using parachute" — not three competing tiles where the
  * "real" entry point is buried under the MCP command pre-hub#342.
  */
-function renderStartUsingTile(vaultName: string, appInstalled: boolean): string {
+/**
+ * Lead "Start using your vault" tile. Points at the canonical
+ * notes.parachute.computer hosted PWA as the primary CTA — with the
+ * operator's own hub URL pre-filled via `?url=` so the connect screen
+ * auto-populates + auto-focuses (notes-ui AddVault route, see
+ * parachute-app/packages/notes-ui/src/app/routes/AddVault.tsx).
+ *
+ * Aaron 2026-05-27 directive: "skipping the local surface install for
+ * most operators is good ... showing notes.parachute.computer more
+ * prominently is a good idea." The notes.parachute.computer PWA is the
+ * canonical user-facing UI; operators no longer need to install the
+ * Surface module locally to use Notes. They still can (local install
+ * works the same way), but the wizard doesn't push them toward it as
+ * the default.
+ *
+ * Secondary CTA: "Open vault admin" (the vault's own admin UI on this
+ * hub) for operators who want to look at raw vault state.
+ *
+ * `appInstalled` is no longer load-bearing for the primary path —
+ * notes.parachute.computer works regardless of whether Surface is
+ * installed locally. Kept in the signature so the older test fixtures
+ * + the boolean flag stay coherent; only the secondary fallback message
+ * differs based on it.
+ */
+function renderStartUsingTile(
+  vaultName: string,
+  appInstalled: boolean,
+  hubOrigin: string,
+): string {
   const safeVault = escapeHtml(vaultName);
   // Vault names pass `/^[a-z0-9][a-z0-9-]*$/i` so URL-encoding is mostly
   // a no-op today, but use encodeURIComponent defensively to match hub.ts:505.
   const urlVault = encodeURIComponent(vaultName);
-  if (appInstalled) {
-    return `<section class="start-using" data-testid="start-using-tile">
-      <h2>Start using your vault</h2>
-      <p>Notes is installed and ready. Capture your first note in the
-        Notes app — it reads from <code>${safeVault}</code> directly.</p>
-      <p><a class="btn btn-primary" href="/surface/notes/">Open Notes</a></p>
-    </section>`;
-  }
+  // The `?url=` query param is consumed by notes-ui's AddVault route
+  // (packages/notes-ui/src/app/routes/AddVault.tsx) — it pre-fills the
+  // vault URL input + auto-focuses Submit.
+  const vaultUrlForAdd = encodeURIComponent(
+    `${hubOrigin.replace(/\/+$/, "")}/vault/${vaultName}`,
+  );
+  // For appInstalled=false case (Surface NOT installed locally),
+  // notes.parachute.computer is the recommended path. For appInstalled=true,
+  // we mention the local option as a secondary affordance.
+  const localNotesFallback = appInstalled
+    ? `<p class="start-using-secondary">
+        <a href="/surface/notes/">Or use Notes installed locally on this hub →</a>
+      </p>`
+    : "";
   return `<section class="start-using" data-testid="start-using-tile">
     <h2>Start using your vault</h2>
-    <p>Your vault <code>${safeVault}</code> is provisioned. Install
-      <strong>Surface</strong> below (it bundles the Notes UI) to start
-      capturing — or open the vault's admin UI now to see what's
-      inside.</p>
-    <p><a class="btn btn-primary" href="/vault/${urlVault}/admin/">Open vault admin</a></p>
+    <p>Open Notes — the canonical browser UI for your vault <code>${safeVault}</code>.
+      It connects to your hub over HTTPS and remembers your URL after the first OAuth.</p>
+    <p><a class="btn btn-primary" href="https://notes.parachute.computer/add?url=${vaultUrlForAdd}" target="_blank" rel="noopener">Open Notes ↗</a></p>
+    <p class="start-using-secondary">
+      <a href="/vault/${urlVault}/admin/">Or browse the vault's admin UI →</a>
+    </p>
+    ${localNotesFallback}
+  </section>`;
+}
+
+/**
+ * Starter-prompts tile on the done screen. Surfaces the two
+ * interview-style prompts hosted at parachute.computer:
+ *
+ *   1. "Help me set up my vault" — AI interviews the operator about
+ *      where their data lives + proposes a tag/path structure
+ *      (parachute.computer/onboarding/vault-setup/).
+ *   2. "Build a custom UI" — AI builds a static SPA against the vault's
+ *      HTTP API, hosted on the operator's own GitHub Pages
+ *      (parachute.computer/onboarding/surface-build/).
+ *
+ * Aaron 2026-05-27 directive: ship these as the "first AI assist"
+ * surface so freshly-onboarded operators have a clear next thing to
+ * do beyond clicking around the admin UI. The prompts live on
+ * parachute.computer rather than embedded in the wizard so they can
+ * be iterated without a hub release; the wizard just links.
+ */
+function renderStarterPromptsSection(): string {
+  return `<section class="starter-prompts" data-testid="starter-prompts">
+    <h2>Get help from your AI</h2>
+    <p class="starter-prompts-subtitle">Two interview-style prompts to paste into Claude Code or Codex once your vault's MCP is wired up.</p>
+    <div class="starter-prompts-grid">
+      <a class="starter-prompt-tile" href="https://parachute.computer/onboarding/vault-setup/" target="_blank" rel="noopener">
+        <h3>Set up your vault</h3>
+        <p>Interview-style. AI asks where your notes live now + proposes a tag &amp; path structure that fits how you actually think.</p>
+        <p class="starter-prompt-cta">Open prompt ↗</p>
+      </a>
+      <a class="starter-prompt-tile" href="https://parachute.computer/onboarding/surface-build/" target="_blank" rel="noopener">
+        <h3>Build a custom UI</h3>
+        <p>AI generates a static SPA hosted on your own GitHub Pages — talks to your vault over HTTP. Notes UI works as a reference.</p>
+        <p class="starter-prompt-cta">Open prompt ↗</p>
+      </a>
+    </div>
   </section>`;
 }
 
@@ -1270,25 +1446,33 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
   // Step 3 (vault) with an op in flight — render the poll page.
   if (state.hasAdmin && !state.hasVault) {
     const opId = url.searchParams.get("op");
+    const cloudHost = detectAutoExposeMode(deps.env ?? process.env) === "public";
     if (opId) {
       const registry = deps.registry;
       const op = registry?.get(opId);
       if (op) {
+        // Carry the scribe op_id forward via the query param so the
+        // op-poll page's success-redirect threads it into the done
+        // step's URL (where buildInstallTiles picks it up via the
+        // existing per-tile `op_scribe` mechanism).
+        const scribeOpIdParam = url.searchParams.get("op_scribe") ?? undefined;
         return new Response(
           renderVaultStep({
             csrfToken: csrf.token,
+            cloudHost,
             operation: {
               id: op.id,
               status: op.status,
               log: op.log,
               ...(op.error !== undefined ? { error: op.error } : {}),
+              ...(scribeOpIdParam !== undefined ? { scribeOpId: scribeOpIdParam } : {}),
             },
           }),
           { status: 200, headers: extraHeaders },
         );
       }
     }
-    return new Response(renderVaultStep({ csrfToken: csrf.token }), {
+    return new Response(renderVaultStep({ csrfToken: csrf.token, cloudHost }), {
       status: 200,
       headers: extraHeaders,
     });
@@ -1609,7 +1793,130 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
       "[setup-wizard] handleSetupVaultPost called with no operations registry — install will NOT run. Wire deps.registry in the dispatcher.",
     );
   }
-  return redirect(`/admin/setup?op=${encodeURIComponent(op.id)}`);
+  // Scribe sub-form fold (2026-05-27). The vault step's form lets
+  // the operator answer "do you also want voice transcription?" in
+  // the same submission. If they did, we (a) write the provider +
+  // API key to `~/.parachute/surface/config.json` so scribe finds
+  // them on first boot, and (b) kick a scribe install op in
+  // parallel with vault install. The vault op-poll page threads the
+  // scribe op_id through its success-redirect so the done step can
+  // poll scribe progress via the existing per-tile mechanism.
+  const scribeProvider = String(form.get("scribe_provider") ?? "").trim();
+  let scribeOpId: string | undefined;
+  if (scribeProvider !== "" && scribeProvider !== "none") {
+    const scribeApiKey = String(form.get("scribe_api_key") ?? "").trim();
+    // Write scribe config FIRST so scribe's first boot picks up the
+    // provider + key without a second config edit. We don't fail the
+    // wizard on a config-write error — log it + carry on; scribe will
+    // boot with defaults + the operator can fix via /scribe/admin.
+    try {
+      writeScribeConfigForWizard(deps.configDir, scribeProvider, scribeApiKey);
+    } catch (err) {
+      console.warn(
+        `[setup-wizard] failed to write scribe config: ${err instanceof Error ? err.message : String(err)} — kicking install anyway, operator can configure later.`,
+      );
+    }
+    // Kick scribe install in parallel. Don't block on it; the done
+    // step's per-tile op-poll surfaces progress.
+    if (registry) {
+      const scribeSpec = specFor("scribe");
+      const scribeOp = registry.create("install", "scribe");
+      scribeOpId = scribeOp.id;
+      void runInstall(scribeOp.id, "scribe", scribeSpec, {
+        db: deps.db,
+        issuer: deps.issuer,
+        manifestPath: deps.manifestPath,
+        configDir: deps.configDir,
+        supervisor: deps.supervisor,
+        registry,
+        ...(deps.run ? { run: deps.run } : {}),
+      }).catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        registry.update(
+          scribeOp.id,
+          { status: "failed", error: msg },
+          `scribe install failed: ${msg}`,
+        );
+      });
+    }
+  }
+  const redirectUrl = scribeOpId
+    ? `/admin/setup?op=${encodeURIComponent(op.id)}&op_scribe=${encodeURIComponent(scribeOpId)}`
+    : `/admin/setup?op=${encodeURIComponent(op.id)}`;
+  return redirect(redirectUrl);
+}
+
+/**
+ * Write a minimal scribe config that selects the operator's chosen
+ * transcribe provider + API key (when applicable). Idempotent: reads
+ * any existing config, merges, writes back. File mode 0o600 — the
+ * config holds API keys, owner-only.
+ *
+ * Lives in setup-wizard.ts (not scribe's own config-write.ts) because
+ * (a) it's a one-time wizard write — the SPA's PUT /.parachute/config
+ * surface is the canonical post-setup path, and (b) hub doesn't
+ * import scribe-internal modules. The shape of `scribe-config.json`
+ * is documented in parachute-scribe/src/config.ts; the fields we set
+ * (transcribe.provider + transcribeProviders.<name>.apiKey) are
+ * stable.
+ */
+function writeScribeConfigForWizard(
+  configDir: string,
+  provider: string,
+  apiKey: string,
+): void {
+  // For `local` (Mac MLX / cross-platform ONNX), just set the
+  // provider name — no key needed.
+  if (provider === "local") {
+    persistScribeConfig(configDir, { transcribe: { provider: "parakeet-mlx" } });
+    return;
+  }
+  // Cloud providers need a key. Empty key → just set provider; the
+  // operator can paste the key later via /scribe/admin without a
+  // restart (per provider-config.ts's per-request precedence).
+  const update: Record<string, unknown> = { transcribe: { provider } };
+  if (apiKey !== "") {
+    update.transcribeProviders = { [provider]: { apiKey } };
+  }
+  persistScribeConfig(configDir, update);
+}
+
+/**
+ * Merge-write to scribe's config file at `<configDir>/scribe/config.json`.
+ * Reads existing JSON when present, deep-merges `update`, writes back at
+ * mode 0o600. Creates the parent dir if missing.
+ */
+function persistScribeConfig(configDir: string, update: Record<string, unknown>): void {
+  const scribeDir = join(configDir, "scribe");
+  const configPath = join(scribeDir, "config.json");
+  mkdirSync(scribeDir, { recursive: true });
+  let existing: Record<string, unknown> = {};
+  if (existsSync(configPath)) {
+    try {
+      existing = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    } catch {
+      // Malformed existing config — treat as empty + overwrite.
+      existing = {};
+    }
+  }
+  // Shallow merge at top level, deep merge for the two known sub-blocks
+  // we touch (transcribe + transcribeProviders).
+  const merged: Record<string, unknown> = { ...existing };
+  for (const [key, value] of Object.entries(update)) {
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      typeof merged[key] === "object" &&
+      merged[key] !== null &&
+      !Array.isArray(merged[key])
+    ) {
+      merged[key] = { ...(merged[key] as Record<string, unknown>), ...value };
+    } else {
+      merged[key] = value;
+    }
+  }
+  writeFileSync(configPath, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
 }
 
 /**

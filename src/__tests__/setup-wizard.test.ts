@@ -899,6 +899,137 @@ describe("handleSetupVaultPost", () => {
     }
   });
 
+  test("scribe sub-form: provider=groq + api_key kicks scribe install in parallel + writes config", async () => {
+    // Wizard redesign 2026-05-27: the vault step's form now folds in a
+    // scribe sub-section (provider radio + API key). On submit with
+    // scribe enabled, the POST handler should:
+    //   1. Write the operator's chosen provider + API key to scribe's
+    //      config file (`<configDir>/scribe/config.json`)
+    //   2. Kick a scribe install op in parallel with vault install
+    //   3. Redirect with BOTH `?op=<vault>` AND `&op_scribe=<scribe>` so
+    //      the vault op-poll page can thread the scribe op_id through
+    //      to the done step's per-tile mechanism.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession, SESSION_COOKIE_NAME: SC } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const runCalls: string[][] = [];
+      const stubbedRun = async (cmd: readonly string[]) => {
+        runCalls.push([...cmd]);
+        return 0;
+      };
+      const post = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          body: new URLSearchParams({
+            [CSRF_FIELD_NAME]: csrf,
+            scribe_provider: "groq",
+            scribe_api_key: "gsk_testkey_abc123",
+          }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SC}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          supervisor: makeSupervisor(),
+          registry: getDefaultOperationsRegistry(),
+          run: stubbedRun,
+        },
+      );
+      // 303 redirect with both op + op_scribe params.
+      expect(post.status).toBe(303);
+      const location = post.headers.get("location") ?? "";
+      expect(location).toMatch(/op=/);
+      expect(location).toMatch(/op_scribe=/);
+      // Scribe config file written with provider + apiKey.
+      const fs = await import("node:fs");
+      const path = await import("node:path");
+      const scribeConfigPath = path.join(h.dir, "scribe", "config.json");
+      expect(fs.existsSync(scribeConfigPath)).toBe(true);
+      const scribeConfig = JSON.parse(fs.readFileSync(scribeConfigPath, "utf8"));
+      expect(scribeConfig.transcribe?.provider).toBe("groq");
+      expect(scribeConfig.transcribeProviders?.groq?.apiKey).toBe("gsk_testkey_abc123");
+      // Yield + verify both vault AND scribe `bun add` calls happened.
+      await new Promise((r) => setTimeout(r, 50));
+      const cmds = runCalls.map((c) => c.join(" "));
+      expect(cmds.some((c) => c.includes("bun add -g @openparachute/vault"))).toBe(true);
+      expect(cmds.some((c) => c.includes("bun add -g @openparachute/scribe"))).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("scribe sub-form: provider=none skips scribe install, only vault fires", async () => {
+    // Operator can explicitly opt out of scribe. Vault install still
+    // fires; scribe install does NOT. Redirect URL has only `?op=`,
+    // no `&op_scribe=`.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession, SESSION_COOKIE_NAME: SC } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const runCalls: string[][] = [];
+      const stubbedRun = async (cmd: readonly string[]) => {
+        runCalls.push([...cmd]);
+        return 0;
+      };
+      const post = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          body: new URLSearchParams({
+            [CSRF_FIELD_NAME]: csrf,
+            scribe_provider: "none",
+          }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SC}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          issuer: "https://hub.example",
+          supervisor: makeSupervisor(),
+          registry: getDefaultOperationsRegistry(),
+          run: stubbedRun,
+        },
+      );
+      expect(post.status).toBe(303);
+      const location = post.headers.get("location") ?? "";
+      expect(location).toMatch(/op=/);
+      expect(location).not.toMatch(/op_scribe=/);
+      await new Promise((r) => setTimeout(r, 50));
+      const cmds = runCalls.map((c) => c.join(" "));
+      expect(cmds.some((c) => c.includes("bun add -g @openparachute/vault"))).toBe(true);
+      expect(cmds.some((c) => c.includes("bun add -g @openparachute/scribe"))).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
   test("idempotent — second POST while supervisor is running doesn't fire a second `bun add` (N2)", async () => {
     // Reviewer-flagged race: two concurrent POSTs before either seeds
     // services.json both pass `state.hasVault === false` and each fire
