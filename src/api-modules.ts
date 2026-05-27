@@ -80,15 +80,30 @@ function lookupModule(
 export const API_MODULES_REQUIRED_SCOPE = "parachute:host:auth";
 
 /**
- * Curated module short-names for v0.6 Render self-host. Marketplace is
- * Phase 2 — until then, the admin UI offers exactly these. Order is the
- * recommended install order (vault → app → notes → scribe → runner;
- * app auto-bootstraps notes-ui on first boot — `notes` here is the
- * notes-daemon back-compat install path retained for operators still on
- * the pre-app architecture; scribe + runner come last because they
- * depend on a working vault + app to be useful).
+ * Curated module short-names. The admin UI offers exactly these for install
+ * + management. Order is the recommended install order (vault first, scribe
+ * second).
+ *
+ * Trimmed 2026-05-27 (Aaron-directed launch focus) from the prior set of
+ * `["vault", "surface", "notes", "scribe", "runner"]`. The dropped modules
+ * are still published on npm and still work — they're just not the focus:
+ *
+ *   - `notes` (notes-daemon): retired. Notes-UI now lives at
+ *     `notes.parachute.computer` as a hosted SPA — operators don't install
+ *     a notes daemon anymore. The npm package `@openparachute/notes-ui`
+ *     is a library imported by `parachute-surface` and by custom-surface
+ *     builders.
+ *   - `surface` (host module): de-emphasized. `@openparachute/surface-client`
+ *     remains the canonical library for folks building their own UIs
+ *     against a Parachute hub; running the surface-host module on your
+ *     own box is no longer the headline path (use notes.parachute.computer
+ *     or build your own).
+ *   - `runner`: experimental, not in the focus set for launch.
+ *
+ * Re-adding any of these is one line — keep the list small until use
+ * cases demand otherwise.
  */
-export const CURATED_MODULES = ["vault", "surface", "notes", "scribe", "runner"] as const;
+export const CURATED_MODULES = ["vault", "scribe"] as const;
 export type CuratedModuleShort = (typeof CURATED_MODULES)[number];
 
 export interface ApiModulesDeps {
