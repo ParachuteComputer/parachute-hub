@@ -659,6 +659,21 @@ async function parseResetPasswordBody(
 }
 
 /**
+ * Resource-server revocation-cache TTL surfaced in the reset-password
+ * response (smoke 2026-05-27, finding 3). Mirrors
+ * `REVOCATION_CACHE_TTL_MS = 60_000` in
+ * `packages/scope-guard/src/revocation-cache.ts`. Duplicated as a
+ * constant here (not imported) because hub never imports scope-guard
+ * — hub is the issuer + revocation-list publisher; scope-guard runs
+ * at resource servers (vault, scribe, etc.) on the validation side.
+ * Crossing that dependency boundary just to share a constant would
+ * invert the architecture. If the TTL ever changes, update both
+ * places (the scope-guard CHANGELOG entry pins the wire contract;
+ * this constant is the operator-facing surface).
+ */
+export const REVOCATION_LAG_SECONDS = 60;
+
+/**
  * POST /api/users/:id/reset-password — admin sets a new temp password
  * for a non-admin user. The user is force-redirected through
  * `/account/change-password` on next sign-in (same rail as admin-created
@@ -679,10 +694,33 @@ async function parseResetPasswordBody(
  *   7. `resetUserPassword` — rotates hash, flips `password_changed=0`,
  *      revokes the user's still-active tokens, all in one tx.
  *
- * Response on success: `200 { ok: true, user: <wire shape> }`. We
- * deliberately don't echo the password — the admin already typed it
- * and will hand it to the friend out-of-band (Signal, in-person —
- * same as the create-user default-password flow).
+ * Response on success: `200 { ok: true, user: <wire shape>,
+ * revocation_lag_seconds: 60 }`. We deliberately don't echo the
+ * password — the admin already typed it and will hand it to the
+ * friend out-of-band (Signal, in-person — same as the create-user
+ * default-password flow).
+ *
+ * **Revocation propagation lag** (smoke 2026-05-27, finding 3):
+ * `resetUserPassword` marks tokens revoked in hub's DB immediately
+ * AND hub's `/.well-known/parachute-revocation.json` reflects the
+ * new revocation on the next fetch. BUT resource servers (vault,
+ * scribe, etc.) cache the revocation list via scope-guard's
+ * `REVOCATION_CACHE_TTL_MS = 60_000` — they may continue accepting
+ * the revoked token for up to 60 seconds after this call returns.
+ *
+ * - Friend-forgot-pw recovery path: fine. No adversary; the user
+ *   re-authenticates and the lag is invisible.
+ * - Stolen-device / "kill the friend's tokens NOW" path: a
+ *   meaningful exposure window. Operator should also restart the
+ *   affected resource servers (`parachute restart vault`, etc.) to
+ *   flush the cache immediately.
+ *
+ * The `revocation_lag_seconds` field in the response surfaces this
+ * to API clients (admin SPA's reset-password success banner) so
+ * the lag isn't a silent gotcha. The TTL is deliberate (network-
+ * cost tradeoff per the scope-guard CHANGELOG); changing it is a
+ * separate design question (cf. smoke 2026-05-27 Bug 3 mitigation
+ * option 2: inline cache-bust trigger).
  */
 export async function handleResetUserPassword(
   req: Request,
@@ -738,10 +776,22 @@ export async function handleResetUserPassword(
   // + bumped `updated_at`. Cheap (single SELECT). Saves the SPA a refetch
   // to see the row's "pending first login" badge come back.
   const fresh = getUserById(deps.db, userId);
-  return new Response(JSON.stringify({ ok: true, user: fresh ? toWire(fresh) : null }), {
-    status: 200,
-    headers: { "content-type": "application/json", "cache-control": "no-store" },
-  });
+  // `revocation_lag_seconds`: smoke 2026-05-27 finding 3. Resource
+  // servers cache the revocation list for up to 60s; surface that so
+  // the SPA's success banner can warn operators in the
+  // stolen-device-recovery threat model. See REVOCATION_LAG_SECONDS
+  // doc + handler docstring above.
+  return new Response(
+    JSON.stringify({
+      ok: true,
+      user: fresh ? toWire(fresh) : null,
+      revocation_lag_seconds: REVOCATION_LAG_SECONDS,
+    }),
+    {
+      status: 200,
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    },
+  );
 }
 
 function describeUsernameReason(reason: "format" | "length" | "reserved"): string {

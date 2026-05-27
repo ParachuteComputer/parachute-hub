@@ -663,6 +663,30 @@ describe("handleResetUserPassword", () => {
     expect(await verifyPassword(fresh!, "alice-strong-passphrase")).toBe(false);
   });
 
+  test("response body includes revocation_lag_seconds = 60 so clients can surface the propagation lag (smoke 2026-05-27 finding 3)", async () => {
+    // Resource servers cache the revocation list via scope-guard's
+    // REVOCATION_CACHE_TTL_MS = 60_000 — so even though hub marks the
+    // user's tokens revoked immediately and publishes them on the
+    // revocation list, vault/scribe/etc. may keep accepting the
+    // revoked token for up to 60 seconds. For the stolen-device
+    // recovery threat model that's a meaningful exposure window
+    // the admin needs to know about. Surface the lag in the
+    // response body so the SPA's success banner can warn operators.
+    const { bearer } = await makeAdminBearer();
+    const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+    });
+    const res = await post(bearer, friend.id, { new_password: "new-temp-passphrase" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      user: unknown;
+      revocation_lag_seconds: number;
+    };
+    expect(body.revocation_lag_seconds).toBe(60);
+  });
+
   test("revokes the friend's existing tokens (pre-reset token row has revoked_at after)", async () => {
     const { bearer } = await makeAdminBearer();
     const friend = await createUser(harness.db, "alice", "alice-strong-passphrase", {

@@ -36,6 +36,7 @@ import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
+import { isLinked as defaultIsLinked } from "./bun-link.ts";
 import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
 import { getModuleInstallChannel } from "./hub-settings.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
@@ -187,6 +188,21 @@ export interface ApiModulesOpsDeps {
    * null when not found.
    */
   findGlobalInstall?: (pkg: string) => string | null;
+  /**
+   * Override `isLinked` (test seam). Production probes bun's globals
+   * for a symlink-shaped entry under `<prefix>/node_modules/<pkg>` —
+   * true iff the package was installed via `bun link` from a local
+   * checkout. When true, `runInstall` skips `bun add -g <pkg>`
+   * entirely; the linked checkout already provides the binary on
+   * PATH and `bun add -g` would either be a wasted npm round-trip
+   * or fail outright on unrelated global-lockfile noise (smoke
+   * 2026-05-27 finding 1).
+   *
+   * Mirrors the CLI install path's `isLinked` short-circuit in
+   * `commands/install.ts`. Both paths use the same `src/bun-link.ts`
+   * helper so they can't drift again.
+   */
+  isLinked?: (pkg: string) => boolean;
   /**
    * Extra env vars merged onto the supervised child at spawn time (hub#267).
    *
@@ -543,23 +559,43 @@ export async function runInstall(
   // without a hub restart.
   const channel = resolveApiInstallChannel(channelOverride, deps);
   const spec_str = `${spec.package}@${channel}`;
-  registry.update(opId, { status: "running" }, `running bun add -g ${spec_str}`);
-  const code = await run(["bun", "add", "-g", spec_str]);
-  if (code !== 0) {
-    // Bun 1.2.x lockfile-recovery noise: probe the global prefix
-    // before treating non-zero as fatal. Mirrors the same defense in
-    // commands/install.ts.
-    const findGlobalInstall = deps.findGlobalInstall;
-    const probed = findGlobalInstall?.(spec.package) ?? null;
-    if (!probed) {
-      registry.update(
-        opId,
-        { status: "failed", error: `bun add -g exited ${code}` },
-        `bun add -g ${spec_str} failed (exit ${code})`,
-      );
-      return;
+  // bun-link short-circuit (smoke 2026-05-27, finding 1): mirror the
+  // CLI install path's `isLinked` check. When the package is already
+  // linked globally via `bun link <abspath>` (the standard local-dev
+  // shape — Aaron + every workspace contributor runs this way), the
+  // linked checkout already provides the binary on PATH. `bun add -g`
+  // is at best a wasted ~3s npm round-trip and at worst a hard failure
+  // on unrelated global-lockfile noise (one stale entry can crash the
+  // whole `bun add`, failing the wizard's vault step even though the
+  // linked vault is fine). The wizard's parallel install path diverged
+  // pre-this-fix; the shared `src/bun-link.ts` keeps both paths in
+  // lockstep going forward.
+  const isLinked = deps.isLinked ?? defaultIsLinked;
+  if (isLinked(spec.package)) {
+    registry.update(
+      opId,
+      { status: "running" },
+      `${spec.package} is already linked globally (bun link) — skipping bun add -g`,
+    );
+  } else {
+    registry.update(opId, { status: "running" }, `running bun add -g ${spec_str}`);
+    const code = await run(["bun", "add", "-g", spec_str]);
+    if (code !== 0) {
+      // Bun 1.2.x lockfile-recovery noise: probe the global prefix
+      // before treating non-zero as fatal. Mirrors the same defense in
+      // commands/install.ts.
+      const findGlobalInstall = deps.findGlobalInstall;
+      const probed = findGlobalInstall?.(spec.package) ?? null;
+      if (!probed) {
+        registry.update(
+          opId,
+          { status: "failed", error: `bun add -g exited ${code}` },
+          `bun add -g ${spec_str} failed (exit ${code})`,
+        );
+        return;
+      }
+      registry.update(opId, {}, `bun add reported exit ${code} but package landed at ${probed}`);
     }
-    registry.update(opId, {}, `bun add reported exit ${code} but package landed at ${probed}`);
   }
 
   // Seed services.json if absent (the install flow does this for the

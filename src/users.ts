@@ -423,6 +423,19 @@ export async function setPassword(
  * on bun:sqlite is sync; doing it inside silently breaks atomicity (same
  * constraint api-account.ts:399 documents for the change-password POST).
  *
+ * **Revocation propagation lag (smoke 2026-05-27, finding 3)**: this
+ * function marks tokens revoked in hub's DB immediately. Hub's
+ * `/.well-known/parachute-revocation.json` reflects the new revocation
+ * on the next fetch. BUT resource servers (vault, scribe, etc.) consult
+ * the revocation list via scope-guard's `REVOCATION_CACHE_TTL_MS = 60_000`
+ * cache — so they may continue accepting the revoked token for up to
+ * 60 seconds after this call returns. For the "friend forgot pw"
+ * recovery path this is fine (no adversary). For the "stolen device,
+ * kill the friend's tokens NOW" path it's a meaningful exposure
+ * window — operators in that scenario should also restart the
+ * affected resource servers to flush their cache. See
+ * `REVOCATION_LAG_SECONDS` for the value surfaced to API callers.
+ *
  * Caller responsibilities (not enforced here):
  *   - Validate `newPassword` first (`validatePassword`) — this helper
  *     trusts the input and runs argon2id over whatever it gets.

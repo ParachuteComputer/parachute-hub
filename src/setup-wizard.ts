@@ -224,6 +224,18 @@ export interface SetupWizardDeps {
   /** Test seam: stub `bun add` / `bun remove` runner. */
   run?: (cmd: readonly string[]) => Promise<number>;
   /**
+   * Test seam: stub the bun-link detection used by `runInstall` to
+   * short-circuit `bun add -g` when a package is already linked
+   * locally (smoke 2026-05-27 finding 1). Production omits this and
+   * the production detection at `src/bun-link.ts` probes the real
+   * filesystem. Tests that need to assert "bun add -g WAS called"
+   * pass `() => false`; tests asserting the skip path pass `() => true`.
+   *
+   * Threaded through to `ApiModulesOpsDeps.isLinked` on every
+   * `runInstall` call from the wizard.
+   */
+  isLinked?: (pkg: string) => boolean;
+  /**
    * Test seam: override the process env that `detectAutoExposeMode`
    * consults. Production omits this and the helper reads `process.env`
    * directly. Setting in tests lets the auto-skip branch be exercised
@@ -1447,15 +1459,26 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       // /admin/tokens.
       const mintedToken = getSetting(deps.db, "setup_minted_token");
       if (mintedToken) deleteSetting(deps.db, "setup_minted_token");
-      // hub#267: the operator-typed vault name lives in hub_settings
-      // (persisted by handleSetupVaultPost). Fall back to scanning
-      // services.json — covers wizard runs from before this PR where
-      // setup_vault_name wasn't written. The services.json read
-      // returns the path-tail; vault's own first-boot write produces
-      // the canonical name so the two should agree once the vault
-      // boots authoritatively.
+      // Prefer the LIVE vault name from services.json over the
+      // operator-typed value cached in hub_settings (smoke
+      // 2026-05-27, finding 2). The cached value is what the
+      // operator typed into the wizard form — fine on the happy
+      // path, but stale if the vault install failed and the
+      // operator worked around it (e.g. installed vault under a
+      // different name via the CLI). The "static-write + stale-
+      // read" pattern Aaron's flagged repeatedly:
+      // `feedback_static_vs_dynamic_state.md`. Read state
+      // dynamically when it can change.
+      //
+      // Fall back to the DB setting only if services.json has no
+      // vault entry — covers a transient "wizard hit done but
+      // vault is still pending" race where the operator-typed
+      // value is the only signal we have. Final fallback is
+      // "default" so the rendered name is always something the
+      // operator can act on.
+      const liveName = firstVaultNameOrNull(deps.manifestPath);
       const storedName = getSetting(deps.db, "setup_vault_name");
-      const vaultName = storedName ?? firstVaultName(deps.manifestPath);
+      const vaultName = liveName ?? storedName ?? "default";
       // Module install tiles (hub#272 Item B). One per curated module
       // other than vault (which the wizard already provisioned).
       const installTiles = buildInstallTiles(url, deps);
@@ -1836,6 +1859,7 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
       supervisor: deps.supervisor,
       registry,
       ...(deps.run ? { run: deps.run } : {}),
+      ...(deps.isLinked ? { isLinked: deps.isLinked } : {}),
       ...(Object.keys(spawnEnv).length > 0 ? { spawnEnv } : {}),
     }).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1903,6 +1927,7 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
         supervisor: deps.supervisor,
         registry,
         ...(deps.run ? { run: deps.run } : {}),
+        ...(deps.isLinked ? { isLinked: deps.isLinked } : {}),
       }).catch((err) => {
         const msg = err instanceof Error ? err.message : String(err);
         registry.update(
@@ -2261,6 +2286,7 @@ export async function handleSetupInstallPost(
       supervisor: deps.supervisor,
       registry,
       ...(deps.run ? { run: deps.run } : {}),
+      ...(deps.isLinked ? { isLinked: deps.isLinked } : {}),
     }).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       registry.update(op.id, { status: "failed", error: msg }, `install failed: ${msg}`);
@@ -2310,17 +2336,21 @@ function isModuleInstalled(short: CuratedModuleShort, manifestPath: string): boo
 }
 
 /**
- * Read the first vault's display name from services.json for the
- * step-4 success page. Falls back to "default" if for any reason the
- * entry's metadata isn't present.
+ * Read the first vault's display name from services.json. Returns
+ * null when services.json has no vault entry or the entry has no
+ * `/vault/<name>` path — used by the done step to detect "no live
+ * vault, fall back to the operator-typed value." Distinguishing
+ * "no live vault" from "live vault named default" matters: the
+ * former should defer to the DB-cached name; the latter should
+ * win over a possibly-stale DB cache (smoke 2026-05-27 finding 2).
  */
-function firstVaultName(manifestPath: string): string {
+function firstVaultNameOrNull(manifestPath: string): string | null {
   const manifest = readManifestLenient(manifestPath);
   // Match on the canonical vault manifestName from the curated spec.
   // (`CURATED_MODULES.includes("vault")` was a dead guard — vault is a
   // tuple-literal member, so the conjunct is always true.)
   const entry = manifest.services.find((s) => s.name === specFor("vault").manifestName);
-  if (!entry) return "default";
+  if (!entry) return null;
   // services.json entries store the mount path (e.g. `/vault/default`).
   // Strip the canonical prefix to surface the display name.
   for (const p of entry.paths ?? []) {
@@ -2329,7 +2359,7 @@ function firstVaultName(manifestPath: string): string {
       if (tail.length > 0) return tail;
     }
   }
-  return "default";
+  return null;
 }
 
 function htmlResponse(body: string, status = 200, extra: Record<string, string> = {}): Response {

@@ -663,6 +663,13 @@ function ListRendered({
                       >
                         Password reset for <code>{resetDone.username}</code>. Hand them the new
                         password and tell them they'll be prompted to change it on first sign-in.
+                        <div className="muted" style={{ marginTop: "0.5rem", fontSize: "0.85em" }}>
+                          Their existing tokens are revoked. Resource servers (vault, scribe, etc.)
+                          cache the revocation list for up to 60 seconds — if you're resetting
+                          because of a suspected compromise, also restart the affected services
+                          (e.g. <code>parachute restart vault</code>) to flush their cache
+                          immediately.
+                        </div>
                         <div style={{ marginTop: "0.5rem" }}>
                           <button
                             type="button"
