@@ -175,6 +175,14 @@ function defaultProbeHubDbHasUserPassword(dbPath: string): boolean | undefined {
     db = new Database(dbPath, { readonly: true }) as typeof db;
     // COUNT(*) over users with non-empty password_hash. `length(...) > 0`
     // matches the "missing/empty hash" treatment from the YAML side.
+    //
+    // Why "any user with a hash" not "first admin specifically": friend
+    // accounts can only be created by an already-authenticated admin
+    // (per api-users.ts's host:admin gate), so any user-with-hash
+    // implies the first admin has one too. Equivalent in practice and
+    // simpler than a JOIN on earliest-created-at. A future env-seed
+    // flow that creates friend accounts before the operator sets a
+    // password would need to revisit this assumption.
     const row = db?.prepare(
       "SELECT COUNT(*) AS n FROM users WHERE password_hash IS NOT NULL AND length(password_hash) > 0",
     ).get() as { n: number } | null;
