@@ -35,6 +35,13 @@ export function safelistEntries(): Set<string> {
     ...knownServices(),
     "lens",
     "hub",
+    "hub.db",
+    // SQLite WAL-mode companion files. Created automatically when hub
+    // opens the DB in WAL mode and removed on clean close. Catching them
+    // by exact name covers the steady-state shape; a future SQLite mode
+    // change would surface them again here.
+    "hub.db-wal",
+    "hub.db-shm",
     "services.json",
     "expose-state.json",
     "well-known",

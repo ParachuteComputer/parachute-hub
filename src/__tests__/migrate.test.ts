@@ -39,6 +39,12 @@ function seedSafelist(configDir: string): void {
   mkdirSync(join(configDir, "well-known"), { recursive: true });
   touch(join(configDir, "services.json"), '{"services":[]}');
   touch(join(configDir, "expose-state.json"), "{}");
+  // hub.db + SQLite WAL companions — the steady-state shape on any
+  // running hub. Catching the "clean install flagged hub.db" regression
+  // means seeding them as safelist items in every test fixture.
+  touch(join(configDir, "hub.db"), "");
+  touch(join(configDir, "hub.db-wal"), "");
+  touch(join(configDir, "hub.db-shm"), "");
 }
 
 describe("safelistEntries", () => {
@@ -59,6 +65,12 @@ describe("safelistEntries", () => {
     expect(s.has("services.json")).toBe(true);
     expect(s.has("expose-state.json")).toBe(true);
     expect(s.has("well-known")).toBe(true);
+    // Hub DB + SQLite WAL companions. Caught on a fresh EC2 install
+    // 2026-05-27 where the only thing at ~/.parachute/ was hub.db
+    // (hub started but no modules installed) and migrate flagged it.
+    expect(s.has("hub.db")).toBe(true);
+    expect(s.has("hub.db-wal")).toBe(true);
+    expect(s.has("hub.db-shm")).toBe(true);
   });
 });
 
