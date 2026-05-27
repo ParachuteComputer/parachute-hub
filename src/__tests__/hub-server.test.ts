@@ -995,22 +995,22 @@ describe("hubFetch routing", () => {
   });
 
   // Notes-as-app migration Phase 2 (parachute-app design doc §16).
-  // `/notes/*` 301-redirects to `/app/notes/*` so legacy bookmarks land
+  // `/notes/*` 301-redirects to `/surface/notes/*` so legacy bookmarks land
   // on the apps-hosted Notes. Tested with no DB (the migration-default
   // path — absent DB or absent row means redirect-on).
-  test("301: /notes/ → /app/notes/", async () => {
+  test("301: /notes/ → /surface/notes/", async () => {
     clearNotesRedirectLogState();
     const h = makeHarness();
     try {
       const res = await hubFetch(h.dir)(req("/notes/"));
       expect(res.status).toBe(301);
-      expect(res.headers.get("location")).toBe("/app/notes/");
+      expect(res.headers.get("location")).toBe("/surface/notes/");
     } finally {
       h.cleanup();
     }
   });
 
-  test("301: bare /notes → /app/notes", async () => {
+  test("301: bare /notes → /surface/notes", async () => {
     // The bare-prefix form (no trailing slash) is the path browsers land
     // on when an operator types `https://hub.example/notes` directly.
     clearNotesRedirectLogState();
@@ -1018,7 +1018,7 @@ describe("hubFetch routing", () => {
     try {
       const res = await hubFetch(h.dir)(req("/notes"));
       expect(res.status).toBe(301);
-      expect(res.headers.get("location")).toBe("/app/notes");
+      expect(res.headers.get("location")).toBe("/surface/notes");
     } finally {
       h.cleanup();
     }
@@ -1030,7 +1030,7 @@ describe("hubFetch routing", () => {
     try {
       const res = await hubFetch(h.dir)(req("/notes/some/path?q=1&n=2"));
       expect(res.status).toBe(301);
-      expect(res.headers.get("location")).toBe("/app/notes/some/path?q=1&n=2");
+      expect(res.headers.get("location")).toBe("/surface/notes/some/path?q=1&n=2");
     } finally {
       h.cleanup();
     }
@@ -2240,7 +2240,7 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
     // motivator for the `--mount` strip in notes-serve.ts).
     //
     // Post-parachute-app §16 Phase 2 the `/notes/*` path 301-redirects to
-    // `/app/notes/*` by default. This test pins the notes-as-module legacy
+    // `/surface/notes/*` by default. This test pins the notes-as-module legacy
     // path (notes-daemon still serving its own mount); set the opt-out
     // flag so the dispatch falls through to the generic proxy.
     const h = makeHarness();
@@ -3453,7 +3453,7 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
   // Pins the proxy-side wiring of the chrome strip from
   // `parachute-patterns/patterns/design-system.md` §7 — every proxied
   // text/html response gets the strip injected after the first `<body>`,
-  // with opt-outs for `/app/notes/*` (the Notes PWA owns its own chrome).
+  // with opt-outs for `/surface/notes/*` (the Notes PWA owns its own chrome).
   // The pure rewrite + opt-out logic is covered in chrome-strip.test.ts;
   // here we exercise the dispatch integration end-to-end through hubFetch.
 
@@ -3608,7 +3608,7 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
     }
   });
 
-  test("does NOT inject chrome on /app/notes/* (Notes PWA owns its own chrome)", async () => {
+  test("does NOT inject chrome on /surface/notes/* (Notes PWA owns its own chrome)", async () => {
     const h = makeHarness();
     const upstream = startHtmlUpstream("<html><body><h1>Notes</h1></body></html>");
     try {
@@ -3616,10 +3616,10 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
         {
           services: [
             {
-              name: "parachute-app",
+              name: "parachute-surface",
               port: upstream.port,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/surface"],
+              health: "/surface/health",
               version: "0.1.0",
             },
           ],
@@ -3627,7 +3627,7 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
         h.manifestPath,
       );
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/app/notes/"));
+      const res = await fetcher(req("/surface/notes/"));
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toBe("<html><body><h1>Notes</h1></body></html>");
@@ -3638,7 +3638,7 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
     }
   });
 
-  test("DOES inject chrome on /app/admin/* (parachute-app admin, not Notes)", async () => {
+  test("DOES inject chrome on /surface/admin/* (parachute-app admin, not Notes)", async () => {
     const h = makeHarness();
     const upstream = startHtmlUpstream("<html><body>app admin</body></html>");
     try {
@@ -3646,10 +3646,10 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
         {
           services: [
             {
-              name: "parachute-app",
+              name: "parachute-surface",
               port: upstream.port,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/surface"],
+              health: "/surface/health",
               version: "0.1.0",
             },
           ],
@@ -3657,7 +3657,7 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
         h.manifestPath,
       );
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/app/admin/"));
+      const res = await fetcher(req("/surface/admin/"));
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("pc-chrome");
@@ -3668,7 +3668,7 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
     }
   });
 
-  test("does NOT inject on /app/notes/ sub-paths (asset requests)", async () => {
+  test("does NOT inject on /surface/notes/ sub-paths (asset requests)", async () => {
     const h = makeHarness();
     const upstream = startHtmlUpstream("<html><body>asset shell</body></html>");
     try {
@@ -3676,10 +3676,10 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
         {
           services: [
             {
-              name: "parachute-app",
+              name: "parachute-surface",
               port: upstream.port,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/surface"],
+              health: "/surface/health",
               version: "0.1.0",
             },
           ],
@@ -3687,7 +3687,7 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
         h.manifestPath,
       );
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/app/notes/index.html"));
+      const res = await fetcher(req("/surface/notes/index.html"));
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).not.toContain("pc-chrome");

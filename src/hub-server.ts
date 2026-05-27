@@ -23,7 +23,7 @@
  *   /admin/login, /admin/logout                → 301 → /login, /logout
  *
  *   # Notes-as-app migration Phase 2 (parachute-app design doc §16).
- *   /notes, /notes/, /notes/*                  → 301 → /app/notes[/...]
+ *   /notes, /notes/, /notes/*                  → 301 → /surface/notes[/...]
  *                                                (opt-out via
  *                                                 hub_settings.notes_redirect_disabled)
  *
@@ -1199,7 +1199,7 @@ export function hubFetch(
     }
 
     // Notes-as-app migration Phase 2 (parachute-app design doc §16).
-    // `/notes/*` 301-redirects to `/app/notes/*` so legacy bookmarks land on
+    // `/notes/*` 301-redirects to `/surface/notes/*` so legacy bookmarks land on
     // the apps-hosted Notes. Default-on; operators on notes-as-module-only
     // installs can opt out via `hub_settings.notes_redirect_disabled = true`
     // (see hub-settings.ts). The opt-out exists so a legacy operator
@@ -2032,7 +2032,7 @@ export function hubFetch(
  * Inject the persistent chrome strip (workstream G) into a proxied response.
  *
  * Skips the rewrite when the response is non-200, non-HTML, on an opt-out
- * path (e.g. `/app/notes/*`), or larger than `MAX_INJECT_SIZE_BYTES`.
+ * path (e.g. `/surface/notes/*`), or larger than `MAX_INJECT_SIZE_BYTES`.
  * `injectChromeIntoResponse` is the no-side-effects implementation; this
  * wrapper threads in the session-aware chrome HTML and a `set-cookie`
  * append when a fresh CSRF cookie was minted.

@@ -1,5 +1,5 @@
 /**
- * Tests for the `/notes/*` → `/app/notes/*` redirect helper (Notes-as-app
+ * Tests for the `/notes/*` → `/surface/notes/*` redirect helper (Notes-as-app
  * migration Phase 2, parachute-app design doc §16).
  *
  * Covers the path-match predicate, the target-URL builder, the DB-aware
@@ -52,30 +52,30 @@ describe("notes-redirect — isLegacyNotesPath", () => {
 });
 
 describe("notes-redirect — buildNotesRedirectTarget", () => {
-  test("rewrites the bare path /notes → /app/notes", () => {
-    expect(buildNotesRedirectTarget("/notes", "")).toBe("/app/notes");
+  test("rewrites the bare path /notes → /surface/notes", () => {
+    expect(buildNotesRedirectTarget("/notes", "")).toBe("/surface/notes");
   });
 
-  test("rewrites the trailing-slash form /notes/ → /app/notes/", () => {
-    expect(buildNotesRedirectTarget("/notes/", "")).toBe("/app/notes/");
+  test("rewrites the trailing-slash form /notes/ → /surface/notes/", () => {
+    expect(buildNotesRedirectTarget("/notes/", "")).toBe("/surface/notes/");
   });
 
-  test("rewrites a sub-path /notes/sw.js → /app/notes/sw.js", () => {
-    expect(buildNotesRedirectTarget("/notes/sw.js", "")).toBe("/app/notes/sw.js");
+  test("rewrites a sub-path /notes/sw.js → /surface/notes/sw.js", () => {
+    expect(buildNotesRedirectTarget("/notes/sw.js", "")).toBe("/surface/notes/sw.js");
   });
 
   test("preserves a single-param query string", () => {
-    expect(buildNotesRedirectTarget("/notes/foo", "?q=1")).toBe("/app/notes/foo?q=1");
+    expect(buildNotesRedirectTarget("/notes/foo", "?q=1")).toBe("/surface/notes/foo?q=1");
   });
 
   test("preserves a multi-param query string verbatim (no re-encoding)", () => {
     expect(buildNotesRedirectTarget("/notes/foo", "?a=1&b=hello%20world")).toBe(
-      "/app/notes/foo?a=1&b=hello%20world",
+      "/surface/notes/foo?a=1&b=hello%20world",
     );
   });
 
   test("preserves the bare /notes + query (no trailing slash on rewrite)", () => {
-    expect(buildNotesRedirectTarget("/notes", "?next=foo")).toBe("/app/notes?next=foo");
+    expect(buildNotesRedirectTarget("/notes", "?next=foo")).toBe("/surface/notes?next=foo");
   });
 });
 
@@ -90,13 +90,13 @@ describe("notes-redirect — maybeRedirectNotes", () => {
     // Absent DB defaults to redirect-on — the migration-default direction.
     // Operators flipping the opt-out flag have a hub-with-DB; the default
     // doesn't depend on DB readiness.
-    expect(maybeRedirectNotes("/notes/foo", "?q=1", undefined)).toBe("/app/notes/foo?q=1");
+    expect(maybeRedirectNotes("/notes/foo", "?q=1", undefined)).toBe("/surface/notes/foo?q=1");
   });
 
   test("returns the target URL when the path matches and the flag is absent (default)", () => {
     const db = openHubDb(hubDbPath(dir));
     try {
-      expect(maybeRedirectNotes("/notes/foo", "", db)).toBe("/app/notes/foo");
+      expect(maybeRedirectNotes("/notes/foo", "", db)).toBe("/surface/notes/foo");
     } finally {
       db.close();
     }
@@ -109,7 +109,7 @@ describe("notes-redirect — maybeRedirectNotes", () => {
     try {
       setNotesRedirectDisabled(db, true);
       setNotesRedirectDisabled(db, false);
-      expect(maybeRedirectNotes("/notes/foo", "", db)).toBe("/app/notes/foo");
+      expect(maybeRedirectNotes("/notes/foo", "", db)).toBe("/surface/notes/foo");
     } finally {
       db.close();
     }
@@ -144,18 +144,18 @@ describe("notes-redirect — logNotesRedirect (throttled)", () => {
 
   test("logs once on the first hit", () => {
     const lines: string[] = [];
-    logNotesRedirect("/notes/foo", "/app/notes/foo", {
+    logNotesRedirect("/notes/foo", "/surface/notes/foo", {
       now: () => 1_000_000,
       log: (m) => lines.push(m),
     });
-    expect(lines).toEqual(["[notes-migration] redirect /notes/foo → /app/notes/foo"]);
+    expect(lines).toEqual(["[notes-migration] redirect /notes/foo → /surface/notes/foo"]);
   });
 
   test("throttles repeated hits to the same path within the window", () => {
     const lines: string[] = [];
     // Five hits within a 10-second span — well inside the 60-second window.
     for (let i = 0; i < 5; i++) {
-      logNotesRedirect("/notes/foo", "/app/notes/foo", {
+      logNotesRedirect("/notes/foo", "/surface/notes/foo", {
         now: () => 1_000_000 + i * 2_000,
         log: (m) => lines.push(m),
       });
@@ -165,12 +165,12 @@ describe("notes-redirect — logNotesRedirect (throttled)", () => {
 
   test("re-logs the same path after the window expires", () => {
     const lines: string[] = [];
-    logNotesRedirect("/notes/foo", "/app/notes/foo", {
+    logNotesRedirect("/notes/foo", "/surface/notes/foo", {
       now: () => 1_000_000,
       log: (m) => lines.push(m),
     });
     // 60_001 ms later → window has rolled, log fires again.
-    logNotesRedirect("/notes/foo", "/app/notes/foo", {
+    logNotesRedirect("/notes/foo", "/surface/notes/foo", {
       now: () => 1_000_000 + 60_001,
       log: (m) => lines.push(m),
     });
@@ -179,11 +179,11 @@ describe("notes-redirect — logNotesRedirect (throttled)", () => {
 
   test("logs distinct paths independently (per-path bucket)", () => {
     const lines: string[] = [];
-    logNotesRedirect("/notes/foo", "/app/notes/foo", {
+    logNotesRedirect("/notes/foo", "/surface/notes/foo", {
       now: () => 1_000_000,
       log: (m) => lines.push(m),
     });
-    logNotesRedirect("/notes/bar", "/app/notes/bar", {
+    logNotesRedirect("/notes/bar", "/surface/notes/bar", {
       now: () => 1_000_000,
       log: (m) => lines.push(m),
     });

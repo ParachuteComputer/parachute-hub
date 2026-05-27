@@ -13,7 +13,7 @@
  * (above that threshold the response is almost certainly not an HTML shell
  * anyway — SPA index.html files are < 16 KB in this ecosystem).
  *
- * Opt-out: hub-side path-prefix deny list. The Notes PWA at `/app/notes/*`
+ * Opt-out: hub-side path-prefix deny list. The Notes PWA at `/surface/notes/*`
  * is the canonical opt-out — it owns its own chrome (see design-system §7
  * "Where NOT to inject" + AUDIT §4: "Notes is the proof this can work: own
  * application, looks distinctively Notes, reads as Parachute because the
@@ -22,7 +22,7 @@
  * Why path-based and not module-declared:
  *   - Notes is a `uis[]` sub-unit of parachute-app, not its own module —
  *     adding `chrome: "off"` to parachute-app's module.json would suppress
- *     chrome on `/app/admin/*` too (wrong: that surface SHOULD get chrome).
+ *     chrome on `/surface/admin/*` too (wrong: that surface SHOULD get chrome).
  *   - The per-uis well-known fan-out (workstream C/4) is in flight but the
  *     hub side doesn't yet thread per-uis metadata into proxy dispatch.
  *   - HTML meta-tag peeking adds parsing overhead on every response.
@@ -46,10 +46,10 @@ import { CSRF_FIELD_NAME, ensureCsrfToken } from "./csrf.ts";
  * prefix" or "pathname startsWith prefix" — the same shape as
  * `findServiceUpstream`'s mount comparison.
  *
- * `/app/notes/` covers the Notes PWA bundled by parachute-app. Notes is a
+ * `/surface/notes/` covers the Notes PWA bundled by parachute-app. Notes is a
  * destination, not chrome; it owns its own header (see design-system.md §7).
  */
-export const CHROME_OPT_OUT_PREFIXES: readonly string[] = ["/app/notes/"];
+export const CHROME_OPT_OUT_PREFIXES: readonly string[] = ["/surface/notes/"];
 
 /**
  * Buffer size cap. Responses larger than this are passed through unchanged.
@@ -208,8 +208,8 @@ function renderSignedOutCluster(nextPath: string): string {
  * when any opt-out prefix matches (`pathname === prefix` or
  * `pathname startsWith prefix`).
  *
- * Match shape mirrors `findServiceUpstream` so an opt-out for `"/app/notes/"`
- * suppresses chrome for `/app/notes`, `/app/notes/`, and every sub-path.
+ * Match shape mirrors `findServiceUpstream` so an opt-out for `"/surface/notes/"`
+ * suppresses chrome for `/surface/notes`, `/surface/notes/`, and every sub-path.
  */
 export function shouldInjectChrome(
   pathname: string,

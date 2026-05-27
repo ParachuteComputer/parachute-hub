@@ -171,7 +171,7 @@ describe("GET /api/modules", () => {
       supervisor_available: boolean;
     };
     // Curated order is preserved: vault → app → notes → scribe → runner.
-    expect(body.modules.map((m) => m.short)).toEqual(["vault", "app", "notes", "scribe", "runner"]);
+    expect(body.modules.map((m) => m.short)).toEqual(["vault", "surface", "notes", "scribe", "runner"]);
     expect(body.modules.every((m) => m.available)).toBe(true);
     expect(body.modules.every((m) => !m.installed)).toBe(true);
     expect(body.modules.every((m) => m.latest_version === "0.9.9")).toBe(true);
@@ -202,12 +202,12 @@ describe("GET /api/modules", () => {
         available: boolean;
       }>;
     };
-    const app = body.modules.find((m) => m.short === "app");
-    expect(app).toBeDefined();
-    expect(app?.package).toBe("@openparachute/app");
-    expect(app?.display_name).toBe("App");
-    expect(app?.tagline).toContain("auto-installs Notes");
-    expect(app?.available).toBe(true);
+    const surface = body.modules.find((m) => m.short === "surface");
+    expect(surface).toBeDefined();
+    expect(surface?.package).toBe("@openparachute/surface");
+    expect(surface?.display_name).toBe("Surface");
+    expect(surface?.tagline).toContain("auto-installs Notes");
+    expect(surface?.available).toBe(true);
   });
 
   test("runner row carries package + display props from FIRST_PARTY_FALLBACKS (#305)", async () => {
@@ -366,9 +366,9 @@ describe("GET /api/modules", () => {
   });
 
   test("management_url does not double-prepend mount when managementUrl is already mount-prefixed (hub#380)", async () => {
-    // Audit caught 2026-05-25: app declares `managementUrl: "/app/admin/"`
-    // (full hub-origin path) and `paths: ["/app", "/.parachute"]`. The
-    // SPA's Services dropdown was navigating to `/app/app/admin/` (404)
+    // Audit caught 2026-05-25: app declares `managementUrl: "/surface/admin/"`
+    // (full hub-origin path) and `paths: ["/surface", "/.parachute"]`. The
+    // SPA's Services dropdown was navigating to `/app/surface/admin/` (404)
     // because api-modules unconditionally prepended the mount onto the
     // candidate. Fix: detect already-mount-prefixed paths and pass through.
     //
@@ -376,12 +376,12 @@ describe("GET /api/modules", () => {
     // multi-instance modules (vault) use the per-instance relative form.
     writeManifest(h.manifestPath, [
       {
-        name: "parachute-app",
+        name: "parachute-surface",
         port: 1946,
-        paths: ["/app", "/.parachute"],
-        health: "/app/healthz",
+        paths: ["/surface", "/.parachute"],
+        health: "/surface/healthz",
         version: "0.2.0-rc.13",
-        installDir: "/install/dir/app",
+        installDir: "/install/dir/surface",
       },
     ]);
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
@@ -391,17 +391,17 @@ describe("GET /api/modules", () => {
       manifestPath: h.manifestPath,
       fetchLatestVersion: async () => null,
       readModuleManifest: async (installDir) => {
-        if (installDir === "/install/dir/app") {
+        if (installDir === "/install/dir/surface") {
           return {
-            name: "app",
-            manifestName: "parachute-app",
-            displayName: "App",
+            name: "surface",
+            manifestName: "parachute-surface",
+            displayName: "Surface",
             tagline: "",
             port: 1946,
-            paths: ["/app", "/.parachute"],
-            health: "/app/healthz",
-            uiUrl: "/app/admin/",
-            managementUrl: "/app/admin/",
+            paths: ["/surface", "/.parachute"],
+            health: "/surface/healthz",
+            uiUrl: "/surface/admin/",
+            managementUrl: "/surface/admin/",
           } as unknown as Awaited<
             ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
           >;
@@ -413,9 +413,9 @@ describe("GET /api/modules", () => {
     const body = (await res.json()) as {
       modules: Array<{ short: string; management_url: string | null }>;
     };
-    const app = body.modules.find((m) => m.short === "app");
-    // Single `/app/`, not `/app/app/`.
-    expect(app?.management_url).toBe("/app/admin/");
+    const surface = body.modules.find((m) => m.short === "surface");
+    // Single `/surface/`, not `/surface/surface/`.
+    expect(surface?.management_url).toBe("/surface/admin/");
   });
 
   test("management_url prefix-ish names don't collide (hub#380 — /app vs /app-foo)", async () => {
@@ -430,8 +430,8 @@ describe("GET /api/modules", () => {
       {
         name: "parachute-vault",
         port: 1940,
-        paths: ["/app"], // mount is /app (using vault as a stand-in installable)
-        health: "/app/health",
+        paths: ["/surface"], // mount is /app (using vault as a stand-in installable)
+        health: "/surface/health",
         version: "0.4.5",
         installDir: "/install/dir/contrived",
       },
@@ -450,8 +450,8 @@ describe("GET /api/modules", () => {
             displayName: "Vault",
             tagline: "",
             port: 1940,
-            paths: ["/app"],
-            health: "/app/health",
+            paths: ["/surface"],
+            health: "/surface/health",
             // candidate looks like a sibling-name prefix but is NOT a
             // mount-prefix of /app — should still get prepended.
             managementUrl: "/app-foo/admin",
@@ -467,9 +467,9 @@ describe("GET /api/modules", () => {
       modules: Array<{ short: string; management_url: string | null }>;
     };
     const vault = body.modules.find((m) => m.short === "vault");
-    // /app + /app-foo/admin → /app/app-foo/admin (prepend fires; not treated
-    // as already-mount-prefixed because /app-foo/ doesn't start with /app/).
-    expect(vault?.management_url).toBe("/app/app-foo/admin");
+    // /surface + /app-foo/admin → /surface/app-foo/admin (prepend fires; not
+    // treated as already-mount-prefixed because /app-foo/ doesn't start with /surface/).
+    expect(vault?.management_url).toBe("/surface/app-foo/admin");
   });
 
   test("management_url equality edge: tail equals mount exactly (hub#380)", async () => {

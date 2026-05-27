@@ -1079,7 +1079,7 @@ function renderInstallTile(tile: ModuleInstallTileState): string {
  * surface decision.
  */
 const USE_IT_NOW_URLS: Partial<Record<CuratedModuleShort, string>> = {
-  app: "/app/notes/",
+  surface: "/surface/notes/",
   notes: "/notes/",
   // Omitted: scribe + runner. They don't ship an admin SPA yet
   // (scribe#53, runner#8 track). Pointing "Use it now" at /scribe/admin
@@ -1231,7 +1231,7 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       // When parachute-app is installed alongside vault, the tile links
       // to `/app/notes/` (auto-bootstrapped Notes-as-UI per parachute-app
       // §17). Otherwise it falls back to the vault's own admin UI.
-      const appInstalled = isModuleInstalled("app", deps.manifestPath);
+      const appInstalled = isModuleInstalled("surface", deps.manifestPath);
       const doneProps: RenderDoneStepProps = {
         vaultName,
         hubOrigin: deps.issuer,
@@ -1711,9 +1711,9 @@ const INSTALL_TILE_PROPS: ReadonlyArray<{
   tagline: string;
 }> = [
   {
-    short: "app",
-    displayName: "App",
-    tagline: "Host module for Parachute UIs — auto-installs Notes on first boot.",
+    short: "surface",
+    displayName: "Surface",
+    tagline: "Host module for Parachute surfaces — auto-installs Notes on first boot.",
   },
   {
     short: "scribe",

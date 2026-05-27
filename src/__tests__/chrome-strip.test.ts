@@ -82,21 +82,21 @@ describe("shouldInjectChrome", () => {
     expect(shouldInjectChrome("/admin/vaults")).toBe(true);
     expect(shouldInjectChrome("/scribe/admin")).toBe(true);
     expect(shouldInjectChrome("/vault/default/admin/")).toBe(true);
-    expect(shouldInjectChrome("/app/admin/modules")).toBe(true);
+    expect(shouldInjectChrome("/surface/admin/modules")).toBe(true);
   });
 
-  test("default: opts out the Notes PWA at /app/notes/*", () => {
-    expect(shouldInjectChrome("/app/notes")).toBe(false);
-    expect(shouldInjectChrome("/app/notes/")).toBe(false);
-    expect(shouldInjectChrome("/app/notes/index.html")).toBe(false);
-    expect(shouldInjectChrome("/app/notes/assets/index-XXX.js")).toBe(false);
+  test("default: opts out the Notes PWA at /surface/notes/*", () => {
+    expect(shouldInjectChrome("/surface/notes")).toBe(false);
+    expect(shouldInjectChrome("/surface/notes/")).toBe(false);
+    expect(shouldInjectChrome("/surface/notes/index.html")).toBe(false);
+    expect(shouldInjectChrome("/surface/notes/assets/index-XXX.js")).toBe(false);
   });
 
   test("opt-out prefix matching does not over-match sibling paths", () => {
-    // `/app/notesbook` must NOT match `/app/notes/` — startsWith check
+    // `/surface/notesbook` must NOT match `/surface/notes/` — startsWith check
     // requires a trailing slash boundary.
-    expect(shouldInjectChrome("/app/notesbook")).toBe(true);
-    expect(shouldInjectChrome("/app/notes-archive/")).toBe(true);
+    expect(shouldInjectChrome("/surface/notesbook")).toBe(true);
+    expect(shouldInjectChrome("/surface/notes-archive/")).toBe(true);
   });
 
   test("custom opt-out list is honored", () => {
@@ -111,8 +111,8 @@ describe("shouldInjectChrome", () => {
     expect(shouldInjectChrome("/foo/bar", ["/foo"])).toBe(false);
   });
 
-  test("the canonical opt-out list contains /app/notes/", () => {
-    expect(CHROME_OPT_OUT_PREFIXES).toContain("/app/notes/");
+  test("the canonical opt-out list contains /surface/notes/", () => {
+    expect(CHROME_OPT_OUT_PREFIXES).toContain("/surface/notes/");
   });
 });
 
@@ -250,27 +250,27 @@ describe("injectChromeIntoResponse", () => {
     expect(cssOut).toBe(css);
   });
 
-  test("passes through responses on opt-out paths (/app/notes/) unchanged", async () => {
+  test("passes through responses on opt-out paths (/surface/notes/) unchanged", async () => {
     const res = new Response("<html><body>notes</body></html>", {
       status: 200,
       headers: { "content-type": "text/html" },
     });
     const out = await injectChromeIntoResponse(res, {
       chromeHtml: chrome,
-      pathname: "/app/notes/",
+      pathname: "/surface/notes/",
     });
     expect(out).toBe(res);
     expect(await out.text()).toBe("<html><body>notes</body></html>");
   });
 
-  test("passes through responses on opt-out sub-paths (/app/notes/assets/x.js)", async () => {
+  test("passes through responses on opt-out sub-paths (/surface/notes/assets/x.js)", async () => {
     const res = new Response("<html><body>notes</body></html>", {
       status: 200,
       headers: { "content-type": "text/html" },
     });
     const out = await injectChromeIntoResponse(res, {
       chromeHtml: chrome,
-      pathname: "/app/notes/index.html",
+      pathname: "/surface/notes/index.html",
     });
     expect(out).toBe(res);
   });

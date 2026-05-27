@@ -71,7 +71,7 @@ export type HubSettingKey =
   | "hub_origin"
   // Notes-as-app migration Phase 2 (parachute-app design doc §16).
   // When unset (default) or "false", hub serves a 301 redirect from
-  // `/notes/*` → `/app/notes/*` so existing bookmarks transparently
+  // `/notes/*` → `/surface/notes/*` so existing bookmarks transparently
   // follow the operator to the apps-hosted Notes. When "true", the
   // redirect is skipped and `/notes/*` falls through to the existing
   // services.json-driven proxy — the escape hatch for operators
@@ -372,7 +372,7 @@ export function setHubOrigin(db: Database, value: string | null): void {
 // --- domain helpers: notes-as-app redirect (parachute-app §16 Phase 2) ----
 
 /**
- * Read whether the `/notes/*` → `/app/notes/*` redirect is disabled. Default
+ * Read whether the `/notes/*` → `/surface/notes/*` redirect is disabled. Default
  * is `false` (redirect on) — Phase 2 migrates operators to apps-hosted
  * Notes, so the bookmark-friendly path is the default-on behavior. Only an
  * operator running notes-as-a-module without parachute-app installed should
