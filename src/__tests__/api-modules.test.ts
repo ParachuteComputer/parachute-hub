@@ -149,10 +149,12 @@ describe("GET /api/modules", () => {
 
   test("200 + curated list on fresh container (empty services.json)", async () => {
     // The v0.6 hot path: brand-new Render container, no services.json
-    // yet. UI must render "install vault / app / notes / scribe / runner"
-    // cards even though nothing's installed. hub#323 inserted `app` between
-    // `vault` and `notes` — app auto-bootstraps notes-ui as a sub-unit;
-    // `notes` (notes-daemon) stays curated for back-compat install paths.
+    // yet. UI must render "install vault / scribe" cards even though
+    // nothing's installed. Trimmed 2026-05-27 (Aaron-directed launch
+    // focus): notes (notes-daemon), surface (host module), and runner
+    // (experimental) are no longer curated — notes.parachute.computer
+    // is the hosted PWA, surface-client is the library for custom UI
+    // builders, and runner isn't in the launch focus set.
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
@@ -170,8 +172,10 @@ describe("GET /api/modules", () => {
       }>;
       supervisor_available: boolean;
     };
-    // Curated order is preserved: vault → app → notes → scribe → runner.
-    expect(body.modules.map((m) => m.short)).toEqual(["vault", "surface", "notes", "scribe", "runner"]);
+    // Curated order is preserved: vault → scribe (vault first per the
+    // recommended install order — the wizard's vault step already runs
+    // before this catalog surfaces).
+    expect(body.modules.map((m) => m.short)).toEqual(["vault", "scribe"]);
     expect(body.modules.every((m) => m.available)).toBe(true);
     expect(body.modules.every((m) => !m.installed)).toBe(true);
     expect(body.modules.every((m) => m.latest_version === "0.9.9")).toBe(true);
@@ -179,18 +183,25 @@ describe("GET /api/modules", () => {
     expect(body.supervisor_available).toBe(false);
   });
 
-  test("app row carries package + display props from KNOWN_MODULES (#323)", async () => {
-    // hub#323 added app to CURATED_MODULES + KNOWN_MODULES so the admin SPA
-    // install catalog + setup-wizard install tile surface it. Spot-check the
-    // wire shape resolves app-specific fields (package, displayName, tagline)
-    // from KNOWN_MODULES rather than a stale default — same shape as the
-    // runner row test below.
+  test("scribe row carries package + display props from KNOWN_MODULES", async () => {
+    // Spot-check the wire shape resolves scribe-specific fields
+    // (package, displayName, tagline) from KNOWN_MODULES rather than a
+    // stale default. Vault is exercised via the install-state test below;
+    // this pins the other curated row's KNOWN_MODULES round-trip.
+    //
+    // Pre-2026-05-27 this test pinned the `surface` row (added by
+    // hub#323), and a sibling pinned the `runner` FIRST_PARTY_FALLBACKS
+    // row (hub#305). Both modules retired from CURATED_MODULES — the
+    // FIRST_PARTY_FALLBACKS / KNOWN_MODULES entries persist for the
+    // install-bootstrap path but `/api/modules` doesn't return them.
+    // The "uncurated modules don't surface here" test below pins that
+    // boundary.
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
       issuer: ISSUER,
       manifestPath: h.manifestPath,
-      fetchLatestVersion: async () => "0.2.0",
+      fetchLatestVersion: async () => "0.4.4",
     });
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -202,42 +213,41 @@ describe("GET /api/modules", () => {
         available: boolean;
       }>;
     };
-    const surface = body.modules.find((m) => m.short === "surface");
-    expect(surface).toBeDefined();
-    expect(surface?.package).toBe("@openparachute/surface");
-    expect(surface?.display_name).toBe("Surface");
-    expect(surface?.tagline).toContain("auto-installs Notes");
-    expect(surface?.available).toBe(true);
+    const scribe = body.modules.find((m) => m.short === "scribe");
+    expect(scribe).toBeDefined();
+    expect(scribe?.package).toBe("@openparachute/scribe");
+    expect(scribe?.display_name).toBe("Scribe");
+    expect(scribe?.tagline).toContain("transcription");
+    expect(scribe?.available).toBe(true);
   });
 
-  test("runner row carries package + display props from FIRST_PARTY_FALLBACKS (#305)", async () => {
-    // hub#305 added runner to CURATED_MODULES + FIRST_PARTY_FALLBACKS so
-    // the admin SPA install catalog surfaces it. Spot-check the wire
-    // shape resolves the runner-specific fields (package, displayName,
-    // tagline) from the vendored fallback rather than a stale default.
+  test("uncurated modules (notes / runner / surface) are NOT returned by GET /api/modules", async () => {
+    // CURATED_MODULES was trimmed 2026-05-27 to [vault, scribe]. The
+    // KNOWN_MODULES + FIRST_PARTY_FALLBACKS registries still carry
+    // entries for notes / runner (install-bootstrap path), but
+    // /api/modules only returns CURATED rows. Pins the boundary so a
+    // future re-curation has to be intentional, not a stale registry
+    // leak.
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
       issuer: ISSUER,
       manifestPath: h.manifestPath,
-      fetchLatestVersion: async () => "0.1.0",
+      fetchLatestVersion: async () => null,
     });
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      modules: Array<{
-        short: string;
-        package: string;
-        display_name: string;
-        tagline: string;
-        available: boolean;
-      }>;
-    };
-    const runner = body.modules.find((m) => m.short === "runner");
-    expect(runner).toBeDefined();
-    expect(runner?.package).toBe("@openparachute/runner");
-    expect(runner?.display_name).toBe("Runner");
-    expect(runner?.tagline).toContain("Vault-as-job-substrate");
-    expect(runner?.available).toBe(true);
+    const body = (await res.json()) as { modules: Array<{ short: string }> };
+    const shorts = body.modules.map((m) => m.short);
+    // Positive shape assertion — stronger than `not.toContain` because
+    // it also catches "we accidentally added a new uncurated entry"
+    // and "we accidentally removed an existing curated entry." Update
+    // this assertion intentionally when CURATED_MODULES changes.
+    expect(shorts).toEqual(["vault", "scribe"]);
+    // Belt + suspenders: explicit negatives for the modules dropped
+    // 2026-05-27, so a developer regressing the curated list sees both
+    // the shape failure AND the named-module failure messages.
+    expect(shorts).not.toContain("notes");
+    expect(shorts).not.toContain("runner");
+    expect(shorts).not.toContain("surface");
   });
 
   test("surfaces installed_version from services.json", async () => {
@@ -272,11 +282,11 @@ describe("GET /api/modules", () => {
     expect(vault?.installed_version).toBe("0.4.5");
     expect(vault?.latest_version).toBe("0.5.0");
     expect(vault?.install_dir).toBe("/parachute/modules/node_modules/@openparachute/vault");
-    // The other curated rows stay installed:false — the test installed
-    // only vault, so notes + scribe still render as available-but-not-installed.
-    const notes = body.modules.find((m) => m.short === "notes");
-    expect(notes?.installed).toBe(false);
-    expect(notes?.installed_version).toBeNull();
+    // The other curated row stays installed:false — the test installed
+    // only vault, so scribe still renders as available-but-not-installed.
+    const scribe = body.modules.find((m) => m.short === "scribe");
+    expect(scribe?.installed).toBe(false);
+    expect(scribe?.installed_version).toBeNull();
   });
 
   test("includes supervisor status + pid when a supervisor is injected", async () => {
@@ -309,9 +319,9 @@ describe("GET /api/modules", () => {
     expect(vault?.pid).toBe(12345);
     // Modules without a supervisor entry get null status — the UI
     // disables Restart/Stop for those since there's no live process.
-    const notes = body.modules.find((m) => m.short === "notes");
-    expect(notes?.supervisor_status).toBeNull();
-    expect(notes?.pid).toBeNull();
+    const scribe = body.modules.find((m) => m.short === "scribe");
+    expect(scribe?.supervisor_status).toBeNull();
+    expect(scribe?.pid).toBeNull();
     expect(body.supervisor_available).toBe(true);
   });
 
@@ -366,22 +376,28 @@ describe("GET /api/modules", () => {
   });
 
   test("management_url does not double-prepend mount when managementUrl is already mount-prefixed (hub#380)", async () => {
-    // Audit caught 2026-05-25: app declares `managementUrl: "/surface/admin/"`
+    // Audit caught 2026-05-25: surface declared `managementUrl: "/surface/admin/"`
     // (full hub-origin path) and `paths: ["/surface", "/.parachute"]`. The
-    // SPA's Services dropdown was navigating to `/app/surface/admin/` (404)
-    // because api-modules unconditionally prepended the mount onto the
-    // candidate. Fix: detect already-mount-prefixed paths and pass through.
+    // SPA's Services dropdown was navigating to `/surface/surface/admin/`
+    // (404) because api-modules unconditionally prepended the mount onto
+    // the candidate. Fix: detect already-mount-prefixed paths and pass
+    // through.
     //
     // Single-instance modules conventionally declare the full path; only
     // multi-instance modules (vault) use the per-instance relative form.
+    // Post 2026-05-27 CURATED trim the canonical single-instance example
+    // is scribe (when scribe ships a managementUrl — scribe#53). For now
+    // we exercise the same code path with vault declaring an
+    // already-mount-prefixed managementUrl: any module whose declared
+    // URL starts with its mount must pass through unchanged.
     writeManifest(h.manifestPath, [
       {
-        name: "parachute-surface",
-        port: 1946,
-        paths: ["/surface", "/.parachute"],
-        health: "/surface/healthz",
-        version: "0.2.0-rc.13",
-        installDir: "/install/dir/surface",
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.4.5",
+        installDir: "/install/dir/vault",
       },
     ]);
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
@@ -391,17 +407,18 @@ describe("GET /api/modules", () => {
       manifestPath: h.manifestPath,
       fetchLatestVersion: async () => null,
       readModuleManifest: async (installDir) => {
-        if (installDir === "/install/dir/surface") {
+        if (installDir === "/install/dir/vault") {
           return {
-            name: "surface",
-            manifestName: "parachute-surface",
-            displayName: "Surface",
+            name: "parachute-vault",
+            manifestName: "parachute-vault",
+            displayName: "Vault",
             tagline: "",
-            port: 1946,
-            paths: ["/surface", "/.parachute"],
-            health: "/surface/healthz",
-            uiUrl: "/surface/admin/",
-            managementUrl: "/surface/admin/",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/vault/default/health",
+            // Already-mount-prefixed managementUrl — must NOT have the
+            // mount prepended again.
+            managementUrl: "/vault/default/admin/",
           } as unknown as Awaited<
             ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
           >;
@@ -413,9 +430,9 @@ describe("GET /api/modules", () => {
     const body = (await res.json()) as {
       modules: Array<{ short: string; management_url: string | null }>;
     };
-    const surface = body.modules.find((m) => m.short === "surface");
-    // Single `/surface/`, not `/surface/surface/`.
-    expect(surface?.management_url).toBe("/surface/admin/");
+    const vault = body.modules.find((m) => m.short === "vault");
+    // Single `/vault/default/`, not `/vault/default/vault/default/`.
+    expect(vault?.management_url).toBe("/vault/default/admin/");
   });
 
   test("management_url prefix-ish names don't collide (hub#380 — /app vs /app-foo)", async () => {
@@ -786,8 +803,8 @@ describe("GET /api/modules", () => {
         },
       ]);
       // Other curated rows stay empty — uis is per-row, not global.
-      const notes = body.modules.find((m) => m.short === "notes");
-      expect(notes?.uis).toEqual([]);
+      const scribe = body.modules.find((m) => m.short === "scribe");
+      expect(scribe?.uis).toEqual([]);
     });
 
     test("optional fields ride through verbatim, missing fields become null on the wire", async () => {

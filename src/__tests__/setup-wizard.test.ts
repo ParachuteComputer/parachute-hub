@@ -2162,6 +2162,9 @@ describe("done screen install tiles (hub#272 Item B)", () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
+      // Seed services.json with `parachute-scribe` so the wizard's scribe
+      // install tile renders the already-installed shape. Post-2026-05-27
+      // CURATED trim scribe is the only non-vault install tile.
       writeManifest(
         {
           services: [
@@ -2172,15 +2175,12 @@ describe("done screen install tiles (hub#272 Item B)", () => {
               paths: ["/vault/default"],
               health: "/health",
             },
-            // hub#323: app replaces notes as the wizard's first install tile.
-            // Seeding services.json with `parachute-app` exercises the
-            // already-installed render path on the wizard's first tile.
             {
-              name: "parachute-surface",
-              version: "0.2.0",
-              port: 1946,
-              paths: ["/app", "/.parachute"],
-              health: "/surface/healthz",
+              name: "parachute-scribe",
+              version: "0.4.4",
+              port: 1943,
+              paths: ["/scribe"],
+              health: "/scribe/health",
             },
           ],
         },
@@ -2203,13 +2203,16 @@ describe("done screen install tiles (hub#272 Item B)", () => {
       );
       const html = await res.text();
       expect(html).toContain("Already installed");
-      expect(html).toContain('action="/admin/setup/install/scribe"');
+      // The scribe tile rendered the installed shape, not the install form.
+      expect(html).not.toContain('action="/admin/setup/install/scribe"');
+      // "Manage in admin" is the secondary link on the already-installed tile.
+      expect(html).toContain("Manage in admin");
     } finally {
       db.close();
     }
   });
 
-  test("done screen renders op-poll panel when ?op_surface=<id> matches a registry op", async () => {
+  test("done screen renders op-poll panel when ?op_scribe=<id> matches a registry op", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -2229,15 +2232,16 @@ describe("done screen install tiles (hub#272 Item B)", () => {
       );
       setSetting(db, "setup_expose_mode", "localhost");
       const reg = getDefaultOperationsRegistry();
-      // hub#323: op-poll panel rides on the `app` tile now (app is the wizard's
-      // first install tile post-Notes-as-app-migration). Same shape as the
-      // pre-#324 `op_notes=<id>` flow.
-      const op = reg.create("install", "app");
-      reg.update(op.id, { status: "running" }, "running bun add -g @openparachute/app@latest");
+      // Post-2026-05-27 CURATED trim, scribe is the only non-vault wizard
+      // install tile, so it carries the op-poll panel. Same shape as the
+      // prior `op_app=<id>` / `op_notes=<id>` flows — the rendering code
+      // is per-`?op_<short>=<id>` query and tile-row agnostic.
+      const op = reg.create("install", "scribe");
+      reg.update(op.id, { status: "running" }, "running bun add -g @openparachute/scribe@latest");
       const { createSession } = await import("../sessions.ts");
       const session = createSession(db, { userId: user.id });
       const res = handleSetupGet(
-        req(`/admin/setup?just_finished=1&op_surface=${op.id}`, {
+        req(`/admin/setup?just_finished=1&op_scribe=${op.id}`, {
           headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
         }),
         {
@@ -2293,7 +2297,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
         return 0;
       };
       const post = await handleSetupInstallPost(
-        req("/admin/setup/install/notes", {
+        req("/admin/setup/install/scribe", {
           method: "POST",
           body: new URLSearchParams({ [CSRF_FIELD_NAME]: csrf }).toString(),
           headers: {
@@ -2301,7 +2305,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
             cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
           },
         }),
-        "notes",
+        "scribe",
         {
           db,
           manifestPath: h.manifestPath,
@@ -2315,10 +2319,10 @@ describe("done screen install tiles (hub#272 Item B)", () => {
       );
       expect(post.status).toBe(303);
       const location = post.headers.get("location") ?? "";
-      expect(location).toMatch(/^\/admin\/setup\?just_finished=1&op_notes=/);
+      expect(location).toMatch(/^\/admin\/setup\?just_finished=1&op_scribe=/);
       await new Promise((r) => setTimeout(r, 50));
       expect(runCalls.length).toBeGreaterThan(0);
-      expect(runCalls[0]?.join(" ")).toContain("bun add -g @openparachute/notes@latest");
+      expect(runCalls[0]?.join(" ")).toContain("bun add -g @openparachute/scribe@latest");
     } finally {
       db.close();
     }
@@ -2405,7 +2409,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
       });
       const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
       const post = await handleSetupInstallPost(
-        req("/admin/setup/install/notes", {
+        req("/admin/setup/install/scribe", {
           method: "POST",
           body: new URLSearchParams({ [CSRF_FIELD_NAME]: csrf }).toString(),
           headers: {
@@ -2413,7 +2417,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
             cookie: `${CSRF_COOKIE_NAME}=${csrf}`,
           },
         }),
-        "notes",
+        "scribe",
         {
           db,
           manifestPath: h.manifestPath,
@@ -3296,7 +3300,14 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
     }
   });
 
-  test("when app is also installed, the lead tile links to /surface/notes/", async () => {
+  test("lead tile always points at notes.parachute.computer (canonical hosted PWA) regardless of local module installs", async () => {
+    // Pre-2026-05-27 the lead tile flipped to `/surface/notes/` when the
+    // Surface module was installed locally. Aaron's launch-focus
+    // directive: notes.parachute.computer is the canonical user-facing
+    // UI, and the wizard should always point operators at it (rather
+    // than maybe-or-maybe-not-installed local Surface). This test pins
+    // that the lead tile is invariant under the install state of
+    // uncurated modules.
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -3310,6 +3321,9 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
               paths: ["/vault/default"],
               health: "/health",
             },
+            // Even with parachute-surface installed locally (an uncurated
+            // module post-trim), the lead tile must NOT flip to a local
+            // path.
             {
               name: "parachute-surface",
               version: "0.2.0",
@@ -3338,15 +3352,27 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
       );
       const html = await res.text();
       expect(html).toContain("Start using your vault");
-      // App installed → primary CTA links to Notes-as-UI inside App.
-      expect(html).toContain('href="/surface/notes/"');
+      // Lead CTA always targets the hosted PWA.
+      expect(html).toContain("https://notes.parachute.computer/add?url=");
       expect(html).toContain("Open Notes");
+      // The pre-trim local-surface fallback is gone — the lead tile does
+      // NOT link to /surface/notes/ anymore.
+      expect(html).not.toContain('href="/surface/notes/"');
     } finally {
       db.close();
     }
   });
 
-  test("succeeded install op renders a 'Use it now' link pointing at the module's surface", async () => {
+  test("succeeded install op renders 'Manage modules' link (no 'Use it now' for modules without a hosted surface)", async () => {
+    // Pre-2026-05-27 the surface module had a USE_IT_NOW_URLS entry
+    // pointing at `/surface/notes/`, so a succeeded surface install tile
+    // rendered a primary "Use it now" link. Post-trim only scribe + vault
+    // are curated; vault has its own lead tile (above the install row);
+    // scribe doesn't ship a user-facing landing surface today
+    // (scribe#53 tracks the eventual admin SPA), so USE_IT_NOW_URLS is
+    // empty and a succeeded scribe install renders only the "Manage
+    // modules" secondary affordance. Future per-module surfaces can
+    // re-add an entry to that map.
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -3366,12 +3392,12 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
       );
       setSetting(db, "setup_expose_mode", "localhost");
       const reg = getDefaultOperationsRegistry();
-      const op = reg.create("install", "app");
-      reg.update(op.id, { status: "succeeded" }, "installed @openparachute/app");
+      const op = reg.create("install", "scribe");
+      reg.update(op.id, { status: "succeeded" }, "installed @openparachute/scribe");
       const { createSession } = await import("../sessions.ts");
       const session = createSession(db, { userId: user.id });
       const res = handleSetupGet(
-        req(`/admin/setup?just_finished=1&op_surface=${op.id}`, {
+        req(`/admin/setup?just_finished=1&op_scribe=${op.id}`, {
           headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
         }),
         {
@@ -3384,17 +3410,24 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
       );
       const html = await res.text();
       expect(html).toContain("status: succeeded");
-      // Primary "Use it now" link goes to the app's surface; secondary
-      // "Manage modules" link still present.
-      expect(html).toContain(">Use it now<");
-      expect(html).toContain('href="/surface/notes/"');
+      // No "Use it now" — scribe has no entry in USE_IT_NOW_URLS today.
+      expect(html).not.toContain(">Use it now<");
+      // "Manage modules" secondary link is always present on a terminal-
+      // succeeded install tile.
       expect(html).toContain(">Manage modules<");
     } finally {
       db.close();
     }
   });
 
-  test("'Already installed' tile gains a 'Use it now' link too", async () => {
+  test("'Already installed' tile renders without a 'Use it now' link when the module has no hosted surface", async () => {
+    // Post-2026-05-27 CURATED trim, USE_IT_NOW_URLS is empty (scribe has
+    // no first-class user-facing landing surface yet; vault gets its
+    // own lead tile, not an install tile). The already-installed tile
+    // therefore renders only the "Manage in admin" secondary link. Pre-
+    // trim the surface module had a USE_IT_NOW_URLS entry that drove
+    // this surface, so the test now pins the absence rather than the
+    // presence.
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -3409,11 +3442,11 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
               health: "/health",
             },
             {
-              name: "parachute-surface",
-              version: "0.2.0",
-              port: 1946,
-              paths: ["/surface"],
-              health: "/surface/healthz",
+              name: "parachute-scribe",
+              version: "0.4.4",
+              port: 1943,
+              paths: ["/scribe"],
+              health: "/scribe/health",
             },
           ],
         },
@@ -3436,8 +3469,10 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
       );
       const html = await res.text();
       expect(html).toContain("Already installed");
-      // App's already-installed tile carries the Use it now link.
-      expect(html).toContain('href="/surface/notes/"');
+      // No "Use it now" on the scribe already-installed tile.
+      expect(html).not.toContain(">Use it now<");
+      // Secondary affordance still present.
+      expect(html).toContain("Manage in admin");
     } finally {
       db.close();
     }

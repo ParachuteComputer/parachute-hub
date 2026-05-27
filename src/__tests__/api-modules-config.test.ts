@@ -23,6 +23,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeJwt } from "jose";
+import type { CuratedModuleShort } from "../api-modules.ts";
 import {
   API_MODULES_CONFIG_REQUIRED_SCOPE,
   MODULE_CONFIG_PROXY_CLIENT_ID,
@@ -152,14 +153,19 @@ describe("parseModulesConfigPath", () => {
     });
   });
 
-  test("matches vault and notes (curated modules)", () => {
+  test("matches vault and scribe (curated modules)", () => {
     expect(parseModulesConfigPath("/api/modules/vault/config")?.short).toBe("vault");
-    expect(parseModulesConfigPath("/api/modules/notes/config/schema")?.short).toBe("notes");
+    expect(parseModulesConfigPath("/api/modules/scribe/config/schema")?.short).toBe("scribe");
   });
 
   test("rejects unknown short (non-curated)", () => {
     expect(parseModulesConfigPath("/api/modules/unknown/config")).toBeUndefined();
     expect(parseModulesConfigPath("/api/modules/channel/config")).toBeUndefined();
+    // Curated list trimmed 2026-05-27: notes / runner / surface are no
+    // longer curated and reject at the parse boundary.
+    expect(parseModulesConfigPath("/api/modules/notes/config")).toBeUndefined();
+    expect(parseModulesConfigPath("/api/modules/runner/config")).toBeUndefined();
+    expect(parseModulesConfigPath("/api/modules/surface/config")).toBeUndefined();
   });
 
   test("rejects non-config suffix shapes", () => {
@@ -302,7 +308,7 @@ describe("handleApiModulesConfig — FALLBACK retirement (hub#310)", () => {
       makeReq("/api/modules/runner/config/schema", {
         headers: { authorization: `Bearer ${bearer}` },
       }),
-      { short: "runner", suffix: "schema" },
+      { short: "runner" as CuratedModuleShort, suffix: "schema" },
       { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath },
     );
     expect(res.status).toBe(404);
@@ -365,7 +371,7 @@ describe("handleApiModulesConfig — FALLBACK retirement (hub#310)", () => {
       makeReq("/api/modules/runner/config/schema", {
         headers: { authorization: `Bearer ${bearer}` },
       }),
-      { short: "runner", suffix: "schema" },
+      { short: "runner" as CuratedModuleShort, suffix: "schema" },
       {
         db: h.db,
         issuer: ISSUER,
@@ -614,7 +620,7 @@ describe("handleApiModulesConfig — stripPrefix=false (notes-shape)", () => {
       makeReq("/api/modules/notes/config/schema", {
         headers: { authorization: `Bearer ${bearer}` },
       }),
-      { short: "notes", suffix: "schema" },
+      { short: "notes" as CuratedModuleShort, suffix: "schema" },
       {
         db: h.db,
         issuer: ISSUER,
@@ -668,7 +674,7 @@ describe("handleApiModulesConfig — hostsBareParachute (hub#307)", () => {
       makeReq("/api/modules/runner/config/schema", {
         headers: { authorization: `Bearer ${bearer}` },
       }),
-      { short: "runner", suffix: "schema" },
+      { short: "runner" as CuratedModuleShort, suffix: "schema" },
       {
         db: h.db,
         issuer: ISSUER,
@@ -700,7 +706,7 @@ describe("handleApiModulesConfig — hostsBareParachute (hub#307)", () => {
       makeReq("/api/modules/runner/config", {
         headers: { authorization: `Bearer ${bearer}` },
       }),
-      { short: "runner", suffix: "" },
+      { short: "runner" as CuratedModuleShort, suffix: "" },
       {
         db: h.db,
         issuer: ISSUER,
@@ -733,7 +739,7 @@ describe("handleApiModulesConfig — hostsBareParachute (hub#307)", () => {
         },
         body: JSON.stringify({ intervalSeconds: 120 }),
       }),
-      { short: "runner", suffix: "" },
+      { short: "runner" as CuratedModuleShort, suffix: "" },
       {
         db: h.db,
         issuer: ISSUER,
@@ -760,7 +766,7 @@ describe("handleApiModulesConfig — hostsBareParachute (hub#307)", () => {
       makeReq("/api/modules/runner/config", {
         headers: { authorization: `Bearer ${bearer}` },
       }),
-      { short: "runner", suffix: "" },
+      { short: "runner" as CuratedModuleShort, suffix: "" },
       {
         db: h.db,
         issuer: ISSUER,
@@ -863,7 +869,7 @@ describe("handleApiModulesConfig — hostsBareParachute (hub#307)", () => {
       makeReq("/api/modules/runner/config/schema", {
         headers: { authorization: `Bearer ${bearer}` },
       }),
-      { short: "runner", suffix: "schema" },
+      { short: "runner" as CuratedModuleShort, suffix: "schema" },
       {
         db: h.db,
         issuer: ISSUER,

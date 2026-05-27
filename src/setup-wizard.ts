@@ -889,27 +889,15 @@ export interface RenderDoneStepProps {
    * shape.
    */
   installTiles?: readonly ModuleInstallTileState[];
-  /**
-   * Whether parachute-app is installed alongside the vault. Drives the
-   * "Start using your vault" lead tile (hub#342): when true, the tile
-   * links to `/surface/notes/` (the canonical user-facing surface — App
-   * auto-bootstraps Notes-as-UI per the 2026-05-21 migration). When
-   * false, it falls back to the vault's own admin UI at
-   * `/vault/<name>/admin/` so the operator still has a single obvious
-   * "start using parachute" target. Omitted = back-compat with tests
-   * that render the done step without dependency-checking; defaults to
-   * false (vault-admin fallback).
-   */
-  appInstalled?: boolean;
 }
 
 export function renderDoneStep(props: RenderDoneStepProps): string {
-  const { vaultName, hubOrigin, exposeMode, mintedToken, installTiles, appInstalled } = props;
+  const { vaultName, hubOrigin, exposeMode, mintedToken, installTiles } = props;
   const reachable = exposeMode ? renderReachableTile(exposeMode, hubOrigin) : "";
   const mcpTile = renderMcpTile(vaultName, hubOrigin, mintedToken);
   const tiles = installTiles && installTiles.length > 0 ? installTiles : [];
   const installSection = tiles.length > 0 ? renderInstallTiles(tiles) : "";
-  const startTile = renderStartUsingTile(vaultName, appInstalled === true, hubOrigin);
+  const startTile = renderStartUsingTile(vaultName, hubOrigin);
   // The done-grid hosts the MCP-connect tile + the admin-UI fallback.
   // The install tiles sit above it as a "what's next?" surface (curated
   // catalog of modules an operator might want next). The "Start using
@@ -1104,7 +1092,8 @@ function renderMcpTile(
 }
 
 /**
- * The "Start using your vault" lead tile on the done step (hub#342).
+ * The "Start using your vault" lead tile on the done step (hub#342,
+ * Aaron 2026-05-27 simplification).
  *
  * Closes Aaron's "no clear way to go from setting up parachute to
  * actually using parachute" friction. Sits above the MCP / install
@@ -1112,48 +1101,20 @@ function renderMcpTile(
  * everything else on the done screen is operator-flavored (MCP
  * command, admin UI, additional module installs).
  *
- * Two shapes:
- *   - **App installed** → primary tile targets `/surface/notes/` (the
- *     Notes app reading the just-created vault). This is the
- *     canonical surface post-Notes-as-app migration (parachute-app §17).
- *   - **App NOT installed** → primary tile targets the vault's own
- *     admin UI at `/vault/<name>/admin/`. The copy explains that
- *     installing App + Notes is the recommended next step for a
- *     content-browsing surface, and points at the install tile below.
- *
- * Either way, the operator has ONE obvious click target that says
- * "start using parachute" — not three competing tiles where the
- * "real" entry point is buried under the MCP command pre-hub#342.
- */
-/**
- * Lead "Start using your vault" tile. Points at the canonical
- * notes.parachute.computer hosted PWA as the primary CTA — with the
- * operator's own hub URL pre-filled via `?url=` so the connect screen
- * auto-populates + auto-focuses (notes-ui AddVault route, see
- * parachute-app/packages/notes-ui/src/app/routes/AddVault.tsx).
- *
- * Aaron 2026-05-27 directive: "skipping the local surface install for
- * most operators is good ... showing notes.parachute.computer more
- * prominently is a good idea." The notes.parachute.computer PWA is the
- * canonical user-facing UI; operators no longer need to install the
- * Surface module locally to use Notes. They still can (local install
- * works the same way), but the wizard doesn't push them toward it as
- * the default.
- *
+ * Points at the canonical notes.parachute.computer hosted PWA as the
+ * primary CTA — with the operator's own hub URL pre-filled via
+ * `?url=` so the connect screen auto-populates + auto-focuses
+ * (notes-ui AddVault route, see
+ * parachute-surface/packages/notes-ui/src/app/routes/AddVault.tsx).
  * Secondary CTA: "Open vault admin" (the vault's own admin UI on this
  * hub) for operators who want to look at raw vault state.
  *
- * `appInstalled` is no longer load-bearing for the primary path —
- * notes.parachute.computer works regardless of whether Surface is
- * installed locally. Kept in the signature so the older test fixtures
- * + the boolean flag stay coherent; only the secondary fallback message
- * differs based on it.
+ * Previously varied by whether `parachute-surface` was installed
+ * locally — pointing at `/surface/notes/` in that case. Dropped
+ * 2026-05-27: hub+vault+scribe is the focus; notes.parachute.computer
+ * is canonical regardless of local surface install state.
  */
-function renderStartUsingTile(
-  vaultName: string,
-  appInstalled: boolean,
-  hubOrigin: string,
-): string {
+function renderStartUsingTile(vaultName: string, hubOrigin: string): string {
   const safeVault = escapeHtml(vaultName);
   // Vault names pass `/^[a-z0-9][a-z0-9-]*$/i` so URL-encoding is mostly
   // a no-op today, but use encodeURIComponent defensively to match hub.ts:505.
@@ -1164,14 +1125,6 @@ function renderStartUsingTile(
   const vaultUrlForAdd = encodeURIComponent(
     `${hubOrigin.replace(/\/+$/, "")}/vault/${vaultName}`,
   );
-  // For appInstalled=false case (Surface NOT installed locally),
-  // notes.parachute.computer is the recommended path. For appInstalled=true,
-  // we mention the local option as a secondary affordance.
-  const localNotesFallback = appInstalled
-    ? `<p class="start-using-secondary">
-        <a href="/surface/notes/">Or use Notes installed locally on this hub →</a>
-      </p>`
-    : "";
   return `<section class="start-using" data-testid="start-using-tile">
     <h2>Start using your vault</h2>
     <p>Open Notes — the canonical browser UI for your vault <code>${safeVault}</code>.
@@ -1180,7 +1133,6 @@ function renderStartUsingTile(
     <p class="start-using-secondary">
       <a href="/vault/${urlVault}/admin/">Or browse the vault's admin UI →</a>
     </p>
-    ${localNotesFallback}
   </section>`;
 }
 
@@ -1323,13 +1275,12 @@ function renderInstallTile(tile: ModuleInstallTileState): string {
  * surface decision.
  */
 const USE_IT_NOW_URLS: Partial<Record<CuratedModuleShort, string>> = {
-  surface: "/surface/notes/",
-  notes: "/notes/",
-  // Omitted: scribe + runner. They don't ship an admin SPA yet
-  // (scribe#53, runner#8 track). Pointing "Use it now" at /scribe/admin
-  // or /runner/admin today would 404 — better to fall through to the
-  // "Manage modules" link than to send the operator into a dead end.
-  // Add the entry here once those modules ship their admin UI.
+  // Empty: vault has its own lead "Start using" tile (the
+  // notes.parachute.computer CTA), so it doesn't appear here. Scribe
+  // doesn't ship an admin SPA at /scribe/admin/ that's useful for
+  // first-time operators (the page exists but it's config-management;
+  // not "use it"). Re-add per-module entries here if/when a module
+  // ships a user-facing landing surface worth pointing at.
 };
 
 /**
@@ -1482,16 +1433,18 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       // Module install tiles (hub#272 Item B). One per curated module
       // other than vault (which the wizard already provisioned).
       const installTiles = buildInstallTiles(url, deps);
-      // hub#342: drive the lead "Start using your vault" tile's target.
-      // When parachute-app is installed alongside vault, the tile links
-      // to `/surface/notes/` (auto-bootstrapped Notes-as-UI per parachute-app
-      // §17). Otherwise it falls back to the vault's own admin UI.
-      const appInstalled = isModuleInstalled("surface", deps.manifestPath);
+      // The lead "Start using your vault" tile points at
+      // notes.parachute.computer/add — always, regardless of any
+      // local module install state. Prior versions of this code
+      // checked `isModuleInstalled("surface", ...)` to switch to a
+      // local `/surface/notes/` link, but the launch focus is
+      // hub+vault+scribe and notes.parachute.computer is the
+      // canonical Notes UI (Aaron-directed 2026-05-27). Dropped the
+      // local-fallback branch.
       const doneProps: RenderDoneStepProps = {
         vaultName,
         hubOrigin: deps.issuer,
         installTiles,
-        appInstalled,
       };
       if (exposeMode !== undefined) doneProps.exposeMode = exposeMode;
       if (mintedToken) doneProps.mintedToken = mintedToken;
@@ -2153,11 +2106,6 @@ const INSTALL_TILE_PROPS: ReadonlyArray<{
   tagline: string;
 }> = [
   {
-    short: "surface",
-    displayName: "Surface",
-    tagline: "Host module for Parachute surfaces — auto-installs Notes on first boot.",
-  },
-  {
     short: "scribe",
     displayName: "Scribe",
     tagline: "Local audio transcription for vault recordings.",
@@ -2323,11 +2271,10 @@ function validateAccountFields(input: {
 
 /**
  * Whether a given curated module is currently installed (has a row in
- * services.json keyed by its canonical `manifestName`). Used by the
- * done-step renderer (hub#342) to decide whether to point the "Start
- * using your vault" tile at `/surface/notes/` (App installed → Notes UI
- * auto-bootstrapped) vs the vault's own admin UI. Cheap manifest read
- * shared with `buildInstallTiles`.
+ * services.json keyed by its canonical `manifestName`). Used by
+ * `buildInstallTiles` to decide whether an install-tile row renders
+ * the "install" form or the "already installed" state. Cheap manifest
+ * read (no network).
  */
 function isModuleInstalled(short: CuratedModuleShort, manifestPath: string): boolean {
   const manifest = readManifestLenient(manifestPath);
