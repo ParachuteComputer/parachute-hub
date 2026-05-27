@@ -627,14 +627,17 @@ async function main(argv: string[]): Promise<number> {
         return 0;
       }
       const dryRun = rest.includes("--dry-run");
+      const list = rest.includes("--list");
       const yes = rest.includes("--yes") || rest.includes("-y");
-      const unknown = rest.find((a) => a !== "--dry-run" && a !== "--yes" && a !== "-y");
+      const unknown = rest.find(
+        (a) => a !== "--dry-run" && a !== "--list" && a !== "--yes" && a !== "-y",
+      );
       if (unknown !== undefined) {
         console.error(`parachute migrate: unknown argument "${unknown}"`);
-        console.error("usage: parachute migrate [--dry-run] [--yes]");
+        console.error("usage: parachute migrate [--list] [--dry-run] [--yes]");
         return 1;
       }
-      return await migrate({ dryRun, yes });
+      return await migrate({ dryRun, list, yes });
     }
 
     case "serve": {
