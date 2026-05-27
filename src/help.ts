@@ -82,7 +82,7 @@ Environment:
 
 Examples:
   parachute install vault                                   # installs, runs init, starts vault
-  parachute install app                                     # installs app (auto-bootstraps Notes)
+  parachute install surface                                 # installs surface (auto-bootstraps Notes)
   parachute install notes                                   # back-compat: legacy notes-daemon (Phase 2 deprecating)
   parachute install scribe                                  # installs, prompts for provider, starts scribe
   parachute install scribe --scribe-provider groq --scribe-key gsk_…
@@ -188,7 +188,7 @@ Example:
   parachute-vault  1940  0.2.4    active  12345  2h 13m  2ms      bun-linked → parachute-vault @ 8aa167b
     → http://127.0.0.1:1940/vault/default/mcp
   parachute-app    1946  0.2.0    active  12346  2h 12m  3ms      npm (0.2.0-rc.4)
-    → http://127.0.0.1:1946/app/notes
+    → http://127.0.0.1:1946/surface/notes
 `;
 }
 

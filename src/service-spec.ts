@@ -68,7 +68,7 @@ export const PORT_RESERVATIONS: readonly PortReservation[] = [
   // fallback-port walker (`assignPort` in port-assign.ts) from handing this
   // port out to a colliding third-party module. The matching KNOWN_MODULES
   // row carries the canonicalPort + paths for status/expose surfaces.
-  { port: 1946, name: "parachute-app", status: "assigned" },
+  { port: 1946, name: "parachute-surface", status: "assigned" },
   { port: 1947, name: "unassigned", status: "reserved" },
   { port: 1948, name: "unassigned", status: "reserved" },
   { port: 1949, name: "unassigned", status: "reserved" },
@@ -281,7 +281,7 @@ const NOTES_FALLBACK: FirstPartyFallback = {
     name: "notes",
     manifestName: "parachute-notes",
     displayName: "Notes",
-    tagline: "Notes PWA — daemon deprecated 2026-05-22; install `app` for the current path.",
+    tagline: "Notes PWA — daemon deprecated 2026-05-22; install `surface` for the current path.",
     port: 1942,
     paths: ["/notes"],
     health: "/notes/health",
@@ -462,28 +462,29 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
       hasAuth: true,
     },
   },
-  app: {
-    short: "app",
-    package: "@openparachute/app",
-    manifestName: "parachute-app",
+  surface: {
+    short: "surface",
+    package: "@openparachute/surface",
+    manifestName: "parachute-surface",
     canonicalPort: 1946,
-    displayName: "App",
+    displayName: "Surface",
     // Tagline telegraphs the auto-bootstrap so wizard + admin-SPA copy explain
-    // the architecture: installing `app` brings Notes (and other UIs) along
-    // via the Phase 2.1 bootstrap-default-apps step. The notes-daemon path
-    // still exists as a back-compat install (CURATED_MODULES still lists
-    // `notes`) but `app` is the recommended first install post-vault.
-    tagline: "Host module for Parachute UIs — auto-installs Notes on first boot.",
-    canonicalPaths: ["/app", "/.parachute"],
-    canonicalHealth: "/app/healthz",
+    // the architecture: installing `surface` brings Notes (and other UIs)
+    // along via the Phase 2.1 bootstrap-default-apps step. The notes-daemon
+    // path still exists as a back-compat install (CURATED_MODULES still
+    // lists `notes`) but `surface` is the recommended first install
+    // post-vault. Renamed from `app` 2026-05-27 per patterns#102.
+    tagline: "Host module for Parachute surfaces — auto-installs Notes on first boot.",
+    canonicalPaths: ["/surface", "/.parachute"],
+    canonicalHealth: "/surface/healthz",
     canonicalStripPrefix: false,
     extras: {
       // Backward-compat startCmd — same rationale as scribe / vault / runner
       // above. Post-self-register, lifecycle reads module.json's startCmd via
       // `composeKnownModuleSpec` and that path wins.
-      startCmd: () => ["parachute-app", "serve"],
-      // App's admin + per-UI surfaces gate behind hub-issued JWTs (design
-      // doc §6 same-hub auto-trust + scope `app:admin`). Surfaces in
+      startCmd: () => ["parachute-surface", "serve"],
+      // Surface's admin + per-UI surfaces gate behind hub-issued JWTs (design
+      // doc §6 same-hub auto-trust + scope `surface:admin`). Surfaces in
       // `parachute status` as auth-required by default, same posture as vault
       // + runner.
       hasAuth: true,
@@ -516,7 +517,27 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
 export const RETIRED_MODULES: Record<string, { retiredAt: string; replacement?: string }> = {
   agent: {
     retiredAt: "2026-05-20",
-    replacement: "parachute-app or parachute-runner (depending on use case)",
+    replacement: "parachute-surface or parachute-runner (depending on use case)",
+  },
+  // 2026-05-20 retirement caught both forms of legacy rows.
+  "parachute-agent": {
+    retiredAt: "2026-05-20",
+    replacement: "parachute-surface or parachute-runner (depending on use case)",
+  },
+  // The `parachute-app` row name retires 2026-05-27 along with the
+  // app → surface rename (patterns#102). Operators upgrading from
+  // 0.5.13-stable will have a `parachute-app` row in services.json
+  // pointing at the now-removed @openparachute/app package; this entry
+  // drops it on load + steers them at `parachute install surface`.
+  // The short-name `app` form is included for legacy rows that used
+  // the short name as the `name` field.
+  app: {
+    retiredAt: "2026-05-27",
+    replacement: "parachute-surface (renamed from parachute-app — `parachute install surface`)",
+  },
+  "parachute-app": {
+    retiredAt: "2026-05-27",
+    replacement: "parachute-surface (renamed from parachute-app — `parachute install surface`)",
   },
 };
 

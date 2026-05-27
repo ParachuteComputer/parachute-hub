@@ -232,10 +232,10 @@ describe("services-manifest", () => {
   // runner) round-trip byte-identically.
   describe("ServiceEntry.uis hierarchical sub-units (hub#313)", () => {
     const app: ServiceEntry = {
-      name: "parachute-app",
+      name: "parachute-surface",
       port: 1946,
-      paths: ["/app"],
-      health: "/app/healthz",
+      paths: ["/surface"],
+      health: "/surface/healthz",
       version: "0.1.0",
     };
 
@@ -1026,17 +1026,17 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
         JSON.stringify({
           services: [
             {
-              name: "parachute-app",
+              name: "parachute-surface",
               port: 1946,
-              paths: ["/app"],
-              health: "/app/healthz",
+              paths: ["/surface"],
+              health: "/surface/healthz",
               version: "0.2.0",
             },
             {
               name: "app",
               port: 1946,
-              paths: ["/app"],
-              health: "/app/healthz",
+              paths: ["/surface"],
+              health: "/surface/healthz",
               version: "0.2.0",
             },
           ],
@@ -1044,7 +1044,7 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
       );
       const m = readManifest(path);
       expect(m.services).toHaveLength(1);
-      expect(m.services[0]?.name).toBe("parachute-app");
+      expect(m.services[0]?.name).toBe("parachute-surface");
     } finally {
       cleanup();
     }
@@ -1099,10 +1099,10 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
         JSON.stringify({
           services: [
             {
-              name: "app",
+              name: "widget",
               port: 1946,
-              paths: ["/app"],
-              health: "/app/healthz",
+              paths: ["/surface"],
+              health: "/surface/healthz",
               version: "0.2.0",
             },
           ],
@@ -1110,7 +1110,7 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
       );
       const m = readManifest(path);
       expect(m.services).toHaveLength(1);
-      expect(m.services[0]?.name).toBe("app");
+      expect(m.services[0]?.name).toBe("widget");
     } finally {
       cleanup();
     }
@@ -1124,17 +1124,17 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
         JSON.stringify({
           services: [
             {
-              name: "parachute-app",
+              name: "parachute-surface",
               port: 1946,
-              paths: ["/app"],
-              health: "/app/healthz",
+              paths: ["/surface"],
+              health: "/surface/healthz",
               version: "0.2.0",
             },
             {
-              name: "app",
+              name: "widget",
               port: 9999,
-              paths: ["/their-app"],
-              health: "/their-app/health",
+              paths: ["/widget"],
+              health: "/widget/health",
               version: "1.0.0",
             },
           ],
@@ -1142,7 +1142,7 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
       );
       const m = readManifest(path);
       expect(m.services).toHaveLength(2);
-      expect(m.services.map((s) => s.name).sort()).toEqual(["app", "parachute-app"]);
+      expect(m.services.map((s) => s.name).sort()).toEqual(["parachute-surface", "widget"]);
     } finally {
       cleanup();
     }
@@ -1164,10 +1164,10 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
         JSON.stringify({
           services: [
             {
-              name: "parachute-app",
+              name: "parachute-surface",
               port: 1946,
-              paths: ["/app"],
-              health: "/app/healthz",
+              paths: ["/surface"],
+              health: "/surface/healthz",
               version: "0.2.0",
             },
             {
@@ -1197,17 +1197,17 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
         JSON.stringify({
           services: [
             {
-              name: "parachute-app",
+              name: "parachute-surface",
               port: 1946,
-              paths: ["/app"],
-              health: "/app/healthz",
+              paths: ["/surface"],
+              health: "/surface/healthz",
               version: "0.2.0",
             },
             {
               name: "app",
               port: 1946,
-              paths: ["/app"],
-              health: "/app/healthz",
+              paths: ["/surface"],
+              health: "/surface/healthz",
               version: "0.2.0",
             },
           ],
@@ -1296,10 +1296,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "parachute-app",
+              name: "parachute-surface",
               port: 1946,
-              paths: ["/app"],
-              health: "/app/healthz",
+              paths: ["/surface"],
+              health: "/surface/healthz",
               version: "0.2.0",
             },
           ],
@@ -1308,7 +1308,7 @@ describe("retired-module row de-dupe (hub#334)", () => {
       const mtimeBefore = statSync(path).mtimeMs;
       const m = readManifest(path);
       expect(m.services).toHaveLength(1);
-      expect(m.services[0]?.name).toBe("parachute-app");
+      expect(m.services[0]?.name).toBe("parachute-surface");
       // No rewrite when there's nothing to clean.
       expect(statSync(path).mtimeMs).toBe(mtimeBefore);
     } finally {
@@ -1334,10 +1334,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
               version: "0.1.4",
             },
             {
-              name: "parachute-app",
+              name: "parachute-surface",
               port: 1946,
-              paths: ["/app"],
-              health: "/app/healthz",
+              paths: ["/surface"],
+              health: "/surface/healthz",
               version: "0.2.0",
             },
           ],
@@ -1345,7 +1345,7 @@ describe("retired-module row de-dupe (hub#334)", () => {
       );
       const m = readManifest(path);
       expect(m.services).toHaveLength(1);
-      expect(m.services[0]?.name).toBe("parachute-app");
+      expect(m.services[0]?.name).toBe("parachute-surface");
     } finally {
       cleanup();
     }
@@ -1411,8 +1411,8 @@ describe("readManifestLenient — skips bad entries instead of throwing (hub#406
         JSON.stringify({
           services: [
             { name: "parachute-vault", port: 1940, paths: ["/vault/default"], health: "/vault/default/health", version: "0.4.8-rc.10" },
-            { name: "parachute-app", port: 1946, paths: ["/app"], health: "/app/healthz", version: "0.2.0-rc.13" },
-            { name: "app", port: 0, paths: ["/app"], health: "/app/healthz", version: "0.2.0-rc.4" },
+            { name: "parachute-surface", port: 1946, paths: ["/surface"], health: "/surface/healthz", version: "0.2.0-rc.13" },
+            { name: "widget", port: 0, paths: ["/widget"], health: "/widget/health", version: "0.0.1" },
           ],
         }),
       );
@@ -1420,7 +1420,7 @@ describe("readManifestLenient — skips bad entries instead of throwing (hub#406
       const log = { warn: (m: string) => warnings.push(m) };
       const m = readManifestLenient(path, log);
       const names = m.services.map((s) => s.name).sort();
-      expect(names).toEqual(["parachute-app", "parachute-vault"]);
+      expect(names).toEqual(["parachute-surface", "parachute-vault"]);
       expect(warnings.some((w) => w.includes("port") && w.includes("integer"))).toBe(true);
     } finally {
       cleanup();
@@ -1479,7 +1479,7 @@ describe("readManifestLenient — skips bad entries instead of throwing (hub#406
       writeFileSync(
         path,
         JSON.stringify({
-          services: [{ name: "app", port: 0, paths: ["/app"], health: "/app/healthz", version: "0.2.0-rc.4" }],
+          services: [{ name: "widget", port: 0, paths: ["/widget"], health: "/widget/health", version: "0.0.1" }],
         }),
       );
       expect(() => readManifest(path)).toThrow(ServicesManifestError);

@@ -88,7 +88,7 @@ export const API_MODULES_REQUIRED_SCOPE = "parachute:host:auth";
  * the pre-app architecture; scribe + runner come last because they
  * depend on a working vault + app to be useful).
  */
-export const CURATED_MODULES = ["vault", "app", "notes", "scribe", "runner"] as const;
+export const CURATED_MODULES = ["vault", "surface", "notes", "scribe", "runner"] as const;
 export type CuratedModuleShort = (typeof CURATED_MODULES)[number];
 
 export interface ApiModulesDeps {
@@ -385,8 +385,8 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
         //     (e.g. `/vault/default` + `/admin/` → `/vault/default/admin/`).
         //   - Single-instance modules (app, scribe, runner) declare a
         //     full hub-origin path that ALREADY includes the mount
-        //     (e.g. `/app/admin/`, `/scribe/admin`); the mount must NOT
-        //     be prepended again or the result is `/app/app/admin/`
+        //     (e.g. `/surface/admin/`, `/scribe/admin`); the mount must NOT
+        //     be prepended again or the result is `/app/surface/admin/`
         //     (the audit bug caught 2026-05-25 on the SPA's Services
         //     dropdown).
         // Detect by checking if candidate is already mount-prefixed.

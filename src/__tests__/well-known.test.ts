@@ -426,10 +426,10 @@ describe("buildWellKnown", () => {
   // joined onto the canonical origin into a deep-linkable `url`.
   describe("uis hierarchical sub-units (hub#313)", () => {
     const app: ServiceEntry = {
-      name: "parachute-app",
+      name: "parachute-surface",
       port: 1946,
-      paths: ["/app"],
-      health: "/app/healthz",
+      paths: ["/surface"],
+      health: "/surface/healthz",
       version: "0.1.0",
     };
 
@@ -455,7 +455,7 @@ describe("buildWellKnown", () => {
         services: [withUis],
         canonicalOrigin: "https://x.example",
       });
-      const appSvc = doc.services.find((s) => s.name === "parachute-app");
+      const appSvc = doc.services.find((s) => s.name === "parachute-surface");
       expect(appSvc?.uis).toEqual([
         {
           name: "gitcoin-brain",
@@ -500,7 +500,7 @@ describe("buildWellKnown", () => {
         services: [empty],
         canonicalOrigin: "https://x.example",
       });
-      const svc = doc.services.find((s) => s.name === "parachute-app");
+      const svc = doc.services.find((s) => s.name === "parachute-surface");
       expect(svc).not.toHaveProperty("uis");
     });
 
@@ -519,7 +519,7 @@ describe("buildWellKnown", () => {
         services: [withIcon],
         canonicalOrigin: "https://x.example",
       });
-      const svc = doc.services.find((s) => s.name === "parachute-app");
+      const svc = doc.services.find((s) => s.name === "parachute-surface");
       expect(svc?.uis?.[0]?.iconUrl).toBe("https://x.example/app/slug/icon.svg");
     });
 
@@ -538,7 +538,7 @@ describe("buildWellKnown", () => {
         services: [withIcon],
         canonicalOrigin: "https://x.example",
       });
-      const svc = doc.services.find((s) => s.name === "parachute-app");
+      const svc = doc.services.find((s) => s.name === "parachute-surface");
       expect(svc?.uis?.[0]?.iconUrl).toBe("https://cdn.example.com/icon.svg");
     });
 
@@ -562,7 +562,7 @@ describe("buildWellKnown", () => {
         services: [mixed],
         canonicalOrigin: "https://x.example",
       });
-      const svc = doc.services.find((s) => s.name === "parachute-app");
+      const svc = doc.services.find((s) => s.name === "parachute-surface");
       const full = svc?.uis?.find((u) => u.name === "full");
       const minimal = svc?.uis?.find((u) => u.name === "minimal");
       expect(full?.tagline).toBe("Has it all");
@@ -593,7 +593,7 @@ describe("buildWellKnown", () => {
         services: [app1, app2],
         canonicalOrigin: "https://x.example",
       });
-      const svc1 = doc.services.find((s) => s.name === "parachute-app");
+      const svc1 = doc.services.find((s) => s.name === "parachute-surface");
       const svc2 = doc.services.find((s) => s.name === "parachute-app-2");
       expect(svc1?.uis?.map((u) => u.name)).toEqual(["a"]);
       expect(svc2?.uis?.map((u) => u.name)).toEqual(["b"]);

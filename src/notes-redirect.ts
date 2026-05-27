@@ -2,9 +2,9 @@
  * Notes-as-app migration Phase 2 (parachute-app design doc §16).
  *
  * When parachute-app ships and Notes installs as `parachute-app add
- * @openparachute/notes-ui --name notes --path /app/notes`, operators with
+ * @openparachute/notes-ui --name notes --path /surface/notes`, operators with
  * existing `/notes/*` bookmarks need a transparent bridge. The hub serves a
- * 301 redirect from `/notes/*` → `/app/notes/*` so:
+ * 301 redirect from `/notes/*` → `/surface/notes/*` so:
  *
  *   - cached operator URLs (notes PWA install banners, browser history,
  *     in-vault links) keep working
@@ -44,14 +44,14 @@ export function isLegacyNotesPath(pathname: string): boolean {
  * string. The query is preserved verbatim; the fragment isn't visible
  * server-side (clients reassemble it after following the redirect).
  *
- * The transform is purely path-rewrite — `/notes` → `/app/notes`, `/notes/`
- * → `/app/notes/`, `/notes/foo/bar` → `/app/notes/foo/bar`.
+ * The transform is purely path-rewrite — `/notes` → `/surface/notes`, `/notes/`
+ * → `/surface/notes/`, `/notes/foo/bar` → `/surface/notes/foo/bar`.
  */
 export function buildNotesRedirectTarget(pathname: string, search: string): string {
   // Slice off the leading "/notes" — what remains is either "" (bare /notes),
   // "/" (trailing slash), or "/<rest>" (sub-path).
   const tail = pathname.slice("/notes".length);
-  return `/app/notes${tail}${search}`;
+  return `/surface/notes${tail}${search}`;
 }
 
 /**

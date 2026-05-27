@@ -721,7 +721,7 @@ export interface RenderDoneStepProps {
   /**
    * Whether parachute-app is installed alongside the vault. Drives the
    * "Start using your vault" lead tile (hub#342): when true, the tile
-   * links to `/app/notes/` (the canonical user-facing surface — App
+   * links to `/surface/notes/` (the canonical user-facing surface — App
    * auto-bootstraps Notes-as-UI per the 2026-05-21 migration). When
    * false, it falls back to the vault's own admin UI at
    * `/vault/<name>/admin/` so the operator still has a single obvious
@@ -941,7 +941,7 @@ function renderMcpTile(
  * command, admin UI, additional module installs).
  *
  * Two shapes:
- *   - **App installed** → primary tile targets `/app/notes/` (the
+ *   - **App installed** → primary tile targets `/surface/notes/` (the
  *     Notes app reading the just-created vault). This is the
  *     canonical surface post-Notes-as-app migration (parachute-app §17).
  *   - **App NOT installed** → primary tile targets the vault's own
@@ -963,13 +963,13 @@ function renderStartUsingTile(vaultName: string, appInstalled: boolean): string 
       <h2>Start using your vault</h2>
       <p>Notes is installed and ready. Capture your first note in the
         Notes app — it reads from <code>${safeVault}</code> directly.</p>
-      <p><a class="btn btn-primary" href="/app/notes/">Open Notes</a></p>
+      <p><a class="btn btn-primary" href="/surface/notes/">Open Notes</a></p>
     </section>`;
   }
   return `<section class="start-using" data-testid="start-using-tile">
     <h2>Start using your vault</h2>
     <p>Your vault <code>${safeVault}</code> is provisioned. Install
-      <strong>App</strong> below (it bundles the Notes UI) to start
+      <strong>Surface</strong> below (it bundles the Notes UI) to start
       capturing — or open the vault's admin UI now to see what's
       inside.</p>
     <p><a class="btn btn-primary" href="/vault/${urlVault}/admin/">Open vault admin</a></p>
@@ -1079,7 +1079,7 @@ function renderInstallTile(tile: ModuleInstallTileState): string {
  * surface decision.
  */
 const USE_IT_NOW_URLS: Partial<Record<CuratedModuleShort, string>> = {
-  app: "/app/notes/",
+  surface: "/surface/notes/",
   notes: "/notes/",
   // Omitted: scribe + runner. They don't ship an admin SPA yet
   // (scribe#53, runner#8 track). Pointing "Use it now" at /scribe/admin
@@ -1229,9 +1229,9 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       const installTiles = buildInstallTiles(url, deps);
       // hub#342: drive the lead "Start using your vault" tile's target.
       // When parachute-app is installed alongside vault, the tile links
-      // to `/app/notes/` (auto-bootstrapped Notes-as-UI per parachute-app
+      // to `/surface/notes/` (auto-bootstrapped Notes-as-UI per parachute-app
       // §17). Otherwise it falls back to the vault's own admin UI.
-      const appInstalled = isModuleInstalled("app", deps.manifestPath);
+      const appInstalled = isModuleInstalled("surface", deps.manifestPath);
       const doneProps: RenderDoneStepProps = {
         vaultName,
         hubOrigin: deps.issuer,
@@ -1711,9 +1711,9 @@ const INSTALL_TILE_PROPS: ReadonlyArray<{
   tagline: string;
 }> = [
   {
-    short: "app",
-    displayName: "App",
-    tagline: "Host module for Parachute UIs — auto-installs Notes on first boot.",
+    short: "surface",
+    displayName: "Surface",
+    tagline: "Host module for Parachute surfaces — auto-installs Notes on first boot.",
   },
   {
     short: "scribe",
@@ -1882,7 +1882,7 @@ function validateAccountFields(input: {
  * Whether a given curated module is currently installed (has a row in
  * services.json keyed by its canonical `manifestName`). Used by the
  * done-step renderer (hub#342) to decide whether to point the "Start
- * using your vault" tile at `/app/notes/` (App installed → Notes UI
+ * using your vault" tile at `/surface/notes/` (App installed → Notes UI
  * auto-bootstrapped) vs the vault's own admin UI. Cheap manifest read
  * shared with `buildInstallTiles`.
  */

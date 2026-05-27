@@ -471,9 +471,9 @@ const HTML_TEMPLATE = `<!doctype html>
    * Render the "Get started" section (hub#342) above the Services grid.
    *
    * One hardcoded target, conditional on its prerequisite being installed:
-   *   - "Open Notes" → /app/notes/  (requires parachute-app installed;
-   *     App auto-bootstraps Notes-as-UI per parachute-app §17, so the
-   *     mere presence of App means /app/notes/ is live)
+   *   - "Open Notes" → /surface/notes/  (requires parachute-surface installed;
+   *     Surface auto-bootstraps Notes-as-UI per parachute-surface §17, so the
+   *     mere presence of Surface means /surface/notes/ is live)
    *
    * The earlier "Browse Vault" tile retired in workstream C (2026-05-25)
    * once vault declared uiUrl in its module.json (per patterns#96). With
@@ -500,12 +500,12 @@ const HTML_TEMPLATE = `<!doctype html>
   function renderGetStarted(services) {
     if (!getStartedGrid || !getStartedSection) return;
     const tiles = [];
-    const hasApp = services.some((s) => s && s.name === 'parachute-app');
-    if (hasApp) {
+    const hasSurface = services.some((s) => s && s.name === 'parachute-surface');
+    if (hasSurface) {
       tiles.push({
         title: 'Open Notes',
         desc: 'Browse + capture in the Notes app — reads from your vault.',
-        href: '/app/notes/',
+        href: '/surface/notes/',
       });
     }
     if (tiles.length === 0) {
