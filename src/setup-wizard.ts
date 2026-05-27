@@ -38,6 +38,8 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { type OperationsRegistry, runInstall, specFor } from "./api-modules-ops.ts";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
@@ -610,7 +612,7 @@ function renderScribeSubForm(cloudHost: boolean): string {
             <label class="field scribe-api-key-field" data-shows-on="cloud">
               <span class="field-label">API key</span>
               <input type="text" name="scribe_api_key" autocomplete="off" placeholder="gsk_… or sk-…" />
-              <span class="field-hint">Pasted directly into <code>~/.parachute/surface/config.json</code> on this hub (file mode 0o600). Leave blank to skip and set later in the admin SPA.</span>
+              <span class="field-hint">Pasted directly into <code>~/.parachute/scribe/config.json</code> on this hub (file mode 0o600). Leave blank to skip and set later in the admin SPA.</span>
             </label>
           </div>
         </details>
@@ -1885,15 +1887,13 @@ function writeScribeConfigForWizard(
  * mode 0o600. Creates the parent dir if missing.
  */
 function persistScribeConfig(configDir: string, update: Record<string, unknown>): void {
-  const fs = require("node:fs") as typeof import("node:fs");
-  const path = require("node:path") as typeof import("node:path");
-  const scribeDir = path.join(configDir, "scribe");
-  const configPath = path.join(scribeDir, "config.json");
-  fs.mkdirSync(scribeDir, { recursive: true });
+  const scribeDir = join(configDir, "scribe");
+  const configPath = join(scribeDir, "config.json");
+  mkdirSync(scribeDir, { recursive: true });
   let existing: Record<string, unknown> = {};
-  if (fs.existsSync(configPath)) {
+  if (existsSync(configPath)) {
     try {
-      existing = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
+      existing = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
     } catch {
       // Malformed existing config — treat as empty + overwrite.
       existing = {};
@@ -1916,7 +1916,7 @@ function persistScribeConfig(configDir: string, update: Record<string, unknown>)
       merged[key] = value;
     }
   }
-  fs.writeFileSync(configPath, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(configPath, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
 }
 
 /**
