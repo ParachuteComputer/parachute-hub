@@ -1,5 +1,5 @@
 /**
- * `GET /api/ready` — hub-side boot-readiness probe (hub#444).
+ * `GET /api/ready` — hub-side boot-readiness probe (hub#443).
  *
  * Public (no bearer required) — used by:
  *

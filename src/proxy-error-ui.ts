@@ -1,5 +1,5 @@
 /**
- * HTML + JSON renderers for upstream-unreachable responses (hub#444).
+ * HTML + JSON renderers for upstream-unreachable responses (hub#443).
  *
  * Two states, two presentations, two content types — four total responses.
  *
@@ -9,7 +9,7 @@
  *                       the budget, fall back to a manual Refresh button.
  *
  *   transient + JSON  → 503, `{ error: "upstream_starting", error_type,
- *                       retry_after_ms: 2000, attempts_remaining: <N> }`
+ *                       retry_after_ms: 2000, max_attempts: <N> }`
  *                       so an API consumer can drive its own backoff.
  *
  *   persistent + HTML → 502, branded "Module unreachable" page with NO
@@ -97,8 +97,13 @@ export function wantsHtml(req: Request): boolean {
 /**
  * Build the JSON response body for a proxy-error response.
  *
- *   - Transient: includes `retry_after_ms` + `attempts_remaining` so an
- *     API consumer (CLI, MCP client) can implement its own bounded retry.
+ *   - Transient: includes `retry_after_ms` + `max_attempts` so an API
+ *     consumer (CLI, MCP client) can implement its own bounded retry.
+ *     `max_attempts` is the ceiling, not a per-request remaining count —
+ *     hub doesn't track per-consumer state, so it can't honestly emit a
+ *     decrementing counter. The HTML page tracks its own counter
+ *     client-side (5 polls then manual fallback); JSON consumers do
+ *     the same with this ceiling as the budget.
  *   - Persistent: includes `admin_url` so a developer/operator tool can
  *     surface a "go check the supervisor" affordance.
  */
@@ -111,7 +116,7 @@ export function renderProxyErrorJson(opts: BuildProxyErrorOpts): ProxyErrorRespo
       error_description: `${opts.serviceLabel} is still starting; retry shortly.`,
       service: opts.short,
       retry_after_ms: TRANSIENT_RETRY_MS,
-      attempts_remaining: TRANSIENT_MAX_ATTEMPTS,
+      max_attempts: TRANSIENT_MAX_ATTEMPTS,
     });
     return {
       body,
@@ -249,9 +254,18 @@ export function renderProxyErrorHtml(opts: BuildProxyErrorOpts): ProxyErrorRespo
                 if (attempt > maxAttempts) giveUp();
               });
           }
-          setTimeout(poll, intervalMs);
-          setInterval(function () {
-            if (attempt <= maxAttempts) poll();
+          // Single timer source: setInterval fires every intervalMs and
+          // self-stops at maxAttempts. The previous shape armed BOTH a
+          // setTimeout AND a setInterval at the same cadence — they
+          // double-fired at T+intervalMs, racing the attempt counter and
+          // reaching the giveUp ceiling in ~6s instead of the designed 10s.
+          // Reviewer-flagged on #443.
+          var pollTimer = setInterval(function () {
+            if (attempt > maxAttempts) {
+              clearInterval(pollTimer);
+              return;
+            }
+            poll();
           }, intervalMs);
           if (elManualBtn) {
             elManualBtn.addEventListener('click', function () { window.location.reload(); });

@@ -1945,7 +1945,7 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
     // crashed, port shifted, or the user is mid-restart. We owe the caller a
     // useful error instead of a hang or a silent 404. No supervisor +
     // no pidfile → classifier returns "persistent" → 502 + admin_url
-    // (hub#444 boot-readiness gating).
+    // (hub#443 boot-readiness gating).
     const h = makeHarness();
     try {
       writeManifest(
@@ -2013,12 +2013,12 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
       const body = (await res.json()) as {
         error_type: string;
         retry_after_ms: number;
-        attempts_remaining: number;
+        max_attempts: number;
         admin_url?: string;
       };
       expect(body.error_type).toBe("upstream_starting");
       expect(body.retry_after_ms).toBe(2000);
-      expect(body.attempts_remaining).toBe(5);
+      expect(body.max_attempts).toBe(5);
       // Transient JSON MUST NOT carry an admin link.
       expect(body.admin_url).toBeUndefined();
     } finally {
@@ -2196,7 +2196,7 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
   });
 
   test("/api/ready returns supervisor view + is reachable pre-admin", async () => {
-    // hub#444 endpoint is public + pre-admin (it has to be — the page that
+    // hub#443 endpoint is public + pre-admin (it has to be — the page that
     // polls it is itself served pre-auth when modules are still booting).
     const h = makeHarness();
     try {
@@ -2845,7 +2845,7 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
 
   test("returns 502 with persistent-state JSON when the matching upstream is unreachable", async () => {
     // Service is in services.json but the port has nothing listening — same
-    // shape as the vault-unreachable test (hub#444 boot-readiness gating).
+    // shape as the vault-unreachable test (hub#443 boot-readiness gating).
     // No supervisor + no pidfile → persistent → 502 with admin_url.
     const h = makeHarness();
     try {

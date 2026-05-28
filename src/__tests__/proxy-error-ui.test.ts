@@ -52,7 +52,7 @@ describe("statusForState", () => {
 });
 
 describe("renderProxyErrorJson", () => {
-  test("transient → 503 JSON with retry_after_ms + attempts_remaining + no admin_url", () => {
+  test("transient → 503 JSON with retry_after_ms + max_attempts + no admin_url", () => {
     const out = renderProxyErrorJson({
       short: "vault",
       serviceLabel: "parachute-vault",
@@ -66,14 +66,14 @@ describe("renderProxyErrorJson", () => {
       error: string;
       error_type: string;
       retry_after_ms: number;
-      attempts_remaining: number;
+      max_attempts: number;
       admin_url?: string;
       service: string;
     };
     expect(body.error).toBe(ERROR_TYPE_TRANSIENT);
     expect(body.error_type).toBe(ERROR_TYPE_TRANSIENT);
     expect(body.retry_after_ms).toBe(TRANSIENT_RETRY_MS);
-    expect(body.attempts_remaining).toBe(TRANSIENT_MAX_ATTEMPTS);
+    expect(body.max_attempts).toBe(TRANSIENT_MAX_ATTEMPTS);
     expect(body.admin_url).toBeUndefined();
     expect(body.service).toBe("vault");
   });

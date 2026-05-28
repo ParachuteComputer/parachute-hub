@@ -1,5 +1,5 @@
 /**
- * Boot-readiness classifier for upstream proxy failures (hub#444).
+ * Boot-readiness classifier for upstream proxy failures (hub#443).
  *
  * When `proxyRequest` in `hub-server.ts` gets a fetch error talking to a
  * module's loopback port, we want to differentiate two operator

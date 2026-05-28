@@ -456,7 +456,7 @@ export function layerOf(req: Request): RequestLayer {
  *
  *   - **transient** (still booting): 503 + Retry-After. HTML page polls
  *     /api/ready up to 5 attempts on a 2s cadence; JSON includes
- *     retry_after_ms + attempts_remaining.
+ *     retry_after_ms + max_attempts.
  *   - **persistent** (crashed / never started): 502, no auto-retry. HTML
  *     surfaces a /admin/modules link; JSON includes admin_url.
  *
@@ -538,7 +538,7 @@ async function proxyRequest(
     // Classify the failure (transient boot-window vs persistent crash) and
     // render either an HTML page or a JSON error per the request's Accept.
     // See `proxy-state.ts` for the classification logic + `proxy-error-ui.ts`
-    // for the two response shapes (closes hub#444).
+    // for the two response shapes (closes hub#443).
     const classifyOpts: Parameters<typeof classifyUpstream>[1] = {};
     if (supervisor !== undefined) classifyOpts.supervisor = supervisor;
     const state = classifyUpstream(short, classifyOpts);
@@ -1306,7 +1306,7 @@ export function hubFetch(
       );
     }
 
-    // Boot-readiness probe (hub#444). Used by the transient-state proxy
+    // Boot-readiness probe (hub#443). Used by the transient-state proxy
     // error page's inline poll script to detect when a still-booting
     // module has come up. Public + DB-free so it works during the pre-
     // admin lockout (the page that polls it is itself served pre-auth).
