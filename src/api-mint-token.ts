@@ -47,7 +47,18 @@
 import type { Database } from "bun:sqlite";
 import { inferAudience } from "./jwt-audience.ts";
 import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
-import { isNonRequestableScope, isVaultAdminScope, vaultScopeName } from "./scope-explanations.ts";
+import {
+  MINT_HOST_ADMIN_SCOPE,
+  MINT_HOST_AUTH_SCOPE,
+  canGrant,
+  hasMintingAuthority,
+} from "./scope-attenuation.ts";
+import { isVaultAdminScope, vaultScopeName } from "./scope-explanations.ts";
+
+// Re-export `canGrant` so existing importers (and the symmetric revoke path)
+// have a single name to reach for; the implementation lives in the shared
+// `scope-attenuation.ts` module alongside `hasMintingAuthority`.
+export { canGrant } from "./scope-attenuation.ts";
 
 /** Default lifetime when --expires-in / `expires_in` is omitted. Matches the CLI. */
 export const API_MINT_TOKEN_DEFAULT_TTL_SECONDS = 90 * 24 * 60 * 60;
@@ -55,68 +66,17 @@ export const API_MINT_TOKEN_DEFAULT_TTL_SECONDS = 90 * 24 * 60 * 60;
 export const API_MINT_TOKEN_MAX_TTL_SECONDS = 365 * 24 * 60 * 60;
 /**
  * Bearer scope that authorises minting any *requestable* scope (rule 1 of the
- * attenuation model). The operator's admin scope-set carries this; a narrow
- * `--scope-set=auth` operator token carries it too.
+ * attenuation model). Re-exported alias of the shared `MINT_HOST_AUTH_SCOPE`
+ * for back-compat with existing importers.
  */
-export const API_MINT_TOKEN_HOST_AUTH_SCOPE = "parachute:host:auth";
+export const API_MINT_TOKEN_HOST_AUTH_SCOPE = MINT_HOST_AUTH_SCOPE;
 /**
  * Bearer scope that authorises minting `vault:<name>:admin` (rule 2).
- * `parachute:host:admin` already implies box-wide administration of every
- * vault on the hub, so minting a vault-pinned admin from it is a privilege
- * *reduction* (de-escalation), not an escalation — see the design doc
- * `2026-05-28-operator-mintable-vault-admin.md`.
+ * Re-exported alias of the shared `MINT_HOST_ADMIN_SCOPE`.
  */
-export const API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE = "parachute:host:admin";
+export const API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE = MINT_HOST_ADMIN_SCOPE;
 /** client_id stamped on minted tokens. Matches the CLI flow's value. */
 export const API_MINT_TOKEN_CLIENT_ID = "parachute-hub";
-
-/**
- * Capability attenuation: can a bearer holding `bearerScopes` mint a token
- * carrying `requestedScope`? True iff the requested scope is a subset of the
- * bearer's own authority under one of three rules (see the file docstring):
- *
- *   1. requestable + bearer has `parachute:host:auth`;
- *   2. `vault:<N>:admin` + bearer has `parachute:host:admin`;
- *   3. `vault:<N>:<verb>` + bearer has `vault:<N>:admin` (same `<N>`).
- *
- * Pure function — no DB, no I/O — so it's trivially testable and the guard in
- * the handler is a single `scopes.filter((s) => !canGrant(bearerScopes, s))`.
- */
-export function canGrant(bearerScopes: string[], requestedScope: string): boolean {
-  // Rule 1 — host:auth mints any requestable scope.
-  if (
-    !isNonRequestableScope(requestedScope) &&
-    bearerScopes.includes(API_MINT_TOKEN_HOST_AUTH_SCOPE)
-  ) {
-    return true;
-  }
-  // Rule 2 — host:admin attenuates to a named vault's admin.
-  if (
-    isVaultAdminScope(requestedScope) &&
-    bearerScopes.includes(API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE)
-  ) {
-    return true;
-  }
-  // Rule 3 — vault:<N>:admin attenuates to any same-vault subset (incl. admin).
-  const requestedVault = vaultScopeName(requestedScope);
-  if (requestedVault !== null && bearerScopes.includes(`vault:${requestedVault}:admin`)) {
-    return true;
-  }
-  return false;
-}
-
-/**
- * Does the bearer hold ANY minting authority? Entry gate before per-scope
- * checks — a bearer with none (e.g. a read-only token) can mint nothing, so
- * we 403 early rather than walking every requested scope to the same end.
- */
-function hasMintingAuthority(bearerScopes: string[]): boolean {
-  return (
-    bearerScopes.includes(API_MINT_TOKEN_HOST_AUTH_SCOPE) ||
-    bearerScopes.includes(API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE) ||
-    bearerScopes.some((s) => isVaultAdminScope(s))
-  );
-}
 
 export interface ApiMintTokenDeps {
   db: Database;
