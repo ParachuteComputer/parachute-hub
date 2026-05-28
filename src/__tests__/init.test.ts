@@ -24,6 +24,16 @@ function makeHarness(): Harness {
   };
 }
 
+/**
+ * Default test-stub for the vault-module install step (hub#168 Cut 1).
+ * The real `installVaultModuleImpl` shells out to `bun add -g
+ * @openparachute/vault` + seeds services.json — neither is appropriate in
+ * a unit test (slow + side-effectful + leaks state across runs). Tests
+ * that want to observe install-flow side-effects (services.json shape,
+ * etc.) can override this with their own stub.
+ */
+const noopVaultInstall = async (_configDir: string, _manifestPath: string): Promise<number> => 0;
+
 function seedVault(manifestPath: string): void {
   writeFileSync(
     manifestPath,
@@ -88,6 +98,7 @@ describe("init", () => {
         readExposeStateFn: () => undefined,
         isTty: false,
         platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
       });
       expect(code).toBe(0);
       expect(calls).toEqual(["ensureHub"]);
@@ -124,6 +135,7 @@ describe("init", () => {
         readExposeStateFn: () => undefined,
         isTty: false,
         platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
       });
       expect(code).toBe(0);
       // Hub was already running — ensureHub should not have been called.
@@ -196,6 +208,10 @@ describe("init", () => {
         },
         // Skip the new exposure prompt — this test is about the browser prompt only.
         noExposePrompt: true,
+        // Pre-pick the browser wizard so the new (hub#168 Cut 4) "browser
+        // or CLI?" prompt doesn't fire — this test predates that step.
+        wizardChoice: "browser",
+        installVaultModuleImpl: noopVaultInstall,
       });
       expect(code).toBe(0);
       expect(opened).toEqual(["http://127.0.0.1:1939/admin/"]);
@@ -224,6 +240,13 @@ describe("init", () => {
           return true;
         },
         noExposePrompt: true,
+        // No wizardChoice set — falls into the back-compat Y/n confirm,
+        // where 'n' skips the browser open (the original semantic this
+        // test was written to assert). Suppress the new (hub#168 Cut 4)
+        // wizard-choice prompt so this test stays focused on the Y/n
+        // confirm path.
+        noWizardPrompt: true,
+        installVaultModuleImpl: noopVaultInstall,
       });
       expect(code).toBe(0);
       expect(opened).toEqual([]);
@@ -337,6 +360,7 @@ describe("init", () => {
         readExposeStateFn: () => undefined,
         isTty: false,
         platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
       });
       expect(code).toBe(1);
       const joined = logs.join("\n");
@@ -437,6 +461,11 @@ describe("init exposure chain", () => {
           return 0;
         },
         noExposePrompt: true,
+        // Suppress the new wizard-choice prompt + stub the vault-module
+        // install (hub#168 Cuts 1/4) so this pre-existing test stays
+        // focused on the exposure-prompt-skipped assertion.
+        noWizardPrompt: true,
+        installVaultModuleImpl: noopVaultInstall,
       });
       expect(code).toBe(0);
       expect(exposureChained).toBe(false);
@@ -478,6 +507,8 @@ describe("init exposure chain", () => {
           return 0;
         },
         exposeChoice: "tailnet",
+        noWizardPrompt: true,
+        installVaultModuleImpl: noopVaultInstall,
       });
       expect(code).toBe(0);
       expect(tailnetCalls).toBe(1);
@@ -677,6 +708,8 @@ describe("init exposure chain", () => {
           chained = true;
           return 0;
         },
+        noWizardPrompt: true,
+        installVaultModuleImpl: noopVaultInstall,
       });
       expect(code).toBe(0);
       // No exposure chain ran, no exposure prompt asked.

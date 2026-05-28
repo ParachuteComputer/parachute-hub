@@ -11,6 +11,8 @@ Fresh install? Start here — works the same on a laptop or a remote server:
 
 Usage:
   parachute init                    bring hub up, offer exposure, open admin wizard
+                                    (also lets you walk the wizard in the CLI; --cli-wizard)
+  parachute setup-wizard --hub-url <url>  walk /admin/setup in the terminal
   parachute setup                   interactive walk-through: install services + configure
   parachute install <service>       install and register a service
                                     services: ${services}
@@ -109,7 +111,9 @@ export function initHelp(): string {
   return `parachute init — get the admin wizard open in one step
 
 Usage:
-  parachute init [--no-browser] [--no-expose-prompt] [--expose none|tailnet|cloudflare]
+  parachute init [--no-browser] [--no-expose-prompt]
+                 [--expose none|tailnet|cloudflare]
+                 [--cli-wizard | --browser-wizard]
 
 What it does:
   Fresh-install front door, one command for both laptops AND remote
@@ -142,6 +146,9 @@ Flags:
                               none       — stay loopback-only
                               tailnet    — set up Tailscale Funnel (private to your tailnet)
                               cloudflare — set up Cloudflare Tunnel (your own domain)
+  --cli-wizard              skip the "browser or CLI?" prompt and walk the wizard
+                            in this terminal (hub#168 Cut 4)
+  --browser-wizard          skip the prompt and open the browser wizard directly
 
 Examples:
   parachute init                              # laptop: prompts, defaults to "no expose"
@@ -150,6 +157,71 @@ Examples:
   parachute init --expose cloudflare          # CI/scripted: chain straight into Cloudflare
   parachute init --expose tailnet             # CI/scripted: chain straight into Tailscale
   parachute init --no-browser                 # don't shell out to open / xdg-open
+  parachute init --cli-wizard                 # walk the wizard in this terminal (hub#168)
+`;
+}
+
+export function setupWizardHelp(): string {
+  return `parachute setup-wizard — terminal mirror of /admin/setup (hub#168)
+
+Usage:
+  parachute setup-wizard --hub-url <url>
+                         [--account-username <name>] [--account-password <pw>]
+                         [--bootstrap-token <token>]
+                         [--vault-mode create|import|skip] [--vault-name <name>]
+                         [--vault-import-url <url>] [--vault-import-pat <pat>] [--vault-import-replace]
+                         [--expose-mode localhost|tailnet|public]
+
+What it does:
+  Walks the same three-step setup flow the browser wizard does, in your
+  terminal. Hits the same backend handlers (POST /admin/setup/account,
+  /admin/setup/vault, /admin/setup/expose) — so any wizard bug fix lands
+  in both surfaces.
+
+  Step 1: admin account (username + password).
+  Step 2: vault (create / import from git / skip).
+  Step 3: expose mode (localhost / tailnet / public).
+
+  Idempotent: re-running picks up at the next undone step. Already-done
+  steps are skipped without prompts. Same as the browser wizard.
+
+  Run-from-flag: every prompt accepts a paired CLI flag so an entirely
+  scripted setup works (CI, ansible, etc.). Mirrors the existing
+  PARACHUTE_INITIAL_ADMIN_* env-seed path.
+
+Flags:
+  --hub-url <url>                base URL of the hub (required; e.g.
+                                 http://127.0.0.1:1939). \`parachute init\`
+                                 passes this in when chaining; standalone
+                                 callers supply it explicitly.
+  --account-username <name>      pre-supply the admin username (default: admin)
+  --account-password <pw>        pre-supply the admin password (required when
+                                 non-interactive)
+  --bootstrap-token <token>      one-time bootstrap token when the hub is in
+                                 container/serve mode. Reads PARACHUTE_BOOTSTRAP_TOKEN
+                                 from the env if not passed.
+  --vault-mode create|import|skip   pre-pick the vault step's branch
+  --vault-name <name>            pre-supply the vault name (create / import)
+  --vault-import-url <url>       remote URL for import mode (HTTPS or SSH git URL)
+  --vault-import-pat <pat>       PAT for private repo import (optional)
+  --vault-import-replace         use replace mode (default is merge)
+  --skip-vault                   shorthand for --vault-mode skip
+  --expose-mode <mode>           pre-pick the expose-mode answer
+
+Examples:
+  parachute setup-wizard --hub-url http://127.0.0.1:1939
+      # walks all three steps interactively
+
+  parachute setup-wizard --hub-url http://127.0.0.1:1939 \\
+    --account-username admin --account-password 'long-pw-here' \\
+    --vault-mode create --vault-name default \\
+    --expose-mode localhost
+      # fully non-interactive (CI-friendly)
+
+  parachute setup-wizard --hub-url http://127.0.0.1:1939 \\
+    --vault-import-url https://github.com/me/my-vault.git \\
+    --vault-import-pat ghp_xxx
+      # imports an existing vault export from GitHub
 `;
 }
 

@@ -191,6 +191,31 @@ export interface InstallOpts {
    */
   vaultName?: string;
   /**
+   * "Install the module, but don't create a first vault instance" (hub#168 — the
+   * wizard-parity work for Aaron's 2026-05-28 directive: "always install the
+   * vault module, but creating a vault should be optional").
+   *
+   * Default: false (today's behavior — install runs the service's `init` and
+   * starts the daemon, which for vault auto-creates a `default` row).
+   *
+   * When true:
+   *   - The `bun add -g <pkg>` step still runs (puts the binary on PATH).
+   *   - `spec.init` is SKIPPED. For vault this means no `parachute-vault init`
+   *     → no default-vault row is created from this code path.
+   *   - `lifecycle.start` is SKIPPED. The supervisor/wizard owns spawning;
+   *     starting vault here would trigger its server-side auto-init (which
+   *     creates a `default` vault on first boot when `listVaults().length === 0`).
+   *   - services.json is still seeded (`spec.seedEntry`) + installDir stamped
+   *     so subsequent supervisor spawns find the module + module.json.
+   *
+   * Intended for `parachute init` — install the module so the wizard can offer
+   * Create/Import/Skip without a follow-up bun-add round-trip, but defer
+   * vault-instance creation to whichever path the wizard's vault step takes.
+   * On the existing CLI surfaces (`parachute install vault`, `parachute setup`),
+   * leave it false so today's behavior is unchanged.
+   */
+  noCreate?: boolean;
+  /**
    * `parachute install scribe` only: pre-pick the transcription provider so
    * the prompt doesn't fire. Validated against scribe's known providers — an
    * unknown name is logged and the config is left at default.
@@ -708,7 +733,7 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
       ? spec.manifestName
       : manifest.name;
 
-  if (spec.init) {
+  if (spec.init && !opts.noCreate) {
     // Forward --vault-name from the InstallOpts when set so `parachute setup`
     // (and any future programmatic caller) can pre-answer the name prompt.
     const initCmd =
@@ -721,6 +746,8 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
       log(`${initCmd.join(" ")} exited ${initCode}`);
       return initCode;
     }
+  } else if (spec.init && opts.noCreate) {
+    log(`(skipping ${spec.init.join(" ")} — --no-create: module installed, no instance created)`);
   }
 
   // Hub-as-port-authority (#53): pick the service's port now and reflect it
@@ -849,7 +876,11 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   // wondering why nothing happened. Always end with the daemon running unless
   // the caller opted out (CI / piped scripts). Idempotent: if the service is
   // already up, lifecycle.start no-ops via the existing PID-file check.
-  if (!opts.noStart) {
+  //
+  // `noCreate` (hub#168) also suppresses auto-start: starting vault would
+  // trigger its server-side first-boot auto-init (creating a default vault),
+  // which is exactly what --no-create is supposed to defer.
+  if (!opts.noStart && !opts.noCreate) {
     const startService =
       opts.startService ??
       ((short: string) => lifecycleStart(short, { manifestPath, configDir, log }));
