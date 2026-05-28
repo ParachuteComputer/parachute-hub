@@ -43,10 +43,14 @@ import {
   readHubPort,
 } from "../hub-control.ts";
 import { type AliveFn, defaultAlive, processState } from "../process-state.ts";
-import { readManifestLenient } from "../services-manifest.ts";
+import { findService, readManifestLenient } from "../services-manifest.ts";
+import { type InstallOpts, install as defaultInstall } from "./install.ts";
 
 /** The three options the exposure prompt offers — also the `--expose` flag's domain. */
 export type ExposeChoice = "none" | "tailnet" | "cloudflare";
+
+/** Where to continue setup after init finishes. CLI walks prompts in the terminal; browser opens /admin/setup. */
+export type WizardChoice = "browser" | "cli";
 
 export interface InitOpts {
   configDir?: string;
@@ -101,6 +105,33 @@ export interface InitOpts {
    * stub to record the call without shelling out to `cloudflared`.
    */
   exposeCloudflareImpl?: () => Promise<number>;
+  /**
+   * Test seam: shim for the vault-module install step (hub#168 Cut 1).
+   * Production calls `install("vault", { noCreate: true, noStart: true, …})`
+   * to put `@openparachute/vault` on PATH without creating a first-vault
+   * instance — the wizard's vault step decides Create/Import/Skip. Tests
+   * pass a stub to record the call without shelling out.
+   */
+  installVaultModuleImpl?: (configDir: string, manifestPath: string) => Promise<number>;
+  /**
+   * Override the wizard-choice prompt (hub#168 Cut 4). When set, the
+   * "Continue setup in the browser or CLI?" question is answered without
+   * a prompt; otherwise default is `browser`. Non-interactive shells
+   * (`!isTty`) skip the prompt entirely and print the admin URL.
+   */
+  wizardChoice?: WizardChoice;
+  /**
+   * Test seam: shim for the CLI wizard chain (hub#168 Cut 3). Production
+   * lazy-imports `runCliWizard` from `./wizard.ts`. Tests pass a stub.
+   */
+  runCliWizardImpl?: (opts: { hubUrl: string; log: (l: string) => void }) => Promise<number>;
+  /**
+   * Skip the "browser or CLI?" wizard-choice prompt (hub#168 Cut 4). Used
+   * by pre-Cut-4 tests that don't expect the new prompt + by the
+   * `--no-browser` / explicit-`--cli-wizard` paths (where the answer is
+   * already known so there's no question to ask).
+   */
+  noWizardPrompt?: boolean;
 }
 
 /**
@@ -194,6 +225,65 @@ async function defaultExposeCloudflare(): Promise<number> {
 }
 
 /**
+ * Default impl for the vault-module install step (hub#168 Cut 1). Calls
+ * install("vault", { noCreate: true, noStart: true, …}) with a quiet log
+ * shim that re-emits each line under an `[install vault] ` prefix so the
+ * init log stays grep-able. Idempotent — `install` short-circuits the
+ * bun-add when vault is already linked / installed.
+ */
+async function defaultInstallVaultModule(configDir: string, manifestPath: string): Promise<number> {
+  const installOpts: InstallOpts = {
+    configDir,
+    manifestPath,
+    noCreate: true,
+    noStart: true,
+    log: (line) => console.log(`[install vault] ${line}`),
+  };
+  return await defaultInstall("vault", installOpts);
+}
+
+/**
+ * Default impl for the CLI wizard chain (hub#168 Cut 3). Lazy-imports
+ * `runCliWizard` from `./wizard.ts`. Tests pass a stub via
+ * `runCliWizardImpl` rather than triggering the real HTTP-to-localhost
+ * flow.
+ */
+async function defaultRunCliWizard(opts: {
+  hubUrl: string;
+  log: (l: string) => void;
+}): Promise<number> {
+  const { runCliWizard } = await import("./wizard.ts");
+  return await runCliWizard(opts);
+}
+
+/**
+ * Prompt for the wizard-choice question (hub#168 Cut 4). Returns the
+ * picked option, or `undefined` if the operator quit. Default is
+ * `browser` because (a) the browser flow is the canonical post-launch
+ * experience, and (b) it works without re-asking the operator about
+ * their password aloud on the terminal.
+ */
+async function promptWizardChoice(
+  prompt: (q: string) => Promise<string>,
+  log: (line: string) => void,
+): Promise<WizardChoice | undefined> {
+  log("Continue setup here in the CLI, or in your browser?");
+  log("  1) Browser (opens /admin/setup) (default)");
+  log("  2) CLI (walks you through it in this terminal)");
+  log("");
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const raw = (await prompt("Pick [1]: ")).trim().toLowerCase();
+    if (raw === "") return "browser";
+    if (raw === "1" || raw === "browser" || raw === "b") return "browser";
+    if (raw === "2" || raw === "cli" || raw === "c") return "cli";
+    if (raw === "q" || raw === "quit" || raw === "exit") return undefined;
+    log(`Sorry — expected 1, 2, or q (got "${raw}"). Try again.`);
+  }
+  log("Too many invalid entries; defaulting to browser.");
+  return "browser";
+}
+
+/**
  * Prompt for the exposure choice. Returns the picked option, or
  * `undefined` if the operator quit / bailed.
  *
@@ -246,6 +336,8 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   const openBrowser = opts.openBrowser ?? ((url: string) => defaultOpenBrowser(url, platform));
   const exposeTailnetImpl = opts.exposeTailnetImpl ?? defaultExposeTailnet;
   const exposeCloudflareImpl = opts.exposeCloudflareImpl ?? defaultExposeCloudflare;
+  const installVaultModuleImpl = opts.installVaultModuleImpl ?? defaultInstallVaultModule;
+  const runCliWizardImpl = opts.runCliWizardImpl ?? defaultRunCliWizard;
 
   log("Parachute init — getting your hub set up.");
   log("");
@@ -322,7 +414,44 @@ export async function init(opts: InitOpts = {}): Promise<number> {
     }
   }
 
-  // Step 3: vault configured?
+  // Step 2.5: always install the vault module (hub#168 Cut 1). Aaron's
+  // 2026-05-28 directive: "it should always install the vault module"
+  // even though "creating a vault should be optional." We split the
+  // module install (always) from the first-vault create (deferred to
+  // the wizard) by passing `noCreate: true` to install — bun add -g
+  // runs, services.json gets seeded, but `parachute-vault init` (which
+  // would auto-create a `default` vault) is skipped. The wizard's
+  // vault step then either Creates / Imports / Skips.
+  //
+  // Idempotent: install short-circuits the bun-add when vault is
+  // already linked (`bun link`) or already globally installed. If the
+  // operator already has a vault row, this is a no-op past the
+  // already-installed log line. We don't block init on this step;
+  // a non-zero exit code is logged but treated as a warning, since the
+  // wizard can re-attempt the install itself from /admin/setup.
+  const findVaultEntry = (): boolean => {
+    try {
+      return findService("parachute-vault", manifestPath) !== undefined;
+    } catch {
+      return false;
+    }
+  };
+  const vaultAlreadyInstalled = findVaultEntry();
+  if (!vaultAlreadyInstalled) {
+    log("");
+    log("Installing the vault module so the wizard can offer create / import / skip…");
+    const installCode = await installVaultModuleImpl(configDir, manifestPath);
+    if (installCode !== 0) {
+      log(
+        `⚠ vault module install returned ${installCode}; the wizard can retry from /admin/setup.`,
+      );
+    }
+  }
+
+  // Step 3: vault configured? (After the module install above, this may
+  // have flipped from false to true on a fresh box. The wizard reads
+  // services.json on every request, so the "configured" answer here is
+  // best-effort — it only shapes the next-step log message below.)
   let hasVault = false;
   try {
     const manifest = readManifestLenient(manifestPath);
@@ -352,6 +481,37 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   log(`  ${adminUrl}`);
   log("");
 
+  // Step 4.5: offer the operator the CLI wizard vs. the browser wizard
+  // (hub#168 Cut 4). Aaron's 2026-05-28 directive: "we should be able to
+  // move through a setup wizard on the command line or (and this is the
+  // default experience) run it through on the web." Browser remains the
+  // default — the in-terminal CLI walk is opt-in (`2)` at the prompt,
+  // `--cli-wizard` flag non-interactively).
+  //
+  // The CLI wizard chain only fires when:
+  //   - explicit `wizardChoice === "cli"` (flag-driven), or
+  //   - interactive TTY + the operator picked CLI at the prompt.
+  //
+  // In every other case (non-TTY, --no-browser, explicit
+  // `wizardChoice === "browser"`, or interactive default), we fall
+  // through to the existing browser-open flow below.
+  let choice: WizardChoice | undefined = opts.wizardChoice;
+  // `noWizardPrompt` (or pre-existing `noExposePrompt` for back-compat
+  // with the smaller pre-hub#168 test surface) suppresses the
+  // browser-or-CLI question. Tests written before Cut 4 don't expect a
+  // new prompt; without this flag they would see the wizard-choice
+  // prompt fire and timeout on a `'n'` answer (which means "no" to the
+  // historical Y/n browser-open confirm, not "exit" to the new prompt).
+  if (choice === undefined && isTty && !opts.noBrowser && !opts.noWizardPrompt) {
+    log("");
+    choice = await promptWizardChoice(prompt, log);
+  }
+  if (choice === "cli") {
+    log("");
+    log("Launching the CLI wizard. (You can also visit the URL above in a browser any time.)");
+    return await runCliWizardImpl({ hubUrl: adminUrl.replace(/\/admin\/?$/, ""), log });
+  }
+
   // Step 5: offer to open the browser. Skip in non-TTY shells (CI),
   // honor `--no-browser`.
   if (opts.noBrowser) return 0;
@@ -363,8 +523,15 @@ export async function init(opts: InitOpts = {}): Promise<number> {
     log("(Open the URL above in your browser to continue.)");
     return 0;
   }
-  const answer = (await prompt("Open in your browser now? [Y/n] ")).trim().toLowerCase();
-  if (answer === "n" || answer === "no") return 0;
+  // `choice === "browser"` (either flag-driven or the operator picked
+  // browser at the prompt) goes straight to openBrowser — skip the
+  // back-compat "Open in your browser now?" Y/n confirm. If choice is
+  // undefined (no prompt, no flag), keep the historical Y/n confirm
+  // for back-compat with existing tests + scripted callers.
+  if (choice !== "browser") {
+    const answer = (await prompt("Open in your browser now? [Y/n] ")).trim().toLowerCase();
+    if (answer === "n" || answer === "no") return 0;
+  }
   const ok = openBrowser(adminUrl);
   if (!ok) {
     log("");

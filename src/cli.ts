@@ -19,6 +19,7 @@ import { setup } from "./commands/setup.ts";
 import { status } from "./commands/status.ts";
 import { upgrade } from "./commands/upgrade.ts";
 import { dispatchVault } from "./commands/vault.ts";
+import { runSetupWizardCommand } from "./commands/wizard.ts";
 import { ExposeStateError } from "./expose-state.ts";
 import {
   exposeHelp,
@@ -29,6 +30,7 @@ import {
   restartHelp,
   serveHelp,
   setupHelp,
+  setupWizardHelp,
   startHelp,
   statusHelp,
   stopHelp,
@@ -307,6 +309,20 @@ async function main(argv: string[]): Promise<number> {
       return await setup(setupOpts);
     }
 
+    case "setup-wizard": {
+      // hub#168 Cut 3 — the in-terminal mirror of /admin/setup. Distinct
+      // from `parachute setup` (which is the multi-pick install
+      // walk-through, not a wizard-handler frontend). Both surfaces stay
+      // — `parachute setup` is the historical "install + configure
+      // services" entry; `parachute setup-wizard` drives the same
+      // handlers the browser wizard uses.
+      if (isHelpFlag(rest[0])) {
+        console.log(setupWizardHelp());
+        return 0;
+      }
+      return await runSetupWizardCommand(rest);
+    }
+
     case "init": {
       if (isHelpFlag(rest[0])) {
         console.log(initHelp());
@@ -330,13 +346,26 @@ async function main(argv: string[]): Promise<number> {
       }
       const noBrowser = exposeExtract.rest.includes("--no-browser");
       const noExposePrompt = exposeExtract.rest.includes("--no-expose-prompt");
-      const known = new Set(["--no-browser", "--no-expose-prompt"]);
+      const cliWizard = exposeExtract.rest.includes("--cli-wizard");
+      const browserWizard = exposeExtract.rest.includes("--browser-wizard");
+      const known = new Set([
+        "--no-browser",
+        "--no-expose-prompt",
+        "--cli-wizard",
+        "--browser-wizard",
+      ]);
       const unknown = exposeExtract.rest.find((a) => !known.has(a));
       if (unknown !== undefined) {
         console.error(`parachute init: unknown argument "${unknown}"`);
         console.error(
-          "usage: parachute init [--no-browser] [--no-expose-prompt] [--expose none|tailnet|cloudflare]",
+          "usage: parachute init [--no-browser] [--no-expose-prompt]\n" +
+            "                     [--expose none|tailnet|cloudflare]\n" +
+            "                     [--cli-wizard | --browser-wizard]",
         );
+        return 1;
+      }
+      if (cliWizard && browserWizard) {
+        console.error("parachute init: --cli-wizard and --browser-wizard are mutually exclusive.");
         return 1;
       }
       const initOpts: Parameters<typeof init>[0] = {};
@@ -345,6 +374,8 @@ async function main(argv: string[]): Promise<number> {
       if (exposeExtract.value) {
         initOpts.exposeChoice = exposeExtract.value as "none" | "tailnet" | "cloudflare";
       }
+      if (cliWizard) initOpts.wizardChoice = "cli";
+      else if (browserWizard) initOpts.wizardChoice = "browser";
       return await init(initOpts);
     }
 

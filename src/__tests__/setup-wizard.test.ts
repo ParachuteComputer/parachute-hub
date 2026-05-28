@@ -36,6 +36,7 @@ import {
   handleSetupGet,
   handleSetupInstallPost,
   handleSetupVaultPost,
+  postVaultImportImpl,
 } from "../setup-wizard.ts";
 import { Supervisor } from "../supervisor.ts";
 import { createUser, getUserByUsername, userCount } from "../users.ts";
@@ -774,10 +775,15 @@ describe("handleSetupVaultPost", () => {
   });
   afterEach(() => h.cleanup());
 
-  test("requires a supervisor (CLI mode rejects)", async () => {
+  test("requires a supervisor (CLI mode rejects create/import; allows skip — hub#168 Cut 2)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       await createUser(db, "owner", "pw");
+      // Bare POST (no CSRF, no session) still 400s, but on the new
+      // CSRF-first ordering it stops at the CSRF check rather than the
+      // supervisor check. That's correct posture — refuse the
+      // unauthenticated request before tendering an architectural
+      // explanation.
       const post = await handleSetupVaultPost(
         req("/admin/setup/vault", {
           method: "POST",
@@ -794,7 +800,8 @@ describe("handleSetupVaultPost", () => {
       );
       expect(post.status).toBe(400);
       const html = await post.text();
-      expect(html).toContain("supervisor unavailable");
+      // CSRF-first: the bare request bounces at the CSRF gate.
+      expect(html).toContain("Invalid form submission");
     } finally {
       db.close();
     }
@@ -3562,5 +3569,223 @@ describe("detectAutoExposeMode — Fly env detection (patterns#100)", () => {
         FLY_APP_NAME: "my-parachute",
       }),
     ).toBe("public");
+  });
+});
+
+// hub#168 Cut 2/3: vault-step three branches (create/import/skip) + JSON
+// content-type acceptance. The handleSetupVaultPost handler is shared
+// between browser and CLI surfaces — branching is by mode field +
+// content-type. These tests drive the JSON surface directly to keep the
+// behavior locked.
+
+describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  test("GET /admin/setup returns JSON envelope when Accept: application/json", () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const deps = {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+      };
+      const res = handleSetupGet(
+        req("/admin/setup", { headers: { accept: "application/json" } }),
+        deps,
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("vault step skip mode short-circuits + persists setup_vault_skipped", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      // Seed: admin exists so the wizard's vault step is reachable.
+      await createUser(db, "owner", "pw");
+      // Get a session cookie via a CSRF token GET first.
+      const supervisor = makeSupervisor();
+      const baseDeps = {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+        supervisor,
+      };
+      const getRes = handleSetupGet(
+        req("/admin/setup", { headers: { accept: "application/json" } }),
+        baseDeps,
+      );
+      const csrf = setCookie(getRes, CSRF_COOKIE_NAME) ?? "";
+      const envelope = (await getRes.json()) as { csrfToken: string };
+      // Build a session for the operator (proxy what an account POST
+      // would do).
+      const { createSession, buildSessionCookie, SESSION_TTL_MS } = await import("../sessions.ts");
+      const user = (await import("../users.ts")).getUserByUsername(db, "owner");
+      if (!user) throw new Error("user missing");
+      const session = createSession(db, { userId: user.id });
+      const cookieHeader = `${SESSION_COOKIE_NAME}=${session.id}; ${CSRF_COOKIE_NAME}=${csrf}`;
+      const postRes = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            "content-type": "application/json",
+            cookie: cookieHeader,
+          },
+          body: JSON.stringify({
+            [CSRF_FIELD_NAME]: envelope.csrfToken,
+            mode: "skip",
+          }),
+        }),
+        baseDeps,
+      );
+      expect(postRes.status).toBe(200);
+      expect(postRes.headers.get("content-type")).toContain("application/json");
+      const body = (await postRes.json()) as { step: string };
+      expect(body.step).toBe("expose");
+      // The skip flag is persisted.
+      expect(getSetting(db, "setup_vault_skipped")).toBe("true");
+      // deriveWizardState advances past the vault step.
+      const s = deriveWizardState({ db, manifestPath: h.manifestPath });
+      expect(s.hasVault).toBe(true);
+      expect(s.step).toBe("expose");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("vault step import mode requires remote_url (400 on empty)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      const supervisor = makeSupervisor();
+      const baseDeps = {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+        supervisor,
+      };
+      const { createSession } = await import("../sessions.ts");
+      const user = (await import("../users.ts")).getUserByUsername(db, "owner");
+      if (!user) throw new Error("user missing");
+      const session = createSession(db, { userId: user.id });
+      // Need CSRF cookie value matching the body field. Pull a token
+      // through a GET first.
+      const getRes = handleSetupGet(
+        req("/admin/setup", { headers: { accept: "application/json" } }),
+        baseDeps,
+      );
+      const csrf = setCookie(getRes, CSRF_COOKIE_NAME) ?? "";
+      const envelope = (await getRes.json()) as { csrfToken: string };
+      const cookieHeader = `${SESSION_COOKIE_NAME}=${session.id}; ${CSRF_COOKIE_NAME}=${csrf}`;
+      const postRes = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            "content-type": "application/json",
+            cookie: cookieHeader,
+          },
+          body: JSON.stringify({
+            [CSRF_FIELD_NAME]: envelope.csrfToken,
+            mode: "import",
+            vault_name: "imported",
+            remote_url: "",
+          }),
+        }),
+        baseDeps,
+      );
+      expect(postRes.status).toBe(400);
+      const body = (await postRes.json()) as { error: string; message: string };
+      expect(body.error).toContain("Remote URL required");
+    } finally {
+      db.close();
+    }
+  });
+
+  // hub#168 fold (PR #447 reviewer): the import POST to vault MUST carry
+  // a Bearer — vault's `authenticateVaultRequest` rejects 401 before
+  // scope check on missing auth. Asserts the header is present, names
+  // the vault, and the body shape is intact.
+  test("postVaultImportImpl sends Authorization: Bearer + correct body to vault", async () => {
+    let capturedUrl: string | undefined;
+    let capturedHeaders: Headers | undefined;
+    let capturedBody: unknown;
+    const stubFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      capturedUrl = typeof input === "string" ? input : input.toString();
+      capturedHeaders = new Headers(init?.headers ?? {});
+      capturedBody = JSON.parse((init?.body as string) ?? "{}");
+      return new Response(
+        JSON.stringify({
+          notes_imported: 7,
+          tags_imported: 2,
+          attachments_imported: 0,
+          warnings: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const result = await postVaultImportImpl({
+      vaultName: "imported",
+      vaultPort: 1940,
+      bearerToken: "stub-jwt-abc",
+      remoteUrl: "https://github.com/owner/repo.git",
+      mode: "merge",
+      pat: "ghp_stub",
+      fetcher: stubFetch,
+    });
+
+    expect(result.notes_imported).toBe(7);
+    expect(capturedUrl).toBe("http://127.0.0.1:1940/vault/imported/.parachute/mirror/import");
+    expect(capturedHeaders?.get("authorization")).toBe("Bearer stub-jwt-abc");
+    expect(capturedHeaders?.get("content-type")).toBe("application/json");
+    expect(capturedBody).toEqual({
+      remote_url: "https://github.com/owner/repo.git",
+      mode: "merge",
+      credentials: { kind: "pat", token: "ghp_stub" },
+    });
+  });
+
+  // No-PAT branch — public repo import. Sends `credentials: null`,
+  // which vault interprets as "use stored credentials" (or none).
+  // Reviewer-flagged coverage gap on the rc.8 fold.
+  test("postVaultImportImpl sends credentials: null when no PAT is provided", async () => {
+    let capturedBody: unknown;
+    const stubFetch = (async (_: string | URL | Request, init?: RequestInit) => {
+      capturedBody = JSON.parse((init?.body as string) ?? "{}");
+      return new Response(
+        JSON.stringify({ notes_imported: 1 }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    await postVaultImportImpl({
+      vaultName: "public-import",
+      vaultPort: 1940,
+      bearerToken: "stub",
+      remoteUrl: "https://github.com/owner/public.git",
+      mode: "replace",
+      fetcher: stubFetch,
+    });
+
+    expect(capturedBody).toEqual({
+      remote_url: "https://github.com/owner/public.git",
+      mode: "replace",
+      credentials: null,
+    });
   });
 });

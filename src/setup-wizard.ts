@@ -42,13 +42,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type OperationsRegistry, runInstall, specFor } from "./api-modules-ops.ts";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
-import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
 import {
   BOOTSTRAP_TOKEN_PREFIX,
   consumeBootstrapToken,
   getBootstrapToken,
   verifyBootstrapToken,
 } from "./bootstrap-token.ts";
+import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import {
   CSRF_FIELD_NAME,
   ensureCsrfToken,
@@ -64,6 +64,7 @@ import {
   openFirstClientAutoApproveWindow,
   setSetting,
 } from "./hub-settings.ts";
+import { signAccessToken } from "./jwt-sign.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 import { mintOperatorToken } from "./operator-token.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
@@ -104,6 +105,71 @@ const FONT_MONO = `ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", mono
 
 function escapeAttr(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+/**
+ * The CLI wizard (hub#168 Cut 3) sends `Accept: application/json` on
+ * every GET; the browser sends `Accept: text/html, …`. We branch the GET
+ * handler's response shape on this header. Same DB / state-derivation
+ * path both ways — only the rendering forks.
+ *
+ * POSTs from the CLI wizard send `Content-Type: application/json`;
+ * browser POSTs send `application/x-www-form-urlencoded`. The POST
+ * handlers parse-into-the-same-shape with `readBodyFields` below.
+ */
+function wantsJsonResponse(req: Request): boolean {
+  const accept = req.headers.get("accept") ?? "";
+  return accept.includes("application/json");
+}
+
+/**
+ * Best-effort body parser shared by every wizard POST handler. Branches
+ * on Content-Type:
+ *   * `application/json` → parses the body as JSON, projects each
+ *     top-level field into a `Map<string, string>` (matches the
+ *     FormData getter shape the rest of the handlers use).
+ *   * Anything else → standard `req.formData()` (the historical browser
+ *     path).
+ *
+ * Returns a tuple of `[fields, isJson]`. `isJson` lets the handler
+ * decide between a 303 redirect (browser) and a 200 JSON envelope
+ * (CLI). The fields-getter API is intentionally lossy on JSON arrays /
+ * nested objects — every wizard field today is a plain string, so the
+ * Map<string, string> shape is sufficient. If we ever need arrays here,
+ * extend with a `getAll(name)` shim.
+ */
+async function readBodyFields(req: Request): Promise<{
+  get: (name: string) => string | null;
+  isJson: boolean;
+}> {
+  const contentType = req.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    let parsed: Record<string, unknown> = {};
+    try {
+      parsed = (await req.json()) as Record<string, unknown>;
+    } catch {
+      // Malformed JSON falls through to an empty map — the handlers'
+      // existing field-validation surfaces the right error message.
+      parsed = {};
+    }
+    return {
+      isJson: true,
+      get: (name: string) => {
+        const v = parsed[name];
+        if (typeof v === "string") return v;
+        if (typeof v === "number" || typeof v === "boolean") return String(v);
+        return null;
+      },
+    };
+  }
+  const form = await req.formData();
+  return {
+    isJson: false,
+    get: (name: string) => {
+      const v = form.get(name);
+      return typeof v === "string" ? v : null;
+    },
+  };
 }
 
 // --- state derivation ----------------------------------------------------
@@ -164,7 +230,13 @@ export function deriveWizardState(deps: {
   // which maps to `parachute-vault` in services.json.
   const vaultSpec = specFor(FIRST_VAULT_SHORT);
   const vaultEntry = findService(vaultSpec.manifestName, deps.manifestPath);
-  const hasVault = vaultEntry !== undefined;
+  // hub#168 Cut 2: `setup_vault_skipped === "true"` advances the wizard
+  // past the vault step even when no vault row exists. The operator
+  // explicitly chose Skip; the module is installed (Cut 1) but no
+  // instance was provisioned. Treat as "vault step is done" for the
+  // purposes of state-derivation so the wizard moves to expose.
+  const vaultSkipped = getSetting(deps.db, "setup_vault_skipped") === "true";
+  const hasVault = vaultEntry !== undefined || vaultSkipped;
   // Expose-mode is the operator's "how will this hub be reached?" answer
   // (hub#268 Item 2). Stored as a hub_setting; the wizard's expose step
   // sets it; absence means we should still ask. EXCEPT — if we're
@@ -261,7 +333,9 @@ export interface SetupWizardDeps {
  * (RAILWAY_ENVIRONMENT), DigitalOcean App Platform (DIGITALOCEAN_APP_*),
  * etc. Each only auto-detects when the platform clearly owns the public URL.
  */
-export function detectAutoExposeMode(env: Record<string, string | undefined>): "public" | undefined {
+export function detectAutoExposeMode(
+  env: Record<string, string | undefined>,
+): "public" | undefined {
   // Render always sets `RENDER_EXTERNAL_URL` to a real `https://` URL on
   // any web service. `startsWith("https://")` is the precise shape; we
   // also accept `http://` as a defensive fallback in case Render ever
@@ -494,6 +568,14 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
   const { csrfToken, errorMessage, operation, vaultName, cloudHost } = props;
   if (operation) return renderVaultOpStep({ operation });
   const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
+  // hub#168 Cut 2: three-branch vault step. The browser form now sends
+  // `mode=create|import|skip` along with the existing vault_name. Defaults
+  // to create when nothing's selected (back-compat with pre-#168 form
+  // posts that didn't ship a mode field — still works through the same
+  // handler). The radio's `data-shows` attribute drives an inline
+  // <script> block that hides import-specific fields when create/skip
+  // is selected. No SPA bundle, no module deps — same posture as the
+  // existing scribe sub-form's mode-switching JS.
   // hub#267: the typed name now flows end-to-end via
   // `PARACHUTE_VAULT_NAME`. Vault#342 added the env var read on
   // first-boot — hub spawns vault with the env var set and vault's
@@ -542,7 +624,25 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
       ${error}
       <form method="POST" action="/admin/setup/vault" class="auth-form">
         ${renderCsrfHiddenInput(csrfToken)}
-        <label class="field">
+        <fieldset class="vault-mode-block">
+          <legend class="field-label">How do you want to start?</legend>
+          <label class="vault-mode-option">
+            <input type="radio" name="mode" value="create" checked data-shows="name" />
+            <span class="vault-mode-title">Create a new vault</span>
+            <span class="vault-mode-desc">Start fresh. The wizard creates an empty vault under the name below.</span>
+          </label>
+          <label class="vault-mode-option">
+            <input type="radio" name="mode" value="import" data-shows="name,import" />
+            <span class="vault-mode-title">Import from a git repo</span>
+            <span class="vault-mode-desc">Clone a previously-exported vault from GitHub / GitLab / any HTTPS git remote.</span>
+          </label>
+          <label class="vault-mode-option">
+            <input type="radio" name="mode" value="skip" data-shows="" />
+            <span class="vault-mode-title">Skip — create a vault later</span>
+            <span class="vault-mode-desc">The vault module is installed; create or import a vault any time from the admin UI.</span>
+          </label>
+        </fieldset>
+        <label class="field vault-name-field">
           <span class="field-label">Vault name</span>
           <input type="text" name="vault_name"
             autofocus minlength="2" maxlength="32"
@@ -552,9 +652,56 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
           <span class="field-hint">lowercase letters, digits, <code>-</code>, <code>_</code>;
             2–32 chars. Leave blank for <code>${DEFAULT_VAULT_NAME}</code>.</span>
         </label>
+        <fieldset class="vault-import-block" style="display: none;">
+          <legend class="field-label">Import source</legend>
+          <label class="field">
+            <span class="field-label">Remote URL</span>
+            <input type="text" name="remote_url" spellcheck="false" autocomplete="off"
+              placeholder="https://github.com/you/your-vault.git" />
+            <span class="field-hint">HTTPS or SSH clone URL. The repo must be a Parachute vault export — i.e. it carries a <code>.parachute/vault.yaml</code> at the root.</span>
+          </label>
+          <label class="field">
+            <span class="field-label">Personal access token (optional)</span>
+            <input type="password" name="pat" autocomplete="off"
+              placeholder="ghp_… / glpat-… / etc." />
+            <span class="field-hint">Required for private repos. Used in-memory for this import only — not stored. Set up push credentials later from the vault's mirror settings.</span>
+          </label>
+          <label class="vault-mode-option">
+            <input type="radio" name="import_mode" value="merge" checked />
+            <span class="vault-mode-title">Merge into a fresh vault (default)</span>
+            <span class="vault-mode-desc">Recommended on a brand-new install — the vault starts empty, so merge is effectively "import everything."</span>
+          </label>
+          <label class="vault-mode-option">
+            <input type="radio" name="import_mode" value="replace" />
+            <span class="vault-mode-title">Replace (wipes any existing notes first)</span>
+            <span class="vault-mode-desc">Only useful if you re-ran the wizard on an existing vault. Otherwise picks the same shape as merge.</span>
+          </label>
+        </fieldset>
         ${renderScribeSubForm(cloudHost === true)}
-        <button type="submit" class="btn btn-primary">Create vault & finish</button>
+        <button type="submit" class="btn btn-primary">Continue</button>
       </form>
+      <script>
+        (function () {
+          // Show/hide vault-name + import block based on the picked mode.
+          // The radio carries data-shows listing the visible block suffixes
+          // (name, import); the show/hide loop reads them and flips display
+          // on the matching block. Skip mode hides everything below the
+          // mode picker.
+          var radios = document.querySelectorAll('input[name="mode"]');
+          var nameField = document.querySelector('.vault-name-field');
+          var importBlock = document.querySelector('.vault-import-block');
+          function sync() {
+            var picked = document.querySelector('input[name="mode"]:checked');
+            var shows = picked ? (picked.dataset.shows || '') : '';
+            var nameVisible = shows.indexOf('name') !== -1;
+            var importVisible = shows.indexOf('import') !== -1;
+            if (nameField) nameField.style.display = nameVisible ? '' : 'none';
+            if (importBlock) importBlock.style.display = importVisible ? '' : 'none';
+          }
+          radios.forEach(function (r) { r.addEventListener('change', sync); });
+          sync();
+        })();
+      </script>
     </div>`;
   return baseDocument("Set up your Parachute hub — vault", body);
 }
@@ -1122,9 +1269,7 @@ function renderStartUsingTile(vaultName: string, hubOrigin: string): string {
   // The `?url=` query param is consumed by notes-ui's AddVault route
   // (packages/notes-ui/src/app/routes/AddVault.tsx) — it pre-fills the
   // vault URL input + auto-focuses Submit.
-  const vaultUrlForAdd = encodeURIComponent(
-    `${hubOrigin.replace(/\/+$/, "")}/vault/${vaultName}`,
-  );
+  const vaultUrlForAdd = encodeURIComponent(`${hubOrigin.replace(/\/+$/, "")}/vault/${vaultName}`);
   return `<section class="start-using" data-testid="start-using-tile">
     <h2>Start using your vault</h2>
     <p>Open Notes — the canonical browser UI for your vault <code>${safeVault}</code>.
@@ -1357,6 +1502,29 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
   const url = new URL(req.url);
   const state = deriveWizardState(deps);
   const csrf = ensureCsrfToken(req);
+  const wantsJson = wantsJsonResponse(req);
+  // CLI wizard surface (hub#168 Cut 3): the GET endpoint doubles as a
+  // state-probe API. Same state-derivation, same DB read; only the
+  // response shape forks on Accept. Returning the JSON envelope before
+  // the HTML rendering branches means the CLI gets the answer it needs
+  // without the wizard having to render a 30KB HTML page per poll.
+  if (wantsJson) {
+    const requireToken = getBootstrapToken() !== undefined;
+    const envelope = {
+      step: state.step,
+      hasAdmin: state.hasAdmin,
+      hasVault: state.hasVault,
+      hasExposeMode: state.hasExposeMode,
+      requireBootstrapToken: requireToken,
+      csrfToken: csrf.token,
+    };
+    const jsonHeaders: Record<string, string> = {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    };
+    if (csrf.setCookie) jsonHeaders["set-cookie"] = csrf.setCookie;
+    return new Response(JSON.stringify(envelope), { status: 200, headers: jsonHeaders });
+  }
   const extraHeaders: Record<string, string> = {
     "content-type": "text/html; charset=utf-8",
   };
@@ -1543,9 +1711,19 @@ export async function handleSetupAccountPost(
   req: Request,
   deps: SetupWizardDeps,
 ): Promise<Response> {
-  const form = await req.formData();
+  const form = await readBodyFields(req);
+  // JSON callers (CLI wizard, hub#168 Cut 3) generally don't have a
+  // pre-existing CSRF cookie because the GET that returned the JSON
+  // envelope just set one — the CLI's fetch is the first request and
+  // the verifyCsrfToken's double-submit check needs the cookie + body
+  // value to match. The wizard's GET surface sets the cookie; the CLI
+  // reads it back from `Set-Cookie` and threads it on subsequent POSTs,
+  // matching the browser behavior. CSRF verification is shared.
   const formCsrf = form.get(CSRF_FIELD_NAME);
   if (!verifyCsrfToken(req, typeof formCsrf === "string" ? formCsrf : null)) {
+    if (form.isJson) {
+      return jsonErrorResponse(400, "Invalid form submission", "Reload and try again.");
+    }
     return badRequestPage("Invalid form submission", "Reload and try again.");
   }
   // Already-bootstrapped: bounce. The wizard's GET state will resolve to
@@ -1558,10 +1736,16 @@ export async function handleSetupAccountPost(
   const requireToken = getBootstrapToken() !== undefined;
   if (userCount(deps.db) > 0) {
     if (!requireToken) {
+      if (form.isJson) {
+        return jsonOkResponse({ step: "vault", message: "admin already exists" });
+      }
       return redirect("/admin/setup");
     }
     // Defense in depth: a token was active but an admin already exists.
     // Treat as consumed.
+    if (form.isJson) {
+      return jsonErrorResponse(410, "Admin already claimed", "Bootstrap token was already used.");
+    }
     return new Response(renderClaimAlreadyHappenedPage(), {
       status: 410,
       headers: { "content-type": "text/html; charset=utf-8" },
@@ -1575,6 +1759,13 @@ export async function handleSetupAccountPost(
   if (requireToken) {
     const suppliedToken = String(form.get("bootstrap_token") ?? "").trim();
     if (!verifyBootstrapToken(suppliedToken)) {
+      if (form.isJson) {
+        return jsonErrorResponse(
+          401,
+          "Bootstrap token rejected",
+          "Re-check the `parachute-bootstrap-…` line in your hub's startup logs.",
+        );
+      }
       const username = String(form.get("username") ?? "").trim();
       return htmlResponse(
         renderAccountStep({
@@ -1596,6 +1787,9 @@ export async function handleSetupAccountPost(
   const confirm = String(form.get("password_confirm") ?? "");
   const fieldErr = validateAccountFields({ username, password, confirm });
   if (fieldErr) {
+    if (form.isJson) {
+      return jsonErrorResponse(400, "Invalid account fields", fieldErr);
+    }
     return htmlResponse(
       renderAccountStep({
         csrfToken,
@@ -1628,6 +1822,9 @@ export async function handleSetupAccountPost(
     const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
       secure: isHttpsRequest(req),
     });
+    if (form.isJson) {
+      return jsonOkResponse({ step: "vault", message: "admin created" }, { "set-cookie": cookie });
+    }
     return redirect("/admin/setup", { "set-cookie": cookie });
   } catch (err) {
     // Log the raw error server-side for the operator's debugging, but
@@ -1641,6 +1838,13 @@ export async function handleSetupAccountPost(
     // shell.
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[setup-wizard] createUser failed for "${username}": ${msg}`);
+    if (form.isJson) {
+      return jsonErrorResponse(
+        400,
+        "Account creation failed",
+        "Failed to create account. The username may already be taken.",
+      );
+    }
     return htmlResponse(
       renderAccountStep({
         csrfToken,
@@ -1682,7 +1886,26 @@ function renderClaimAlreadyHappenedPage(): string {
 }
 
 /**
- * POST `/admin/setup/vault`. Form-encoded.
+ * POST `/admin/setup/vault`. Accepts `application/x-www-form-urlencoded`
+ * (browser) and `application/json` (CLI wizard).
+ *
+ * Three modes (hub#168 Cut 2 — Aaron's 2026-05-28 directive): `mode`
+ * field is the discriminant.
+ *   * `create` (default if absent — back-compat with the pre-hub#168
+ *     browser flow that didn't send `mode`): provision a new vault under
+ *     the typed name.
+ *   * `import`: provision an empty vault under the typed name, then
+ *     POST to vault's `/vault/<name>/.parachute/mirror/import` endpoint
+ *     with the supplied remote URL + optional PAT. Surfaces import
+ *     progress through the same op-poll machinery used by the create
+ *     path.
+ *   * `skip`: don't create or import anything. The wizard advances to
+ *     the expose step. The "vault module installed" signal is still
+ *     true (init.ts pre-installed it under hub#168 Cut 1), but no
+ *     instance exists — `deriveWizardState`'s `hasVault` reflects the
+ *     services.json shape, which `skip` leaves untouched. To make the
+ *     wizard *advance past* the vault step on skip we persist a
+ *     `setup_vault_skipped` flag that `deriveWizardState` consults.
  *
  * Gated by the admin session cookie set at step 2 — a stale tab without
  * the cookie won't accidentally try to provision a vault. The session is
@@ -1690,31 +1913,33 @@ function renderClaimAlreadyHappenedPage(): string {
  * same one driving step 3 (they're necessarily the only user in
  * single-user mode).
  *
- * Drives `runInstall` directly (not the bearer-gated `handleInstall`).
- * The bearer check exists to keep narrow `:auth`-scope automation
- * tokens from hitting destructive endpoints; the wizard is already
- * gated on session + on "no vault exists yet," so a separate
- * bearer-mint dance would be pure ceremony.
- *
- * Returns a 303-redirect to `/admin/setup?op=<id>` so the wizard's
- * polling GET shape kicks in. The actual `bun add` runs in the
- * background; failures surface in the op log.
+ * Browser shape: returns 303 to `/admin/setup?op=<id>` (create/import) or
+ * `/admin/setup` (skip).
+ * CLI shape: returns 200 JSON `{ op_id?, step }`.
  */
 export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps): Promise<Response> {
-  if (!deps.supervisor) {
-    return badRequestPage(
-      "Module supervisor unavailable",
-      "The first-boot wizard needs container-mode `parachute serve` to install modules. " +
-        "On the on-box CLI surface, run `parachute install vault` directly.",
-    );
-  }
-  const form = await req.formData();
+  // Note: supervisor gate moved BELOW the mode check (hub#168 Cut 2) so
+  // that `mode=skip` doesn't fail on the CLI hub surface (which doesn't
+  // wire a supervisor — operators install vault via `parachute install
+  // vault` on the on-box CLI path; the wizard's role there is the
+  // account + skip + expose decisions only).
+  const form = await readBodyFields(req);
   const formCsrf = form.get(CSRF_FIELD_NAME);
   if (!verifyCsrfToken(req, typeof formCsrf === "string" ? formCsrf : null)) {
+    if (form.isJson) {
+      return jsonErrorResponse(400, "Invalid form submission", "Reload and try again.");
+    }
     return badRequestPage("Invalid form submission", "Reload and try again.");
   }
   const session = findActiveSession(deps.db, req);
   if (!session) {
+    if (form.isJson) {
+      return jsonErrorResponse(
+        401,
+        "No admin session",
+        "Sign in to continue setup. The session cookie was set on step 2.",
+      );
+    }
     return badRequestPage(
       "No admin session",
       "Sign in to continue setup. (The wizard sets a session cookie on step 2; clearing cookies between steps will land you here.)",
@@ -1722,7 +1947,66 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
   }
   // Already done — short-circuit to the done step.
   const state = deriveWizardState(deps);
-  if (state.hasVault) return redirect("/admin/setup?just_finished=1");
+  if (state.hasVault) {
+    if (form.isJson) {
+      return jsonOkResponse({ step: "expose", message: "vault already provisioned" });
+    }
+    return redirect("/admin/setup?just_finished=1");
+  }
+
+  // Mode discriminant (hub#168 Cut 2). Default is "create" for back-
+  // compat with the existing browser form — it doesn't send `mode`.
+  const rawMode = String(form.get("mode") ?? "create").trim();
+  if (rawMode !== "create" && rawMode !== "import" && rawMode !== "skip") {
+    if (form.isJson) {
+      return jsonErrorResponse(
+        400,
+        "Invalid vault mode",
+        `mode must be one of create, import, skip (got "${rawMode}")`,
+      );
+    }
+    return badRequestPage("Invalid vault mode", "mode must be one of create, import, skip.");
+  }
+
+  // Skip path (hub#168 Cut 2): module is already installed (init.ts
+  // ran `install vault --no-create`); we just persist a flag that
+  // `deriveWizardState` consults to skip the vault step on subsequent
+  // GETs. No supervisor work, no op_id — runs without the supervisor.
+  if (rawMode === "skip") {
+    setSetting(deps.db, "setup_vault_skipped", "true");
+    if (form.isJson) {
+      return jsonOkResponse({ step: "expose", message: "vault step skipped" });
+    }
+    return redirect("/admin/setup");
+  }
+
+  // Operator picked create or import — if they previously skipped (in
+  // another tab / via back button), the skip flag would still claim
+  // "vault step done" even after the vault row appears. Clear it
+  // defensively so `deriveWizardState` consults the real vault entry
+  // going forward.
+  deleteSetting(deps.db, "setup_vault_skipped");
+
+  // Create / import paths need the supervisor — they spawn vault and
+  // (for import) call vault's mirror endpoint. The CLI hub surface
+  // doesn't wire a supervisor; operators are expected to use
+  // `parachute install vault` directly there. Container/serve-mode
+  // hub has one.
+  if (!deps.supervisor) {
+    if (form.isJson) {
+      return jsonErrorResponse(
+        503,
+        "Module supervisor unavailable",
+        "The wizard's create/import paths need container-mode `parachute serve` to spawn vault. " +
+          "On the on-box CLI surface, run `parachute install vault` first, then re-run the wizard with --vault-mode skip.",
+      );
+    }
+    return badRequestPage(
+      "Module supervisor unavailable",
+      "The first-boot wizard needs container-mode `parachute serve` to install modules. " +
+        "On the on-box CLI surface, run `parachute install vault` directly.",
+    );
+  }
 
   // hub#267: the operator-typed vault name is now threaded all the way
   // through to vault's first-boot via `PARACHUTE_VAULT_NAME` (vault#342
@@ -1737,6 +2021,9 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
   } else {
     const v = validateVaultName(rawName);
     if (!v.ok) {
+      if (form.isJson) {
+        return jsonErrorResponse(400, "Invalid vault name", v.error);
+      }
       return htmlResponse(
         renderVaultStep({
           csrfToken: csrfTokenStr,
@@ -1747,6 +2034,51 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
       );
     }
     vaultName = v.name;
+  }
+
+  // Import path (hub#168 Cut 2): collect the remote URL + optional PAT
+  // + replace flag up front so a malformed input fails fast before we
+  // spawn the vault. The actual import POST to vault's
+  // `/vault/<name>/.parachute/mirror/import` happens AFTER vault has
+  // come up under the supervisor; the params are captured by closure
+  // into the post-install `.then()` (see `importToRun` below).
+  let importParams: { remoteUrl: string; pat?: string; mode: "merge" | "replace" } | undefined;
+  if (rawMode === "import") {
+    const remoteUrl = String(form.get("remote_url") ?? "").trim();
+    if (remoteUrl === "") {
+      if (form.isJson) {
+        return jsonErrorResponse(
+          400,
+          "Remote URL required",
+          'remote_url must be a non-empty HTTPS or SSH clone URL when mode="import".',
+        );
+      }
+      return htmlResponse(
+        renderVaultStep({
+          csrfToken: csrfTokenStr,
+          vaultName: rawName,
+          errorMessage: "Remote URL is required to import a vault. Paste a git clone URL.",
+        }),
+        400,
+      );
+    }
+    const importMode = String(form.get("import_mode") ?? "merge").trim();
+    if (importMode !== "merge" && importMode !== "replace") {
+      const err = `import_mode must be "merge" or "replace" (got "${importMode}").`;
+      if (form.isJson) {
+        return jsonErrorResponse(400, "Invalid import_mode", err);
+      }
+      return htmlResponse(
+        renderVaultStep({ csrfToken: csrfTokenStr, vaultName: rawName, errorMessage: err }),
+        400,
+      );
+    }
+    const pat = String(form.get("pat") ?? "").trim();
+    importParams = {
+      remoteUrl,
+      mode: importMode,
+      ...(pat ? { pat } : {}),
+    };
   }
   // Persist for the done-step renderer. Vault overwrites services.json
   // on its first authoritative boot, but until that completes the wizard
@@ -1780,7 +2112,13 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
         { status: "succeeded" },
         `${FIRST_VAULT_SHORT} already supervised (status=${supervisorState.status})`,
       );
+      if (form.isJson) {
+        return jsonOkResponse({ op_id: op.id, step: "vault", message: "vault already supervised" });
+      }
       return redirect(`/admin/setup?op=${encodeURIComponent(op.id)}`);
+    }
+    if (form.isJson) {
+      return jsonOkResponse({ step: "vault", message: "vault already supervised" });
     }
     return redirect("/admin/setup");
   }
@@ -1804,6 +2142,17 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
     if (vaultName !== DEFAULT_VAULT_NAME) {
       spawnEnv.PARACHUTE_VAULT_NAME = vaultName;
     }
+    // Capture importParams + deps in the runInstall promise chain — when
+    // mode === "import", run the vault-side `/.parachute/mirror/import`
+    // POST as a follow-up step once the supervised vault has come up
+    // and confirmed healthy. The hub-side op_id stays the same so the
+    // CLI / browser sees a single progress stream; we just append more
+    // log lines while the import runs. On import error, the op is
+    // marked failed so the caller surfaces a usable message.
+    const importToRun = importParams;
+    const vaultIssuer = deps.issuer;
+    const importerUserId = session.userId;
+    const vaultPort = vaultSpec.seedEntry?.().port ?? 1940;
     void runInstall(op.id, FIRST_VAULT_SHORT, vaultSpec, {
       db: deps.db,
       issuer: deps.issuer,
@@ -1814,10 +2163,61 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
       ...(deps.run ? { run: deps.run } : {}),
       ...(deps.isLinked ? { isLinked: deps.isLinked } : {}),
       ...(Object.keys(spawnEnv).length > 0 ? { spawnEnv } : {}),
-    }).catch((err) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      registry.update(op.id, { status: "failed", error: msg }, `install failed: ${msg}`);
-    });
+    })
+      .then(async () => {
+        if (!importToRun) return;
+        const opState = registry.get(op.id);
+        if (!opState || opState.status !== "succeeded") return;
+        // Import is a follow-up step: mark op back to running, POST to
+        // vault, surface the result in the op log.
+        registry.update(
+          op.id,
+          { status: "running" },
+          `vault up — starting import from ${importToRun.remoteUrl} (mode=${importToRun.mode})`,
+        );
+        try {
+          // Mint a short-lived per-vault admin Bearer for the import POST.
+          // Vault validates audience `vault.<name>` + scope `vault:<name>:admin`
+          // (see admin-vault-admin-token.ts for the canonical shape — same
+          // contract the SPA Manage link uses). The token only needs to
+          // live until vault accepts the HTTP request (the clone itself
+          // happens inside vault after the auth check passes); 5 min is
+          // a generous safety net covering the supervisor's boot-grace
+          // retries on a sluggish host. Deliberate divergence from the
+          // SPA's 10-min TTL because this token is one-shot, not refreshed.
+          const minted = await signAccessToken(deps.db, {
+            sub: importerUserId,
+            scopes: [`vault:${vaultName}:admin`],
+            audience: `vault.${vaultName}`,
+            clientId: "parachute-hub-setup-wizard",
+            issuer: vaultIssuer,
+            ttlSeconds: 5 * 60,
+            vaultScope: [vaultName],
+          });
+          const result = await postVaultImportImpl({
+            vaultName,
+            vaultPort,
+            bearerToken: minted.token,
+            remoteUrl: importToRun.remoteUrl,
+            mode: importToRun.mode,
+            ...(importToRun.pat ? { pat: importToRun.pat } : {}),
+          });
+          registry.update(
+            op.id,
+            { status: "succeeded" },
+            `import succeeded — notes_imported=${result.notes_imported ?? 0}, tags_imported=${
+              result.tags_imported ?? 0
+            }, attachments_imported=${result.attachments_imported ?? 0}`,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          registry.update(op.id, { status: "failed", error: msg }, `import failed: ${msg}`);
+        }
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        registry.update(op.id, { status: "failed", error: msg }, `install failed: ${msg}`);
+      });
   } else {
     // No registry wired (test-only path; production always passes one).
     // Log a visible warning so future mis-wirings are debuggable —
@@ -1894,7 +2294,103 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
   const redirectUrl = scribeOpId
     ? `/admin/setup?op=${encodeURIComponent(op.id)}&op_scribe=${encodeURIComponent(scribeOpId)}`
     : `/admin/setup?op=${encodeURIComponent(op.id)}`;
+  if (form.isJson) {
+    return jsonOkResponse({
+      op_id: op.id,
+      ...(scribeOpId ? { scribe_op_id: scribeOpId } : {}),
+      step: "vault",
+      mode: rawMode,
+    });
+  }
   return redirect(redirectUrl);
+}
+
+/**
+ * POST the wizard-collected import params to vault's
+ * `/vault/<name>/.parachute/mirror/import` endpoint. The caller mints
+ * the per-vault admin Bearer (see `signAccessToken` use in the
+ * `runInstall().then(...)` block above) and passes it in; vault gates
+ * the endpoint on `vault:<name>:admin` upstream. Returns vault's
+ * structured response or throws with a usable message.
+ *
+ * Lives in setup-wizard.ts (not as a vault-internal helper) because
+ * vault doesn't import hub-internal code; the import POST is naturally
+ * the wizard's job — it's the only caller until vault ships its own
+ * admin SPA flow. Shape mirrors vault#390's contract:
+ *   POST /vault/<name>/.parachute/mirror/import
+ *   { remote_url, mode: "merge"|"replace", credentials: {kind, token}|null }
+ *   200 { notes_imported, tags_imported, attachments_imported, warnings }
+ *
+ * Exported (with the `Impl` suffix) so tests can inject a stub fetcher
+ * and assert the Authorization header without standing up a real vault.
+ */
+export async function postVaultImportImpl(args: {
+  vaultName: string;
+  vaultPort: number;
+  bearerToken: string;
+  remoteUrl: string;
+  mode: "merge" | "replace";
+  pat?: string;
+  fetcher?: typeof fetch;
+}): Promise<{
+  notes_imported?: number;
+  tags_imported?: number;
+  attachments_imported?: number;
+  warnings?: readonly string[];
+}> {
+  const fetcher = args.fetcher ?? fetch;
+  // Vault listens on its supervised port — talk directly to 127.0.0.1
+  // rather than going through hub's path-routing proxy. Cuts one
+  // network hop and avoids the operator-session/CSRF dance.
+  const url = `http://127.0.0.1:${args.vaultPort}/vault/${encodeURIComponent(args.vaultName)}/.parachute/mirror/import`;
+  const body: Record<string, unknown> = {
+    remote_url: args.remoteUrl,
+    mode: args.mode,
+  };
+  if (args.pat) {
+    body.credentials = { kind: "pat", token: args.pat };
+  } else {
+    body.credentials = null;
+  }
+  // Best-effort retry — the supervisor's `start` returns before vault
+  // accepts traffic; a tiny grace window covers the boot lag without
+  // a tight poll loop. Three attempts spaced 1s apart.
+  let lastErr: Error | undefined;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const res = await fetcher(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          // Vault's `authenticateVaultRequest` rejects 401 before scope
+          // check when no Bearer is present. The token must carry
+          // `vault:<name>:admin` + audience `vault.<name>` — minted at
+          // the call site via `signAccessToken` so this function stays
+          // pure (no db / userId capture).
+          authorization: `Bearer ${args.bearerToken}`,
+        },
+        body: JSON.stringify(body),
+      });
+      if (res.status === 200) {
+        return (await res.json()) as Awaited<ReturnType<typeof postVaultImportImpl>>;
+      }
+      // Vault returns structured JSON errors per mirror-routes.ts:
+      // 400 (validation), 409 (concurrent), 502 (clone failed), 500.
+      const errBody = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+      throw new Error(
+        `vault import returned ${res.status}: ${errBody.message ?? errBody.error ?? "unknown"}`,
+      );
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      // ECONNREFUSED / fetch failure → vault hasn't bound yet. Retry.
+      if (lastErr.message.includes("ECONNREFUSED") || lastErr.message.includes("Failed to fetch")) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        continue;
+      }
+      throw lastErr;
+    }
+  }
+  throw lastErr ?? new Error("vault import: exhausted retries");
 }
 
 /**
@@ -2028,13 +2524,19 @@ export async function handleSetupExposePost(
   req: Request,
   deps: SetupWizardDeps,
 ): Promise<Response> {
-  const form = await req.formData();
+  const form = await readBodyFields(req);
   const formCsrf = form.get(CSRF_FIELD_NAME);
   if (!verifyCsrfToken(req, typeof formCsrf === "string" ? formCsrf : null)) {
+    if (form.isJson) {
+      return jsonErrorResponse(400, "Invalid form submission", "Reload and try again.");
+    }
     return badRequestPage("Invalid form submission", "Reload and try again.");
   }
   const session = findActiveSession(deps.db, req);
   if (!session) {
+    if (form.isJson) {
+      return jsonErrorResponse(401, "No admin session", "Sign in to continue setup.");
+    }
     return badRequestPage(
       "No admin session",
       "Sign in to continue setup. (The wizard sets a session cookie on step 2; clearing cookies between steps will land you here.)",
@@ -2044,10 +2546,20 @@ export async function handleSetupExposePost(
   // the wizard's GET shape catches this case too, but a direct POST
   // (curl, tab race) shouldn't double-fire the auto-approve window.
   if (getSetting(deps.db, "setup_expose_mode") !== undefined) {
+    if (form.isJson) {
+      return jsonOkResponse({ step: "done", message: "expose mode already set" });
+    }
     return redirect("/admin/setup?just_finished=1");
   }
   const rawMode = form.get("expose_mode");
   if (!isSetupExposeMode(rawMode)) {
+    if (form.isJson) {
+      return jsonErrorResponse(
+        400,
+        "Invalid expose_mode",
+        `Pick one of: ${SETUP_EXPOSE_MODES.join(", ")}.`,
+      );
+    }
     return htmlResponse(
       renderExposeStep({
         csrfToken: typeof formCsrf === "string" ? formCsrf : "",
@@ -2073,18 +2585,27 @@ export async function handleSetupExposePost(
   // registry so revocation via the admin UI works as usual. Failures
   // are non-fatal: the done page falls back to the un-headered MCP
   // command + a "mint manually at /admin/tokens" hint.
+  let mintedTokenForJson: string | undefined;
   try {
     const minted = await mintOperatorToken(deps.db, session.userId, {
       issuer: deps.issuer,
       scopeSet: "admin",
     });
     setSetting(deps.db, "setup_minted_token", minted.token);
+    mintedTokenForJson = minted.token;
     console.log(
       `[setup-wizard] auto-minted operator token (jti=${minted.jti}, scope-set=admin) for done-screen MCP command`,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[setup-wizard] failed to auto-mint operator token: ${msg}`);
+  }
+  if (form.isJson) {
+    return jsonOkResponse({
+      step: "done",
+      message: "expose mode set",
+      ...(mintedTokenForJson ? { minted_token: mintedTokenForJson } : {}),
+    });
   }
   return redirect("/admin/setup?just_finished=1");
 }
@@ -2318,6 +2839,32 @@ function htmlResponse(body: string, status = 200, extra: Record<string, string> 
 
 function redirect(location: string, extra: Record<string, string> = {}): Response {
   return new Response(null, { status: 303, headers: { location, ...extra } });
+}
+
+/**
+ * Structured JSON-200 helper for the CLI wizard surface (hub#168 Cut 3).
+ * Mirrors the browser-redirect responses' header shape (extra cookies
+ * pass through) without the 303 status that would force the CLI's
+ * `fetch` to chase a non-existent location.
+ */
+function jsonOkResponse(body: unknown, extra: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8", ...extra },
+  });
+}
+
+/**
+ * Structured JSON-error helper for the CLI wizard surface (hub#168 Cut 3).
+ * The browser path renders a full HTML error page; the CLI wants a
+ * machine-parseable envelope with the same fields the rendered page
+ * shows. Status code is the same as the HTML branch (400/401/410/etc).
+ */
+function jsonErrorResponse(status: number, title: string, message: string): Response {
+  return new Response(JSON.stringify({ error: title, message, status }), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
 }
 
 function badRequestPage(title: string, message: string): Response {
@@ -2809,6 +3356,55 @@ const STYLES = `
     margin: 0.5rem 0;
   }
   .done-tile .fine { font-size: 0.85rem; color: ${PALETTE.fgMuted}; }
+
+  /* Vault-mode picker (hub#168 Cut 2). Three-option radio block at the
+     top of the vault step, plus a collapsible import-only sub-form
+     below. Shape mirrors .expose-option for visual consistency. */
+  .vault-mode-block, .vault-import-block {
+    border: 1px solid ${PALETTE.border};
+    border-radius: 8px;
+    padding: 0.75rem 0.9rem;
+    margin: 0.4rem 0;
+    background: ${PALETTE.cardBg};
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+  .vault-mode-block legend, .vault-import-block legend {
+    padding: 0 0.4rem;
+    font-size: 0.85rem;
+    color: ${PALETTE.fgMuted};
+    font-family: ${FONT_MONO};
+  }
+  .vault-mode-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    padding: 0.6rem 0.8rem;
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .vault-mode-option:hover { border-color: ${PALETTE.accent}; }
+  .vault-mode-option input[type=radio] {
+    margin-top: 0.25rem;
+    accent-color: ${PALETTE.accent};
+    flex-shrink: 0;
+  }
+  .vault-mode-title {
+    font-weight: 600;
+    color: ${PALETTE.fg};
+    font-size: 0.95rem;
+    margin-left: 0.3rem;
+  }
+  .vault-mode-desc {
+    color: ${PALETTE.fgMuted};
+    font-size: 0.85rem;
+    line-height: 1.45;
+    flex-basis: 100%;
+    margin-left: 1.7rem;
+  }
 
   /* expose step (hub#268 Item 2). Vertical stack of radio cards;
      each label is the full clickable hit target. */

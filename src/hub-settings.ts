@@ -42,6 +42,17 @@ export type HubSettingKey =
   // (vault's first-boot may write its own paths shape that the wizard
   // can't trust to match `<name>` exactly until the spawn settles).
   | "setup_vault_name"
+  // hub#168 Cut 2: operator explicitly chose Skip on the vault step.
+  // The vault module is installed (init.ts ran `install vault
+  // --no-create` per Cut 1), but no first-vault instance was created
+  // or imported. `deriveWizardState` consults this flag to advance
+  // past the vault step on subsequent GETs even though `hasVault`
+  // remains false. Value is the literal string "true" when set; absent
+  // means "operator hasn't skipped". Cleared if the operator later
+  // creates a vault from the admin SPA — that path can either delete
+  // this row directly or let the next wizard GET notice `hasVault ===
+  // true` and ignore the skip flag.
+  | "setup_vault_skipped"
   // hub#275: which dist-tag the runtime module installer uses
   // (`bun add -g <pkg>@<channel>`). `"latest"` (default) tracks the
   // stable channel; `"rc"` follows the release-candidate chain so
