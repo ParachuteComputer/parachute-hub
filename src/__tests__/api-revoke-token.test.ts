@@ -581,4 +581,124 @@ describe("POST /api/auth/revoke-token — capability attenuation (symmetric to h
       h.cleanup();
     }
   });
+
+  test("HOST-ESCALATION BLOCKED: host:admin bearer revokes parachute:host:auth jti → 403, NOT revoked", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        // host:admin is NOT host:auth, so it goes through the per-jti
+        // attenuation check. `parachute:host:auth` is non-requestable and not
+        // a vault-admin scope, so canGrant returns false for it → 403.
+        const hostAdmin = await signAccessToken(db, {
+          sub: userId,
+          scopes: ["parachute:host:admin"],
+          audience: "hub",
+          clientId: "parachute-hub",
+          issuer: ISSUER,
+          ttlSeconds: 3600,
+        });
+        const jti = await seedToken(db, userId, ["parachute:host:auth"]);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${hostAdmin.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(403);
+        expect(((await resp.json()) as { error: string }).error).toBe("insufficient_scope");
+        expect(findTokenRowByJti(db, jti)?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("EMPTY-SCOPES GUARD: non-host:auth bearer cannot revoke a scopeless target → 403, NOT revoked", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const bearer = await mintVaultAdminBearer(db, userId, "work");
+        // Seed a registry row with ZERO recorded scopes directly — the CLI/SPA
+        // never mint these, but a vacuous `[].filter(canGrant)` would
+        // otherwise pass the authority check for any entry-gate-clearing
+        // bearer. The explicit empty-scopes guard must 403 instead.
+        const jti = "scopeless-target-jti";
+        recordTokenMint(db, {
+          jti,
+          createdVia: "cli_mint",
+          subject: userId,
+          clientId: "parachute-hub",
+          scopes: [],
+          expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        });
+        expect(findTokenRowByJti(db, jti)?.scopes).toEqual([]);
+
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${bearer}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(403);
+        expect(((await resp.json()) as { error: string }).error).toBe("insufficient_scope");
+        // SECURITY: the scopeless token must NOT have been revoked.
+        expect(findTokenRowByJti(db, jti)?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("EMPTY-SCOPES: host:auth bearer CAN revoke a scopeless target → 200 (guard is non-host:auth-only)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const jti = "scopeless-target-host-auth";
+        recordTokenMint(db, {
+          jti,
+          createdVia: "cli_mint",
+          subject: userId,
+          clientId: "parachute-hub",
+          scopes: [],
+          expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        });
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(200);
+        expect(findTokenRowByJti(db, jti)?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("JTI LENGTH GUARD: jti longer than the cap → 400 invalid_request", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti: "x".repeat(257) }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(400);
+        const body = (await resp.json()) as { error: string; error_description: string };
+        expect(body.error).toBe("invalid_request");
+        expect(body.error_description).toContain("256");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
 });

@@ -62,6 +62,13 @@ import { MINT_HOST_AUTH_SCOPE, canGrant, hasMintingAuthority } from "./scope-att
  */
 export const API_REVOKE_TOKEN_REQUIRED_SCOPE = MINT_HOST_AUTH_SCOPE;
 
+/**
+ * Maximum accepted length of a caller-supplied `jti`. A real jti is a UUID or
+ * short opaque token; anything materially longer is malformed input. Capping
+ * it keeps the verbatim-echoed value out of structured logs from bloating.
+ */
+export const MAX_JTI_LENGTH = 256;
+
 export interface ApiRevokeTokenDeps {
   db: Database;
   /** Hub origin — used to validate the bearer's `iss`. */
@@ -138,6 +145,14 @@ export async function handleApiRevokeToken(
   if (typeof body.jti !== "string" || body.jti.length === 0) {
     return jsonError(400, "invalid_request", "jti is required and must be a non-empty string");
   }
+  // Cap the jti length. It's echoed verbatim into `error_description` and
+  // structured log lines; a real jti is a UUID/short token (well under 256
+  // chars), so a longer value is malformed input — reject it before it can
+  // bloat log lines. JSON-encoded responses already neutralize injection;
+  // this is a size guard, not an escaping one.
+  if (body.jti.length > MAX_JTI_LENGTH) {
+    return jsonError(400, "invalid_request", `jti exceeds ${MAX_JTI_LENGTH}-character maximum`);
+  }
   const jti = body.jti;
 
   // 5. Lookup + per-jti authority + revoke. Order: row-existence first
@@ -159,6 +174,20 @@ export async function handleApiRevokeToken(
   // leaks nothing beyond what it holds; idempotent-ok would falsely imply a
   // revoke happened.
   if (!bearerHasHostAuth) {
+    // A scopeless target (recorded `scopes: []`) would otherwise pass the
+    // `canGrant` filter vacuously — `[].filter(...)` is empty, so
+    // `ungrantable.length === 0`. That's silently permissive: any bearer
+    // clearing the entry gate could revoke a zero-scope token. Such tokens
+    // shouldn't exist (the CLI/SPA never mint them), but if one does, only a
+    // host:auth bearer may revoke it — a non-host:auth bearer has no
+    // attenuation authority that "covers" the empty scope set.
+    if (existing.scopes.length === 0) {
+      return jsonError(
+        403,
+        "insufficient_scope",
+        `bearer token cannot revoke jti ${jti}: target has no recorded scopes (only ${API_REVOKE_TOKEN_REQUIRED_SCOPE} may revoke a scopeless token)`,
+      );
+    }
     const ungrantable = existing.scopes.filter((s) => !canGrant(bearerScopes, s));
     if (ungrantable.length > 0) {
       return jsonError(
