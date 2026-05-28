@@ -137,6 +137,7 @@ import {
   parseModulesPath,
 } from "./api-modules-ops.ts";
 import { handleApiModules, handleApiModulesChannel } from "./api-modules.ts";
+import { handleApiReady } from "./api-ready.ts";
 import { REVOCATION_LIST_MOUNT, handleRevocationList } from "./api-revocation-list.ts";
 import { handleApiRevokeToken } from "./api-revoke-token.ts";
 import { handleApiSettingsHubOrigin } from "./api-settings-hub-origin.ts";
@@ -177,6 +178,8 @@ import {
 import { renderNotFoundPage } from "./oauth-ui.ts";
 import { buildHubBoundOrigins } from "./origin-check.ts";
 import { clearPid, writePid } from "./process-state.ts";
+import { toResponse as proxyErrorToResponse, renderProxyError } from "./proxy-error-ui.ts";
+import { classifyUpstream } from "./proxy-state.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import {
   FIRST_PARTY_FALLBACKS,
@@ -446,10 +449,21 @@ export function layerOf(req: Request): RequestLayer {
  * / agent / vault want the prefix), so the decision lives one layer up in
  * `proxyToService` / `proxyToVault`.
  *
- * Returns 502 when the loopback fetch fails — port valid, target unreachable
- * (service crashed, port shifted, mid-restart). `serviceLabel` is folded into
- * the error message so 502 bodies say `vault upstream unreachable` /
- * `scribe upstream unreachable` etc.
+ * Returns a boot-readiness-classified response when the loopback fetch fails
+ * — port valid, target unreachable (service crashed, port shifted, mid-
+ * restart, OR module is still inside its boot window). The response is
+ * classified by `classifyUpstream` into:
+ *
+ *   - **transient** (still booting): 503 + Retry-After. HTML page polls
+ *     /api/ready up to 5 attempts on a 2s cadence; JSON includes
+ *     retry_after_ms + max_attempts.
+ *   - **persistent** (crashed / never started): 502, no auto-retry. HTML
+ *     surfaces a /admin/modules link; JSON includes admin_url.
+ *
+ * `serviceLabel` is the services.json entry name (`parachute-vault`,
+ * `scribe`, …) folded into the response body for operator clarity.
+ * `short` is the canonical short (`vault`/`scribe`/`notes`) — used as
+ * the supervisor map key + pidfile directory key for classification.
  *
  * Hop-by-hop notes: WebSocket upgrades and HTTP/2 trailers don't traverse
  * fetch-based proxies cleanly. No on-box service uses either today; if one
@@ -460,6 +474,8 @@ async function proxyRequest(
   req: Request,
   port: number,
   serviceLabel: string,
+  short: string,
+  supervisor: Supervisor | undefined,
   targetPath?: string,
 ): Promise<Response> {
   const url = new URL(req.url);
@@ -519,10 +535,20 @@ async function proxyRequest(
     return await fetch(upstream, init);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return new Response(JSON.stringify({ error: `${serviceLabel} upstream unreachable: ${msg}` }), {
-      status: 502,
-      headers: { "content-type": "application/json" },
+    // Classify the failure (transient boot-window vs persistent crash) and
+    // render either an HTML page or a JSON error per the request's Accept.
+    // See `proxy-state.ts` for the classification logic + `proxy-error-ui.ts`
+    // for the two response shapes (closes hub#443).
+    const classifyOpts: Parameters<typeof classifyUpstream>[1] = {};
+    if (supervisor !== undefined) classifyOpts.supervisor = supervisor;
+    const state = classifyUpstream(short, classifyOpts);
+    const rendered = renderProxyError(req, {
+      short,
+      serviceLabel,
+      state,
+      upstreamError: msg,
     });
+    return proxyErrorToResponse(rendered);
   }
 }
 
@@ -536,7 +562,11 @@ async function proxyRequest(
  * fall through to the SPA shell fallback for unknown vault names (the seam
  * #173 introduced).
  */
-async function proxyToVault(req: Request, manifestPath: string): Promise<Response | undefined> {
+async function proxyToVault(
+  req: Request,
+  manifestPath: string,
+  supervisor: Supervisor | undefined,
+): Promise<Response | undefined> {
   // Lenient — see hub#406. One bad services.json row no longer takes
   // down vault routing the way it used to take down /admin/setup and
   // /api/modules (the symptom Aaron hit 2026-05-26).
@@ -557,7 +587,11 @@ async function proxyToVault(req: Request, manifestPath: string): Promise<Respons
   // both proxies keeps the dispatch surface consistent for future readers.
   const stripPrefix = stripPrefixFor(match.entry);
   const targetPath = stripPrefix ? url.pathname.slice(match.mount.length) || "/" : undefined;
-  return proxyRequest(req, match.port, "vault", targetPath);
+  // Vault's short is the literal "vault" — fixed by KNOWN_MODULES. Multiple
+  // vault instances share the same supervisor key under hub's current
+  // single-vault-per-hub model; if multi-vault-per-hub ever ships, the
+  // classifier will need a per-instance key.
+  return proxyRequest(req, match.port, "vault", "vault", supervisor, targetPath);
 }
 
 /**
@@ -613,7 +647,11 @@ export function findServiceUpstream(
  *
  * Returns `undefined` when no service claims the pathname; caller 404s.
  */
-async function proxyToService(req: Request, manifestPath: string): Promise<Response | undefined> {
+async function proxyToService(
+  req: Request,
+  manifestPath: string,
+  supervisor: Supervisor | undefined,
+): Promise<Response | undefined> {
   // Lenient read on the hot-path — a single malformed services.json
   // entry (e.g. a module installed at a buggy version that wrote
   // `port: 0`) used to cascade into 500s for every route on this hub
@@ -649,7 +687,13 @@ async function proxyToService(req: Request, manifestPath: string): Promise<Respo
   // services).
   const stripPrefix = stripPrefixFor(match.entry);
   const targetPath = stripPrefix ? url.pathname.slice(match.mount.length) || "/" : undefined;
-  return proxyRequest(req, match.port, match.entry.name, targetPath);
+  // Resolve canonical short for classification — falls back to the
+  // services.json name when the entry isn't a KNOWN_MODULES / FALLBACK
+  // shape (third-party services have no canonical short; the classifier
+  // will land in "persistent" by default which is the safer choice for
+  // unknown lifecycle).
+  const short = shortNameForManifest(match.entry.name) ?? match.entry.name;
+  return proxyRequest(req, match.port, match.entry.name, short, supervisor, targetPath);
 }
 
 /**
@@ -1260,6 +1304,16 @@ export function hubFetch(
           },
         },
       );
+    }
+
+    // Boot-readiness probe (hub#443). Used by the transient-state proxy
+    // error page's inline poll script to detect when a still-booting
+    // module has come up. Public + DB-free so it works during the pre-
+    // admin lockout (the page that polls it is itself served pre-auth).
+    if (pathname === "/api/ready") {
+      const readyDeps: Parameters<typeof handleApiReady>[1] = {};
+      if (deps?.supervisor !== undefined) readyDeps.supervisor = deps.supervisor;
+      return handleApiReady(req, readyDeps);
     }
 
     // First-boot setup wizard (hub#259). Three steps server-rendered:
@@ -2041,7 +2095,7 @@ export function hubFetch(
     // here anymore (the SPA moved to /admin), so we can't accidentally
     // mask a backend 404 with HTML.
     if (pathname.startsWith("/vault/")) {
-      const proxied = await proxyToVault(req, manifestPath);
+      const proxied = await proxyToVault(req, manifestPath, deps?.supervisor);
       if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
       return new Response("not found", { status: 404 });
     }
@@ -2068,7 +2122,7 @@ export function hubFetch(
     // here only after every hub-owned prefix above has had its turn — so
     // `/`, `/admin/*`, `/oauth/*`, `/.well-known/*`, `/hub/*`, `/vault/*`,
     // `/api/*` are excluded by ordering, not by an explicit denylist (#182).
-    const proxied = await proxyToService(req, manifestPath);
+    const proxied = await proxyToService(req, manifestPath, deps?.supervisor);
     if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
 
     // Branded fall-through 404 (closes hub#392) — the operator who mistyped
