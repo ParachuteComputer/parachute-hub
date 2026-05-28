@@ -3759,4 +3759,33 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
       credentials: { kind: "pat", token: "ghp_stub" },
     });
   });
+
+  // No-PAT branch — public repo import. Sends `credentials: null`,
+  // which vault interprets as "use stored credentials" (or none).
+  // Reviewer-flagged coverage gap on the rc.8 fold.
+  test("postVaultImportImpl sends credentials: null when no PAT is provided", async () => {
+    let capturedBody: unknown;
+    const stubFetch = (async (_: string | URL | Request, init?: RequestInit) => {
+      capturedBody = JSON.parse((init?.body as string) ?? "{}");
+      return new Response(
+        JSON.stringify({ notes_imported: 1 }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    await postVaultImportImpl({
+      vaultName: "public-import",
+      vaultPort: 1940,
+      bearerToken: "stub",
+      remoteUrl: "https://github.com/owner/public.git",
+      mode: "replace",
+      fetcher: stubFetch,
+    });
+
+    expect(capturedBody).toEqual({
+      remote_url: "https://github.com/owner/public.git",
+      mode: "replace",
+      credentials: null,
+    });
+  });
 });

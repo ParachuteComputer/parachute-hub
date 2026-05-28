@@ -2179,9 +2179,12 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
           // Mint a short-lived per-vault admin Bearer for the import POST.
           // Vault validates audience `vault.<name>` + scope `vault:<name>:admin`
           // (see admin-vault-admin-token.ts for the canonical shape — same
-          // contract the SPA Manage link uses). The TTL covers retries +
-          // clone time on a slow remote; the JWT is single-use (we don't
-          // persist or reuse the jti).
+          // contract the SPA Manage link uses). The token only needs to
+          // live until vault accepts the HTTP request (the clone itself
+          // happens inside vault after the auth check passes); 5 min is
+          // a generous safety net covering the supervisor's boot-grace
+          // retries on a sluggish host. Deliberate divergence from the
+          // SPA's 10-min TTL because this token is one-shot, not refreshed.
           const minted = await signAccessToken(deps.db, {
             sub: importerUserId,
             scopes: [`vault:${vaultName}:admin`],
