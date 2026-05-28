@@ -148,8 +148,10 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
  *     (the vault SPA's Manage link + setup wizard); and
  *   - `POST /api/auth/mint-token` under the capability-attenuation model —
  *     a `parachute:host:admin` bearer (box-wide → one-vault) or a
- *     `vault:<name>:admin` bearer (same-vault subset). See `canGrant` and
- *     the guard in `api-mint-token.ts`.
+ *     `vault:<name>:admin` bearer (same-vault subset). The same model governs
+ *     `POST /api/auth/revoke-token` (revoke what you could mint). See
+ *     `canGrant` in `scope-attenuation.ts` and the guards in
+ *     `api-mint-token.ts` / `api-revoke-token.ts`.
  *
  * Pattern-based because the set is open-ended — every vault instance the
  * operator creates implies a new scope, and we don't want to enumerate them.

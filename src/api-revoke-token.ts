@@ -1,38 +1,66 @@
 /**
  * `POST /api/auth/revoke-token` — HTTP companion to `parachute auth
- * revoke-token <jti>` (hub#221) and the missing piece behind the future
- * admin UI's revoke action.
+ * revoke-token <jti>` (hub#221) and the backing endpoint for the admin
+ * UI's revoke action. Closes hub#220.
  *
- * Same auth shape as `POST /api/auth/mint-token`: bearer-gated on
- * `parachute:host:auth` (admin scope-set tokens carry it as a superset;
- * narrow `--scope-set auth` operator tokens carry it directly). Closes
- * hub#220.
+ * Auth — capability attenuation, SYMMETRIC to mint-token (hub#452): you may
+ * revoke exactly what you could have minted. After validating the bearer
+ * (signature / issuer / expiry — same as today):
+ *
+ *   1. If the bearer holds `parachute:host:auth` → it may revoke ANY jti
+ *      (the original, broadest behavior — preserved unchanged).
+ *   2. Otherwise the bearer must clear the entry gate — it must hold at least
+ *      one minting authority (`parachute:host:auth`, `parachute:host:admin`,
+ *      or some `vault:<*>:admin`, via `hasMintingAuthority`). A bearer with
+ *      none (e.g. a read-only token) gets 403 up front — it can revoke
+ *      nothing, just as it can mint nothing.
+ *   3. The per-jti authority check then governs what such a bearer may
+ *      actually revoke: the target jti is revocable iff EVERY one of its
+ *      recorded scopes satisfies `canGrant(bearerScopes, scope)` — i.e. the
+ *      bearer could have minted that exact token. A `vault:work:admin` bearer
+ *      can revoke a `vault:work:write` or `vault:work:admin` jti, but NOT a
+ *      `vault:other:*` jti and NOT a `parachute:host:*` jti — the same
+ *      cross-vault / host-escalation walls mint enforces.
+ *
+ * Idempotency / no-info-leak: an UNKNOWN jti (no `tokens` row — never minted
+ * or already purged) returns the SAME 404 `not_found` the endpoint has always
+ * returned, for every caller including host:auth. The per-jti authority check
+ * only runs when the row is FOUND. So an attenuated bearer probing a jti it
+ * doesn't own cannot distinguish "exists but not yours" from "doesn't exist"
+ * by the unknown-jti path — it gets the identical 404 a host:auth bearer
+ * would. A jti that EXISTS but is out of the bearer's authority returns 403
+ * (and is NOT revoked): the caller already knows the jti string, so "exists
+ * but not yours" leaks nothing beyond what it already holds — and returning
+ * idempotent-ok there would be a lie (it revoked nothing).
  *
  * Body: `{ jti: string }`.
  *
- * Responses (matching the OAuth 2.0 error-shape vocabulary used by
- * mint-token and the rest of the hub's bearer-protected admin API):
+ * Responses (OAuth 2.0 error-shape vocabulary, matching mint-token):
  *
  *   - 200 `{ jti, revoked_at }` — success. Idempotent: re-revoking an
- *     already-revoked jti returns the existing `revoked_at` and 200,
- *     same as the CLI's exit-0-with-existing-timestamp behavior.
+ *     already-revoked jti returns the existing `revoked_at` and 200.
  *   - 400 `invalid_request` — missing/malformed body, missing jti.
  *   - 401 `unauthenticated` — missing or invalid bearer.
- *   - 403 `insufficient_scope` — bearer lacks `parachute:host:auth`.
+ *   - 403 `insufficient_scope` — bearer holds no minting authority (entry
+ *     gate), or the target jti carries a scope the bearer couldn't have
+ *     minted (per-jti authority check).
  *   - 404 `not_found` — no `tokens` row matches the jti.
  *   - 405 `method_not_allowed` — non-POST.
  *
  * Identity field in audit-friendly success: not echoed in the response
  * body (the JSON shape is intentionally minimal — `jti` + `revoked_at`
  * is all a UI consumer needs); operator-side audit lives in hub logs.
- * Mirrors the CLI's design where `identity=` was added for stdout but
- * the wire response stays narrow.
  */
 import type { Database } from "bun:sqlite";
 import { findTokenRowByJti, revokeTokenByJti, validateAccessToken } from "./jwt-sign.ts";
+import { MINT_HOST_AUTH_SCOPE, canGrant, hasMintingAuthority } from "./scope-attenuation.ts";
 
-/** Scope required on the bearer token to call this endpoint. */
-export const API_REVOKE_TOKEN_REQUIRED_SCOPE = "parachute:host:auth";
+/**
+ * Scope that authorises revoking ANY jti unconditionally (rule 1). A bearer
+ * without it may still revoke via attenuation (rule 3) if it clears the
+ * `hasMintingAuthority` entry gate.
+ */
+export const API_REVOKE_TOKEN_REQUIRED_SCOPE = MINT_HOST_AUTH_SCOPE;
 
 export interface ApiRevokeTokenDeps {
   db: Database;
@@ -80,12 +108,19 @@ export async function handleApiRevokeToken(
     return jsonError(401, "unauthenticated", `bearer token invalid — ${msg}`);
   }
 
-  // 3. Scope gate.
-  if (!bearerScopes.includes(API_REVOKE_TOKEN_REQUIRED_SCOPE)) {
+  // 3. Entry gate. A `parachute:host:auth` bearer may revoke anything
+  //    (rule 1) and skips the per-jti authority check below. Any other
+  //    bearer must hold SOME minting authority (host:admin or a
+  //    `vault:<*>:admin`) to attempt a revoke at all — a bearer with none
+  //    can revoke nothing under attenuation, so we 403 it here rather than
+  //    looking up the jti. Whether such a bearer may revoke a SPECIFIC jti
+  //    is decided per-jti in step 5 via `canGrant`.
+  const bearerHasHostAuth = bearerScopes.includes(API_REVOKE_TOKEN_REQUIRED_SCOPE);
+  if (!bearerHasHostAuth && !hasMintingAuthority(bearerScopes)) {
     return jsonError(
       403,
       "insufficient_scope",
-      `bearer token lacks ${API_REVOKE_TOKEN_REQUIRED_SCOPE}`,
+      `bearer token holds no revoke authority (need ${API_REVOKE_TOKEN_REQUIRED_SCOPE}, parachute:host:admin, or vault:<name>:admin)`,
     );
   }
 
@@ -105,13 +140,35 @@ export async function handleApiRevokeToken(
   }
   const jti = body.jti;
 
-  // 5. Lookup + revoke. Order: row-existence first (404 if missing), then
-  // attempt revoke. Idempotent: if already revoked, surface the existing
-  // revoked_at — same CLI semantics from hub#221.
+  // 5. Lookup + per-jti authority + revoke. Order: row-existence first
+  // (404 if missing — same response for every caller, no leak), then the
+  // attenuation authority check (for non-host:auth bearers), then attempt
+  // revoke. Idempotent: if already revoked, surface the existing revoked_at
+  // — same CLI semantics from hub#221.
   const existing = findTokenRowByJti(deps.db, jti);
   if (!existing) {
     return jsonError(404, "not_found", `no token with jti ${jti} found in registry`);
   }
+
+  // Per-jti authority (rule 3 / symmetric to mint attenuation). A host:auth
+  // bearer skips this — it may revoke anything. Any other bearer may revoke
+  // this jti only if EVERY one of its recorded scopes is one the bearer could
+  // have minted (`canGrant`). One out-of-authority scope (cross-vault, a
+  // host:* scope, etc.) blocks the whole revoke with 403 — and the token is
+  // left intact. The caller already knows the jti, so "exists but not yours"
+  // leaks nothing beyond what it holds; idempotent-ok would falsely imply a
+  // revoke happened.
+  if (!bearerHasHostAuth) {
+    const ungrantable = existing.scopes.filter((s) => !canGrant(bearerScopes, s));
+    if (ungrantable.length > 0) {
+      return jsonError(
+        403,
+        "insufficient_scope",
+        `bearer token cannot revoke jti ${jti}: its scope(s) ${ungrantable.join(", ")} are outside the bearer's authority`,
+      );
+    }
+  }
+
   if (existing.revokedAt) {
     return ok({ jti, revoked_at: existing.revokedAt });
   }

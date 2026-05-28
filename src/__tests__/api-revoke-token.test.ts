@@ -318,3 +318,267 @@ describe("POST /api/auth/revoke-token (closes hub#220)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Capability attenuation — symmetric to mint-token (hub#452). A bearer that
+// is NOT host:auth may revoke a jti iff every one of the jti's recorded scopes
+// is one the bearer could have minted (`canGrant`): you may revoke what you
+// could mint. This is the security-critical half of the auth arc.
+// ---------------------------------------------------------------------------
+describe("POST /api/auth/revoke-token — capability attenuation (symmetric to hub#452)", () => {
+  /**
+   * Hand-mint a `vault:<vault>:admin` bearer the way the SPA / mcp-install
+   * path obtains one (scope `vault:<vault>:admin`, aud `vault.<vault>`,
+   * vaultScope `[vault]`). Mirrors `mintVaultAdminBearer` in
+   * api-mint-token.test.ts.
+   */
+  async function mintVaultAdminBearer(
+    db: ReturnType<typeof openHubDb>,
+    userId: string,
+    vault: string,
+  ): Promise<string> {
+    const signed = await signAccessToken(db, {
+      sub: userId,
+      scopes: [`vault:${vault}:admin`],
+      audience: `vault.${vault}`,
+      clientId: "parachute-hub",
+      issuer: ISSUER,
+      ttlSeconds: 3600,
+      vaultScope: [vault],
+    });
+    return signed.token;
+  }
+
+  test("host:auth bearer revokes ANY jti (preserved) — incl. a host-scoped target", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        // Seed a target whose own scopes a vault-admin could never mint.
+        const jti = await seedToken(db, userId, ["parachute:host:auth"]);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(200);
+        expect(findTokenRowByJti(db, jti)?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("vault:work:admin revokes a vault:work:write jti → 200 (could have minted it)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const bearer = await mintVaultAdminBearer(db, userId, "work");
+        const jti = await seedToken(db, userId, ["vault:work:write"]);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${bearer}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(200);
+        expect(findTokenRowByJti(db, jti)?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("vault:work:admin revokes a vault:work:admin jti → 200", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const bearer = await mintVaultAdminBearer(db, userId, "work");
+        const jti = await seedToken(db, userId, ["vault:work:admin"]);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${bearer}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(200);
+        expect(findTokenRowByJti(db, jti)?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("CROSS-VAULT BLOCKED: vault:work:admin revokes vault:other:write jti → 403, NOT revoked", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const bearer = await mintVaultAdminBearer(db, userId, "work");
+        const jti = await seedToken(db, userId, ["vault:other:write"]);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${bearer}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(403);
+        expect(((await resp.json()) as { error: string }).error).toBe("insufficient_scope");
+        // SECURITY: the cross-vault token must NOT have been revoked.
+        expect(findTokenRowByJti(db, jti)?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("HOST-ESCALATION BLOCKED: vault:work:admin revokes parachute:host:auth jti → 403, NOT revoked", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const bearer = await mintVaultAdminBearer(db, userId, "work");
+        const jti = await seedToken(db, userId, ["parachute:host:auth"]);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${bearer}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(403);
+        expect(findTokenRowByJti(db, jti)?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("NO LEAK: vault:work:admin revokes an UNKNOWN jti → 404 (same as host:auth, no leak)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const bearer = await mintVaultAdminBearer(db, userId, "work");
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti: "no-such-jti-ever-minted" }, { authorization: `Bearer ${bearer}` }),
+          { db, issuer: ISSUER },
+        );
+        // Identical to today's unknown-jti behavior for a host:auth bearer:
+        // the attenuated caller cannot distinguish "doesn't exist" here.
+        expect(resp.status).toBe(404);
+        expect(((await resp.json()) as { error: string }).error).toBe("not_found");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("ENTRY GATE: vault:work:read bearer (no admin, no host) → 403, NOT revoked", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const readOnly = await signAccessToken(db, {
+          sub: userId,
+          scopes: ["vault:work:read"],
+          audience: "vault.work",
+          clientId: "parachute-hub",
+          issuer: ISSUER,
+          ttlSeconds: 3600,
+          vaultScope: ["work"],
+        });
+        // Seed a target the read bearer could never mint anyway.
+        const jti = await seedToken(db, userId, ["vault:work:write"]);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${readOnly.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(403);
+        expect(((await resp.json()) as { error: string }).error).toBe("insufficient_scope");
+        // Entry-gated before any lookup — the target stays intact.
+        expect(findTokenRowByJti(db, jti)?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("MULTI-SCOPE: vault:work:admin revokes vault:work:read+write jti → 200 (all in authority)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const bearer = await mintVaultAdminBearer(db, userId, "work");
+        const jti = await seedToken(db, userId, ["vault:work:read", "vault:work:write"]);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${bearer}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(200);
+        expect(findTokenRowByJti(db, jti)?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("MULTI-SCOPE BLOCKED: one out-of-authority scope blocks the whole revoke → 403, NOT revoked", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const bearer = await mintVaultAdminBearer(db, userId, "work");
+        // In-authority scope + one cross-vault scope: must block entirely.
+        const jti = await seedToken(db, userId, ["vault:work:write", "vault:other:read"]);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${bearer}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(403);
+        expect(findTokenRowByJti(db, jti)?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("host:admin bearer revokes a vault:<name>:admin jti → 200 (rule 2 symmetry)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const hostAdmin = await signAccessToken(db, {
+          sub: userId,
+          scopes: ["parachute:host:admin"],
+          audience: "hub",
+          clientId: "parachute-hub",
+          issuer: ISSUER,
+          ttlSeconds: 3600,
+        });
+        const jti = await seedToken(db, userId, ["vault:work:admin"]);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `Bearer ${hostAdmin.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(200);
+        expect(findTokenRowByJti(db, jti)?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
