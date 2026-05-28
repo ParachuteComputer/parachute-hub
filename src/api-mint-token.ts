@@ -53,7 +53,11 @@ import {
   canGrant,
   hasMintingAuthority,
 } from "./scope-attenuation.ts";
-import { isVaultAdminScope, vaultScopeName } from "./scope-explanations.ts";
+import {
+  isVaultAdminScope,
+  isWellFormedOrNonVaultScope,
+  vaultScopeName,
+} from "./scope-explanations.ts";
 
 // Re-export `canGrant` so existing importers (and the symmetric revoke path)
 // have a single name to reach for; the implementation lives in the shared
@@ -161,6 +165,27 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   const scopes = body.scope.split(/\s+/).filter((s) => s.length > 0);
   if (scopes.length === 0) {
     return jsonError(400, "invalid_request", "scope must contain at least one scope");
+  }
+
+  // Shape guard (defensive hygiene — adversarial audit 2026-05-28): reject any
+  // scope that is shaped like a *named* per-vault scope but malformed —
+  // `vault:work:ADMIN` (uppercase verb), `vault::admin` (empty name),
+  // `vault:work:read:admin` (extra segment), `VAULT:work:admin` (uppercase
+  // resource). These slip past `isNonRequestableScope`'s strict regexes, so
+  // `canGrant` rule 1 would admit them as "requestable" and mint a junk
+  // registry row. They grant zero access today (the vault consumer's
+  // `decomposeVaultScope` rejects all four), so this is NOT exploitable now —
+  // the check is a backstop against a future consumer-normalization regression
+  // plus registry hygiene. It's an input-shape check, orthogonal to authority,
+  // so it runs for ALL callers before any `canGrant` attenuation. Non-vault
+  // scopes and the unnamed `vault:<verb>` forms are unaffected.
+  const malformed = scopes.filter((s) => !isWellFormedOrNonVaultScope(s));
+  if (malformed.length > 0) {
+    return jsonError(
+      400,
+      "invalid_scope",
+      `malformed vault scope ${malformed.join(", ")}; expected vault:<name>:<read|write|admin>`,
+    );
   }
 
   // Capability-attenuation guard: every requested scope must be a subset of
