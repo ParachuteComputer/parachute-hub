@@ -225,6 +225,12 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   // pin the named vault(s) so the token can ONLY ever be used against
   // that vault, matching the canonical session-path mint in
   // `admin-vault-admin-token.ts` (defense-in-depth + least privilege).
+  //
+  // Note: `audience` is single-valued and `inferAudience` is first-wins,
+  // so a multi-vault request (`vault:a:admin vault:b:admin`) gets
+  // `aud=vault.a` and the resulting token only authenticates against `a`.
+  // Mint one token per vault for the multi-vault case. The canonical
+  // consumers (mcp-install, SPA tokens page) request a single vault.
   const vaultScopePin = scopes
     .map((s) => vaultAdminScopeName(s))
     .filter((n): n is string => n !== null);
