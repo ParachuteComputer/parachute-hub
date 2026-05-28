@@ -142,20 +142,27 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
  * public OAuth flow: they let the holder mint, revoke, and rotate tokens
  * for a specific vault instance, which is operator-only territory.
  *
- * They are mintable by two operator-proving local paths, both of which
- * require already-established hub-admin identity (never third-party consent):
+ * They are mintable by operator-proving local paths, all of which require
+ * already-established authority (never third-party consent):
  *   - the session-cookie-gated `/admin/vault-admin-token/:name` endpoint
  *     (the vault SPA's Manage link + setup wizard); and
- *   - `POST /api/auth/mint-token` when the calling bearer carries
- *     `parachute:host:admin` (operator-token / host-admin-token). Minting a
- *     vault-pinned admin from a box-wide `host:admin` is a privilege
- *     *reduction*, so the mint path admits it — see `isVaultAdminScope`
- *     and the guard in `api-mint-token.ts`.
+ *   - `POST /api/auth/mint-token` under the capability-attenuation model —
+ *     a `parachute:host:admin` bearer (box-wide → one-vault) or a
+ *     `vault:<name>:admin` bearer (same-vault subset). See `canGrant` and
+ *     the guard in `api-mint-token.ts`.
  *
  * Pattern-based because the set is open-ended — every vault instance the
  * operator creates implies a new scope, and we don't want to enumerate them.
  */
 const VAULT_ADMIN_RE = /^vault:[a-zA-Z0-9_-]+:admin$/;
+
+/**
+ * Any per-vault scope: `vault:<name>:<verb>` for verb ∈ {read, write, admin}.
+ * Captures the name in group 1 and the verb in group 2. Used by the
+ * mint-token capability-attenuation model to recognise the scopes a
+ * `vault:<name>:admin` bearer may attenuate to (same-vault subsets).
+ */
+const VAULT_SCOPED_RE = /^vault:([a-zA-Z0-9_-]+):(read|write|admin)$/;
 
 /**
  * True when `scope` is a per-vault admin scope (`vault:<name>:admin`).
@@ -167,13 +174,15 @@ export function isVaultAdminScope(scope: string): boolean {
 }
 
 /**
- * Extract the vault name from a `vault:<name>:admin` scope, or null if the
- * scope isn't a per-vault admin scope. Used to derive the `vault_scope`
- * pin when minting an operator-requested vault-admin token.
+ * Extract the vault name from ANY per-vault scope (`vault:<name>:<verb>` for
+ * verb ∈ {read, write, admin}), or null if the scope isn't per-vault-scoped.
+ * Used by the mint-token attenuation model to (a) match a `vault:<name>:admin`
+ * bearer against same-vault requested scopes, and (b) derive the `vault_scope`
+ * pin for every vault-scoped mint regardless of verb.
  */
-export function vaultAdminScopeName(scope: string): string | null {
-  if (!VAULT_ADMIN_RE.test(scope)) return null;
-  return scope.split(":")[1] ?? null;
+export function vaultScopeName(scope: string): string | null {
+  const m = VAULT_SCOPED_RE.exec(scope);
+  return m ? (m[1] ?? null) : null;
 }
 
 /** True when the scope is non-requestable via the public OAuth flow. */
