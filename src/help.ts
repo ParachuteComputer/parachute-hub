@@ -5,11 +5,12 @@ export function topLevelHelp(): string {
   const services = knownServices().join(" | ");
   return `parachute ${pkg.version} — top-level CLI for the Parachute ecosystem
 
-Fresh install? Start here:
+Fresh install? Start here — works the same on a laptop or a remote server:
   parachute init                    one quick step → admin wizard in your browser
+                                    (offers optional exposure on remote boxes)
 
 Usage:
-  parachute init                    bring hub up + open admin wizard (idempotent)
+  parachute init                    bring hub up, offer exposure, open admin wizard
   parachute setup                   interactive walk-through: install services + configure
   parachute install <service>       install and register a service
                                     services: ${services}
@@ -108,31 +109,47 @@ export function initHelp(): string {
   return `parachute init — get the admin wizard open in one step
 
 Usage:
-  parachute init [--no-browser]
+  parachute init [--no-browser] [--no-expose-prompt] [--expose none|tailnet|cloudflare]
 
 What it does:
-  Fresh-install front door. The admin SPA already walks operators through
-  the rest (install vault, set up the admin user, install scribe / runner
-  / app); this command's only job is to get you to that wizard with one
-  command.
+  Fresh-install front door, one command for both laptops AND remote
+  servers (EC2, DigitalOcean, Hetzner, any VPS). The admin SPA already
+  walks operators through the rest (install vault, set up the admin
+  user, install scribe / runner / app); this command's only job is to
+  get you to that wizard.
 
   Idempotent — every re-run is safe:
     1. If the hub isn't running, start it.
-    2. Print the canonical admin URL (loopback when not exposed, the
+    2. If the hub isn't already exposed, in a terminal, offer to set up
+       exposure (Tailscale Funnel, Cloudflare Tunnel, or stay loopback).
+       The default highlights "no thanks" on laptops and Cloudflare on
+       servers (SSH session detected). Skip with --no-expose-prompt or
+       pin non-interactively with --expose.
+    3. Print the canonical admin URL (loopback when not exposed, the
        tailnet / cloudflare FQDN when exposure is active).
-    3. In a terminal, offer to open the URL in your browser
+    4. In a terminal, offer to open the URL in your browser
        (macOS \`open\`, Linux \`xdg-open\`). Skip with --no-browser or
        run from a non-TTY shell.
 
-  If your hub is up and a vault is already configured, init just
-  confirms "looks good — here's your URL" and exits 0.
+  If your hub is up + exposure is already set up + a vault is already
+  configured, init just confirms "looks good — here's your URL" and
+  exits 0.
 
 Flags:
-  --no-browser     just print the URL; don't offer to launch a browser
+  --no-browser              just print the URL; don't offer to launch a browser
+  --no-expose-prompt        skip the exposure question; fall through to localhost URL
+  --expose <choice>         non-interactive exposure override:
+                              none       — stay loopback-only
+                              tailnet    — set up Tailscale Funnel (private to your tailnet)
+                              cloudflare — set up Cloudflare Tunnel (your own domain)
 
 Examples:
-  parachute init                    bring up hub + open the wizard
-  parachute init --no-browser       same, but don't shell out to open / xdg-open
+  parachute init                              # laptop: prompts, defaults to "no expose"
+  parachute init                              # ssh'd server: prompts, defaults to Cloudflare
+  parachute init --no-expose-prompt           # skip the question; just print localhost URL
+  parachute init --expose cloudflare          # CI/scripted: chain straight into Cloudflare
+  parachute init --expose tailnet             # CI/scripted: chain straight into Tailscale
+  parachute init --no-browser                 # don't shell out to open / xdg-open
 `;
 }
 
