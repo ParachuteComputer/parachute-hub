@@ -342,19 +342,98 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     }
   });
 
-  test("400 invalid_scope when minting vault:<name>:admin (regex non-requestable)", async () => {
+  // De-escalation (PR-A): a `parachute:host:admin` bearer MAY mint a
+  // vault-pinned admin token — host:admin already implies box-wide vault
+  // administration, so narrowing it to one vault is a privilege reduction.
+  // This is the canonical headless path replacing deprecated pvt_* (vault#282).
+  test("200 when host:admin bearer mints vault:<name>:admin (de-escalation)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        // The default admin operator scope-set carries parachute:host:admin.
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const resp = await handleApiMintToken(
+          jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(200);
+        const body = (await resp.json()) as { jti: string; token: string; scope: string };
+        expect(body.scope).toBe("vault:work:admin");
+        const validated = await validateAccessToken(db, body.token, ISSUER);
+        // Audience must be the per-vault resource so vault's strict-equality
+        // audience check accepts it.
+        expect(validated.payload.aud).toBe("vault.work");
+        expect(validated.payload.scope).toBe("vault:work:admin");
+        // vault_scope is pinned to the named vault (defense-in-depth — the
+        // token can ONLY be used against `work`), matching the canonical
+        // session-path mint in admin-vault-admin-token.ts.
+        expect(validated.payload.vault_scope).toEqual(["work"]);
+        // Registry row written → revocable like any operator mint.
+        const row = db
+          .query<{ jti: string }, [string]>("SELECT jti FROM tokens WHERE jti = ?")
+          .get(body.jti);
+        expect(row).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // The de-escalation exception is gated on host:admin specifically. A
+  // bearer that only holds `parachute:host:auth` (the narrow auth scope-set)
+  // can mint verb scopes but NOT vault-admin — that would be an escalation.
+  test("400 invalid_scope when auth-only bearer mints vault:<name>:admin", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, {
+          issuer: ISSUER,
+          scopeSet: "auth",
+        });
+        const resp = await handleApiMintToken(
+          jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(400);
+        const body = (await resp.json()) as { error: string; error_description: string };
+        expect(body.error).toBe("invalid_scope");
+        expect(body.error_description).toContain("vault:work:admin");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // A bare `vault:admin` (no vault name) is NOT a per-vault admin scope —
+  // the de-escalation exception only covers `vault:<name>:admin`. It isn't
+  // in the non-requestable set either, so it's treated as an ordinary
+  // (unnamed) scope and mints — but with the `vault` fallback audience, not
+  // a per-vault one. Pinned so a future regex loosening can't silently let
+  // an unnamed admin through the named-vault exemption.
+  test("bare vault:admin (no name) is not caught by the de-escalation exemption", async () => {
     const h = makeHarness();
     try {
       const { db, userId } = await bootstrap(h.dir);
       try {
         const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
         const resp = await handleApiMintToken(
-          jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
+          jsonRequest({ scope: "vault:admin" }, { authorization: `Bearer ${op.token}` }),
           { db, issuer: ISSUER },
         );
-        expect(resp.status).toBe(400);
-        const body = (await resp.json()) as { error: string };
-        expect(body.error).toBe("invalid_scope");
+        // `vault:admin` isn't a per-vault admin scope and isn't in the
+        // non-requestable set, so it mints as an ordinary scope. The point
+        // of this test is that it does NOT get a per-vault audience/pin.
+        expect(resp.status).toBe(200);
+        const body = (await resp.json()) as { token: string };
+        const validated = await validateAccessToken(db, body.token, ISSUER);
+        expect(validated.payload.aud).toBe("vault");
+        expect(validated.payload.vault_scope).toEqual([]);
       } finally {
         db.close();
       }

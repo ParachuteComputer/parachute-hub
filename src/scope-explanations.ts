@@ -138,16 +138,43 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Per-vault `vault:<name>:admin` scopes are also non-requestable: they let
- * the holder mint, revoke, and rotate tokens for a specific vault instance,
- * which is operator-only territory. Like `parachute:host:admin`, these are
- * minted by a session-cookie-gated hub endpoint (`/admin/vault-admin-token/:name`),
- * never by the public OAuth flow.
+ * Per-vault `vault:<name>:admin` scopes are also non-requestable via the
+ * public OAuth flow: they let the holder mint, revoke, and rotate tokens
+ * for a specific vault instance, which is operator-only territory.
+ *
+ * They are mintable by two operator-proving local paths, both of which
+ * require already-established hub-admin identity (never third-party consent):
+ *   - the session-cookie-gated `/admin/vault-admin-token/:name` endpoint
+ *     (the vault SPA's Manage link + setup wizard); and
+ *   - `POST /api/auth/mint-token` when the calling bearer carries
+ *     `parachute:host:admin` (operator-token / host-admin-token). Minting a
+ *     vault-pinned admin from a box-wide `host:admin` is a privilege
+ *     *reduction*, so the mint path admits it — see `isVaultAdminScope`
+ *     and the guard in `api-mint-token.ts`.
  *
  * Pattern-based because the set is open-ended — every vault instance the
  * operator creates implies a new scope, and we don't want to enumerate them.
  */
 const VAULT_ADMIN_RE = /^vault:[a-zA-Z0-9_-]+:admin$/;
+
+/**
+ * True when `scope` is a per-vault admin scope (`vault:<name>:admin`).
+ * Exported so the mint-token path can recognise the one non-requestable
+ * scope it conditionally admits for `parachute:host:admin` bearers.
+ */
+export function isVaultAdminScope(scope: string): boolean {
+  return VAULT_ADMIN_RE.test(scope);
+}
+
+/**
+ * Extract the vault name from a `vault:<name>:admin` scope, or null if the
+ * scope isn't a per-vault admin scope. Used to derive the `vault_scope`
+ * pin when minting an operator-requested vault-admin token.
+ */
+export function vaultAdminScopeName(scope: string): string | null {
+  if (!VAULT_ADMIN_RE.test(scope)) return null;
+  return scope.split(":")[1] ?? null;
+}
 
 /** True when the scope is non-requestable via the public OAuth flow. */
 export function isNonRequestableScope(scope: string): boolean {
