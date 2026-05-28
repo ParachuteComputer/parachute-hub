@@ -4,6 +4,10 @@ All notable changes to `@openparachute/scope-guard` are documented here. The for
 
 The library's RC cadence is independent of `@openparachute/hub`'s — they ship from the same repo but aren't coupled in version.
 
+## 0.4.0-rc.2 — 2026-05-28
+
+Surfaces the raw `permissions` claim on `HubJwtClaims` (additive) so resource servers (e.g. vault reading `permissions.scoped_tags` for tag-scoping) can read it without re-decoding the token. scope-guard passes the object through verbatim — a non-null plain object surfaces; absent / null / non-object (string, number, array) leaves `permissions` `undefined`, distinct from an empty `{}`. Auth-unification arc C0.
+
 ## 0.4.0-rc.1 — 2026-05-22
 
 Adds the hub#218 jti-presence hardening: hub-signed JWTs that lack a `jti` claim are rejected by default. **Behaviour-breaking minor** — any adopter that bumps from `0.3.x` will start rejecting jti-less hub-signed tokens. The default is the security floor; an `allowMissingJti: true` opt-out is available for operators with pre-Phase-1 legacy tokens still in flight.

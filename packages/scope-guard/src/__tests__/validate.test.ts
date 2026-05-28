@@ -114,6 +114,13 @@ interface SignOpts {
    * JSON-null, plus mixed arrays with non-string entries.
    */
   vaultScopeRaw?: unknown;
+  /**
+   * Force a raw value into the `permissions` claim. Used to exercise the
+   * passthrough (a plain object surfaces verbatim) and the malformed-input
+   * paths the validate code leaves `undefined` (string / number / array /
+   * null). Omit to emit no `permissions` claim at all.
+   */
+  permissionsRaw?: unknown;
 }
 
 async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
@@ -130,6 +137,9 @@ async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
     // emit, even for admins). "OMIT_CLAIM" is the test seam for pre-PR-4
     // tokens that lack the claim entirely.
     payload.vault_scope = opts.vaultScope ?? [];
+  }
+  if (opts.permissionsRaw !== undefined) {
+    payload.permissions = opts.permissionsRaw;
   }
   const builder = new SignJWT(payload)
     .setProtectedHeader(opts.omitKid ? { alg: "RS256" } : { alg: "RS256", kid: opts.kid ?? kp.kid })
@@ -866,6 +876,66 @@ describe("createScopeGuard — vault_scope claim surfacing", () => {
     });
     const claims = await guard.validateHubJwt(token);
     expect(claims.vaultScope).toEqual(["aaron", "work", "personal"]);
+    guard.resetJwksCache();
+  });
+});
+
+describe("createScopeGuard — permissions claim surfacing", () => {
+  // The permissions claim is a raw passthrough: scope-guard surfaces the
+  // object verbatim (after full signature/issuer/expiry/revocation
+  // validation) without interpreting it. Consumers (e.g. vault reading
+  // `permissions.scoped_tags`) own the semantics. The validate-side contract:
+  // surface a non-null plain object, leave everything else `undefined`, never
+  // throw on malformed input. Mirrors the vault_scope tests above.
+
+  test("permissions object surfaces verbatim on claims", async () => {
+    const guard = makeGuard();
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      permissionsRaw: { scoped_tags: ["work", "personal"], extra: 1 },
+    });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.permissions).toEqual({ scoped_tags: ["work", "personal"], extra: 1 });
+    guard.resetJwksCache();
+  });
+
+  test("token without permissions claim → permissions === undefined", async () => {
+    const guard = makeGuard();
+    const token = await signJwt(kp, { iss: fixture.origin });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.permissions).toBeUndefined();
+    guard.resetJwksCache();
+  });
+
+  test("empty permissions object surfaces as {} (distinct from absent)", async () => {
+    // `{}` must stay distinguishable from "no claim" (undefined) — the lib
+    // does NOT default absent to `{}`.
+    const guard = makeGuard();
+    const token = await signJwt(kp, { iss: fixture.origin, permissionsRaw: {} });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.permissions).toEqual({});
+    expect(claims.permissions).not.toBeUndefined();
+    guard.resetJwksCache();
+  });
+
+  test("non-object permissions (string / number / array / null) → undefined, no throw", async () => {
+    // Malformed input is tolerated: the claim is dropped (undefined), the
+    // token still validates. An array is JSON-typeof "object" but is not a
+    // plain object, so it must also drop.
+    const guard = makeGuard();
+
+    const tokenStr = await signJwt(kp, { iss: fixture.origin, permissionsRaw: "scoped" });
+    expect((await guard.validateHubJwt(tokenStr)).permissions).toBeUndefined();
+
+    const tokenNum = await signJwt(kp, { iss: fixture.origin, permissionsRaw: 42 });
+    expect((await guard.validateHubJwt(tokenNum)).permissions).toBeUndefined();
+
+    const tokenArr = await signJwt(kp, { iss: fixture.origin, permissionsRaw: ["work"] });
+    expect((await guard.validateHubJwt(tokenArr)).permissions).toBeUndefined();
+
+    const tokenNull = await signJwt(kp, { iss: fixture.origin, permissionsRaw: null });
+    expect((await guard.validateHubJwt(tokenNull)).permissions).toBeUndefined();
+
     guard.resetJwksCache();
   });
 });
