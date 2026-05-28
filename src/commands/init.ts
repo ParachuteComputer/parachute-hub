@@ -139,6 +139,11 @@ export function resolveAdminUrl(
  */
 export function looksLikeServer(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): boolean {
   if (platform !== "linux") return false;
+  // WSL2 is Linux + headless from $DISPLAY's perspective but is in fact a
+  // developer's laptop. Detect via WSL-specific env vars (set in every WSL
+  // distro) so we don't pre-select Cloudflare for someone running Parachute
+  // inside WSL on Windows. Reviewer-flagged on #445.
+  if (env.WSL_DISTRO_NAME || env.WSL_INTEROP) return false;
   if (env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY) return true;
   if (!env.DISPLAY && !env.WAYLAND_DISPLAY) return true;
   return false;
@@ -203,7 +208,7 @@ async function promptExposeChoice(
 ): Promise<ExposeChoice | undefined> {
   log("Do you want to expose it publicly so you can reach it from other devices?");
   const mark = (c: ExposeChoice) => (c === defaultChoice ? " (default)" : "");
-  log(`  1) No — keep it loopback-only (good for laptops)${mark("none")}`);
+  log(`  1) No — keep it loopback-only${mark("none")}`);
   log(`  2) Yes via Tailscale Funnel (private to your devices)${mark("tailnet")}`);
   log(`  3) Yes via Cloudflare Tunnel (public HTTPS, your own domain)${mark("cloudflare")}`);
   log("");
