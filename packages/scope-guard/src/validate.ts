@@ -61,6 +61,19 @@ export interface HubJwtClaims {
    * additive, not the sole gate.
    */
   vaultScope: string[];
+  /**
+   * Raw `permissions` claim from the validated JWT payload, surfaced
+   * verbatim. scope-guard does NOT interpret it — it parses-and-passes the
+   * object so resource servers can read their own permission shapes without
+   * re-decoding the token. e.g. vault reads `permissions.scoped_tags` for
+   * tag-scoping; scope-guard knows nothing of `scoped_tags` semantics.
+   *
+   * Present only when the validated payload carries a non-null plain object
+   * under `permissions`. Absent or non-object (string / number / array)
+   * surfaces as `undefined` — distinct from an empty object `{}` so consumers
+   * can tell "no permissions claim" from "permissions claim with no entries."
+   */
+  permissions?: Record<string, unknown>;
 }
 
 /** Reasons a hub JWT may fail validation. Each maps to a `HubJwtError.code`. */
@@ -347,6 +360,21 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
         ? vaultScopeRaw.filter((s): s is string => typeof s === "string")
         : [];
 
+      // permissions: raw passthrough of the consumer-interpreted permissions
+      // object (e.g. vault's `scoped_tags`). scope-guard surfaces it verbatim
+      // without knowing its shape. Only a non-null plain object is surfaced;
+      // absent / null / non-object (string, number, array) leaves it
+      // `undefined` so "no claim" stays distinguishable from `{}`. Mirrors
+      // the defensive style of vaultScope above — malformed input is tolerated
+      // (left undefined), never thrown on.
+      const permissionsRaw = (payload as { permissions?: unknown }).permissions;
+      const permissions: Record<string, unknown> | undefined =
+        typeof permissionsRaw === "object" &&
+        permissionsRaw !== null &&
+        !Array.isArray(permissionsRaw)
+          ? (permissionsRaw as Record<string, unknown>)
+          : undefined;
+
       // Revocation enforcement runs LAST — only consulted if the JWT is
       // otherwise valid. Cheaper checks (signature, iss, aud, expiry,
       // jti-presence) reject first, so a bad signature never costs a
@@ -376,7 +404,7 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
         }
       }
 
-      return { sub: payload.sub, scopes, aud, jti, clientId, vaultScope };
+      return { sub: payload.sub, scopes, aud, jti, clientId, vaultScope, permissions };
     },
 
     resetJwksCache() {
