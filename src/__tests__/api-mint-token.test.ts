@@ -876,6 +876,172 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     });
   });
 
+  // ── Malformed vault-shaped scope guard (defensive hygiene, audit 2026-05-28) ──
+  //
+  // A `parachute:host:auth` bearer can craft scope strings that LOOK like a
+  // named per-vault scope but slip past `isNonRequestableScope`'s strict
+  // regexes, so `canGrant` rule 1 would admit them as "requestable" and mint a
+  // junk registry row. They grant zero access today (the vault consumer rejects
+  // them), so this isn't exploitable now — the mint-time shape check is a
+  // backstop against a future consumer-normalization regression + registry
+  // hygiene. It's an input-shape check, orthogonal to authority.
+  describe("malformed vault-shaped scope rejection", () => {
+    const MALFORMED = [
+      "vault:work:ADMIN", // uppercase verb
+      "vault::admin", // empty name
+      "vault:work:read:admin", // extra segment
+      "VAULT:work:admin", // uppercase resource
+    ];
+
+    for (const scope of MALFORMED) {
+      test(`host:auth bearer minting ${scope} → 400 invalid_scope (malformed)`, async () => {
+        const h = makeHarness();
+        try {
+          const { db, userId } = await bootstrap(h.dir);
+          try {
+            const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+            const resp = await handleApiMintToken(
+              jsonRequest({ scope }, { authorization: `Bearer ${op.token}` }),
+              { db, issuer: ISSUER },
+            );
+            expect(resp.status).toBe(400);
+            const body = (await resp.json()) as { error: string; error_description: string };
+            expect(body.error).toBe("invalid_scope");
+            expect(body.error_description).toContain("malformed vault scope");
+            expect(body.error_description).toContain(scope);
+            // No junk registry row written — the request was rejected before
+            // mint. The only `cli_mint` provenance comes from this endpoint;
+            // the operator bearer's own row is `operator` provenance, so a
+            // count of zero proves the malformed mint never landed.
+            const row = db
+              .query<{ n: number }, []>(
+                "SELECT COUNT(*) AS n FROM tokens WHERE created_via = 'cli_mint'",
+              )
+              .get();
+            expect(row?.n ?? 0).toBe(0);
+          } finally {
+            db.close();
+          }
+        } finally {
+          h.cleanup();
+        }
+      });
+    }
+
+    // Regression: well-formed named scopes still mint (host:auth → read/write
+    // via rule 1; host:admin → admin via rule 2). The guard is shape-only.
+    test("host:auth bearer minting vault:work:read → 200 (well-formed, regression)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER, scopeSet: "auth" });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:read" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { scope: string };
+          expect(body.scope).toBe("vault:work:read");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("host:auth bearer minting vault:work:write → 200 (well-formed, regression)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER, scopeSet: "auth" });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:write" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { scope: string };
+          expect(body.scope).toBe("vault:work:write");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("host:admin bearer minting vault:work:admin → 200 (well-formed, attenuation path)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { scope: string };
+          expect(body.scope).toBe("vault:work:admin");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    // The existing non-requestable behaviour is unchanged: a host:auth-only
+    // bearer minting the well-formed `vault:work:admin` is still 400 (rule 1
+    // doesn't cover admin) — this path is reached AFTER the shape guard passes.
+    test("host:auth-only bearer minting vault:work:admin → 400 (non-requestable, unchanged)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER, scopeSet: "auth" });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(400);
+          const body = (await resp.json()) as { error: string; error_description: string };
+          expect(body.error).toBe("invalid_scope");
+          // Not the malformed-shape message — it cleared the shape guard.
+          expect(body.error_description).toContain("not grantable");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    // Non-vault scopes are entirely unaffected by the shape guard.
+    test("host:auth bearer minting scribe:transcribe → 200 (non-vault, unaffected)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER, scopeSet: "auth" });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "scribe:transcribe" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { scope: string };
+          expect(body.scope).toBe("scribe:transcribe");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
   test("405 on non-POST", async () => {
     const h = makeHarness();
     try {

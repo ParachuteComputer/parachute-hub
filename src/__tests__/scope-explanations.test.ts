@@ -5,6 +5,7 @@ import {
   SCOPE_EXPLANATIONS,
   explainScope,
   isRequestableScope,
+  isWellFormedOrNonVaultScope,
   scopeIsAdmin,
 } from "../scope-explanations.ts";
 
@@ -131,5 +132,40 @@ describe("isRequestableScope", () => {
   test("vault:<name>:read|write stays requestable (only :admin is locked down)", () => {
     expect(isRequestableScope("vault:default:read")).toBe(true);
     expect(isRequestableScope("vault:work:write")).toBe(true);
+  });
+});
+
+// Mint-time shape guard (defensive hygiene, audit 2026-05-28). Rejects only the
+// *named* three-segment vault shape when malformed; leaves the unnamed two-
+// segment forms and all non-vault scopes alone.
+describe("isWellFormedOrNonVaultScope", () => {
+  test("rejects the four audited malformed named-vault forms", () => {
+    expect(isWellFormedOrNonVaultScope("vault:work:ADMIN")).toBe(false); // uppercase verb
+    expect(isWellFormedOrNonVaultScope("vault::admin")).toBe(false); // empty name
+    expect(isWellFormedOrNonVaultScope("vault:work:read:admin")).toBe(false); // extra segment
+    expect(isWellFormedOrNonVaultScope("VAULT:work:admin")).toBe(false); // uppercase resource
+  });
+
+  test("admits well-formed named-vault scopes (all three verbs)", () => {
+    expect(isWellFormedOrNonVaultScope("vault:work:read")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault:work:write")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault:work:admin")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault:my-techne_2:admin")).toBe(true);
+  });
+
+  test("admits the unnamed two-segment vault forms (out of remit)", () => {
+    expect(isWellFormedOrNonVaultScope("vault:read")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault:write")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault:admin")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("vault")).toBe(true); // bare, no colon
+  });
+
+  test("admits all non-vault scopes unconditionally", () => {
+    expect(isWellFormedOrNonVaultScope("scribe:transcribe")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("parachute:host:auth")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("parachute:host:admin")).toBe(true);
+    expect(isWellFormedOrNonVaultScope("hub:admin")).toBe(true);
+    // A three-segment non-vault scope is not constrained even if malformed-looking.
+    expect(isWellFormedOrNonVaultScope("scribe:work:ADMIN")).toBe(true);
   });
 });

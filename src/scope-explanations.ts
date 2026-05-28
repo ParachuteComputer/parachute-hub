@@ -187,6 +187,57 @@ export function vaultScopeName(scope: string): string | null {
   return m ? (m[1] ?? null) : null;
 }
 
+/**
+ * Mint-time shape guard: reject scopes that LOOK like a *named* per-vault scope
+ * (`vault:<name>:<verb>`, three+ colon-segments, first segment `vault`
+ * case-insensitively to catch `VAULT:…`) but are malformed — i.e. they don't
+ * match the strict `vault:<name>:<read|write|admin>` shape (`VAULT_SCOPED_RE`).
+ *
+ * Returns true for (i.e. ADMITS):
+ *   - well-formed named scopes `vault:<name>:<read|write|admin>`;
+ *   - the canonical *unnamed* two-segment scopes `vault:read|write|admin`
+ *     (legitimate OAuth/consent forms — keys in `SCOPE_EXPLANATIONS`, narrowed
+ *     to a named vault at consent time) and any other non-three-segment
+ *     `vault`-prefixed string — those aren't attempting the named shape, so
+ *     they're out of this guard's remit and keep their existing behaviour;
+ *   - every non-vault scope (`scribe:transcribe`, `parachute:host:*`, …).
+ *
+ * Returns false for (i.e. REJECTS) only a `vault`-prefixed string with three
+ * or more colon-segments that fails `VAULT_SCOPED_RE`:
+ *   `vault:work:ADMIN` (uppercase verb), `vault::admin` (empty name),
+ *   `vault:work:read:admin` (extra segment), `VAULT:work:admin` (uppercase
+ *   resource).
+ *
+ * Why this exists (defensive hygiene — adversarial audit, 2026-05-28): a
+ * `parachute:host:auth` bearer can today mint those four malformed strings.
+ * `isNonRequestableScope`'s strict regexes don't match them, so `canGrant`
+ * rule 1 admits them as "requestable" — the mint succeeds (200) carrying the
+ * literal junk string and writes a registry row. They grant ZERO access today
+ * (the vault consumer's `decomposeVaultScope` is case-sensitive + anchored and
+ * rejects all four), so this is NOT exploitable now. The value is (a) registry
+ * hygiene (no junk rows) and (b) a backstop against a FUTURE consumer-
+ * normalization regression — if vault ever started case-folding scope verbs,
+ * those junk tokens could silently become live admin. A strict mint-time shape
+ * check closes that door now.
+ *
+ * Orthogonal to authority: this is an input-shape check applied to ALL mint
+ * callers (host:auth, host:admin, vault:<name>:admin) before any `canGrant`
+ * attenuation. It does not affect non-vault scopes or the unnamed `vault:<verb>`
+ * forms.
+ */
+export function isWellFormedOrNonVaultScope(scope: string): boolean {
+  const segments = scope.split(":");
+  // Only constrain the *named* per-vault shape: first segment names the vault
+  // resource (case-insensitive, to catch `VAULT:`) AND there are three or more
+  // segments (an attempt at `vault:<name>:<verb>`). The unnamed two-segment
+  // forms (`vault:read|write|admin`) and a bare `vault` are out of remit.
+  const firstSegment = segments[0] ?? "";
+  if (firstSegment.toLowerCase() !== "vault" || segments.length < 3) {
+    return true;
+  }
+  return VAULT_SCOPED_RE.test(scope);
+}
+
 /** True when the scope is non-requestable via the public OAuth flow. */
 export function isNonRequestableScope(scope: string): boolean {
   return NON_REQUESTABLE_SCOPES.has(scope) || VAULT_ADMIN_RE.test(scope);
