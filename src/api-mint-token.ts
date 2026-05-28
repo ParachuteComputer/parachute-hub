@@ -13,6 +13,15 @@
  * (admin scope-set) covers this; a narrow `--scope-set=auth` operator
  * token also covers this.
  *
+ * Mintable scopes: any requestable scope (vault/scribe/agent verbs, etc.).
+ * Non-requestable scopes (`parachute:host:*`, `vault:<name>:admin`) are
+ * refused — with ONE de-escalation exception: a bearer that carries
+ * `parachute:host:admin` may mint `vault:<name>:admin`, because host:admin
+ * already implies box-wide vault administration, so a vault-pinned admin is
+ * strictly narrower. That's the canonical headless path to a per-vault admin
+ * token (replacing deprecated `pvt_*` — vault#282) and the path the SPA
+ * tokens page uses via session → /admin/host-admin-token → here.
+ *
  * Why a separate endpoint instead of extending /admin/host-admin-token:
  * that endpoint is session-cookie-gated for the SPA's needs and only
  * mints `parachute:host:admin`. This endpoint is bearer-gated for
@@ -26,7 +35,11 @@
 import type { Database } from "bun:sqlite";
 import { inferAudience } from "./jwt-audience.ts";
 import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
-import { isNonRequestableScope } from "./scope-explanations.ts";
+import {
+  isNonRequestableScope,
+  isVaultAdminScope,
+  vaultAdminScopeName,
+} from "./scope-explanations.ts";
 
 /** Default lifetime when --expires-in / `expires_in` is omitted. Matches the CLI. */
 export const API_MINT_TOKEN_DEFAULT_TTL_SECONDS = 90 * 24 * 60 * 60;
@@ -34,6 +47,14 @@ export const API_MINT_TOKEN_DEFAULT_TTL_SECONDS = 90 * 24 * 60 * 60;
 export const API_MINT_TOKEN_MAX_TTL_SECONDS = 365 * 24 * 60 * 60;
 /** Scope required on the bearer token to call this endpoint. */
 export const API_MINT_TOKEN_REQUIRED_SCOPE = "parachute:host:auth";
+/**
+ * Bearer scope that admits an otherwise-non-requestable `vault:<name>:admin`
+ * into a mint request. `parachute:host:admin` already implies box-wide
+ * administration of every vault on the hub, so minting a vault-pinned admin
+ * from it is a privilege *reduction* (de-escalation), not an escalation —
+ * see the design doc `2026-05-28-operator-mintable-vault-admin.md`.
+ */
+export const API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE = "parachute:host:admin";
 /** client_id stamped on minted tokens. Matches the CLI flow's value. */
 export const API_MINT_TOKEN_CLIENT_ID = "parachute-hub";
 
@@ -124,7 +145,21 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   // cannot mint another `:auth` (or any other non-requestable) without
   // forced re-auth via the operator.token rotation path. Same set the
   // public OAuth flow already rejects.
-  const blocked = scopes.filter((s) => isNonRequestableScope(s));
+  //
+  // Exception (de-escalation): a bearer that already carries
+  // `parachute:host:admin` may mint `vault:<name>:admin`. host:admin
+  // implies box-wide administration of every vault on the hub, so pinning
+  // it to a single named vault is a privilege *reduction*. This is the
+  // canonical headless path to a per-vault admin token (mcp-install via
+  // operator.token; SPA via session → host-admin-token → here) and the
+  // replacement for the deprecated `pvt_*` admin tokens (vault#282). The
+  // host:* narrow scopes and a bare `vault:admin` (no name) stay blocked.
+  const bearerHasHostAdmin = bearerScopes.includes(API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE);
+  const blocked = scopes.filter((s) => {
+    if (!isNonRequestableScope(s)) return false;
+    if (bearerHasHostAdmin && isVaultAdminScope(s)) return false;
+    return true;
+  });
   if (blocked.length > 0) {
     return jsonError(
       400,
@@ -183,6 +218,17 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     permissionsCanonical = JSON.stringify(permissionsClaim);
   }
 
+  // Derive the `vault_scope` pin. For ordinary verb mints (read/write)
+  // this stays `[]` — the "no per-user restriction" sentinel; the scope
+  // string + audience are the authorization-bearing gate. For a
+  // `vault:<name>:admin` mint (admitted above for host:admin bearers) we
+  // pin the named vault(s) so the token can ONLY ever be used against
+  // that vault, matching the canonical session-path mint in
+  // `admin-vault-admin-token.ts` (defense-in-depth + least privilege).
+  const vaultScopePin = scopes
+    .map((s) => vaultAdminScopeName(s))
+    .filter((n): n is string => n !== null);
+
   // 6. Mint + register.
   const minted = await signAccessToken(deps.db, {
     sub: subject,
@@ -192,11 +238,9 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     issuer: deps.issuer,
     ttlSeconds,
     // Operator-driven CLI/API mint — the bearer already cleared the
-    // `parachute:host:auth` privilege gate, so there's no per-user vault
-    // pin to enforce. Empty `vault_scope` is the "no restriction"
-    // sentinel; the `scopes` themselves remain authorization-bearing as
-    // before.
-    vaultScope: [],
+    // privilege gate. `vault_scope` is `[]` (no restriction) for verb
+    // mints, or the named vault(s) for an admin mint (see above).
+    vaultScope: vaultScopePin,
     ...(permissionsClaim !== undefined ? { extraClaims: { permissions: permissionsClaim } } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
