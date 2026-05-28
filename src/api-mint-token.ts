@@ -8,19 +8,31 @@
  *   - the future admin SPA when the operator wants to mint a one-shot
  *     scope-narrow token without dropping to a terminal.
  *
- * Auth: `Authorization: Bearer <token>` where `token`'s `scope` claim
- * contains `parachute:host:auth`. The operator's local operator.token
- * (admin scope-set) covers this; a narrow `--scope-set=auth` operator
- * token also covers this.
+ * Auth — capability attenuation: any bearer may mint a token whose authority
+ * is a SUBSET of its own. A requested scope `s` is grantable (`canGrant`) iff:
  *
- * Mintable scopes: any requestable scope (vault/scribe/agent verbs, etc.).
- * Non-requestable scopes (`parachute:host:*`, `vault:<name>:admin`) are
- * refused — with ONE de-escalation exception: a bearer that carries
- * `parachute:host:admin` may mint `vault:<name>:admin`, because host:admin
- * already implies box-wide vault administration, so a vault-pinned admin is
- * strictly narrower. That's the canonical headless path to a per-vault admin
- * token (replacing deprecated `pvt_*` — vault#282) and the path the SPA
- * tokens page uses via session → /admin/host-admin-token → here.
+ *   1. `s` is requestable AND the bearer holds `parachute:host:auth`
+ *      — host:auth mints any requestable scope (vault/scribe verbs, etc.).
+ *   2. `s` is `vault:<N>:admin` AND the bearer holds `parachute:host:admin`
+ *      — box-wide admin attenuates to one named vault's admin.
+ *   3. `s` is `vault:<N>:<verb>` (verb ∈ read/write/admin) AND the bearer
+ *      holds `vault:<N>:admin` for the SAME `<N>` — a vault-admin attenuates
+ *      to any same-vault subset, including an equal-level admin.
+ *
+ * Otherwise `s` is refused (400 `invalid_scope`). This single rule subsumes
+ * the former two-part guard: the old hard `parachute:host:auth` gate is now
+ * rule 1, and PR-A's `host:admin → vault:<name>:admin` carve-out (hub#449) is
+ * now rule 2. Rule 3 is new — it lets a `vault:<name>:admin` bearer mint
+ * same-vault sub-tokens (the canonical headless path to per-vault admin,
+ * replacing deprecated `pvt_*` — vault#282 — and the path the SPA tokens
+ * page uses via session → /admin/host-admin-token → here). Cross-vault and
+ * host-authority escalation are always blocked: a `vault:work:admin` bearer
+ * can never mint `vault:other:*` or any `parachute:host:*`.
+ *
+ * Entry gate: the bearer must hold at least one minting authority —
+ * `parachute:host:auth`, `parachute:host:admin`, or some `vault:<*>:admin`.
+ * A bearer with none (e.g. a read-only token) gets 403 `insufficient_scope`
+ * before any per-scope check; it cannot mint anything.
  *
  * Why a separate endpoint instead of extending /admin/host-admin-token:
  * that endpoint is session-cookie-gated for the SPA's needs and only
@@ -35,28 +47,76 @@
 import type { Database } from "bun:sqlite";
 import { inferAudience } from "./jwt-audience.ts";
 import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
-import {
-  isNonRequestableScope,
-  isVaultAdminScope,
-  vaultAdminScopeName,
-} from "./scope-explanations.ts";
+import { isNonRequestableScope, isVaultAdminScope, vaultScopeName } from "./scope-explanations.ts";
 
 /** Default lifetime when --expires-in / `expires_in` is omitted. Matches the CLI. */
 export const API_MINT_TOKEN_DEFAULT_TTL_SECONDS = 90 * 24 * 60 * 60;
 /** Hard cap. Matches the CLI's --expires-in upper bound. */
 export const API_MINT_TOKEN_MAX_TTL_SECONDS = 365 * 24 * 60 * 60;
-/** Scope required on the bearer token to call this endpoint. */
-export const API_MINT_TOKEN_REQUIRED_SCOPE = "parachute:host:auth";
 /**
- * Bearer scope that admits an otherwise-non-requestable `vault:<name>:admin`
- * into a mint request. `parachute:host:admin` already implies box-wide
- * administration of every vault on the hub, so minting a vault-pinned admin
- * from it is a privilege *reduction* (de-escalation), not an escalation —
- * see the design doc `2026-05-28-operator-mintable-vault-admin.md`.
+ * Bearer scope that authorises minting any *requestable* scope (rule 1 of the
+ * attenuation model). The operator's admin scope-set carries this; a narrow
+ * `--scope-set=auth` operator token carries it too.
+ */
+export const API_MINT_TOKEN_HOST_AUTH_SCOPE = "parachute:host:auth";
+/**
+ * Bearer scope that authorises minting `vault:<name>:admin` (rule 2).
+ * `parachute:host:admin` already implies box-wide administration of every
+ * vault on the hub, so minting a vault-pinned admin from it is a privilege
+ * *reduction* (de-escalation), not an escalation — see the design doc
+ * `2026-05-28-operator-mintable-vault-admin.md`.
  */
 export const API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE = "parachute:host:admin";
 /** client_id stamped on minted tokens. Matches the CLI flow's value. */
 export const API_MINT_TOKEN_CLIENT_ID = "parachute-hub";
+
+/**
+ * Capability attenuation: can a bearer holding `bearerScopes` mint a token
+ * carrying `requestedScope`? True iff the requested scope is a subset of the
+ * bearer's own authority under one of three rules (see the file docstring):
+ *
+ *   1. requestable + bearer has `parachute:host:auth`;
+ *   2. `vault:<N>:admin` + bearer has `parachute:host:admin`;
+ *   3. `vault:<N>:<verb>` + bearer has `vault:<N>:admin` (same `<N>`).
+ *
+ * Pure function — no DB, no I/O — so it's trivially testable and the guard in
+ * the handler is a single `scopes.filter((s) => !canGrant(bearerScopes, s))`.
+ */
+export function canGrant(bearerScopes: string[], requestedScope: string): boolean {
+  // Rule 1 — host:auth mints any requestable scope.
+  if (
+    !isNonRequestableScope(requestedScope) &&
+    bearerScopes.includes(API_MINT_TOKEN_HOST_AUTH_SCOPE)
+  ) {
+    return true;
+  }
+  // Rule 2 — host:admin attenuates to a named vault's admin.
+  if (
+    isVaultAdminScope(requestedScope) &&
+    bearerScopes.includes(API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE)
+  ) {
+    return true;
+  }
+  // Rule 3 — vault:<N>:admin attenuates to any same-vault subset (incl. admin).
+  const requestedVault = vaultScopeName(requestedScope);
+  if (requestedVault !== null && bearerScopes.includes(`vault:${requestedVault}:admin`)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Does the bearer hold ANY minting authority? Entry gate before per-scope
+ * checks — a bearer with none (e.g. a read-only token) can mint nothing, so
+ * we 403 early rather than walking every requested scope to the same end.
+ */
+function hasMintingAuthority(bearerScopes: string[]): boolean {
+  return (
+    bearerScopes.includes(API_MINT_TOKEN_HOST_AUTH_SCOPE) ||
+    bearerScopes.includes(API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE) ||
+    bearerScopes.some((s) => isVaultAdminScope(s))
+  );
+}
 
 export interface ApiMintTokenDeps {
   db: Database;
@@ -108,12 +168,17 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     return jsonError(401, "unauthenticated", `bearer token invalid — ${msg}`);
   }
 
-  // 3. Scope gate.
-  if (!bearerScopes.includes(API_MINT_TOKEN_REQUIRED_SCOPE)) {
+  // 3. Entry gate — the bearer must hold at least one minting authority
+  //    (`parachute:host:auth`, `parachute:host:admin`, or some
+  //    `vault:<*>:admin`). A bearer with none can mint nothing under the
+  //    attenuation model, so we 403 before per-scope checks. Per-scope
+  //    grantability (which authority covers which scope) is enforced below
+  //    via `canGrant`.
+  if (!hasMintingAuthority(bearerScopes)) {
     return jsonError(
       403,
       "insufficient_scope",
-      `bearer token lacks ${API_MINT_TOKEN_REQUIRED_SCOPE}`,
+      `bearer token holds no minting authority (need ${API_MINT_TOKEN_HOST_AUTH_SCOPE}, ${API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE}, or vault:<name>:admin)`,
     );
   }
 
@@ -138,33 +203,19 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     return jsonError(400, "invalid_request", "scope must contain at least one scope");
   }
 
-  // Privilege-diffusion guard: mint paths cannot themselves mint tokens
-  // carrying non-requestable scopes (parachute:host:admin, the host:*
-  // narrow scopes, vault:<name>:admin). Holder of `parachute:host:auth`
-  // can mint vault/scribe/agent verb scopes for downstream services, but
-  // cannot mint another `:auth` (or any other non-requestable) without
-  // forced re-auth via the operator.token rotation path. Same set the
-  // public OAuth flow already rejects.
-  //
-  // Exception (de-escalation): a bearer that already carries
-  // `parachute:host:admin` may mint `vault:<name>:admin`. host:admin
-  // implies box-wide administration of every vault on the hub, so pinning
-  // it to a single named vault is a privilege *reduction*. This is the
-  // canonical headless path to a per-vault admin token (mcp-install via
-  // operator.token; SPA via session → host-admin-token → here) and the
-  // replacement for the deprecated `pvt_*` admin tokens (vault#282). The
-  // host:* narrow scopes and a bare `vault:admin` (no name) stay blocked.
-  const bearerHasHostAdmin = bearerScopes.includes(API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE);
-  const blocked = scopes.filter((s) => {
-    if (!isNonRequestableScope(s)) return false;
-    if (bearerHasHostAdmin && isVaultAdminScope(s)) return false;
-    return true;
-  });
+  // Capability-attenuation guard: every requested scope must be a subset of
+  // the bearer's own authority under `canGrant` (rules in the file docstring).
+  // A `parachute:host:auth` bearer mints any requestable scope; a
+  // `parachute:host:admin` bearer additionally mints `vault:<name>:admin`; a
+  // `vault:<name>:admin` bearer mints same-vault subsets only. Anything else
+  // — host:* escalation, cross-vault, a non-requestable with no covering
+  // authority — is blocked. One blocked scope rejects the whole request.
+  const blocked = scopes.filter((s) => !canGrant(bearerScopes, s));
   if (blocked.length > 0) {
     return jsonError(
       400,
       "invalid_scope",
-      `scope ${blocked.join(", ")} is not requestable via mint-token; use OAuth flow or operator rotation`,
+      `scope ${blocked.join(", ")} is not grantable by this bearer; use OAuth flow or operator rotation`,
     );
   }
 
@@ -218,22 +269,39 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     permissionsCanonical = JSON.stringify(permissionsClaim);
   }
 
-  // Derive the `vault_scope` pin. For ordinary verb mints (read/write)
-  // this stays `[]` — the "no per-user restriction" sentinel; the scope
-  // string + audience are the authorization-bearing gate. For a
-  // `vault:<name>:admin` mint (admitted above for host:admin bearers) we
-  // pin the named vault(s) so the token can ONLY ever be used against
-  // that vault, matching the canonical session-path mint in
-  // `admin-vault-admin-token.ts` (defense-in-depth + least privilege).
+  // Derive the `vault_scope` pin. Collect the set of vault names `<N>` from
+  // every requested `vault:<N>:<verb>` scope that was authorized via a
+  // vault-scoped authority — rule 2 (host:admin → vault:<N>:admin) or rule 3
+  // (vault:<N>:admin → same-vault subset). These are the vault-scoped mints,
+  // so we pin the token to those vault(s): it can ONLY ever be used against
+  // them (defense-in-depth + least privilege), matching the canonical
+  // session-path mint in `admin-vault-admin-token.ts`.
   //
-  // Note: `audience` is single-valued and `inferAudience` is first-wins,
-  // so a multi-vault request (`vault:a:admin vault:b:admin`) gets
-  // `aud=vault.a` and the resulting token only authenticates against `a`.
-  // Mint one token per vault for the multi-vault case. The canonical
-  // consumers (mcp-install, SPA tokens page) request a single vault.
-  const vaultScopePin = scopes
-    .map((s) => vaultAdminScopeName(s))
-    .filter((n): n is string => n !== null);
+  // Pure `parachute:host:auth` requestable mints (a `vault:<N>:read/write`
+  // granted by rule 1 with no covering vault-admin authority) stay UNpinned
+  // (`[]`) — the "no per-user restriction" sentinel; the scope string +
+  // audience are the authorization-bearing gate there, as before. We
+  // distinguish by checking the bearer's own vault-scoped authority: a vault
+  // name is pinned only when the bearer held `vault:<N>:admin` (rule 3) or
+  // host:admin and the scope is admin (rule 2).
+  //
+  // Note: `audience` is single-valued and `inferAudience` is first-wins, so a
+  // multi-vault request gets `aud=vault.<first>` and only authenticates
+  // against that vault. Mint one token per vault for the multi-vault case.
+  // The canonical consumers (mcp-install, SPA tokens page) request a single
+  // vault.
+  const bearerHasHostAdmin = bearerScopes.includes(API_MINT_TOKEN_VAULT_ADMIN_BEARER_SCOPE);
+  const vaultScopePinSet = new Set<string>();
+  for (const s of scopes) {
+    const name = vaultScopeName(s);
+    if (name === null) continue;
+    const grantedByVaultAdminBearer = bearerScopes.includes(`vault:${name}:admin`); // rule 3
+    const grantedByHostAdminForAdmin = isVaultAdminScope(s) && bearerHasHostAdmin; // rule 2
+    if (grantedByVaultAdminBearer || grantedByHostAdminForAdmin) {
+      vaultScopePinSet.add(name);
+    }
+  }
+  const vaultScopePin = [...vaultScopePinSet];
 
   // 6. Mint + register.
   const minted = await signAccessToken(deps.db, {
@@ -244,8 +312,9 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     issuer: deps.issuer,
     ttlSeconds,
     // Operator-driven CLI/API mint — the bearer already cleared the
-    // privilege gate. `vault_scope` is `[]` (no restriction) for verb
-    // mints, or the named vault(s) for an admin mint (see above).
+    // attenuation guard. `vault_scope` is `[]` (no restriction) for pure
+    // host:auth verb mints, or the named vault(s) for vault-scoped mints
+    // authorized via rule 2 / rule 3 (see above).
     vaultScope: vaultScopePin,
     ...(permissionsClaim !== undefined ? { extraClaims: { permissions: permissionsClaim } } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),

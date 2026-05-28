@@ -308,7 +308,7 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
         const body = (await resp.json()) as { error: string; error_description: string };
         expect(body.error).toBe("invalid_scope");
         expect(body.error_description).toContain("parachute:host:auth");
-        expect(body.error_description).toContain("not requestable");
+        expect(body.error_description).toContain("not grantable");
       } finally {
         db.close();
       }
@@ -440,6 +440,397 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     } finally {
       h.cleanup();
     }
+  });
+
+  // ── Capability attenuation (hub PR — subsumes hub#449's PR-A carve-out) ──
+  //
+  // A `vault:<name>:admin` bearer may mint a token whose authority is a
+  // SUBSET of its own: same-vault read/write/admin. It can NEVER mint a
+  // cross-vault scope or any host-level authority. We hand-mint the bearer
+  // via signAccessToken (scope `vault:work:admin`, aud `vault.work`,
+  // vaultScope `["work"]`) — mirroring how the SPA / mcp-install obtain one.
+  async function mintVaultAdminBearer(
+    db: ReturnType<typeof openHubDb>,
+    userId: string,
+    vault: string,
+  ): Promise<string> {
+    const signed = await signAccessToken(db, {
+      sub: userId,
+      scopes: [`vault:${vault}:admin`],
+      audience: `vault.${vault}`,
+      clientId: "parachute-hub",
+      issuer: ISSUER,
+      ttlSeconds: 3600,
+      vaultScope: [vault],
+    });
+    return signed.token;
+  }
+
+  describe("capability attenuation — vault:<name>:admin bearer", () => {
+    test("mints vault:work:write → 200, aud=vault.work, vault_scope=[work]", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:write" }, { authorization: `Bearer ${bearer}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.aud).toBe("vault.work");
+          expect(validated.payload.scope).toBe("vault:work:write");
+          expect(validated.payload.vault_scope).toEqual(["work"]);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("mints vault:work:read → 200", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:read" }, { authorization: `Bearer ${bearer}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.vault_scope).toEqual(["work"]);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("mints vault:work:admin → 200 (same-level allowed)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${bearer}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.aud).toBe("vault.work");
+          expect(validated.payload.scope).toBe("vault:work:admin");
+          expect(validated.payload.vault_scope).toEqual(["work"]);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    // THE CRUX: cross-vault is the security boundary. A work-admin bearer
+    // MUST NOT be able to mint authority over any other vault.
+    test("mints vault:other:write → 400 (cross-vault BLOCKED)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:other:write" }, { authorization: `Bearer ${bearer}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(400);
+          const body = (await resp.json()) as { error: string; error_description: string };
+          expect(body.error).toBe("invalid_scope");
+          expect(body.error_description).toContain("vault:other:write");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("mints vault:other:admin → 400 (cross-vault BLOCKED)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:other:admin" }, { authorization: `Bearer ${bearer}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(400);
+          const body = (await resp.json()) as { error: string };
+          expect(body.error).toBe("invalid_scope");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("mints parachute:host:auth → 400 (no escalation to host authority)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "parachute:host:auth" }, { authorization: `Bearer ${bearer}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(400);
+          const body = (await resp.json()) as { error: string };
+          expect(body.error).toBe("invalid_scope");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("mints parachute:host:admin → 400 (no escalation to host authority)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "parachute:host:admin" }, { authorization: `Bearer ${bearer}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(400);
+          const body = (await resp.json()) as { error: string };
+          expect(body.error).toBe("invalid_scope");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    // No host:auth, and scribe:transcribe is not a vault:work scope → blocked.
+    test("mints scribe:transcribe → 400 (not a vault:work scope, no host:auth)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "scribe:transcribe" }, { authorization: `Bearer ${bearer}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(400);
+          const body = (await resp.json()) as { error: string };
+          expect(body.error).toBe("invalid_scope");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("multi-scope vault:work:read vault:work:write → 200, vault_scope=[work]", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read vault:work:write" },
+              { authorization: `Bearer ${bearer}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.vault_scope).toEqual(["work"]);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    // One blocked scope rejects the whole request (no partial mint).
+    test("multi-scope vault:work:read vault:other:read → 400 (one blocked → all rejected)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read vault:other:read" },
+              { authorization: `Bearer ${bearer}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(400);
+          const body = (await resp.json()) as { error: string; error_description: string };
+          expect(body.error).toBe("invalid_scope");
+          expect(body.error_description).toContain("vault:other:read");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
+  describe("capability attenuation — entry gate + regression", () => {
+    test("host:auth-only bearer mints vault:work:read → 200 (rule 1, preserved)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER, scopeSet: "auth" });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:read" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          // Pure host:auth requestable mint → no vault pin.
+          expect(validated.payload.vault_scope).toEqual([]);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("host:auth-only bearer mints vault:work:admin → 400 (rule 1 doesn't cover admin)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER, scopeSet: "auth" });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(400);
+          const body = (await resp.json()) as { error: string };
+          expect(body.error).toBe("invalid_scope");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("host:admin bearer mints vault:work:admin → 200 (rule 2, PR-A preserved)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.aud).toBe("vault.work");
+          expect(validated.payload.vault_scope).toEqual(["work"]);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    // Entry gate: a bearer with no host:* and no vault-admin holds no minting
+    // authority → 403 before any per-scope check.
+    test("403 entry gate when bearer holds no minting authority", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const noAuthority = await signAccessToken(db, {
+            sub: userId,
+            scopes: ["hub:admin", "scribe:transcribe"],
+            audience: "hub",
+            clientId: "parachute-hub",
+            issuer: ISSUER,
+            ttlSeconds: 3600,
+          });
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read" },
+              { authorization: `Bearer ${noAuthority.token}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(403);
+          const body = (await resp.json()) as { error: string };
+          expect(body.error).toBe("insufficient_scope");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    // A read-only token used AS A BEARER is not minting authority → 403.
+    test("403 entry gate when bearer is a vault:work:read token (read is not minting authority)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const readOnly = await signAccessToken(db, {
+            sub: userId,
+            scopes: ["vault:work:read"],
+            audience: "vault.work",
+            clientId: "parachute-hub",
+            issuer: ISSUER,
+            ttlSeconds: 3600,
+            vaultScope: ["work"],
+          });
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read" },
+              { authorization: `Bearer ${readOnly.token}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(403);
+          const body = (await resp.json()) as { error: string };
+          expect(body.error).toBe("insufficient_scope");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
   });
 
   test("405 on non-POST", async () => {
