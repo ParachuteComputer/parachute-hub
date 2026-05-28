@@ -312,15 +312,39 @@ async function main(argv: string[]): Promise<number> {
         console.log(initHelp());
         return 0;
       }
-      const noBrowser = rest.includes("--no-browser");
-      const unknown = rest.find((a) => a !== "--no-browser");
+      const exposeExtract = extractNamedFlag(rest, "--expose");
+      if (exposeExtract.error) {
+        console.error(`parachute init: ${exposeExtract.error}`);
+        return 1;
+      }
+      if (
+        exposeExtract.value !== undefined &&
+        exposeExtract.value !== "none" &&
+        exposeExtract.value !== "tailnet" &&
+        exposeExtract.value !== "cloudflare"
+      ) {
+        console.error(
+          `parachute init: --expose must be one of none|tailnet|cloudflare (got "${exposeExtract.value}")`,
+        );
+        return 1;
+      }
+      const noBrowser = exposeExtract.rest.includes("--no-browser");
+      const noExposePrompt = exposeExtract.rest.includes("--no-expose-prompt");
+      const known = new Set(["--no-browser", "--no-expose-prompt"]);
+      const unknown = exposeExtract.rest.find((a) => !known.has(a));
       if (unknown !== undefined) {
         console.error(`parachute init: unknown argument "${unknown}"`);
-        console.error("usage: parachute init [--no-browser]");
+        console.error(
+          "usage: parachute init [--no-browser] [--no-expose-prompt] [--expose none|tailnet|cloudflare]",
+        );
         return 1;
       }
       const initOpts: Parameters<typeof init>[0] = {};
       if (noBrowser) initOpts.noBrowser = true;
+      if (noExposePrompt) initOpts.noExposePrompt = true;
+      if (exposeExtract.value) {
+        initOpts.exposeChoice = exposeExtract.value as "none" | "tailnet" | "cloudflare";
+      }
       return await init(initOpts);
     }
 

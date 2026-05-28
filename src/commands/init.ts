@@ -1,30 +1,35 @@
 /**
- * `parachute init` — fresh-install front door.
+ * `parachute init` — fresh-install front door, single entry point for both
+ * laptops and remote servers (EC2, DigitalOcean, Hetzner, any VPS).
  *
- * Aaron's framing (2026-05-27): "On render I just install it and then the
- * wizard walks me through all that including installing vault; I think
- * that should be similar here. One quick thing to set it up then I can
- * walk through in CLI (probably parachute init or something) or ideally
- * I can visit the page and go through the wizard."
+ * Aaron's framing (2026-05-28): "orient local install more to leveraging the
+ * wizard if possible. Local install in this case should be extremely similar
+ * to ec2, except that perhaps we get parachute expose set up first."
  *
  * The job: get the user from a fresh install to the admin SPA setup
- * wizard with one command. The wizard already handles vault install +
- * scribe install + first-boot bootstrap (`/admin/setup`). `init`'s
- * responsibility is narrower:
+ * wizard with one command, regardless of where the box lives. The wizard
+ * already handles vault install + scribe install + first-boot bootstrap
+ * (`/admin/setup`). `init`'s responsibility is narrower:
  *
  *   1. The hub binary is already on PATH (you can't `parachute init`
  *      without it). So "is hub installed" is always yes here.
  *   2. Is the hub *running* on this box? If not, start it.
- *   3. Print the canonical admin URL — local loopback if we're not
- *      exposed, the tailnet / cloudflare FQDN if we are.
- *   4. Offer to open the URL in a browser (macOS: `open`, Linux:
+ *   3. Is the hub already exposed (`expose-state.json` present)? If so,
+ *      skip straight to printing the FQDN. Otherwise, in a TTY, ask
+ *      whether the operator wants to expose it now — defaulting to
+ *      "no, loopback" on a laptop and pre-selecting Cloudflare on a
+ *      server (SSH session detected). Same command both paths.
+ *   4. After any exposure chain, re-resolve and print the canonical
+ *      admin URL — local loopback if we're not exposed, the tailnet /
+ *      cloudflare FQDN if we are.
+ *   5. Offer to open the URL in a browser (macOS: `open`, Linux:
  *      `xdg-open`). Skip in non-TTY shells.
- *   5. If a vault is already configured, just confirm "looks good" and
+ *   6. If a vault is already configured, confirm "looks good" and
  *      point at the URL. The wizard surfaces install-state internally —
  *      no need to duplicate that logic here.
  *
- * Idempotent: every re-run is safe. If hub is up and a vault row exists,
- * we print the URL and exit 0 without touching anything.
+ * Idempotent: every re-run is safe. If hub is up and exposed (or the user
+ * picked "no expose" once), the chain short-circuits.
  */
 
 import { spawnSync } from "node:child_process";
@@ -39,6 +44,9 @@ import {
 } from "../hub-control.ts";
 import { type AliveFn, defaultAlive, processState } from "../process-state.ts";
 import { readManifestLenient } from "../services-manifest.ts";
+
+/** The three options the exposure prompt offers — also the `--expose` flag's domain. */
+export type ExposeChoice = "none" | "tailnet" | "cloudflare";
 
 export interface InitOpts {
   configDir?: string;
@@ -55,7 +63,7 @@ export interface InitOpts {
   readExposeStateFn?: () => ExposeState | undefined;
   /** Test seam: TTY check (production reads `process.stdin.isTTY`). */
   isTty?: boolean;
-  /** Test seam: prompt for "open in browser?". */
+  /** Test seam: prompt for "open in browser?" and exposure choice. */
   prompt?: (question: string) => Promise<string>;
   /**
    * Test seam: browser-open shim. Receives `url`; production shells out
@@ -64,11 +72,35 @@ export interface InitOpts {
   openBrowser?: (url: string) => boolean;
   /** Test seam: `process.platform`. */
   platform?: NodeJS.Platform;
+  /** Test seam: process.env for SSH / DISPLAY detection. */
+  env?: NodeJS.ProcessEnv;
   /**
    * If true, don't even ask about opening the browser. Convenient flag for
    * CI / scripts that just want the URL printed and exit 0.
    */
   noBrowser?: boolean;
+  /**
+   * Non-interactive exposure choice. Skips the prompt entirely:
+   *   - "none"       — no-op (laptop default)
+   *   - "tailnet"    — chain into `exposeTailnet("up", {})`
+   *   - "cloudflare" — chain into the cloudflare interactive flow
+   * For CI / scripted deploys.
+   */
+  exposeChoice?: ExposeChoice;
+  /** Skip the exposure prompt; fall through to "here's localhost URL". */
+  noExposePrompt?: boolean;
+  /**
+   * Test seam: shim for the tailnet exposure chain. Production imports
+   * `exposeTailnet` lazily. Tests pass a stub to record the call without
+   * shelling out to `tailscale serve`.
+   */
+  exposeTailnetImpl?: () => Promise<number>;
+  /**
+   * Test seam: shim for the cloudflare exposure chain. Production imports
+   * `exposePublicInteractive` with `preselect: "cloudflare"`. Tests pass a
+   * stub to record the call without shelling out to `cloudflared`.
+   */
+  exposeCloudflareImpl?: () => Promise<number>;
 }
 
 /**
@@ -84,13 +116,37 @@ export function resolveAdminUrl(
   exposeState: ExposeState | undefined,
   hubPort: number | undefined,
 ): string | undefined {
-  if (exposeState && exposeState.canonicalFqdn) {
+  if (exposeState?.canonicalFqdn) {
     return `https://${exposeState.canonicalFqdn}/admin/`;
   }
   if (hubPort !== undefined) {
     return `http://127.0.0.1:${hubPort}/admin/`;
   }
   return undefined;
+}
+
+/**
+ * Heuristic: is this likely a server (vs. a laptop)?
+ *
+ * Servers default-highlight Cloudflare in the prompt; laptops default to
+ * "no expose". We don't auto-pick — always prompt — but pre-select the
+ * sensible default so an operator can confirm with Enter.
+ *
+ * Signals:
+ *   - Linux platform AND ($SSH_CONNECTION set OR no $DISPLAY)
+ *
+ * macOS / Windows / Linux desktop → laptop.
+ */
+export function looksLikeServer(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): boolean {
+  if (platform !== "linux") return false;
+  // WSL2 is Linux + headless from $DISPLAY's perspective but is in fact a
+  // developer's laptop. Detect via WSL-specific env vars (set in every WSL
+  // distro) so we don't pre-select Cloudflare for someone running Parachute
+  // inside WSL on Windows. Reviewer-flagged on #445.
+  if (env.WSL_DISTRO_NAME || env.WSL_INTEROP) return false;
+  if (env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY) return true;
+  if (!env.DISPLAY && !env.WAYLAND_DISPLAY) return true;
+  return false;
 }
 
 /**
@@ -118,6 +174,64 @@ async function defaultPrompt(question: string): Promise<string> {
   }
 }
 
+/**
+ * Default chain into Tailscale exposure. Lazy-imports so tests don't pull
+ * tailscale wiring into the init module's surface.
+ */
+async function defaultExposeTailnet(): Promise<number> {
+  const { exposeTailnet } = await import("./expose.ts");
+  return await exposeTailnet("up", {});
+}
+
+/**
+ * Default chain into Cloudflare exposure. Goes through the interactive
+ * flow with `preselect: "cloudflare"` so the operator gets walked
+ * through install / login / hostname-prompt as needed.
+ */
+async function defaultExposeCloudflare(): Promise<number> {
+  const { exposePublicInteractive } = await import("./expose-interactive.ts");
+  return await exposePublicInteractive({ preselect: "cloudflare" });
+}
+
+/**
+ * Prompt for the exposure choice. Returns the picked option, or
+ * `undefined` if the operator quit / bailed.
+ *
+ * Default is whichever option matches the platform heuristic — laptops
+ * default to "none", servers to "cloudflare". Empty input picks the
+ * default (so Enter == confirm).
+ */
+async function promptExposeChoice(
+  prompt: (q: string) => Promise<string>,
+  log: (line: string) => void,
+  defaultChoice: ExposeChoice,
+): Promise<ExposeChoice | undefined> {
+  log("Do you want to expose it publicly so you can reach it from other devices?");
+  const mark = (c: ExposeChoice) => (c === defaultChoice ? " (default)" : "");
+  log(`  1) No — keep it loopback-only${mark("none")}`);
+  log(`  2) Yes via Tailscale Funnel (private to your devices)${mark("tailnet")}`);
+  log(`  3) Yes via Cloudflare Tunnel (public HTTPS, your own domain)${mark("cloudflare")}`);
+  log("");
+
+  const defaultDigit = defaultChoice === "none" ? "1" : defaultChoice === "tailnet" ? "2" : "3";
+
+  // Bounded retries — a stuck prompt (non-TTY stdin that slipped through,
+  // piped /dev/null, etc.) shouldn't spin forever.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const raw = (await prompt(`Pick [${defaultDigit}]: `)).trim().toLowerCase();
+    if (raw === "") {
+      return defaultChoice;
+    }
+    if (raw === "1" || raw === "no" || raw === "none") return "none";
+    if (raw === "2" || raw === "tailnet" || raw === "tailscale") return "tailnet";
+    if (raw === "3" || raw === "cloudflare") return "cloudflare";
+    if (raw === "q" || raw === "quit" || raw === "exit") return undefined;
+    log(`Sorry — expected 1, 2, 3, or q (got "${raw}"). Try again.`);
+  }
+  log("Too many invalid entries; falling back to default.");
+  return defaultChoice;
+}
+
 export async function init(opts: InitOpts = {}): Promise<number> {
   const configDir = opts.configDir ?? CONFIG_DIR;
   const manifestPath = opts.manifestPath ?? SERVICES_MANIFEST_PATH;
@@ -128,7 +242,10 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   const isTty = opts.isTty ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
   const prompt = opts.prompt ?? defaultPrompt;
   const platform = opts.platform ?? process.platform;
+  const env = opts.env ?? process.env;
   const openBrowser = opts.openBrowser ?? ((url: string) => defaultOpenBrowser(url, platform));
+  const exposeTailnetImpl = opts.exposeTailnetImpl ?? defaultExposeTailnet;
+  const exposeCloudflareImpl = opts.exposeCloudflareImpl ?? defaultExposeCloudflare;
 
   log("Parachute init — getting your hub set up.");
   log("");
@@ -160,7 +277,52 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   // overridden, so the fallback is almost always correct.
   if (hubPort === undefined) hubPort = HUB_DEFAULT_PORT;
 
-  // Step 2: vault configured?
+  // Step 2: exposure chain. Skipped when already exposed, in non-TTY,
+  // or when --no-expose-prompt was passed. `--expose <choice>` jumps
+  // straight to the corresponding chain without asking.
+  let exposeState = readExposeStateFn();
+  const alreadyExposed = Boolean(exposeState?.canonicalFqdn);
+
+  if (alreadyExposed) {
+    // Already-exposed short-circuit: don't prompt. The admin URL printed
+    // later will be the FQDN.
+    log(`✓ Hub is already exposed at ${exposeState?.canonicalFqdn}.`);
+  } else if (opts.exposeChoice !== undefined) {
+    // Non-interactive override.
+    const code = await runExposureChoice(opts.exposeChoice, {
+      log,
+      exposeTailnetImpl,
+      exposeCloudflareImpl,
+    });
+    if (code !== 0) return code;
+    // Refresh state — the chain may have brought up an FQDN.
+    exposeState = readExposeStateFn();
+  } else if (opts.noExposePrompt) {
+    // Skip the question; fall through to localhost URL.
+  } else if (!isTty) {
+    // Non-TTY: don't prompt. Operator can re-run with --expose if needed.
+  } else {
+    log(`Hub is running locally at http://127.0.0.1:${hubPort}.`);
+    log("");
+    const isServer = looksLikeServer(platform, env);
+    const defaultChoice: ExposeChoice = isServer ? "cloudflare" : "none";
+    const picked = await promptExposeChoice(prompt, log, defaultChoice);
+    if (picked === undefined) {
+      log("");
+      log("Skipped exposure. Re-run `parachute expose public` later if you want to.");
+    } else if (picked !== "none") {
+      log("");
+      const code = await runExposureChoice(picked, {
+        log,
+        exposeTailnetImpl,
+        exposeCloudflareImpl,
+      });
+      if (code !== 0) return code;
+      exposeState = readExposeStateFn();
+    }
+  }
+
+  // Step 3: vault configured?
   let hasVault = false;
   try {
     const manifest = readManifestLenient(manifestPath);
@@ -171,8 +333,7 @@ export async function init(opts: InitOpts = {}): Promise<number> {
     hasVault = false;
   }
 
-  // Step 3: resolve the admin URL.
-  const exposeState = readExposeStateFn();
+  // Step 4: resolve the admin URL.
   const adminUrl = resolveAdminUrl(exposeState, hubPort);
   if (!adminUrl) {
     log("");
@@ -191,7 +352,7 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   log(`  ${adminUrl}`);
   log("");
 
-  // Step 4: offer to open the browser. Skip in non-TTY shells (CI),
+  // Step 5: offer to open the browser. Skip in non-TTY shells (CI),
   // honor `--no-browser`.
   if (opts.noBrowser) return 0;
   if (!isTty) {
@@ -210,4 +371,26 @@ export async function init(opts: InitOpts = {}): Promise<number> {
     log("(Couldn't launch a browser — open the URL above manually.)");
   }
   return 0;
+}
+
+/**
+ * Dispatch the chosen exposure path. Returns the exit code of the
+ * downstream chain. `none` is a no-op (success).
+ */
+async function runExposureChoice(
+  choice: ExposeChoice,
+  ctx: {
+    log: (line: string) => void;
+    exposeTailnetImpl: () => Promise<number>;
+    exposeCloudflareImpl: () => Promise<number>;
+  },
+): Promise<number> {
+  if (choice === "none") return 0;
+  if (choice === "tailnet") {
+    ctx.log("Setting up Tailscale Funnel…");
+    return await ctx.exposeTailnetImpl();
+  }
+  // cloudflare
+  ctx.log("Setting up Cloudflare Tunnel…");
+  return await ctx.exposeCloudflareImpl();
 }
