@@ -671,6 +671,49 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
       }
     });
 
+    // Realistic headless-runner shape: a bearer holding admin over MULTIPLE
+    // vaults composes rule 3 across them. Minting same-vault subsets of both
+    // succeeds; vault_scope collects every authorized vault name (order-
+    // insensitive). aud is first-wins (vault.work), which is fine — a
+    // multi-vault token only authenticates against its single aud, the pin is
+    // defense-in-depth.
+    test("multi-vault-admin bearer mints vault:work:read vault:other:read → 200, vault_scope=[work,other]", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await signAccessToken(db, {
+            sub: userId,
+            scopes: ["vault:work:admin", "vault:other:admin"],
+            audience: "vault.work",
+            clientId: "parachute-hub",
+            issuer: ISSUER,
+            ttlSeconds: 3600,
+            vaultScope: ["work", "other"],
+          });
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read vault:other:read" },
+              { authorization: `Bearer ${bearer.token}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.aud).toBe("vault.work");
+          const pin = validated.payload.vault_scope as string[];
+          expect(pin).toContain("work");
+          expect(pin).toContain("other");
+          expect(pin).toHaveLength(2);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
     // One blocked scope rejects the whole request (no partial mint).
     test("multi-scope vault:work:read vault:other:read → 400 (one blocked → all rejected)", async () => {
       const h = makeHarness();

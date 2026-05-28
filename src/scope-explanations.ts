@@ -174,31 +174,15 @@ export function isVaultAdminScope(scope: string): boolean {
 }
 
 /**
- * Extract the vault name from a `vault:<name>:admin` scope, or null if the
- * scope isn't a per-vault admin scope. Used to derive the `vault_scope`
- * pin when minting an operator-requested vault-admin token.
- */
-export function vaultAdminScopeName(scope: string): string | null {
-  if (!VAULT_ADMIN_RE.test(scope)) return null;
-  return scope.split(":")[1] ?? null;
-}
-
-/**
  * Extract the vault name from ANY per-vault scope (`vault:<name>:<verb>` for
  * verb ∈ {read, write, admin}), or null if the scope isn't per-vault-scoped.
- * Broader than `vaultAdminScopeName` (which is admin-only) — used by the
- * mint-token attenuation model to (a) match a `vault:<name>:admin` bearer
- * against same-vault requested scopes, and (b) derive the `vault_scope` pin
- * for every vault-scoped mint regardless of verb.
+ * Used by the mint-token attenuation model to (a) match a `vault:<name>:admin`
+ * bearer against same-vault requested scopes, and (b) derive the `vault_scope`
+ * pin for every vault-scoped mint regardless of verb.
  */
 export function vaultScopeName(scope: string): string | null {
   const m = VAULT_SCOPED_RE.exec(scope);
   return m ? (m[1] ?? null) : null;
-}
-
-/** True when `scope` is any per-vault scope `vault:<name>:<read|write|admin>`. */
-export function isVaultScopedScope(scope: string): boolean {
-  return VAULT_SCOPED_RE.test(scope);
 }
 
 /** True when the scope is non-requestable via the public OAuth flow. */

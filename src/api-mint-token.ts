@@ -312,9 +312,13 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     issuer: deps.issuer,
     ttlSeconds,
     // Operator-driven CLI/API mint — the bearer already cleared the
-    // attenuation guard. `vault_scope` is `[]` (no restriction) for pure
-    // host:auth verb mints, or the named vault(s) for vault-scoped mints
-    // authorized via rule 2 / rule 3 (see above).
+    // attenuation guard. `vault_scope` is `[]` (no restriction) for any
+    // verb scope granted by rule 1, or the named vault(s) for vault-scoped
+    // mints authorized via rule 2 / rule 3 (see above). The pin tracks the
+    // grant rule, not the bearer: a host:admin bearer minting
+    // `vault:work:write` goes through rule 1 (write is requestable), so it
+    // ALSO gets `vault_scope:[]` — only its `vault:work:admin` mints (rule 2)
+    // are pinned.
     vaultScope: vaultScopePin,
     ...(permissionsClaim !== undefined ? { extraClaims: { permissions: permissionsClaim } } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
