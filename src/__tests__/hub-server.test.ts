@@ -17,6 +17,7 @@ import { clearNotesRedirectLogState } from "../notes-redirect.ts";
 import { pidPath } from "../process-state.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
+import type { ModuleState, Supervisor } from "../supervisor.ts";
 import { createUser } from "../users.ts";
 
 interface Harness {
@@ -40,6 +41,33 @@ function req(path: string, init?: RequestInit): Request {
 
 function mkdirIfMissing(dir: string): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+}
+
+/**
+ * Minimal stub of the Supervisor surface that proxyRequest's classifier
+ * reads from. We don't drive real Bun.spawn — just hand back hand-crafted
+ * ModuleState values so the test can pin "vault is starting" / "vault has
+ * been running for a minute" exactly. See `supervisor.test.ts` for the
+ * real lifecycle tests.
+ */
+function stubSupervisor(states: ModuleState[]): Supervisor {
+  return {
+    list: () => states,
+    get: (short: string) => states.find((s) => s.short === short),
+    start: async () => {
+      throw new Error("not implemented");
+    },
+    stop: async () => undefined,
+    restart: async () => undefined,
+  } as unknown as Supervisor;
+}
+
+function moduleState(partial: Partial<ModuleState> & { short: string }): ModuleState {
+  return {
+    status: "running",
+    restartsInWindow: 0,
+    ...partial,
+  };
 }
 
 function vaultEntry(name: string): ServiceEntry {
@@ -1912,10 +1940,12 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
     }
   });
 
-  test("returns 502 when the matching vault upstream is unreachable", async () => {
+  test("returns 502 with persistent-state JSON when the matching vault upstream is unreachable", async () => {
     // Vault is in services.json but the port has nothing listening — vault
     // crashed, port shifted, or the user is mid-restart. We owe the caller a
-    // useful error instead of a hang or a silent 404.
+    // useful error instead of a hang or a silent 404. No supervisor +
+    // no pidfile → classifier returns "persistent" → 502 + admin_url
+    // (hub#444 boot-readiness gating).
     const h = makeHarness();
     try {
       writeManifest(
@@ -1934,10 +1964,261 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
         h.manifestPath,
       );
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/vault/default/health"));
+      const res = await fetcher(
+        req("/vault/default/health", { headers: { accept: "application/json" } }),
+      );
       expect(res.status).toBe(502);
-      const body = (await res.json()) as { error: string };
-      expect(body.error).toContain("vault upstream unreachable");
+      const body = (await res.json()) as {
+        error: string;
+        error_type: string;
+        admin_url?: string;
+        service: string;
+      };
+      expect(body.error_type).toBe("upstream_unreachable");
+      expect(body.error).toBe("upstream_unreachable");
+      expect(body.admin_url).toBe("/admin/modules");
+      expect(body.service).toBe("vault");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("transient state (supervisor reports starting) → 503 + Retry-After when fetch fails", async () => {
+    // Supervisor says vault is `starting` — the loopback port hasn't bound
+    // yet, fetch fails with ECONNREFUSED. Classifier returns "transient",
+    // proxy responds 503 with a Retry-After hint instead of 502.
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: await pickClosedPort(),
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const supervisor = stubSupervisor([moduleState({ short: "vault", status: "starting" })]);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath, supervisor });
+      const res = await fetcher(
+        req("/vault/default/health", { headers: { accept: "application/json" } }),
+      );
+      expect(res.status).toBe(503);
+      expect(res.headers.get("retry-after")).toBe("2");
+      const body = (await res.json()) as {
+        error_type: string;
+        retry_after_ms: number;
+        attempts_remaining: number;
+        admin_url?: string;
+      };
+      expect(body.error_type).toBe("upstream_starting");
+      expect(body.retry_after_ms).toBe(2000);
+      expect(body.attempts_remaining).toBe(5);
+      // Transient JSON MUST NOT carry an admin link.
+      expect(body.admin_url).toBeUndefined();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("transient state + Accept: text/html → 503 HTML page with auto-refresh + poll, no admin link", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: await pickClosedPort(),
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const supervisor = stubSupervisor([moduleState({ short: "vault", status: "starting" })]);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath, supervisor });
+      const res = await fetcher(req("/vault/default/health", { headers: { accept: "text/html" } }));
+      expect(res.status).toBe(503);
+      expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      const text = await res.text();
+      expect(text).toContain(`<meta http-equiv="refresh"`);
+      expect(text).toContain("/api/ready");
+      expect(text).toContain("Just a moment");
+      // Aaron design (d): transient page has no admin link.
+      expect(text).not.toContain("/admin/modules");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("persistent state + Accept: text/html → 502 HTML page with admin link, no auto-refresh", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: await pickClosedPort(),
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const supervisor = stubSupervisor([moduleState({ short: "vault", status: "crashed" })]);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath, supervisor });
+      const res = await fetcher(req("/vault/default/health", { headers: { accept: "text/html" } }));
+      expect(res.status).toBe(502);
+      expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(res.headers.get("retry-after")).toBeNull();
+      const text = await res.text();
+      expect(text).toContain("Module unreachable");
+      expect(text).toContain("/admin/modules");
+      expect(text).not.toContain(`http-equiv="refresh"`);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("supervisor running-but-fresh-startedAt → transient classification", async () => {
+    // Supervisor says vault is running, but startedAt is recent enough that
+    // we trust the boot-window heuristic over the failed fetch.
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: await pickClosedPort(),
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const supervisor = stubSupervisor([
+        moduleState({
+          short: "vault",
+          status: "running",
+          startedAt: new Date(Date.now() - 5_000).toISOString(),
+        }),
+      ]);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath, supervisor });
+      const res = await fetcher(
+        req("/vault/default/health", { headers: { accept: "application/json" } }),
+      );
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { error_type: string };
+      expect(body.error_type).toBe("upstream_starting");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("supervisor running-but-old-startedAt → persistent (boot window expired)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: await pickClosedPort(),
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const supervisor = stubSupervisor([
+        moduleState({
+          short: "vault",
+          status: "running",
+          startedAt: new Date(Date.now() - 120_000).toISOString(),
+        }),
+      ]);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath, supervisor });
+      const res = await fetcher(
+        req("/vault/default/health", { headers: { accept: "application/json" } }),
+      );
+      expect(res.status).toBe(502);
+      const body = (await res.json()) as { error_type: string };
+      expect(body.error_type).toBe("upstream_unreachable");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("non-vault upstream (scribe) classified through supervisor when starting", async () => {
+    // Same logic as vault, but exercising the generic /<svc>/* dispatch path.
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "scribe",
+              port: await pickClosedPort(),
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const supervisor = stubSupervisor([moduleState({ short: "scribe", status: "starting" })]);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath, supervisor });
+      const res = await fetcher(req("/scribe/health", { headers: { accept: "application/json" } }));
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { error_type: string; service: string };
+      expect(body.error_type).toBe("upstream_starting");
+      expect(body.service).toBe("scribe");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/api/ready returns supervisor view + is reachable pre-admin", async () => {
+    // hub#444 endpoint is public + pre-admin (it has to be — the page that
+    // polls it is itself served pre-auth when modules are still booting).
+    const h = makeHarness();
+    try {
+      const supervisor = stubSupervisor([
+        moduleState({ short: "vault", status: "starting" }),
+        moduleState({
+          short: "scribe",
+          status: "running",
+          startedAt: new Date(Date.now() - 60_000).toISOString(),
+        }),
+      ]);
+      const fetcher = hubFetch(h.dir, { supervisor });
+      const res = await fetcher(req("/api/ready"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        ready: boolean;
+        ready_modules: string[];
+        transient_modules: string[];
+      };
+      expect(body.ready).toBe(false);
+      expect(body.transient_modules).toEqual(["vault"]);
+      expect(body.ready_modules).toEqual(["scribe"]);
     } finally {
       h.cleanup();
     }
@@ -2562,9 +2843,10 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
     }
   });
 
-  test("returns 502 when the matching upstream is unreachable", async () => {
+  test("returns 502 with persistent-state JSON when the matching upstream is unreachable", async () => {
     // Service is in services.json but the port has nothing listening — same
-    // shape as the vault-unreachable test, label is the entry's `name`.
+    // shape as the vault-unreachable test (hub#444 boot-readiness gating).
+    // No supervisor + no pidfile → persistent → 502 with admin_url.
     const h = makeHarness();
     try {
       writeManifest(
@@ -2582,10 +2864,17 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
         h.manifestPath,
       );
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/scribe/health"));
+      const res = await fetcher(req("/scribe/health", { headers: { accept: "application/json" } }));
       expect(res.status).toBe(502);
-      const body = (await res.json()) as { error: string };
-      expect(body.error).toContain("scribe upstream unreachable");
+      const body = (await res.json()) as {
+        error: string;
+        error_type: string;
+        admin_url?: string;
+        service: string;
+      };
+      expect(body.error_type).toBe("upstream_unreachable");
+      expect(body.admin_url).toBe("/admin/modules");
+      expect(body.service).toBe("scribe");
     } finally {
       h.cleanup();
     }
