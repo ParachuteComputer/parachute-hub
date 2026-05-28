@@ -36,6 +36,7 @@ import {
   handleSetupGet,
   handleSetupInstallPost,
   handleSetupVaultPost,
+  postVaultImportImpl,
 } from "../setup-wizard.ts";
 import { Supervisor } from "../supervisor.ts";
 import { createUser, getUserByUsername, userCount } from "../users.ts";
@@ -3713,5 +3714,49 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
     } finally {
       db.close();
     }
+  });
+
+  // hub#168 fold (PR #447 reviewer): the import POST to vault MUST carry
+  // a Bearer — vault's `authenticateVaultRequest` rejects 401 before
+  // scope check on missing auth. Asserts the header is present, names
+  // the vault, and the body shape is intact.
+  test("postVaultImportImpl sends Authorization: Bearer + correct body to vault", async () => {
+    let capturedUrl: string | undefined;
+    let capturedHeaders: Headers | undefined;
+    let capturedBody: unknown;
+    const stubFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      capturedUrl = typeof input === "string" ? input : input.toString();
+      capturedHeaders = new Headers(init?.headers ?? {});
+      capturedBody = JSON.parse((init?.body as string) ?? "{}");
+      return new Response(
+        JSON.stringify({
+          notes_imported: 7,
+          tags_imported: 2,
+          attachments_imported: 0,
+          warnings: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const result = await postVaultImportImpl({
+      vaultName: "imported",
+      vaultPort: 1940,
+      bearerToken: "stub-jwt-abc",
+      remoteUrl: "https://github.com/owner/repo.git",
+      mode: "merge",
+      pat: "ghp_stub",
+      fetcher: stubFetch,
+    });
+
+    expect(result.notes_imported).toBe(7);
+    expect(capturedUrl).toBe("http://127.0.0.1:1940/vault/imported/.parachute/mirror/import");
+    expect(capturedHeaders?.get("authorization")).toBe("Bearer stub-jwt-abc");
+    expect(capturedHeaders?.get("content-type")).toBe("application/json");
+    expect(capturedBody).toEqual({
+      remote_url: "https://github.com/owner/repo.git",
+      mode: "merge",
+      credentials: { kind: "pat", token: "ghp_stub" },
+    });
   });
 });

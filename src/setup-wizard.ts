@@ -64,6 +64,7 @@ import {
   openFirstClientAutoApproveWindow,
   setSetting,
 } from "./hub-settings.ts";
+import { signAccessToken } from "./jwt-sign.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 import { mintOperatorToken } from "./operator-token.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
@@ -663,7 +664,7 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
             <span class="field-label">Personal access token (optional)</span>
             <input type="password" name="pat" autocomplete="off"
               placeholder="ghp_… / glpat-… / etc." />
-            <span class="field-hint">Required for private repos. Stored in vault's mirror credentials for the import only; not persisted unless you visit the mirror config later.</span>
+            <span class="field-hint">Required for private repos. Used in-memory for this import only — not stored. Set up push credentials later from the vault's mirror settings.</span>
           </label>
           <label class="vault-mode-option">
             <input type="radio" name="import_mode" value="merge" checked />
@@ -1979,6 +1980,13 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
     return redirect("/admin/setup");
   }
 
+  // Operator picked create or import — if they previously skipped (in
+  // another tab / via back button), the skip flag would still claim
+  // "vault step done" even after the vault row appears. Clear it
+  // defensively so `deriveWizardState` consults the real vault entry
+  // going forward.
+  deleteSetting(deps.db, "setup_vault_skipped");
+
   // Create / import paths need the supervisor — they spawn vault and
   // (for import) call vault's mirror endpoint. The CLI hub surface
   // doesn't wire a supervisor; operators are expected to use
@@ -2032,8 +2040,8 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
   // + replace flag up front so a malformed input fails fast before we
   // spawn the vault. The actual import POST to vault's
   // `/vault/<name>/.parachute/mirror/import` happens AFTER vault has
-  // come up under the supervisor; we stash the import params in a
-  // db setting so the post-spawn callback can re-read them.
+  // come up under the supervisor; the params are captured by closure
+  // into the post-install `.then()` (see `importToRun` below).
   let importParams: { remoteUrl: string; pat?: string; mode: "merge" | "replace" } | undefined;
   if (rawMode === "import") {
     const remoteUrl = String(form.get("remote_url") ?? "").trim();
@@ -2143,6 +2151,7 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
     // marked failed so the caller surfaces a usable message.
     const importToRun = importParams;
     const vaultIssuer = deps.issuer;
+    const importerUserId = session.userId;
     const vaultPort = vaultSpec.seedEntry?.().port ?? 1940;
     void runInstall(op.id, FIRST_VAULT_SHORT, vaultSpec, {
       db: deps.db,
@@ -2167,10 +2176,25 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
           `vault up — starting import from ${importToRun.remoteUrl} (mode=${importToRun.mode})`,
         );
         try {
-          const result = await postVaultImport({
+          // Mint a short-lived per-vault admin Bearer for the import POST.
+          // Vault validates audience `vault.<name>` + scope `vault:<name>:admin`
+          // (see admin-vault-admin-token.ts for the canonical shape — same
+          // contract the SPA Manage link uses). The TTL covers retries +
+          // clone time on a slow remote; the JWT is single-use (we don't
+          // persist or reuse the jti).
+          const minted = await signAccessToken(deps.db, {
+            sub: importerUserId,
+            scopes: [`vault:${vaultName}:admin`],
+            audience: `vault.${vaultName}`,
+            clientId: "parachute-hub-setup-wizard",
+            issuer: vaultIssuer,
+            ttlSeconds: 5 * 60,
+            vaultScope: [vaultName],
+          });
+          const result = await postVaultImportImpl({
             vaultName,
             vaultPort,
-            issuer: vaultIssuer,
+            bearerToken: minted.token,
             remoteUrl: importToRun.remoteUrl,
             mode: importToRun.mode,
             ...(importToRun.pat ? { pat: importToRun.pat } : {}),
@@ -2280,33 +2304,38 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
 
 /**
  * POST the wizard-collected import params to vault's
- * `/vault/<name>/.parachute/mirror/import` endpoint. Mints a one-shot
- * operator token via the hub's own minting helper so vault accepts the
- * call (the endpoint is gated by `vault:<name>:admin` upstream in vault's
- * routing). Returns vault's structured response or throws with a usable
- * message.
+ * `/vault/<name>/.parachute/mirror/import` endpoint. The caller mints
+ * the per-vault admin Bearer (see `signAccessToken` use in the
+ * `runInstall().then(...)` block above) and passes it in; vault gates
+ * the endpoint on `vault:<name>:admin` upstream. Returns vault's
+ * structured response or throws with a usable message.
  *
  * Lives in setup-wizard.ts (not as a vault-internal helper) because
  * vault doesn't import hub-internal code; the import POST is naturally
  * the wizard's job — it's the only caller until vault ships its own
- * admin SPA flow. shape mirrors vault#390's contract:
+ * admin SPA flow. Shape mirrors vault#390's contract:
  *   POST /vault/<name>/.parachute/mirror/import
  *   { remote_url, mode: "merge"|"replace", credentials: {kind, token}|null }
  *   200 { notes_imported, tags_imported, attachments_imported, warnings }
+ *
+ * Exported (with the `Impl` suffix) so tests can inject a stub fetcher
+ * and assert the Authorization header without standing up a real vault.
  */
-async function postVaultImport(args: {
+export async function postVaultImportImpl(args: {
   vaultName: string;
   vaultPort: number;
-  issuer: string;
+  bearerToken: string;
   remoteUrl: string;
   mode: "merge" | "replace";
   pat?: string;
+  fetcher?: typeof fetch;
 }): Promise<{
   notes_imported?: number;
   tags_imported?: number;
   attachments_imported?: number;
   warnings?: readonly string[];
 }> {
+  const fetcher = args.fetcher ?? fetch;
   // Vault listens on its supervised port — talk directly to 127.0.0.1
   // rather than going through hub's path-routing proxy. Cuts one
   // network hop and avoids the operator-session/CSRF dance.
@@ -2326,13 +2355,21 @@ async function postVaultImport(args: {
   let lastErr: Error | undefined;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const res = await fetch(url, {
+      const res = await fetcher(url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          // Vault's `authenticateVaultRequest` rejects 401 before scope
+          // check when no Bearer is present. The token must carry
+          // `vault:<name>:admin` + audience `vault.<name>` — minted at
+          // the call site via `signAccessToken` so this function stays
+          // pure (no db / userId capture).
+          authorization: `Bearer ${args.bearerToken}`,
+        },
         body: JSON.stringify(body),
       });
       if (res.status === 200) {
-        return (await res.json()) as Awaited<ReturnType<typeof postVaultImport>>;
+        return (await res.json()) as Awaited<ReturnType<typeof postVaultImportImpl>>;
       }
       // Vault returns structured JSON errors per mirror-routes.ts:
       // 400 (validation), 409 (concurrent), 502 (clone failed), 500.
