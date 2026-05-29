@@ -2,8 +2,6 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "../config.ts";
 
-export const CLOUDFLARED_DIR = join(CONFIG_DIR, "cloudflared");
-
 export const DEFAULT_TUNNEL_NAME = "parachute";
 
 /**
@@ -16,12 +14,20 @@ export const DEFAULT_TUNNEL_NAME = "parachute";
  * location change from pre-#32 (`~/.parachute/cloudflared/config.yml`).
  * Re-running `parachute expose public --cloudflare` regenerates the file
  * at the new path; the legacy file is left in place but unused.
+ *
+ * `configDir` overrides the base (`~/.parachute` by default). Tests pass a
+ * tmp dir so per-tunnel-derived paths never resolve against the operator's
+ * real `CONFIG_DIR` — otherwise running the suite scribbles fixture
+ * config.yml + log files into `~/.parachute/cloudflared/<name>/`.
  */
-export function cloudflaredPathsFor(tunnelName: string): {
+export function cloudflaredPathsFor(
+  tunnelName: string,
+  configDir: string = CONFIG_DIR,
+): {
   configPath: string;
   logPath: string;
 } {
-  const dir = join(CLOUDFLARED_DIR, tunnelName);
+  const dir = join(configDir, "cloudflared", tunnelName);
   return {
     configPath: join(dir, "config.yml"),
     logPath: join(dir, "cloudflared.log"),
