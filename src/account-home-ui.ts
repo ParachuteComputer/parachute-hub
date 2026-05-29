@@ -109,6 +109,12 @@ export interface RenderAccountHomeOpts {
    * to keep a cross-origin form from logging the user out.
    */
   csrfToken: string;
+  /**
+   * Whether the signed-in user has TOTP 2FA enrolled (hub#473). Drives the
+   * Account card's 2FA status line + enroll/manage link. The link points at
+   * `/account/2fa` either way — "Set up" when off, "Manage" when on.
+   */
+  twoFactorEnabled: boolean;
 }
 
 export function renderAccountHome(opts: RenderAccountHomeOpts): string {
@@ -127,6 +133,7 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
   const accountCard = renderAccountCard({
     username: safeUsername,
     csrfToken,
+    twoFactorEnabled: opts.twoFactorEnabled,
   });
 
   const body = `
@@ -263,19 +270,31 @@ function renderVaultCard(opts: VaultCardOpts): string {
 interface AccountCardOpts {
   username: string;
   csrfToken: string;
+  twoFactorEnabled: boolean;
 }
 
 function renderAccountCard(opts: AccountCardOpts): string {
-  const { username, csrfToken } = opts;
+  const { username, csrfToken, twoFactorEnabled } = opts;
+  const twoFactorStatus = twoFactorEnabled
+    ? `<dd><span class="badge badge-on" data-testid="2fa-status">On</span></dd>`
+    : `<dd><span class="badge badge-off" data-testid="2fa-status">Off</span></dd>`;
+  const twoFactorLink = twoFactorEnabled
+    ? `<a class="account-action" href="/account/2fa" data-testid="manage-2fa-link">Manage two-factor →</a>`
+    : `<a class="account-action" href="/account/2fa" data-testid="setup-2fa-link">Set up two-factor →</a>`;
   return `
     <section class="section" data-testid="account-card">
       <h2>Account</h2>
       <dl class="kv">
         <dt>Username</dt>
         <dd><code>${username}</code></dd>
+        <dt>Two-factor authentication</dt>
+        ${twoFactorStatus}
       </dl>
       <p>
         <a class="account-action" href="/account/change-password" data-testid="change-password-link">Change password →</a>
+      </p>
+      <p>
+        ${twoFactorLink}
       </p>
       <form method="POST" action="/logout" class="signout-form" data-testid="signout-form">
         ${renderCsrfHiddenInput(csrfToken)}
@@ -483,6 +502,17 @@ const STYLES = `
     margin-top: 0.4rem;
   }
   .kv dd { margin: 0.15rem 0 0.4rem; }
+
+  .badge {
+    display: inline-block;
+    font-size: 0.78rem;
+    font-weight: 500;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid transparent;
+  }
+  .badge-on { background: ${PALETTE.successSoft}; color: ${PALETTE.success}; border-color: ${PALETTE.success}; }
+  .badge-off { background: ${PALETTE.bgSoft}; color: ${PALETTE.fgMuted}; border-color: ${PALETTE.border}; }
 
   .btn {
     font: inherit;
