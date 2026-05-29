@@ -22,11 +22,22 @@ vi.mock("../lib/api.ts", async (orig) => {
     deleteUser: vi.fn(),
     resetUserPassword: vi.fn(),
     updateUserVaults: vi.fn(),
+    getHubOriginSetting: vi.fn(),
   };
 });
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The Users load effect fetches the hub origin (for the sign-in
+  // handoff URL on the create / reset banners) alongside listUsers +
+  // listUserVaults. Default to a representative resolved issuer so every
+  // existing test loads cleanly; tests that assert the URL override the
+  // resolved_issuer value explicitly.
+  vi.mocked(api.getHubOriginSetting).mockResolvedValue({
+    hub_origin: "https://hub.example.com",
+    resolved_issuer: "https://hub.example.com",
+    source: "settings",
+  });
 });
 
 afterEach(() => {
@@ -480,5 +491,97 @@ describe("Users — multi-vault membership (Phase 2 PR 2)", () => {
     fireEvent.click(within(form).getByRole("button", { name: /cancel/i }));
     await waitFor(() => expect(screen.queryByLabelText(/vault assignments for alice/i)).toBeNull());
     expect(api.updateUserVaults).not.toHaveBeenCalled();
+  });
+});
+
+describe("Users — sign-in handoff URL (onboarding discoverability)", () => {
+  it("create-user success banner surfaces <hub-origin>/login with the username", async () => {
+    const listMock = vi.mocked(api.listUsers);
+    listMock.mockResolvedValueOnce([user("operator")]);
+    listMock.mockResolvedValueOnce([
+      user("operator"),
+      user("alice", { password_changed: false, assigned_vaults: ["home"] }),
+    ]);
+    vi.mocked(api.listUserVaults).mockResolvedValue(["home"]);
+    vi.mocked(api.getHubOriginSetting).mockResolvedValue({
+      hub_origin: "https://hub.example.com",
+      resolved_issuer: "https://hub.example.com",
+      source: "settings",
+    });
+    vi.mocked(api.createUser).mockResolvedValue(
+      user("alice", { password_changed: false, assigned_vaults: ["home"] }),
+    );
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/^password/i), {
+      target: { value: "alice-strong-passphrase" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^create user$/i }));
+    // Scope to the success banner (<output>) so the assertion doesn't
+    // accidentally match the page-level intro prose, which also mentions
+    // the sign-in URL.
+    await waitFor(() =>
+      expect(screen.getByText(/prompted to change their password/i)).toBeInTheDocument(),
+    );
+    const banner = screen.getByText(/prompted to change their password/i).closest("output");
+    expect(banner).not.toBeNull();
+    // The concrete <hub-origin>/login URL + the username are both in the banner.
+    expect(within(banner!).getByText("https://hub.example.com/login")).toBeInTheDocument();
+    expect(banner?.textContent).toMatch(/send them to/i);
+    expect(banner?.textContent).toContain("alice");
+  });
+
+  it("reset-password success banner surfaces <hub-origin>/login with the username", async () => {
+    const listMock = vi.mocked(api.listUsers);
+    listMock.mockResolvedValueOnce([user("operator"), user("alice")]);
+    listMock.mockResolvedValueOnce([user("operator"), user("alice", { password_changed: false })]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    vi.mocked(api.getHubOriginSetting).mockResolvedValue({
+      hub_origin: null,
+      resolved_issuer: "https://my-hub.tailnet.ts.net",
+      source: "request",
+    });
+    vi.mocked(api.resetUserPassword).mockResolvedValue({ revocationLagSeconds: 60 });
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /reset password for alice/i }));
+    fireEvent.change(screen.getByLabelText(/new temporary password for alice/i), {
+      target: { value: "new-temp-passphrase" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /set new password/i }));
+    await waitFor(() => expect(screen.getByText(/password reset for/i)).toBeInTheDocument());
+    const banner = screen.getByText(/password reset for/i).closest("output");
+    expect(banner).not.toBeNull();
+    // resolved_issuer (request-origin precedence) drives the URL when no
+    // operator-set hub_origin is stored.
+    expect(within(banner!).getByText("https://my-hub.tailnet.ts.net/login")).toBeInTheDocument();
+    expect(banner?.textContent).toMatch(/send them to/i);
+    expect(banner?.textContent).toContain("alice");
+  });
+
+  it("trims a trailing slash from resolved_issuer before building the login URL", async () => {
+    const listMock = vi.mocked(api.listUsers);
+    listMock.mockResolvedValueOnce([user("operator")]);
+    listMock.mockResolvedValueOnce([user("operator"), user("alice", { password_changed: false })]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    vi.mocked(api.getHubOriginSetting).mockResolvedValue({
+      hub_origin: "https://hub.example.com/",
+      resolved_issuer: "https://hub.example.com/",
+      source: "settings",
+    });
+    vi.mocked(api.createUser).mockResolvedValue(user("alice", { password_changed: false }));
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/^password/i), {
+      target: { value: "alice-strong-passphrase" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^create user$/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/prompted to change their password/i)).toBeInTheDocument(),
+    );
+    const banner = screen.getByText(/prompted to change their password/i).closest("output");
+    // No double slash — the loader trims the trailing slash.
+    expect(within(banner!).getByText("https://hub.example.com/login")).toBeInTheDocument();
   });
 });

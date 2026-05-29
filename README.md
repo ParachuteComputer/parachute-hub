@@ -155,6 +155,29 @@ parachute expose tailnet  # HTTPS, MagicDNS, only your devices (the supported sh
 
 Tear down with `parachute expose tailnet off`. The public layer (`expose public off`) tears down independently — `off` only affects the layer you name. Public-internet exposure is exploratory (see "Public exposure" below).
 
+### Onboarding a team member
+
+Want to give a friend or teammate their own account on your hub? The flow is
+self-service end to end:
+
+1. **Create the user.** In the admin UI, open **Users → Create User**: pick a
+   username, set a temporary password, and (optionally) assign one or more
+   vaults. The success banner echoes the exact sign-in URL.
+2. **Hand them three things:** your hub's sign-in URL (`<hub-origin>/login`),
+   their username, and the temporary password you set.
+3. **They sign in and set their own password.** On first sign-in they're
+   prompted to change it — they can't reach the rest of the hub until they do.
+4. **Later changes are self-service.** A signed-in user changes their password
+   anytime from their account home at `/account/` (reachable via the **Account**
+   link in the top-right once signed in).
+5. **You can reset it for them.** If they're locked out, the **Reset password**
+   button on the Users row sets a new temporary password and re-arms the
+   force-change-on-next-sign-in prompt.
+
+The first admin (the wizard / env-seeded account) is unrestricted and can't be
+deleted or reset from the Users page — it changes its own password at
+`/account/change-password` directly.
+
 ## Service lifecycle
 
 `parachute start`, `stop`, `restart`, and `logs` manage services as background processes — no launchd, no manual `bun serve`, no hunting for PIDs.

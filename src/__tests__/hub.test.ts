@@ -189,6 +189,17 @@ describe("renderHub — signed-in indicator (rc.13)", () => {
     expect(html).not.toContain('href="/login?next=/"');
   });
 
+  test("signed-in indicator carries an Account breadcrumb to /account/", () => {
+    // Onboarding discoverability: a signed-in friend needs a single link
+    // to the self-service /account/ home (change password, their vault).
+    // Applies to admins too — harmless for them.
+    const html = renderHub({
+      session: { displayName: "aaron", csrfToken: "csrf-token-xyz" },
+    });
+    expect(html).toContain('href="/account/"');
+    expect(html).toContain("Account");
+  });
+
   test("displayName with HTML special chars is escaped", () => {
     // Username field allows alphanumerics historically, but the
     // displayName field on the wire is forward-compatible with profile

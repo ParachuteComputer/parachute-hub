@@ -51,6 +51,7 @@ import {
   type UserListing,
   createUser,
   deleteUser,
+  getHubOriginSetting,
   listUserVaults,
   listUsers,
   resetUserPassword,
@@ -77,6 +78,15 @@ const USERNAME_MAX_LEN = 32;
 interface UsersData {
   users: UserListing[];
   vaults: string[];
+  /**
+   * Canonical hub origin (`resolved_issuer` from
+   * `GET /api/settings/hub-origin`) — the same value the OAuth issuer
+   * stamps into JWTs and the MCP-connect card / Settings page surface.
+   * Used to build the concrete `<hub-origin>/login` URL the operator
+   * hands a newly-created or password-reset user, so onboarding doesn't
+   * stall on "where does the friend sign in?". Trailing slash trimmed.
+   */
+  hubOrigin: string;
 }
 
 type ListState =
@@ -134,6 +144,34 @@ type EditVaultsState =
   | { kind: "done"; userId: string; username: string }
   | { kind: "error"; userId: string; selected: string[]; message: string };
 
+/**
+ * The "where do they sign in?" handoff line, shared by the create-user
+ * and reset-password success banners. Surfaces the concrete
+ * `<hub-origin>/login` URL + the username so the operator can hand a
+ * newly-created or reset user everything they need in one place — the
+ * onboarding-discoverability gap this addresses was that the banners
+ * said "they'll be prompted to change on first sign-in" but never showed
+ * *where* to sign in. `hubOrigin` is already trailing-slash-trimmed by
+ * the loader.
+ */
+function SignInHandoff({
+  username,
+  hubOrigin,
+}: {
+  username: string;
+  hubOrigin: string;
+}): React.ReactNode {
+  // Defensive: if the origin somehow didn't resolve (empty string), fall
+  // back to a relative `/login` so the line still tells them where to go.
+  const loginUrl = `${hubOrigin || ""}/login`;
+  return (
+    <div className="muted" style={{ marginTop: "0.5rem", fontSize: "0.9em" }}>
+      Send them to <code>{loginUrl}</code> with username <code>{username}</code> and this password —
+      they'll be prompted to set a new one on first sign-in.
+    </div>
+  );
+}
+
 export function Users() {
   const [state, setState] = useState<ListState>({ kind: "loading" });
   const [reload, setReload] = useState(0);
@@ -148,10 +186,14 @@ export function Users() {
     void reload;
     let cancelled = false;
     setState({ kind: "loading" });
-    Promise.all([listUsers(), listUserVaults()])
-      .then(([users, vaults]) => {
+    Promise.all([listUsers(), listUserVaults(), getHubOriginSetting()])
+      .then(([users, vaults, hubOriginSetting]) => {
         if (cancelled) return;
-        setState({ kind: "ok", data: { users, vaults } });
+        // `resolved_issuer` is the precedence-aware hub origin (settings
+        // → env → request). Trim any trailing slash so the banner builds
+        // a clean `<origin>/login` regardless of how it was configured.
+        const hubOrigin = hubOriginSetting.resolved_issuer.replace(/\/+$/, "");
+        setState({ kind: "ok", data: { users, vaults, hubOrigin } });
       })
       .catch((err) => {
         if (cancelled) return;
@@ -290,7 +332,14 @@ export function Users() {
         narrows their tokens to <code>vault:&lt;assigned&gt;:*</code> scopes for any vault in their
         list. Users with no assignments can't authorize any vault yet — assign at least one above.
         The first admin is unrestricted (admin posture). Admin-created users land with a default
-        password and are prompted to change it on first sign-in.
+        password and are prompted to change it on first sign-in
+        {state.kind === "ok" ? (
+          <>
+            {" "}
+            at <code>{state.data.hubOrigin}/login</code>
+          </>
+        ) : null}
+        .
       </p>
 
       {renderListSection(
@@ -305,6 +354,7 @@ export function Users() {
         setEditVaultsSt,
         onSubmitEditVaults,
         state.kind === "ok" ? state.data.vaults : [],
+        state.kind === "ok" ? state.data.hubOrigin : "",
         () => setReload((n) => n + 1),
       )}
 
@@ -315,6 +365,7 @@ export function Users() {
           form={form}
           setForm={setForm}
           vaults={state.data.vaults}
+          hubOrigin={state.data.hubOrigin}
           createState={createState}
           setCreateState={setCreateState}
           onSubmit={onSubmitCreate}
@@ -336,6 +387,7 @@ function renderListSection(
   setEditVaultsSt: (s: EditVaultsState) => void,
   onSubmitEditVaults: (user: UserListing, selected: string[]) => Promise<void>,
   availableVaults: string[],
+  hubOrigin: string,
   onRetry: () => void,
 ): React.ReactNode {
   if (state.kind === "loading") {
@@ -382,6 +434,7 @@ function renderListSection(
       setEditVaultsSt={setEditVaultsSt}
       onSubmitEditVaults={onSubmitEditVaults}
       availableVaults={availableVaults}
+      hubOrigin={hubOrigin}
     />
   );
 }
@@ -399,6 +452,8 @@ interface ListRenderedProps {
   setEditVaultsSt: (s: EditVaultsState) => void;
   onSubmitEditVaults: (user: UserListing, selected: string[]) => Promise<void>;
   availableVaults: string[];
+  /** Canonical hub origin for the reset-password sign-in handoff line. */
+  hubOrigin: string;
 }
 
 function ListRendered({
@@ -414,6 +469,7 @@ function ListRendered({
   setEditVaultsSt,
   onSubmitEditVaults,
   availableVaults,
+  hubOrigin,
 }: ListRenderedProps): React.ReactNode {
   return (
     <div className="user-list" style={{ marginTop: "1rem" }}>
@@ -668,13 +724,13 @@ function ListRendered({
                       >
                         Password reset for <code>{resetDone.username}</code>. Hand them the new
                         password and tell them they'll be prompted to change it on first sign-in.
+                        <SignInHandoff username={resetDone.username} hubOrigin={hubOrigin} />
                         <div className="muted" style={{ marginTop: "0.5rem", fontSize: "0.85em" }}>
                           Their existing tokens are revoked. Resource servers (vault, scribe, etc.)
                           cache the revocation list for up to {resetDone.revocationLagSeconds}{" "}
-                          seconds — if you're resetting
-                          because of a suspected compromise, also restart the affected services
-                          (e.g. <code>parachute restart vault</code>) to flush their cache
-                          immediately.
+                          seconds — if you're resetting because of a suspected compromise, also
+                          restart the affected services (e.g. <code>parachute restart vault</code>)
+                          to flush their cache immediately.
                         </div>
                         <div style={{ marginTop: "0.5rem" }}>
                           <button
@@ -908,6 +964,8 @@ interface CreateUserSectionProps {
   form: FormFields;
   setForm: (f: FormFields) => void;
   vaults: string[];
+  /** Canonical hub origin for the create-user sign-in handoff line. */
+  hubOrigin: string;
   createState: CreateState;
   setCreateState: (s: CreateState) => void;
   onSubmit: (e: FormEvent) => Promise<void>;
@@ -919,6 +977,7 @@ function CreateUserSection({
   form,
   setForm,
   vaults,
+  hubOrigin,
   createState,
   setCreateState,
   onSubmit,
@@ -1028,6 +1087,7 @@ function CreateUserSection({
             <output className="success-banner">
               User <code>{createState.username}</code> created. They'll be prompted to change their
               password on first sign-in.
+              <SignInHandoff username={createState.username} hubOrigin={hubOrigin} />
             </output>
           )}
 
