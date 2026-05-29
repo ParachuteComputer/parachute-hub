@@ -19,16 +19,17 @@
  *
  *   - no owner password: loud warning — the exposure is wide open. Offer to
  *     set a password, and point at the hub-JWT mint path for clients.
- *   - password set: one-line "looks good" + an honest note that hub-login 2FA
- *     isn't shipped yet (#473), so the owner password is the wall.
+ *   - password set, no 2FA: one-line "looks good" + offer to enroll hub-login
+ *     TOTP (real as of hub#473) since the box is now public.
+ *   - password + 2FA set: one-line "looks good, 2FA on."
  *
- * We no longer offer "enable 2FA": `parachute auth 2fa enroll` forwarded to the
- * deprecated vault stub, which post auth-unification exits 1 and (on the old
- * happy path) only wrote vault YAML that never gated hub `/login`. Offering it
- * was a dead path. Real hub-login TOTP is tracked at #473.
+ * `parachute auth 2fa enroll` is the real hub-login TOTP path now (hub#473) —
+ * it gates `/login` for real, so the preflight offers it when the operator has
+ * a password but no second factor.
  *
  * Defaults are always "skip" — Enter declines every prompt. User can always
- * run `parachute auth set-password` / `parachute auth mint-token …` later.
+ * run `parachute auth set-password` / `parachute auth 2fa enroll` /
+ * `parachute auth mint-token …` later.
  */
 
 import { createInterface } from "node:readline/promises";
@@ -114,14 +115,25 @@ async function offerOwnerPassword(r: Resolved): Promise<void> {
 }
 
 /**
- * Honest note that hub-login 2FA isn't shipped yet. Replaces the old
- * `offerTotp` (which ran the dead `parachute auth 2fa enroll` path). No prompt —
- * there's nothing actionable to offer until #473 lands.
+ * Offer to enroll hub-login TOTP 2FA (real as of hub#473). Interactive enroll
+ * needs to print a secret + prompt for a confirm code, so we run the real CLI
+ * command inheriting stdio. Declining is fine — the operator can run it later.
  */
-function note2faComing(r: Resolved): void {
+async function offerTotp(r: Resolved): Promise<void> {
   r.log("");
-  r.log("Note: 2FA at the hub login layer is coming (#473) but isn't shipped yet —");
-  r.log("for now the owner password is the wall, so keep it strong.");
+  r.log("Add two-factor authentication? It puts a one-time code (from your");
+  r.log("authenticator app) in front of /login on top of your password.");
+  if (await yesNo(r, "Set up two-factor authentication now?")) {
+    await runCmd(r, ["parachute", "auth", "2fa", "enroll"], "parachute auth 2fa enroll");
+  } else {
+    r.log("");
+    r.log("You can enroll later: `parachute auth 2fa enroll` (or /account/2fa in a browser).");
+  }
+}
+
+/** One-line confirmation that 2FA is already on. */
+function note2faOn(r: Resolved): void {
+  r.log("✓  Two-factor authentication is on.");
 }
 
 /**
@@ -168,33 +180,41 @@ async function handleWideOpen(r: Resolved): Promise<void> {
   // Programmatic-client guidance is informational (no auto-mint) — print it
   // so the operator knows the headless path exists, not the dead pvt_* one.
   printTokenGuidance(r);
-  // Honest 2FA state — coming (#473), not yet shippable.
-  note2faComing(r);
+  // Offer real hub-login 2FA (hub#473) — the box is public now.
+  await offerTotp(r);
   printDivider(r);
 }
 
 /**
- * `password set`: the operator did the obvious thing. One-line confirmation
- * plus the honest 2FA note. (We don't assert on tokens — a hub JWT is minted
- * on demand, not a standing prerequisite.)
+ * `password set, no 2FA`: the operator has a password but no second factor.
+ * One-line confirmation, then offer to enroll TOTP since the box is public.
  */
-function handlePasswordSet(r: Resolved): void {
+async function handlePasswordSetNo2fa(r: Resolved): Promise<void> {
   r.log("");
   r.log("✓  Owner password is set.");
-  note2faComing(r);
+  await offerTotp(r);
+}
+
+/**
+ * `password + 2FA set`: the operator did everything. Two-line confirmation.
+ */
+function handleFullyConfigured(r: Resolved): void {
+  r.log("");
+  r.log("✓  Owner password is set.");
+  note2faOn(r);
 }
 
 /**
  * Pick the branch. Pure function of the status — keeps test coverage trivial.
  *
  * Owner-password-centric since the pvt_* DROP (hub#466): `tokenCount` is no
- * longer consulted — those rows are vestigial and minting access now flows
- * through the owner password, not a standing vault token. 2FA isn't a branch
- * anymore (hub-login TOTP not shipped — #473): two states.
+ * longer consulted. Real hub-login 2FA (hub#473) re-introduces the 2FA branch:
+ * three states — wide-open, password-but-no-2FA, fully-configured.
  */
-function classify(s: VaultAuthStatus): "wide-open" | "password-set" {
+function classify(s: VaultAuthStatus): "wide-open" | "password-no-2fa" | "fully-configured" {
   if (!s.hasOwnerPassword) return "wide-open";
-  return "password-set";
+  if (!s.hasTotp) return "password-no-2fa";
+  return "fully-configured";
 }
 
 export async function runAuthPreflight(opts: AuthPreflightOpts = {}): Promise<void> {
@@ -203,8 +223,11 @@ export async function runAuthPreflight(opts: AuthPreflightOpts = {}): Promise<vo
     case "wide-open":
       await handleWideOpen(r);
       return;
-    case "password-set":
-      handlePasswordSet(r);
+    case "password-no-2fa":
+      await handlePasswordSetNo2fa(r);
+      return;
+    case "fully-configured":
+      handleFullyConfigured(r);
       return;
   }
 }

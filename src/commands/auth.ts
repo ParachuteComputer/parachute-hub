@@ -15,9 +15,12 @@
  * Vault-forwarded subcommands (still implemented in `parachute-vault`):
  *   - (none currently). `2fa` used to forward here, but the legacy
  *     `parachute-vault 2fa` stub writes vault YAML that does NOT gate hub
- *     `/login` — and post auth-unification it requires a vault owner password
- *     that no longer exists, so it just exits 1. `parachute auth 2fa` is now an
- *     honest informational stub on the hub side (real feature: #473).
+ *     `/login`. As of hub#473 `parachute auth 2fa` is the REAL hub-login TOTP
+ *     surface: it reads/writes the hub.db `users` TOTP columns and gates
+ *     `/login`. Subcommands: `status`, `enroll` (CLI text enroll — prints the
+ *     otpauth:// URI + base32 secret for manual authenticator entry, then
+ *     prompts for the confirm code), `disenroll`. The browser path lives at
+ *     `<hub-origin>/account/2fa` (QR + backup codes).
  */
 
 import { join } from "node:path";
@@ -48,6 +51,13 @@ import {
 } from "../operator-token.ts";
 import { isNonRequestableScope } from "../scope-explanations.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
+import { generateTotpSecret, otpauthUrlFor, verifyTotpCode } from "../totp.ts";
+import {
+  clearEnrollment,
+  getTotpState,
+  isTotpEnrolled,
+  persistEnrollment,
+} from "../two-factor-store.ts";
 import {
   SingleUserModeError,
   UsernameTakenError,
@@ -97,8 +107,14 @@ Usage:
   parachute auth set-password [--username <name>] [--password <pw>] [--allow-multi]
                                        Create or update the hub user's password
   parachute auth list-users            Show registered hub accounts
-  parachute auth 2fa                   2FA status (hub-login TOTP not shipped
-                                       yet — tracked #473)
+  parachute auth 2fa [status]          Show hub-login 2FA (TOTP) status
+  parachute auth 2fa enroll [--username <name>]
+                                       Enroll TOTP for hub login (prints the
+                                       otpauth:// URI + base32 secret for manual
+                                       authenticator entry, then prompts for a
+                                       confirm code; prints backup codes once)
+  parachute auth 2fa disenroll [--username <name>]
+                                       Turn off hub-login 2FA for the account
   parachute auth rotate-key            Rotate the hub's JWT signing key
   parachute auth rotate-operator [--scope-set <set>]
                                        Mint a fresh ~/.parachute/operator.token
@@ -131,12 +147,20 @@ The default username on first run is "owner" — override with --username.
 Single-user mode is the default; pass --allow-multi to add additional
 accounts beyond the first.
 
-2fa is informational only for now: TOTP at the hub login layer isn't shipped
-yet (tracked #473). The legacy \`parachute-vault 2fa\` command writes vault YAML
-that does NOT gate hub \`/login\`, so it's intentionally no longer wired here —
-\`parachute auth 2fa\` prints the honest state and exits 0. Until hub-login TOTP
-ships, rely on a strong owner password (and don't expose \`/login\` if a
-guessable password is a concern).
+2fa is real hub-login TOTP (hub#473). It reads/writes the hub.db \`users\` TOTP
+columns and gates \`/login\`: once enrolled, signing in requires a 6-digit code
+from your authenticator app (or a single-use backup code) after your password.
+
+\`parachute auth 2fa enroll\` is headless-friendly — it prints the \`otpauth://\`
+URI and the base32 secret as text so you can type them into an authenticator
+manually (no QR scan needed on a server), then prompts for the current 6-digit
+code to confirm. On success it prints 10 single-use backup codes ONCE — save
+them. The browser path (\`<hub-origin>/account/2fa\`) shows a scannable QR code.
+
+\`parachute auth 2fa disenroll\` clears the TOTP secret + backup codes.
+
+In single-user mode both default to the only hub account; pass --username to
+target a specific account when more than one exists.
 
 rotate-key generates a fresh RSA-2048 keypair and retires the previous
 one. The retired key keeps appearing in /.well-known/jwks.json for 24
@@ -1130,26 +1154,112 @@ async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<
 }
 
 /**
- * Honest informational stub for `parachute auth 2fa [enroll|status|…]`.
+ * Real hub-login TOTP 2FA CLI (hub#473). `parachute auth 2fa [status|enroll|
+ * disenroll]`. Reads/writes the hub.db `users` TOTP columns — the same store
+ * the `/login` flow and `/account/2fa` browser surface use, so a CLI enroll
+ * gates the exposed hub login exactly like the browser one.
  *
- * 2FA at the hub login layer isn't implemented yet (#473). The old path
- * forwarded to the deprecated `parachute-vault 2fa` stub, which (a) post
- * auth-unification requires a vault owner password that no longer exists, so it
- * exits 1, and (b) even on success only writes vault YAML that does NOT gate
- * hub `/login`. Telling operators to run it was actively misleading — enrolling
- * did nothing for the exposed hub login. So we print the honest state and exit
- * 0 (informational, not a crash).
+ * Headless-first by design: `enroll` prints the `otpauth://` URI + base32
+ * secret as text so the operator can type them into an authenticator app
+ * manually (no QR scan on a server), then prompts for the current code to
+ * confirm before persisting. Browser enroll (QR) lives at
+ * `<hub-origin>/account/2fa`.
  */
-function run2faInfo(): number {
-  console.log("2FA for hub login isn't available yet (tracked: #473).");
-  console.log("");
-  console.log("The legacy `parachute-vault 2fa` command writes vault YAML but does NOT protect");
-  console.log("your hub login (`/login`), so enrolling there does nothing for the exposed hub.");
-  console.log("");
-  console.log("Until hub-login TOTP ships:");
-  console.log("  • Use a strong owner password (`parachute auth set-password`).");
-  console.log("  • If a guessable password is a concern, don't expose `/login` publicly.");
-  return 0;
+async function run2fa(args: readonly string[], deps: AuthDeps): Promise<number> {
+  const flag = extractUsernameFlag(args);
+  if (flag.error) {
+    console.error(`parachute auth 2fa: ${flag.error}`);
+    return 1;
+  }
+  const sub = flag.rest[0] ?? "status";
+  if (flag.rest.length > 1) {
+    console.error(`parachute auth 2fa: unexpected argument "${flag.rest[1]}"`);
+    console.error("usage: parachute auth 2fa [status|enroll|disenroll] [--username <name>]");
+    return 1;
+  }
+  if (sub !== "status" && sub !== "enroll" && sub !== "disenroll") {
+    console.error(`parachute auth 2fa: unknown subcommand "${sub}"`);
+    console.error("usage: parachute auth 2fa [status|enroll|disenroll] [--username <name>]");
+    return 1;
+  }
+
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const target = resolveTargetUser(db, flag.username, sub);
+    if ("error" in target) {
+      console.error(`parachute auth 2fa: ${target.error}`);
+      return 1;
+    }
+
+    if (sub === "status") {
+      const state = getTotpState(db, target.id);
+      if (state.secret) {
+        console.log(`Two-factor authentication: ON for "${target.username}".`);
+        if (state.enrolledAt) console.log(`  enrolled_at:   ${state.enrolledAt}`);
+        console.log(`  backup_codes:  ${state.backupCodes.length} remaining`);
+      } else {
+        console.log(`Two-factor authentication: OFF for "${target.username}".`);
+        console.log("Run `parachute auth 2fa enroll` to turn it on.");
+      }
+      return 0;
+    }
+
+    if (sub === "disenroll") {
+      if (!isTotpEnrolled(db, target.id)) {
+        console.log(`Two-factor authentication is already off for "${target.username}".`);
+        return 0;
+      }
+      clearEnrollment(db, target.id);
+      console.log(`Turned off two-factor authentication for "${target.username}".`);
+      return 0;
+    }
+
+    // sub === "enroll"
+    if (isTotpEnrolled(db, target.id)) {
+      console.error(
+        `parachute auth 2fa: two-factor is already enabled for "${target.username}". Run \`parachute auth 2fa disenroll\` first to re-enroll.`,
+      );
+      return 1;
+    }
+    const isInteractive = (deps.isInteractive ?? defaultIsInteractive)();
+    if (!isInteractive) {
+      console.error(
+        "parachute auth 2fa enroll: a TTY is required to confirm the enrollment code (run it interactively)",
+      );
+      return 1;
+    }
+    const readLine = deps.readLine ?? defaultReadLine;
+
+    const { secret } = generateTotpSecret(target.username);
+    const otpauthUrl = otpauthUrlFor(secret, target.username);
+    console.log(`Enrolling two-factor authentication for "${target.username}".`);
+    console.log("");
+    console.log("Add this account to your authenticator app. Either scan the otpauth URL");
+    console.log("(paste it into a QR generator), or enter the secret key manually:");
+    console.log("");
+    console.log(`  otpauth URL:  ${otpauthUrl}`);
+    console.log(`  secret key:   ${secret}`);
+    console.log("");
+    const code = (await readLine("Enter the 6-digit code from your app to confirm: ")).trim();
+    if (!verifyTotpCode(secret, code)) {
+      console.error(
+        "parachute auth 2fa enroll: that code didn't match — nothing was saved. Check your device clock and try again.",
+      );
+      return 1;
+    }
+    const result = await persistEnrollment(db, target.id, secret);
+    console.log("");
+    console.log("✓ Two-factor authentication is now ON for hub login.");
+    console.log("");
+    console.log("Save these backup codes — each works once if you lose your authenticator:");
+    console.log("");
+    for (const c of result.backupCodes) console.log(`  ${c}`);
+    console.log("");
+    console.log("They are shown only once. Store them somewhere safe.");
+    return 0;
+  } finally {
+    db.close();
+  }
 }
 
 function runListUsers(deps: AuthDeps): number {
@@ -1211,7 +1321,13 @@ export async function auth(args: readonly string[], deps: AuthDeps | Runner = {}
       }
     }
     if (sub === "2fa") {
-      return run2faInfo();
+      try {
+        return await run2fa(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth 2fa: ${msg}`);
+        return 1;
+      }
     }
     if (sub === "list-users") {
       return runListUsers(normalized);

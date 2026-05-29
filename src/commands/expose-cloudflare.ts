@@ -246,8 +246,8 @@ function printAuthGuidance(log: (line: string) => void, vaultUrl: string): void 
   log("");
   log("  Humans (claude.ai / ChatGPT connectors, browser):");
   log("    parachute auth set-password         # set a STRONG owner password");
-  log("    # (hub-login 2FA is coming — #473 — but not shipped yet; the owner");
-  log("    #  password is the wall for now, so make it a good one)");
+  log("    parachute auth 2fa enroll           # add a second factor (recommended)");
+  log("    #  (or set 2FA up in the browser at /account/2fa for a scannable QR)");
   log("    then point your connector at:");
   log(`    ${vaultUrl}`);
   log("");
