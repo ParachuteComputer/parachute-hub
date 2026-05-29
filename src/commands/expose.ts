@@ -24,6 +24,7 @@ import { type ServiceEntry, readManifest } from "../services-manifest.ts";
 import { type ServeEntry, bringupCommand, teardownCommand } from "../tailscale/commands.ts";
 import { getFqdn, isTailscaleInstalled } from "../tailscale/detect.ts";
 import { type Runner, defaultRunner } from "../tailscale/run.ts";
+import { clearVaultHubOrigin } from "../vault-hub-origin-env.ts";
 import type { VaultAuthStatus } from "../vault/auth-status.ts";
 import {
   WELL_KNOWN_DIR,
@@ -438,6 +439,13 @@ export async function exposeOff(layer: ExposeLayer, opts: ExposeOpts = {}): Prom
   }
 
   clearExposeState(statePath);
+  // Drop the persisted PARACHUTE_HUB_ORIGIN from vault's `.env`. `expose up`
+  // (via the vault restart) persisted the public origin so the launchd /
+  // systemd daemon validates `iss` against it. With exposure gone, a
+  // local-only hub mints loopback-`iss` tokens, so a stale public origin left
+  // in `.env` would itself cause the mismatch on the next daemon restart.
+  // Reverting to vault's loopback default (`getHubOrigin`) keeps them aligned.
+  clearVaultHubOrigin(configDir, log);
   // Pair to the debug-only write at expose-up — clean up the inspection artifact
   // on teardown so it doesn't outlive the layer it described.
   if (existsSync(wellKnownFilePath)) {

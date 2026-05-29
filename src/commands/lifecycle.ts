@@ -33,6 +33,7 @@ import {
   shortNameForManifest,
 } from "../service-spec.ts";
 import { type ServiceEntry, readManifest } from "../services-manifest.ts";
+import { persistVaultHubOrigin } from "../vault-hub-origin-env.ts";
 
 /**
  * Tiny seam over `Bun.spawn` for lifecycle tests. The real spawner opens the
@@ -484,6 +485,17 @@ export async function start(svc: string | undefined, opts: LifecycleOpts = {}): 
 
     r.log(`✓ ${short} started (pid ${pid}); logs: ${logFile}`);
     if (r.hubOrigin) r.log(`  ${HUB_ORIGIN_ENV}=${r.hubOrigin}`);
+    // Persist the resolved public origin to vault's `.env` so the launchd /
+    // systemd daemon (which boots vault out-of-band on reboot / crash-restart
+    // and never sees this spawn env) validates hub-minted JWTs' `iss` against
+    // the public origin. The spawn-env injection above is ephemeral; this is
+    // the durable half of the OAuth issuer-mismatch fix. Vault is the only
+    // hub-origin-dependent service with an OS-supervised autostart daemon
+    // today — scribe/notes don't validate `iss`. See
+    // `vault-hub-origin-env.ts:persistVaultHubOrigin`.
+    if (short === "vault" && r.hubOrigin) {
+      persistVaultHubOrigin(r.configDir, r.hubOrigin, r.log);
+    }
   }
   return failures === 0 ? 0 : 1;
 }

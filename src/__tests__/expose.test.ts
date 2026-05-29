@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exposePublic, exposeTailnet } from "../commands/expose.ts";
+import { readEnvFileValues } from "../env-file.ts";
 import { readExposeState, writeExposeState } from "../expose-state.ts";
 import type { EnsureHubOpts, HubSpawner, StopHubOpts } from "../hub-control.ts";
 import { writePid } from "../process-state.ts";
@@ -691,6 +692,53 @@ describe("expose tailnet off", () => {
       expect(existsSync(h.hubPath)).toBe(false);
       // Hub was running and got stopped.
       expect(signals).toContain("SIGTERM");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("clears the persisted PARACHUTE_HUB_ORIGIN from vault/.env on teardown", async () => {
+    // OAuth issuer-mismatch fix: `expose up` persisted the public origin into
+    // vault/.env so the daemon validates `iss` against it. With exposure gone,
+    // a local-only hub mints loopback-`iss` tokens, so a stale public origin
+    // left in `.env` would itself cause the mismatch on the next daemon boot.
+    // Tearing it down reverts vault to its loopback default.
+    const h = makeHarness();
+    try {
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: false,
+          entries: [{ kind: "proxy", mount: "/", target: "http://127.0.0.1:1939", service: "hub" }],
+          hubOrigin: "https://parachute.taildf9ce2.ts.net",
+        },
+        h.statePath,
+      );
+      mkdirSync(join(h.configDir, "vault"), { recursive: true });
+      writeFileSync(
+        join(h.configDir, "vault", ".env"),
+        "SCRIBE_AUTH_TOKEN=secret\nPARACHUTE_HUB_ORIGIN=https://parachute.taildf9ce2.ts.net\n",
+      );
+      const { runner } = makeRunner();
+      const code = await exposeTailnet("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        wellKnownDir: h.wellKnownDir,
+        configDir: h.configDir,
+        skipHub: true,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const values = readEnvFileValues(join(h.configDir, "vault", ".env"));
+      expect(values.PARACHUTE_HUB_ORIGIN).toBeUndefined();
+      // Sibling keys preserved.
+      expect(values.SCRIBE_AUTH_TOKEN).toBe("secret");
     } finally {
       h.cleanup();
     }
