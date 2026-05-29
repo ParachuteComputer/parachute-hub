@@ -77,10 +77,12 @@ parachute init
 
 1. **Starts the hub** if it isn't already running (port `1939`).
 2. **Offers to expose it** so you can reach the wizard from other devices. In a
-   terminal you pick: stay loopback-only, Tailscale Funnel, or Cloudflare
-   Tunnel. The default highlights "no thanks — loopback" on a laptop and
-   pre-selects Cloudflare on an SSH'd server. Skip with `--no-expose-prompt`,
-   or pin non-interactively with `--expose none|tailnet|cloudflare`.
+   terminal you pick: stay loopback-only, your **tailnet** (`tailscale serve` —
+   private to your own Tailscale devices), or a **Cloudflare Tunnel** (public
+   HTTPS on your own domain). The default highlights "no thanks — loopback" on a
+   laptop and pre-selects Cloudflare on an SSH'd server. Skip with
+   `--no-expose-prompt`, or pin non-interactively with
+   `--expose none|tailnet|cloudflare`.
 3. **Installs the vault module** — always — so the wizard can offer
    create / import / skip. No vault *instance* is created yet; that's the
    wizard's call.
