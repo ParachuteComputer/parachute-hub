@@ -13,8 +13,16 @@ import {
 } from "../commands/lifecycle.ts";
 import { readEnvFileValues } from "../env-file.ts";
 import { writeHubPort } from "../hub-control.ts";
+import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { validateAccessToken } from "../jwt-sign.ts";
+import {
+  OPERATOR_TOKEN_SCOPE_SET_CLAIM,
+  issueOperatorToken,
+  readOperatorTokenFile,
+} from "../operator-token.ts";
 import { ensureLogPath, logPath, readPid, writePid } from "../process-state.ts";
 import { upsertService } from "../services-manifest.ts";
+import { rotateSigningKey } from "../signing-keys.ts";
 
 interface Harness {
   configDir: string;
@@ -1520,6 +1528,149 @@ describe("parachute start|stop|restart hub", () => {
       });
       expect(code).toBe(1);
       expect(log.join("\n")).toMatch(/hub failed to start.*port 1939 unavailable/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // hub#481 — `start hub` self-heals a stale operator-token issuer. Tests use
+  // the injectable `hub.selfHealOperatorToken` seam to assert the call happens
+  // (and to make it throw without failing start); a separate test drives the
+  // REAL self-heal against an on-disk operator token + hub.db.
+  test("start hub: invokes operator-token self-heal with the resolved issuer + configDir", async () => {
+    const h = makeHarness();
+    try {
+      const log: string[] = [];
+      const calls: Array<{ issuer: string; configDir: string }> = [];
+      const code = await start("hub", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        hubOrigin: "https://hub.example.com",
+        hub: {
+          ensureRunning: async () => ({ pid: 4711, port: 1939, started: true }),
+          selfHealOperatorToken: async (args) => {
+            calls.push({ issuer: args.issuer, configDir: args.configDir });
+            return {
+              kind: "rotated",
+              path: "/x/operator.token",
+              scopeSet: "admin",
+              expiresAt: "z",
+            };
+          },
+        },
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(calls).toEqual([{ issuer: "https://hub.example.com", configDir: h.configDir }]);
+      // Rotation emits an operator-facing line.
+      expect(log.join("\n")).toMatch(
+        /refreshed operator\.token issuer → https:\/\/hub\.example\.com/,
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("start hub: skips operator-token self-heal when no hub origin is resolvable", async () => {
+    const h = makeHarness();
+    try {
+      let called = false;
+      // No hubOrigin override, no expose-state, no hub.port file → resolveHubOrigin
+      // yields undefined, so the self-heal seam must NOT be called.
+      const code = await start("hub", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        hub: {
+          ensureRunning: async () => ({ pid: 4711, port: 1939, started: true }),
+          selfHealOperatorToken: async () => {
+            called = true;
+            return { kind: "absent" };
+          },
+        },
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      expect(called).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("start hub: a thrown error inside operator-token self-heal does NOT fail start", async () => {
+    const h = makeHarness();
+    try {
+      const log: string[] = [];
+      const code = await start("hub", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        hubOrigin: "https://hub.example.com",
+        hub: {
+          ensureRunning: async () => ({ pid: 4711, port: 1939, started: true }),
+          selfHealOperatorToken: async () => {
+            throw new Error("hub.db is locked");
+          },
+        },
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      // Degrades to a brief note, not a hard failure.
+      expect(log.join("\n")).toMatch(
+        /operator\.token issuer self-heal skipped \(hub\.db is locked\)/,
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("start hub: real self-heal re-mints a stale-iss operator token on disk", async () => {
+    const h = makeHarness();
+    try {
+      // Seed signing keys + a stale-iss operator token in the harness configDir's
+      // hub.db / operator.token, then drive the production self-heal seam.
+      const db = openHubDb(hubDbPath(h.configDir));
+      try {
+        rotateSigningKey(db);
+        await issueOperatorToken(db, "user-abc", {
+          dir: h.configDir,
+          issuer: "http://127.0.0.1:1939",
+          scopeSet: "start",
+        });
+      } finally {
+        db.close();
+      }
+
+      const log: string[] = [];
+      const code = await start("hub", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        hubOrigin: "https://gitcoin-parachute.unforced.dev",
+        // No selfHealOperatorToken override → exercises defaultSelfHealOperatorToken
+        // (opens hub.db at <configDir>/hub.db).
+        hub: {
+          ensureRunning: async () => ({ pid: 4711, port: 1939, started: true }),
+        },
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log.join("\n")).toMatch(
+        /refreshed operator\.token issuer → https:\/\/gitcoin-parachute\.unforced\.dev/,
+      );
+
+      // The on-disk token now validates under the new issuer, scope-set preserved.
+      const verifyDb = openHubDb(hubDbPath(h.configDir));
+      try {
+        const onDisk = await readOperatorTokenFile(h.configDir);
+        expect(onDisk).not.toBeNull();
+        const validated = await validateAccessToken(
+          verifyDb,
+          onDisk as string,
+          "https://gitcoin-parachute.unforced.dev",
+        );
+        expect(validated.payload.iss).toBe("https://gitcoin-parachute.unforced.dev");
+        expect(validated.payload[OPERATOR_TOKEN_SCOPE_SET_CLAIM]).toBe("start");
+      } finally {
+        verifyDb.close();
+      }
     } finally {
       h.cleanup();
     }

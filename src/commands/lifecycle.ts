@@ -13,8 +13,10 @@ import {
   readHubPort,
   stopHub,
 } from "../hub-control.ts";
+import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { HUB_ORIGIN_ENV, deriveHubOrigin } from "../hub-origin.ts";
 import { ModuleManifestError, readModuleManifest } from "../module-manifest.ts";
+import { type OperatorIssuerHealStatus, selfHealOperatorTokenIssuer } from "../operator-token.ts";
 import {
   type AliveFn,
   clearPid,
@@ -271,6 +273,18 @@ export interface LifecycleOpts {
   hub?: {
     ensureRunning?: (opts: EnsureHubOpts) => Promise<EnsureHubResult>;
     stop?: (opts: StopHubOpts) => Promise<boolean>;
+    /**
+     * Self-heal the operator token's stale `iss` after `start hub` (hub#481).
+     * Production opens hub.db at `<configDir>/hub.db` and delegates to
+     * `selfHealOperatorTokenIssuer`. Tests inject a stub to assert the call
+     * happens — or to make it throw and prove a self-heal failure never fails
+     * `start hub`.
+     */
+    selfHealOperatorToken?: (args: {
+      issuer: string;
+      configDir: string;
+      log: (line: string) => void;
+    }) => Promise<OperatorIssuerHealStatus>;
   };
 }
 
@@ -292,6 +306,35 @@ interface Resolved {
   hubOrigin: string | undefined;
   ensureHub: (opts: EnsureHubOpts) => Promise<EnsureHubResult>;
   stopHubFn: (opts: StopHubOpts) => Promise<boolean>;
+  selfHealOperatorTokenFn: (args: {
+    issuer: string;
+    configDir: string;
+    log: (line: string) => void;
+  }) => Promise<OperatorIssuerHealStatus>;
+}
+
+/**
+ * Production self-heal: open hub.db at `<configDir>/hub.db`, run
+ * `selfHealOperatorTokenIssuer`, and close the db. Derives the db path the
+ * same way the rest of the repo does (`hubDbPath(configDir)`); `openHubDb`
+ * runs migrations + WAL on open, matching `commands/auth.ts`. Tests override
+ * this whole seam, so the db-open only happens on the production path.
+ */
+async function defaultSelfHealOperatorToken(args: {
+  issuer: string;
+  configDir: string;
+  log: (line: string) => void;
+}): Promise<OperatorIssuerHealStatus> {
+  const db = openHubDb(hubDbPath(args.configDir));
+  try {
+    return await selfHealOperatorTokenIssuer(db, {
+      issuer: args.issuer,
+      configDir: args.configDir,
+      log: args.log,
+    });
+  } finally {
+    db.close();
+  }
 }
 
 function resolve(opts: LifecycleOpts): Resolved {
@@ -328,6 +371,7 @@ function resolve(opts: LifecycleOpts): Resolved {
     hubOrigin: resolveHubOrigin(opts.hubOrigin, configDir),
     ensureHub: opts.hub?.ensureRunning ?? ensureHubRunning,
     stopHubFn: opts.hub?.stop ?? stopHub,
+    selfHealOperatorTokenFn: opts.hub?.selfHealOperatorToken ?? defaultSelfHealOperatorToken,
   };
 }
 
@@ -774,10 +818,46 @@ async function startHubSvc(r: Resolved): Promise<number> {
     } else {
       r.log(`hub already running (pid ${result.pid}) on port ${result.port}.`);
     }
+    // Self-heal a stale operator-token issuer (hub#481). Runs whether the hub
+    // was freshly started OR already running — a token stamped at loopback
+    // before exposure must heal even when the hub is already up. The loopback /
+    // provenance guards live inside `selfHealOperatorTokenIssuer`, so the only
+    // gate here is "is there a real issuer to heal toward?".
+    await selfHealOperatorTokenOnStart(r);
     return 0;
   } catch (err) {
     r.log(`✗ hub failed to start: ${err instanceof Error ? err.message : String(err)}`);
     return 1;
+  }
+}
+
+/**
+ * Re-issue the operator token under the hub's current origin when its `iss`
+ * went stale after an init-at-loopback → expose transition (hub#481). Mirrors
+ * `persistVaultHubOriginForStart`'s quiet style: emit a single line only when
+ * a rotation actually happens; stay silent for fresh / absent / skipped.
+ *
+ * The ENTIRE self-heal is wrapped here so it can NEVER block or fail
+ * `start hub` — a db-open error, a corrupt token, anything — degrades to a
+ * brief warning and `start hub` still returns 0.
+ */
+async function selfHealOperatorTokenOnStart(r: Resolved): Promise<void> {
+  if (!r.hubOrigin) return;
+  try {
+    const status = await r.selfHealOperatorTokenFn({
+      issuer: r.hubOrigin,
+      configDir: r.configDir,
+      log: r.log,
+    });
+    if (status.kind === "rotated") {
+      r.log(`  refreshed operator.token issuer → ${r.hubOrigin} (was stale after exposure)`);
+    }
+  } catch (err) {
+    r.log(
+      `  note: operator.token issuer self-heal skipped (${
+        err instanceof Error ? err.message : String(err)
+      })`,
+    );
   }
 }
 
