@@ -61,33 +61,99 @@ Operators who want env-var-driven seeding (CI, scripted deploys) can still set `
 
 ## First 5 minutes
 
+One command gets you from a fresh install to the setup wizard:
+
 ```sh
 # 1. Install the hub (one line — installs the `parachute` binary)
 bun add -g @openparachute/hub
 
-# 2. Install a service (runs `bun add -g @openparachute/vault` + `parachute-vault init`)
-parachute install vault
-
-# 3. Start the service in the background (PID + logs tracked under ~/.parachute/vault/)
-parachute start vault
-
-# 4. Check it landed — reads ~/.parachute/services.json, shows process state + probes health
-parachute status
-# SERVICE          PORT  VERSION  PROCESS  PID    UPTIME  HEALTH  LATENCY
-# parachute-vault  1940  0.2.4    running  12345  12s     ok      2ms
-
-# 5. Use it. Vault is up on 127.0.0.1:1940; Claude Code picked up the MCP
-#    on your next session. Point any other local MCP client (Codex, Goose,
-#    OpenCode, Cursor, Zed, Cline, your own agent) at:
-#      http://127.0.0.1:1940/vault/default/mcp
-
-# 6. Expose across your tailnet — HTTPS, MagicDNS, only your devices.
-#    The supported exposure shape today; public-internet exposure is
-#    exploratory (see "Public exposure" below).
-parachute expose tailnet
+# 2. parachute init — the unified front door (laptop, EC2, any VPS).
+#    It starts the hub, offers to expose it, always installs the vault
+#    module, then drops you into the setup wizard.
+parachute init
 ```
 
-Tear down with `parachute expose tailnet off`. The public layer (`expose public off`) tears down independently — `off` only affects the layer you name.
+`parachute init` is idempotent — every re-run is safe. End to end it:
+
+1. **Starts the hub** if it isn't already running (port `1939`).
+2. **Offers to expose it** so you can reach the wizard from other devices. In a
+   terminal you pick: stay loopback-only, your **tailnet** (`tailscale serve` —
+   private to your own Tailscale devices), or a **Cloudflare Tunnel** (public
+   HTTPS on your own domain). The default highlights "no thanks — loopback" on a
+   laptop and pre-selects Cloudflare on an SSH'd server. Skip with
+   `--no-expose-prompt`, or pin non-interactively with
+   `--expose none|tailnet|cloudflare`.
+3. **Installs the vault module** — always — so the wizard can offer
+   create / import / skip. No vault *instance* is created yet; that's the
+   wizard's call.
+4. **Drops you into the setup wizard.** Browser by default (opens
+   `/admin/setup`); pick the in-terminal walk-through with `--cli-wizard`, or
+   force the browser with `--browser-wizard`. It prints the canonical admin URL
+   either way — loopback when you're not exposed, the tailnet / Cloudflare FQDN
+   when you are.
+
+The wizard walks the same three steps in the browser and the CLI:
+
+- **Account** — create the admin operator for this hub (username + password).
+- **Vault** — *create* a fresh vault (default name `default`), *import* one from
+  a git repo (a previously-exported Parachute vault on any HTTPS / SSH remote;
+  PAT optional for private repos), or *skip* and create one later. The vault
+  module is installed regardless of which you pick.
+- **Expose** — record how this hub is reached (localhost / tailnet / public) so
+  the done screen surfaces the right URLs.
+
+The done screen hands you a copy-pasteable `claude mcp add` command (with a
+freshly-minted operator token), a link to start using your vault, and the admin
+UI. Verify the stack any time:
+
+```sh
+parachute status
+# SERVICE          PORT  VERSION  PROCESS  PID    UPTIME  HEALTH  LATENCY
+# parachute-hub    1939  0.5.14   running  12344  20s     ok      1ms
+# parachute-vault  1940  0.4.5    running  12345  12s     ok      2ms
+```
+
+Vault is up on `127.0.0.1:1940`; Claude Code picks up the MCP on your next
+session. Point any other local MCP client (Codex, Goose, OpenCode, Cursor, Zed,
+Cline, your own agent) at `http://127.0.0.1:1940/vault/<name>/mcp`.
+
+### Want the wizard in the terminal instead of the browser?
+
+```sh
+parachute init --cli-wizard
+```
+
+…or drive the wizard directly against an already-running hub:
+
+```sh
+parachute setup-wizard --hub-url http://127.0.0.1:1939
+```
+
+`setup-wizard` is the in-terminal mirror of `/admin/setup` — same handlers, same
+Account → Vault → Expose walk. Every prompt has a paired flag for scripted /
+non-interactive setup (`--account-username`, `--account-password`,
+`--vault-mode create|import|skip`, `--vault-name`, `--vault-import-url`,
+`--expose-mode localhost|tailnet|public`, …); run `parachute setup-wizard --help`
+for the full list.
+
+### Prefer to drive installs by hand?
+
+`parachute init` → wizard is the recommended path, but the per-module commands
+still work and are additive:
+
+```sh
+parachute install vault   # install + register + create first vault + start one module
+parachute setup           # older interactive multi-pick: survey + install vault/notes/scribe
+parachute start vault     # PID + logs tracked under ~/.parachute/vault/
+```
+
+### Expose across your tailnet
+
+```sh
+parachute expose tailnet  # HTTPS, MagicDNS, only your devices (the supported shape today)
+```
+
+Tear down with `parachute expose tailnet off`. The public layer (`expose public off`) tears down independently — `off` only affects the layer you name. Public-internet exposure is exploratory (see "Public exposure" below).
 
 ## Service lifecycle
 
@@ -313,6 +379,11 @@ Public-internet exposure (`parachute expose public`) is exploratory — see "Pub
 Run `parachute --help` for the top-level list, and `parachute <subcommand> --help` for details on any individual command.
 
 ```
+parachute init                    fresh-install front door: start hub, offer expose,
+                                  install vault module, open the setup wizard
+parachute setup-wizard --hub-url <url>
+                                  in-terminal mirror of /admin/setup (Account/Vault/Expose)
+parachute setup                   older interactive multi-pick service installer
 parachute install <service>       install and register a service
 parachute status                  show installed services, process state, health
 parachute start   [service]       start services in the background
