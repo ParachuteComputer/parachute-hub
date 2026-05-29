@@ -12,16 +12,24 @@
  *   Content-Type: application/json
  *   { "name": "<vault-name>" }
  *
- *   201 → { name, url, version, token?, paths? }
- *           // vault freshly created. `token` (single-emit `pvt_*`) and
- *           // filesystem `paths` are present when the create path took the
- *           // `parachute-vault create --json` branch — that's the only time
- *           // the just-emitted token is captured. The first-vault-on-host
- *           // bootstrap (`parachute install vault`) doesn't emit JSON yet,
- *           // so a fresh-box response carries name/url/version only.
+ *   201 → { name, url, version, token?, token_guidance?, paths? }
+ *           // vault freshly created. `token` is a hub-issued ACCESS token
+ *           // (a JWT scoped `vault:<name>:admin`) captured from the
+ *           // `parachute-vault create --json` branch — NOT a `pvt_*` vault
+ *           // token (those were dropped). Post-DROP `token` may be the
+ *           // empty string `""` when the bootstrap mint was unavailable
+ *           // (e.g. a loopback origin the hub can't mint against); in that
+ *           // case `token_guidance` carries the vault's human-readable
+ *           // reason, forwarded verbatim so the SPA can explain the gap.
+ *           // `paths` is the new vault's filesystem layout. The
+ *           // first-vault-on-host bootstrap (`parachute install vault`)
+ *           // doesn't emit JSON yet, so a fresh-box response carries
+ *           // name/url/version only.
  *   200 → { name, url, version }
  *           // idempotent re-POST: existing vault. Never includes `token` —
- *           // tokens are single-emit at create time, not retrievable later.
+ *           // the create-time access token isn't retrievable later. The
+ *           // caller branches on HTTP status (201 vs 200), not on `token`
+ *           // truthiness, so an empty-token 201 isn't confused with a 200.
  *   400 → { error: "invalid_request", error_description: ... }
  *   401/403 → bearer-auth failure
  *   500 → orchestration failure
@@ -50,7 +58,7 @@
 import type { Database } from "bun:sqlite";
 import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
-import { findService, readManifest, readManifestLenient } from "./services-manifest.ts";
+import { findService, type readManifest, readManifestLenient } from "./services-manifest.ts";
 import { type WellKnownVaultEntry, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 /** Scope required to call POST /vaults. */
@@ -74,7 +82,20 @@ export interface CreateVaultRequest {
 /** Output shape of `parachute-vault create --json` (vault PR #184). */
 export interface VaultCreateJson {
   name: string;
+  /**
+   * Hub-issued access token (a JWT scoped `vault:<name>:admin`) the vault
+   * minted at create time. Post the pvt_* DROP this is the empty string
+   * `""` when no hub origin was reachable to mint against (e.g. a loopback
+   * create) — the field is always present but may be empty.
+   */
   token: string;
+  /**
+   * Vault-supplied human-readable reason no token was minted, present only
+   * when `token` is empty (e.g. "no hub origin reachable to mint against").
+   * Optional — older vaults that always minted don't emit it. Forwarded
+   * verbatim to the caller so the SPA can explain the empty-token state.
+   */
+  token_guidance?: string;
   paths: {
     vault_dir: string;
     vault_db: string;
@@ -239,8 +260,9 @@ interface OrchestrateError {
  * Run the orchestration step. Picks `parachute install` (bootstrap) vs
  * `parachute-vault create --json` (subsequent) based on whether vault is
  * already registered in services.json. The create branch parses stdout for
- * the just-emitted `pvt_*` token + filesystem paths so the caller can talk
- * to the new vault — those creds are single-emit.
+ * the just-minted hub access token (a `vault:<name>:admin` JWT, possibly
+ * empty post-DROP), the optional `token_guidance`, and filesystem paths so
+ * the caller can talk to the new vault — the access token is single-emit.
  */
 async function orchestrate(
   manifestPath: string,
@@ -348,14 +370,25 @@ export async function handleCreateVault(req: Request, deps: CreateVaultDeps): Pr
   }
 
   const entry = buildEntry(name, created.path, created.version, deps.issuer);
-  // Token + filesystem paths are single-emit at create time. We surface them
-  // here so the caller can immediately bootstrap a connection to the new
-  // vault. Idempotent re-POSTs intentionally never include them.
+  // Access token (a `vault:<name>:admin` JWT, possibly empty post-DROP) +
+  // filesystem paths are single-emit at create time. We surface them here so
+  // the caller can immediately bootstrap a connection to the new vault.
+  // `token_guidance` (when the vault couldn't mint) is forwarded verbatim so
+  // the SPA can explain the empty-token state rather than rendering a blank.
+  // Idempotent re-POSTs intentionally never include any of these.
   const body: WellKnownVaultEntry & {
     token?: string;
+    token_guidance?: string;
     paths?: VaultCreateJson["paths"];
   } = result.createJson
-    ? { ...entry, token: result.createJson.token, paths: result.createJson.paths }
+    ? {
+        ...entry,
+        token: result.createJson.token,
+        ...(result.createJson.token_guidance
+          ? { token_guidance: result.createJson.token_guidance }
+          : {}),
+        paths: result.createJson.paths,
+      }
     : entry;
 
   return new Response(JSON.stringify(body), {

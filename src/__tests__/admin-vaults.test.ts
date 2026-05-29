@@ -8,11 +8,21 @@ import { signAccessToken } from "../jwt-sign.ts";
 import { upsertService, writeManifest } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 
-/** Build the JSON shape parachute-vault create --json emits (PR #184). */
-function vaultCreateJson(name: string, token = `pvt_${name}_token`): string {
+/**
+ * Build the JSON shape `parachute-vault create --json` emits (PR #184).
+ * Post the pvt_* DROP the `token` is a hub-issued access JWT (scoped
+ * `vault:<name>:admin`), and may be the empty string when the vault
+ * couldn't mint — in which case `token_guidance` carries the reason.
+ */
+function vaultCreateJson(
+  name: string,
+  token = `hubjwt.${name}.access`,
+  tokenGuidance?: string,
+): string {
   return JSON.stringify({
     name,
     token,
+    ...(tokenGuidance ? { token_guidance: tokenGuidance } : {}),
     paths: {
       vault_dir: `/home/test/.parachute/vault/${name}`,
       vault_db: `/home/test/.parachute/vault/${name}/vault.db`,
@@ -404,7 +414,7 @@ describe("POST /vaults — orchestration", () => {
           );
           return {
             exitCode: 0,
-            stdout: vaultCreateJson("work", "pvt_supersecret"),
+            stdout: vaultCreateJson("work", "hubjwt.work.access"),
             stderr: "",
           };
         };
@@ -420,12 +430,68 @@ describe("POST /vaults — orchestration", () => {
           token?: string;
           paths?: { vault_dir: string; vault_db: string; vault_config: string };
         };
-        expect(body.token).toBe("pvt_supersecret");
+        expect(body.token).toBe("hubjwt.work.access");
         expect(body.paths).toEqual({
           vault_dir: "/home/test/.parachute/vault/work",
           vault_db: "/home/test/.parachute/vault/work/vault.db",
           vault_config: "/home/test/.parachute/vault/work/config.yaml",
         });
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("201 forwards an empty token + token_guidance when the vault couldn't mint (post-DROP)", async () => {
+    // The vault emits `token: ""` + a `token_guidance` reason when no hub
+    // origin was reachable to mint against (e.g. loopback create). The hub
+    // must forward both verbatim so the SPA can render the
+    // created-but-no-token state instead of confusing it with a re-POST.
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        upsertService(
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/health",
+            version: "0.3.5",
+          },
+          h.manifestPath,
+        );
+        const runCommand = async (_cmd: readonly string[]): Promise<RunResult> => {
+          upsertService(
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/default", "/vault/work"],
+              health: "/health",
+              version: "0.3.5",
+            },
+            h.manifestPath,
+          );
+          return {
+            exitCode: 0,
+            stdout: vaultCreateJson("work", "", "no hub origin reachable to mint against"),
+            stderr: "",
+          };
+        };
+        const res = await call({
+          db,
+          manifestPath: h.manifestPath,
+          body: { name: "work" },
+          runCommand,
+        });
+        // Still a fresh create — HTTP 201, NOT 200.
+        expect(res.status).toBe(201);
+        const body = (await res.json()) as { token?: string; token_guidance?: string };
+        expect(body.token).toBe("");
+        expect(body.token_guidance).toBe("no hub origin reachable to mint against");
       } finally {
         db.close();
       }

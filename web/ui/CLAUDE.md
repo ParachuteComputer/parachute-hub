@@ -83,7 +83,7 @@ web/ui/
     │   └── api.ts          # listVaults + createVault
     ├── routes/
     │   ├── VaultsList.tsx  # / (under /vault basename)
-    │   ├── NewVault.tsx    # /new (single-emit pvt_* banner)
+    │   ├── NewVault.tsx    # /new (one-shot hub access-token banner)
     │   └── VaultDetail.tsx # /:name (Phase 2 placeholder)
     └── test/setup.ts
 ```
