@@ -31,6 +31,7 @@ import { promises as fs } from "node:fs";
 import { join } from "node:path";
 import { configDir } from "./config.ts";
 import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
+import { isLoopbackOrigin } from "./vault-hub-origin-env.ts";
 
 export const OPERATOR_TOKEN_FILENAME = "operator.token";
 /** Default operator-token lifetime — 90 days, was 365d through 0.5.7 (#213). */
@@ -460,5 +461,155 @@ export async function useOperatorTokenWithAutoRotate(
     payload: reValidated.payload,
     rotated: { path: issued.path, scopeSet: issued.scopeSet, expiresAt: issued.expiresAt },
     status: { kind: "rotated" },
+  };
+}
+
+export interface SelfHealOperatorTokenOpts {
+  /**
+   * The hub's CURRENT issuer (its public origin once exposed). The stale
+   * on-disk token is re-minted under this value. Must be the resolved hub
+   * origin, never a raw flag — callers pass `r.hubOrigin` from lifecycle.
+   */
+  issuer: string;
+  /** configDir override (where operator.token lives). Defaults to `configDir()`. */
+  configDir?: string;
+  /** Operator-facing log sink. Defaults to a no-op (silent). */
+  log?: (line: string) => void;
+  /** Override the JWT-sign clock — tests pin time. Forwarded to `issueOperatorToken`. */
+  now?: () => Date;
+}
+
+/**
+ * Disambiguated outcome of {@link selfHealOperatorTokenIssuer}. Modelled on
+ * {@link RotationStatus} — a small discriminated union the caller logs and
+ * tests assert.
+ *
+ * - `absent` — no `operator.token` on disk; nothing to heal.
+ * - `fresh` — the token's `iss` already matches the current issuer; the file
+ *   is left byte-identical (no rewrite, no log).
+ * - `rotated` — the token was genuine-but-stale; re-minted under the current
+ *   issuer with the SAME scope-set + sub. `path` / `expiresAt` / `scopeSet`
+ *   describe the freshly-written token.
+ * - `skipped` — a guard fired; the on-disk file is left untouched. `reason`:
+ *     - `unverifiable`: the on-disk token's signature did NOT verify against
+ *       this hub's current keys (bad/unknown/expired kid, jose `exp` failure,
+ *       or a revoked jti). We must NOT resurrect or trust it — the operator
+ *       recovers via `parachute auth rotate-operator`.
+ *     - `aud-mismatch`: the token carries a non-operator audience. A
+ *       hand-stashed scope-narrow JWT must not be silently re-minted as a
+ *       full operator token (parallels the {@link useOperatorTokenWithAutoRotate}
+ *       privilege guard).
+ *     - `no-sub`: the token lacks a `sub` claim, so we can't re-mint (don't
+ *       know who it belongs to).
+ *     - `no-scope-set`: the token lacks (or has an unrecognized) `pa_scope_set`
+ *       claim. Falling back to a default would widen scope (hub#224 hardening);
+ *       refuse instead. Operator recovers via explicit rotate-operator.
+ *     - `issuer-loopback`: the TARGET issuer is loopback. Re-minting to a
+ *       loopback `iss` would downgrade a good public token; never do it.
+ */
+export type OperatorIssuerHealStatus =
+  | { kind: "absent" }
+  | { kind: "fresh" }
+  | { kind: "rotated"; path: string; scopeSet: OperatorScopeSet; expiresAt: string }
+  | {
+      kind: "skipped";
+      reason: "unverifiable" | "aud-mismatch" | "no-sub" | "no-scope-set" | "issuer-loopback";
+    };
+
+/**
+ * Self-heal the operator token's `iss` when the hub's origin changed after
+ * the token was minted.
+ *
+ * The bug this closes (hub#481, same family as the rc.17 Cloudflare 401 P0):
+ * `parachute init`/setup mints `~/.parachute/operator.token` stamped with the
+ * hub's origin-at-creation-time (`http://127.0.0.1:1939` on a box set up
+ * before exposure). After `parachute expose` brings the hub up on a public
+ * origin, on-box services validate incoming bearers' `iss` against the hub's
+ * CURRENT origin, so the stale-`iss` operator token is rejected on every CLI
+ * auth flow with `bearer token invalid — unexpected "iss" claim value`. That
+ * breaks `vault create`, `mcp-install`, and `/api/auth/mint-token`. The token
+ * is genuine — it just predates the origin change — so re-issuing it under the
+ * current issuer (preserving its scope-set + sub) is the right repair.
+ *
+ * Hooked into `parachute start hub` (parallel to how rc.17 hooked
+ * `selfHealVaultHubOrigin` into `start vault`): existing broken deploys
+ * self-correct on the next `start/restart hub`.
+ *
+ * ## Security invariant (reviewer: verify this holds)
+ *
+ * Re-mint is gated on `validateAccessToken(db, token)` succeeding WITHOUT an
+ * `expectedIssuer` argument — i.e. the on-disk token's SIGNATURE verifies
+ * against THIS hub's current public keys (by kid) and passes jose's `exp`
+ * check and the revocation check, while NOT pinning `iss`. An attacker cannot
+ * forge that signature, so the ONLY tokens that can ever be re-minted are ones
+ * this hub itself previously minted. There is no path to mint a token from an
+ * untrusted/forged input. Further:
+ *   - scope-set is preserved verbatim (`payload.pa_scope_set`) — no widening;
+ *   - expired tokens are refused (jose `exp` → `skipped: unverifiable`);
+ *   - revoked tokens are refused (validateAccessToken's revocation check);
+ *   - a non-operator audience is refused (`skipped: aud-mismatch`);
+ *   - a loopback TARGET issuer is refused (`skipped: issuer-loopback`) — never
+ *     downgrade a good public token back to loopback.
+ * This is strictly a re-issue of the hub's own still-valid credential under
+ * the hub's own new issuer.
+ */
+export async function selfHealOperatorTokenIssuer(
+  db: Database,
+  opts: SelfHealOperatorTokenOpts,
+): Promise<OperatorIssuerHealStatus> {
+  const dir = opts.configDir ?? configDir();
+  const token = await readOperatorTokenFile(dir);
+  if (!token) return { kind: "absent" };
+
+  // Target-issuer loopback guard FIRST. Re-minting to a loopback `iss` would
+  // downgrade a good public token to a non-reachable issuer, recreating the
+  // exact iss-mismatch this fix prevents (mirrors `isLoopbackOrigin`'s role in
+  // vault-hub-origin-env.ts). Never do it — bail before touching the token.
+  if (isLoopbackOrigin(opts.issuer)) return { kind: "skipped", reason: "issuer-loopback" };
+
+  // Verify the on-disk token WITHOUT pinning `iss`: this checks the signature
+  // against the hub's current keys (by kid) + jose's `exp` + revocation, but
+  // deliberately does NOT reject a stale issuer. A throw here means the token
+  // is unverifiable (bad/unknown/expired kid, expired-by-jose, revoked) — we
+  // must NOT resurrect or trust it. Leave the disk file untouched; the operator
+  // recovers via `parachute auth rotate-operator`.
+  let payload: Awaited<ReturnType<typeof validateAccessToken>>["payload"];
+  try {
+    ({ payload } = await validateAccessToken(db, token));
+  } catch {
+    return { kind: "skipped", reason: "unverifiable" };
+  }
+
+  // `iss` already current → no-op. Do NOT rewrite the file; it must stay
+  // byte-identical so repeated `start hub`s don't churn it.
+  if (payload.iss === opts.issuer) return { kind: "fresh" };
+
+  // `iss` differs → genuine-but-stale. Apply the same provenance guards
+  // `useOperatorTokenWithAutoRotate` uses before re-minting.
+  if (payload.aud !== OPERATOR_TOKEN_AUDIENCE) {
+    return { kind: "skipped", reason: "aud-mismatch" };
+  }
+  const sub = typeof payload.sub === "string" && payload.sub.length > 0 ? payload.sub : null;
+  if (!sub) return { kind: "skipped", reason: "no-sub" };
+  const claimedSet = payload[OPERATOR_TOKEN_SCOPE_SET_CLAIM];
+  if (!isOperatorScopeSet(claimedSet)) {
+    // No recognized scope-set → falling back to a default would widen scope
+    // (hub#224). Refuse; never widen.
+    return { kind: "skipped", reason: "no-scope-set" };
+  }
+
+  // Re-mint preserving scope-set + sub. `issueOperatorToken` writes the new
+  // token to disk atomically (mint → writeOperatorTokenFile).
+  const issued = await issueOperatorToken(db, sub, {
+    dir,
+    issuer: opts.issuer,
+    scopeSet: claimedSet,
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
+  });
+  return {
+    kind: "rotated",
+    path: issued.path,
+    scopeSet: issued.scopeSet,
+    expiresAt: issued.expiresAt,
   };
 }
