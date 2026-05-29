@@ -12,7 +12,7 @@
  *
  * Pure functions — DB, sessions live in `admin-handlers.ts`.
  */
-import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
+import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 
@@ -106,6 +106,50 @@ export function renderAdminLogin(props: AdminLoginProps): string {
       </form>
     </div>`;
   return baseDocument("Sign in — Parachute", body);
+}
+
+// --- /login/2fa (second-factor step) --------------------------------------
+
+export interface TotpChallengeProps {
+  /** Continuation path after a successful second factor — hidden field. */
+  next: string;
+  csrfToken: string;
+  errorMessage?: string;
+}
+
+/**
+ * Server-rendered "enter your code" page shown after a correct password when
+ * the user has 2FA enrolled (hub#473). Posts to `/login/2fa` along with the
+ * pending-login cookie minted by the password step. Accepts either a 6-digit
+ * TOTP code or a backup code in the same field — the handler tries TOTP first,
+ * then backup codes.
+ *
+ * No JS, stands alone like `/login`. `inputmode`/`autocomplete` hint mobile
+ * keyboards toward a numeric pad + the platform's one-time-code autofill.
+ */
+export function renderTotpChallenge(props: TotpChallengeProps): string {
+  const { next, csrfToken, errorMessage } = props;
+  const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        ${header()}
+        <h1>Two-factor authentication</h1>
+        <p class="subtitle">Enter the 6-digit code from your authenticator app, or a backup code.</p>
+      </div>
+      ${error}
+      <form method="POST" action="/login/2fa" class="auth-form">
+        ${renderCsrfHiddenInput(csrfToken)}
+        <input type="hidden" name="next" value="${escapeAttr(next)}" />
+        <label class="field">
+          <span class="field-label">Authentication code</span>
+          <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code"
+                 autofocus required placeholder="123456" />
+        </label>
+        <button type="submit" class="btn btn-primary">Verify</button>
+      </form>
+    </div>`;
+  return baseDocument("Two-factor authentication — Parachute", body);
 }
 
 // --- error page ------------------------------------------------------------

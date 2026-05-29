@@ -67,11 +67,16 @@
  *   /api/users/<id>               (DELETE)     → hard-delete user + revoke tokens (host:admin)
  *   /api/users/<id>/reset-password (POST)      → admin-initiated password reset (host:admin)
  *   /login                        (GET + POST) → operator password login
+ *   /login/2fa                    (POST)       → second-factor (TOTP/backup) step
+ *                                                 (hub#473; reached after a correct
+ *                                                 password for a 2FA-enrolled user)
  *   /logout                       (POST)       → end admin session
  *   /account/change-password      (GET + POST) → user self-service change-password
  *                                                 (force-redirect target for users
  *                                                 with password_changed=false; also
  *                                                 reachable directly to rotate)
+ *   /account/2fa                  (GET + POST) → user self-service 2FA enroll/disenroll
+ *                                                 (hub#473; QR + backup codes)
  *   /admin/config*                             → 301 → /admin/vaults (legacy
  *                                                portal retired post-SPA-rework)
  *
@@ -113,6 +118,7 @@ import { handleListGrants, handleRevokeGrant } from "./admin-grants.ts";
 import {
   handleAdminLoginGet,
   handleAdminLoginPost,
+  handleAdminLoginTotpPost,
   handleAdminLogoutPost,
 } from "./admin-handlers.ts";
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
@@ -199,6 +205,7 @@ import {
 } from "./setup-wizard.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
 import type { Supervisor } from "./supervisor.ts";
+import { handleTwoFactorGet, handleTwoFactorPost } from "./two-factor-handlers.ts";
 import { getUserById, userCount } from "./users.ts";
 import {
   WELL_KNOWN_DIR,
@@ -2029,6 +2036,17 @@ export function hubFetch(
       return new Response("method not allowed", { status: 405 });
     }
 
+    // /login/2fa — second-factor step (hub#473). POST-only: reached only
+    // after a correct password POST for a 2FA-enrolled user handed back a
+    // pending-login cookie + rendered the challenge page. A bare GET (e.g.
+    // browser back button) has no form to render usefully, so 405 → the
+    // operator restarts at /login.
+    if (pathname === "/login/2fa") {
+      if (!getDb) return dbNotConfigured();
+      if (req.method === "POST") return handleAdminLoginTotpPost(getDb(), req);
+      return new Response("method not allowed", { status: 405 });
+    }
+
     if (pathname === "/logout") {
       if (!getDb) return dbNotConfigured();
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
@@ -2053,6 +2071,18 @@ export function hubFetch(
       const accountDeps = { db: getDb() };
       if (req.method === "GET") return handleAccountChangePasswordGet(req, accountDeps);
       if (req.method === "POST") return handleAccountChangePasswordPost(req, accountDeps);
+      return new Response("method not allowed", { status: 405 });
+    }
+
+    // /account/2fa — user self-service TOTP 2FA enroll / disenroll (hub#473).
+    // Both GET (render state) and POST (start/confirm/disable) require an
+    // active session; the handler does the session check + 302 to /login when
+    // missing, same posture as /account/change-password.
+    if (pathname === "/account/2fa") {
+      if (!getDb) return dbNotConfigured();
+      const twoFactorDeps = { db: getDb() };
+      if (req.method === "GET") return handleTwoFactorGet(req, twoFactorDeps);
+      if (req.method === "POST") return handleTwoFactorPost(req, twoFactorDeps);
       return new Response("method not allowed", { status: 405 });
     }
 

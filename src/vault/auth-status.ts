@@ -18,11 +18,12 @@
  *   3. ~/.parachute/vault/data/<name>/vault.db (SQLite) → tokens table
  *      count, summed across every vault instance.
  *
- * The hub.db schema doesn't yet carry a TOTP column (2FA lands in a later
- * phase per the multi-user design doc); we always report `hasTotp: false`
- * when the hub.db path is the source of truth. That matches what's
- * actually shipped — pretending otherwise would whisper "you're covered"
- * when no second factor exists.
+ * As of hub#473 the hub.db `users` table carries TOTP columns
+ * (`totp_secret` et al.) and `/login` enforces a second factor when set, so
+ * `hasTotp` now reflects the hub.db state: true when any user has a non-empty
+ * `totp_secret`. The legacy vault `config.yaml` `totp_secret` (which never
+ * gated hub `/login`) is still read as a fallback for super-old installs whose
+ * hub.db is absent, but real hub-login 2FA is the hub.db signal.
  *
  * The YAML fallback path uses line-anchored regex parsing that matches
  * vault's own `readGlobalConfig()` semantics (parachute-vault src/config.ts):
@@ -99,6 +100,16 @@ export interface AuthStatusOpts {
    * want true "I can sign in" semantics get the OR of hub.db∪YAML.
    */
   probeHubDbHasUserPassword?: (dbPath: string) => boolean | undefined;
+  /**
+   * Probe hub.db for "does at least one user row have a non-empty
+   * `totp_secret`?" — the canonical "real hub-login 2FA is on" signal
+   * (hub#473). Same tri-state semantics as {@link probeHubDbHasUserPassword}:
+   *   - `true`  → at least one user has TOTP enrolled.
+   *   - `false` → hub.db opened cleanly but no user has a secret.
+   *   - `undefined` → hub.db missing / unreadable / column absent (pre-v11);
+   *                   caller falls back to the legacy YAML probe.
+   */
+  probeHubDbHasTotp?: (dbPath: string) => boolean | undefined;
 }
 
 interface Resolved {
@@ -108,6 +119,7 @@ interface Resolved {
   listVaultNames: (dataDir: string) => string[];
   countTokens: (dbPath: string) => number;
   probeHubDbHasUserPassword: (dbPath: string) => boolean | undefined;
+  probeHubDbHasTotp: (dbPath: string) => boolean | undefined;
 }
 
 function defaultVaultHome(): string {
@@ -203,6 +215,39 @@ function defaultProbeHubDbHasUserPassword(dbPath: string): boolean | undefined {
   }
 }
 
+/**
+ * Open hub.db readonly and ask "does at least one user have a non-empty
+ * `totp_secret`?" — the real hub-login 2FA signal (hub#473). Returns
+ * `undefined` on any failure (DB missing, locked, or the `totp_secret` column
+ * absent because migration v11 hasn't applied) — the caller then falls back to
+ * the legacy YAML probe. Readonly open (no migration side effects) mirrors
+ * {@link defaultProbeHubDbHasUserPassword}.
+ */
+function defaultProbeHubDbHasTotp(dbPath: string): boolean | undefined {
+  if (!existsSync(dbPath)) return undefined;
+  const { Database } = require("bun:sqlite");
+  let db: { prepare: (sql: string) => { get: () => unknown }; close: () => void } | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true }) as typeof db;
+    const row = db
+      ?.prepare(
+        "SELECT COUNT(*) AS n FROM users WHERE totp_secret IS NOT NULL AND length(totp_secret) > 0",
+      )
+      .get() as { n: number } | null;
+    return (row?.n ?? 0) > 0;
+  } catch {
+    // Column absent (pre-v11) or DB unreadable — indistinguishable from
+    // "no hub.db"; let the YAML fallback decide.
+    return undefined;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
 function resolve(opts: AuthStatusOpts): Resolved {
   return {
     vaultHome: opts.vaultHome ?? defaultVaultHome(),
@@ -211,6 +256,7 @@ function resolve(opts: AuthStatusOpts): Resolved {
     listVaultNames: opts.listVaultNames ?? defaultListVaultNames,
     countTokens: opts.countTokens ?? defaultCountTokens,
     probeHubDbHasUserPassword: opts.probeHubDbHasUserPassword ?? defaultProbeHubDbHasUserPassword,
+    probeHubDbHasTotp: opts.probeHubDbHasTotp ?? defaultProbeHubDbHasTotp,
   };
 }
 
@@ -262,12 +308,14 @@ function readAuthSignals(r: Resolved): AuthSignals {
   const yaml = readYamlAuth(r);
   const hubDbHasUser = r.probeHubDbHasUserPassword(r.hubDbPath);
   const hasOwnerPassword = hubDbHasUser === true ? true : yaml.hasOwnerPassword;
-  return {
-    hasOwnerPassword,
-    // No hub-side TOTP column shipped yet (multi-user Phase 3). Until it
-    // lands, TOTP is YAML-only — matches what's actually true on disk.
-    hasTotp: yaml.hasTotp,
-  };
+  // Real hub-login 2FA (hub#473): read hub.db's totp_secret. `undefined` (DB
+  // missing / pre-v11 column absent) falls back to the legacy YAML totp_secret
+  // — that one never gated hub `/login`, but suppressing the warning for an
+  // operator who set it avoids nagging. A definitive hub.db `false` (column
+  // present, no user enrolled) overrides a stale YAML true.
+  const hubDbHasTotp = r.probeHubDbHasTotp(r.hubDbPath);
+  const hasTotp = hubDbHasTotp === undefined ? yaml.hasTotp : hubDbHasTotp;
+  return { hasOwnerPassword, hasTotp };
 }
 
 /**

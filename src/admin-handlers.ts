@@ -11,9 +11,17 @@
  * (`parachute_hub_csrf` cookie + `__csrf` form field, constant-time compare).
  */
 import type { Database } from "bun:sqlite";
-import { renderAdminError, renderAdminLogin } from "./admin-login-ui.ts";
+import { renderAdminError, renderAdminLogin, renderTotpChallenge } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { checkAndRecord, clientIpFromRequest } from "./rate-limit.ts";
+import {
+  buildPendingLoginClearCookie,
+  buildPendingLoginCookie,
+  consumePendingLogin,
+  createPendingLogin,
+  getPendingLogin,
+  parsePendingLoginCookie,
+} from "./pending-login.ts";
+import { checkAndRecord, clientIpFromRequest, totpRateLimiter } from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import {
   SESSION_TTL_MS,
@@ -23,9 +31,11 @@ import {
   deleteSession,
   parseSessionCookie,
 } from "./sessions.ts";
+import { isTotpEnrolled, verifySecondFactor } from "./two-factor-store.ts";
 import {
   PASSWORD_MAX_LEN,
   type User,
+  getUserById,
   getUserByUsername,
   isFirstAdmin,
   verifyPassword,
@@ -214,8 +224,42 @@ export async function handleAdminLoginPost(
       401,
     );
   }
+
+  // 2FA gate (hub#473). If the user has TOTP enrolled, the password is only
+  // the *first* factor — do NOT mint a session yet. Stash a short-lived
+  // pending-login (server-side, keyed by an opaque cookie token) and render
+  // the "enter your code" page. The session is minted in
+  // `handleAdminLoginTotpPost` only after the second factor verifies.
+  // Users WITHOUT 2FA fall through to the existing password-only path
+  // unchanged — existing operators keep signing in exactly as before.
+  if (isTotpEnrolled(db, user.id)) {
+    const pendingToken = createPendingLogin(user.id, next);
+    // Reuse the same CSRF token (cookie unchanged) for the challenge form.
+    return htmlResponse(renderTotpChallenge({ next, csrfToken }), 200, {
+      "set-cookie": buildPendingLoginCookie(pendingToken, req),
+    });
+  }
+
+  return mintSessionAndRedirect(db, req, user, next);
+}
+
+/**
+ * Mint a session for an authenticated user and 302 to the resolved target.
+ * Shared by the password-only login path and the post-2FA path so both apply
+ * the identical force-change-password / friend-rewrite redirect logic.
+ *
+ * `extraCookies` lets the 2FA path also clear the pending-login cookie in the
+ * same response.
+ */
+function mintSessionAndRedirect(
+  db: Database,
+  req: Request,
+  user: User,
+  next: string,
+  extraCookies: string[] = [],
+): Response {
   const session = createSession(db, { userId: user.id });
-  const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
+  const sessionCookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
     secure: isHttpsRequest(req),
   });
   // Multi-user Phase 1 PR 3 — `password_changed === false` (admin-created
@@ -226,7 +270,118 @@ export async function handleAdminLoginPost(
   // `next` rides along on the change-password URL so the post-change
   // POST can land them at their intended destination.
   const target = loginRedirectTarget(db, user, next);
-  return redirect(target, { "set-cookie": cookie });
+  const headers = new Headers({ location: target });
+  headers.append("set-cookie", sessionCookie);
+  for (const c of extraCookies) headers.append("set-cookie", c);
+  return new Response(null, { status: 302, headers });
+}
+
+/**
+ * POST `/login/2fa` — the second-factor step (hub#473).
+ *
+ * Reached only after a correct password POST for a 2FA-enrolled user handed
+ * back a pending-login cookie. Order of checks:
+ *   1. CSRF (else 400 — same shape as `/login`).
+ *   2. Per-IP rate-limit (5 / 15 min) BEFORE the factor check, so backup-code
+ *      / TOTP grinding by a password-holder is bounded.
+ *   3. Pending-login cookie resolves to a live half-login (else 401 — the
+ *      pending login expired or was never created; restart the password step).
+ *   4. The user row still exists + still has 2FA enrolled (defensive).
+ *   5. Verify the submitted code as TOTP (±1 window) OR a backup code (single-
+ *      use, consumed on match). On success: consume the pending login, mint
+ *      the session, 302 to the resolved target + clear the pending cookie.
+ *      On failure: re-render the challenge with an error (the pending login
+ *      stays valid so the user can retry without re-entering the password).
+ */
+export async function handleAdminLoginTotpPost(
+  db: Database,
+  req: Request,
+  deps: AdminLoginDeps = {},
+): Promise<Response> {
+  const form = await req.formData();
+  const formCsrf = form.get(CSRF_FIELD_NAME);
+  const csrfToken = typeof formCsrf === "string" ? formCsrf : "";
+  if (!verifyCsrfToken(req, csrfToken || null)) {
+    return htmlResponse(
+      renderAdminError({
+        title: "Invalid form submission",
+        message: "The form's CSRF token did not match. Reload the page and try again.",
+      }),
+      400,
+    );
+  }
+
+  const next = safeNext(String(form.get("next") ?? ""));
+  const code = String(form.get("code") ?? "");
+
+  // Rate-limit BEFORE resolving the pending login or verifying the factor.
+  const clientIp = clientIpFromRequest(req);
+  const now = deps.now ? deps.now() : new Date();
+  const gate = totpRateLimiter.checkAndRecord(clientIp, now);
+  if (!gate.allowed) {
+    return htmlResponse(
+      renderAdminError({
+        title: "Too many attempts",
+        message: `Too many verification attempts from this IP. Try again in ${gate.retryAfterSeconds ?? 1} seconds.`,
+      }),
+      429,
+      { "retry-after": String(gate.retryAfterSeconds ?? 1) },
+    );
+  }
+
+  const pendingToken = parsePendingLoginCookie(req.headers.get("cookie"));
+  const pending = getPendingLogin(pendingToken, () => now);
+  if (!pending) {
+    // No live pending login — expired, missing, or tampered. Send the user
+    // back to the start; clear any stale pending cookie.
+    return htmlResponse(
+      renderAdminError({
+        title: "Session expired",
+        message: "Your sign-in attempt expired. Please sign in again.",
+      }),
+      401,
+      { "set-cookie": buildPendingLoginClearCookie(req) },
+    );
+  }
+
+  const user = getUserById(db, pending.userId);
+  if (!user || !isTotpEnrolled(db, user.id)) {
+    consumePendingLogin(pendingToken);
+    return htmlResponse(
+      renderAdminError({
+        title: "Sign-in unavailable",
+        message: "Please sign in again.",
+      }),
+      401,
+      { "set-cookie": buildPendingLoginClearCookie(req) },
+    );
+  }
+
+  if (!code) {
+    return htmlResponse(
+      renderTotpChallenge({ next, csrfToken, errorMessage: "Enter your authentication code." }),
+      400,
+    );
+  }
+
+  const result = await verifySecondFactor(db, user.id, code);
+  if (!result.ok) {
+    return htmlResponse(
+      renderTotpChallenge({
+        next,
+        csrfToken,
+        errorMessage: "That code is incorrect or expired. Try again.",
+      }),
+      401,
+    );
+  }
+
+  // Second factor good. Consume the pending login (single use), mint the
+  // session, and clear the pending cookie in the same response. Use the
+  // pending login's stored `next` if the form's was tampered to the default.
+  consumePendingLogin(pendingToken);
+  const target = pending.next && pending.next !== POST_LOGIN_DEFAULT ? pending.next : next;
+  return mintSessionAndRedirect(db, req, user, target, [buildPendingLoginClearCookie(req)]);
 }
 
 /**

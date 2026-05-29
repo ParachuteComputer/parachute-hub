@@ -55,6 +55,7 @@ import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { changePasswordRateLimiter } from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { findActiveSession } from "./sessions.ts";
+import { isTotpEnrolled } from "./two-factor-store.ts";
 import {
   PASSWORD_MAX_LEN,
   UserNotFoundError,
@@ -497,6 +498,7 @@ export function handleAccountHomeGet(req: Request, deps: AccountHomeDeps): Respo
       hubOrigin: deps.hubOrigin,
       isFirstAdmin: adminFlag,
       csrfToken: csrf.token,
+      twoFactorEnabled: isTotpEnrolled(deps.db, user.id),
     }),
     200,
     extra,

@@ -32,6 +32,7 @@ describe("renderAccountHome", () => {
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: false,
       csrfToken: CSRF,
+      twoFactorEnabled: false,
     });
     // Welcome header includes the username.
     expect(html).toContain("Welcome, alice");
@@ -69,6 +70,7 @@ describe("renderAccountHome", () => {
       hubOrigin: `${HUB_ORIGIN}/`,
       isFirstAdmin: false,
       csrfToken: CSRF,
+      twoFactorEnabled: false,
     });
     const cleanEncoded = encodeURIComponent(`${HUB_ORIGIN}/vault/alice`);
     expect(html).toContain(`https://notes.parachute.computer/add?url=${cleanEncoded}`);
@@ -86,6 +88,7 @@ describe("renderAccountHome", () => {
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: true,
       csrfToken: CSRF,
+      twoFactorEnabled: false,
     });
     expect(html).toContain("Welcome, admin");
     expect(html).toContain("hub administrator");
@@ -106,6 +109,7 @@ describe("renderAccountHome", () => {
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: false,
       csrfToken: CSRF,
+      twoFactorEnabled: false,
     });
     expect(html).toContain("Welcome, ghost");
     expect(html).toContain("Ask the hub operator");
@@ -123,6 +127,7 @@ describe("renderAccountHome", () => {
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: false,
       csrfToken: CSRF,
+      twoFactorEnabled: false,
     });
     // Change-password link points at the existing /account/change-password
     // route (server-rendered HTML, separate handler).
@@ -136,6 +141,37 @@ describe("renderAccountHome", () => {
     expect(html).toContain("<code>alice</code>");
   });
 
+  test("account card — 2FA status reflects twoFactorEnabled (hub#473)", () => {
+    const off = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    expect(off).toContain('data-testid="2fa-status"');
+    expect(off).toContain(">Off<");
+    // Off → "Set up two-factor" affordance.
+    expect(off).toContain('data-testid="setup-2fa-link"');
+    expect(off).toContain('href="/account/2fa"');
+
+    const on = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: true,
+    });
+    expect(on).toContain(">On<");
+    // On → "Manage two-factor" affordance.
+    expect(on).toContain('data-testid="manage-2fa-link"');
+    expect(on).toContain('href="/account/2fa"');
+  });
+
   test("multi-vault branch — renders one tile per assigned vault (Phase 2 PR 2)", () => {
     const html = renderAccountHome({
       username: "alice",
@@ -144,6 +180,7 @@ describe("renderAccountHome", () => {
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: false,
       csrfToken: CSRF,
+      twoFactorEnabled: false,
     });
     // Plural heading.
     expect(html).toContain("Your vaults");
@@ -191,6 +228,7 @@ describe("renderAccountHome", () => {
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: false,
       csrfToken: CSRF,
+      twoFactorEnabled: false,
     });
     // The injected username/vault metacharacters are escaped — the only
     // `<script>` tag in the output is the page's own copy-button helper, so

@@ -2,7 +2,8 @@
  * Hub-local SQLite database. Opens `~/.parachute/hub.db` (overridable via
  * `$PARACHUTE_HOME`). Holds everything the hub owns as the ecosystem's OAuth
  * issuer — signing keys (v1), users + opaque refresh tokens (v2), OAuth
- * clients + auth-codes + grants + browser sessions (v3).
+ * clients + auth-codes + grants + browser sessions (v3), and TOTP 2FA
+ * enrollment on the users row (v11, hub#473).
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -318,6 +319,43 @@ const MIGRATIONS: readonly Migration[] = [
       FROM users
       WHERE assigned_vault IS NOT NULL;
       ALTER TABLE users DROP COLUMN assigned_vault;
+    `,
+  },
+  {
+    version: 11,
+    sql: `
+      -- Real TOTP 2FA at the hub login layer (hub#473). Three nullable
+      -- columns on \`users\`:
+      --
+      --   * totp_secret (TEXT, nullable) — the base32-encoded RFC 6238 TOTP
+      --     secret. NULL means "2FA not enrolled" — the canonical "is 2FA on
+      --     for this user?" signal. Stored as the plaintext base32 string
+      --     (not encrypted at rest): hub.db already holds the argon2id
+      --     password hashes AND the OAuth signing private keys in plaintext
+      --     PEM (signing_keys.private_key_pem), so the TOTP secret sits at
+      --     the same operator-local trust boundary — encrypting one column
+      --     while leaving the signing key in the clear would be security
+      --     theatre. A future at-rest-encryption pass (hub#474 follow-up)
+      --     would cover all three (password hashes are already one-way; the
+      --     signing key + TOTP secret are the recoverable secrets).
+      --   * totp_backup_codes (TEXT, nullable) — JSON array of argon2id-HASHED
+      --     single-use recovery codes. Same hash family as passwords
+      --     (@node-rs/argon2). Plaintext codes are shown to the user exactly
+      --     once at enrollment and never stored. A code is removed from the
+      --     array when consumed. NULL / "[]" means "no backup codes left."
+      --   * totp_enrolled_at (TEXT, nullable) — ISO-8601 timestamp of the
+      --     last successful enrollment. NULL until first enroll; informational
+      --     (admin UI / account page "2FA enabled since …").
+      --
+      -- Backfill: every existing user pre-dates this migration and gets NULL
+      -- for all three — i.e. "2FA not enrolled." Their /login flow stays
+      -- password-only (the login handler only requires a TOTP step when
+      -- totp_secret IS NOT NULL), so existing operators keep signing in
+      -- exactly as before. No backfill UPDATE needed — the column default is
+      -- NULL.
+      ALTER TABLE users ADD COLUMN totp_secret TEXT;
+      ALTER TABLE users ADD COLUMN totp_backup_codes TEXT;
+      ALTER TABLE users ADD COLUMN totp_enrolled_at TEXT;
     `,
   },
 ];

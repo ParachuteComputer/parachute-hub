@@ -81,6 +81,18 @@ export const CHANGE_PASSWORD_WINDOW_MS = 5 * 60 * 1000;
  * cookie attacker shouldn't get a 5-shot grind window.
  */
 export const CHANGE_PASSWORD_MAX_ATTEMPTS = 3;
+/**
+ * `/login/2fa` window length: 15 minutes — same as `/login`. The second-
+ * factor step (hub#473) sits behind a verified password + a short-lived
+ * pending-login token, so the threat model is "attacker who already has the
+ * password grinding 6-digit codes / backup codes." A 5-attempt / 15-min
+ * bucket per IP turns 10^6-space TOTP grinding into "rotate IPs," same floor
+ * as `/login`. Keyed by IP (the pending-login token is short-lived and an
+ * attacker could mint many, so IP is the stable actor key here).
+ */
+export const TOTP_WINDOW_MS = 15 * 60 * 1000;
+/** `/login/2fa` attempts allowed per window. 6th within the window is denied. */
+export const TOTP_MAX_ATTEMPTS = 5;
 /** Sentinel for the IP-extraction priority chain when nothing parsed. */
 export const UNKNOWN_IP_SENTINEL = "unknown";
 
@@ -198,6 +210,15 @@ export const changePasswordRateLimiter = new RateLimiter(
 );
 
 /**
+ * `/login/2fa` rate limiter — per-IP, 5 attempts / 15 min (hub#473). Bounds
+ * second-factor grinding by an attacker who already has the password. Separate
+ * bucket from `/login` so a password failure and a TOTP failure don't share a
+ * window — but both are per-IP so rotating egress IPs is the only escape, same
+ * as the password floor.
+ */
+export const totpRateLimiter = new RateLimiter(TOTP_MAX_ATTEMPTS, TOTP_WINDOW_MS);
+
+/**
  * Backwards-compat shim for hub#188's call sites: the original
  * top-level `checkAndRecord` was the login limiter. New code should
  * reach into `loginRateLimiter.checkAndRecord` directly.
@@ -215,6 +236,7 @@ export function checkAndRecord(key: string, now: Date): RateLimitResult {
 export function __resetForTests(): void {
   loginRateLimiter.reset();
   changePasswordRateLimiter.reset();
+  totpRateLimiter.reset();
 }
 
 /**

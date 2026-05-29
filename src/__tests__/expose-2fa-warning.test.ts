@@ -24,46 +24,53 @@ describe("is2FAEnrolled", () => {
     expect(is2FAEnrolled({ status: status({ hasTotp: false }) })).toBe(false);
   });
 
-  test("reads totp_secret from vaultHome's config.yaml when status not supplied", () => {
+  test("falls back to legacy config.yaml totp_secret when hub.db is absent", () => {
+    // hub#473: hub.db is the source of truth for real 2FA, but a super-old
+    // install with no hub.db still suppresses the warning if the legacy vault
+    // YAML totp_secret is set. Point hubDbPath at a nonexistent file so the
+    // YAML fallback is exercised.
     const dir = mkdtempSync(join(tmpdir(), "pcli-2fa-warn-"));
     try {
       writeFileSync(join(dir, "config.yaml"), 'totp_secret: "JBSWY3DPEHPK3PXP"\n');
-      expect(is2FAEnrolled({ vaultHome: dir })).toBe(true);
+      expect(is2FAEnrolled({ vaultHome: dir, hubDbPath: join(dir, "absent-hub.db") })).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("missing config.yaml → not enrolled (false)", () => {
+  test("missing config.yaml + absent hub.db → not enrolled (false)", () => {
     const dir = mkdtempSync(join(tmpdir(), "pcli-2fa-warn-"));
     try {
-      // No config.yaml written.
-      expect(is2FAEnrolled({ vaultHome: dir })).toBe(false);
+      // No config.yaml written, no hub.db.
+      expect(is2FAEnrolled({ vaultHome: dir, hubDbPath: join(dir, "absent-hub.db") })).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("empty totp_secret value → not enrolled (matches vault's readGlobalConfig)", () => {
+  test("empty totp_secret value + absent hub.db → not enrolled", () => {
     const dir = mkdtempSync(join(tmpdir(), "pcli-2fa-warn-"));
     try {
       writeFileSync(join(dir, "config.yaml"), 'totp_secret: ""\n');
-      expect(is2FAEnrolled({ vaultHome: dir })).toBe(false);
+      expect(is2FAEnrolled({ vaultHome: dir, hubDbPath: join(dir, "absent-hub.db") })).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("malformed config.yaml → not enrolled (safer fail mode, fires warning)", () => {
-    // The probe parses config.yaml with a line-anchored regex (no YAML
-    // dependency), so junk content simply doesn't match `totp_secret: "..."`
-    // and resolves to `hasTotp: false` — which fires the public-exposure
-    // warning rather than silently suppressing it. Pin that contract so a
-    // future refactor of auth-status.ts can't quietly invert it.
+  test("hub.db with an enrolled user → enrolled (the real signal)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pcli-2fa-warn-"));
     try {
-      writeFileSync(join(dir, "config.yaml"), "totp_secret: [unbalanced\n  ::: not yaml\n");
-      expect(is2FAEnrolled({ vaultHome: dir })).toBe(false);
+      const { hubDbPath, openHubDb } = await import("../hub-db.ts");
+      const { createUser } = await import("../users.ts");
+      const { persistEnrollment } = await import("../two-factor-store.ts");
+      const { generateTotpSecret } = await import("../totp.ts");
+      const dbPath = hubDbPath(dir);
+      const db = openHubDb(dbPath);
+      const u = await createUser(db, "owner", "owner-password-123");
+      await persistEnrollment(db, u.id, generateTotpSecret("owner").secret);
+      db.close();
+      expect(is2FAEnrolled({ vaultHome: dir, hubDbPath: dbPath })).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -80,13 +87,14 @@ describe("printPublic2FAWarning", () => {
     });
     expect(fired).toBe(true);
     const joined = logs.join("\n");
-    // Honest copy: /login is public, owner password is the wall, hub-login 2FA
-    // is coming (#473) — does NOT recommend the dead `auth 2fa enroll` path.
+    // hub#473: real hub-login 2FA. The warning now recommends the real
+    // `parachute auth 2fa enroll` path (+ the /account/2fa browser path) and
+    // still nudges a strong owner password.
     expect(joined).toContain("/login is now reachable on the public internet");
     expect(joined).toContain("https://vault.example.com/login");
-    expect(joined).toContain("#473");
+    expect(joined).toContain("parachute auth 2fa enroll");
+    expect(joined).toContain("/account/2fa");
     expect(joined).toContain("parachute auth set-password");
-    expect(joined).not.toContain("parachute auth 2fa enroll");
   });
 
   test("enrolled → suppressed, returns false, logs nothing", () => {
