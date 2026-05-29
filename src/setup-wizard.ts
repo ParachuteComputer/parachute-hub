@@ -509,7 +509,11 @@ export interface RenderAccountStepProps {
 export function renderAccountStep(props: RenderAccountStepProps): string {
   const { csrfToken, errorMessage, username, requireBootstrapToken, bootstrapToken } = props;
   const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
-  const usernameAttr = username ? ` value="${escapeAttr(username)}"` : "";
+  // Pre-fill "owner" on a fresh render (no prior submission) so the web wizard's
+  // default matches the CLI paths (`set-password`, `setup-wizard`) + the
+  // operator.token convention. Operators can still type any name. On a
+  // validation-failure re-render we echo back what they typed instead.
+  const usernameAttr = ` value="${escapeAttr(username ?? "owner")}"`;
   const tokenAttr = bootstrapToken ? ` value="${escapeAttr(bootstrapToken)}"` : "";
   // Bootstrap-token field comes FIRST when required. An operator who
   // missed the log line is stopped here rather than after filling
