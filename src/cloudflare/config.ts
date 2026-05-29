@@ -2,8 +2,6 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "../config.ts";
 
-export const CLOUDFLARED_DIR = join(CONFIG_DIR, "cloudflared");
-
 export const DEFAULT_TUNNEL_NAME = "parachute";
 
 /**
@@ -29,8 +27,7 @@ export function cloudflaredPathsFor(
   configPath: string;
   logPath: string;
 } {
-  const base = configDir === CONFIG_DIR ? CLOUDFLARED_DIR : join(configDir, "cloudflared");
-  const dir = join(base, tunnelName);
+  const dir = join(configDir, "cloudflared", tunnelName);
   return {
     configPath: join(dir, "config.yml"),
     logPath: join(dir, "cloudflared.log"),
