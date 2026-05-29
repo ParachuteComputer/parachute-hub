@@ -149,8 +149,16 @@ describe("selfHealOperatorTokenIssuer", () => {
         const hdr = parts[0] ?? "";
         const body = parts[1] ?? "";
         const sig = parts[2] ?? "";
-        // Flip a character in the signature; keep it base64url-shaped.
-        const tampered = `${hdr}.${body}.${sig.slice(0, -1)}${sig.endsWith("A") ? "B" : "A"}`;
+        // Flip a character in the MIDDLE of the signature, keeping it
+        // base64url-shaped. Corrupting the last char is unreliable: the final
+        // base64url char of an RS256 signature encodes only padding bits, so a
+        // flip there can decode to identical bytes and leave the signature
+        // valid (~25% of mints). A mid-signature char sits in a full 4-char
+        // group with no padding, so any single-char change deterministically
+        // alters the decoded bytes and invalidates the signature.
+        const mid = Math.floor(sig.length / 2);
+        const flipped = sig[mid] === "A" ? "B" : "A";
+        const tampered = `${hdr}.${body}.${sig.slice(0, mid)}${flipped}${sig.slice(mid + 1)}`;
         await writeOperatorTokenFile(tampered, h.dir);
 
         const status = await selfHealOperatorTokenIssuer(db, {
