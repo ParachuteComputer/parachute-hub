@@ -42,7 +42,17 @@ export function isLoopbackOrigin(origin: string): boolean {
     // URL.hostname keeps IPv6 in bracket form (`[::1]`); strip them so the
     // comparison is on the bare address.
     const hostname = new URL(origin).hostname.replace(/^\[|\]$/g, "");
-    return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+    // `0.0.0.0` is a bind-all wildcard, not a reachable origin — `deriveHubOrigin`
+    // never emits it, but `--hub-origin http://0.0.0.0:1939` flows straight
+    // through `persistVaultHubOrigin`. Baking it into vault/.env would advertise
+    // a non-functional issuer and recreate the iss-mismatch class this guard
+    // exists to prevent. Refuse it like any other loopback.
+    return (
+      hostname === "127.0.0.1" ||
+      hostname === "localhost" ||
+      hostname === "::1" ||
+      hostname === "0.0.0.0"
+    );
   } catch {
     return false;
   }

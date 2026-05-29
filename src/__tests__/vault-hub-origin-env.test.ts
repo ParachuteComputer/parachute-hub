@@ -30,10 +30,12 @@ function vaultEnv(): string {
 }
 
 describe("isLoopbackOrigin", () => {
-  test("flags 127.0.0.1 / localhost / [::1]", () => {
+  test("flags 127.0.0.1 / localhost / [::1] / 0.0.0.0", () => {
     expect(isLoopbackOrigin("http://127.0.0.1:1939")).toBe(true);
     expect(isLoopbackOrigin("http://localhost:1939")).toBe(true);
     expect(isLoopbackOrigin("http://[::1]:1939")).toBe(true);
+    // 0.0.0.0 is a bind-all wildcard, not a reachable origin.
+    expect(isLoopbackOrigin("http://0.0.0.0:1939")).toBe(true);
   });
 
   test("does not flag a public FQDN", () => {
@@ -57,6 +59,15 @@ describe("persistVaultHubOrigin", () => {
 
   test("refuses to persist a loopback origin (would shadow a later exposure)", () => {
     const wrote = persistVaultHubOrigin(dir, "http://127.0.0.1:1939", () => {});
+    expect(wrote).toBe(false);
+    expect(existsSync(vaultEnv())).toBe(false);
+  });
+
+  test("refuses to persist a 0.0.0.0 origin (--hub-origin flows straight through)", () => {
+    // `--hub-origin http://0.0.0.0:1939` bypasses deriveHubOrigin and reaches
+    // here verbatim; baking a bind-all wildcard into vault/.env would advertise
+    // a non-functional issuer and recreate the iss-mismatch class.
+    const wrote = persistVaultHubOrigin(dir, "http://0.0.0.0:1939", () => {});
     expect(wrote).toBe(false);
     expect(existsSync(vaultEnv())).toBe(false);
   });
