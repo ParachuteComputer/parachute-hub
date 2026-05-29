@@ -1,4 +1,5 @@
-import { existsSync, openSync } from "node:fs";
+import { existsSync, openSync, readFileSync } from "node:fs";
+import { Socket } from "node:net";
 import { join } from "node:path";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { readEnvFileValues } from "../env-file.ts";
@@ -85,6 +86,44 @@ export type KillFn = (pid: number, signal: NodeJS.Signals | number) => void;
 export type SleepFn = (ms: number) => Promise<void>;
 
 /**
+ * "Is something listening on this TCP port on loopback?" seam. Pairs with the
+ * spawn-then-die settle (hub#194) to catch the *other* silent-start failure
+ * shape (hub#487): a service that lives long enough to clear the liveness
+ * check but never binds its port because the port is already held (EADDRINUSE
+ * from an orphan). The recorded pid stays alive (vault's process supervisor
+ * retries / lingers) so `alive(pid)` says "running" while `parachute status`
+ * shows it inactive because nothing answers on the port.
+ *
+ * Tests inject a deterministic stub; production uses `defaultPortListening`.
+ */
+export type PortListeningFn = (port: number) => Promise<boolean>;
+
+/**
+ * Connect-probe: open a TCP socket to 127.0.0.1:<port> and see if it's
+ * accepted. A successful connect means *something* is listening; we close
+ * immediately. Connection refused / timeout means nothing is bound yet.
+ * `node:net` rather than `Bun.connect` because the latter has no clean
+ * "connection refused → false" without a custom socket handler, and the net
+ * Socket's `error`/`connect` events map directly onto the boolean we want.
+ */
+export const defaultPortListening: PortListeningFn = (port) =>
+  new Promise((resolve) => {
+    const socket = new Socket();
+    let settled = false;
+    const done = (listening: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(listening);
+    };
+    socket.setTimeout(1000);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+    socket.connect(port, "127.0.0.1");
+  });
+
+/**
  * Group-aware liveness: returns true if the process group (pgid == pid)
  * still has any member. Pairs with `defaultSpawner`'s `detached: true` —
  * the recorded pid is the pgid we created, so the group's existence is
@@ -130,6 +169,35 @@ export const defaultKill: KillFn = (pid, signal) => {
 
 export const defaultSleep: SleepFn = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Read the trailing `n` lines of a logfile, best-effort. Used to surface the
+ * real boot error when a start fails — operators shouldn't have to manually
+ * `tail` the log to learn *why* the daemon died. Returns [] on any read
+ * error (missing file, permissions) so the caller falls back to the generic
+ * "tail the log" hint without throwing.
+ */
+function readLogTail(logFile: string, n: number): string[] {
+  try {
+    const content = readFileSync(logFile, "utf8");
+    const trimmed = content.replace(/\n$/, "");
+    if (trimmed === "") return [];
+    return trimmed.split("\n").slice(-n);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Heuristic EADDRINUSE detector over a logfile tail. cloudflared, Bun, and
+ * Node all surface port collisions with recognizable phrases; we match the
+ * common ones rather than parse a structured error (there isn't one across
+ * runtimes). False positives are harmless — the worst case is we *also* print
+ * the port-in-use remedy on an unrelated failure, which is still actionable.
+ */
+function detectAddrInUse(logTail: readonly string[]): boolean {
+  return logTail.some((line) => /EADDRINUSE|address already in use|port .* in use/i.test(line));
+}
+
 export interface LifecycleOpts {
   spawner?: Spawner;
   kill?: KillFn;
@@ -161,6 +229,30 @@ export interface LifecycleOpts {
    * settle.
    */
   startSettleMs?: number;
+  /**
+   * Probe whether the service's port is listening, post-spawn. Pairs with the
+   * settle (hub#194) to catch the EADDRINUSE-orphan shape (hub#487): the
+   * process survives the liveness window (vault lingers / retries) but never
+   * binds because the port is already held, so `start` would otherwise report
+   * "✓ started" while `status` shows it inactive. Tests inject a stub;
+   * production uses `defaultPortListening` (a loopback TCP connect probe).
+   */
+  portListening?: PortListeningFn;
+  /**
+   * How long `start` polls for the service to bind its port after the
+   * liveness settle passes. Default 4000ms in production — long enough to
+   * cover vault/scribe cold-boot (DB open, route registration) without making
+   * a healthy start feel laggy. Polled at `startReadyPollMs` intervals; the
+   * first time the port answers we declare success. If the window elapses
+   * with the process still alive but the port silent, we print a non-fatal
+   * warning (the daemon may still be coming up) rather than failing — only a
+   * *dead* process is a hard failure. Defaulting policy mirrors
+   * `startSettleMs`: 0 (skipped) unless `portListening` is injected or the
+   * production path (no spawner override) is active.
+   */
+  startReadyMs?: number;
+  /** Poll interval while waiting for the port to come up. Default 200ms. */
+  startReadyPollMs?: number;
   /**
    * Override the hub origin passed to services as PARACHUTE_HUB_ORIGIN. If
    * unset, `start` derives it from `expose-state.json` (when exposed) or
@@ -194,6 +286,9 @@ interface Resolved {
   killWaitMs: number;
   pollIntervalMs: number;
   startSettleMs: number;
+  portListening: PortListeningFn;
+  startReadyMs: number;
+  startReadyPollMs: number;
   hubOrigin: string | undefined;
   ensureHub: (opts: EnsureHubOpts) => Promise<EnsureHubResult>;
   stopHubFn: (opts: StopHubOpts) => Promise<boolean>;
@@ -220,6 +315,16 @@ function resolve(opts: LifecycleOpts): Resolved {
     // override `alive`, which re-enables the default 250ms.
     startSettleMs:
       opts.startSettleMs ?? (opts.spawner === undefined || opts.alive !== undefined ? 250 : 0),
+    portListening: opts.portListening ?? defaultPortListening,
+    // Same defaulting policy as startSettleMs: production (no spawner
+    // override) gets the real 4s readiness window; tests that inject a stub
+    // spawner get 0 (skipped) unless they explicitly opt in via
+    // `portListening` or `startReadyMs`, so existing stub-spawner tests don't
+    // start probing a fake port.
+    startReadyMs:
+      opts.startReadyMs ??
+      (opts.spawner === undefined || opts.portListening !== undefined ? 4000 : 0),
+    startReadyPollMs: opts.startReadyPollMs ?? 200,
     hubOrigin: resolveHubOrigin(opts.hubOrigin, configDir),
     ensureHub: opts.hub?.ensureRunning ?? ensureHubRunning,
     stopHubFn: opts.hub?.stop ?? stopHub,
@@ -464,21 +569,97 @@ export async function start(svc: string | undefined, opts: LifecycleOpts = {}): 
     }
     writePid(short, pid, r.configDir);
 
-    // Settle-poll for spawn-then-immediately-die (hub#194). A spawn returning
-    // a pid only proves the kernel forked the process; the child may exit
-    // microseconds later if its main code path throws before listening
-    // (e.g. notes-serve's Bun.resolveSync failing for bun-linked installs).
-    // Without this poll, we'd report success and the operator would chase
-    // a phantom 502.
+    // Boot-readiness gating (hub#194 + hub#487). A spawn returning a pid only
+    // proves the kernel forked the process — it says nothing about whether the
+    // service survived its boot or bound its port. Two silent-start shapes:
+    //
+    //   (1) spawn-then-immediately-die (hub#194): the child throws before
+    //       listening (notes-serve's Bun.resolveSync failing for bun-linked
+    //       installs) and exits microseconds later. Caught by the settle below.
+    //
+    //   (2) alive-but-never-bound (hub#487): the port is already held by an
+    //       orphan, the child hits EADDRINUSE, but its process *lingers* (or a
+    //       supervisor retries) long enough to clear the liveness check. `start`
+    //       would report "✓ started" while `parachute status` shows it inactive
+    //       because nothing answers on the port. Aaron hit exactly this with an
+    //       orphan holding vault's 1940 on a fresh EC2 box. Caught by the
+    //       port-readiness poll below.
+    //
+    // On any failure we surface the tail of the logfile so the operator sees
+    // the real boot error inline, and we specifically call out EADDRINUSE with
+    // the `lsof -ti:<port>` remedy.
+    const reportStartFailure = (reason: string): void => {
+      clearPid(short, r.configDir);
+      failures++;
+      const tail = readLogTail(logFile, 20);
+      if (detectAddrInUse(tail)) {
+        r.log(
+          `✗ ${short} failed to start: port ${entry.port} is already in use. Stop the existing process first — find it with \`lsof -ti:${entry.port}\` (then \`kill <pid>\`), or run \`parachute restart ${short}\`.`,
+        );
+      } else {
+        r.log(`✗ ${short} failed to start: ${reason}`);
+      }
+      if (tail.length > 0) {
+        r.log(`  ── last ${tail.length} log line(s) (${logFile}) ──`);
+        for (const line of tail) r.log(`  │ ${line}`);
+      } else {
+        r.log(`  Tail the log for details: tail -50 ${logFile}`);
+      }
+    };
+
     if (r.startSettleMs > 0) {
       await r.sleep(r.startSettleMs);
       if (!r.alive(pid)) {
-        clearPid(short, r.configDir);
-        failures++;
-        r.log(
-          `✗ ${short} failed to start: spawned pid ${pid} but the process exited within ${r.startSettleMs}ms.`,
+        reportStartFailure(
+          `spawned pid ${pid} but the process exited within ${r.startSettleMs}ms.`,
         );
-        r.log(`  Tail the log for details: tail -50 ${logFile}`);
+        continue;
+      }
+    }
+
+    // Port-readiness poll (hub#487). The process is alive; now confirm it
+    // actually bound its port before claiming success. Poll up to
+    // `startReadyMs`, re-checking liveness each iteration so a *later* death
+    // (e.g. a slow EADDRINUSE crash) is still reported as a failure. A process
+    // that stays alive but never binds within the window gets a non-fatal
+    // warning rather than a hard failure — some daemons legitimately do slow
+    // boot work, and we'd rather not flip a healthy-but-slow start to red.
+    if (r.startReadyMs > 0) {
+      const deadline = r.now() + r.startReadyMs;
+      let listening = false;
+      let died = false;
+      while (r.now() < deadline) {
+        if (!r.alive(pid)) {
+          died = true;
+          break;
+        }
+        if (await r.portListening(entry.port)) {
+          listening = true;
+          break;
+        }
+        await r.sleep(r.startReadyPollMs);
+      }
+      if (died) {
+        reportStartFailure(`spawned pid ${pid} but the process exited during startup.`);
+        continue;
+      }
+      if (!listening) {
+        // Last-chance liveness check — the loop may have exited on the
+        // deadline right as the process died.
+        if (!r.alive(pid)) {
+          reportStartFailure(`spawned pid ${pid} but the process exited during startup.`);
+          continue;
+        }
+        r.log(
+          `⚠ ${short} started (pid ${pid}) but port ${entry.port} isn't accepting connections yet after ${r.startReadyMs}ms.`,
+        );
+        r.log(
+          `  It may still be coming up — check \`parachute status\` and \`parachute logs ${short}\`.`,
+        );
+        if (r.hubOrigin) r.log(`  ${HUB_ORIGIN_ENV}=${r.hubOrigin}`);
+        if (short === "vault" && r.hubOrigin) {
+          persistVaultHubOrigin(r.configDir, r.hubOrigin, r.log);
+        }
         continue;
       }
     }
