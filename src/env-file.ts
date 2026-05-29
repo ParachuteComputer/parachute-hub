@@ -68,6 +68,16 @@ export function upsertEnvLine(lines: string[], key: string, value: string): stri
   return next;
 }
 
+/**
+ * Drop every `KEY=…` line for `key`, preserving the order of the rest.
+ * Returns a new array; the input is untouched. No-op (returns a copy) when
+ * the key isn't present.
+ */
+export function removeEnvLine(lines: string[], key: string): string[] {
+  const prefix = `${key}=`;
+  return lines.filter((line) => !line.startsWith(prefix));
+}
+
 export function writeEnvFile(path: string, lines: readonly string[]): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;

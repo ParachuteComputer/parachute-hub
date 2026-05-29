@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,7 @@ import {
   start,
   stop,
 } from "../commands/lifecycle.ts";
+import { readEnvFileValues } from "../env-file.ts";
 import { writeHubPort } from "../hub-control.ts";
 import { ensureLogPath, logPath, readPid, writePid } from "../process-state.ts";
 import { upsertService } from "../services-manifest.ts";
@@ -348,6 +349,37 @@ describe("parachute start", () => {
         PORT: "1940",
         PARACHUTE_HUB_ORIGIN: "https://parachute.taildf9ce2.ts.net",
       });
+      // OAuth issuer-mismatch fix: the spawn-env injection above is ephemeral
+      // (lost on the next launchd / systemd boot). `start vault` ALSO persists
+      // the public origin into vault/.env so the out-of-band daemon validates
+      // hub-minted JWTs' `iss` against it. Without this, every reconnect after
+      // a reboot / crash-restart 401s.
+      expect(readEnvFileValues(join(h.configDir, "vault", ".env")).PARACHUTE_HUB_ORIGIN).toBe(
+        "https://parachute.taildf9ce2.ts.net",
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("does NOT persist a loopback origin into vault/.env (would shadow a later exposure)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writeHubPort(1939, h.configDir);
+      const spawner = makeSpawner([4242]);
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      // Loopback is fine to inject into the ephemeral spawn env (local dev),
+      // but persisting it would brick the daemon path once exposure comes up:
+      // the baked loopback would shadow the real origin. So vault/.env stays
+      // absent of the key on a loopback-only start.
+      expect(existsSync(join(h.configDir, "vault", ".env"))).toBe(false);
     } finally {
       h.cleanup();
     }
