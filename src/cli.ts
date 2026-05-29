@@ -749,26 +749,13 @@ async function main(argv: string[]): Promise<number> {
       // after `vault` (including --help) is passed through verbatim.
       if (rest.length === 0) return await dispatchVault(["--help"]);
 
-      // `parachute vault tokens create` in a TTY with no scope-narrowing flag
-      // → guided flow. Any of --scope / --read / --permission means the user
-      // has already decided, so we stay out of the way. Non-TTY always
-      // bypasses (no way to answer a prompt). Label is orthogonal — the
-      // guided flow prompts for it only if --label wasn't supplied.
-      const wantsGuidedTokenCreate =
-        rest[0] === "tokens" &&
-        rest[1] === "create" &&
-        isTtyInteractive() &&
-        !rest.includes("--scope") &&
-        !rest.includes("--read") &&
-        !rest.includes("--permission") &&
-        !isHelpFlag(rest[2]);
-      if (wantsGuidedTokenCreate) {
-        const { runVaultTokensCreateInteractive } = await import(
-          "./commands/vault-tokens-create-interactive.ts"
-        );
-        return await runVaultTokensCreateInteractive({ args: rest.slice(2) });
-      }
-
+      // Everything under `vault` forwards transparently to `parachute-vault`.
+      // `vault tokens create` used to route through a guided interactive
+      // wrapper, but the pvt_* DROP (vault#412 / hub#466) removed that vault
+      // subcommand — it now exits 1 with migration guidance. Access tokens are
+      // hub-issued JWTs; mint them with `parachute auth mint-token` or the
+      // admin SPA Connect card. We forward verbatim so the operator sees
+      // vault's own migration error rather than a hub-side stub.
       return await dispatchVault(rest);
     }
 

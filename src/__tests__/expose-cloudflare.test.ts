@@ -192,7 +192,12 @@ describe("exposeCloudflareUp", () => {
       // Security copy surfaces both paths plus a pointer to the auth doc.
       const joined = logs.join("\n");
       expect(joined).toContain("parachute auth set-password");
-      expect(joined).toContain("parachute vault tokens create");
+      // Scripts/machines path points at the hub-JWT mint (vault#412 / hub#466
+      // DROPped `vault tokens create`), not the removed pvt_* command.
+      expect(joined).toContain("parachute auth mint-token --scope vault:");
+      expect(joined).toContain("Bearer <hub-jwt>");
+      expect(joined).not.toContain("vault tokens create");
+      expect(joined).not.toContain("pvt_");
       expect(joined).toContain("auth-model.md");
     } finally {
       env.cleanup();
