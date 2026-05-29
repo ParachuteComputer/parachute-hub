@@ -336,7 +336,16 @@ export async function handleCreateUser(req: Request, deps: ApiUsersDeps): Promis
   }
 }
 
-/** DELETE /api/users/:id — hard-delete + token revocation + session/grant cleanup. */
+/**
+ * DELETE /api/users/:id — hard-delete + token revocation + session/grant
+ * cleanup.
+ *
+ * Success returns `200 { ok: true, revocation_lag_seconds: 60 }` (was a bare
+ * 204 pre-consistency-fix) so the SPA can warn that the deleted user's
+ * tokens linger ~60s on resource-server revocation caches — same surface
+ * the reset-password path carries. The race-tolerant "row already gone"
+ * path stays a bodyless 204 (nothing was revoked here, no lag to report).
+ */
 export async function handleDeleteUser(
   req: Request,
   userId: string,
@@ -390,11 +399,28 @@ export async function handleDeleteUser(
   if (!removed) {
     // Race: row deleted by a concurrent request. Operator's intent
     // (no such user) is already satisfied — same shape as the grant-
-    // revoke race in `admin-grants.ts`.
+    // revoke race in `admin-grants.ts`. No tokens were revoked by THIS
+    // call, so there's no revocation lag to warn about; keep the bodyless
+    // 204 for the race path.
     return new Response(null, { status: 204 });
   }
   console.log(`user deleted: id=${userId} username=${target.username}`);
-  return new Response(null, { status: 204 });
+  // `revocation_lag_seconds`: same consistency fix the reset-password path
+  // got (smoke 2026-05-27 finding 3). Deleting a user revokes their tokens
+  // in hub's DB immediately, but resource servers (vault, scribe, …) cache
+  // the revocation list via scope-guard's `REVOCATION_CACHE_TTL_MS = 60_000`
+  // — a deleted user's tokens linger for up to ~60s on those caches. Surface
+  // that so the admin isn't surprised when a just-deleted user's client can
+  // still read for a minute (relevant in the stolen-device / compromise
+  // threat model). 200 + body instead of the old bare 204 so the SPA can
+  // render the warning banner.
+  return new Response(
+    JSON.stringify({ ok: true, revocation_lag_seconds: REVOCATION_LAG_SECONDS }),
+    {
+      status: 200,
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    },
+  );
 }
 
 /**

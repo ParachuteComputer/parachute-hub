@@ -79,6 +79,23 @@ describe("runAuthPreflight — wide open (no owner password)", () => {
     ]);
   });
 
+  test("null tokenCount with no owner password still classifies wide-open", async () => {
+    // The `tokenCount: null` (unreadable vault DB) path is vestigial post-DROP
+    // — `classify()` gates on `hasOwnerPassword` alone. A box with no owner
+    // password AND an unreadable token DB must still take the loud wide-open
+    // branch, not silently fall through to a quieter state.
+    const h = makeHarness(["n", "n"]);
+    await runAuthPreflight({
+      status: status({ hasOwnerPassword: false, tokenCount: null }),
+      ...wire(h),
+    });
+    const joined = h.logs.join("\n");
+    expect(joined).toContain("No owner password");
+    expect(joined).toContain("public internet");
+    // Wide-open offers password + 2FA (two prompts); not the all-good path.
+    expect(h.prompts).toHaveLength(2);
+  });
+
   test("never offers the removed `vault tokens create` command", async () => {
     const h = makeHarness(["y", "y"]);
     await runAuthPreflight({ status: status(), ...wire(h) });
