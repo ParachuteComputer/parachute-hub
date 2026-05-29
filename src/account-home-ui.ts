@@ -186,14 +186,20 @@ function renderVaultCard(opts: VaultCardOpts): string {
 
   if (assignedVaults.length > 0) {
     // One vault tile per assignment (multi-user Phase 2 PR 2). Each tile
-    // carries the Notes "Open" CTA AND a server-rendered MCP connect block
-    // (endpoint + `claude mcp add` command, each with a copy button). The
-    // connect command is the OAuth path — no token, so a non-admin friend
-    // who can't run the SPA's host-admin mint still gets a working
-    // connect affordance (the first `claude mcp add` use opens a browser,
-    // signs them in, and approves the scope). This closes the multi-user
-    // gap where the friend tile only offered the external Notes link + a
-    // bare hub-origin string.
+    // leads with a friendly "connect your AI assistant to this vault" block
+    // that covers BOTH connect paths a non-technical friend is likely to
+    // use — Claude Code (the `claude mcp add` CLI command) and Claude.ai on
+    // the web (Settings → Connectors → Add custom connector, pointed at the
+    // endpoint). Both are the OAuth path — no token to paste, the first
+    // connection opens a browser to sign in + approve. The Notes "Open" CTA
+    // sits alongside as the browser-UI option. Phrasing mirrors
+    // parachute.computer/install.njk's #connect-mcp-clients section so the
+    // operator docs and the friend's account page stay consistent.
+    //
+    // This closes the multi-user gap where the friend tile read as MCP
+    // jargon ("Connect an MCP client") rather than "here's how to connect
+    // this to your AI" — and where the web (Claude.ai) path was entirely
+    // missing, only the Claude Code CLI command was offered.
     const heading = assignedVaults.length === 1 ? "<h2>Your vault</h2>" : "<h2>Your vaults</h2>";
     const tiles = assignedVaults
       .map((vaultName) => {
@@ -206,42 +212,56 @@ function renderVaultCard(opts: VaultCardOpts): string {
         return `
         <div class="vault-tile" data-testid="vault-tile" data-vault-name="${safeVault}">
           <p class="vault-name"><strong>${safeVault}</strong></p>
-          <p>
-            <a class="btn btn-primary" href="https://notes.parachute.computer/add?url=${vaultUrlForAdd}"
-               target="_blank" rel="noopener" data-testid="open-notes-cta">Open Notes ↗</a>
-          </p>
           <div class="mcp-connect" data-testid="mcp-connect">
-            <p class="mcp-connect-label">Connect an MCP client (Claude Code, Claude.ai)</p>
-            <div class="mcp-field">
-              <span class="mcp-field-label">Endpoint</span>
-              <div class="copy-row">
-                <code data-testid="mcp-endpoint">${safeEndpoint}</code>
-                <button type="button" class="btn btn-copy" data-copy="${safeEndpoint}"
-                        data-testid="copy-mcp-endpoint">Copy</button>
-              </div>
-            </div>
-            <div class="mcp-field">
-              <span class="mcp-field-label">Claude Code</span>
+            <p class="mcp-connect-label" data-testid="connect-ai-heading">Connect your AI
+               assistant to this vault</p>
+            <p class="mcp-connect-intro">Two common ways. Both sign you in to this hub over
+               HTTPS and ask you to approve access the first time — no token to copy.</p>
+
+            <div class="mcp-method" data-testid="connect-method-claude-code">
+              <p class="mcp-method-title">Claude Code (terminal)</p>
+              <p class="mcp-method-sub">Run this in your terminal:</p>
               <div class="copy-row">
                 <code data-testid="mcp-add-command">${safeAddCmd}</code>
                 <button type="button" class="btn btn-copy" data-copy="${safeAddCmd}"
                         data-testid="copy-mcp-add-command">Copy</button>
               </div>
             </div>
-            <p class="mcp-connect-hint">No token needed — the command opens a browser to
-               sign you in to this hub and approve access on first use.</p>
+
+            <div class="mcp-method" data-testid="connect-method-claude-ai">
+              <p class="mcp-method-title">Claude.ai (web)</p>
+              <p class="mcp-method-sub">In Claude.ai, open <strong>Settings → Connectors</strong>,
+                 choose <strong>Add custom connector</strong>, and paste this endpoint:</p>
+              <div class="copy-row">
+                <code data-testid="mcp-endpoint">${safeEndpoint}</code>
+                <button type="button" class="btn btn-copy" data-copy="${safeEndpoint}"
+                        data-testid="copy-mcp-endpoint">Copy</button>
+              </div>
+              <p class="mcp-method-note">Claude.ai then redirects you here to sign in and
+                 approve. (Your hub must be reachable from the web for this.)</p>
+            </div>
+
+            <p class="mcp-connect-hint" data-testid="connect-any-client-hint">Any other MCP
+               client (Codex, Goose, Cursor, your own agent): point it at the same endpoint
+               above over HTTP.</p>
           </div>
+          <p class="vault-notes-cta">
+            <a class="btn btn-primary" href="https://notes.parachute.computer/add?url=${vaultUrlForAdd}"
+               target="_blank" rel="noopener" data-testid="open-notes-cta">Open Notes ↗</a>
+            <span class="vault-notes-cta-sub">Prefer a browser UI? Open Notes to browse +
+               capture in this vault.</span>
+          </p>
         </div>`;
       })
       .join("");
     return `
       <section class="section" data-testid="vault-card">
         ${heading}
-        <p>Open Notes — the canonical browser UI for your vault${
+        <p>Connect Claude (or any AI assistant) to your vault${
           assignedVaults.length === 1 ? "" : "s"
-        } — or connect an MCP client
-          (Claude Code, Claude.ai) with the command below. Either way you sign in to your
-          hub over HTTPS and approve access on the first connection.</p>
+        } — pick Claude Code or
+          Claude.ai below — or open Notes for a browser UI. The first connection signs you in
+          to your hub over HTTPS and asks you to approve access.</p>
         <div class="vault-tiles">${tiles}
         </div>
       </section>${COPY_SCRIPT}`;
@@ -262,8 +282,11 @@ function renderVaultCard(opts: VaultCardOpts): string {
   return `
     <section class="section" data-testid="no-vault-card">
       <h2>Your vault</h2>
-      <p>Your account isn't assigned to a vault yet. Ask the hub operator
-         to assign one.</p>
+      <p>You don't have a vault yet, so there's nothing to connect to. A vault
+         is your personal knowledge store on this hub — once the operator
+         assigns you one, this page will show you how to connect Claude (or
+         any AI assistant) to it.</p>
+      <p><strong>Ask the hub operator to assign you a vault.</strong></p>
     </section>`;
 }
 
@@ -433,15 +456,40 @@ const STYLES = `
   .vault-tile p:last-child { margin-top: 0.5rem; }
 
   .mcp-connect {
-    margin-top: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+  .mcp-connect-label {
+    font-family: ${FONT_SERIF};
+    font-size: 1.05rem;
+    font-weight: 400;
+    color: ${PALETTE.fg};
+    margin: 0 0 0.3rem;
+  }
+  .mcp-connect-intro {
+    font-size: 0.85rem;
+    color: ${PALETTE.fgMuted};
+    margin: 0 0 0.75rem;
+  }
+  .mcp-method {
+    margin: 0.75rem 0;
     padding-top: 0.6rem;
     border-top: 1px solid ${PALETTE.borderLight};
   }
-  .mcp-connect-label {
-    font-size: 0.85rem;
-    font-weight: 500;
+  .mcp-method-title {
+    font-size: 0.9rem;
+    font-weight: 600;
     color: ${PALETTE.fg};
-    margin: 0 0 0.5rem;
+    margin: 0 0 0.15rem;
+  }
+  .mcp-method-sub {
+    font-size: 0.82rem;
+    color: ${PALETTE.fgMuted};
+    margin: 0 0 0.4rem;
+  }
+  .mcp-method-note {
+    font-size: 0.78rem;
+    color: ${PALETTE.fgMuted};
+    margin: 0.35rem 0 0;
   }
   .mcp-field { margin: 0.5rem 0; }
   .mcp-field-label {
@@ -452,6 +500,20 @@ const STYLES = `
     color: ${PALETTE.fgMuted};
     font-family: ${FONT_MONO};
     margin-bottom: 0.2rem;
+  }
+  .vault-notes-cta {
+    margin: 0.9rem 0 0;
+    padding-top: 0.6rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.75rem;
+  }
+  .vault-notes-cta-sub {
+    font-size: 0.82rem;
+    color: ${PALETTE.fgMuted};
+    flex: 1 1 12rem;
   }
   .copy-row {
     display: flex;
@@ -564,11 +626,14 @@ const STYLES = `
     body { background: #1a1815; color: #e8e4dc; }
     .card { background: #25221d; border-color: #3a362f; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3); }
     h1, h2 { color: #f0ece4; }
-    .subtitle, .kv dt, .mcp-field-label, .mcp-connect-hint { color: #a8a29a; }
-    .vault-name strong, .mcp-connect-label { color: #f0ece4; }
+    .subtitle, .kv dt, .mcp-field-label, .mcp-connect-hint,
+    .mcp-connect-intro, .mcp-method-sub, .mcp-method-note,
+    .vault-notes-cta-sub { color: #a8a29a; }
+    .vault-name strong, .mcp-connect-label, .mcp-method-title { color: #f0ece4; }
     code { background: #1f1c18; color: #e8e4dc; }
     .copy-row code { background: transparent; }
-    .section, .mcp-connect { border-top-color: #3a362f; }
+    .section { border-top-color: #3a362f; }
+    .mcp-method, .vault-notes-cta { border-top-color: #3a362f; }
     .brand-tag { border-color: #3a362f; color: #a8a29a; }
     .copy-row { background: #1f1c18; border-color: #3a362f; }
     .btn-secondary, .btn-copy { color: #e8e4dc; border-color: #3a362f; }

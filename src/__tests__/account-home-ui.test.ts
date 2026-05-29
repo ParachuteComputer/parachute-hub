@@ -57,6 +57,23 @@ describe("renderAccountHome", () => {
     expect(html).not.toContain("Authorization: Bearer");
     // Copy-button progressive-enhancement script is present.
     expect(html).toContain("navigator.clipboard");
+    // Friendlier framing: the block leads with "connect your AI assistant"
+    // rather than MCP jargon up top.
+    expect(html).toContain('data-testid="connect-ai-heading"');
+    expect(html).toContain("Connect your AI");
+    // BOTH connect methods render as distinct, labelled blocks.
+    expect(html).toContain('data-testid="connect-method-claude-code"');
+    expect(html).toContain("Claude Code");
+    expect(html).toContain('data-testid="connect-method-claude-ai"');
+    expect(html).toContain("Claude.ai");
+    // The Claude.ai path mirrors the install.njk canonical phrasing
+    // (Settings → Connectors → Add custom connector, paste the endpoint).
+    expect(html).toContain("Connectors");
+    expect(html).toContain("Add custom connector");
+    // A brief "any other MCP client" line is present (no bloat — just one).
+    expect(html).toContain('data-testid="connect-any-client-hint"');
+    // Notes CTA still present, now framed as the browser-UI option.
+    expect(html).toContain('data-testid="open-notes-cta"');
   });
 
   test("assigned-vault branch — trailing slash on hubOrigin is normalized", () => {
@@ -112,11 +129,16 @@ describe("renderAccountHome", () => {
       twoFactorEnabled: false,
     });
     expect(html).toContain("Welcome, ghost");
-    expect(html).toContain("Ask the hub operator");
+    // The message explains WHY there's nothing to connect (no vault yet) and
+    // gives a clear next step — not just a bare "ask your admin".
+    expect(html).toContain("Ask the hub operator to assign you a vault");
+    expect(html).toContain("don't have a vault yet");
     // No /admin/ link in this branch — they have no admin role.
     expect(html).not.toContain('href="/admin/"');
     // No Notes CTA.
     expect(html).not.toContain("notes.parachute.computer/add");
+    // No connect block — you can't connect a vault you don't have.
+    expect(html).not.toContain('data-testid="mcp-connect"');
   });
 
   test("account card — change-password link and sign-out form are present", () => {
