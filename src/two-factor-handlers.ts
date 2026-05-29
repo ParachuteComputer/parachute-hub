@@ -184,8 +184,15 @@ export async function handleTwoFactorPost(req: Request, deps: TwoFactorDeps): Pr
   if (action === "confirm") {
     const secret = String(form.get("secret") ?? "");
     const code = String(form.get("code") ?? "");
-    if (!secret) {
-      // Lost the in-flight secret (stale form) — restart enrollment.
+    // Validate the in-flight secret format before it reaches verifyTotpCode /
+    // persistEnrollment (N1 — cheap defense in depth). The secret is a
+    // server-minted base32 string round-tripped through a hidden form field;
+    // it's session-gated + CSRF'd, but a malformed value (truncated paste,
+    // hand-crafted POST) should be rejected explicitly rather than stored.
+    // base32 alphabet (A–Z, 2–7) + optional `=` padding, ≥16 chars (our secret
+    // is 20 bytes → 32 base32 chars; 16 is a conservative floor).
+    if (!secret || !/^[A-Z2-7]+=*$/i.test(secret) || secret.length < 16) {
+      // Lost / malformed in-flight secret (stale form, bad paste) — restart.
       return htmlResponse(
         renderTwoFactorNotEnrolled({
           csrfToken,

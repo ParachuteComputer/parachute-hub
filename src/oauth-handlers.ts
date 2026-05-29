@@ -23,6 +23,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
+import { renderTotpChallenge } from "./admin-login-ui.ts";
 import {
   AuthCodeExpiredError,
   AuthCodeNotFoundError,
@@ -65,6 +66,7 @@ import {
   renderUnknownClient,
 } from "./oauth-ui.ts";
 import { isSameOriginRequest } from "./origin-check.ts";
+import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { narrowResourceVaultScopes, resolveResourceVault } from "./resource-binding.ts";
 import { isNonRequestableScope, isRequestableScope, scopeIsAdmin } from "./scope-explanations.ts";
@@ -84,6 +86,7 @@ import {
   findSession,
   parseSessionCookie,
 } from "./sessions.ts";
+import { isTotpEnrolled } from "./two-factor-store.ts";
 import { getUserById, getUserByUsername, isFirstAdmin, verifyPassword } from "./users.ts";
 import { listVaultNames } from "./vault-names.ts";
 import { isVaultEntry, shortName, vaultInstanceNameFor } from "./well-known.ts";
@@ -1139,17 +1142,49 @@ async function handleLoginSubmit(
       401,
     );
   }
+
+  // Where to land after a successful sign-in: back at GET /oauth/authorize
+  // with the original query string so the user resumes the OAuth flow on the
+  // consent screen with full params re-validated.
+  const authorizeReturnUrl = buildAuthorizeReturnUrl(params);
+
+  // 2FA gate (hub#473 — security fix). The OAuth login POST is the MORE-common
+  // sign-in path (every OAuth client: vault, notes-ui, `parachute auth login`).
+  // It must enforce the second factor exactly like `/login` does: after the
+  // password verifies, if the user has TOTP enrolled, do NOT mint a session.
+  // Stash a pending-login whose `next` is the FULL /oauth/authorize return URL
+  // (so the post-TOTP redirect resumes the OAuth flow), and render the TOTP
+  // challenge. The challenge form posts to `/login/2fa` — the shared
+  // completion path (`handleAdminLoginTotpPost`) — which verifies the factor,
+  // mints the session, and 302s to the stored `next`. The pending-login cookie
+  // is scoped `Path=/login`, so it rides the `/login/2fa` POST. Without this
+  // gate a 2FA-enrolled user could obtain a full session with password ONLY.
+  if (isTotpEnrolled(db, user.id)) {
+    const pendingToken = createPendingLogin(user.id, authorizeReturnUrl);
+    return htmlResponse(renderTotpChallenge({ next: authorizeReturnUrl, csrfToken }), 200, {
+      "set-cookie": buildPendingLoginCookie(pendingToken, req),
+    });
+  }
+
   const session = createSession(db, { userId: user.id });
   const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
     secure: isHttpsRequest(req),
   });
-  // Redirect back to GET /oauth/authorize with the original query string so
-  // the user lands on the consent screen with full params re-validated.
+  return redirectResponse(authorizeReturnUrl, { "set-cookie": cookie });
+}
+
+/**
+ * Build the `/oauth/authorize?...` return URL (path + query, same-origin) that
+ * a successful sign-in redirects back to so the OAuth flow resumes on the
+ * consent screen. Shared by the password-only path and the post-TOTP path
+ * (the latter via the pending-login's `next`).
+ */
+function buildAuthorizeReturnUrl(params: AuthorizeFormParams): string {
   const u = new URL("/oauth/authorize", "http://placeholder");
   for (const [k, v] of Object.entries(authorizeParamsToQuery(params))) {
     u.searchParams.set(k, v);
   }
-  return redirectResponse(`${u.pathname}${u.search}`, { "set-cookie": cookie });
+  return `${u.pathname}${u.search}`;
 }
 
 async function handleConsentSubmit(

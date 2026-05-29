@@ -434,6 +434,29 @@ describe("/account/2fa handlers — hub#473", () => {
     expect(isTotpEnrolled(harness.db, id)).toBe(false);
   });
 
+  test("POST confirm with a MALFORMED secret → 400, nothing persisted (N1 guard)", async () => {
+    const { id, cookie } = await signedInUser();
+    // Non-base32 / too-short secret from a tampered or truncated form.
+    for (const badSecret of ["not-base32!", "ABC123", "", "0189{}<>"]) {
+      const { body, headers } = formBody({
+        [CSRF_FIELD_NAME]: TEST_CSRF,
+        action: "confirm",
+        secret: badSecret,
+        code: "123456",
+      });
+      const res = await handleTwoFactorPost(
+        new Request("http://hub.test/account/2fa", {
+          method: "POST",
+          headers: { ...headers, cookie },
+          body,
+        }),
+        { db: harness.db },
+      );
+      expect(res.status).toBe(400);
+      expect(isTotpEnrolled(harness.db, id)).toBe(false);
+    }
+  });
+
   test("POST disable requires the correct current password; clears 2FA on success", async () => {
     const { id, cookie } = await signedInUser();
     await persistEnrollment(harness.db, id, generateTotpSecret("owner").secret);

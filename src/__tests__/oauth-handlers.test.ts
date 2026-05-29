@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { handleAdminLoginTotpPost } from "../admin-handlers.ts";
 import { approveClient, getClient, registerClient } from "../clients.ts";
 import { CSRF_COOKIE_NAME } from "../csrf.ts";
 import { findGrant, recordGrant } from "../grants.ts";
@@ -26,8 +27,12 @@ import {
   protectedResourceMetadata,
   vaultScopeForUser,
 } from "../oauth-handlers.ts";
+import { PENDING_LOGIN_COOKIE_NAME, _resetPendingLogins } from "../pending-login.ts";
+import { __resetForTests as resetRateLimit } from "../rate-limit.ts";
 import type { ServicesManifest } from "../services-manifest.ts";
-import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
+import { SESSION_TTL_MS, buildSessionCookie, createSession, findSession } from "../sessions.ts";
+import { _resetTotpReplayCache, generateTotpSecret } from "../totp.ts";
+import { backupCodesRemaining, isTotpEnrolled, persistEnrollment } from "../two-factor-store.ts";
 import { createUser, setUserVaults } from "../users.ts";
 
 const ISSUER = "https://hub.example";
@@ -867,6 +872,223 @@ describe("handleAuthorizePost — login submit", () => {
       const res = await handleAuthorizePost(db, req, { issuer: ISSUER });
       expect(res.status).toBe(401);
       expect(res.headers.get("set-cookie")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// --- OAuth-path TOTP gate (hub#473 P0 bypass regression) -------------------
+//
+// The OAuth login POST (`__action=login`) is the more-common sign-in path
+// (every OAuth client: vault, notes-ui, `parachute auth login`). Before the
+// fix it minted a session on password ALONE even for a 2FA-enrolled user —
+// a full TOTP bypass. These tests pin that the OAuth login now diverts to the
+// TOTP challenge and only mints a session after the second factor, resuming
+// the original /oauth/authorize flow.
+
+/** Generate a live TOTP code for a base32 secret (matches the hub's params). */
+function liveTotpCode(secretBase32: string, label = "owner"): string {
+  // Lazy import via require keeps the top of file clean; otpauth is a dep.
+  const OTPAuth = require("otpauth");
+  return new OTPAuth.TOTP({
+    issuer: "Parachute Hub",
+    label,
+    algorithm: "SHA1",
+    digits: 6,
+    period: 30,
+    secret: OTPAuth.Secret.fromBase32(secretBase32),
+  }).generate();
+}
+
+function cookieValueFrom(res: Response, name: string): string | null {
+  for (const sc of res.headers.getSetCookie()) {
+    if (sc.startsWith(`${name}=`)) return sc.slice(name.length + 1).split(";")[0] ?? "";
+  }
+  return null;
+}
+
+describe("handleAuthorizePost — login submit + 2FA (hub#473 bypass regression)", () => {
+  function loginForm(clientId: string, challenge: string, password = "hunter2"): URLSearchParams {
+    return new URLSearchParams({
+      __action: "login",
+      __csrf: TEST_CSRF,
+      username: "owner",
+      password,
+      client_id: clientId,
+      redirect_uri: "https://app.example/cb",
+      response_type: "code",
+      scope: "vault:read",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "xyz-state",
+    });
+  }
+
+  test("2FA-enrolled user: correct password ALONE does NOT mint a session — diverts to TOTP challenge", async () => {
+    const { db, cleanup } = await makeDb();
+    _resetPendingLogins();
+    _resetTotpReplayCache();
+    resetRateLimit();
+    try {
+      const user = await createUser(db, "owner", "hunter2", { passwordChanged: true });
+      await persistEnrollment(db, user.id, generateTotpSecret("owner").secret);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: loginForm(reg.client.clientId, challenge),
+        headers: { "content-type": "application/x-www-form-urlencoded", cookie: CSRF_COOKIE },
+      });
+      const res = await handleAuthorizePost(db, req, { issuer: ISSUER });
+      // NO session cookie. The bypass was: this used to be 302 + session.
+      expect(cookieValueFrom(res, "parachute_hub_session")).toBeNull();
+      // Diverts to the TOTP challenge page + sets a pending-login cookie.
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("Two-factor authentication");
+      expect(html).toContain('action="/login/2fa"');
+      expect(cookieValueFrom(res, PENDING_LOGIN_COOKIE_NAME)).toBeTruthy();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("full OAuth two-step: password → challenge → correct TOTP → session minted + resumes /oauth/authorize", async () => {
+    const { db, cleanup } = await makeDb();
+    _resetPendingLogins();
+    _resetTotpReplayCache();
+    resetRateLimit();
+    try {
+      const user = await createUser(db, "owner", "hunter2", { passwordChanged: true });
+      const { secret } = generateTotpSecret("owner");
+      await persistEnrollment(db, user.id, secret);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+
+      // Step 1 — OAuth login POST (password).
+      const loginReq = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: loginForm(reg.client.clientId, challenge),
+        headers: { "content-type": "application/x-www-form-urlencoded", cookie: CSRF_COOKIE },
+      });
+      const loginRes = await handleAuthorizePost(db, loginReq, { issuer: ISSUER });
+      expect(loginRes.status).toBe(200);
+      const pendingToken = cookieValueFrom(loginRes, PENDING_LOGIN_COOKIE_NAME);
+      expect(pendingToken).toBeTruthy();
+
+      // Step 2 — TOTP at the shared completion path /login/2fa, carrying the
+      // pending-login cookie. (No `next` form field — the stored pending-login
+      // `next` is the source of truth for the return URL.)
+      const code = liveTotpCode(secret);
+      const tfBody = new URLSearchParams({ __csrf: TEST_CSRF, code });
+      const tfReq = new Request(`${ISSUER}/login/2fa`, {
+        method: "POST",
+        body: tfBody,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${PENDING_LOGIN_COOKIE_NAME}=${pendingToken}`,
+        },
+      });
+      const tfRes = await handleAdminLoginTotpPost(db, tfReq);
+      expect(tfRes.status).toBe(302);
+      // Session minted now (after the second factor), not before.
+      const sessionId = cookieValueFrom(tfRes, "parachute_hub_session");
+      expect(sessionId).toBeTruthy();
+      expect(findSession(db, sessionId!)).not.toBeNull();
+      // Redirect resumes the ORIGINAL OAuth flow with all its query params.
+      const loc = tfRes.headers.get("location") ?? "";
+      expect(loc.startsWith("/oauth/authorize?")).toBe(true);
+      expect(loc).toContain(`client_id=${reg.client.clientId}`);
+      expect(loc).toContain("code_challenge=");
+      expect(loc).toContain("state=xyz-state");
+      expect(loc).toContain("scope=vault");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("OAuth path: wrong TOTP code → 401, no session; a backup code completes + is consumed", async () => {
+    const { db, cleanup } = await makeDb();
+    _resetPendingLogins();
+    _resetTotpReplayCache();
+    resetRateLimit();
+    try {
+      const user = await createUser(db, "owner", "hunter2", { passwordChanged: true });
+      const { secret } = generateTotpSecret("owner");
+      const { backupCodes } = await persistEnrollment(db, user.id, secret);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+
+      const loginRes = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: loginForm(reg.client.clientId, challenge),
+          headers: { "content-type": "application/x-www-form-urlencoded", cookie: CSRF_COOKIE },
+        }),
+        { issuer: ISSUER },
+      );
+      const pendingToken = cookieValueFrom(loginRes, PENDING_LOGIN_COOKIE_NAME)!;
+
+      // Wrong code → 401, no session, pending login survives.
+      const badRes = await handleAdminLoginTotpPost(
+        db,
+        new Request(`${ISSUER}/login/2fa`, {
+          method: "POST",
+          body: new URLSearchParams({ __csrf: TEST_CSRF, code: "000000" }),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${PENDING_LOGIN_COOKIE_NAME}=${pendingToken}`,
+          },
+        }),
+      );
+      expect(badRes.status).toBe(401);
+      expect(cookieValueFrom(badRes, "parachute_hub_session")).toBeNull();
+
+      // Backup code completes + is consumed.
+      expect(backupCodesRemaining(db, user.id)).toBe(10);
+      const okRes = await handleAdminLoginTotpPost(
+        db,
+        new Request(`${ISSUER}/login/2fa`, {
+          method: "POST",
+          body: new URLSearchParams({ __csrf: TEST_CSRF, code: backupCodes[0]! }),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE}; ${PENDING_LOGIN_COOKIE_NAME}=${pendingToken}`,
+          },
+        }),
+      );
+      expect(okRes.status).toBe(302);
+      expect(cookieValueFrom(okRes, "parachute_hub_session")).toBeTruthy();
+      expect((okRes.headers.get("location") ?? "").startsWith("/oauth/authorize?")).toBe(true);
+      expect(backupCodesRemaining(db, user.id)).toBe(9);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("OAuth path UNCHANGED for a user WITHOUT 2FA — password alone mints a session (no regression)", async () => {
+    const { db, cleanup } = await makeDb();
+    _resetPendingLogins();
+    resetRateLimit();
+    try {
+      const user = await createUser(db, "owner", "hunter2", { passwordChanged: true });
+      expect(isTotpEnrolled(db, user.id)).toBe(false);
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const res = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: loginForm(reg.client.clientId, challenge),
+          headers: { "content-type": "application/x-www-form-urlencoded", cookie: CSRF_COOKIE },
+        }),
+        { issuer: ISSUER },
+      );
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toContain("/oauth/authorize?");
+      expect(cookieValueFrom(res, "parachute_hub_session")).toBeTruthy();
     } finally {
       cleanup();
     }
