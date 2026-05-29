@@ -5,7 +5,15 @@ import { join } from "node:path";
 import { renderHub, writeHubFile } from "../hub.ts";
 
 describe("renderHub", () => {
-  const html = renderHub();
+  // The verbose discovery body (Get started / Services / Admin) + its
+  // data-loading script render only for a signed-in visitor (the signed-out
+  // landing is slimmed — see the "signed-out slimming" describe block below).
+  // Assertions about that verbose body therefore run against a signed-in
+  // render; assertions about the page shell (doctype, styles, brand) hold for
+  // both and use whichever render is convenient.
+  const html = renderHub({
+    session: { displayName: "operator", csrfToken: "csrf-shell" },
+  });
 
   test("is a self-contained HTML document with inline styles and script", () => {
     expect(html).toStartWith("<!doctype html>");
@@ -162,12 +170,72 @@ describe("renderHub", () => {
   });
 
   test("default render (no session) emits the 'Sign in' affordance", () => {
-    expect(html).toContain('class="auth-indicator"');
-    expect(html).toContain("Sign in");
-    expect(html).toContain('href="/login?next=/"');
+    const out = renderHub();
+    expect(out).toContain('class="auth-indicator"');
+    expect(out).toContain("Sign in");
+    expect(out).toContain('href="/login?next=/"');
     // No POST form, no CSRF input — those only appear when signed in.
-    expect(html).not.toContain('action="/logout"');
-    expect(html).not.toContain("__csrf");
+    expect(out).not.toContain('action="/logout"');
+    expect(out).not.toContain("__csrf");
+  });
+});
+
+describe("renderHub — signed-out slimming (operator feedback)", () => {
+  // A signed-out visitor should see a clean, minimal landing: brand +
+  // tagline (in the header) + a single clear "Sign in" call. The hub's
+  // internal detail — the service catalog, vault listings, admin surfaces,
+  // and the well-known-driven loading script — must NOT render until the
+  // visitor authenticates. The signed-in render is unchanged.
+  const signedOut = renderHub();
+  const signedIn = renderHub({
+    session: { displayName: "operator", csrfToken: "csrf-xyz" },
+  });
+
+  test("signed-out: brand wordmark + tagline still render (the slim landing keeps the brand)", () => {
+    expect(signedOut).toContain("<h1>Parachute</h1>");
+    expect(signedOut).toContain("Truly personal computing. Your knowledge belongs with you.");
+  });
+
+  test("signed-out: a clear 'Sign in' call is the primary affordance", () => {
+    expect(signedOut).toContain('data-testid="signed-out-signin"');
+    expect(signedOut).toContain('href="/login?next=/"');
+    expect(signedOut).toContain("Sign in");
+  });
+
+  test("signed-out: the verbose Services / Admin / Get started sections are absent", () => {
+    expect(signedOut).not.toContain('id="services-section"');
+    expect(signedOut).not.toContain('id="admin-section"');
+    expect(signedOut).not.toContain('id="get-started-section"');
+    expect(signedOut).not.toContain("<h2>Services</h2>");
+    expect(signedOut).not.toContain("<h2>Admin</h2>");
+    // Admin links / token surface must not be exposed pre-auth.
+    expect(signedOut).not.toContain("/admin/vaults");
+    expect(signedOut).not.toContain("/admin/tokens");
+  });
+
+  test("signed-out: the well-known service-catalog loading script is not emitted", () => {
+    // No data-driven discovery body to populate when signed out → no script.
+    // (The brand mark is an inline SVG, not a <script>; assert on the IIFE's
+    // load function rather than a blanket "no <script>".) The footer's
+    // public "discovery" anchor → /.well-known/parachute.json stays — it's a
+    // plain link, not the catalog-fetching script — so assert on the fetch
+    // call + the loader function, not the URL string.
+    expect(signedOut).not.toContain("loadServices");
+    expect(signedOut).not.toContain("renderServices");
+    expect(signedOut).not.toContain("fetch('/.well-known/parachute.json'");
+    expect(signedOut).not.toContain("<script>");
+  });
+
+  test("signed-in: the verbose sections + loading script DO render (signed-in view unchanged)", () => {
+    expect(signedIn).toContain('id="services-section"');
+    expect(signedIn).toContain('id="admin-section"');
+    expect(signedIn).toContain('id="get-started-section"');
+    expect(signedIn).toContain("/admin/vaults");
+    expect(signedIn).toContain("/.well-known/parachute.json");
+    expect(signedIn).toContain("loadServices");
+    // And the signed-out lede / standalone Sign-in CTA is gone (the
+    // auth-indicator carries sign-out instead).
+    expect(signedIn).not.toContain('data-testid="signed-out-signin"');
   });
 });
 

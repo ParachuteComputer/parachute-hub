@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { brandMarkSvg, CANONICAL_TAGLINE, WORDMARK_TEXT } from "./brand.ts";
+import { CANONICAL_TAGLINE, WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { CONFIG_DIR } from "./config.ts";
 import { CSRF_FIELD_NAME } from "./csrf.ts";
 
@@ -84,7 +84,19 @@ function buildHtml({ session }: RenderHubOpts): string {
   const authBlock = session
     ? renderSignedIn(session.displayName, session.csrfToken)
     : renderSignedOut();
-  return HTML_TEMPLATE.replace("<!--AUTH-INDICATOR-->", authBlock);
+  // Gate the verbose discovery sections (Get started / Services / Admin)
+  // and their data-loading script on auth state. A signed-out visitor sees
+  // a clean, minimal landing — brand + tagline + a clear "Sign in" call —
+  // not the hub's service catalog, vault listings, or admin links. The
+  // detail un-gates the moment they sign in (the server already knows auth
+  // state from the session cookie, so this stays a no-JS-required,
+  // session-aware render). Operator feedback from a live multi-user deploy:
+  // the signed-out page exposed too much to anonymous visitors.
+  const body = session ? SIGNED_IN_BODY : SIGNED_OUT_BODY;
+  const script = session ? DISCOVERY_SCRIPT : "";
+  return HTML_TEMPLATE.replace("<!--AUTH-INDICATOR-->", authBlock)
+    .replace("<!--DISCOVERY-BODY-->", body)
+    .replace("<!--DISCOVERY-SCRIPT-->", script);
 }
 
 function renderSignedIn(displayName: string, csrfToken: string): string {
@@ -269,6 +281,34 @@ const HTML_TEMPLATE = `<!doctype html>
     font-size: 0.92rem;
     margin: 0 0 1.25rem;
   }
+  /* Signed-out landing: a single centered "Sign in" call under the brand.
+     Minimal by design — the service catalog + admin surfaces stay hidden
+     until the visitor authenticates. */
+  .signed-out-cta {
+    text-align: center;
+    margin-bottom: 0;
+  }
+  .signed-out-lede {
+    color: var(--fg-muted);
+    font-size: 1.05rem;
+    margin: 0 0 1.5rem;
+  }
+  .btn-signin {
+    display: inline-block;
+    background: var(--accent);
+    color: var(--card-bg);
+    font-family: var(--sans);
+    font-size: 1rem;
+    font-weight: 500;
+    text-decoration: none;
+    padding: 0.65rem 1.6rem;
+    border-radius: 8px;
+    transition: background 0.15s ease, transform 0.15s ease;
+  }
+  .btn-signin:hover {
+    background: var(--accent-hover);
+    transform: translateY(-1px);
+  }
   .grid {
     display: grid;
     gap: 1.25rem;
@@ -378,7 +418,22 @@ const HTML_TEMPLATE = `<!doctype html>
     <h1>${WORDMARK_TEXT}</h1>
     <p class="tagline">${CANONICAL_TAGLINE}</p>
   </header>
+<!--DISCOVERY-BODY-->
+  <footer>
+    <a href="/.well-known/parachute.json">discovery</a>
+  </footer>
+</main>
+<!--DISCOVERY-SCRIPT-->
+</body>
+</html>
+`;
 
+// The verbose discovery body — the service catalog, admin surfaces, and the
+// "Get started" CTA. Rendered ONLY for a signed-in visitor (`buildHtml`
+// selects this vs SIGNED_OUT_BODY on `session`). Anonymous visitors get the
+// slim landing below instead, so the hub's internal surface isn't exposed
+// pre-auth.
+const SIGNED_IN_BODY = `
   <section class="section" id="get-started-section" hidden>
     <h2>Get started</h2>
     <p class="section-sub">Jump straight into what you came here for.</p>
@@ -398,12 +453,21 @@ const HTML_TEMPLATE = `<!doctype html>
     <p class="section-sub">Manage this hub — vaults, permissions, tokens.</p>
     <div class="grid" id="admin-grid"></div>
   </section>
+`;
 
-  <footer>
-    <a href="/.well-known/parachute.json">discovery</a>
-  </footer>
-</main>
-<script>
+// The slim signed-out landing. Brand + tagline (in the header above) plus a
+// single clear "Sign in" call — no service catalog, no vault listings, no
+// admin links. Keep it tasteful and minimal; the detail un-gates on sign-in.
+const SIGNED_OUT_BODY = `
+  <section class="section signed-out-cta" id="signed-out-cta">
+    <p class="signed-out-lede">Sign in to reach your vault and the services on this hub.</p>
+    <a href="/login?next=/" class="btn-signin" data-testid="signed-out-signin">Sign in →</a>
+  </section>
+`;
+
+// The data-loading script for the signed-in discovery body. Emitted only
+// when signed in (the signed-out body has nothing for it to populate).
+const DISCOVERY_SCRIPT = `<script>
 (async () => {
   const servicesGrid = document.getElementById('services-grid');
   const adminGrid = document.getElementById('admin-grid');
@@ -614,7 +678,4 @@ const HTML_TEMPLATE = `<!doctype html>
 
   void loadServices();
 })();
-</script>
-</body>
-</html>
-`;
+</script>`;
