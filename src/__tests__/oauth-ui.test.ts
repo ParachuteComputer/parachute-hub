@@ -20,6 +20,7 @@ const PARAMS: AuthorizeFormParams = {
   codeChallenge: "ch",
   codeChallengeMethod: "S256",
   state: "xyz",
+  resource: null,
 };
 
 const CSRF = "csrf-token-fixture";
@@ -50,9 +51,19 @@ describe("renderHiddenInputs", () => {
   });
 
   test("escapes hostile values into hidden inputs", () => {
-    const html = renderHiddenInputs({ ...PARAMS, state: `"><script>alert(1)</script>` });
+    const html = renderHiddenInputs({
+      ...PARAMS,
+      state: `"><script>alert(1)</script>`,
+      // RFC 8707 resource is round-tripped through a hidden input too, so a
+      // hostile value must be escaped the same way.
+      resource: `"><script>alert(2)</script>`,
+    });
     expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).not.toContain("<script>alert(2)</script>");
     expect(html).toContain("&lt;script&gt;");
+    // The resource value is emitted as a hidden input (escaped).
+    expect(html).toContain('name="resource"');
+    expect(html).toContain("alert(2)");
   });
 });
 
