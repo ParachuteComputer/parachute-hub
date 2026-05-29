@@ -497,7 +497,10 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
-        // Use defaults for configPath/logPath so they're per-tunnel-derived.
+        // Omit configPath/logPath so they're per-tunnel-derived — but the
+        // derivation now resolves against the tmp `configDir` above, so the
+        // generated config.yml lands under tmp, not the operator's real
+        // ~/.parachute/cloudflared/parachute/.
       });
       expect(code1).toBe(0);
 
@@ -581,8 +584,8 @@ describe("exposeCloudflareUp", () => {
           configPath: env.configPath,
           logPath: env.logPath,
           cloudflaredHome: env.cloudflaredHome,
-        configDir: env.configDir,
-        skipHub: true,
+          configDir: env.configDir,
+          skipHub: true,
           // No password, no 2FA — fully wide open. The warning should still
           // fire; password-recovery copy already lives in `printAuthGuidance`.
           vaultAuthStatus: {
@@ -631,8 +634,8 @@ describe("exposeCloudflareUp", () => {
           configPath: env.configPath,
           logPath: env.logPath,
           cloudflaredHome: env.cloudflaredHome,
-        configDir: env.configDir,
-        skipHub: true,
+          configDir: env.configDir,
+          skipHub: true,
           vaultAuthStatus: {
             hasOwnerPassword: true,
             hasTotp: true,

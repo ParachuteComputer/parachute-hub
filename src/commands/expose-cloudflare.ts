@@ -190,7 +190,12 @@ interface Resolved {
 
 function resolve(opts: ExposeCloudflareOpts): Resolved {
   const tunnelName = opts.tunnelName ?? DEFAULT_TUNNEL_NAME;
-  const paths = cloudflaredPathsFor(tunnelName);
+  const configDir = opts.configDir ?? CONFIG_DIR;
+  // Derive per-tunnel config/log paths from the *resolved* configDir, not the
+  // real `CONFIG_DIR`. When a test threads a tmp `configDir` but omits explicit
+  // `configPath`/`logPath`, this keeps the derived files inside the tmp dir
+  // instead of writing fixtures into the operator's real ~/.parachute.
+  const paths = cloudflaredPathsFor(tunnelName, configDir);
   return {
     runner: opts.runner ?? defaultRunner,
     spawner: opts.spawner ?? defaultCloudflaredSpawner,
@@ -203,7 +208,7 @@ function resolve(opts: ExposeCloudflareOpts): Resolved {
     configPath: opts.configPath ?? paths.configPath,
     logPath: opts.logPath ?? paths.logPath,
     cloudflaredHome: opts.cloudflaredHome ?? DEFAULT_CLOUDFLARED_HOME,
-    configDir: opts.configDir ?? CONFIG_DIR,
+    configDir,
     hubOrigin: opts.hubOrigin,
     hubEnsureOpts: opts.hubEnsureOpts ?? {},
     wellKnownDir: opts.wellKnownDir ?? WELL_KNOWN_DIR,
