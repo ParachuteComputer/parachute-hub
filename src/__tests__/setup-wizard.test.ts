@@ -23,6 +23,7 @@ import {
   getDefaultOperationsRegistry,
 } from "../api-modules-ops.ts";
 import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
+import { type ExposeState, readExposeState, writeExposeState } from "../expose-state.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
 import { getSetting, setSetting } from "../hub-settings.ts";
@@ -44,6 +45,20 @@ import { createUser, getUserByUsername, userCount } from "../users.ts";
 interface Harness {
   dir: string;
   manifestPath: string;
+  /**
+   * Hermetic expose-state reader scoped to the harness's tmp dir. The
+   * production `readExposeState()` defaults to the operator's real
+   * `~/.parachute/expose-state.json` (a module-load constant), so a
+   * wizard test that omits an injected reader would auto-seed
+   * `setup_expose_mode` from the developer's LIVE exposure (hub#406) and
+   * flip expose-step assertions nondeterministically. Threading this
+   * harness reader keeps every wizard test isolated from the real
+   * filesystem — same isolation the harness already gives DB + manifest.
+   * Defaults to "no live exposure" (the tmp file doesn't exist) unless a
+   * test writes one via `writeExposeState(state, h.exposeStatePath)`.
+   */
+  exposeStatePath: string;
+  readExposeStateFn: () => ExposeState | undefined;
   cleanup: () => void;
 }
 
@@ -52,9 +67,12 @@ function makeHarness(): Harness {
   writeFileSync(join(dir, "hub.html"), "<html>discovery</html>");
   const manifestPath = join(dir, "services.json");
   writeManifest({ services: [] }, manifestPath);
+  const exposeStatePath = join(dir, "expose-state.json");
   return {
     dir,
     manifestPath,
+    exposeStatePath,
+    readExposeStateFn: () => readExposeState(exposeStatePath),
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
 }
@@ -124,7 +142,11 @@ describe("deriveWizardState", () => {
   test("welcome step when no admin and no vault", () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
-      const s = deriveWizardState({ db, manifestPath: h.manifestPath });
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        readExposeStateFn: h.readExposeStateFn,
+      });
       expect(s.step).toBe("welcome");
       expect(s.hasAdmin).toBe(false);
       expect(s.hasVault).toBe(false);
@@ -137,7 +159,11 @@ describe("deriveWizardState", () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       await createUser(db, "owner", "pw");
-      const s = deriveWizardState({ db, manifestPath: h.manifestPath });
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        readExposeStateFn: h.readExposeStateFn,
+      });
       expect(s.step).toBe("vault");
       expect(s.hasAdmin).toBe(true);
       expect(s.hasVault).toBe(false);
@@ -164,7 +190,11 @@ describe("deriveWizardState", () => {
         },
         h.manifestPath,
       );
-      const s = deriveWizardState({ db, manifestPath: h.manifestPath });
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        readExposeStateFn: h.readExposeStateFn,
+      });
       expect(s.step).toBe("expose");
       expect(s.hasAdmin).toBe(true);
       expect(s.hasVault).toBe(true);
@@ -201,7 +231,12 @@ describe("deriveWizardState", () => {
       );
       // Simulate Render env. detectAutoExposeMode reads RENDER_EXTERNAL_URL.
       const renderEnv = { RENDER_EXTERNAL_URL: "https://parachute-hub.onrender.com" };
-      const s = deriveWizardState({ db, manifestPath: h.manifestPath, env: renderEnv });
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: renderEnv,
+        readExposeStateFn: h.readExposeStateFn,
+      });
       expect(s.step).toBe("done");
       expect(s.hasExposeMode).toBe(true);
     } finally {
@@ -227,10 +262,197 @@ describe("deriveWizardState", () => {
         },
         h.manifestPath,
       );
-      const s = deriveWizardState({ db, manifestPath: h.manifestPath, env: {} });
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: {},
+        readExposeStateFn: h.readExposeStateFn,
+      });
       // Local install path — the operator still gets to choose
       expect(s.step).toBe("expose");
       expect(s.hasExposeMode).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("auto-seeds expose mode from a live `parachute expose tailnet` (hub#406 team-onboarding bug)", async () => {
+    // Team-onboarding bug: an operator ran `parachute expose tailnet`
+    // BEFORE opening the wizard. That writes expose-state.json
+    // (layer=tailnet) but never the `setup_expose_mode` hub_setting —
+    // the two are orthogonal axes. Pre-fix, the wizard consulted only
+    // the setting and re-rendered "How will this hub be reached?" though
+    // tailnet was already live. deriveWizardState now reads the live
+    // exposure layer and auto-seeds the setting, so the expose step is
+    // treated as satisfied and the wizard advances to done.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      // Simulate `parachute expose tailnet`: write a real expose-state
+      // file (round-trips through readExposeState's validator) into the
+      // harness tmp path. No env signal (not Render/Fly), no setting.
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "my-mac.tailnet-name.ts.net",
+          port: 1939,
+          funnel: false,
+          entries: [],
+        },
+        h.exposeStatePath,
+      );
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: {},
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.step).toBe("done");
+      expect(s.hasExposeMode).toBe(true);
+      // The setting was auto-seeded from the live exposure layer.
+      expect(getSetting(db, "setup_expose_mode")).toBe("tailnet");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("auto-seeds expose mode = public from a live public exposure", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      writeExposeState(
+        {
+          version: 1,
+          layer: "public",
+          mode: "path",
+          canonicalFqdn: "hub.example.com",
+          port: 1939,
+          funnel: true,
+          entries: [],
+        },
+        h.exposeStatePath,
+      );
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: {},
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.step).toBe("done");
+      expect(s.hasExposeMode).toBe(true);
+      expect(getSetting(db, "setup_expose_mode")).toBe("public");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("still asks the expose step when no live exposure + no setting (unchanged)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      // No env signal, no expose-state file written (reader returns
+      // undefined), no setting → the operator still gets the expose step.
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: {},
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.step).toBe("expose");
+      expect(s.hasExposeMode).toBe(false);
+      expect(getSetting(db, "setup_expose_mode")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("an explicit setup_expose_mode wins over a live exposure (no clobber)", async () => {
+    // If the operator already answered the expose step (or it was seeded
+    // by a prior call), a later live-exposure read must not overwrite the
+    // recorded answer. Guards the `=== undefined` gate.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      writeExposeState(
+        {
+          version: 1,
+          layer: "public",
+          mode: "path",
+          canonicalFqdn: "hub.example.com",
+          port: 1939,
+          funnel: true,
+          entries: [],
+        },
+        h.exposeStatePath,
+      );
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: {},
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.step).toBe("done");
+      // Recorded answer is preserved, not overwritten by the live layer.
+      expect(getSetting(db, "setup_expose_mode")).toBe("localhost");
     } finally {
       db.close();
     }
@@ -255,7 +477,11 @@ describe("deriveWizardState", () => {
         h.manifestPath,
       );
       setSetting(db, "setup_expose_mode", "localhost");
-      const s = deriveWizardState({ db, manifestPath: h.manifestPath });
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        readExposeStateFn: h.readExposeStateFn,
+      });
       expect(s.step).toBe("done");
       expect(s.hasAdmin).toBe(true);
       expect(s.hasVault).toBe(true);
@@ -283,6 +509,7 @@ describe("handleSetupGet", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -304,6 +531,7 @@ describe("handleSetupGet", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -354,6 +582,7 @@ describe("handleSetupGet", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -386,6 +615,7 @@ describe("handleSetupGet", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -434,6 +664,7 @@ describe("handleSetupGet", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -483,6 +714,7 @@ describe("handleSetupGet", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -524,6 +756,7 @@ describe("handleSetupGet", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -548,6 +781,7 @@ describe("handleSetupGet", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: reg,
       });
@@ -577,6 +811,7 @@ describe("handleSetupGet", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: reg,
       });
@@ -608,6 +843,7 @@ describe("handleSetupAccountPost", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -632,6 +868,7 @@ describe("handleSetupAccountPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -660,6 +897,7 @@ describe("handleSetupAccountPost", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -680,6 +918,7 @@ describe("handleSetupAccountPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -712,6 +951,7 @@ describe("handleSetupAccountPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -731,6 +971,7 @@ describe("handleSetupAccountPost", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -751,6 +992,7 @@ describe("handleSetupAccountPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -794,6 +1036,7 @@ describe("handleSetupVaultPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -815,6 +1058,7 @@ describe("handleSetupVaultPost", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -834,6 +1078,7 @@ describe("handleSetupVaultPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
@@ -863,6 +1108,7 @@ describe("handleSetupVaultPost", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -887,6 +1133,7 @@ describe("handleSetupVaultPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
@@ -940,6 +1187,7 @@ describe("handleSetupVaultPost", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -966,6 +1214,7 @@ describe("handleSetupVaultPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
@@ -1009,6 +1258,7 @@ describe("handleSetupVaultPost", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -1034,6 +1284,7 @@ describe("handleSetupVaultPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
@@ -1070,6 +1321,7 @@ describe("handleSetupVaultPost", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -1099,6 +1351,7 @@ describe("handleSetupVaultPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor,
           registry: getDefaultOperationsRegistry(),
@@ -1153,6 +1406,7 @@ describe("handleSetupVaultPost", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -1178,6 +1432,7 @@ describe("handleSetupVaultPost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
@@ -1432,6 +1687,7 @@ describe("handleSetupExposePost", () => {
       db,
       manifestPath: h.manifestPath,
       configDir: h.dir,
+      readExposeStateFn: h.readExposeStateFn,
       issuer: "https://hub.example",
       registry: getDefaultOperationsRegistry(),
     });
@@ -1460,6 +1716,7 @@ describe("handleSetupExposePost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -1495,6 +1752,7 @@ describe("handleSetupExposePost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -1533,6 +1791,7 @@ describe("handleSetupExposePost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -1567,6 +1826,7 @@ describe("handleSetupExposePost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -1603,6 +1863,7 @@ describe("handleSetupExposePost", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -1653,6 +1914,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
       db,
       manifestPath: h.manifestPath,
       configDir: h.dir,
+      readExposeStateFn: h.readExposeStateFn,
       issuer: "https://hub.example",
       registry: getDefaultOperationsRegistry(),
     });
@@ -1681,6 +1943,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -1727,6 +1990,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -1792,6 +2056,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -1836,6 +2101,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       };
@@ -1892,6 +2158,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -1957,6 +2224,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -2015,6 +2283,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -2076,6 +2345,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2139,6 +2409,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -2204,6 +2475,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -2255,6 +2527,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: reg,
         },
@@ -2294,6 +2567,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2317,6 +2591,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
@@ -2345,6 +2620,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2363,6 +2639,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
@@ -2390,6 +2667,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
@@ -2411,6 +2689,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2429,6 +2708,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
@@ -2457,6 +2737,7 @@ describe("done screen install tiles (hub#272 Item B)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -2490,6 +2771,7 @@ describe("typed vault name (hub#267)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2532,6 +2814,7 @@ describe("typed vault name (hub#267)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor,
           registry: getDefaultOperationsRegistry(),
@@ -2565,6 +2848,7 @@ describe("typed vault name (hub#267)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2585,6 +2869,7 @@ describe("typed vault name (hub#267)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor: makeSupervisor(),
           registry: getDefaultOperationsRegistry(),
@@ -2610,6 +2895,7 @@ describe("typed vault name (hub#267)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2650,6 +2936,7 @@ describe("typed vault name (hub#267)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           supervisor,
           registry: getDefaultOperationsRegistry(),
@@ -2712,6 +2999,7 @@ describe("typed vault name (hub#267)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -2763,6 +3051,7 @@ describe("typed vault name (hub#267)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -2814,6 +3103,7 @@ describe("typed vault name (hub#267)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -2884,6 +3174,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2908,6 +3199,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2933,6 +3225,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2954,6 +3247,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -2976,6 +3270,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -2997,6 +3292,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -3026,6 +3322,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -3047,6 +3344,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -3074,6 +3372,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -3095,6 +3394,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -3120,6 +3420,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -3140,6 +3441,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -3186,6 +3488,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -3207,6 +3510,7 @@ describe("bootstrap token gate (handleSetupAccountPost)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       };
@@ -3290,6 +3594,7 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -3353,6 +3658,7 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -3411,6 +3717,7 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: reg,
         },
@@ -3470,6 +3777,7 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
           db,
           manifestPath: h.manifestPath,
           configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
           issuer: "https://hub.example",
           registry: getDefaultOperationsRegistry(),
         },
@@ -3497,6 +3805,7 @@ describe("done screen — 'Start using your vault' tile (hub#342)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
@@ -3593,6 +3902,7 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "http://127.0.0.1:1939",
         registry: getDefaultOperationsRegistry(),
       };
@@ -3618,6 +3928,7 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "http://127.0.0.1:1939",
         registry: getDefaultOperationsRegistry(),
         supervisor,
@@ -3657,7 +3968,11 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
       // The skip flag is persisted.
       expect(getSetting(db, "setup_vault_skipped")).toBe("true");
       // deriveWizardState advances past the vault step.
-      const s = deriveWizardState({ db, manifestPath: h.manifestPath });
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        readExposeStateFn: h.readExposeStateFn,
+      });
       expect(s.hasVault).toBe(true);
       expect(s.step).toBe("expose");
     } finally {
@@ -3674,6 +3989,7 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
         db,
         manifestPath: h.manifestPath,
         configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
         issuer: "http://127.0.0.1:1939",
         registry: getDefaultOperationsRegistry(),
         supervisor,
@@ -3767,10 +4083,10 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
     let capturedBody: unknown;
     const stubFetch = (async (_: string | URL | Request, init?: RequestInit) => {
       capturedBody = JSON.parse((init?.body as string) ?? "{}");
-      return new Response(
-        JSON.stringify({ notes_imported: 1 }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
+      return new Response(JSON.stringify({ notes_imported: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     }) as typeof fetch;
 
     await postVaultImportImpl({
