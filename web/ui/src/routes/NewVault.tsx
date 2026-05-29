@@ -6,11 +6,15 @@
  *      "list" reserved) client-side so the operator gets immediate
  *      feedback, but the server is still authoritative — see admin-
  *      vaults.ts for the canonical list.
- *   2. Result: on 201 with `token`, render the single-emit `pvt_*`
- *      banner with copy + a "Done" dismiss. The token is shown ONCE,
- *      ever — refreshing the page or navigating away loses it; the hub
- *      can't re-emit it. We block navigation away while the banner is
- *      live so an accidental Back doesn't strand the operator.
+ *   2. Result: on 201 with `token`, render the single-emit token banner
+ *      with copy + a "Done" dismiss. The token is shown ONCE, ever —
+ *      refreshing the page or navigating away loses it; the hub can't
+ *      re-emit it. We block navigation away while the banner is live so
+ *      an accidental Back doesn't strand the operator. Below the token
+ *      banner, the created-view renders the per-vault MCP connect card
+ *      (the same `<McpConnectCard>` the Vaults list uses) so the bare
+ *      token has a clear, in-context purpose — closing the team-onboarding
+ *      gap where a freshly-minted token arrived with no stated use.
  *
  * 200 (idempotent re-POST against an existing vault) is treated as
  * success but renders without a token banner — there's nothing to copy
@@ -18,6 +22,7 @@
  */
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { McpConnectCard } from "../components/McpConnectCard.tsx";
 import { type CreateVaultResult, HttpError, createVault } from "../lib/api.ts";
 
 const VAULT_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
@@ -191,6 +196,14 @@ function CreatedView({
           </div>
         </div>
       )}
+
+      {/* The per-vault MCP connect card — same component the Vaults list
+          renders. Gives the freshly-minted token a clear purpose and
+          surfaces the OAuth-first connect snippet right where the operator
+          lands after creating a vault (team-onboarding gap #1). */}
+      <div className="section">
+        <McpConnectCard vaultName={result.name} vaultUrl={result.url} />
+      </div>
 
       <div className="kv section">
         <div>Name</div>

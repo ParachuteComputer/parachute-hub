@@ -1295,9 +1295,12 @@ function renderMcpTile(
     <h2>Connect Claude Code (MCP)</h2>
     <p>Wire <code>vault:${safeVault}</code> into Claude Code as an MCP server:</p>
     <pre>${escapeHtml(bareCmd)}</pre>
-    <p class="fine">Mint an operator token at
-      <a href="/admin/tokens"><code>/admin/tokens</code></a> and append
-      <code>--header "Authorization: Bearer pvt_..."</code> on first use.</p>
+    <p class="fine">No token needed — the command triggers browser OAuth on
+      first use (you sign in to this hub and approve access). For headless
+      clients that can't do the browser flow, mint a hub token at
+      <a href="/admin/tokens"><code>/admin/tokens</code></a> (or with
+      <code>parachute auth mint-token</code>) and append
+      <code>--header "Authorization: Bearer &lt;token&gt;"</code>.</p>
   </div>`;
 }
 

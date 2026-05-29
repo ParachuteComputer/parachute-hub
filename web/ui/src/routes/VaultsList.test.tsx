@@ -186,6 +186,39 @@ describe("VaultsList", () => {
     );
   });
 
+  it("toggles a per-row MCP connect card showing the /vault/<name>/mcp endpoint + command", async () => {
+    vi.mocked(api.listVaults).mockResolvedValue({
+      moduleInstalled: true,
+      vaults: [
+        {
+          name: "work",
+          url: "https://hub.example.ts.net/vault/work",
+          version: "0.5.1",
+          path: "/vault/work",
+          managementUrl: "/admin",
+        },
+      ],
+    });
+    renderList();
+    const connectBtn = await screen.findByRole("button", {
+      name: /connect an mcp client to vault work/i,
+    });
+    // Card is collapsed until the operator clicks Connect.
+    expect(screen.queryByTestId("mcp-endpoint")).toBeNull();
+    fireEvent.click(connectBtn);
+
+    expect(screen.getByTestId("mcp-endpoint")).toHaveTextContent(
+      "https://hub.example.ts.net/vault/work/mcp",
+    );
+    expect(screen.getByTestId("mcp-add-command")).toHaveTextContent(
+      "claude mcp add --transport http parachute-work https://hub.example.ts.net/vault/work/mcp",
+    );
+
+    // Clicking again collapses it.
+    fireEvent.click(screen.getByRole("button", { name: /connect an mcp client to vault work/i }));
+    expect(screen.queryByTestId("mcp-endpoint")).toBeNull();
+  });
+
   it("surfaces a per-row error banner when the mint fails (no redirect)", async () => {
     vi.mocked(api.listVaults).mockResolvedValue({
       moduleInstalled: true,

@@ -10,6 +10,7 @@
  */
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { McpConnectCard } from "../components/McpConnectCard.tsx";
 import {
   HttpError,
   type VaultListing,
@@ -37,6 +38,9 @@ export function VaultsList() {
   const [state, setState] = useState<State>({ kind: "loading" });
   const [reload, setReload] = useState(0);
   const [manage, setManage] = useState<ManageState>({ kind: "idle" });
+  // Which row's MCP-connect card is expanded. Single-open: clicking
+  // Connect on another row swaps the open card rather than stacking them.
+  const [connectFor, setConnectFor] = useState<string | null>(null);
 
   async function onManage(vault: VaultListing): Promise<void> {
     if (!vault.managementUrl) return;
@@ -174,43 +178,58 @@ export function VaultsList() {
           {state.vaults.map((v) => {
             const isMinting = manage.kind === "minting" && manage.name === v.name;
             const rowError = manage.kind === "error" && manage.name === v.name ? manage : null;
+            const isConnectOpen = connectFor === v.name;
             return (
-              <div key={v.name} className="vault-row">
-                <div className="body">
-                  <div className="name">
-                    <code>{v.name}</code>
-                    <span className="tag muted" title="Vault version">
-                      v{v.version}
-                    </span>
-                  </div>
-                  <div className="dim url">
-                    <code>{v.url}</code>
-                  </div>
-                  {rowError ? (
-                    <div className="error-banner" style={{ marginTop: "0.5rem" }}>
-                      <code>{rowError.message}</code>
+              <div key={v.name} className="vault-row-group">
+                <div className="vault-row">
+                  <div className="body">
+                    <div className="name">
+                      <code>{v.name}</code>
+                      <span className="tag muted" title="Vault version">
+                        v{v.version}
+                      </span>
                     </div>
-                  ) : null}
+                    <div className="dim url">
+                      <code>{v.url}</code>
+                    </div>
+                    {rowError ? (
+                      <div className="error-banner" style={{ marginTop: "0.5rem" }}>
+                        <code>{rowError.message}</code>
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="vault-row-actions">
+                    <button
+                      type="button"
+                      className={isConnectOpen ? undefined : "secondary"}
+                      aria-expanded={isConnectOpen}
+                      aria-label={`Connect an MCP client to vault ${v.name}`}
+                      onClick={() => setConnectFor((cur) => (cur === v.name ? null : v.name))}
+                    >
+                      {isConnectOpen ? "Hide connect" : "Connect"}
+                    </button>
+                    {v.managementUrl ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void onManage(v);
+                        }}
+                        disabled={isMinting}
+                        aria-label={`Manage vault ${v.name}`}
+                      >
+                        {isMinting ? "Opening…" : "Manage"}
+                      </button>
+                    ) : (
+                      <span
+                        className="muted"
+                        title="This vault has no admin SPA — manage with parachute-vault on the host."
+                      >
+                        CLI only
+                      </span>
+                    )}
+                  </div>
                 </div>
-                {v.managementUrl ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      void onManage(v);
-                    }}
-                    disabled={isMinting}
-                    aria-label={`Manage vault ${v.name}`}
-                  >
-                    {isMinting ? "Opening…" : "Manage"}
-                  </button>
-                ) : (
-                  <span
-                    className="muted"
-                    title="This vault has no admin SPA — manage with parachute-vault on the host."
-                  >
-                    CLI only
-                  </span>
-                )}
+                {isConnectOpen ? <McpConnectCard vaultName={v.name} vaultUrl={v.url} /> : null}
               </div>
             );
           })}

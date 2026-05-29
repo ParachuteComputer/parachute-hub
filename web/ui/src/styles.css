@@ -532,6 +532,94 @@ h2 {
   color: var(--fg-dim);
   font-size: 1.2rem;
 }
+/* Groups a vault row with its (optionally expanded) MCP-connect card so
+ * the card reads as belonging to the row above it. */
+.vault-row-group {
+  margin-bottom: 0.5rem;
+}
+.vault-row-group .vault-row {
+  margin-bottom: 0;
+}
+.vault-row-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+/*
+ * Per-vault "MCP connection" card (the SPA twin of setup-wizard.ts
+ * renderMcpTile). Surfaced inline under a vault row (Vaults list) and
+ * inside the NewVault created-view. The endpoint + command codeboxes
+ * reuse the `.token-box` shape from the mint banner so copy affordances
+ * read consistently across the SPA.
+ */
+.mcp-connect-card {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.1rem 1.25rem;
+  margin: 0 0 0.5rem;
+}
+.mcp-connect-card-embedded {
+  background: white;
+  margin-bottom: 0;
+}
+.mcp-connect-card h3 {
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+}
+.mcp-connect-card > p {
+  margin-top: 0;
+}
+.mcp-connect-card .token-box {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.35rem 0 0.25rem;
+}
+.mcp-connect-card .token-box code {
+  flex: 1;
+  font-size: 0.85rem;
+  padding: 0.55rem 0.7rem;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  word-break: break-all;
+  user-select: all;
+}
+.mcp-field {
+  margin-top: 0.9rem;
+}
+.mcp-field-label {
+  display: block;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+.mcp-field .dim {
+  margin: 0.3rem 0 0;
+}
+.mcp-token-path {
+  margin-top: 1rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+.mcp-token-path > summary {
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+}
+.mcp-token-path > summary:hover {
+  color: var(--accent);
+}
+.mcp-token-path .mint-banner {
+  margin-top: 0.75rem;
+  margin-bottom: 0;
+}
+.mcp-docs-link {
+  margin: 0.9rem 0 0;
+}
 
 form .row {
   margin-bottom: 1rem;

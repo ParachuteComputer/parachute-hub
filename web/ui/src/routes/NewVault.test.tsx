@@ -98,6 +98,14 @@ describe("NewVault", () => {
     expect(screen.getByRole("button", { name: /done/i })).toBeInTheDocument();
     expect(screen.getByText(/vault\.db/)).toBeInTheDocument();
 
+    // The created-view also surfaces the per-vault MCP connect card so the
+    // freshly-minted token has a clear purpose (team-onboarding gap #1).
+    // The card derives its endpoint from the created vault's URL.
+    expect(screen.getByTestId("mcp-endpoint")).toHaveTextContent("http://hub.local/vault/work/mcp");
+    expect(screen.getByTestId("mcp-add-command")).toHaveTextContent(
+      "claude mcp add --transport http parachute-work http://hub.local/vault/work/mcp",
+    );
+
     // "Done — I've saved the token" must land on the vaults list, NOT a
     // non-existent `/${name}` detail route (which 404'd in production).
     await user.click(screen.getByRole("button", { name: /done/i }));
