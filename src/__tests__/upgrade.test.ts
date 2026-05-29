@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UpgradeRunner } from "../commands/upgrade.ts";
-import { compareVersions, detectChannel, upgrade } from "../commands/upgrade.ts";
+import { compareVersions, defaultRunner, detectChannel, upgrade } from "../commands/upgrade.ts";
 import { upsertService } from "../services-manifest.ts";
 
 interface RunCall {
@@ -400,6 +400,83 @@ describe("parachute upgrade", () => {
     } finally {
       h.cleanup();
     }
+  });
+
+  test("git absent (ENOENT): no crash, isGitCheckout → false, npm path taken", async () => {
+    // Real EC2 repro: a published-npm install on a minimal server with no
+    // `git` binary. The production runner's Bun.spawn(["git", ...]) throws
+    // synchronously with ENOENT; the upgrade flow must degrade to the npm
+    // path rather than crashing with an uncaught "Executable not found".
+    const h = makeHarness();
+    try {
+      const installDir = join(h.installRoot, "vault");
+      writePackageJson(installDir, { name: "@openparachute/vault", version: "0.4.0" });
+      seedVault(h.manifestPath, installDir, "0.4.0");
+
+      const calls: RunCall[] = [];
+      // Simulate the git-absent host: any spawn of `git` ENOENTs, surfaced
+      // through the runner as a non-zero captured result (code 127). This is
+      // exactly what the patched defaultRunner produces — we assert the
+      // upgrade flow handles that result gracefully.
+      const runner: UpgradeRunner = {
+        async run(cmd, opts) {
+          calls.push({ cmd: [...cmd], cwd: opts?.cwd, kind: "run" });
+          if (cmd[0] === "git") return 127; // git-less host
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            writePackageJson(installDir, { name: "@openparachute/vault", version: "0.5.0" });
+          }
+          return 0;
+        },
+        async capture(cmd, opts) {
+          calls.push({ cmd: [...cmd], cwd: opts?.cwd, kind: "capture" });
+          if (cmd[0] === "git") return { code: 127, stdout: "git: not found on this host\n" };
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      let restartedShort: string | undefined;
+      const logs: string[] = [];
+      const code = await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: () => join(installDir, "package.json"),
+        restartFn: async (svc) => {
+          restartedShort = svc;
+          return 0;
+        },
+        log: (l) => logs.push(l),
+      });
+
+      // No throw; the npm path ran end-to-end.
+      expect(code).toBe(0);
+      expect(restartedShort).toBe("vault");
+      const joined = logs.join("\n");
+      // isGitCheckout returned false → npm-installed branch, not bun-linked.
+      expect(joined).toMatch(/npm-installed/);
+      expect(joined).not.toMatch(/bun-linked/);
+      expect(joined).toMatch(/bun add -g @openparachute\/vault@latest/);
+      expect(joined).toMatch(/0\.4\.0 → 0\.5\.0/);
+      // We probed git (and degraded) but never reached the git-mutating
+      // commands (pull / status) that only run on the bun-linked branch.
+      const gitRun = calls.filter((c) => c.kind === "run" && c.cmd[0] === "git");
+      expect(gitRun).toHaveLength(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("defaultRunner.capture: git-absent ENOENT yields code 127, no throw", async () => {
+    // Drive the *production* runner against a binary that doesn't exist, to
+    // prove the synchronous-spawn-throw is caught (not just the injectable
+    // seam). Bun.spawn throws ENOENT synchronously for a missing binary.
+    const missing = `parachute-no-such-binary-${process.pid}`;
+    const captured = await defaultRunner.capture([missing, "--version"]);
+    expect(captured.code).toBe(127);
+    expect(captured.stdout).toContain("not found on this host");
+
+    const ran = await defaultRunner.run([missing, "--version"]);
+    expect(ran).toBe(127);
   });
 
   test("npm-installed: version unchanged → skip restart", async () => {
