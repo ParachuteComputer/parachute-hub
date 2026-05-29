@@ -20,6 +20,7 @@ const PARAMS: AuthorizeFormParams = {
   codeChallenge: "ch",
   codeChallengeMethod: "S256",
   state: "xyz",
+  resource: null,
 };
 
 const CSRF = "csrf-token-fixture";

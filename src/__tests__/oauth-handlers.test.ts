@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getClient, registerClient } from "../clients.ts";
+import { approveClient, getClient, registerClient } from "../clients.ts";
 import { CSRF_COOKIE_NAME } from "../csrf.ts";
 import { findGrant, recordGrant } from "../grants.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
@@ -7465,6 +7465,343 @@ describe("zero-vault non-admin privesc gate (hub#429 reviewer)", () => {
       expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
       expect(loc.searchParams.get("code")?.length).toBeGreaterThan(20);
       expect(loc.searchParams.get("state")).toBe("first-admin-ok");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// RFC 8707 resource binding (fix #461). A friend connecting an MCP client to
+// ONE vault (`<origin>/vault/<name>/mcp`) must see ONLY that vault's scopes on
+// consent, and the minted token must carry the narrow, NAMED scope +
+// `aud=vault.<name>` — otherwise (a) the consent screen is scary (whole-hub
+// catalog) and (b) a current-line vault REJECTS the token via
+// `findBroadVaultScopes` (unnamed `vault:read` → `aud=vault` → 401).
+//
+// The deps thread `hubBoundOrigins` so the resource's origin is recognized as
+// one the hub fronts — same set the same-origin CSRF gate consults.
+describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
+  const RESOURCE_DEPS = {
+    issuer: ISSUER,
+    loadServicesManifest: () => MULTI_VAULT_MANIFEST,
+    hubBoundOrigins: () => [ISSUER],
+  };
+
+  // Two vaults on the hub so "narrow to ONE" is observable: a request bound to
+  // `jon` must NOT surface `boulder`'s scopes nor the rest of the catalog.
+  const MULTI_VAULT_MANIFEST: ServicesManifest = {
+    services: [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/jon", "/vault/boulder"],
+        health: "/health",
+        version: "0.6.0",
+      },
+      {
+        name: "parachute-scribe",
+        port: 1943,
+        paths: ["/scribe"],
+        health: "/health",
+        version: "0.6.0",
+      },
+    ],
+  };
+
+  /**
+   * Mirror of `parachute-vault/src/scopes.ts:findBroadVaultScopes` — the exact
+   * predicate `authenticateHubJwt` runs to REJECT hub tokens. A token a
+   * current-line vault accepts must (a) carry zero broad `vault:<verb>` scopes
+   * and (b) name the vault in the audience. Inlined (vault is a separate
+   * package, not a hub dep) so this hub test genuinely encodes vault's
+   * contract — the cross-cutting half of the E2E gate.
+   */
+  function findBroadVaultScopes(granted: string[]): string[] {
+    return granted.filter((s) => {
+      const parts = s.split(":");
+      return (
+        parts.length === 2 &&
+        parts[0] === "vault" &&
+        ["read", "write", "admin"].includes(parts[1] ?? "")
+      );
+    });
+  }
+
+  test("E2E GATE: DCR → /authorize?resource=…/vault/jon/mcp → consent → code → /token mints aud=vault.jon + NAMED narrow scopes that a current-line vault accepts", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      // --- the operator (first admin) signed into the hub ---
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const cookie = `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`;
+
+      // --- DCR: register the friend's MCP client (plain pending, then
+      //     operator-approve so consent renders rather than same-hub
+      //     auto-trust skipping it) ---
+      const regRes = await handleRegister(
+        db,
+        new Request(`${ISSUER}/oauth/register`, {
+          method: "POST",
+          body: JSON.stringify({
+            redirect_uris: ["https://claude.ai/mcp/callback"],
+            client_name: "claude-code",
+            scope: "vault:read vault:write",
+          }),
+          headers: { "content-type": "application/json" },
+        }),
+        RESOURCE_DEPS,
+      );
+      expect(regRes.status).toBe(201);
+      const reg = (await regRes.json()) as { client_id: string };
+      approveClient(db, reg.client_id);
+
+      // --- /authorize WITH the RFC 8707 resource indicator. The client asks
+      //     for UNNAMED vault:read/write but names the jon MCP resource. ---
+      const { verifier, challenge } = makePkce();
+      const authReq = new Request(
+        authorizeUrl({
+          client_id: reg.client_id,
+          redirect_uri: "https://claude.ai/mcp/callback",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read vault:write",
+          resource: `${ISSUER}/vault/jon/mcp`,
+        }),
+        { headers: { cookie } },
+      );
+      const authRes = handleAuthorizeGet(db, authReq, RESOURCE_DEPS);
+      expect(authRes.status).toBe(200);
+      const consentHtml = await authRes.text();
+
+      // Consent shows ONLY jon's scopes — narrowed + locked, no whole-hub
+      // catalog, no dropdown to guess, no other vault.
+      expect(consentHtml).toContain("vault:jon:read");
+      expect(consentHtml).toContain("vault:jon:write");
+      // Scary-scope guard: the friend never sees the rest of the catalog or
+      // the other vault.
+      expect(consentHtml).not.toContain("vault:boulder");
+      expect(consentHtml).not.toContain("hub:admin");
+      expect(consentHtml).not.toContain("scribe:");
+      // No vault-picker dropdown — the vault is locked to jon by the resource.
+      expect(consentHtml).not.toContain('name="vault_pick"');
+
+      // --- consent submit (approve). The hidden inputs already carry the
+      //     narrowed named scopes; the POST path re-narrows defensively. ---
+      const consentForm = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "yes",
+        client_id: reg.client_id,
+        redirect_uri: "https://claude.ai/mcp/callback",
+        response_type: "code",
+        scope: "vault:jon:read vault:jon:write",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        resource: `${ISSUER}/vault/jon/mcp`,
+      });
+      const consentRes = await handleAuthorizePost(
+        db,
+        new Request(`${ISSUER}/oauth/authorize`, {
+          method: "POST",
+          body: consentForm,
+          headers: { "content-type": "application/x-www-form-urlencoded", cookie },
+        }),
+        RESOURCE_DEPS,
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      expect(code).toBeTruthy();
+
+      // --- /token exchange ---
+      const tokenRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code: code ?? "",
+            client_id: reg.client_id,
+            redirect_uri: "https://claude.ai/mcp/callback",
+            code_verifier: verifier,
+          }),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        RESOURCE_DEPS,
+      );
+      expect(tokenRes.status).toBe(200);
+      const tok = (await tokenRes.json()) as { access_token: string; scope: string };
+
+      // Wire-level scope: NAMED + narrow — NOT the catalog, NOT unnamed.
+      expect(tok.scope).toBe("vault:jon:read vault:jon:write");
+
+      // --- minted access token claims ---
+      const { payload } = await validateAccessToken(db, tok.access_token, ISSUER);
+      expect(payload.aud).toBe("vault.jon"); // resource-bound audience (RFC 8707)
+      expect(payload.scope).toBe("vault:jon:read vault:jon:write");
+      expect(payload.iss).toBe(ISSUER);
+
+      // --- CROSS-CUTTING: the token shape a current-line vault REQUIRES.
+      //     vault's `authenticateHubJwt` runs `findBroadVaultScopes` (reject
+      //     any unnamed vault verb) + audience strict-check `vault.<name>`.
+      const grantedScopes = (payload.scope as string).split(" ");
+      expect(findBroadVaultScopes(grantedScopes)).toEqual([]); // no broad-scope rejection
+      expect(payload.aud).toBe("vault.jon"); // matches the URL-derived vault name at /vault/jon/mcp
+      // Every granted scope is the named form vault accepts.
+      for (const s of grantedScopes) {
+        expect(s).toMatch(/^vault:jon:(read|write)$/);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("resource → consent narrows to the named vault (no whole-hub catalog, picker locked)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:read",
+            resource: `${ISSUER}/vault/jon/.well-known/oauth-protected-resource`,
+          }),
+          {
+            headers: {
+              cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            },
+          },
+        ),
+        RESOURCE_DEPS,
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // PRM-URL form of the resource resolves to jon too.
+      expect(html).toContain("vault:jon:read");
+      expect(html).not.toContain('name="vault_pick"');
+      expect(html).not.toContain("vault:boulder");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("no resource param → behavior unchanged (unnamed scope still renders the picker)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:read",
+            // no resource param
+          }),
+          {
+            headers: {
+              cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            },
+          },
+        ),
+        RESOURCE_DEPS,
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Manual-pick path preserved: picker renders, vault not pre-narrowed.
+      expect(html).toContain("Pick a vault");
+      expect(html).toContain('name="vault_pick"');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("off-origin resource → ignored (no narrowing; manual-pick path)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:read",
+            resource: "https://evil.example/vault/jon/mcp",
+          }),
+          {
+            headers: {
+              cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            },
+          },
+        ),
+        RESOURCE_DEPS,
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // An attacker-controlled resource origin can't drive narrowing — the
+      // flow falls back to the normal manual picker.
+      expect(html).toContain("Pick a vault");
+      expect(html).not.toContain("vault:jon:read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-requestable scope still refused even with a resource (vault:admin → vault:jon:admin blocked)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:admin",
+            resource: `${ISSUER}/vault/jon/mcp`,
+          }),
+          {
+            headers: {
+              cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+            },
+          },
+        ),
+        RESOURCE_DEPS,
+      );
+      // Narrowing turns vault:admin → vault:jon:admin which is NON-requestable;
+      // the gate rejects via redirect with invalid_scope.
+      expect(res.status).toBe(302);
+      const loc = res.headers.get("location") ?? "";
+      expect(loc).toContain("error=invalid_scope");
+      expect(loc).toContain("vault%3Ajon%3Aadmin");
     } finally {
       cleanup();
     }

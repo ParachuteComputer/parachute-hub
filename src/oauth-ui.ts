@@ -20,7 +20,7 @@
  *     module scopes that the hub doesn't know about) render verbatim.
  *   - **No JavaScript.** Entirely form-based. Submit is the only interaction.
  */
-import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
+import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import { type ScopeExplanation, explainScope } from "./scope-explanations.ts";
 
@@ -62,6 +62,12 @@ export interface AuthorizeFormParams {
   codeChallenge: string;
   codeChallengeMethod: string;
   state: string | null;
+  /**
+   * RFC 8707 resource indicator. Carried through the login → consent →
+   * form-post round-trip so the resource-bound vault narrowing survives a
+   * sign-in redirect. Null when the client sent no `resource` param.
+   */
+  resource: string | null;
 }
 
 export interface LoginViewProps {
@@ -932,6 +938,10 @@ export function renderHiddenInputs(p: AuthorizeFormParams): string {
     ["code_challenge_method", p.codeChallengeMethod],
   ];
   if (p.state) fields.push(["state", p.state]);
+  // RFC 8707 resource indicator — round-tripped through the consent form so
+  // the resource-bound vault narrowing survives the POST (the consent submit
+  // path re-derives the bound vault from it).
+  if (p.resource) fields.push(["resource", p.resource]);
   return fields
     .map(([k, v]) => `<input type="hidden" name="${k}" value="${escapeHtml(v)}" />`)
     .join("\n        ");

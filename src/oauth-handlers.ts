@@ -66,6 +66,7 @@ import {
 } from "./oauth-ui.ts";
 import { isSameOriginRequest } from "./origin-check.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
+import { narrowResourceVaultScopes, resolveResourceVault } from "./resource-binding.ts";
 import { isNonRequestableScope, isRequestableScope, scopeIsAdmin } from "./scope-explanations.ts";
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
 import {
@@ -460,6 +461,9 @@ function parseAuthorizeFormParams(url: URL): AuthorizeFormParams | { error: stri
     codeChallenge,
     codeChallengeMethod,
     state: url.searchParams.get("state"),
+    // RFC 8707 resource indicator (optional). When present and resolvable to
+    // a per-vault MCP resource, drives the narrow-consent + named-scope path.
+    resource: url.searchParams.get("resource"),
   };
 }
 
@@ -844,6 +848,41 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     );
   }
 
+  // RFC 8707 resource binding. When the client named a per-vault MCP
+  // resource (`<origin>/vault/<name>/mcp` or its PRM URL), narrow the
+  // requested vault verbs to the named `vault:<name>:<verb>` form BEFORE any
+  // downstream processing. Two effects:
+  //
+  //   1. The consent screen shows ONLY that vault's scopes (the picker locks
+  //      to <name>) instead of the whole-hub catalog — a friend connecting to
+  //      one vault no longer sees `hub:admin`, `scribe:admin`, or every other
+  //      vault's verbs.
+  //   2. The minted token carries the named scope, so `inferAudience` stamps
+  //      `aud=vault.<name>` and a current-line vault accepts it (an unnamed
+  //      `vault:read` token is rejected by `findBroadVaultScopes`).
+  //
+  // Narrowing happens before the non-requestable gate (below) on purpose: if
+  // a resource-bound client somehow asked for `vault:admin`, narrowing makes
+  // it `vault:<name>:admin`, which IS non-requestable — so the gate correctly
+  // blocks it. Read/write narrow to the requestable named form. Non-vault
+  // scopes and already-named scopes for other vaults pass through unchanged.
+  //
+  // No resource, or a resource that isn't one of our per-vault MCP resources
+  // (off-origin, malformed, non-vault path) → `boundVault` is null and the
+  // flow is byte-for-byte the pre-#461 behavior (manual picker, etc.).
+  const boundVault = resolveResourceVault(parsed.resource, resolveBoundOrigins(deps));
+  if (boundVault) {
+    const narrowed = narrowResourceVaultScopes(
+      parsed.scope.split(" ").filter((s) => s.length > 0),
+      boundVault,
+    );
+    // Rewrite `parsed.scope` so the narrowed named scopes flow through every
+    // downstream consumer: the login-redirect query round-trip, the consent
+    // props + hidden inputs, the skip-consent grant lookup, and the
+    // auth-code mint.
+    parsed.scope = narrowed.join(" ");
+  }
+
   // Operator-only scope gate (#96). Reject any request that names a scope
   // we'll never mint via this flow — `parachute:host:admin` and friends.
   // Per RFC 6749 §4.1.2.1, errors that aren't redirect-uri-related are
@@ -1121,6 +1160,21 @@ async function handleConsentSubmit(
   csrfToken: string,
 ): Promise<Response> {
   const params = paramsFromForm(form);
+  // RFC 8707 resource binding — defense-in-depth (mirror of the GET handler).
+  // The consent form's hidden inputs already carry the narrowed named scopes
+  // (the GET handler rewrote `parsed.scope` before rendering), but a hand-
+  // crafted POST could re-supply an unnamed `vault:read` alongside the
+  // `resource` field. Re-narrow here so the minted token is always named +
+  // correctly-audienced regardless of what the form body claims. Same
+  // semantics as the GET path: only when `resource` resolves to one of our
+  // per-vault MCP resources; no-op otherwise (manual-pick path unchanged).
+  const boundVault = resolveResourceVault(params.resource, resolveBoundOrigins(deps));
+  if (boundVault) {
+    params.scope = narrowResourceVaultScopes(
+      params.scope.split(" ").filter((s) => s.length > 0),
+      boundVault,
+    ).join(" ");
+  }
   const approve = String(form.get("approve") ?? "") === "yes";
   const sessionId = parseSessionCookie(req.headers.get("cookie"));
   const session = sessionId ? findSession(db, sessionId) : null;
@@ -1554,6 +1608,7 @@ function paramsFromForm(form: Awaited<ReturnType<Request["formData"]>>): Authori
     codeChallenge: String(form.get("code_challenge") ?? ""),
     codeChallengeMethod: String(form.get("code_challenge_method") ?? "S256"),
     state: (form.get("state") as string | null) ?? null,
+    resource: (form.get("resource") as string | null) ?? null,
   };
 }
 
@@ -1567,6 +1622,10 @@ function authorizeParamsToQuery(p: AuthorizeFormParams): Record<string, string> 
     code_challenge_method: p.codeChallengeMethod,
   };
   if (p.state) q.state = p.state;
+  // Round-trip the RFC 8707 resource indicator through the login redirect so
+  // the resource-bound narrowing survives a sign-in (it re-enters GET
+  // /oauth/authorize with the original params).
+  if (p.resource) q.resource = p.resource;
   return q;
 }
 
