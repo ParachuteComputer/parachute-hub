@@ -326,6 +326,7 @@ Usage:
   parachute expose public  --tailnet
   parachute expose public  --cloudflare --domain <hostname>
   parachute expose public  off --cloudflare
+  parachute expose cloudflare --domain <hostname>           # alias for the above
 
 Status:
   tailnet is the supported exposure shape. The hub's OAuth + per-module
@@ -381,6 +382,7 @@ Examples:
   parachute expose public off                              # stop the Funnel
   parachute expose public --cloudflare --domain vault.example.com
                                                            # stable URL via cloudflared
+  parachute expose cloudflare --domain vault.example.com   # alias for the line above
   parachute expose public off --cloudflare                 # stop the cloudflared tunnel
 
 Tailscale Funnel constraints:
