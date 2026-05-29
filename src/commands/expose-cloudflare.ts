@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 import { DEFAULT_TUNNEL_NAME, cloudflaredPathsFor, writeConfig } from "../cloudflare/config.ts";
@@ -100,11 +101,159 @@ const defaultKill: KillFn = (pid, signal) => {
   process.kill(pid, signal);
 };
 
+/**
+ * Find the PIDs of every running `cloudflared` connector serving THIS tunnel.
+ * "This tunnel" is identified by either the tunnel UUID or the config.yml path
+ * appearing on the process command line — both are unique to Parachute's
+ * connector for this tunnel, so we never touch an unrelated cloudflared the
+ * operator may be running for a different tunnel.
+ *
+ * The motivating bug (hub#487): each `parachute expose public --cloudflare`
+ * "reused the tunnel" but spawned a fresh connector (new pid) without killing
+ * the prior ones, and the state file only tracked the most-recent pid. Orphan
+ * connectors accumulated — multiple `cloudflared tunnel run` processes all
+ * serving stale `config.yml` snapshots, so edge routing became nondeterministic
+ * ("silent fails"). Sweeping by UUID/config-path catches the orphans that the
+ * single-pid state record misses (prior runs that crashed mid-rewrite, or a
+ * connector the operator started by hand for this tunnel).
+ *
+ * Injectable so tests assert the sweep without a live `pgrep`.
+ */
+export type ConnectorPidsFn = (tunnelUuid: string, configPath: string) => number[];
+
+export const defaultConnectorPids: ConnectorPidsFn = (tunnelUuid, configPath) => {
+  try {
+    // `pgrep -fl cloudflared` lists "<pid> <full command line>" for every
+    // process whose command line matches "cloudflared". We then filter to the
+    // ones that name THIS tunnel (uuid or config path) so the kill is surgical.
+    // macOS + Linux ship pgrep; Windows is out of scope (mirrors hub#287's lsof
+    // assumption). Any failure → [] (caller falls back to state-tracked pid).
+    const result = spawnSync("pgrep", ["-fl", "cloudflared"], {
+      encoding: "utf8",
+      timeout: 2000,
+    });
+    if (result.status !== 0 || typeof result.stdout !== "string") return [];
+    const selfPid = process.pid;
+    const pids: number[] = [];
+    for (const line of result.stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+      const match = trimmed.match(/^(\d+)\s+(.*)$/);
+      if (!match) continue;
+      const pid = Number.parseInt(match[1]!, 10);
+      const cmdline = match[2]!;
+      if (!Number.isInteger(pid) || pid <= 0 || pid === selfPid) continue;
+      // Surgical match: only connectors that name this tunnel's UUID or its
+      // config path. A bare `cloudflared` (e.g. `--version`, `tunnel list`)
+      // or a connector for a *different* tunnel won't match either token.
+      if (cmdline.includes(tunnelUuid) || cmdline.includes(configPath)) {
+        pids.push(pid);
+      }
+    }
+    return pids;
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * Resolve a hostname to its A/AAAA addresses. Returns [] when the name doesn't
+ * resolve (NXDOMAIN, SERVFAIL, no records yet) — the signal the DNS
+ * self-diagnosis keys on. Injectable so tests drive each case (unresolved /
+ * Cloudflare / non-Cloudflare) deterministically.
+ */
+export type ResolveHostFn = (hostname: string) => Promise<string[]>;
+
+export const defaultResolveHost: ResolveHostFn = async (hostname) => {
+  try {
+    // Bun.dns ships with the runtime; `node:dns/promises` is equally fine but
+    // Bun.dns.lookup returns both families in one call. `all: true` gives every
+    // record so a partially-propagated name still surfaces an address.
+    const records = await Bun.dns.lookup(hostname, { family: 0 });
+    return records.map((r) => r.address).filter((a) => typeof a === "string" && a.length > 0);
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * Cloudflare's published anycast IPv4 ranges (the proxy edge). A proxied
+ * (orange-cloud) record — which is what `cloudflared tunnel route dns` creates
+ * — resolves to one of these. If the hostname resolves to something *outside*
+ * these ranges, it's almost certainly shadowed: a Pages project, an A record,
+ * or a grey-cloud CNAME pointing elsewhere. We keep the list to the v4 ranges
+ * (the common case) and treat any IPv6 in Cloudflare's 2606:4700::/32 block as
+ * Cloudflare too. Source: https://www.cloudflare.com/ips/ (stable for years).
+ */
+const CLOUDFLARE_V4_RANGES: ReadonlyArray<readonly [string, number]> = [
+  ["173.245.48.0", 20],
+  ["103.21.244.0", 22],
+  ["103.22.200.0", 22],
+  ["103.31.4.0", 22],
+  ["141.101.64.0", 18],
+  ["108.162.192.0", 18],
+  ["190.93.240.0", 20],
+  ["188.114.96.0", 20],
+  ["197.234.240.0", 22],
+  ["198.41.128.0", 17],
+  ["162.158.0.0", 15],
+  ["104.16.0.0", 13],
+  ["104.24.0.0", 14],
+  ["172.64.0.0", 13],
+  ["131.0.72.0", 22],
+];
+
+function ipv4ToInt(ip: string): number | undefined {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return undefined;
+  let n = 0;
+  for (const part of parts) {
+    const octet = Number.parseInt(part, 10);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return undefined;
+    n = n * 256 + octet;
+  }
+  return n >>> 0;
+}
+
+/** True if any resolved address belongs to Cloudflare's edge. */
+export function looksLikeCloudflare(addresses: readonly string[]): boolean {
+  for (const addr of addresses) {
+    // IPv6: Cloudflare's edge lives in 2606:4700::/32.
+    if (addr.includes(":")) {
+      if (addr.toLowerCase().startsWith("2606:4700")) return true;
+      continue;
+    }
+    const ipInt = ipv4ToInt(addr);
+    if (ipInt === undefined) continue;
+    for (const [base, bits] of CLOUDFLARE_V4_RANGES) {
+      const baseInt = ipv4ToInt(base);
+      if (baseInt === undefined) continue;
+      const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+      if ((ipInt & mask) === (baseInt & mask)) return true;
+    }
+  }
+  return false;
+}
+
 export interface ExposeCloudflareOpts {
   runner?: Runner;
   spawner?: CloudflaredSpawner;
   alive?: AliveFn;
   kill?: KillFn;
+  /**
+   * Find every running cloudflared connector PID serving this tunnel (by UUID
+   * or config-path match). Used to sweep orphan connectors before spawning a
+   * fresh one (hub#487). Tests inject a stub; production uses
+   * `defaultConnectorPids` (a filtered `pgrep -fl cloudflared`).
+   */
+  connectorPids?: ConnectorPidsFn;
+  /**
+   * Resolve a hostname to its addresses, for the post-route DNS self-diagnosis
+   * (hub#487). Returns the resolved IPs (empty when NXDOMAIN / not yet live).
+   * Best-effort and non-fatal — a failure to resolve never blocks the expose.
+   * Tests inject a stub; production uses `defaultResolveHost` (Bun DNS).
+   */
+  resolveHost?: ResolveHostFn;
   log?: (line: string) => void;
   manifestPath?: string;
   statePath?: string;
@@ -186,6 +335,8 @@ interface Resolved {
   spawner: CloudflaredSpawner;
   alive: AliveFn;
   kill: KillFn;
+  connectorPids: ConnectorPidsFn;
+  resolveHost: ResolveHostFn;
   log: (line: string) => void;
   manifestPath: string;
   statePath: string;
@@ -217,6 +368,17 @@ function resolve(opts: ExposeCloudflareOpts): Resolved {
     spawner: opts.spawner ?? defaultCloudflaredSpawner,
     alive: opts.alive ?? defaultAlive,
     kill: opts.kill ?? defaultKill,
+    // Defaulting policy mirrors lifecycle's startReadyMs (hub#487): the real
+    // implementations shell out (`pgrep`) / hit the network (DNS). When a test
+    // injects a fake `spawner` but no explicit seam, fall back to inert stubs
+    // (no orphans found; "resolves at Cloudflare" → no DNS warning) so suites
+    // stay deterministic and offline. Production (no spawner override) always
+    // gets the real `pgrep` sweep + DNS diagnosis.
+    connectorPids:
+      opts.connectorPids ?? (opts.spawner === undefined ? defaultConnectorPids : () => []),
+    resolveHost:
+      opts.resolveHost ??
+      (opts.spawner === undefined ? defaultResolveHost : async () => ["104.16.0.1"]),
     log: opts.log ?? ((line) => console.log(line)),
     manifestPath: opts.manifestPath ?? SERVICES_MANIFEST_PATH,
     statePath: opts.statePath ?? CLOUDFLARED_STATE_PATH,
@@ -259,6 +421,49 @@ function printAuthGuidance(log: (line: string) => void, vaultUrl: string): void 
   log("The owner password gates both paths — browser sign-in and minting tokens.");
   log("Full auth reference:");
   log(`  ${AUTH_DOC_URL}`);
+}
+
+/**
+ * Best-effort registrable-zone guess: the last two labels of the hostname
+ * (`vault.example.com` → `example.com`, `gitcoin.parachute.computer` →
+ * `parachute.computer`). This is a heuristic — multi-label public suffixes
+ * (`foo.co.uk`) would guess `co.uk` — but it's only used to phrase the
+ * `dig +short <zone> NS` remedy, where being off by a label is a harmless
+ * nudge. We don't ship a full public-suffix list for one warning string.
+ */
+function guessZone(hostname: string): string {
+  const labels = hostname.split(".").filter((l) => l.length > 0);
+  if (labels.length <= 2) return hostname;
+  return labels.slice(-2).join(".");
+}
+
+/**
+ * Non-fatal post-route DNS diagnosis. Resolves `hostname` and warns when the
+ * result looks wrong — see the call site for the two symptoms this addresses.
+ * Never throws (resolveHost swallows its own errors) and never changes the
+ * exit code; the worst case is no output.
+ */
+async function diagnoseDns(hostname: string, r: Resolved): Promise<void> {
+  const zone = guessZone(hostname);
+  const addresses = await r.resolveHost(hostname);
+  if (addresses.length === 0) {
+    r.log("");
+    r.log(`⚠ DNS isn't live yet for ${hostname}.`);
+    r.log(`  If ${zone} is a new Cloudflare zone, its nameservers may not be switched at your`);
+    r.log("  registrar yet. Check with:");
+    r.log(`    dig +short ${zone} NS          # should list *.ns.cloudflare.com`);
+    r.log("  Propagation can take minutes to hours. The tunnel itself is up — the URLs below");
+    r.log("  will start working once DNS resolves.");
+    return;
+  }
+  if (!looksLikeCloudflare(addresses)) {
+    r.log("");
+    r.log(`⚠ ${hostname} resolves (${addresses.join(", ")}) but not to Cloudflare's edge.`);
+    r.log(`  It may be shadowed by another DNS record or a Cloudflare Pages project on ${zone}.`);
+    r.log("  Ensure it's a proxied (orange-cloud) CNAME to the tunnel — check");
+    r.log(`  https://dash.cloudflare.com → DNS for ${zone}. A grey-cloud / A record / Pages`);
+    r.log("  binding on this hostname will 404 the tunnel at the edge.");
+  }
 }
 
 export async function exposeCloudflareUp(
@@ -390,6 +595,19 @@ export async function exposeCloudflareUp(
   }
   r.log("✓ DNS routed.");
 
+  // Post-route DNS self-diagnosis (hub#487). `cloudflared tunnel route dns`
+  // can succeed (the CNAME is written in Cloudflare's API) while the hostname
+  // is still NOT actually serving the tunnel — two shapes Aaron hit:
+  //   (a) a "pending" zone whose nameservers aren't switched at the registrar
+  //       yet, so the record exists in Cloudflare but nothing resolves; and
+  //   (b) a subdomain shadowed by a Cloudflare Pages project on the same zone,
+  //       so the edge 404s the tunnel.
+  // Both previously printed "✓ DNS routed" + the URLs as if fine. This check
+  // is best-effort and strictly NON-FATAL — it only adds a warning; it never
+  // changes the exit code or blocks the expose. Fast: one DNS lookup with a
+  // built-in timeout in `resolveHost`.
+  await diagnoseDns(hostname, r);
+
   const credsFile = credentialsPath(tunnel.id, r.cloudflaredHome);
   writeConfig(
     {
@@ -408,12 +626,28 @@ export async function exposeCloudflareUp(
   );
   r.log(`✓ Wrote ${r.configPath}`);
 
+  // Orphan-connector sweep (hub#487). Before spawning a fresh connector, kill
+  // EVERY cloudflared connector currently serving this tunnel so exactly one
+  // process serves the config.yml we just wrote. Pre-fix, each re-expose
+  // spawned a new connector without killing the prior ones (state tracked only
+  // the most-recent pid), so orphans accumulated and edge routing became
+  // nondeterministic. We union two sources:
+  //   - the pid recorded in cloudflared-state.json (the prior `parachute`-
+  //     spawned connector for this tunnel name), and
+  //   - any pid found by scanning running processes for this tunnel's UUID or
+  //     config path (catches orphans the state file lost track of — crashed
+  //     mid-rewrite, or started by hand for this tunnel).
   const stateBefore = readCloudflaredState(r.statePath);
   const prior = findTunnelRecord(stateBefore, r.tunnelName);
-  if (prior && r.alive(prior.pid)) {
+  const toKill = new Set<number>();
+  if (prior && r.alive(prior.pid)) toKill.add(prior.pid);
+  for (const pid of r.connectorPids(tunnel.id, r.configPath)) {
+    if (r.alive(pid)) toKill.add(pid);
+  }
+  for (const deadPid of toKill) {
     try {
-      r.kill(prior.pid, "SIGTERM");
-      r.log(`Stopped prior cloudflared (pid ${prior.pid}).`);
+      r.kill(deadPid, "SIGTERM");
+      r.log(`Stopped prior cloudflared connector (pid ${deadPid}).`);
     } catch {
       // Process is already gone — safe to ignore; we replace the record below.
     }
@@ -529,6 +763,18 @@ export async function exposeCloudflareOff(opts: ExposeCloudflareOpts = {}): Prom
     }
   } else {
     r.log(`cloudflared (pid ${record.pid}) wasn't running; clearing stale state.`);
+  }
+  // Sweep any orphan connectors for this tunnel that the state record didn't
+  // track (hub#487) so `off` leaves exactly zero connectors serving it. Match
+  // by UUID/config-path; skip the record pid we already signalled above.
+  for (const orphanPid of r.connectorPids(record.tunnelUuid, record.configPath)) {
+    if (orphanPid === record.pid || !r.alive(orphanPid)) continue;
+    try {
+      r.kill(orphanPid, "SIGTERM");
+      r.log(`✓ Stopped orphan cloudflared connector (pid ${orphanPid}).`);
+    } catch {
+      // Already gone between probe and kill — fine.
+    }
   }
   const stateAfter = withoutTunnelRecord(stateBefore, r.tunnelName);
   if (stateAfter) {

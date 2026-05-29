@@ -551,6 +551,191 @@ describe("exposeCloudflareUp", () => {
     }
   });
 
+  test("hub#487: kills orphan connectors found by pgrep before spawning, not just the state pid", async () => {
+    // The orphan-accumulation bug: each re-expose spawned a fresh connector
+    // without killing prior ones, and state only tracked the most-recent pid.
+    // Orphans the state file lost track of (crashed mid-rewrite, started by
+    // hand) must still be swept — `connectorPids` finds them by UUID/config
+    // path. Here state knows pid 99999, but pgrep also surfaces 88888 + 77777
+    // serving the same tunnel; all three get SIGTERM before the new spawn.
+    const env = makeEnv();
+    try {
+      const uuid = "cccccccc-0000-0000-0000-000000000003";
+      const priorRecord: CloudflaredTunnelRecord = {
+        pid: 99999,
+        tunnelUuid: uuid,
+        tunnelName: "parachute",
+        hostname: "vault.example.com",
+        startedAt: "2026-04-21T00:00:00.000Z",
+        configPath: env.configPath,
+      };
+      writeCloudflaredState({ version: 2, tunnels: { parachute: priorRecord } }, env.statePath);
+
+      const { runner } = queueRunner([
+        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+        { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
+        { code: 0, stdout: "", stderr: "" }, // route dns
+      ]);
+      const { spawner, seen } = fakeSpawner(42010);
+      const killed: number[] = [];
+
+      const code = await exposeCloudflareUp("vault.example.com", {
+        runner,
+        spawner,
+        alive: () => true, // all candidate pids report alive
+        kill: (pid) => killed.push(pid),
+        // pgrep surfaces two orphans the state record didn't track.
+        connectorPids: () => [88888, 77777],
+        resolveHost: async () => ["104.16.0.1"], // Cloudflare — no DNS warning
+        log: () => {},
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
+      });
+
+      expect(code).toBe(0);
+      // Every prior connector (state pid + both pgrep orphans) is stopped
+      // before the new one spawns.
+      expect(killed.sort()).toEqual([77777, 88888, 99999]);
+      // Exactly one fresh connector spawned, and it's the one recorded.
+      expect(seen).toHaveLength(1);
+      expect(findTunnelRecord(readCloudflaredState(env.statePath), "parachute")?.pid).toBe(42010);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub#487: warns when DNS doesn't resolve yet (pending zone)", async () => {
+    // route dns succeeded but the hostname doesn't resolve — the "pending"
+    // zone shape (NS not switched at the registrar). Non-fatal: still exit 0,
+    // still print the URLs, but add the nameserver-switch nudge.
+    const env = makeEnv();
+    try {
+      const uuid = "dddddddd-0000-0000-0000-000000000004";
+      const { runner } = queueRunner([
+        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+        { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
+        { code: 0, stdout: "", stderr: "" },
+      ]);
+      const { spawner } = fakeSpawner(42020);
+      const logs: string[] = [];
+
+      const code = await exposeCloudflareUp("vault.newzone.com", {
+        runner,
+        spawner,
+        alive: () => false,
+        kill: () => {},
+        connectorPids: () => [],
+        resolveHost: async () => [], // NXDOMAIN / not live yet
+        log: (l) => logs.push(l),
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
+      });
+
+      expect(code).toBe(0); // non-fatal — the expose still completes
+      const joined = logs.join("\n");
+      expect(joined).toContain("DNS isn't live yet for vault.newzone.com");
+      expect(joined).toContain("dig +short newzone.com NS");
+      expect(joined).toContain("ns.cloudflare.com");
+      // The success URLs still print.
+      expect(joined).toContain("https://vault.newzone.com/admin/");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub#487: warns when hostname resolves but not to Cloudflare (shadowed)", async () => {
+    // route dns succeeded but the hostname resolves to a non-Cloudflare IP —
+    // a Pages project / grey-cloud A record shadowing the tunnel → edge 404.
+    const env = makeEnv();
+    try {
+      const uuid = "eeeeeeee-0000-0000-0000-000000000006";
+      const { runner } = queueRunner([
+        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+        { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
+        { code: 0, stdout: "", stderr: "" },
+      ]);
+      const { spawner } = fakeSpawner(42021);
+      const logs: string[] = [];
+
+      const code = await exposeCloudflareUp("docs.parachute.computer", {
+        runner,
+        spawner,
+        alive: () => false,
+        kill: () => {},
+        connectorPids: () => [],
+        resolveHost: async () => ["203.0.113.10"], // not a Cloudflare range
+        log: (l) => logs.push(l),
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
+      });
+
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toContain("not to Cloudflare's edge");
+      expect(joined).toContain("shadowed");
+      expect(joined).toContain("Pages project");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub#487: no DNS warning when hostname resolves at Cloudflare's edge", async () => {
+    const env = makeEnv();
+    try {
+      const uuid = "ffffffff-0000-0000-0000-000000000007";
+      const { runner } = queueRunner([
+        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+        { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
+        { code: 0, stdout: "", stderr: "" },
+      ]);
+      const { spawner } = fakeSpawner(42022);
+      const logs: string[] = [];
+
+      const code = await exposeCloudflareUp("vault.example.com", {
+        runner,
+        spawner,
+        alive: () => false,
+        kill: () => {},
+        connectorPids: () => [],
+        resolveHost: async () => ["104.18.32.7"], // 104.16.0.0/13 — Cloudflare
+        log: (l) => logs.push(l),
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
+      });
+
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).not.toContain("DNS isn't live yet");
+      expect(joined).not.toContain("not to Cloudflare's edge");
+    } finally {
+      env.cleanup();
+    }
+  });
+
   test("two tunnels with different --tunnel-name coexist in state", async () => {
     const env = makeEnv();
     try {
@@ -923,6 +1108,46 @@ describe("exposeCloudflareOff", () => {
       });
       expect(code).toBe(0);
       expect(killed).toEqual([]);
+      expect(existsSync(env.statePath)).toBe(false);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub#487: off sweeps orphan connectors the state record didn't track", async () => {
+    const env = makeEnv();
+    try {
+      const uuid = "abababab-0000-0000-0000-000000000009";
+      writeCloudflaredState(
+        {
+          version: 2,
+          tunnels: {
+            parachute: {
+              pid: 55555,
+              tunnelUuid: uuid,
+              tunnelName: "parachute",
+              hostname: "vault.example.com",
+              startedAt: "2026-04-22T12:00:00.000Z",
+              configPath: env.configPath,
+            },
+          },
+        },
+        env.statePath,
+      );
+      const killed: number[] = [];
+      const code = await exposeCloudflareOff({
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        alive: () => true,
+        kill: (pid) => killed.push(pid),
+        // pgrep finds the tracked pid (skipped — already signalled) plus an
+        // untracked orphan 66666 serving the same tunnel.
+        connectorPids: () => [55555, 66666],
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      // Tracked pid stopped once, orphan also stopped — no double-kill of 55555.
+      expect(killed.sort()).toEqual([55555, 66666]);
       expect(existsSync(env.statePath)).toBe(false);
     } finally {
       env.cleanup();
