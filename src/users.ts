@@ -144,6 +144,64 @@ function readVaultsForUser(db: Database, userId: string): string[] {
     .map((r) => r.vault_name);
 }
 
+/**
+ * The per-vault verbs a `user_vaults.role` grants. The schema's `role`
+ * column is `TEXT NOT NULL DEFAULT 'write'` and is reserved forward-compat
+ * for per-vault role granularity (see the v10 migration note in
+ * `hub-db.ts`). Today every assignment is created with `role = 'write'`, so
+ * the only live mapping is `write → {read, write}`. The function is the
+ * single place the verb-cap lives so a future role taxonomy (`read`-only,
+ * `admin`, etc.) lands here without the friend-mint path having to change.
+ *
+ * Mapping:
+ *   - `write` (today's only value)  → `["read", "write"]`
+ *   - `read`                        → `["read"]`
+ *   - anything else (unknown role)  → `[]` — fail closed. An unrecognised
+ *     role grants no minting authority rather than silently defaulting to
+ *     write. (Defense-in-depth: a hand-edited / future row with a role this
+ *     code doesn't understand should not be treated as broad write.)
+ *
+ * `admin` is intentionally NOT mapped to a `vault:<name>:admin` mint here —
+ * the friend-facing token mint is capped at read/write by design. A
+ * future per-vault-admin friend grant would route through the
+ * vault-admin-token path, not this one.
+ */
+export type VaultVerb = "read" | "write";
+
+export function vaultVerbsForRole(role: string): VaultVerb[] {
+  if (role === "write") return ["read", "write"];
+  if (role === "read") return ["read"];
+  return [];
+}
+
+/**
+ * Read the verbs a user may mint for one of their assigned vaults.
+ *
+ * Returns `null` when the user has NO `user_vaults` row for `vaultName` —
+ * i.e. the vault is not in their assignment. The caller treats `null` as a
+ * hard 403 (no minting for an unassigned vault). When a row exists, returns
+ * the verb list `vaultVerbsForRole` maps the stored role to (today always
+ * `["read", "write"]` since every assignment is `role = 'write'`).
+ *
+ * This reads the role column directly rather than going through
+ * `getUserById().assignedVaults` because that array is verb-blind — it
+ * names the vaults but not the role granted. The friend-mint authorization
+ * cap needs the role.
+ */
+export function vaultVerbsForUserVault(
+  db: Database,
+  userId: string,
+  vaultName: string,
+): VaultVerb[] | null {
+  const row = db
+    .query<{ role: string }, [string, string]>(
+      "SELECT role FROM user_vaults WHERE user_id = ? AND vault_name = ?",
+    )
+    .get(userId, vaultName);
+  if (!row) return null;
+  return vaultVerbsForRole(row.role);
+}
+
 export interface CreateUserOpts {
   /** Allow creating an additional user when one already exists. Off by default. */
   allowMulti?: boolean;
