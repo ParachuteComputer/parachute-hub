@@ -72,25 +72,69 @@ export interface UpgradeRunner {
   ): Promise<{ code: number; stdout: string }>;
 }
 
+/**
+ * Exit code we synthesize when a binary can't be spawned at all. 127 is the
+ * POSIX shell convention for "command not found" — it lets every git call
+ * degrade to a normal non-zero result instead of crashing the whole command.
+ */
+const SPAWN_NOT_FOUND_CODE = 127;
+
+/**
+ * True when an error thrown by `Bun.spawn` means "the executable doesn't
+ * exist on this host" (ENOENT). On a minimal server with no `git` installed —
+ * a legitimate, common shape for a published-npm install on the canonical
+ * install path — `Bun.spawn(["git", ...])` throws *synchronously* with this
+ * shape. We catch it so `parachute upgrade` degrades to the npm path rather
+ * than dying with an uncaught `Executable not found in $PATH: "git"`.
+ */
+function isSpawnNotFound(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const code = (err as { code?: unknown }).code;
+  const message = (err as { message?: unknown }).message;
+  return (
+    code === "ENOENT" ||
+    (typeof message === "string" && message.includes("Executable not found in $PATH"))
+  );
+}
+
 export const defaultRunner: UpgradeRunner = {
   async run(cmd, opts) {
     // Inherit env so `bun add -g` etc. see TMPDIR, BUN_INSTALL, PATH, HOME.
     // Bun.spawn defaults to empty env — see api-modules-ops.ts:defaultRun.
-    const proc = Bun.spawn([...cmd], {
-      cwd: opts?.cwd,
-      stdio: ["inherit", "inherit", "inherit"],
-      env: process.env,
-    });
+    let proc: Bun.Subprocess;
+    try {
+      proc = Bun.spawn([...cmd], {
+        cwd: opts?.cwd,
+        stdio: ["inherit", "inherit", "inherit"],
+        env: process.env,
+      });
+    } catch (err) {
+      // Binary not on this host (e.g. no `git` on a minimal server). Degrade
+      // to a non-zero exit rather than letting the throw crash the command.
+      if (isSpawnNotFound(err)) return SPAWN_NOT_FOUND_CODE;
+      throw err;
+    }
     return await proc.exited;
   },
   async capture(cmd, opts) {
     // Inherit env — same rationale as `run` above.
-    const proc = Bun.spawn([...cmd], {
-      cwd: opts?.cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: process.env,
-    });
+    let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
+    try {
+      proc = Bun.spawn([...cmd], {
+        cwd: opts?.cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+        env: process.env,
+      });
+    } catch (err) {
+      // See `run` above: ENOENT (binary-not-found) becomes a captured
+      // non-zero result so every git call degrades to "command failed".
+      if (isSpawnNotFound(err)) {
+        const bin = cmd[0] ?? "command";
+        return { code: SPAWN_NOT_FOUND_CODE, stdout: `${bin}: not found on this host\n` };
+      }
+      throw err;
+    }
     const [stdout, stderr] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
