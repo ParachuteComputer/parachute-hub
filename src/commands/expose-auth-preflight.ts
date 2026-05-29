@@ -15,12 +15,17 @@
  * purely on password + 2FA; we no longer count vault-DB rows for the auth
  * decision.
  *
- * Three states we branch on, based on {@link VaultAuthStatus}:
+ * Two states we branch on, based on {@link VaultAuthStatus}:
  *
  *   - no owner password: loud warning — the exposure is wide open. Offer to
- *     set a password (+ 2FA), and point at the hub-JWT mint path for clients.
- *   - password, no 2FA: shorter "recommend 2FA" nudge.
- *   - password + 2FA: one-line "looks good" (the quiet path).
+ *     set a password, and point at the hub-JWT mint path for clients.
+ *   - password set: one-line "looks good" + an honest note that hub-login 2FA
+ *     isn't shipped yet (#473), so the owner password is the wall.
+ *
+ * We no longer offer "enable 2FA": `parachute auth 2fa enroll` forwarded to the
+ * deprecated vault stub, which post auth-unification exits 1 and (on the old
+ * happy path) only wrote vault YAML that never gated hub `/login`. Offering it
+ * was a dead path. Real hub-login TOTP is tracked at #473.
  *
  * Defaults are always "skip" — Enter declines every prompt. User can always
  * run `parachute auth set-password` / `parachute auth mint-token …` later.
@@ -108,10 +113,15 @@ async function offerOwnerPassword(r: Resolved): Promise<void> {
   }
 }
 
-async function offerTotp(r: Resolved): Promise<void> {
-  if (await yesNo(r, "Enable TOTP 2FA now?")) {
-    await runCmd(r, ["parachute", "auth", "2fa", "enroll"], "parachute auth 2fa enroll");
-  }
+/**
+ * Honest note that hub-login 2FA isn't shipped yet. Replaces the old
+ * `offerTotp` (which ran the dead `parachute auth 2fa enroll` path). No prompt —
+ * there's nothing actionable to offer until #473 lands.
+ */
+function note2faComing(r: Resolved): void {
+  r.log("");
+  r.log("Note: 2FA at the hub login layer is coming (#473) but isn't shipped yet —");
+  r.log("for now the owner password is the wall, so keep it strong.");
 }
 
 /**
@@ -155,34 +165,23 @@ async function handleWideOpen(r: Resolved): Promise<void> {
   r.log("sign-in (OAuth) and minting hub tokens for programmatic clients.");
   r.log("");
   await offerOwnerPassword(r);
-  // Offer 2FA regardless of the password step outcome: we can't observe it
-  // from outside the subprocess, and vault itself will reject a 2fa enroll
-  // if there's no password yet, surfacing the real error to the user.
-  await offerTotp(r);
   // Programmatic-client guidance is informational (no auto-mint) — print it
   // so the operator knows the headless path exists, not the dead pvt_* one.
   printTokenGuidance(r);
+  // Honest 2FA state — coming (#473), not yet shippable.
+  note2faComing(r);
   printDivider(r);
 }
 
 /**
- * `password set, no 2FA`: the common case where the user did the obvious
- * thing but hasn't opted into the stronger factor yet. Short nudge.
+ * `password set`: the operator did the obvious thing. One-line confirmation
+ * plus the honest 2FA note. (We don't assert on tokens — a hub JWT is minted
+ * on demand, not a standing prerequisite.)
  */
-async function handlePasswordNoTotp(r: Resolved): Promise<void> {
+function handlePasswordSet(r: Resolved): void {
   r.log("");
   r.log("✓  Owner password is set.");
-  r.log("   Consider also enabling 2FA for defense-in-depth.");
-  await offerTotp(r);
-}
-
-/**
- * `all set`: owner password + 2FA. Keep it tight. (We don't assert on
- * tokens — a hub JWT is minted on demand, not a standing prerequisite.)
- */
-function handleAllGood(r: Resolved): void {
-  r.log("");
-  r.log("✓  Auth config looks good (owner password + 2FA).");
+  note2faComing(r);
 }
 
 /**
@@ -190,12 +189,12 @@ function handleAllGood(r: Resolved): void {
  *
  * Owner-password-centric since the pvt_* DROP (hub#466): `tokenCount` is no
  * longer consulted — those rows are vestigial and minting access now flows
- * through the owner password, not a standing vault token. Three states.
+ * through the owner password, not a standing vault token. 2FA isn't a branch
+ * anymore (hub-login TOTP not shipped — #473): two states.
  */
-function classify(s: VaultAuthStatus): "wide-open" | "password-no-totp" | "all-good" {
+function classify(s: VaultAuthStatus): "wide-open" | "password-set" {
   if (!s.hasOwnerPassword) return "wide-open";
-  if (!s.hasTotp) return "password-no-totp";
-  return "all-good";
+  return "password-set";
 }
 
 export async function runAuthPreflight(opts: AuthPreflightOpts = {}): Promise<void> {
@@ -204,11 +203,8 @@ export async function runAuthPreflight(opts: AuthPreflightOpts = {}): Promise<vo
     case "wide-open":
       await handleWideOpen(r);
       return;
-    case "password-no-totp":
-      await handlePasswordNoTotp(r);
-      return;
-    case "all-good":
-      handleAllGood(r);
+    case "password-set":
+      handlePasswordSet(r);
       return;
   }
 }

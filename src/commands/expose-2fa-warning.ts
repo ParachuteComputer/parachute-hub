@@ -1,29 +1,27 @@
 /**
- * Public-exposure 2FA-enrollment warning (#186). Lands as the next layer of
- * defense after #188's `/login` rate-limit floor: once the operator brings
- * up cloudflare or Tailscale Funnel, `/login` is reachable from the public
- * internet on every layer admitting traffic. 2FA is the difference between
- * "password is the only wall" and "password + something-you-have."
+ * Public-exposure security warning (#186). Once the operator brings up
+ * cloudflare or Tailscale Funnel, `/login` is reachable from the public
+ * internet on every layer admitting traffic. After #188's `/login` rate-limit
+ * floor, the owner password is the wall.
+ *
+ * 2FA at the hub login layer is the planned next layer of defense — "password +
+ * something-you-have" — but it isn't shipped yet (#473). So this warning no
+ * longer recommends `parachute auth 2fa enroll` (that command writes vault YAML
+ * that does NOT gate hub `/login`, and post auth-unification it just exits 1).
+ * Instead it nudges toward a strong owner password and "don't expose /login if
+ * a guessable password is a concern."
  *
  * Why this is a warning, not a hard gate: hard-gating would surprise operators
  * mid-flow — they ran `parachute expose public` to expose, not to be told
- * "set up 2FA first." A loud, contextual warning + a clear one-line
- * remediation is the right shape; the operator decides whether to act now or
- * later. The tunnel is up regardless.
+ * "set up 2FA first." A loud, contextual warning + a clear remediation is the
+ * right shape; the operator decides whether to act now or later. The tunnel is
+ * up regardless.
  *
- * Why the source-of-truth is vault's `config.yaml`: 2FA enrollment lives in
- * `parachute-vault` (the hub forwards `parachute auth 2fa enroll` to vault —
- * see `commands/auth.ts` `VAULT_FORWARDED_SUBCOMMANDS`). The hub's `users`
- * table has no TOTP column today; it will gain one when hub-admin login
- * verifies TOTP against vault. Until then, "is 2FA enrolled?" maps cleanly
- * to "does vault's config.yaml carry a non-empty `totp_secret`?", which is
- * exactly what `readVaultAuthStatus().hasTotp` returns.
- *
- * If vault isn't installed at all (rare for the cloudflare path — it requires
- * a vault entry — but possible on the tailnet/funnel path): `hasTotp` comes
- * back `false` and the warning still fires. The remediation
- * `parachute auth 2fa enroll` then surfaces vault's "install vault first"
- * error, which is the right next step regardless.
+ * The probe still consults `readVaultAuthStatus().hasTotp` (true only when a
+ * legacy vault `config.yaml` carries a non-empty `totp_secret`) to suppress the
+ * warning for operators who DID set up the legacy vault TOTP — even though it
+ * doesn't gate hub login, suppressing avoids nagging them. Once hub-login TOTP
+ * (#473) lands with a hub-side column, this reads that instead.
  */
 
 import { type VaultAuthStatus, readVaultAuthStatus } from "../vault/auth-status.ts";
@@ -71,12 +69,14 @@ export function printPublic2FAWarning(opts: Public2FAWarningOpts): boolean {
     return false;
   }
   log("");
-  log("⚠ 2FA is not enrolled. /login is now reachable on the public internet");
-  log(`  (${opts.publicUrl}/login). Anyone who guesses your password`);
-  log("  is in. Strongly recommended:");
+  log("⚠ /login is now reachable on the public internet");
+  log(`  (${opts.publicUrl}/login). Anyone who guesses your password is in.`);
   log("");
-  log("    parachute auth 2fa enroll");
+  log("  2FA at the hub login layer is coming (#473) but isn't shipped yet —");
+  log("  for now your owner password is the wall. Make sure it's a strong one:");
   log("");
-  log("  Adds TOTP + backup codes. Takes 30 seconds.");
+  log("    parachute auth set-password");
+  log("");
+  log("  If a guessable password is a concern, don't expose /login publicly.");
   return true;
 }

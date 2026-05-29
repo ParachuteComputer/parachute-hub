@@ -80,9 +80,13 @@ describe("printPublic2FAWarning", () => {
     });
     expect(fired).toBe(true);
     const joined = logs.join("\n");
-    expect(joined).toContain("2FA is not enrolled");
+    // Honest copy: /login is public, owner password is the wall, hub-login 2FA
+    // is coming (#473) — does NOT recommend the dead `auth 2fa enroll` path.
+    expect(joined).toContain("/login is now reachable on the public internet");
     expect(joined).toContain("https://vault.example.com/login");
-    expect(joined).toContain("parachute auth 2fa enroll");
+    expect(joined).toContain("#473");
+    expect(joined).toContain("parachute auth set-password");
+    expect(joined).not.toContain("parachute auth 2fa enroll");
   });
 
   test("enrolled → suppressed, returns false, logs nothing", () => {
@@ -108,7 +112,9 @@ describe("printPublic2FAWarning", () => {
       publicUrl: "https://vault.example.com",
     });
     expect(fired).toBe(true);
-    expect(logs.some((l) => l.includes("2FA is not enrolled"))).toBe(true);
+    expect(logs.some((l) => l.includes("/login is now reachable on the public internet"))).toBe(
+      true,
+    );
   });
 
   test("embeds the supplied publicUrl into the /login pointer", () => {

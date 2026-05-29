@@ -41,8 +41,8 @@ function status(partial: Partial<VaultAuthStatus> = {}): VaultAuthStatus {
 }
 
 describe("runAuthPreflight — wide open (no owner password)", () => {
-  test("warns loudly, offers password + 2FA, and prints hub-JWT token guidance", async () => {
-    const h = makeHarness(["y", "n"]); // password yes, 2fa no
+  test("warns loudly, offers password only, prints hub-JWT token guidance + honest 2FA note", async () => {
+    const h = makeHarness(["y"]); // password yes
     await runAuthPreflight({ status: status(), ...wire(h) });
     const joined = h.logs.join("\n");
     expect(joined).toContain("No owner password");
@@ -50,33 +50,34 @@ describe("runAuthPreflight — wide open (no owner password)", () => {
     // Programmatic-client guidance points at the hub mint path, not pvt_*.
     expect(joined).toContain("parachute auth mint-token --scope vault:default:read");
     expect(joined).toContain("Bearer <hub-jwt>");
-    // Only password + 2FA are interactive offers; token guidance is printed,
-    // not prompted (no auto-mint).
+    // Honest 2FA state — coming (#473), not offered as a dead enroll command.
+    expect(joined).toContain("#473");
+    expect(joined).not.toContain("2fa enroll");
+    // Only password is an interactive offer; token guidance + 2FA note are
+    // printed, not prompted.
     expect(h.commands).toHaveLength(1);
     expect(h.commands[0]).toEqual(["parachute", "auth", "set-password"]);
+    expect(h.prompts).toHaveLength(1);
   });
 
   test("token guidance uses the first discovered vault name", async () => {
-    const h = makeHarness(["n", "n"]);
+    const h = makeHarness(["n"]);
     await runAuthPreflight({ status: status({ vaultNames: ["work"] }), ...wire(h) });
     expect(h.logs.join("\n")).toContain("--scope vault:work:read");
   });
 
-  test("user declines every prompt → no subprocesses run", async () => {
-    const h = makeHarness(["", ""]); // all Enter = skip
+  test("user declines the password prompt → no subprocesses run", async () => {
+    const h = makeHarness([""]); // Enter = skip
     await runAuthPreflight({ status: status(), ...wire(h) });
     expect(h.commands).toHaveLength(0);
-    // Prompted on password + 2FA (token guidance is not a prompt).
-    expect(h.prompts).toHaveLength(2);
+    // Only one prompt now (password); token guidance + 2FA note aren't prompts.
+    expect(h.prompts).toHaveLength(1);
   });
 
-  test("user accepts password + 2FA → both commands invoked in order", async () => {
-    const h = makeHarness(["y", "y"]);
+  test("user accepts the password offer → set-password invoked", async () => {
+    const h = makeHarness(["y"]);
     await runAuthPreflight({ status: status(), ...wire(h) });
-    expect(h.commands.map((c) => c.join(" "))).toEqual([
-      "parachute auth set-password",
-      "parachute auth 2fa enroll",
-    ]);
+    expect(h.commands.map((c) => c.join(" "))).toEqual(["parachute auth set-password"]);
   });
 
   test("null tokenCount with no owner password still classifies wide-open", async () => {
@@ -84,7 +85,7 @@ describe("runAuthPreflight — wide open (no owner password)", () => {
     // — `classify()` gates on `hasOwnerPassword` alone. A box with no owner
     // password AND an unreadable token DB must still take the loud wide-open
     // branch, not silently fall through to a quieter state.
-    const h = makeHarness(["n", "n"]);
+    const h = makeHarness(["n"]);
     await runAuthPreflight({
       status: status({ hasOwnerPassword: false, tokenCount: null }),
       ...wire(h),
@@ -92,24 +93,26 @@ describe("runAuthPreflight — wide open (no owner password)", () => {
     const joined = h.logs.join("\n");
     expect(joined).toContain("No owner password");
     expect(joined).toContain("public internet");
-    // Wide-open offers password + 2FA (two prompts); not the all-good path.
-    expect(h.prompts).toHaveLength(2);
+    // Wide-open offers the password (one prompt); not the password-set path.
+    expect(h.prompts).toHaveLength(1);
   });
 
-  test("never offers the removed `vault tokens create` command", async () => {
-    const h = makeHarness(["y", "y"]);
+  test("never offers a dead command (vault tokens create OR auth 2fa enroll)", async () => {
+    const h = makeHarness(["y"]);
     await runAuthPreflight({ status: status(), ...wire(h) });
     const allCommands = h.commands.map((c) => c.join(" ")).join("\n");
     expect(allCommands).not.toContain("vault tokens create");
-    // And no log line steers the operator at the dead command as guidance.
-    const guidance = h.logs.filter((l) => !l.includes("old affordance")).join("\n");
+    expect(allCommands).not.toContain("auth 2fa enroll");
+    // And no log line steers the operator at a dead command as guidance.
+    const guidance = h.logs.join("\n");
     expect(guidance).not.toContain("parachute vault tokens create");
+    expect(guidance).not.toContain("parachute auth 2fa enroll");
   });
 });
 
-describe("runAuthPreflight — password set, no 2FA", () => {
-  test("short nudge, offers 2FA only — ignores vestigial tokenCount", async () => {
-    const h = makeHarness(["y"]);
+describe("runAuthPreflight — password set", () => {
+  test("single confirmation line + honest 2FA note, no prompts (ignores vestigial tokenCount)", async () => {
+    const h = makeHarness([]);
     await runAuthPreflight({
       // tokenCount is non-zero (vestigial pvt_* rows) but no longer consulted.
       status: status({ hasOwnerPassword: true, tokenCount: 3 }),
@@ -117,59 +120,42 @@ describe("runAuthPreflight — password set, no 2FA", () => {
     });
     const joined = h.logs.join("\n");
     expect(joined).toContain("Owner password is set");
-    expect(joined).toContain("2FA");
-    expect(h.prompts).toHaveLength(1);
-    expect(h.commands).toEqual([["parachute", "auth", "2fa", "enroll"]]);
-  });
-
-  test("user declines → no command runs", async () => {
-    const h = makeHarness([""]);
-    await runAuthPreflight({
-      status: status({ hasOwnerPassword: true, tokenCount: 3 }),
-      ...wire(h),
-    });
+    // Honest 2FA note (#473) — not a prompt, not the dead enroll command.
+    expect(joined).toContain("#473");
+    expect(joined).not.toContain("2fa enroll");
+    expect(h.prompts).toHaveLength(0);
     expect(h.commands).toHaveLength(0);
   });
 
   test("null tokenCount (DB unreadable) is irrelevant — password gates the branch", async () => {
-    const h = makeHarness([""]); // decline 2FA
+    const h = makeHarness([]);
     await runAuthPreflight({
       status: status({ hasOwnerPassword: true, hasTotp: false, tokenCount: null }),
       ...wire(h),
     });
-    expect(h.prompts).toHaveLength(1);
-    expect(h.prompts[0]?.toLowerCase()).toContain("2fa");
+    expect(h.logs.join("\n")).toContain("Owner password is set");
+    expect(h.prompts).toHaveLength(0);
+    expect(h.commands).toHaveLength(0);
   });
-});
 
-describe("runAuthPreflight — all good", () => {
-  test("single positive line, no prompts (tokens not required)", async () => {
+  test("password + legacy vault TOTP — still the quiet password-set path", async () => {
     const h = makeHarness([]);
     await runAuthPreflight({
-      // tokenCount: 0 — a hub JWT is minted on demand, not a standing need.
       status: status({ hasOwnerPassword: true, hasTotp: true, tokenCount: 0 }),
       ...wire(h),
     });
-    const joined = h.logs.join("\n");
-    expect(joined).toContain("looks good");
-    expect(joined).toContain("owner password + 2FA");
+    expect(h.logs.join("\n")).toContain("Owner password is set");
     expect(h.prompts).toHaveLength(0);
     expect(h.commands).toHaveLength(0);
   });
 });
 
 describe("runAuthPreflight — subprocess failure handling", () => {
-  test("non-zero exit from an auth command doesn't abort the rest of the preflight", async () => {
-    const h = makeHarness(["y", "y"]);
-    // Override the interactive runner to return non-zero on the first call.
-    let first = true;
+  test("non-zero exit from set-password doesn't abort the rest of the preflight", async () => {
+    const h = makeHarness(["y"]);
     const interactiveRunner = async (cmd: readonly string[]) => {
       h.commands.push([...cmd]);
-      if (first) {
-        first = false;
-        return 7;
-      }
-      return 0;
+      return 7;
     };
     await runAuthPreflight({
       status: status(),
@@ -180,19 +166,22 @@ describe("runAuthPreflight — subprocess failure handling", () => {
       },
       interactiveRunner,
     });
-    // Both commands still attempted, neither aborted the flow.
-    expect(h.commands.map((c) => c[0])).toEqual(["parachute", "parachute"]);
+    // The command was attempted; the flow continued (token guidance still
+    // printed afterward).
+    expect(h.commands.map((c) => c[0])).toEqual(["parachute"]);
     const joined = h.logs.join("\n");
     expect(joined).toContain("exited 7");
+    expect(joined).toContain("Bearer <hub-jwt>");
   });
 });
 
 describe("runAuthPreflight — case-insensitive yes", () => {
   test('"Y", "YES", and "y" all count as affirmative; anything else is decline', async () => {
+    // Now only the wide-open path prompts (for the password). Drive it there.
     for (const yes of ["y", "Y", "yes", "YES"]) {
       const h = makeHarness([yes]);
       await runAuthPreflight({
-        status: status({ hasOwnerPassword: true, tokenCount: 1 }),
+        status: status({ hasOwnerPassword: false }),
         ...wire(h),
       });
       expect(h.commands).toHaveLength(1);
@@ -200,7 +189,7 @@ describe("runAuthPreflight — case-insensitive yes", () => {
     for (const no of ["", "n", "no", "q", "bogus"]) {
       const h = makeHarness([no]);
       await runAuthPreflight({
-        status: status({ hasOwnerPassword: true, tokenCount: 1 }),
+        status: status({ hasOwnerPassword: false }),
         ...wire(h),
       });
       expect(h.commands).toHaveLength(0);

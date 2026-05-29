@@ -1009,8 +1009,11 @@ describe("expose public up", () => {
       });
       expect(code).toBe(0);
       const joined = logs.join("\n");
-      expect(joined).toContain("2FA is not enrolled");
-      expect(joined).toContain("parachute auth 2fa enroll");
+      // Honest copy: /login is public, owner password is the wall, hub-login
+      // 2FA is coming (#473) — no longer recommends the dead `2fa enroll`.
+      expect(joined).toContain("/login is now reachable on the public internet");
+      expect(joined).toContain("#473");
+      expect(joined).not.toContain("parachute auth 2fa enroll");
       // /login pointer uses the canonical https://<fqdn> origin.
       expect(joined).toContain("https://parachute.taildf9ce2.ts.net/login");
     } finally {

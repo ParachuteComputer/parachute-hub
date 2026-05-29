@@ -13,7 +13,11 @@
  *   - `list-users` — show accounts in `users`.
  *
  * Vault-forwarded subcommands (still implemented in `parachute-vault`):
- *   - `2fa` — TOTP enroll/disable/backup-codes.
+ *   - (none currently). `2fa` used to forward here, but the legacy
+ *     `parachute-vault 2fa` stub writes vault YAML that does NOT gate hub
+ *     `/login` — and post auth-unification it requires a vault owner password
+ *     that no longer exists, so it just exits 1. `parachute auth 2fa` is now an
+ *     honest informational stub on the hub side (real feature: #473).
  */
 
 import { join } from "node:path";
@@ -71,9 +75,10 @@ export const defaultRunner: Runner = {
   },
 };
 
-const VAULT_FORWARDED_SUBCOMMANDS = new Set(["2fa"]);
+const VAULT_FORWARDED_SUBCOMMANDS = new Set<string>([]);
 const HUB_LOCAL_SUBCOMMANDS = new Set([
   "rotate-key",
+  "2fa",
   "set-password",
   "list-users",
   "rotate-operator",
@@ -92,10 +97,8 @@ Usage:
   parachute auth set-password [--username <name>] [--password <pw>] [--allow-multi]
                                        Create or update the hub user's password
   parachute auth list-users            Show registered hub accounts
-  parachute auth 2fa status            Show 2FA state
-  parachute auth 2fa enroll            Enable TOTP 2FA (QR + backup codes)
-  parachute auth 2fa disable           Disable 2FA (requires password)
-  parachute auth 2fa backup-codes      Regenerate backup codes
+  parachute auth 2fa                   2FA status (hub-login TOTP not shipped
+                                       yet — tracked #473)
   parachute auth rotate-key            Rotate the hub's JWT signing key
   parachute auth rotate-operator [--scope-set <set>]
                                        Mint a fresh ~/.parachute/operator.token
@@ -128,10 +131,12 @@ The default username on first run is "owner" — override with --username.
 Single-user mode is the default; pass --allow-multi to add additional
 accounts beyond the first.
 
-2fa forwards to \`parachute-vault\` which still implements TOTP storage. If
-you see "not found on PATH", install vault first:
-
-  parachute install vault
+2fa is informational only for now: TOTP at the hub login layer isn't shipped
+yet (tracked #473). The legacy \`parachute-vault 2fa\` command writes vault YAML
+that does NOT gate hub \`/login\`, so it's intentionally no longer wired here —
+\`parachute auth 2fa\` prints the honest state and exits 0. Until hub-login TOTP
+ships, rely on a strong owner password (and don't expose \`/login\` if a
+guessable password is a concern).
 
 rotate-key generates a fresh RSA-2048 keypair and retires the previous
 one. The retired key keeps appearing in /.well-known/jwks.json for 24
@@ -1124,6 +1129,29 @@ async function runRevokeToken(args: readonly string[], deps: AuthDeps): Promise<
   }
 }
 
+/**
+ * Honest informational stub for `parachute auth 2fa [enroll|status|…]`.
+ *
+ * 2FA at the hub login layer isn't implemented yet (#473). The old path
+ * forwarded to the deprecated `parachute-vault 2fa` stub, which (a) post
+ * auth-unification requires a vault owner password that no longer exists, so it
+ * exits 1, and (b) even on success only writes vault YAML that does NOT gate
+ * hub `/login`. Telling operators to run it was actively misleading — enrolling
+ * did nothing for the exposed hub login. So we print the honest state and exit
+ * 0 (informational, not a crash).
+ */
+function run2faInfo(): number {
+  console.log("2FA for hub login isn't available yet (tracked: #473).");
+  console.log("");
+  console.log("The legacy `parachute-vault 2fa` command writes vault YAML but does NOT protect");
+  console.log("your hub login (`/login`), so enrolling there does nothing for the exposed hub.");
+  console.log("");
+  console.log("Until hub-login TOTP ships:");
+  console.log("  • Use a strong owner password (`parachute auth set-password`).");
+  console.log("  • If a guessable password is a concern, don't expose `/login` publicly.");
+  return 0;
+}
+
 function runListUsers(deps: AuthDeps): number {
   const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
   try {
@@ -1181,6 +1209,9 @@ export async function auth(args: readonly string[], deps: AuthDeps | Runner = {}
         console.error(`parachute auth set-password: ${msg}`);
         return 1;
       }
+    }
+    if (sub === "2fa") {
+      return run2faInfo();
     }
     if (sub === "list-users") {
       return runListUsers(normalized);
@@ -1250,23 +1281,17 @@ export async function auth(args: readonly string[], deps: AuthDeps | Runner = {}
     }
   }
 
-  if (!VAULT_FORWARDED_SUBCOMMANDS.has(sub)) {
-    console.error(`parachute auth: unknown subcommand "${sub}"`);
-    console.error("run `parachute auth --help` for usage");
-    return 1;
-  }
-  try {
+  // No subcommands forward to parachute-vault anymore (VAULT_FORWARDED_SUBCOMMANDS
+  // is empty — `2fa` is now hub-local + honest, see #473). Anything that fell
+  // through every hub-local handler above is unknown.
+  if (VAULT_FORWARDED_SUBCOMMANDS.has(sub)) {
+    // Defensive: if a future subcommand is added back to the forward set, route
+    // it. Currently unreachable (the set is empty).
     return await runner.run(["parachute-vault", ...args]);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.toLowerCase().includes("enoent") || msg.toLowerCase().includes("not found")) {
-      console.error("parachute-vault not found on PATH.");
-      console.error("Install it with: parachute install vault");
-      return 127;
-    }
-    console.error(`failed to run parachute-vault: ${msg}`);
-    return 1;
   }
+  console.error(`parachute auth: unknown subcommand "${sub}"`);
+  console.error("run `parachute auth --help` for usage");
+  return 1;
 }
 
 // Re-exported so `users.ts` consumers can preserve the named-export.
