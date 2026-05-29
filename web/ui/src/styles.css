@@ -169,6 +169,16 @@ code {
   text-decoration: none;
   color: var(--fg);
 }
+/* Active section indicator (NavLink). The current section reads accent +
+   carries an underline so the operator sees where they are at a glance —
+   pairs with the aria-current="page" the NavLink sets for assistive tech. */
+.nav a.nav-link-active {
+  color: var(--accent);
+  font-weight: 500;
+  text-decoration: underline;
+  text-underline-offset: 0.3em;
+  text-decoration-thickness: 2px;
+}
 /* Visual grouping between nav sections — vault provisioning, host admin,
    top-level discovery. Subtle 1px vertical line; flex layout takes care
    of spacing via the parent `.nav { gap: 1rem }`. */
@@ -205,7 +215,7 @@ code {
   color: var(--fg);
 }
 .nav .nav-dropdown-summary::after {
-  content: ' \25BE'; /* ▾ */
+  content: " \25BE"; /* ▾ */
   font-size: 0.7em;
   color: var(--fg-dim);
 }
@@ -345,8 +355,13 @@ h2 {
  * Default cadence: 1.4s breath. Subtle enough to recede if the load
  * finishes within 100–200ms; recognizable on slow connections. */
 @keyframes pc-loading-pulse {
-  0%, 100% { opacity: 0.55; }
-  50% { opacity: 1; }
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 [data-loading="true"] {
   animation: pc-loading-pulse 1.4s ease-in-out infinite;
@@ -371,8 +386,14 @@ h2 {
  * area (opt-in — tests / specific routes can omit if they care about
  * deterministic paint timing). */
 @keyframes pc-route-fade-up {
-  from { opacity: 0; transform: translateY(6px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 [data-route-content] {
   animation: pc-route-fade-up 0.32s ease forwards;

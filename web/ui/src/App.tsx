@@ -67,10 +67,31 @@ function subtitleFor(pathname: string): string {
   return "vaults";
 }
 
+/**
+ * Title-case the route subtitle for the browser tab. `subtitleFor` returns
+ * lowercase section words ("vaults", "module config", "approve app"); the
+ * `<title>` reads better capitalized ("Vaults · Parachute Hub").
+ */
+function documentTitleFor(pathname: string): string {
+  const section = subtitleFor(pathname)
+    .split(" ")
+    .map((w) => (w.length > 0 ? w[0]!.toUpperCase() + w.slice(1) : w))
+    .join(" ");
+  return `${section} · ${WORDMARK_TEXT}`;
+}
+
 export function App() {
   const { pathname } = useLocation();
   const subtitle = subtitleFor(pathname);
   const [me, setMe] = useState<MeResponse | null>(null);
+
+  // Per-route document.title so a deep-link / multi-tab operator sees which
+  // admin section a tab holds without focusing it. The static index.html
+  // <title> only ever read "Parachute Hub"; this updates it on every
+  // client-side navigation.
+  useEffect(() => {
+    document.title = documentTitleFor(pathname);
+  }, [pathname]);
   const [signingOut, setSigningOut] = useState(false);
   // hub#342: surface a "Services" quick-access dropdown in the nav with
   // an entry per installed module that declares a `management_url`. One
@@ -147,13 +168,13 @@ export function App() {
           <span className="sub">{subtitle}</span>
         </Link>
         <AuthIndicator me={me} signingOut={signingOut} onSignOut={onSignOut} />
-        <Link to="/vaults">Vaults</Link>
-        <Link to="/modules">Modules</Link>
+        <NavSection to="/vaults" label="Vaults" alsoActiveAt="/" />
+        <NavSection to="/modules" label="Modules" />
         <InstalledServicesDropdown services={installedServices} />
-        <Link to="/users">Users</Link>
-        <Link to="/permissions">Permissions</Link>
-        <Link to="/tokens">Tokens</Link>
-        <Link to="/settings">Settings</Link>
+        <NavSection to="/users" label="Users" />
+        <NavSection to="/permissions" label="Permissions" />
+        <NavSection to="/tokens" label="Tokens" />
+        <NavSection to="/settings" label="Settings" />
         <span className="nav-divider" aria-hidden="true" />
         <a href="/" title="Hub discovery page (top-level)">
           Discovery
@@ -188,6 +209,45 @@ export function App() {
           ever see admin diagnostics, and /api/hub would 401 anyway. */}
       {me?.hasSession ? <HubVersionBadge /> : null}
     </div>
+  );
+}
+
+/**
+ * A top-level nav section link with an active-state class + `aria-current`.
+ *
+ * We compute the active state ourselves (prefix-match on the section path,
+ * plus an optional `alsoActiveAt` exact-match alias) rather than leaning on
+ * `NavLink`'s internal `aria-current`: NavLink only stamps `aria-current`
+ * when ITS OWN path matches, so the index-route alias (the SPA renders
+ * `<VaultsList>` at `/` as well as `/vaults`) wouldn't get the attribute.
+ * A plain `<Link>` + manual flags gives full control over both the class
+ * and `aria-current`, and still resolves against the router basename.
+ *
+ * `isPrefix` matches `/vaults` AND `/vaults/new`; the exact-segment check
+ * (`pathname === to`) guards against `/tokens` lighting up for an unrelated
+ * `/tokens-something` were such a route ever added.
+ */
+function NavSection({
+  to,
+  label,
+  alsoActiveAt,
+}: {
+  to: string;
+  label: string;
+  alsoActiveAt?: string;
+}) {
+  const { pathname } = useLocation();
+  const isPrefix = pathname === to || pathname.startsWith(`${to}/`);
+  const aliasActive = alsoActiveAt !== undefined && pathname === alsoActiveAt;
+  const active = isPrefix || aliasActive;
+  return (
+    <Link
+      to={to}
+      className={active ? "nav-link nav-link-active" : "nav-link"}
+      aria-current={active ? "page" : undefined}
+    >
+      {label}
+    </Link>
   );
 }
 
