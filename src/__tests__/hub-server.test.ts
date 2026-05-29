@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildCsrfCookie, generateCsrfToken } from "../csrf.ts";
 import { HUB_SVC, hubPortPath } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
@@ -16,6 +17,7 @@ import { setNotesRedirectDisabled } from "../hub-settings.ts";
 import { clearNotesRedirectLogState } from "../notes-redirect.ts";
 import { pidPath } from "../process-state.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
+import { buildSessionCookie, createSession } from "../sessions.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import type { ModuleState, Supervisor } from "../supervisor.ts";
 import { createUser } from "../users.ts";
@@ -4167,6 +4169,101 @@ describe("hubFetch persistent chrome strip injection (workstream G)", () => {
       expect(body).toContain('href="/login?next=%2Fscribe%2Fadmin%3Fshow%3Dall"');
     } finally {
       upstream.stop();
+      h.cleanup();
+    }
+  });
+});
+
+describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to-end)", () => {
+  // Drive the real dispatch (`hubFetch`) so the route wiring + precedence
+  // (the `/account/vault-token/` prefix must win over `/account/` and the
+  // SPA catch-all) is exercised, not just the handler in isolation.
+  async function seed(h: Harness, assignedVaults: string[]) {
+    const db = openHubDb(hubDbPath(h.dir));
+    rotateSigningKey(db); // mint needs an active signing key
+    await createUser(db, "operator", "operator-password-123");
+    const friend = await createUser(db, "friend", "friend-password-123", {
+      assignedVaults,
+      allowMulti: true,
+    });
+    const session = createSession(db, { userId: friend.id });
+    const csrf = generateCsrfToken();
+    const cookie = `${buildSessionCookie(session.id, 3600, { secure: false })}; ${
+      buildCsrfCookie(csrf, { secure: false }).split(";")[0]
+    }`;
+    return { db, friendId: friend.id, cookie, csrf };
+  }
+
+  function postBody(csrf: string, verb: string): string {
+    const b = new URLSearchParams();
+    b.set("__csrf", csrf);
+    b.set("verb", verb);
+    return b.toString();
+  }
+
+  test("assigned vault → 200 with a token banner, routed through hubFetch", async () => {
+    const h = makeHarness();
+    writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+    const { db, cookie, csrf } = await seed(h, ["work"]);
+    try {
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        issuer: "https://hub.test",
+      })(
+        req("/account/vault-token/work", {
+          method: "POST",
+          headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+          body: postBody(csrf, "read"),
+        }),
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('data-testid="minted-token-banner"');
+      expect(html).toContain("vault:work:read");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("unassigned vault → 403, no token, routed through hubFetch", async () => {
+    const h = makeHarness();
+    writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+    const { db, cookie, csrf } = await seed(h, ["work"]);
+    try {
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        issuer: "https://hub.test",
+      })(
+        req("/account/vault-token/other", {
+          method: "POST",
+          headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+          body: postBody(csrf, "read"),
+        }),
+      );
+      expect(res.status).toBe(403);
+      const html = await res.text();
+      expect(html).not.toContain('data-testid="minted-token-banner"');
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("GET on the mint path → 405 (POST-only)", async () => {
+    const h = makeHarness();
+    writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+    const { db } = await seed(h, ["work"]);
+    try {
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+      })(req("/account/vault-token/work"));
+      expect(res.status).toBe(405);
+    } finally {
+      db.close();
       h.cleanup();
     }
   });

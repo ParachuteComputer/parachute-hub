@@ -24,6 +24,8 @@ import {
   userCount,
   validatePassword,
   validateUsername,
+  vaultVerbsForRole,
+  vaultVerbsForUserVault,
   verifyPassword,
 } from "../users.ts";
 
@@ -730,6 +732,72 @@ describe("getFirstAdminId / isFirstAdmin", () => {
       deleteUser(db, friend.id);
       expect(getFirstAdminId(db)).toBe(admin.id);
       expect(isFirstAdmin(db, admin.id)).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("vaultVerbsForRole / vaultVerbsForUserVault (friend token-mint cap)", () => {
+  test("vaultVerbsForRole maps roles to verbs, fails closed on unknown", () => {
+    expect(vaultVerbsForRole("write")).toEqual(["read", "write"]);
+    expect(vaultVerbsForRole("read")).toEqual(["read"]);
+    // Unknown / future roles grant NO mintable verb — never silently
+    // default to write. `admin` is explicitly NOT a mintable role here.
+    expect(vaultVerbsForRole("admin")).toEqual([]);
+    expect(vaultVerbsForRole("owner")).toEqual([]);
+    expect(vaultVerbsForRole("")).toEqual([]);
+  });
+
+  test("vaultVerbsForUserVault returns the role's verbs for an assigned vault", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      await createUser(db, "admin", "pw1");
+      const friend = await createUser(db, "alice", "pw2", {
+        allowMulti: true,
+        assignedVaults: ["work"],
+      });
+      // createUser/setUserVaults insert role='write' today → read+write.
+      expect(vaultVerbsForUserVault(db, friend.id, "work")).toEqual(["read", "write"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("vaultVerbsForUserVault returns null for a vault NOT in the assignment", async () => {
+    // This null is the authorization spine of the friend mint path: a vault
+    // the user isn't assigned to → null → the handler 403s. No cross-vault.
+    const { db, cleanup } = makeDb();
+    try {
+      await createUser(db, "admin", "pw1");
+      const friend = await createUser(db, "alice", "pw2", {
+        allowMulti: true,
+        assignedVaults: ["work"],
+      });
+      expect(vaultVerbsForUserVault(db, friend.id, "other")).toBeNull();
+      // The unrestricted admin has no user_vaults rows → null for everything.
+      const admin = getUserById(db, getFirstAdminId(db) ?? "");
+      expect(vaultVerbsForUserVault(db, admin?.id ?? "", "work")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("vaultVerbsForUserVault honors a hand-set read-only role (fail-closed forward-compat)", async () => {
+    // The schema reserves `role` for future granularity; if a row ever holds
+    // role='read', the cap must drop write. Simulate by direct UPDATE.
+    const { db, cleanup } = makeDb();
+    try {
+      await createUser(db, "admin", "pw1");
+      const friend = await createUser(db, "alice", "pw2", {
+        allowMulti: true,
+        assignedVaults: ["work"],
+      });
+      db.prepare("UPDATE user_vaults SET role = 'read' WHERE user_id = ? AND vault_name = ?").run(
+        friend.id,
+        "work",
+      );
+      expect(vaultVerbsForUserVault(db, friend.id, "work")).toEqual(["read"]);
     } finally {
       cleanup();
     }
