@@ -194,7 +194,7 @@ Flags:
                                  http://127.0.0.1:1939). \`parachute init\`
                                  passes this in when chaining; standalone
                                  callers supply it explicitly.
-  --account-username <name>      pre-supply the admin username (default: admin)
+  --account-username <name>      pre-supply the admin username (default: owner)
   --account-password <pw>        pre-supply the admin password (required when
                                  non-interactive)
   --bootstrap-token <token>      one-time bootstrap token when the hub is in
