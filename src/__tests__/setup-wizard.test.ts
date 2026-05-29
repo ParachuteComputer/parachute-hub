@@ -2063,10 +2063,14 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
       );
       const html = await res.text();
       expect(html).toContain("claude mcp add --transport http parachute-default");
-      // The fallback explanatory text mentions `pvt_...` as a placeholder
-      // but the actual `--header` flag must NOT be appended to the
-      // command line itself.
-      expect(html).toContain("Bearer pvt_");
+      // The fallback explanatory text leads with the OAuth path (no token
+      // needed) and, for headless clients, references a hub JWT placeholder
+      // — NOT the retired `pvt_*` format (gap #4). The `--header` flag must
+      // also NOT be appended to the command line itself.
+      expect(html).toContain("browser OAuth");
+      expect(html).toContain("Bearer &lt;token&gt;");
+      expect(html).not.toContain("pvt_");
+      expect(html).toContain("parachute auth mint-token");
       expect(html).toContain("/admin/tokens");
       // Specifically no Copy button — that's a token-present surface.
       expect(html).not.toContain('id="mcp-cmd"');
