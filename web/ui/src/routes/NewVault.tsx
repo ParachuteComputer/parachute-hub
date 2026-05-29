@@ -6,19 +6,30 @@
  *      "list" reserved) client-side so the operator gets immediate
  *      feedback, but the server is still authoritative — see admin-
  *      vaults.ts for the canonical list.
- *   2. Result: on 201 with `token`, render the single-emit token banner
- *      with copy + a "Done" dismiss. The token is shown ONCE, ever —
- *      refreshing the page or navigating away loses it; the hub can't
- *      re-emit it. We block navigation away while the banner is live so
- *      an accidental Back doesn't strand the operator. Below the token
- *      banner, the created-view renders the per-vault MCP connect card
- *      (the same `<McpConnectCard>` the Vaults list uses) so the bare
- *      token has a clear, in-context purpose — closing the team-onboarding
- *      gap where a freshly-minted token arrived with no stated use.
+ *   2. Result, branched on `created` (HTTP 201 vs 200), NOT on token
+ *      truthiness:
+ *        - created + token present → show the one-shot ACCESS-token banner
+ *          (a hub-issued JWT scoped `vault:<name>:admin`) with copy + a
+ *          "Done" dismiss. Shown ONCE — the hub captured it from the
+ *          create JSON and doesn't re-emit it. We block navigation away
+ *          while the banner is live so an accidental Back doesn't strand
+ *          the operator.
+ *        - created + NO token (HTTP 201, `token: ""`) → the vault exists
+ *          but the bootstrap mint was unavailable (e.g. a loopback origin
+ *          the hub can't mint against). Render a "created, but no token
+ *          minted" state with the vault's `token_guidance` reason and
+ *          point at the real mint path. Pre-fix this wrongly rendered
+ *          "already existed" because the empty string read as falsy.
+ *        - NOT created (HTTP 200, idempotent re-POST) → "already existed"
+ *          state. Nothing was minted.
  *
- * 200 (idempotent re-POST against an existing vault) is treated as
- * success but renders without a token banner — there's nothing to copy
- * because the original token was already emitted.
+ * Recovery story (all branches): the created-view mounts the per-vault
+ * `<McpConnectCard>` (same component the Vaults list uses). Its OAuth-first
+ * `claude mcp add` command needs NO token — that's the canonical connect
+ * path. For a header-auth token, mint a scope-narrow one via the card's
+ * "Use a token instead" disclosure, or from the CLI with
+ * `parachute auth mint-token --scope vault:<name>:read`. There is NO
+ * "mint from the vault directly" path — that mental model is gone post-DROP.
  */
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
@@ -39,11 +50,13 @@ export function NewVault() {
   const [name, setName] = useState("");
   const [state, setState] = useState<State>({ kind: "idle" });
 
-  // Block accidental navigation while a single-emit token is on-screen.
+  // Block accidental navigation while a one-shot access token is on-screen.
   // The browser's "leave this page?" dialog is the cheapest belt-and-
   // braces — react-router won't intercept window.close, but it covers
-  // refresh + tab-close, which are the realistic mistakes here.
-  const hasUnsavedToken = state.kind === "created" && state.result.token != null;
+  // refresh + tab-close, which are the realistic mistakes here. Guard on a
+  // non-empty token: a 201 with `token: ""` (mint unavailable) has nothing
+  // to lose, so don't nag the operator.
+  const hasUnsavedToken = state.kind === "created" && !!state.result.token;
   useEffect(() => {
     if (!hasUnsavedToken) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -161,11 +174,15 @@ function CreatedView({
 
       {result.token ? (
         <div className="mint-banner">
-          <h3>Your vault token (shown once)</h3>
+          <h3>Your access token (shown once)</h3>
           <p className="muted">
-            This is the only time the hub will show this token. Copy it and store it somewhere safe
-            — a password manager, the operator's notes, parachute-agent's secrets store. If you lose
-            it, you'll need to mint a new one from the vault directly.
+            This is a hub-issued access token (a JWT scoped <code>vault:{result.name}:admin</code>)
+            — not a vault password. It's the only time the hub will show it. Copy it and store it
+            somewhere safe — a password manager, the operator's notes. If you lose it, you don't
+            need it for the OAuth connect path below; for a header-auth token, mint a fresh
+            scope-narrow one with{" "}
+            <code>parachute auth mint-token --scope vault:{result.name}:read</code> (or the connect
+            card's "Use a token instead" option).
           </p>
           <div className="token-box">
             <code>{result.token}</code>
@@ -180,12 +197,45 @@ function CreatedView({
             </button>
           </div>
         </div>
-      ) : (
+      ) : result.created ? (
+        // HTTP 201, but no token came back (`token: ""`). The vault WAS
+        // created — the bootstrap mint just wasn't available (e.g. a
+        // loopback origin the hub can't mint a JWT against). Don't render
+        // "already existed" — that's the empty-token-wrong-branch bug.
+        // Steer the operator at the real connect path (the OAuth command in
+        // the card below needs no token) + the CLI mint path.
         <div className="section">
           <p>
-            Vault <code>{result.name}</code> already existed; nothing new was minted. Use the
-            existing token, or mint a fresh one from the vault directly with{" "}
-            <code>parachute-vault mint-token</code>.
+            Vault <code>{result.name}</code> was created, but no access token was minted
+            {result.tokenGuidance ? (
+              <>
+                {" "}
+                — <span className="muted">{result.tokenGuidance}</span>
+              </>
+            ) : (
+              <span className="muted">
+                {" "}
+                (the hub couldn't mint one at create time — common on a loopback origin)
+              </span>
+            )}
+            . You don't need a token for the OAuth connect command below. For a header-auth token,
+            mint a scope-narrow one with{" "}
+            <code>parachute auth mint-token --scope vault:{result.name}:read</code>.
+          </p>
+          <div className="actions">
+            <button type="button" onClick={onDone}>
+              Done
+            </button>
+          </div>
+        </div>
+      ) : (
+        // HTTP 200 — idempotent re-POST against an existing vault. Nothing
+        // was created or minted.
+        <div className="section">
+          <p>
+            Vault <code>{result.name}</code> already existed; nothing new was created. Connect to it
+            with the command below (OAuth, no token needed), or mint a scope-narrow header-auth
+            token with <code>parachute auth mint-token --scope vault:{result.name}:read</code>.
           </p>
           <div className="actions">
             {/* No per-vault detail route exists — land on the vaults list

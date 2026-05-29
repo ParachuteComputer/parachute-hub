@@ -104,6 +104,7 @@ type DeleteState =
   | { kind: "idle" }
   | { kind: "confirming"; user: UserListing }
   | { kind: "deleting"; userId: string }
+  | { kind: "done"; username: string; revocationLagSeconds: number }
   | { kind: "error"; userId: string; message: string };
 
 /**
@@ -253,8 +254,11 @@ export function Users() {
   async function onConfirmDelete(user: UserListing): Promise<void> {
     setDeleteSt({ kind: "deleting", userId: user.id });
     try {
-      await deleteUser(user.id);
-      setDeleteSt({ kind: "idle" });
+      const { revocationLagSeconds } = await deleteUser(user.id);
+      // Surface a done-banner with the revocation-lag warning (consistency
+      // with the reset-password flow) so the admin knows the deleted user's
+      // tokens linger ~60s on resource-server caches.
+      setDeleteSt({ kind: "done", username: user.username, revocationLagSeconds });
       setReload((n) => n + 1);
     } catch (err) {
       const message =
@@ -341,6 +345,31 @@ export function Users() {
         ) : null}
         .
       </p>
+
+      {deleteSt.kind === "done" && (
+        // Section-level (not per-row): the deleted user's row is gone after
+        // the reload, so the revocation-lag warning lives above the list.
+        // Mirrors the reset-password success banner's wording.
+        <output
+          className="success-banner"
+          style={{ display: "block", marginBottom: "0.75rem" }}
+          data-testid="delete-done-banner"
+        >
+          Deleted <code>{deleteSt.username}</code>. Their tokens are revoked. Resource servers
+          (vault, scribe, etc.) cache the revocation list for up to {deleteSt.revocationLagSeconds}{" "}
+          seconds — if you're deleting because of a suspected compromise, also restart the affected
+          services (e.g. <code>parachute restart vault</code>) to flush their cache immediately.
+          <div style={{ marginTop: "0.5rem" }}>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setDeleteSt({ kind: "idle" })}
+            >
+              Dismiss
+            </button>
+          </div>
+        </output>
+      )}
 
       {renderListSection(
         state,

@@ -462,7 +462,7 @@ describe("handleDeleteUser", () => {
     expect(list.users.map((u) => u.id)).toContain(userId);
   });
 
-  test("204 deletes a non-first user and revokes their tokens", async () => {
+  test("200 + revocation_lag_seconds deletes a non-first user and revokes their tokens", async () => {
     const { bearer } = await makeAdminBearer();
     // Create a second user (non-first) + mint a token on their behalf.
     const second = await createUser(harness.db, "alice", "alice-strong-passphrase", {
@@ -497,7 +497,12 @@ describe("handleDeleteUser", () => {
       second.id,
       deps(),
     );
-    expect(res.status).toBe(204);
+    // 200 + body (was a bare 204) so the SPA can warn about revocation lag —
+    // consistency with the reset-password path.
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; revocation_lag_seconds: number };
+    expect(body.ok).toBe(true);
+    expect(body.revocation_lag_seconds).toBe(60);
 
     // User row is gone.
     const listRes = await handleListUsers(withBearer("/api/users", bearer), deps());

@@ -54,9 +54,12 @@ export interface VaultAuthStatus {
   hasTotp: boolean;
   /**
    * `null` means we couldn't read the SQLite DB — distinct from "0 tokens
-   * exist." Callers branch the UI on this: `null` → "token status unknown,
-   * run `parachute vault tokens list` to check"; `0` → loud "no auth at
-   * all!" warning; `>0` → benign.
+   * exist." Post the pvt_* DROP (hub#466) the expose preflight no longer
+   * branches on this — `classify()` in expose-auth-preflight.ts gates on
+   * `hasOwnerPassword`, since access now flows through the owner password +
+   * on-demand hub JWT mint, not standing vault tokens. `tokenCount` is kept
+   * as a best-effort diagnostic only (these rows are vestigial); `null`
+   * still cleanly distinguishes "unreadable DB" from "0 rows."
    */
   tokenCount: number | null;
   /** Vault instance names discovered under data/. Empty when vault has
@@ -183,9 +186,11 @@ function defaultProbeHubDbHasUserPassword(dbPath: string): boolean | undefined {
     // simpler than a JOIN on earliest-created-at. A future env-seed
     // flow that creates friend accounts before the operator sets a
     // password would need to revisit this assumption.
-    const row = db?.prepare(
-      "SELECT COUNT(*) AS n FROM users WHERE password_hash IS NOT NULL AND length(password_hash) > 0",
-    ).get() as { n: number } | null;
+    const row = db
+      ?.prepare(
+        "SELECT COUNT(*) AS n FROM users WHERE password_hash IS NOT NULL AND length(password_hash) > 0",
+      )
+      .get() as { n: number } | null;
     return (row?.n ?? 0) > 0;
   } catch {
     return undefined;
@@ -205,8 +210,7 @@ function resolve(opts: AuthStatusOpts): Resolved {
     readText: opts.readText ?? defaultReadText,
     listVaultNames: opts.listVaultNames ?? defaultListVaultNames,
     countTokens: opts.countTokens ?? defaultCountTokens,
-    probeHubDbHasUserPassword:
-      opts.probeHubDbHasUserPassword ?? defaultProbeHubDbHasUserPassword,
+    probeHubDbHasUserPassword: opts.probeHubDbHasUserPassword ?? defaultProbeHubDbHasUserPassword,
   };
 }
 

@@ -167,19 +167,25 @@ describe("Users — delete confirm flow", () => {
     expect(api.deleteUser).not.toHaveBeenCalled();
   });
 
-  it("confirm Delete calls deleteUser and refreshes the list", async () => {
+  it("confirm Delete calls deleteUser, refreshes the list, and shows the revocation-lag banner", async () => {
     const listMock = vi.mocked(api.listUsers);
     listMock.mockResolvedValueOnce([user("operator"), user("alice")]);
     listMock.mockResolvedValueOnce([user("operator")]);
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
-    vi.mocked(api.deleteUser).mockResolvedValue();
+    vi.mocked(api.deleteUser).mockResolvedValue({ revocationLagSeconds: 60 });
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /delete alice/i }));
     const dialog = screen.getByRole("dialog", { name: /confirm delete alice/i });
     fireEvent.click(within(dialog).getByRole("button", { name: /^delete$/i }));
     await waitFor(() => expect(api.deleteUser).toHaveBeenCalledWith("id-alice"));
-    // alice gone after refresh.
-    await waitFor(() => expect(screen.queryByText("alice")).toBeNull());
+    // alice's row is gone after refresh (her Delete button no longer exists).
+    // We assert on the row affordance, not bare text — the success banner
+    // legitimately echoes the deleted username.
+    await waitFor(() => expect(screen.queryByRole("button", { name: /delete alice/i })).toBeNull());
+    // Revocation-lag warning banner appears (consistency with reset-password).
+    const banner = await screen.findByTestId("delete-done-banner");
+    expect(banner).toHaveTextContent(/tokens are revoked/i);
+    expect(banner).toHaveTextContent(/up to 60 seconds/i);
   });
 
   it("surfaces a per-row error banner when delete fails", async () => {

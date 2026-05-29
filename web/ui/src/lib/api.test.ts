@@ -186,7 +186,7 @@ describe("createVault", () => {
         name: "work",
         url: "http://hub.local/vault/work/",
         version: "0.5.1",
-        token: "pvt_abc123",
+        token: "hubjwt.abc123",
         paths: {
           vault_dir: "/home/u/.parachute/vault/work",
           vault_db: "/home/u/.parachute/vault/work/vault.db",
@@ -199,7 +199,9 @@ describe("createVault", () => {
     const api = await import("./api.ts");
     const result = await api.createVault({ name: "work" });
 
-    expect(result.token).toBe("pvt_abc123");
+    // 201 → `created: true` is the authoritative create signal.
+    expect(result.created).toBe(true);
+    expect(result.token).toBe("hubjwt.abc123");
     expect(result.paths?.vault_dir).toContain("/vault/work");
     expect(fetchMock).toHaveBeenCalledWith(
       "/vaults",
@@ -214,11 +216,11 @@ describe("createVault", () => {
     );
   });
 
-  it("on 200 idempotent re-POST returns the existing entry without a token", async () => {
+  it("on 200 idempotent re-POST returns the existing entry without a token (created: false)", async () => {
     // Server short-circuits when the vault already exists: same name + url +
-    // version, but no fresh `token` (we only emit once, on first create).
-    // NewVault.tsx must handle the missing-token branch without claiming
-    // success-with-banner.
+    // version, but no fresh `token` (the create-time access token isn't
+    // retrievable later). `created: false` is the authoritative signal —
+    // NewVault.tsx renders the "already existed" branch off it.
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -232,8 +234,34 @@ describe("createVault", () => {
     const api = await import("./api.ts");
     const result = await api.createVault({ name: "work" });
     expect(result.name).toBe("work");
+    expect(result.created).toBe(false);
     expect(result.token).toBeUndefined();
     expect(result.paths).toBeUndefined();
+  });
+
+  it("on 201 with an empty token reports created: true + forwards token_guidance", async () => {
+    // Post the pvt_* DROP, the vault emits `token: ""` when the bootstrap
+    // mint was unavailable (e.g. loopback origin). `created` must come from
+    // the HTTP status (201), NOT token truthiness — and the empty token must
+    // not survive as a falsy-but-present field. `token_guidance` is forwarded
+    // so the UI can explain the gap.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(201, {
+          name: "work",
+          url: "http://hub.local/vault/work/",
+          version: "0.5.1",
+          token: "",
+          token_guidance: "no hub origin reachable to mint against",
+        }),
+      ),
+    );
+    const api = await import("./api.ts");
+    const result = await api.createVault({ name: "work" });
+    expect(result.created).toBe(true);
+    expect(result.token).toBeUndefined();
+    expect(result.tokenGuidance).toBe("no hub origin reachable to mint against");
   });
 
   it("on 401 clears the cached token and throws HttpError(401)", async () => {

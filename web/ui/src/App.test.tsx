@@ -138,6 +138,53 @@ describe("App — nav structure", () => {
   });
 });
 
+describe("App — active nav indicator", () => {
+  it("marks the current section's NavLink active with aria-current + class", () => {
+    const { container } = renderAt("/tokens");
+    const tokens = within(screen.getByRole("navigation")).getByRole("link", {
+      name: /^tokens$/i,
+    });
+    expect(tokens).toHaveClass("nav-link-active");
+    expect(tokens).toHaveAttribute("aria-current", "page");
+    // Exactly one section is active at a time.
+    expect(container.querySelectorAll(".nav .nav-link-active")).toHaveLength(1);
+  });
+
+  it("lights up Vaults on the index route (/) via the alsoActiveAt alias", () => {
+    renderAt("/");
+    const vaults = within(screen.getByRole("navigation")).getByRole("link", {
+      name: /^vaults$/i,
+    });
+    expect(vaults).toHaveClass("nav-link-active");
+    expect(vaults).toHaveAttribute("aria-current", "page");
+  });
+
+  it("keeps Vaults active on the /vaults/new sub-route", () => {
+    renderAt("/vaults/new");
+    const vaults = within(screen.getByRole("navigation")).getByRole("link", {
+      name: /^vaults$/i,
+    });
+    expect(vaults).toHaveClass("nav-link-active");
+  });
+});
+
+describe("App — document title", () => {
+  it("sets a per-route document.title", async () => {
+    renderAt("/tokens");
+    await waitFor(() => expect(document.title).toBe("Tokens · Parachute"));
+  });
+
+  it("title-cases multi-word sections", async () => {
+    renderAt("/modules/scribe/config");
+    await waitFor(() => expect(document.title).toBe("Module Config · Parachute"));
+  });
+
+  it("falls back to Vaults on the index route", async () => {
+    renderAt("/");
+    await waitFor(() => expect(document.title).toBe("Vaults · Parachute"));
+  });
+});
+
 describe("App — auth indicator (rc.13)", () => {
   it("renders nothing on first paint, then 'Sign in' once /api/me resolves to signed-out", async () => {
     vi.mocked(api.getMe).mockResolvedValue({ hasSession: false });

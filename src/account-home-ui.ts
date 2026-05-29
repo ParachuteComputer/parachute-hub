@@ -148,21 +148,54 @@ interface VaultCardOpts {
   isFirstAdmin: boolean;
 }
 
+/**
+ * Build `<hub-origin>/vault/<name>/mcp` — the MCP endpoint a client connects
+ * to. Mirrors the SPA's `mcpEndpointFor` (McpConnectCard.tsx) and the
+ * wizard's `renderMcpTile`. The friend's `/account/` tile is server-rendered
+ * (no SPA), so we compute it here from the hub origin + vault name rather
+ * than the vault's well-known `url`.
+ *
+ * Exported for direct unit testing.
+ */
+export function accountMcpEndpoint(trimmedOrigin: string, vaultName: string): string {
+  return `${trimmedOrigin}/vault/${vaultName}/mcp`;
+}
+
+/**
+ * The OAuth-path `claude mcp add` command — no token, triggers browser OAuth
+ * on first use. Same `parachute-<name>` server name as the SPA card and the
+ * wizard tile, so a friend and the operator end up with identically-named
+ * MCP servers. Exported for direct unit testing.
+ */
+export function accountClaudeMcpAddCommand(trimmedOrigin: string, vaultName: string): string {
+  return `claude mcp add --transport http parachute-${vaultName} ${accountMcpEndpoint(
+    trimmedOrigin,
+    vaultName,
+  )}`;
+}
+
 function renderVaultCard(opts: VaultCardOpts): string {
   const { assignedVaults, trimmedOrigin, isFirstAdmin } = opts;
 
   if (assignedVaults.length > 0) {
-    // One vault tile per assignment (multi-user Phase 2 PR 2). Each
-    // tile carries its own Notes "Open" CTA and the hub-origin code
-    // block. The disclosure ("Use a custom client") lives at the
-    // section level, not per-tile, because the hub origin is the same
-    // regardless of which vault the user picks.
-    const hubOriginDisplay = escapeHtml(trimmedOrigin);
+    // One vault tile per assignment (multi-user Phase 2 PR 2). Each tile
+    // carries the Notes "Open" CTA AND a server-rendered MCP connect block
+    // (endpoint + `claude mcp add` command, each with a copy button). The
+    // connect command is the OAuth path — no token, so a non-admin friend
+    // who can't run the SPA's host-admin mint still gets a working
+    // connect affordance (the first `claude mcp add` use opens a browser,
+    // signs them in, and approves the scope). This closes the multi-user
+    // gap where the friend tile only offered the external Notes link + a
+    // bare hub-origin string.
     const heading = assignedVaults.length === 1 ? "<h2>Your vault</h2>" : "<h2>Your vaults</h2>";
     const tiles = assignedVaults
       .map((vaultName) => {
         const safeVault = escapeHtml(vaultName);
         const vaultUrlForAdd = encodeURIComponent(`${trimmedOrigin}/vault/${vaultName}`);
+        const endpoint = accountMcpEndpoint(trimmedOrigin, vaultName);
+        const addCmd = accountClaudeMcpAddCommand(trimmedOrigin, vaultName);
+        const safeEndpoint = escapeHtml(endpoint);
+        const safeAddCmd = escapeHtml(addCmd);
         return `
         <div class="vault-tile" data-testid="vault-tile" data-vault-name="${safeVault}">
           <p class="vault-name"><strong>${safeVault}</strong></p>
@@ -170,6 +203,27 @@ function renderVaultCard(opts: VaultCardOpts): string {
             <a class="btn btn-primary" href="https://notes.parachute.computer/add?url=${vaultUrlForAdd}"
                target="_blank" rel="noopener" data-testid="open-notes-cta">Open Notes ↗</a>
           </p>
+          <div class="mcp-connect" data-testid="mcp-connect">
+            <p class="mcp-connect-label">Connect an MCP client (Claude Code, Claude.ai)</p>
+            <div class="mcp-field">
+              <span class="mcp-field-label">Endpoint</span>
+              <div class="copy-row">
+                <code data-testid="mcp-endpoint">${safeEndpoint}</code>
+                <button type="button" class="btn btn-copy" data-copy="${safeEndpoint}"
+                        data-testid="copy-mcp-endpoint">Copy</button>
+              </div>
+            </div>
+            <div class="mcp-field">
+              <span class="mcp-field-label">Claude Code</span>
+              <div class="copy-row">
+                <code data-testid="mcp-add-command">${safeAddCmd}</code>
+                <button type="button" class="btn btn-copy" data-copy="${safeAddCmd}"
+                        data-testid="copy-mcp-add-command">Copy</button>
+              </div>
+            </div>
+            <p class="mcp-connect-hint">No token needed — the command opens a browser to
+               sign you in to this hub and approve access on first use.</p>
+          </div>
         </div>`;
       })
       .join("");
@@ -178,18 +232,12 @@ function renderVaultCard(opts: VaultCardOpts): string {
         ${heading}
         <p>Open Notes — the canonical browser UI for your vault${
           assignedVaults.length === 1 ? "" : "s"
-        }. It connects to your hub
-          over HTTPS and remembers your URL after the first OAuth.</p>
+        } — or connect an MCP client
+          (Claude Code, Claude.ai) with the command below. Either way you sign in to your
+          hub over HTTPS and approve access on the first connection.</p>
         <div class="vault-tiles">${tiles}
         </div>
-        <details class="custom-client">
-          <summary>Use a custom client</summary>
-          <p>To connect a custom Surface or MCP client running on your own machine,
-             point it at the hub origin below and run through OAuth — the hub will
-             ask you to consent.</p>
-          <p class="hub-origin-line">Hub origin: <code>${hubOriginDisplay}</code></p>
-        </details>
-      </section>`;
+      </section>${COPY_SCRIPT}`;
   }
   if (isFirstAdmin) {
     return `
@@ -236,12 +284,39 @@ function renderAccountCard(opts: AccountCardOpts): string {
     </section>`;
 }
 
+// --- copy-button script ---------------------------------------------------
+//
+// Tiny inline progressive-enhancement script for the per-tile copy buttons.
+// Delegated click handler reads the command/endpoint from the button's
+// `data-copy` attribute and writes it to the clipboard, flashing "Copied ✓"
+// for 2s. No-ops gracefully when the Clipboard API is unavailable (insecure
+// context, older browser) — the command text stays selectable in the
+// codebox. Mirrors the SPA `CopyButton` posture (McpConnectCard.tsx) for a
+// surface that has no React. Only emitted on the assigned-vault branch
+// (where copy buttons exist).
+const COPY_SCRIPT = `
+  <script>
+    (function () {
+      document.addEventListener('click', function (e) {
+        var btn = e.target && e.target.closest ? e.target.closest('[data-copy]') : null;
+        if (!btn) return;
+        var value = btn.getAttribute('data-copy') || '';
+        if (typeof navigator === 'undefined' || !navigator.clipboard) return;
+        navigator.clipboard.writeText(value).then(function () {
+          var original = btn.textContent;
+          btn.textContent = 'Copied \\u2713';
+          setTimeout(function () { btn.textContent = original; }, 2000);
+        }).catch(function () { /* insecure context — leave selectable */ });
+      });
+    })();
+  </script>`;
+
 // --- styles ---------------------------------------------------------------
 //
 // Same brand palette + font stack as account-change-password-ui.ts so the
 // `/account/*` family is visually cohesive. Extra rules (.section, .kv,
-// .vault-name, .custom-client, .hub-origin-line) describe the new card +
-// disclosure shapes this page introduces.
+// .vault-name, .mcp-connect, .copy-row) describe the new card + MCP
+// connect-block shapes this page introduces.
 
 const STYLES = `
   *, *::before, *::after { box-sizing: border-box; }
@@ -338,22 +413,58 @@ const STYLES = `
   .vault-tile p { margin: 0.2rem 0; }
   .vault-tile p:last-child { margin-top: 0.5rem; }
 
-  .custom-client { margin-top: 0.8rem; }
-  .custom-client summary {
-    cursor: pointer;
+  .mcp-connect {
+    margin-top: 0.75rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+  }
+  .mcp-connect-label {
     font-size: 0.85rem;
+    font-weight: 500;
+    color: ${PALETTE.fg};
+    margin: 0 0 0.5rem;
+  }
+  .mcp-field { margin: 0.5rem 0; }
+  .mcp-field-label {
+    display: block;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
     color: ${PALETTE.fgMuted};
     font-family: ${FONT_MONO};
-    padding: 0.25rem 0;
-    user-select: none;
+    margin-bottom: 0.2rem;
   }
-  .custom-client[open] summary { color: ${PALETTE.fg}; }
-  .custom-client p {
-    font-size: 0.9rem;
+  .copy-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: ${PALETTE.cardBg};
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    padding: 0.4rem 0.5rem;
+  }
+  .copy-row code {
+    flex: 1 1 auto;
+    overflow-x: auto;
+    white-space: nowrap;
+    background: transparent;
+    padding: 0;
+    font-size: 0.82rem;
+  }
+  .btn-copy {
+    flex: 0 0 auto;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.7rem;
+    background: transparent;
+    color: ${PALETTE.fg};
+    border-color: ${PALETTE.border};
+  }
+  .btn-copy:hover { background: ${PALETTE.bgSoft}; border-color: ${PALETTE.accent}; }
+  .mcp-connect-hint {
+    font-size: 0.82rem;
     color: ${PALETTE.fgMuted};
-    margin: 0.4rem 0;
+    margin: 0.4rem 0 0;
   }
-  .hub-origin-line { font-family: ${FONT_MONO}; }
   code {
     font-family: ${FONT_MONO};
     background: ${PALETTE.bgSoft};
@@ -423,12 +534,14 @@ const STYLES = `
     body { background: #1a1815; color: #e8e4dc; }
     .card { background: #25221d; border-color: #3a362f; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3); }
     h1, h2 { color: #f0ece4; }
-    .subtitle, .kv dt, .custom-client summary { color: #a8a29a; }
-    .vault-name strong { color: #f0ece4; }
+    .subtitle, .kv dt, .mcp-field-label, .mcp-connect-hint { color: #a8a29a; }
+    .vault-name strong, .mcp-connect-label { color: #f0ece4; }
     code { background: #1f1c18; color: #e8e4dc; }
-    .section { border-top-color: #3a362f; }
+    .copy-row code { background: transparent; }
+    .section, .mcp-connect { border-top-color: #3a362f; }
     .brand-tag { border-color: #3a362f; color: #a8a29a; }
-    .btn-secondary { color: #e8e4dc; border-color: #3a362f; }
-    .btn-secondary:hover { background: #1f1c18; border-color: ${PALETTE.accent}; }
+    .copy-row { background: #1f1c18; border-color: #3a362f; }
+    .btn-secondary, .btn-copy { color: #e8e4dc; border-color: #3a362f; }
+    .btn-secondary:hover, .btn-copy:hover { background: #1f1c18; border-color: ${PALETTE.accent}; }
   }
 `;

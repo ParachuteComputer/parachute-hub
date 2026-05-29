@@ -41,8 +41,32 @@ export interface CreateVaultResult {
   name: string;
   url: string;
   version: string;
-  /** Single-emit `pvt_*` token from `parachute-vault create --json`. Only on first creation. */
+  /**
+   * Whether THIS request freshly created the vault (HTTP 201) vs hit an
+   * already-existing one (idempotent re-POST, HTTP 200). Branch the UI on
+   * this, NOT on `token` truthiness — post the pvt_* DROP a freshly-created
+   * vault can come back with `token: ""` (the bootstrap mint was
+   * unavailable, e.g. on a loopback origin the hub can't mint against), and
+   * treating `""` as "already existed" wrongly tells the operator nothing
+   * was created. Status is the authoritative create signal.
+   */
+  created: boolean;
+  /**
+   * One-shot hub ACCESS token (a JWT scoped `vault:<name>:admin`) captured
+   * from `parachute-vault create --json`. Present and non-empty only when
+   * the hub could mint at create time. Empty string (or absent) on a 201
+   * means the vault was created but no token was minted — see
+   * `tokenGuidance`. This is NOT a `pvt_*` vault token (those were dropped);
+   * it's a hub-issued JWT the connect command can carry as a header.
+   */
   token?: string;
+  /**
+   * Vault-supplied human-readable reason no token was minted (e.g. "no hub
+   * origin reachable to mint against"), forwarded verbatim from the vault
+   * create JSON's `token_guidance` field. Surfaced on the empty-token-on-201
+   * state so the operator understands the gap rather than seeing a blank.
+   */
+  tokenGuidance?: string;
   paths?: {
     vault_dir: string;
     vault_db: string;
@@ -173,7 +197,30 @@ export async function createVault(input: CreateVaultInput): Promise<CreateVaultR
   if (!res.ok) {
     throw new HttpError(res.status, await readError(res));
   }
-  return (await res.json()) as CreateVaultResult;
+  // The hub returns 201 on a fresh create, 200 on an idempotent re-POST
+  // against an existing vault. Carry that distinction into `created` so the
+  // UI branches on status, not on `token` truthiness — a 201 can legitimately
+  // carry `token: ""` post-DROP (mint unavailable) and must NOT be treated as
+  // "already existed."
+  const created = res.status === 201;
+  const body = (await res.json()) as {
+    name: string;
+    url: string;
+    version: string;
+    token?: string;
+    token_guidance?: string;
+    paths?: CreateVaultResult["paths"];
+  };
+  const result: CreateVaultResult = {
+    name: body.name,
+    url: body.url,
+    version: body.version,
+    created,
+  };
+  if (body.token) result.token = body.token;
+  if (body.token_guidance) result.tokenGuidance = body.token_guidance;
+  if (body.paths) result.paths = body.paths;
+  return result;
 }
 
 /**
@@ -1125,8 +1172,15 @@ export async function createUser(input: CreateUserInput): Promise<UserListing> {
  * delete the first-created admin (403 `first_admin_undeletable`) so the
  * hub can't be self-locked. The SPA also disables the row-level button
  * for that user as a UX hint, but the server check is authoritative.
+ *
+ * Returns `{ revocationLagSeconds }` — same shape + rationale as
+ * `resetUserPassword`. A successful delete revokes the user's tokens, but
+ * resource servers cache the revocation list for ~60s; surface the lag so
+ * the SPA can warn the admin (consistency with the reset-password banner).
+ * The server's race-tolerant "row already gone" path returns a bodyless
+ * 204; we default to 60 when there's no body to parse.
  */
-export async function deleteUser(id: string): Promise<void> {
+export async function deleteUser(id: string): Promise<{ revocationLagSeconds: number }> {
   const bearer = await getHostAdminToken();
   const res = await fetch(`/api/users/${encodeURIComponent(id)}`, {
     method: "DELETE",
@@ -1141,6 +1195,12 @@ export async function deleteUser(id: string): Promise<void> {
     throw new HttpError(res.status, await readError(res));
   }
   if (!res.ok) throw new HttpError(res.status, await readError(res));
+  // 200 carries `{ ok, revocation_lag_seconds }`; the race-path 204 has no
+  // body. Default to 60 (the server constant) when missing — same posture
+  // as `resetUserPassword`.
+  const body = (await res.json().catch(() => ({}))) as { revocation_lag_seconds?: number };
+  const lag = typeof body.revocation_lag_seconds === "number" ? body.revocation_lag_seconds : 60;
+  return { revocationLagSeconds: lag };
 }
 
 /**
