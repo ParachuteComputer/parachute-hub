@@ -55,6 +55,7 @@ import {
   renderCsrfHiddenInput,
   verifyCsrfToken,
 } from "./csrf.ts";
+import { type ExposeState, readExposeState } from "./expose-state.ts";
 import {
   SETUP_EXPOSE_MODES,
   type SetupExposeMode,
@@ -208,12 +209,40 @@ export interface DerivedWizardState {
 export const FIRST_VAULT_SHORT: CuratedModuleShort = "vault";
 
 /**
+ * Map a live exposure layer (`expose-state.json`) onto the wizard's
+ * `setup_expose_mode`. The two enums overlap exactly on the layers the
+ * exposure file can carry: `ExposeLayer` is `tailnet | public`, both of
+ * which are valid `SetupExposeMode` values. (There's no `localhost`
+ * exposure layer — running nothing is the absence of a state file, which
+ * `readExposeState` reports as `undefined`, so a missing/unexposed hub
+ * never seeds and the wizard still asks.)
+ *
+ * Returns `undefined` when no exposure is live (or the reader throws on
+ * a malformed file — we swallow that and fall through to "still ask"
+ * rather than crashing the wizard GET).
+ */
+function exposeModeFromLiveState(read: () => ExposeState | undefined): SetupExposeMode | undefined {
+  let state: ExposeState | undefined;
+  try {
+    state = read();
+  } catch {
+    // A corrupt expose-state.json shouldn't brick the wizard. Treat it
+    // as "no live exposure" and let the operator answer the step.
+    return undefined;
+  }
+  if (!state) return undefined;
+  // `ExposeLayer` ⊆ `SetupExposeMode` ("tailnet" | "public").
+  return state.layer;
+}
+
+/**
  * Read DB + services.json to decide which step the wizard should render.
  * Idempotent — re-running after partial setup picks up where it left
  * off. Mostly read-only, with one specific write: on Render (or any
- * platform `detectAutoExposeMode` recognizes), the first call auto-
- * seeds `setup_expose_mode = "public"` so the wizard skips the expose
- * step. Subsequent calls find the setting present and are read-only.
+ * platform `detectAutoExposeMode` recognizes), OR when a live tailscale
+ * exposure (`expose-state.json`) is already up, the first call auto-
+ * seeds `setup_expose_mode` so the wizard skips the expose step.
+ * Subsequent calls find the setting present and are read-only.
  */
 export function deriveWizardState(deps: {
   db: Database;
@@ -224,6 +253,15 @@ export function deriveWizardState(deps: {
    * SetupWizardDeps.env.
    */
   env?: Record<string, string | undefined>;
+  /**
+   * Optional injected reader for the live exposure state
+   * (`~/.parachute/expose-state.json`). Defaults to the real
+   * `readExposeState`. Mirrors the `init.ts` seam (`readExposeStateFn`)
+   * so tests can drive the "a tailnet layer is already live" branch
+   * without writing a real state file. When `setup_expose_mode` is
+   * unset, the live exposure layer auto-seeds the setting (see below).
+   */
+  readExposeStateFn?: () => ExposeState | undefined;
 }): DerivedWizardState {
   const hasAdmin = userCount(deps.db) > 0;
   // The wizard's first-vault provisioning uses the curated `vault` short,
@@ -251,6 +289,23 @@ export function deriveWizardState(deps: {
     detectAutoExposeMode(deps.env ?? process.env) === "public"
   ) {
     setSetting(deps.db, "setup_expose_mode", "public");
+  }
+  // hub#406 team-onboarding bug: `setup_expose_mode` (the wizard's
+  // answer) and `expose-state.json` (the live tailscale exposure) are
+  // orthogonal axes. An operator who ran `parachute expose tailnet`
+  // before opening the wizard has a live tailnet layer but no
+  // `setup_expose_mode` setting — so the wizard re-asked "how will this
+  // hub be reached?" even though tailnet was already up. Auto-seed the
+  // setting from the live exposure layer (tailnet→"tailnet",
+  // public→"public") so the answered-by-action case is treated as
+  // satisfied, mirroring the Render/Fly auto-seed above. Reading the
+  // live state is injected for testability (defaults to the real
+  // reader); a malformed/missing file falls through to "still ask."
+  if (getSetting(deps.db, "setup_expose_mode") === undefined) {
+    const seeded = exposeModeFromLiveState(deps.readExposeStateFn ?? readExposeState);
+    if (seeded !== undefined) {
+      setSetting(deps.db, "setup_expose_mode", seeded);
+    }
   }
   const hasExposeMode = getSetting(deps.db, "setup_expose_mode") !== undefined;
   let step: WizardStep;
@@ -314,6 +369,14 @@ export interface SetupWizardDeps {
    * without mutating the real process env.
    */
   env?: Record<string, string | undefined>;
+  /**
+   * Test seam: inject the live-exposure reader `deriveWizardState`
+   * consults to auto-seed `setup_expose_mode` from a live
+   * `parachute expose tailnet|public` (hub#406). Production omits this
+   * and the real `readExposeState` is used. Mirrors `init.ts`'s
+   * `readExposeStateFn` seam.
+   */
+  readExposeStateFn?: () => ExposeState | undefined;
 }
 
 /**
