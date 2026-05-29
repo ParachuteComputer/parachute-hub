@@ -41,12 +41,14 @@ import {
   readHubPort,
 } from "../hub-control.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
-import { type AliveFn, defaultAlive } from "../process-state.ts";
+import { type AliveFn, defaultAlive, processState } from "../process-state.ts";
 import { readManifest } from "../services-manifest.ts";
 import { type Runner, defaultRunner } from "../tailscale/run.ts";
+import { persistVaultHubOrigin } from "../vault-hub-origin-env.ts";
 import type { VaultAuthStatus } from "../vault/auth-status.ts";
 import { WELL_KNOWN_DIR } from "../well-known.ts";
 import { printPublic2FAWarning } from "./expose-2fa-warning.ts";
+import { restart } from "./lifecycle.ts";
 
 const AUTH_DOC_URL =
   "https://github.com/ParachuteComputer/parachute-vault/blob/main/docs/auth-model.md";
@@ -328,6 +330,14 @@ export interface ExposeCloudflareOpts {
    * `<vaultHome>/config.yaml` from disk. (#186)
    */
   vaultAuthStatus?: VaultAuthStatus;
+  /**
+   * Restart a hub-dependent service so it re-reads the new public hub origin.
+   * Mirrors the Tailscale path's `restartService` seam (`expose.ts`). Defaults
+   * to lifecycle `restart`; tests inject a fake to assert the call without
+   * spawning a real daemon. Only invoked for vault (the only `iss`-validating
+   * service) and only when it's already running.
+   */
+  restartService?: (short: string) => Promise<number>;
 }
 
 interface Resolved {
@@ -353,6 +363,7 @@ interface Resolved {
   now: () => Date;
   vaultHome: string | undefined;
   vaultAuthStatus: VaultAuthStatus | undefined;
+  restartService: (short: string) => Promise<number>;
 }
 
 function resolve(opts: ExposeCloudflareOpts): Resolved {
@@ -395,6 +406,14 @@ function resolve(opts: ExposeCloudflareOpts): Resolved {
     now: opts.now ?? (() => new Date()),
     vaultHome: opts.vaultHome,
     vaultAuthStatus: opts.vaultAuthStatus,
+    restartService:
+      opts.restartService ??
+      ((short: string) =>
+        restart(short, {
+          manifestPath: opts.manifestPath,
+          configDir,
+          log: opts.log ?? (() => {}),
+        })),
   };
 }
 
@@ -699,6 +718,35 @@ export async function exposeCloudflareUp(
     hubOrigin,
   };
   writeExposeState(exposeState, r.exposeStatePath);
+
+  // Persist the public hub origin into vault's `.env` and restart vault — the
+  // durable half of the OAuth issuer-mismatch fix on Cloudflare deploys.
+  //
+  // The bug (vault 401s every hub token on a Cloudflare deploy): the Tailscale
+  // path gets this for free because it auto-restarts vault, and that restart
+  // flows the freshly-written expose-state `hubOrigin` into `vault/.env` via
+  // lifecycle's `persistVaultHubOrigin`. The Cloudflare path wrote expose-state
+  // but never touched vault's `.env` or restarted it, so the launchd / systemd
+  // daemon kept booting vault with NO `PARACHUTE_HUB_ORIGIN` → vault fell back
+  // to loopback as its expected issuer → every hub-minted token (whose `iss`
+  // is the public origin) failed the `iss` check → 401 → "You're not signed in
+  // to the hub." We mirror the Tailscale path here exactly.
+  //
+  // `persistVaultHubOrigin` writes the durable `.env` (skips loopback itself,
+  // so a `--hub-origin http://127.0.0.1` override never bakes a dead issuer in);
+  // the restart makes the running vault re-read it immediately rather than
+  // waiting for the next reboot.
+  persistVaultHubOrigin(r.configDir, hubOrigin, r.log);
+  if (processState("vault", r.configDir, r.alive).status === "running") {
+    r.log("");
+    r.log("Restarting vault to pick up new hub origin…");
+    const rcode = await r.restartService("vault");
+    if (rcode !== 0) {
+      r.log(
+        "⚠ vault restart failed. Run manually once the issue is resolved: parachute restart vault",
+      );
+    }
+  }
 
   const baseUrl = `https://${hostname}`;
   // A well-formed vault manifest always lists at least one mount path. If
