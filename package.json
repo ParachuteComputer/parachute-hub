@@ -1,7 +1,7 @@
 {
   "name": "@openparachute/hub",
-  "version": "0.5.14-rc.12",
-  "description": "parachute \u2014 the local hub for the Parachute ecosystem (discovery, ports, lifecycle, soon OAuth).",
+  "version": "0.5.14-rc.13",
+  "description": "parachute — the local hub for the Parachute ecosystem (discovery, ports, lifecycle, soon OAuth).",
   "license": "AGPL-3.0",
   "publishConfig": {
     "access": "public"
@@ -37,13 +37,16 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@types/qrcode": "^1.5.6"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.0.2",
-    "jose": "^6.2.2"
+    "jose": "^6.2.2",
+    "otpauth": "^9.5.0",
+    "qrcode": "^1.5.4"
   }
 }
