@@ -4,8 +4,9 @@
  * tests pin the load-bearing shape:
  *
  *   - Assigned-vault branch: Notes CTA href encodes the hub+vault URL,
- *     vault name shows in the body, hub origin appears as inline code
- *     in the custom-client disclosure.
+ *     vault name shows in the body, AND a per-tile MCP connect block
+ *     surfaces the endpoint + `claude mcp add` command (OAuth, no token)
+ *     with copy buttons — the multi-user friend-connect surface.
  *   - Admin (no assigned vault) branch: link to /admin/ visible.
  *   - Defensive third branch (non-admin + no vault): "ask the operator"
  *     copy renders.
@@ -13,7 +14,11 @@
  *     change-password link.
  */
 import { describe, expect, test } from "bun:test";
-import { renderAccountHome } from "../account-home-ui.ts";
+import {
+  accountClaudeMcpAddCommand,
+  accountMcpEndpoint,
+  renderAccountHome,
+} from "../account-home-ui.ts";
 
 const HUB_ORIGIN = "https://hub.example";
 const CSRF = "test-csrf-token";
@@ -38,9 +43,19 @@ describe("renderAccountHome", () => {
     expect(html).toContain(`https://notes.parachute.computer/add?url=${encodedVaultUrl}`);
     expect(html).toContain('target="_blank"');
     expect(html).toContain('rel="noopener"');
-    // Hub origin renders as inline <code> in the custom-client disclosure.
-    expect(html).toContain(`<code>${HUB_ORIGIN}</code>`);
-    expect(html).toContain("Use a custom client");
+    // The friend-connect surface: MCP endpoint + `claude mcp add` command,
+    // each with a copy button. OAuth path (no token in the command).
+    expect(html).toContain(`${HUB_ORIGIN}/vault/alice/mcp`);
+    expect(html).toContain(
+      `claude mcp add --transport http parachute-alice ${HUB_ORIGIN}/vault/alice/mcp`,
+    );
+    expect(html).toContain('data-testid="copy-mcp-endpoint"');
+    expect(html).toContain('data-testid="copy-mcp-add-command"');
+    // The connect command must NOT embed a token — the OAuth path needs none.
+    expect(html).not.toContain("--header");
+    expect(html).not.toContain("Authorization: Bearer");
+    // Copy-button progressive-enhancement script is present.
+    expect(html).toContain("navigator.clipboard");
   });
 
   test("assigned-vault branch — trailing slash on hubOrigin is normalized", () => {
@@ -57,9 +72,10 @@ describe("renderAccountHome", () => {
     });
     const cleanEncoded = encodeURIComponent(`${HUB_ORIGIN}/vault/alice`);
     expect(html).toContain(`https://notes.parachute.computer/add?url=${cleanEncoded}`);
-    // The inline-code display also drops the trailing slash.
-    expect(html).toContain(`<code>${HUB_ORIGIN}</code>`);
-    expect(html).not.toContain(`<code>${HUB_ORIGIN}/</code>`);
+    // The MCP endpoint + connect command also drop the trailing slash — no
+    // `//vault` double-slash sneaks in.
+    expect(html).toContain(`${HUB_ORIGIN}/vault/alice/mcp`);
+    expect(html).not.toContain(`${HUB_ORIGIN}//vault`);
   });
 
   test("admin branch — null assignedVault + isFirstAdmin renders an /admin/ link", () => {
@@ -139,8 +155,28 @@ describe("renderAccountHome", () => {
     const familyEncoded = encodeURIComponent(`${HUB_ORIGIN}/vault/family`);
     expect(html).toContain(`https://notes.parachute.computer/add?url=${personalEncoded}`);
     expect(html).toContain(`https://notes.parachute.computer/add?url=${familyEncoded}`);
-    // Hub origin block appears once at the section level, not per tile.
-    expect(html.split(`<code>${HUB_ORIGIN}</code>`).length - 1).toBe(1);
+    // One per-vault MCP connect block per tile (endpoint + command).
+    expect(html).toContain(`${HUB_ORIGIN}/vault/personal/mcp`);
+    expect(html).toContain(`${HUB_ORIGIN}/vault/family/mcp`);
+    expect(html).toContain(
+      `claude mcp add --transport http parachute-personal ${HUB_ORIGIN}/vault/personal/mcp`,
+    );
+    expect(html).toContain(
+      `claude mcp add --transport http parachute-family ${HUB_ORIGIN}/vault/family/mcp`,
+    );
+    // Two tiles → two copy-endpoint buttons.
+    expect(html.split('data-testid="copy-mcp-endpoint"').length - 1).toBe(2);
+    // The copy script is emitted once at the section level, not per-tile.
+    expect(html.split("<script>").length - 1).toBe(1);
+  });
+
+  test("accountMcpEndpoint / accountClaudeMcpAddCommand build the canonical shapes", () => {
+    expect(accountMcpEndpoint("https://hub.example", "work")).toBe(
+      "https://hub.example/vault/work/mcp",
+    );
+    expect(accountClaudeMcpAddCommand("https://hub.example", "work")).toBe(
+      "claude mcp add --transport http parachute-work https://hub.example/vault/work/mcp",
+    );
   });
 
   test("escapes hostile content in username and vault name", () => {
@@ -149,15 +185,21 @@ describe("renderAccountHome", () => {
     // the renderer is a pure function over arbitrary string input and the
     // escape is load-bearing if the validator ever loosens.
     const html = renderAccountHome({
-      username: "<script>",
+      username: "<script>alert(1)</script>",
       assignedVaults: ["<vault>"],
       passwordChanged: true,
       hubOrigin: HUB_ORIGIN,
       isFirstAdmin: false,
       csrfToken: CSRF,
     });
-    expect(html).not.toContain("<script>");
-    expect(html).toContain("&lt;script&gt;");
+    // The injected username/vault metacharacters are escaped — the only
+    // `<script>` tag in the output is the page's own copy-button helper, so
+    // we assert on the injected payload specifically rather than a blanket
+    // "no <script>" (the connect block legitimately emits one).
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
     expect(html).toContain("&lt;vault&gt;");
+    // The escaped vault name also flows into the connect command + endpoint.
+    expect(html).toContain("parachute-&lt;vault&gt;");
   });
 });
