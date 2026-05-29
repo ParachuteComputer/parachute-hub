@@ -34,7 +34,7 @@ import {
   shortNameForManifest,
 } from "../service-spec.ts";
 import { type ServiceEntry, readManifest } from "../services-manifest.ts";
-import { persistVaultHubOrigin } from "../vault-hub-origin-env.ts";
+import { persistVaultHubOrigin, selfHealVaultHubOrigin } from "../vault-hub-origin-env.ts";
 
 /**
  * Tiny seam over `Bun.spawn` for lifecycle tests. The real spawner opens the
@@ -657,28 +657,42 @@ export async function start(svc: string | undefined, opts: LifecycleOpts = {}): 
           `  It may still be coming up — check \`parachute status\` and \`parachute logs ${short}\`.`,
         );
         if (r.hubOrigin) r.log(`  ${HUB_ORIGIN_ENV}=${r.hubOrigin}`);
-        if (short === "vault" && r.hubOrigin) {
-          persistVaultHubOrigin(r.configDir, r.hubOrigin, r.log);
-        }
+        if (short === "vault") persistVaultHubOriginForStart(r);
         continue;
       }
     }
 
     r.log(`✓ ${short} started (pid ${pid}); logs: ${logFile}`);
     if (r.hubOrigin) r.log(`  ${HUB_ORIGIN_ENV}=${r.hubOrigin}`);
-    // Persist the resolved public origin to vault's `.env` so the launchd /
-    // systemd daemon (which boots vault out-of-band on reboot / crash-restart
-    // and never sees this spawn env) validates hub-minted JWTs' `iss` against
-    // the public origin. The spawn-env injection above is ephemeral; this is
-    // the durable half of the OAuth issuer-mismatch fix. Vault is the only
-    // hub-origin-dependent service with an OS-supervised autostart daemon
-    // today — scribe/notes don't validate `iss`. See
-    // `vault-hub-origin-env.ts:persistVaultHubOrigin`.
-    if (short === "vault" && r.hubOrigin) {
-      persistVaultHubOrigin(r.configDir, r.hubOrigin, r.log);
-    }
+    if (short === "vault") persistVaultHubOriginForStart(r);
   }
   return failures === 0 ? 0 : 1;
+}
+
+/**
+ * Durable-persist vault's `PARACHUTE_HUB_ORIGIN` on a vault `start`. Two cases,
+ * in order:
+ *
+ *  1. The resolved spawn origin (`r.hubOrigin`) is a real public origin — write
+ *     it. This is the long-standing happy path: an exposure is live, the
+ *     launchd / systemd daemon (which boots vault out-of-band and never sees
+ *     this spawn env) needs it in `.env` to validate hub-minted JWTs' `iss`.
+ *     `persistVaultHubOrigin` skips loopback / unchanged values itself.
+ *
+ *  2. Self-heal: even when `r.hubOrigin` resolved to loopback or undefined
+ *     (e.g. the hub.port file outran the expose-state read, or this is a bare
+ *     `restart vault` on a deploy whose `.env` was never written), consult
+ *     `expose-state.json` directly. If it advertises a public origin and
+ *     vault's persisted value is unset / loopback, write the public origin.
+ *     This is what lets an EXISTING broken Cloudflare deploy self-correct on
+ *     the next `parachute restart vault`, not only fresh exposes.
+ *
+ * Case 1 covers the override / freshly-resolved path; case 2 catches the gap
+ * the Cloudflare 401 P0 fell through. See `vault-hub-origin-env.ts`.
+ */
+function persistVaultHubOriginForStart(r: Resolved): void {
+  if (r.hubOrigin) persistVaultHubOrigin(r.configDir, r.hubOrigin, r.log);
+  selfHealVaultHubOrigin(r.configDir, r.log, join(r.configDir, "expose-state.json"));
 }
 
 export async function stop(svc: string | undefined, opts: LifecycleOpts = {}): Promise<number> {

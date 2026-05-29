@@ -10,10 +10,14 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readEnvFileValues } from "../env-file.ts";
+import type { ExposeState } from "../expose-state.ts";
+import { writeExposeState } from "../expose-state.ts";
 import {
   clearVaultHubOrigin,
   isLoopbackOrigin,
   persistVaultHubOrigin,
+  publicOriginFromExposeState,
+  selfHealVaultHubOrigin,
 } from "../vault-hub-origin-env.ts";
 
 let dir: string;
@@ -124,3 +128,136 @@ function mkVaultDir(): string {
   mkdirSync(join(dir, "vault"), { recursive: true });
   return vaultEnv();
 }
+
+function exposeStatePath(): string {
+  return join(dir, "expose-state.json");
+}
+
+/** Cloudflare-shaped expose state (subdomain mode, single hub-catchall entry). */
+function cloudflareState(overrides: Partial<ExposeState> = {}): ExposeState {
+  return {
+    version: 1,
+    layer: "public",
+    mode: "subdomain",
+    canonicalFqdn: "gitcoin-parachute.unforced.dev",
+    port: 1939,
+    funnel: false,
+    entries: [{ kind: "proxy", mount: "/", target: "http://localhost:1939", service: "hub" }],
+    hubOrigin: "https://gitcoin-parachute.unforced.dev",
+    ...overrides,
+  };
+}
+
+/** Tailnet-shaped expose state (path mode). */
+function tailnetState(overrides: Partial<ExposeState> = {}): ExposeState {
+  return {
+    version: 1,
+    layer: "tailnet",
+    mode: "path",
+    canonicalFqdn: "parachute-aaron.tailc75afc.ts.net",
+    port: 1939,
+    funnel: false,
+    entries: [{ kind: "proxy", mount: "/", target: "http://localhost:1939", service: "hub" }],
+    hubOrigin: "https://parachute-aaron.tailc75afc.ts.net",
+    ...overrides,
+  };
+}
+
+describe("publicOriginFromExposeState", () => {
+  test("undefined when no expose-state file exists", () => {
+    expect(publicOriginFromExposeState(exposeStatePath())).toBeUndefined();
+  });
+
+  test("returns the cloudflare hubOrigin", () => {
+    writeExposeState(cloudflareState(), exposeStatePath());
+    expect(publicOriginFromExposeState(exposeStatePath())).toBe(
+      "https://gitcoin-parachute.unforced.dev",
+    );
+  });
+
+  test("returns the tailnet hubOrigin", () => {
+    writeExposeState(tailnetState(), exposeStatePath());
+    expect(publicOriginFromExposeState(exposeStatePath())).toBe(
+      "https://parachute-aaron.tailc75afc.ts.net",
+    );
+  });
+
+  test("synthesizes https://<canonicalFqdn> when hubOrigin is absent (pre-Phase-0 state)", () => {
+    // hubOrigin is optional on older state files; canonicalFqdn is mandatory.
+    const { hubOrigin, ...rest } = cloudflareState();
+    void hubOrigin;
+    writeExposeState(rest as ExposeState, exposeStatePath());
+    expect(publicOriginFromExposeState(exposeStatePath())).toBe(
+      "https://gitcoin-parachute.unforced.dev",
+    );
+  });
+});
+
+describe("selfHealVaultHubOrigin (Cloudflare 401 self-heal)", () => {
+  test("writes the cloudflare public origin when vault/.env is UNSET", () => {
+    // The exact broken-deploy shape: expose-state carries a public cloudflare
+    // hubOrigin but vault/.env has no PARACHUTE_HUB_ORIGIN, so the daemon falls
+    // back to loopback and 401s every hub token. Restart self-corrects it.
+    writeExposeState(cloudflareState(), exposeStatePath());
+    const wrote = selfHealVaultHubOrigin(dir, () => {}, exposeStatePath());
+    expect(wrote).toBe(true);
+    expect(readEnvFileValues(vaultEnv()).PARACHUTE_HUB_ORIGIN).toBe(
+      "https://gitcoin-parachute.unforced.dev",
+    );
+  });
+
+  test("overwrites a LOOPBACK value already persisted in vault/.env", () => {
+    writeExposeState(cloudflareState(), exposeStatePath());
+    writeFileSync(mkVaultDir(), "PARACHUTE_HUB_ORIGIN=http://127.0.0.1:1939\n");
+    const wrote = selfHealVaultHubOrigin(dir, () => {}, exposeStatePath());
+    expect(wrote).toBe(true);
+    expect(readEnvFileValues(vaultEnv()).PARACHUTE_HUB_ORIGIN).toBe(
+      "https://gitcoin-parachute.unforced.dev",
+    );
+  });
+
+  test("tailnet shape still self-heals (no regression)", () => {
+    writeExposeState(tailnetState(), exposeStatePath());
+    const wrote = selfHealVaultHubOrigin(dir, () => {}, exposeStatePath());
+    expect(wrote).toBe(true);
+    expect(readEnvFileValues(vaultEnv()).PARACHUTE_HUB_ORIGIN).toBe(
+      "https://parachute-aaron.tailc75afc.ts.net",
+    );
+  });
+
+  test("does NOT persist when there's no exposure (genuine loopback / local dev)", () => {
+    // No expose-state file → no public origin → vault keeps its loopback
+    // default. Persisting loopback would shadow a later exposure.
+    const wrote = selfHealVaultHubOrigin(dir, () => {}, exposeStatePath());
+    expect(wrote).toBe(false);
+    expect(existsSync(vaultEnv())).toBe(false);
+  });
+
+  test("leaves a DIFFERENT non-loopback value alone (deliberate --hub-origin override)", () => {
+    writeExposeState(cloudflareState(), exposeStatePath());
+    writeFileSync(mkVaultDir(), "PARACHUTE_HUB_ORIGIN=https://custom.example.com\n");
+    const wrote = selfHealVaultHubOrigin(dir, () => {}, exposeStatePath());
+    expect(wrote).toBe(false);
+    // Untouched — self-heal only fixes unset/loopback, never clobbers a public
+    // value an operator may have set on purpose.
+    expect(readEnvFileValues(vaultEnv()).PARACHUTE_HUB_ORIGIN).toBe("https://custom.example.com");
+  });
+
+  test("no-op (no double-write) when the persisted value already equals the public origin", () => {
+    writeExposeState(cloudflareState(), exposeStatePath());
+    writeFileSync(mkVaultDir(), "PARACHUTE_HUB_ORIGIN=https://gitcoin-parachute.unforced.dev\n");
+    const wrote = selfHealVaultHubOrigin(dir, () => {}, exposeStatePath());
+    expect(wrote).toBe(false);
+  });
+
+  test("expose-state with a loopback hubOrigin is treated as no public exposure", () => {
+    // A loopback hubOrigin (local-dev hub) must never be persisted — it would
+    // recreate the iss mismatch on the daemon boot path.
+    writeExposeState(cloudflareState({ hubOrigin: "http://127.0.0.1:1939" }), exposeStatePath());
+    // canonicalFqdn is still public here, but hubOrigin wins — we honor the
+    // explicit value the writer chose.
+    const wrote = selfHealVaultHubOrigin(dir, () => {}, exposeStatePath());
+    expect(wrote).toBe(false);
+    expect(existsSync(vaultEnv())).toBe(false);
+  });
+});
