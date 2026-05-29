@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { init, looksLikeServer, resolveAdminUrl } from "../commands/init.ts";
+import { hasNoDisplay, init, looksLikeServer, resolveAdminUrl } from "../commands/init.ts";
 import type { ExposeState } from "../expose-state.ts";
 import { writeHubPort } from "../hub-control.ts";
 import { writePid } from "../process-state.ts";
@@ -345,6 +345,76 @@ describe("init", () => {
     }
   });
 
+  test("linux SSH (no display): prints the link, does NOT spawn a browser (Fix 2)", async () => {
+    // A TTY isn't enough — an SSH session is a TTY with no display, so
+    // `xdg-open` fails/blocks. Aaron hit this on EC2: init tried to open a
+    // browser and failed with "Couldn't launch a browser." We now skip the
+    // spawn on a server-shaped box and just print the URL.
+    const h = makeHarness();
+    try {
+      writeHubPort(1939, h.configDir);
+      const opened: string[] = [];
+      const logs: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => false,
+        ensureHub: async () => ({ pid: 7, port: 1939, started: true }),
+        readExposeStateFn: () => undefined,
+        isTty: true,
+        platform: "linux",
+        env: { SSH_CONNECTION: "1.2.3.4 22 5.6.7.8 22" },
+        // Pre-pick the browser wizard so a real desktop would spawn — proves
+        // the display guard (not the prompt) is what suppresses the spawn.
+        wizardChoice: "browser",
+        prompt: async () => "y",
+        openBrowser: (url) => {
+          opened.push(url);
+          return true;
+        },
+        noExposePrompt: true,
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      expect(opened).toEqual([]); // never spawned
+      expect(logs.join("\n")).toContain("No display detected");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("linux WITH a display still spawns the browser (desktop unchanged)", async () => {
+    const h = makeHarness();
+    try {
+      writeHubPort(1939, h.configDir);
+      const opened: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        ensureHub: async () => ({ pid: 7, port: 1939, started: true }),
+        readExposeStateFn: () => undefined,
+        isTty: true,
+        platform: "linux",
+        env: { DISPLAY: ":0" },
+        wizardChoice: "browser",
+        prompt: async () => "y",
+        openBrowser: (url) => {
+          opened.push(url);
+          return true;
+        },
+        noExposePrompt: true,
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      expect(opened).toEqual(["http://127.0.0.1:1939/admin/"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("ensureHub failure exits 1 with an actionable hint", async () => {
     const h = makeHarness();
     try {
@@ -395,6 +465,37 @@ describe("looksLikeServer heuristic", () => {
 
   test("Windows is not a server (init doesn't auto-pick on win32 anyway)", () => {
     expect(looksLikeServer("win32", {})).toBe(false);
+  });
+});
+
+describe("hasNoDisplay heuristic (Fix 2 — headless browser-open guard)", () => {
+  test("macOS / Windows always have a display", () => {
+    expect(hasNoDisplay("darwin", {})).toBe(false);
+    expect(hasNoDisplay("darwin", { SSH_CONNECTION: "1.2.3.4 22 5.6.7.8 22" })).toBe(false);
+    expect(hasNoDisplay("win32", {})).toBe(false);
+  });
+
+  test("linux SSH session (a TTY, but no display) → no display", () => {
+    expect(hasNoDisplay("linux", { SSH_CONNECTION: "1.2.3.4 22 5.6.7.8 22" })).toBe(true);
+    expect(hasNoDisplay("linux", { SSH_TTY: "/dev/pts/0" })).toBe(true);
+  });
+
+  test("linux headless console (no SSH, no DISPLAY) → no display", () => {
+    expect(hasNoDisplay("linux", {})).toBe(true);
+  });
+
+  test("linux desktop with DISPLAY / WAYLAND_DISPLAY → has a display", () => {
+    expect(hasNoDisplay("linux", { DISPLAY: ":0" })).toBe(false);
+    expect(hasNoDisplay("linux", { WAYLAND_DISPLAY: "wayland-0" })).toBe(false);
+  });
+
+  test("WSL (linux + DISPLAY-less but a dev laptop) is treated as having a display via looksLikeServer exclusion", () => {
+    // WSL with no DISPLAY would otherwise look headless; looksLikeServer
+    // excludes it, but the bare no-DISPLAY fallback still trips. This documents
+    // that a WSL user without an X server set won't auto-spawn — acceptable,
+    // since xdg-open would fail there anyway. WSL WITH an X server (DISPLAY set)
+    // correctly resolves to has-a-display.
+    expect(hasNoDisplay("linux", { WSL_DISTRO_NAME: "Ubuntu", DISPLAY: ":0" })).toBe(false);
   });
 });
 

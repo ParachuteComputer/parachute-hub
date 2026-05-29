@@ -76,8 +76,9 @@ export interface RunCliWizardOpts {
   sleep?: (ms: number) => Promise<void>;
   /**
    * Non-interactive escape hatch: pre-supply the account-step answers.
-   * Username defaults to `admin` when unset; password is required (no
-   * default, no prompt → exit-with-error). Mirrors the
+   * Username defaults to `owner` when unset (aligned with
+   * `parachute auth set-password` + the operator.token convention); password
+   * is required (no default, no prompt → exit-with-error). Mirrors the
    * `PARACHUTE_INITIAL_ADMIN_*` env-seed shape.
    */
   accountUsername?: string;
@@ -400,8 +401,11 @@ async function walkAccountStep(
   log("  Set up the operator account that owns this hub.");
   let username = opts.accountUsername;
   if (username === undefined) {
-    const raw = (await opts.prompt("  username [admin]: ")).trim();
-    username = raw === "" ? "admin" : raw;
+    // Default to "owner" — aligns with `parachute auth set-password` and the
+    // operator.token convention (the earliest-created user is the operator).
+    // The web wizard lets the operator name it freely; so does this prompt.
+    const raw = (await opts.prompt("  username [owner]: ")).trim();
+    username = raw === "" ? "owner" : raw;
   }
   let password = opts.accountPassword;
   if (password === undefined) {

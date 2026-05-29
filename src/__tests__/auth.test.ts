@@ -65,34 +65,26 @@ async function captureOutput(fn: () => Promise<number> | number): Promise<{
 }
 
 describe("parachute auth", () => {
-  test("2fa enroll forwards to parachute-vault 2fa enroll", async () => {
+  test("2fa is an honest hub-side stub — never forwards to parachute-vault", async () => {
+    // 2fa used to forward to the deprecated `parachute-vault 2fa` stub, which
+    // exits 1 post auth-unification and only wrote vault YAML that never gated
+    // hub /login. It's now an informational stub: exit 0, no subprocess.
     const { runner, calls } = makeRunner(0);
-    const code = await auth(["2fa", "enroll"], runner);
-    expect(code).toBe(0);
-    expect(calls).toEqual([["parachute-vault", "2fa", "enroll"]]);
+    const out = await captureOutput(() => auth(["2fa", "enroll"], runner));
+    expect(out.code).toBe(0);
+    expect(calls).toEqual([]); // did NOT spawn parachute-vault
+    expect(out.stdout).toContain("isn't available yet");
+    expect(out.stdout).toContain("#473");
+    // Doesn't tell the operator to run the dead vault command.
+    expect(out.stdout).not.toContain("2fa enroll");
   });
 
-  test("2fa enroll --some-flag forwards every arg after the subcommand", async () => {
+  test("2fa with any sub-args still resolves to the honest stub (exit 0, no spawn)", async () => {
     const { runner, calls } = makeRunner(0);
-    const code = await auth(["2fa", "enroll", "--some-flag", "value"], runner);
-    expect(code).toBe(0);
-    expect(calls).toEqual([["parachute-vault", "2fa", "enroll", "--some-flag", "value"]]);
-  });
-
-  test("exit code from parachute-vault is propagated", async () => {
-    const { runner } = makeRunner(3);
-    const code = await auth(["2fa", "status"], runner);
-    expect(code).toBe(3);
-  });
-
-  test("ENOENT on a vault-forwarded subcommand surfaces install hint and exit 127", async () => {
-    const runner: Runner = {
-      async run() {
-        throw new Error("ENOENT: spawn parachute-vault");
-      },
-    };
-    const code = await auth(["2fa", "status"], runner);
-    expect(code).toBe(127);
+    const out = await captureOutput(() => auth(["2fa", "status", "--whatever"], runner));
+    expect(out.code).toBe(0);
+    expect(calls).toEqual([]);
+    expect(out.stdout).toContain("#473");
   });
 
   test("set-password no longer forwards to vault", async () => {
@@ -142,21 +134,22 @@ describe("authHelp", () => {
   test("lists every blessed subcommand", () => {
     expect(h).toContain("parachute auth set-password");
     expect(h).toContain("parachute auth list-users");
-    expect(h).toContain("parachute auth 2fa status");
-    expect(h).toContain("parachute auth 2fa enroll");
-    expect(h).toContain("parachute auth 2fa disable");
-    expect(h).toContain("parachute auth 2fa backup-codes");
+    expect(h).toContain("parachute auth 2fa");
     expect(h).toContain("parachute auth rotate-key");
+  });
+
+  test("2fa help is honest about hub-login TOTP not being shipped (#473)", () => {
+    expect(h).toContain("#473");
+    // No longer advertises the dead enroll/disable/backup-codes subcommands.
+    expect(h).not.toContain("2fa enroll");
+    expect(h).not.toContain("2fa disable");
+    expect(h).not.toContain("2fa backup-codes");
   });
 
   test("set-password help mentions the new flags + hub-local home", () => {
     expect(h).toContain("--username");
     expect(h).toContain("--allow-multi");
     expect(h).toContain("hub.db");
-  });
-
-  test("mentions the vault-install hint", () => {
-    expect(h).toContain("parachute install vault");
   });
 
   test("rotate-key explains the 24h JWKS retention", () => {

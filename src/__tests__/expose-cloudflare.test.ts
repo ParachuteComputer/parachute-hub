@@ -14,6 +14,7 @@ import {
   exposeCloudflareOff,
   exposeCloudflareUp,
 } from "../commands/expose-cloudflare.ts";
+import { readExposeState } from "../expose-state.ts";
 import { writeHubPort } from "../hub-control.ts";
 import type { CommandResult, Runner } from "../tailscale/run.ts";
 
@@ -25,6 +26,7 @@ interface TestEnv {
   configDir: string;
   manifestPath: string;
   statePath: string;
+  exposeStatePath: string;
   configPath: string;
   logPath: string;
   cloudflaredHome: string;
@@ -40,6 +42,7 @@ function makeEnv(opts: { includeVault?: boolean; loggedIn?: boolean } = {}): Tes
   const cloudflaredHome = join(dir, "cloudflared");
   const manifestPath = join(configDir, "services.json");
   const statePath = join(configDir, "cloudflared-state.json");
+  const exposeStatePath = join(configDir, "expose-state.json");
   const configPath = join(configDir, "cloudflared", "parachute", "config.yml");
   const logPath = join(configDir, "cloudflared", "parachute", "cloudflared.log");
 
@@ -72,6 +75,7 @@ function makeEnv(opts: { includeVault?: boolean; loggedIn?: boolean } = {}): Tes
     configDir,
     manifestPath,
     statePath,
+    exposeStatePath,
     configPath,
     logPath,
     cloudflaredHome,
@@ -135,6 +139,7 @@ describe("exposeCloudflareUp", () => {
         log: (l) => logs.push(l),
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
@@ -204,6 +209,70 @@ describe("exposeCloudflareUp", () => {
     }
   });
 
+  test("persists expose-state.json with the canonicalFqdn + public hubOrigin (Fix 1)", async () => {
+    // The OAuth-iss bug: pre-fix the cloudflare path never wrote
+    // expose-state.json, so `readExposeState()` returned undefined and
+    // downstream consumers (init's resolveAdminUrl, lifecycle's
+    // resolveHubOrigin, the vault .env PARACHUTE_HUB_ORIGIN persistence)
+    // fell back to loopback — wrong OAuth `iss` on Cloudflare deploys.
+    const env = makeEnv();
+    try {
+      const uuid = "eeeeeeee-0000-0000-0000-000000000005";
+      const { runner } = queueRunner([
+        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+        { code: 0, stdout: "[]", stderr: "" },
+        {
+          code: 0,
+          stdout: `Tunnel credentials written to ${env.cloudflaredHome}/${uuid}.json.\nCreated tunnel parachute with id ${uuid}\n`,
+          stderr: "",
+        },
+        { code: 0, stdout: "", stderr: "" },
+      ]);
+      const { spawner } = fakeSpawner(42200);
+
+      // Pre-condition: no expose-state.json yet.
+      expect(readExposeState(env.exposeStatePath)).toBeUndefined();
+
+      const code = await exposeCloudflareUp("gitcoin.parachute.computer", {
+        runner,
+        spawner,
+        alive: () => false,
+        kill: () => {},
+        log: () => {},
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
+      });
+
+      expect(code).toBe(0);
+      const exposeState = readExposeState(env.exposeStatePath);
+      expect(exposeState).toBeDefined();
+      expect(exposeState?.layer).toBe("public");
+      expect(exposeState?.mode).toBe("subdomain");
+      expect(exposeState?.canonicalFqdn).toBe("gitcoin.parachute.computer");
+      expect(exposeState?.funnel).toBe(false);
+      expect(exposeState?.port).toBe(TEST_HUB_PORT);
+      // The public origin OAuth clients will see — the load-bearing field.
+      expect(exposeState?.hubOrigin).toBe("https://gitcoin.parachute.computer");
+      // Single hub-catchall proxy entry (matches the Tailscale path's shape).
+      expect(exposeState?.entries).toEqual([
+        {
+          kind: "proxy",
+          mount: "/",
+          target: `http://localhost:${TEST_HUB_PORT}`,
+          service: "hub",
+        },
+      ]);
+    } finally {
+      env.cleanup();
+    }
+  });
+
   test("reuses existing tunnel when name already present", async () => {
     const env = makeEnv();
     try {
@@ -228,6 +297,7 @@ describe("exposeCloudflareUp", () => {
         log: (l) => logs.push(l),
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
@@ -257,6 +327,7 @@ describe("exposeCloudflareUp", () => {
         log: (l) => logs.push(l),
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
@@ -285,6 +356,7 @@ describe("exposeCloudflareUp", () => {
         log: (l) => logs.push(l),
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
@@ -316,6 +388,7 @@ describe("exposeCloudflareUp", () => {
         log: (l) => logs.push(l),
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
@@ -344,6 +417,7 @@ describe("exposeCloudflareUp", () => {
         log: (l) => logs.push(l),
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
@@ -371,6 +445,7 @@ describe("exposeCloudflareUp", () => {
         log: (l) => logs.push(l),
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
@@ -407,6 +482,7 @@ describe("exposeCloudflareUp", () => {
         log: (l) => logs.push(l),
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
@@ -458,6 +534,7 @@ describe("exposeCloudflareUp", () => {
         log: () => {},
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         configPath: env.configPath,
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
@@ -499,6 +576,7 @@ describe("exposeCloudflareUp", () => {
         log: () => {},
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
@@ -529,6 +607,7 @@ describe("exposeCloudflareUp", () => {
         log: () => {},
         manifestPath: env.manifestPath,
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
@@ -586,6 +665,7 @@ describe("exposeCloudflareUp", () => {
           log: (l) => logs.push(l),
           manifestPath: env.manifestPath,
           statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
           configPath: env.configPath,
           logPath: env.logPath,
           cloudflaredHome: env.cloudflaredHome,
@@ -603,15 +683,18 @@ describe("exposeCloudflareUp", () => {
 
         expect(code).toBe(0);
         const joined = logs.join("\n");
-        expect(joined).toContain("2FA is not enrolled");
+        // Honest copy: /login is public, owner password is the wall, hub-login
+        // 2FA is coming (#473) — does NOT recommend the dead `2fa enroll`.
+        expect(joined).toContain("/login is now reachable on the public internet");
         expect(joined).toContain("https://vault.example.com/login");
-        expect(joined).toContain("parachute auth 2fa enroll");
+        expect(joined).toContain("#473");
+        expect(joined).not.toContain("parachute auth 2fa enroll");
       } finally {
         env.cleanup();
       }
     });
 
-    test("enrolled → warning suppressed (no '2FA is not enrolled' line)", async () => {
+    test("enrolled → warning suppressed (no public-/login warning line)", async () => {
       const env = makeEnv();
       try {
         const uuid = "dddddddd-0000-0000-0000-000000000004";
@@ -636,6 +719,7 @@ describe("exposeCloudflareUp", () => {
           log: (l) => logs.push(l),
           manifestPath: env.manifestPath,
           statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
           configPath: env.configPath,
           logPath: env.logPath,
           cloudflaredHome: env.cloudflaredHome,
@@ -651,11 +735,12 @@ describe("exposeCloudflareUp", () => {
 
         expect(code).toBe(0);
         const joined = logs.join("\n");
-        expect(joined).not.toContain("2FA is not enrolled");
-        // The existing `printAuthGuidance` 2FA-recommend bullet is unrelated
-        // to the new contextual warning and stays in place — assert it on a
-        // shape that doesn't collide with the warning text.
-        expect(joined).toContain("(recommended) TOTP + backup codes");
+        expect(joined).not.toContain("/login is now reachable on the public internet");
+        // The contextual 2FA warning is suppressed (legacy vault TOTP present);
+        // the always-shown owner-password guidance from `printAuthGuidance`
+        // still appears, and it no longer recommends the dead `2fa enroll`.
+        expect(joined).toContain("parachute auth set-password");
+        expect(joined).not.toContain("parachute auth 2fa enroll");
       } finally {
         env.cleanup();
       }
@@ -698,6 +783,7 @@ describe("exposeCloudflareUp", () => {
           log: (l) => logs.push(l),
           manifestPath: env.manifestPath,
           statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
           configPath: env.configPath,
           logPath: env.logPath,
           cloudflaredHome: env.cloudflaredHome,
@@ -732,6 +818,7 @@ describe("exposeCloudflareOff", () => {
       const logs: string[] = [];
       const code = await exposeCloudflareOff({
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
@@ -741,7 +828,7 @@ describe("exposeCloudflareOff", () => {
     }
   });
 
-  test("SIGTERMs the process and clears state", async () => {
+  test("SIGTERMs the process and clears state (incl. expose-state.json — Fix 1)", async () => {
     const env = makeEnv();
     try {
       writeCloudflaredState(
@@ -760,10 +847,36 @@ describe("exposeCloudflareOff", () => {
         },
         env.statePath,
       );
+      // Seed the shared expose-state.json the up-path would have written, so we
+      // can assert teardown clears it (downstream consumers stop resolving the
+      // now-dead public URL).
+      writeFileSync(
+        env.exposeStatePath,
+        `${JSON.stringify({
+          version: 1,
+          layer: "public",
+          mode: "subdomain",
+          canonicalFqdn: "vault.example.com",
+          port: TEST_HUB_PORT,
+          funnel: false,
+          entries: [
+            {
+              kind: "proxy",
+              mount: "/",
+              target: `http://localhost:${TEST_HUB_PORT}`,
+              service: "hub",
+            },
+          ],
+          hubOrigin: "https://vault.example.com",
+        })}\n`,
+      );
+      expect(readExposeState(env.exposeStatePath)).toBeDefined();
+
       const killed: number[] = [];
       const logs: string[] = [];
       const code = await exposeCloudflareOff({
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         alive: () => true,
         kill: (pid) => killed.push(pid),
         log: (l) => logs.push(l),
@@ -771,6 +884,9 @@ describe("exposeCloudflareOff", () => {
       expect(code).toBe(0);
       expect(killed).toEqual([55555]);
       expect(existsSync(env.statePath)).toBe(false);
+      // Fix 1: the shared expose-state.json is cleared on the last tunnel down.
+      expect(existsSync(env.exposeStatePath)).toBe(false);
+      expect(readExposeState(env.exposeStatePath)).toBeUndefined();
       // Reassures the user that the tunnel definition isn't lost.
       expect(logs.join("\n")).toContain("remains defined in Cloudflare");
     } finally {
@@ -800,6 +916,7 @@ describe("exposeCloudflareOff", () => {
       const killed: number[] = [];
       const code = await exposeCloudflareOff({
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         alive: () => false,
         kill: (pid) => killed.push(pid),
         log: () => {},
@@ -839,6 +956,7 @@ describe("exposeCloudflareOff", () => {
       const killed: number[] = [];
       const code = await exposeCloudflareOff({
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         alive: () => true,
         kill: (pid) => killed.push(pid),
         log: () => {},
@@ -873,6 +991,7 @@ describe("exposeCloudflareOff", () => {
       const logs: string[] = [];
       const code = await exposeCloudflareOff({
         statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
         alive: () => true,
         kill: () => {},
         log: (l) => logs.push(l),

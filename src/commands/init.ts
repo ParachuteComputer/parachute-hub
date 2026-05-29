@@ -181,6 +181,26 @@ export function looksLikeServer(platform: NodeJS.Platform, env: NodeJS.ProcessEn
 }
 
 /**
+ * Heuristic: would a browser-spawn fail because there's no display?
+ *
+ * A TTY guard alone is insufficient — an SSH session is a TTY with no display,
+ * so `xdg-open` fails (or blocks). We treat a box as display-less when:
+ *   - it's a server per {@link looksLikeServer} (linux + SSH or no X/Wayland,
+ *     excluding WSL which is a dev laptop), OR
+ *   - it's linux with neither $DISPLAY nor $WAYLAND_DISPLAY (covers a local
+ *     headless linux console that isn't over SSH).
+ *
+ * macOS / Windows always have a window server, so they're never display-less
+ * here (someone SSH'd into a Mac is a rare enough edge that we keep the happy
+ * path — `open` no-ops gracefully there anyway).
+ */
+export function hasNoDisplay(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): boolean {
+  if (platform !== "linux") return false;
+  if (looksLikeServer(platform, env)) return true;
+  return !env.DISPLAY && !env.WAYLAND_DISPLAY;
+}
+
+/**
  * Default browser-opener. Tries `open` on macOS, `xdg-open` on Linux, and
  * returns false when neither is available (Windows / WSL fallthrough +
  * misc Unixes ship `xdg-open` so coverage is decent without bringing in
@@ -521,6 +541,17 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   }
   if (platform !== "darwin" && platform !== "linux") {
     log("(Open the URL above in your browser to continue.)");
+    return 0;
+  }
+  // Headless guard: a TTY isn't enough — an SSH session is a TTY but has no
+  // display, so `xdg-open` either fails noisily or (worse) blocks. Skip the
+  // spawn entirely on a server-shaped box (linux + no $DISPLAY/$WAYLAND_DISPLAY,
+  // or SSH) and just print the link. Aaron hit this on EC2: init tried to open
+  // a browser, failed with "Couldn't launch a browser," and (pre-Fix-1) showed
+  // the loopback URL. With Fix 1 the printed link is now the public Cloudflare
+  // URL. Keep spawning on a real desktop (macOS, Linux-with-display).
+  if (hasNoDisplay(platform, env)) {
+    log("(No display detected — open the URL above in a browser to continue.)");
     return 0;
   }
   // `choice === "browser"` (either flag-driven or the operator picked

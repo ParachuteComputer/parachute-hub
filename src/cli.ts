@@ -472,11 +472,20 @@ async function main(argv: string[]): Promise<number> {
         return 1;
       }
       const exposeArgs = flagExtract.rest;
-      const layer = exposeArgs[0];
+      let layer = exposeArgs[0];
       const mode = exposeArgs[1];
       if (isHelpFlag(layer)) {
         console.log(exposeHelp());
         return 0;
+      }
+      // Alias: `parachute expose cloudflare [--domain X] [off]` is shorthand for
+      // `parachute expose public --cloudflare …`. Cloudflare is a public-internet
+      // provider, so we rewrite the layer to `public` and force the cloudflare
+      // flag — the rest of the dispatch (domain prompt, off-path, etc.) is
+      // identical to the canonical form.
+      if (layer === "cloudflare") {
+        layer = "public";
+        flagExtract.cloudflare = true;
       }
       if (layer !== "tailnet" && layer !== "public") {
         console.error(`parachute expose: unknown layer "${layer ?? ""}"`);

@@ -123,6 +123,43 @@ describe("cli per-subcommand help", () => {
     expect(stderr).toMatch(/dash\.cloudflare\.com/);
   });
 
+  test("expose cloudflare is an alias for expose public --cloudflare (Fix 5)", async () => {
+    // No --domain, non-TTY → same hard error as `expose public --cloudflare`.
+    // That it reaches the cloudflare-domain check (not "unknown layer") proves
+    // the alias rewrote the layer to public + forced the cloudflare flag.
+    const { code, stderr } = await runCli(["expose", "cloudflare"]);
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/--domain <hostname> is required/);
+    expect(stderr).not.toMatch(/unknown layer/);
+  });
+
+  test("expose cloudflare --domain X routes to the cloudflare path (not 'unknown layer')", async () => {
+    // cloudflared isn't installed under PATH="", so the cloudflare path prints
+    // its own not-installed hint — distinct from the layer-validation error.
+    const proc = Bun.spawn(
+      [process.execPath, CLI, "expose", "cloudflare", "--domain", "vault.example.com"],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          ...process.env,
+          PATH: "",
+          HOME: "/tmp/parachute-hub-nonexistent-home",
+          PARACHUTE_HOME: "/tmp/parachute-hub-nonexistent-home",
+        },
+      },
+    );
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    expect(code).toBe(1);
+    expect(stderr).not.toMatch(/unknown layer/);
+    // Reached the cloudflare path (cloudflared detection), proving the alias.
+    expect(stdout).toMatch(/cloudflared is not installed/);
+  });
+
   test("expose tailnet --cloudflare is rejected (cloudflare is public-only)", async () => {
     const { code, stderr } = await runCli([
       "expose",
