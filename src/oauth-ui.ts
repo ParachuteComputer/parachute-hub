@@ -20,7 +20,7 @@
  *     module scopes that the hub doesn't know about) render verbatim.
  *   - **No JavaScript.** Entirely form-based. Submit is the only interaction.
  */
-import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
+import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import { type ScopeExplanation, explainScope } from "./scope-explanations.ts";
 

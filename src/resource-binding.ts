@@ -74,24 +74,38 @@ export function resolveResourceVault(
   }
   if (!boundOrigins.includes(parsed.origin)) return null;
   const mcp = VAULT_MCP_PATH_RE.exec(parsed.pathname);
-  if (mcp?.[1]) return safeDecode(mcp[1]);
+  if (mcp?.[1]) return decodeVaultName(mcp[1]);
   const prm = VAULT_PRM_PATH_RE.exec(parsed.pathname);
-  if (prm?.[1]) return safeDecode(prm[1]);
+  if (prm?.[1]) return decodeVaultName(prm[1]);
   return null;
 }
 
+/** Canonical vault-name shape — mirrors `VAULT_SCOPED_RE`'s name group. */
+const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+
 /**
- * Decode a path segment, returning null on a malformed percent-escape rather
- * than throwing (a malformed `resource` must degrade to the unbound flow, not
- * 500 the authorize handler). Vault names are `[a-zA-Z0-9_-]` in practice so
- * this is belt-and-suspenders.
+ * Decode a captured path segment into a vault name, returning null when it
+ * isn't a well-formed vault name. Two failure modes both fall through to the
+ * unbound flow (no narrowing, no junk mint):
+ *
+ *   - malformed percent-escape (`%GG`) → `decodeURIComponent` throws → null.
+ *     A bad `resource` must degrade gracefully, not 500 the authorize handler.
+ *   - decoded value isn't `[a-zA-Z0-9_-]+` → null. The `[^/]+` path capture
+ *     admits anything between slashes; a crafted `resource=…/vault/%2F..%2Fadmin/mcp`
+ *     decodes to `/../admin`, which would otherwise mint a token stamped
+ *     `aud=vault./../admin`. Harmless (the resource server rejects it) but it's
+ *     audit-log noise + a minting path for non-vault names. Anchoring the name
+ *     to the canonical shape closes it. Matches `VAULT_SCOPED_RE`'s name group
+ *     so what we accept here is exactly what a vault scope can name.
  */
-function safeDecode(segment: string): string | null {
+function decodeVaultName(segment: string): string | null {
+  let decoded: string;
   try {
-    return decodeURIComponent(segment);
+    decoded = decodeURIComponent(segment);
   } catch {
     return null;
   }
+  return VAULT_NAME_RE.test(decoded) ? decoded : null;
 }
 
 /**

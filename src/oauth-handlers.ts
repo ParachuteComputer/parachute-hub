@@ -1255,6 +1255,11 @@ async function handleConsentSubmit(
   const sessionUser = getUserById(db, session.userId);
   const assignedVaults: string[] = userIsAdmin ? [] : (sessionUser?.assignedVaults ?? []);
   const isPinned = assignedVaults.length > 0;
+  // By design: the resource-bound re-narrow above does NOT check the bound
+  // vault exists in services.json for the admin path — admin (isPinned=false)
+  // can already consent to any vault via the manual picker, so the asymmetry
+  // (named-scope mint against a possibly-missing vault) is deliberate, not an
+  // oversight. Non-admins still hit the assignment + stale-vault defenses below.
 
   // Zero-vault non-admin gate (Phase 2 PR 2 reviewer fold). A non-admin
   // user with no `user_vaults` rows is a known-but-not-yet-assigned

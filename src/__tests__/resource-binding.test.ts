@@ -48,6 +48,21 @@ describe("resolveResourceVault", () => {
     // `/vault/jon/mcp/extra` is not the canonical MCP endpoint.
     expect(resolveResourceVault(`${ORIGIN}/vault/jon/mcp/extra`, BOUND)).toBeNull();
   });
+
+  test("rejects a vault segment that isn't a well-formed vault name (no junk mint)", () => {
+    // A crafted `resource=…/vault/%2F..%2Fadmin/mcp` decodes to `/../admin`,
+    // which is not `[a-zA-Z0-9_-]+`. Returning null falls through to the
+    // unbound flow — no narrowing, no token stamped `aud=vault./../admin`.
+    expect(resolveResourceVault(`${ORIGIN}/vault/%2F..%2Fadmin/mcp`, BOUND)).toBeNull();
+    // Spaces / dots / slashes in the decoded name are all out of shape.
+    expect(resolveResourceVault(`${ORIGIN}/vault/a.b/mcp`, BOUND)).toBeNull();
+  });
+
+  test("returns null for a malformed percent-escape in the vault segment (safeDecode catch path)", () => {
+    // `%GG` is not a valid percent-escape — `decodeURIComponent` throws; the
+    // helper must degrade to null rather than 500 the authorize handler.
+    expect(resolveResourceVault(`${ORIGIN}/vault/%GG/mcp`, BOUND)).toBeNull();
+  });
 });
 
 describe("narrowResourceVaultScopes", () => {
