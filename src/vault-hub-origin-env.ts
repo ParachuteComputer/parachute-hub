@@ -28,6 +28,7 @@
  */
 import { join } from "node:path";
 import { parseEnvFile, removeEnvLine, upsertEnvLine, writeEnvFile } from "./env-file.ts";
+import { EXPOSE_STATE_PATH, readExposeState } from "./expose-state.ts";
 import { HUB_ORIGIN_ENV } from "./hub-origin.ts";
 
 /**
@@ -97,4 +98,66 @@ export function clearVaultHubOrigin(configDir: string, log: (line: string) => vo
   writeEnvFile(path, removeEnvLine(parsed.lines, HUB_ORIGIN_ENV));
   log(`  cleared ${HUB_ORIGIN_ENV} from ${path} (exposure torn down)`);
   return true;
+}
+
+/**
+ * The public origin a live exposure advertises, or undefined when no exposure
+ * is active. Both the Tailscale and Cloudflare expose paths populate
+ * `expose-state.json` with a `hubOrigin` (the URL stamped into OAuth tokens'
+ * `iss` claim); older state files predating Phase 0 may carry only
+ * `canonicalFqdn`, so we synthesize `https://<fqdn>` as a fallback. Loopback /
+ * empty values resolve to undefined — there's no public origin to persist.
+ */
+export function publicOriginFromExposeState(
+  exposeStatePath: string = EXPOSE_STATE_PATH,
+): string | undefined {
+  let state: ReturnType<typeof readExposeState>;
+  try {
+    state = readExposeState(exposeStatePath);
+  } catch {
+    // A malformed expose-state must never block a vault start — treat it as
+    // "no exposure" and let the loopback default stand.
+    return undefined;
+  }
+  if (!state) return undefined;
+  const origin = state.hubOrigin ?? (state.canonicalFqdn ? `https://${state.canonicalFqdn}` : "");
+  if (!origin || isLoopbackOrigin(origin)) return undefined;
+  return origin.replace(/\/+$/, "");
+}
+
+/**
+ * Self-heal vault's persisted `PARACHUTE_HUB_ORIGIN` from `expose-state.json`.
+ *
+ * The bug this closes (the Cloudflare 401 P0): on a Cloudflare-tunnel deploy the
+ * expose path writes a public `hubOrigin` into `expose-state.json`, but — unlike
+ * the Tailscale path, which auto-restarts vault and so flows the public origin
+ * into `vault/.env` via `persistVaultHubOrigin` — it never wrote vault's `.env`.
+ * So the launchd / systemd daemon kept booting vault with NO `PARACHUTE_HUB_ORIGIN`,
+ * vault fell back to loopback as its expected issuer, and every hub-minted token
+ * (whose `iss` is the public origin) failed the `iss` check → 401 on every vault
+ * request → "You're not signed in to the hub."
+ *
+ * Called on `parachute start|restart vault`: when expose-state advertises a
+ * public origin AND vault's persisted value is unset or loopback, write the
+ * public origin. Existing broken deploys self-correct on the next restart, not
+ * just fresh ones. We deliberately do NOT overwrite a *different* non-loopback
+ * value already in `.env` — that could be a deliberate `--hub-origin` override;
+ * `persistVaultHubOrigin` (the explicit, resolved-origin path) owns that case.
+ *
+ * Returns true iff `.env` was written this call.
+ */
+export function selfHealVaultHubOrigin(
+  configDir: string,
+  log: (line: string) => void,
+  exposeStatePath: string = EXPOSE_STATE_PATH,
+): boolean {
+  const publicOrigin = publicOriginFromExposeState(exposeStatePath);
+  if (!publicOrigin) return false;
+  const current = parseEnvFile(vaultEnvPath(configDir)).values[HUB_ORIGIN_ENV];
+  // Only heal the broken shapes: unset (daemon falls back to loopback) or an
+  // already-persisted loopback (a value that itself causes the iss mismatch).
+  // A current public value — including one equal to publicOrigin — is left to
+  // persistVaultHubOrigin's idempotent path so we don't double-log.
+  if (current !== undefined && !isLoopbackOrigin(current)) return false;
+  return persistVaultHubOrigin(configDir, publicOrigin, log);
 }
