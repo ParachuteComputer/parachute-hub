@@ -39,10 +39,10 @@ describe("readVaultAuthStatus — hub.db source of truth (multi-user Phase 1+)",
         vaultHome: env.path,
         countTokens: () => 0,
         probeHubDbHasUserPassword: () => true,
+        probeHubDbHasTotp: () => false,
       });
       expect(status.hasOwnerPassword).toBe(true);
-      // No hub-side TOTP column yet (Phase 3). Stays false on the hub.db
-      // path until the schema gains a column.
+      // No TOTP enrolled in hub.db (and no legacy YAML) → false.
       expect(status.hasTotp).toBe(false);
     } finally {
       env.cleanup();
@@ -57,6 +57,7 @@ describe("readVaultAuthStatus — hub.db source of truth (multi-user Phase 1+)",
         vaultHome: env.path,
         countTokens: () => 0,
         probeHubDbHasUserPassword: () => false,
+        probeHubDbHasTotp: () => false,
       });
       expect(status.hasOwnerPassword).toBe(true);
       expect(status.hasTotp).toBe(false);
@@ -87,6 +88,7 @@ describe("readVaultAuthStatus — hub.db source of truth (multi-user Phase 1+)",
         vaultHome: env.path,
         countTokens: () => 0,
         probeHubDbHasUserPassword: () => false,
+        probeHubDbHasTotp: () => false,
       });
       expect(status.hasOwnerPassword).toBe(false);
       expect(status.hasTotp).toBe(false);
@@ -95,20 +97,55 @@ describe("readVaultAuthStatus — hub.db source of truth (multi-user Phase 1+)",
     }
   });
 
-  test("hub.db says yes overrides absent YAML — TOTP still reflects YAML state", () => {
+  test("hub.db password=true, hub.db TOTP unreachable → TOTP falls back to YAML state", () => {
     const env = makeVaultHome();
     try {
-      // TOTP-only YAML: vault-side 2FA was configured but hub.db is the
-      // canonical password source. Should report password=true (hub.db),
-      // totp=true (YAML).
+      // hub#473: hub.db is the canonical TOTP source, but when the TOTP probe
+      // is unreachable (pre-v11 column absent) it falls back to the legacy
+      // vault YAML totp_secret. password=true (hub.db), totp=true (YAML fallback).
       writeConfig(env.path, 'totp_secret: "JBSWY3DPEHPK3PXP"\n');
       const status = readVaultAuthStatus({
         vaultHome: env.path,
         countTokens: () => 0,
         probeHubDbHasUserPassword: () => true,
+        probeHubDbHasTotp: () => undefined,
       });
       expect(status.hasOwnerPassword).toBe(true);
       expect(status.hasTotp).toBe(true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub.db TOTP=true is the real signal — overrides absent YAML", () => {
+    const env = makeVaultHome();
+    try {
+      // No YAML totp_secret, but a hub.db user has enrolled real 2FA (hub#473).
+      const status = readVaultAuthStatus({
+        vaultHome: env.path,
+        countTokens: () => 0,
+        probeHubDbHasUserPassword: () => true,
+        probeHubDbHasTotp: () => true,
+      });
+      expect(status.hasTotp).toBe(true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub.db TOTP=false (column present, none enrolled) overrides a stale YAML true", () => {
+    const env = makeVaultHome();
+    try {
+      // Legacy YAML totp_secret present, but hub.db definitively says no user
+      // has enrolled real hub-login 2FA → report false (the real signal wins).
+      writeConfig(env.path, 'totp_secret: "JBSWY3DPEHPK3PXP"\n');
+      const status = readVaultAuthStatus({
+        vaultHome: env.path,
+        countTokens: () => 0,
+        probeHubDbHasUserPassword: () => true,
+        probeHubDbHasTotp: () => false,
+      });
+      expect(status.hasTotp).toBe(false);
     } finally {
       env.cleanup();
     }
@@ -123,6 +160,7 @@ describe("readVaultAuthStatus — YAML fallback (pre-multi-user installs)", () =
         vaultHome: env.path,
         countTokens: () => 0,
         probeHubDbHasUserPassword: hubDbUnreachable,
+        probeHubDbHasTotp: hubDbUnreachable,
       });
       expect(status.hasOwnerPassword).toBe(false);
       expect(status.hasTotp).toBe(false);
@@ -147,6 +185,7 @@ describe("readVaultAuthStatus — YAML fallback (pre-multi-user installs)", () =
         vaultHome: env.path,
         countTokens: () => 0,
         probeHubDbHasUserPassword: hubDbUnreachable,
+        probeHubDbHasTotp: hubDbUnreachable,
       });
       expect(status.hasOwnerPassword).toBe(true);
       expect(status.hasTotp).toBe(true);
@@ -163,6 +202,7 @@ describe("readVaultAuthStatus — YAML fallback (pre-multi-user installs)", () =
         vaultHome: env.path,
         countTokens: () => 0,
         probeHubDbHasUserPassword: hubDbUnreachable,
+        probeHubDbHasTotp: hubDbUnreachable,
       });
       expect(status.hasOwnerPassword).toBe(false);
       expect(status.hasTotp).toBe(false);
@@ -179,6 +219,7 @@ describe("readVaultAuthStatus — YAML fallback (pre-multi-user installs)", () =
         vaultHome: env.path,
         countTokens: () => 0,
         probeHubDbHasUserPassword: hubDbUnreachable,
+        probeHubDbHasTotp: hubDbUnreachable,
       });
       expect(status.hasOwnerPassword).toBe(true);
       expect(status.hasTotp).toBe(false);

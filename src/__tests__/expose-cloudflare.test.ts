@@ -683,12 +683,11 @@ describe("exposeCloudflareUp", () => {
 
         expect(code).toBe(0);
         const joined = logs.join("\n");
-        // Honest copy: /login is public, owner password is the wall, hub-login
-        // 2FA is coming (#473) — does NOT recommend the dead `2fa enroll`.
+        // hub#473: real hub-login 2FA — the warning now recommends the real
+        // `parachute auth 2fa enroll` path.
         expect(joined).toContain("/login is now reachable on the public internet");
         expect(joined).toContain("https://vault.example.com/login");
-        expect(joined).toContain("#473");
-        expect(joined).not.toContain("parachute auth 2fa enroll");
+        expect(joined).toContain("parachute auth 2fa enroll");
       } finally {
         env.cleanup();
       }
@@ -736,11 +735,12 @@ describe("exposeCloudflareUp", () => {
         expect(code).toBe(0);
         const joined = logs.join("\n");
         expect(joined).not.toContain("/login is now reachable on the public internet");
-        // The contextual 2FA warning is suppressed (legacy vault TOTP present);
-        // the always-shown owner-password guidance from `printAuthGuidance`
-        // still appears, and it no longer recommends the dead `2fa enroll`.
+        // The contextual 2FA warning is suppressed (2FA already enrolled); the
+        // always-shown owner-password guidance from `printAuthGuidance` still
+        // appears, and it now (hub#473) also surfaces the real `2fa enroll`
+        // path in the humans section.
         expect(joined).toContain("parachute auth set-password");
-        expect(joined).not.toContain("parachute auth 2fa enroll");
+        expect(joined).toContain("parachute auth 2fa enroll");
       } finally {
         env.cleanup();
       }

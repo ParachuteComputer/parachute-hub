@@ -65,26 +65,159 @@ async function captureOutput(fn: () => Promise<number> | number): Promise<{
 }
 
 describe("parachute auth", () => {
-  test("2fa is an honest hub-side stub — never forwards to parachute-vault", async () => {
-    // 2fa used to forward to the deprecated `parachute-vault 2fa` stub, which
-    // exits 1 post auth-unification and only wrote vault YAML that never gated
-    // hub /login. It's now an informational stub: exit 0, no subprocess.
-    const { runner, calls } = makeRunner(0);
-    const out = await captureOutput(() => auth(["2fa", "enroll"], runner));
-    expect(out.code).toBe(0);
-    expect(calls).toEqual([]); // did NOT spawn parachute-vault
-    expect(out.stdout).toContain("isn't available yet");
-    expect(out.stdout).toContain("#473");
-    // Doesn't tell the operator to run the dead vault command.
-    expect(out.stdout).not.toContain("2fa enroll");
+  test("2fa is hub-local — never forwards to parachute-vault", async () => {
+    // 2fa used to forward to the deprecated `parachute-vault 2fa` stub. As of
+    // hub#473 it's real hub-login TOTP, fully hub-local (hub.db). No subprocess.
+    const tmp = makeTmp();
+    try {
+      const db = openHubDb(tmp.dbPath);
+      await createUser(db, "owner", "owner-password-123");
+      db.close();
+      const { runner, calls } = makeRunner(0);
+      const out = await captureOutput(() =>
+        auth(["2fa", "status"], { runner, dbPath: tmp.dbPath }),
+      );
+      expect(out.code).toBe(0);
+      expect(calls).toEqual([]); // did NOT spawn parachute-vault
+      expect(out.stdout).toContain("Two-factor authentication: OFF");
+    } finally {
+      tmp.cleanup();
+    }
   });
 
-  test("2fa with any sub-args still resolves to the honest stub (exit 0, no spawn)", async () => {
-    const { runner, calls } = makeRunner(0);
-    const out = await captureOutput(() => auth(["2fa", "status", "--whatever"], runner));
-    expect(out.code).toBe(0);
-    expect(calls).toEqual([]);
-    expect(out.stdout).toContain("#473");
+  test("2fa status reports OFF for a fresh user, then ON after a CLI enroll round-trip", async () => {
+    const tmp = makeTmp();
+    try {
+      const db = openHubDb(tmp.dbPath);
+      await createUser(db, "owner", "owner-password-123");
+      db.close();
+
+      // status → OFF
+      const off = await captureOutput(() =>
+        auth(["2fa", "status"], { dbPath: tmp.dbPath, isInteractive: () => false }),
+      );
+      expect(off.code).toBe(0);
+      expect(off.stdout).toContain("OFF");
+
+      // enroll requires a confirm code — drive the readLine seam with the
+      // live TOTP code generated from the secret the command prints.
+      const { generateTotpSecret } = await import("../totp.ts");
+      // We can't intercept the random secret the command mints, so instead
+      // exercise the store directly to assert the ON path is reachable, then
+      // assert the CLI status reflects it. (The handler-level enroll round
+      // trip is covered in two-factor.test.ts against the real secret.)
+      const db2 = openHubDb(tmp.dbPath);
+      const { persistEnrollment } = await import("../two-factor-store.ts");
+      const u = listUsers(db2)[0]!;
+      const { secret } = generateTotpSecret(u.username);
+      await persistEnrollment(db2, u.id, secret);
+      db2.close();
+
+      const on = await captureOutput(() =>
+        auth(["2fa", "status"], { dbPath: tmp.dbPath, isInteractive: () => false }),
+      );
+      expect(on.code).toBe(0);
+      expect(on.stdout).toContain("ON");
+      expect(on.stdout).toContain("backup_codes");
+
+      // disenroll clears it.
+      const dis = await captureOutput(() =>
+        auth(["2fa", "disenroll"], { dbPath: tmp.dbPath, isInteractive: () => false }),
+      );
+      expect(dis.code).toBe(0);
+      expect(dis.stdout).toContain("Turned off");
+
+      const off2 = await captureOutput(() =>
+        auth(["2fa", "status"], { dbPath: tmp.dbPath, isInteractive: () => false }),
+      );
+      expect(off2.stdout).toContain("OFF");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("2fa enroll confirms the printed secret against a live code, prints backup codes", async () => {
+    const tmp = makeTmp();
+    try {
+      const db = openHubDb(tmp.dbPath);
+      await createUser(db, "owner", "owner-password-123");
+      db.close();
+
+      // Single console.log interception that BOTH accumulates stdout and lets
+      // the readLine seam read the secret the command just printed. (Avoids
+      // nesting two console.log replacements.)
+      const OTPAuth = await import("otpauth");
+      const origLog = console.log;
+      let stdout = "";
+      let capturedSecret = "";
+      console.log = (...a: unknown[]) => {
+        const line = a.map(String).join(" ");
+        stdout += `${line}\n`;
+        const m = line.match(/secret key:\s+([A-Z2-7]+)/);
+        if (m) capturedSecret = m[1]!;
+      };
+      let code = "";
+      let exitCode = 0;
+      try {
+        exitCode = await auth(["2fa", "enroll"], {
+          dbPath: tmp.dbPath,
+          isInteractive: () => true,
+          readLine: async () => {
+            // The secret has been printed by the time the prompt fires.
+            const totp = new OTPAuth.TOTP({
+              issuer: "Parachute Hub",
+              label: "owner",
+              algorithm: "SHA1",
+              digits: 6,
+              period: 30,
+              secret: OTPAuth.Secret.fromBase32(capturedSecret),
+            });
+            code = totp.generate();
+            return code;
+          },
+        });
+      } finally {
+        console.log = origLog;
+      }
+      expect(exitCode).toBe(0);
+      expect(capturedSecret.length).toBeGreaterThan(0);
+      expect(stdout).toContain("now ON");
+      // 10 backup codes printed (hyphenated form).
+      const backupLines = stdout.split("\n").filter((l) => /^ {2}[a-z2-9]{5}-[a-z2-9]{5}$/.test(l));
+      expect(backupLines.length).toBe(10);
+      expect(code.length).toBe(6);
+      // The persisted state reflects the enrollment: the captured secret is
+      // now stored on the user row. (We don't re-verify `code` — the enroll
+      // confirm consumed it via the replay cache, by design.)
+      const db2 = openHubDb(tmp.dbPath);
+      const { getTotpState } = await import("../two-factor-store.ts");
+      const uid = listUsers(db2)[0]!.id;
+      const persisted = getTotpState(db2, uid);
+      expect(persisted.secret).toBe(capturedSecret);
+      expect(persisted.backupCodes.length).toBe(10);
+      db2.close();
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("2fa enroll refuses to re-enroll when already on", async () => {
+    const tmp = makeTmp();
+    try {
+      const db = openHubDb(tmp.dbPath);
+      const u = await createUser(db, "owner", "owner-password-123");
+      const { generateTotpSecret } = await import("../totp.ts");
+      const { persistEnrollment } = await import("../two-factor-store.ts");
+      await persistEnrollment(db, u.id, generateTotpSecret("owner").secret);
+      db.close();
+      const out = await captureOutput(() =>
+        auth(["2fa", "enroll"], { dbPath: tmp.dbPath, isInteractive: () => true }),
+      );
+      expect(out.code).toBe(1);
+      expect(out.stderr).toContain("already enabled");
+    } finally {
+      tmp.cleanup();
+    }
   });
 
   test("set-password no longer forwards to vault", async () => {
@@ -138,12 +271,13 @@ describe("authHelp", () => {
     expect(h).toContain("parachute auth rotate-key");
   });
 
-  test("2fa help is honest about hub-login TOTP not being shipped (#473)", () => {
+  test("2fa help documents the real hub-login TOTP subcommands (#473)", () => {
     expect(h).toContain("#473");
-    // No longer advertises the dead enroll/disable/backup-codes subcommands.
-    expect(h).not.toContain("2fa enroll");
-    expect(h).not.toContain("2fa disable");
-    expect(h).not.toContain("2fa backup-codes");
+    // Real enroll / disenroll subcommands are now advertised.
+    expect(h).toContain("2fa enroll");
+    expect(h).toContain("2fa disenroll");
+    expect(h).toContain("otpauth://");
+    expect(h).toContain("backup codes");
   });
 
   test("set-password help mentions the new flags + hub-local home", () => {
