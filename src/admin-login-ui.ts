@@ -67,7 +67,7 @@ function header(): string {
         <div class="brand">
           <span class="brand-mark" aria-hidden="true">${brandMarkSvg(20, "admin-login")}</span>
           <span class="brand-name">${WORDMARK_TEXT}</span>
-          <span class="brand-tag">admin</span>
+          <span class="brand-tag">sign in</span>
         </div>`;
 }
 
@@ -87,8 +87,8 @@ export function renderAdminLogin(props: AdminLoginProps): string {
     <div class="card">
       <div class="card-header">
         ${header()}
-        <h1>Sign in</h1>
-        <p class="subtitle">to administer this hub</p>
+        <h1>Sign in to your Parachute account</h1>
+        <p class="subtitle">Hub operators and invited members sign in here.</p>
       </div>
       ${error}
       <form method="POST" action="/login" class="auth-form">
@@ -105,7 +105,7 @@ export function renderAdminLogin(props: AdminLoginProps): string {
         <button type="submit" class="btn btn-primary">Sign in</button>
       </form>
     </div>`;
-  return baseDocument("Sign in to Parachute Hub admin", body);
+  return baseDocument("Sign in — Parachute", body);
 }
 
 // --- error page ------------------------------------------------------------

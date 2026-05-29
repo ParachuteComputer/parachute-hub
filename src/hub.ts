@@ -91,8 +91,15 @@ function renderSignedIn(displayName: string, csrfToken: string): string {
   // Inline POST form so sign-out works without JS. Submit button is
   // styled as a text link via `.auth-signout` so the visual weight
   // matches the surrounding "Signed in as <name>" text.
+  //
+  // The "Account" link is the single breadcrumb to `/account/` — the
+  // self-service home where any signed-in user (admin or invited
+  // member) can change their password, see their vault, and sign out.
+  // Without it, a friend who's been handed credentials has no way to
+  // discover the change-password surface after the first-login prompt.
   return `<div class="auth-indicator">
       <span class="muted">Signed in as <strong>${escapeHtml(displayName)}</strong></span>
+      <a href="/account/" class="auth-account">Account</a>
       <form method="POST" action="/logout" class="auth-signout-form">
         <input type="hidden" name="${CSRF_FIELD_NAME}" value="${escapeAttr(csrfToken)}" />
         <button type="submit" class="auth-signout">Sign out</button>
@@ -203,7 +210,7 @@ const HTML_TEMPLATE = `<!doctype html>
     margin: 0;
     display: inline;
   }
-  .auth-signout, .auth-signin {
+  .auth-signout, .auth-signin, .auth-account {
     background: none;
     border: none;
     padding: 0;
@@ -214,10 +221,10 @@ const HTML_TEMPLATE = `<!doctype html>
     text-decoration-thickness: 1px;
     text-underline-offset: 2px;
   }
-  .auth-signout:hover, .auth-signin:hover {
+  .auth-signout:hover, .auth-signin:hover, .auth-account:hover {
     color: var(--accent-hover);
   }
-  a.auth-signin {
+  a.auth-signin, a.auth-account {
     /* Anchor needs explicit reset since the a element has its own
        color/decoration. */
     border-bottom: none;
