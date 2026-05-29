@@ -28,6 +28,12 @@ import {
 } from "../cloudflare/tunnel.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import {
+  EXPOSE_STATE_PATH,
+  type ExposeState,
+  clearExposeState,
+  writeExposeState,
+} from "../expose-state.ts";
+import {
   type EnsureHubOpts,
   HUB_DEFAULT_PORT,
   ensureHubRunning,
@@ -103,6 +109,15 @@ export interface ExposeCloudflareOpts {
   manifestPath?: string;
   statePath?: string;
   /**
+   * Path to `expose-state.json` — the shared cross-provider expose record the
+   * Tailscale path also writes (`expose.ts`). Distinct from `statePath`
+   * (cloudflared-state.json, the per-tunnel process record). The cloudflare
+   * up-path writes this so downstream consumers (`resolveAdminUrl` in init,
+   * `resolveHubOrigin` in lifecycle / auth) see the public URL instead of
+   * loopback; the off-path clears it. Defaults to `EXPOSE_STATE_PATH`.
+   */
+  exposeStatePath?: string;
+  /**
    * Tunnel name targeted by this invocation. Defaults to `parachute` —
    * the canonical single-tunnel name. Override to run multiple tunnels on
    * one box (#32).
@@ -174,6 +189,7 @@ interface Resolved {
   log: (line: string) => void;
   manifestPath: string;
   statePath: string;
+  exposeStatePath: string;
   tunnelName: string;
   configPath: string;
   logPath: string;
@@ -204,6 +220,7 @@ function resolve(opts: ExposeCloudflareOpts): Resolved {
     log: opts.log ?? ((line) => console.log(line)),
     manifestPath: opts.manifestPath ?? SERVICES_MANIFEST_PATH,
     statePath: opts.statePath ?? CLOUDFLARED_STATE_PATH,
+    exposeStatePath: opts.exposeStatePath ?? EXPOSE_STATE_PATH,
     tunnelName,
     configPath: opts.configPath ?? paths.configPath,
     logPath: opts.logPath ?? paths.logPath,
@@ -228,8 +245,9 @@ function printAuthGuidance(log: (line: string) => void, vaultUrl: string): void 
   log("Pick the path that matches how you'll reach it:");
   log("");
   log("  Humans (claude.ai / ChatGPT connectors, browser):");
-  log("    parachute auth set-password         # set an owner password");
-  log("    parachute auth 2fa enroll           # (recommended) TOTP + backup codes");
+  log("    parachute auth set-password         # set a STRONG owner password");
+  log("    # (hub-login 2FA is coming — #473 — but not shipped yet; the owner");
+  log("    #  password is the wall for now, so make it a good one)");
   log("    then point your connector at:");
   log(`    ${vaultUrl}`);
   log("");
@@ -416,6 +434,38 @@ export async function exposeCloudflareUp(
   };
   writeCloudflaredState(withTunnelRecord(stateBefore, record), r.statePath);
 
+  // Persist the shared cross-provider expose record. Without this, the
+  // Tailscale path was the only one writing expose-state.json — so after a
+  // Cloudflare bring-up `readExposeState()` returned undefined and downstream
+  // consumers fell back to loopback:
+  //   - init's `resolveAdminUrl` printed http://127.0.0.1:1939/admin/ instead
+  //     of the public URL.
+  //   - lifecycle's `resolveHubOrigin` (and the hub#460 vault `.env`
+  //     PARACHUTE_HUB_ORIGIN persistence) kept the loopback origin, so vault's
+  //     OAuth `iss` claim didn't match the public host — the "rejected on
+  //     reconnect" P0 on Cloudflare deploys.
+  // Mode is "subdomain": cloudflared routes the whole FQDN at the hub catchall
+  // (one ingress → hub), unlike the Tailscale path's "path" routing. The single
+  // proxy entry mirrors the hub-catchall shape the Tailscale Funnel path plans.
+  const exposeState: ExposeState = {
+    version: 1,
+    layer: "public",
+    mode: "subdomain",
+    canonicalFqdn: hostname,
+    port: hubPort,
+    funnel: false,
+    entries: [
+      {
+        kind: "proxy",
+        mount: "/",
+        target: `http://localhost:${hubPort}`,
+        service: "hub",
+      },
+    ],
+    hubOrigin,
+  };
+  writeExposeState(exposeState, r.exposeStatePath);
+
   const baseUrl = `https://${hostname}`;
   // A well-formed vault manifest always lists at least one mount path. If
   // it's empty, something went sideways in `parachute install vault` — warn
@@ -485,6 +535,13 @@ export async function exposeCloudflareOff(opts: ExposeCloudflareOpts = {}): Prom
     writeCloudflaredState(stateAfter, r.statePath);
   } else {
     clearCloudflaredState(r.statePath);
+  }
+  // Clear the shared expose-state.json when no Cloudflare tunnels remain, so
+  // downstream consumers stop resolving the now-dead public URL (mirrors the
+  // up-path write above + the Tailscale off-path's expose-state teardown). When
+  // other tunnels survive we leave it — a later off for the last one clears it.
+  if (!stateAfter) {
+    clearExposeState(r.exposeStatePath);
   }
   r.log(`  ${record.hostname} is no longer reachable through this machine.`);
   r.log(
