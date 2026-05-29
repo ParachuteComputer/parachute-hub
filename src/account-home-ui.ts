@@ -21,6 +21,7 @@
 import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import { escapeHtml } from "./oauth-ui.ts";
+import type { VaultVerb } from "./users.ts";
 
 // --- shared chrome (mirrors account-change-password-ui.ts) ----------------
 
@@ -115,7 +116,49 @@ export interface RenderAccountHomeOpts {
    * `/account/2fa` either way — "Set up" when off, "Manage" when on.
    */
   twoFactorEnabled: boolean;
+  /**
+   * Per-vault mintable verbs for the "mint an access token" affordance on
+   * each vault tile (friend headless-client path). Maps `vaultName` → the
+   * verbs the user's assignment role permits (today always
+   * `["read", "write"]` since every `user_vaults.role` is `'write'`). A
+   * vault absent from this map (or mapped to an empty list) renders no mint
+   * affordance — the UI never offers a verb the server would reject. The
+   * `/account/` GET handler builds this from `vaultVerbsForUserVault` for
+   * each assigned vault. Omitted (or empty) for the admin / no-vault
+   * branches, where no token-mint tile is shown.
+   */
+  mintableVerbs?: Record<string, VaultVerb[]>;
+  /**
+   * Set after a successful `POST /account/vault-token/<name>` to show the
+   * freshly-minted token ONCE (the only time it's ever shown — the hub keeps
+   * no plaintext copy). Drives the show-once banner at the top of the page.
+   * Absent on the normal GET render.
+   */
+  mintedToken?: MintedTokenView;
+  /**
+   * Set after a `POST /account/vault-token/<name>` that failed authorization
+   * or validation, to surface an inline error banner on the re-rendered page
+   * (e.g. unassigned vault, capped verb, rate-limited). Absent on success and
+   * on the normal GET render.
+   */
+  mintError?: string;
 }
+
+/**
+ * The one-time view of a freshly-minted friend vault token. The hub stores
+ * only a hash-keyed registry row (no plaintext), so this is the single moment
+ * the token string is shown — the UI copy makes that explicit.
+ */
+export interface MintedTokenView {
+  vaultName: string;
+  verb: VaultVerb;
+  token: string;
+  /** Whole-day TTL for the "expires in N days" copy. */
+  expiresInDays: number;
+}
+
+/** Friend-mint token default lifetime: 90 days (matches the CLI/api-mint default). */
+export const ACCOUNT_VAULT_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60;
 
 export function renderAccountHome(opts: RenderAccountHomeOpts): string {
   const { username, assignedVaults, hubOrigin, isFirstAdmin, csrfToken } = opts;
@@ -124,10 +167,19 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
   // but defensively re-trim so a stray slash here doesn't break the CTA href.
   const trimmedOrigin = hubOrigin.replace(/\/+$/, "");
 
+  const mintedBanner = opts.mintedToken ? renderMintedTokenBanner(opts.mintedToken) : "";
+  const mintErrorBanner = opts.mintError
+    ? `<div class="mint-error-banner" data-testid="mint-error-banner" role="alert">${escapeHtml(
+        opts.mintError,
+      )}</div>`
+    : "";
+
   const vaultCard = renderVaultCard({
     assignedVaults,
     trimmedOrigin,
     isFirstAdmin,
+    csrfToken,
+    mintableVerbs: opts.mintableVerbs ?? {},
   });
 
   const accountCard = renderAccountCard({
@@ -143,9 +195,11 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
         <h1>Welcome, ${safeUsername}</h1>
         <p class="subtitle">Your Parachute account home.</p>
       </div>
+      ${mintedBanner}
+      ${mintErrorBanner}
       ${vaultCard}
       ${accountCard}
-    </div>`;
+    </div>${COPY_SCRIPT}`;
   return baseDocument(`${username} — Parachute`, body);
 }
 
@@ -153,6 +207,8 @@ interface VaultCardOpts {
   assignedVaults: string[];
   trimmedOrigin: string;
   isFirstAdmin: boolean;
+  csrfToken: string;
+  mintableVerbs: Record<string, VaultVerb[]>;
 }
 
 /**
@@ -182,7 +238,7 @@ export function accountClaudeMcpAddCommand(trimmedOrigin: string, vaultName: str
 }
 
 function renderVaultCard(opts: VaultCardOpts): string {
-  const { assignedVaults, trimmedOrigin, isFirstAdmin } = opts;
+  const { assignedVaults, trimmedOrigin, isFirstAdmin, csrfToken, mintableVerbs } = opts;
 
   if (assignedVaults.length > 0) {
     // One vault tile per assignment (multi-user Phase 2 PR 2). Each tile
@@ -209,6 +265,12 @@ function renderVaultCard(opts: VaultCardOpts): string {
         const addCmd = accountClaudeMcpAddCommand(trimmedOrigin, vaultName);
         const safeEndpoint = escapeHtml(endpoint);
         const safeAddCmd = escapeHtml(addCmd);
+        const tokenMintBlock = renderTokenMintBlock(
+          vaultName,
+          safeVault,
+          mintableVerbs[vaultName] ?? [],
+          csrfToken,
+        );
         return `
         <div class="vault-tile" data-testid="vault-tile" data-vault-name="${safeVault}">
           <p class="vault-name"><strong>${safeVault}</strong></p>
@@ -251,6 +313,7 @@ function renderVaultCard(opts: VaultCardOpts): string {
             <span class="vault-notes-cta-sub">Prefer a browser UI? Open Notes to browse +
                capture in this vault.</span>
           </p>
+          ${tokenMintBlock}
         </div>`;
       })
       .join("");
@@ -264,7 +327,7 @@ function renderVaultCard(opts: VaultCardOpts): string {
           to your hub over HTTPS and asks you to approve access.</p>
         <div class="vault-tiles">${tiles}
         </div>
-      </section>${COPY_SCRIPT}`;
+      </section>`;
   }
   if (isFirstAdmin) {
     return `
@@ -288,6 +351,103 @@ function renderVaultCard(opts: VaultCardOpts): string {
          any AI assistant) to it.</p>
       <p><strong>Ask the hub operator to assign you a vault.</strong></p>
     </section>`;
+}
+
+/**
+ * The "mint an access token (for scripts / headless clients)" affordance on a
+ * vault tile. Sits BELOW the OAuth connect block + Notes CTA — the no-token
+ * OAuth path stays the recommended default; this is the secondary, opt-in
+ * path for clients that can't do an interactive browser sign-in (cron jobs,
+ * headless agents, a `curl` script).
+ *
+ * Renders one radio per verb the user's assignment role permits (`verbs` —
+ * today always `["read", "write"]`). The UI NEVER offers a verb the server
+ * would reject: a read-only assignment shows only "Read". An empty `verbs`
+ * list (unknown / unmappable role) renders nothing — fail-closed, matching
+ * the server's `vaultVerbsForUserVault` returning `[]`.
+ *
+ * The form POSTs `application/x-www-form-urlencoded` to
+ * `/account/vault-token/<name>` with the CSRF hidden field + a `verb` radio —
+ * same no-JS-required posture as the change-password and sign-out forms. The
+ * `<details>` keeps it collapsed by default so the tile leads with the
+ * recommended OAuth path.
+ */
+function renderTokenMintBlock(
+  vaultName: string,
+  safeVault: string,
+  verbs: VaultVerb[],
+  csrfToken: string,
+): string {
+  if (verbs.length === 0) return "";
+  // Path segment is URL-encoded; the action attribute is HTML-escaped on top.
+  const action = escapeHtml(`/account/vault-token/${encodeURIComponent(vaultName)}`);
+  const radios = verbs
+    .map((verb, i) => {
+      const checked = i === 0 ? " checked" : "";
+      const label = verb === "read" ? "Read-only" : "Read + write";
+      return `
+              <label class="mint-verb-option">
+                <input type="radio" name="verb" value="${verb}"${checked}
+                       data-testid="mint-verb-${verb}" />
+                <span><strong>${verb}</strong> — ${label} access to <code>${safeVault}</code></span>
+              </label>`;
+    })
+    .join("");
+  return `
+          <details class="token-mint" data-testid="token-mint">
+            <summary data-testid="token-mint-summary">Mint an access token
+              <span class="token-mint-sub">for scripts / headless clients</span></summary>
+            <div class="token-mint-body">
+              <p class="token-mint-intro">Most clients should use the no-token
+                connect options above — they sign you in over HTTPS and never
+                ask you to paste a secret. Mint a token only for a script or
+                headless client that can't open a browser to sign in. It's a
+                bearer for <code>vault:${safeVault}:&lt;verb&gt;</code>, scoped to
+                <strong>this vault only</strong>, and you'll see it once.</p>
+              <form method="POST" action="${action}" class="mint-form"
+                    data-testid="mint-form">
+                ${renderCsrfHiddenInput(csrfToken)}
+                <fieldset class="mint-verbs">
+                  <legend>Access level</legend>${radios}
+                </fieldset>
+                <button type="submit" class="btn btn-secondary"
+                        data-testid="mint-token-button">Mint token</button>
+              </form>
+            </div>
+          </details>`;
+}
+
+/**
+ * The show-once banner for a freshly-minted friend vault token. Rendered at
+ * the top of `/account/` after a successful `POST /account/vault-token/<name>`.
+ * The token string appears here and NOWHERE else — the hub stores only a
+ * hash-keyed registry row. The copy is explicit about that ("save it now —
+ * it won't be shown again"). No revoke link: there's no friend-facing revoke
+ * surface today, so we don't claim one.
+ */
+function renderMintedTokenBanner(view: MintedTokenView): string {
+  const safeVault = escapeHtml(view.vaultName);
+  const scope = `vault:${view.vaultName}:${view.verb}`;
+  const safeScope = escapeHtml(scope);
+  // The token value goes in a data attribute for the copy button + as text.
+  // It's a hub-signed JWT (no HTML-significant chars in base64url + dots), but
+  // escape defensively all the same.
+  const safeToken = escapeHtml(view.token);
+  return `
+    <div class="minted-banner" data-testid="minted-token-banner" role="status">
+      <p class="minted-title">Your access token for <code>${safeVault}</code></p>
+      <p class="minted-warn"><strong>Save it now — it won't be shown again.</strong>
+        This is a bearer credential for <code>${safeScope}</code>. It expires in
+        ${view.expiresInDays} days. Treat it like a password; anyone who has it
+        can act on this vault at that access level.</p>
+      <div class="copy-row">
+        <code data-testid="minted-token-value">${safeToken}</code>
+        <button type="button" class="btn btn-copy" data-copy="${safeToken}"
+                data-testid="copy-minted-token">Copy</button>
+      </div>
+      <p class="minted-hint">Use it as <code>Authorization: Bearer &lt;token&gt;</code>
+        when calling this vault's MCP endpoint. To revoke it, ask the hub operator.</p>
+    </div>`;
 }
 
 interface AccountCardOpts {
@@ -328,14 +488,16 @@ function renderAccountCard(opts: AccountCardOpts): string {
 
 // --- copy-button script ---------------------------------------------------
 //
-// Tiny inline progressive-enhancement script for the per-tile copy buttons.
-// Delegated click handler reads the command/endpoint from the button's
-// `data-copy` attribute and writes it to the clipboard, flashing "Copied ✓"
-// for 2s. No-ops gracefully when the Clipboard API is unavailable (insecure
-// context, older browser) — the command text stays selectable in the
+// Tiny inline progressive-enhancement script for the page's copy buttons
+// (the per-tile MCP command/endpoint buttons AND the show-once minted-token
+// banner's Copy button). Delegated click handler reads the value from the
+// button's `data-copy` attribute and writes it to the clipboard, flashing
+// "Copied ✓" for 2s. No-ops gracefully when the Clipboard API is unavailable
+// (insecure context, older browser) — the value stays selectable in the
 // codebox. Mirrors the SPA `CopyButton` posture (McpConnectCard.tsx) for a
-// surface that has no React. Only emitted on the assigned-vault branch
-// (where copy buttons exist).
+// surface that has no React. Emitted once at the page body level so it covers
+// both the vault tiles and the minted-token banner (which lives above the
+// vault card).
 const COPY_SCRIPT = `
   <script>
     (function () {
@@ -546,6 +708,82 @@ const STYLES = `
     color: ${PALETTE.fgMuted};
     margin: 0.4rem 0 0;
   }
+
+  .token-mint {
+    margin: 0.9rem 0 0;
+    padding-top: 0.6rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+  }
+  .token-mint > summary {
+    cursor: pointer;
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: ${PALETTE.fg};
+    list-style: revert;
+  }
+  .token-mint-sub {
+    font-weight: 400;
+    font-size: 0.8rem;
+    color: ${PALETTE.fgMuted};
+  }
+  .token-mint-body { margin-top: 0.6rem; }
+  .token-mint-intro {
+    font-size: 0.8rem;
+    color: ${PALETTE.fgMuted};
+    margin: 0 0 0.6rem;
+  }
+  .mint-verbs {
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    padding: 0.5rem 0.7rem;
+    margin: 0 0 0.6rem;
+  }
+  .mint-verbs legend {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: ${PALETTE.fgMuted};
+    font-family: ${FONT_MONO};
+    padding: 0 0.3rem;
+  }
+  .mint-verb-option {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    margin: 0.3rem 0;
+  }
+  .mint-verb-option input { margin: 0; }
+  .mint-form .btn { margin-top: 0.2rem; }
+
+  .minted-banner {
+    border: 1px solid ${PALETTE.accent};
+    background: ${PALETTE.accentSoft};
+    border-radius: 8px;
+    padding: 0.9rem 1rem;
+    margin: 1.25rem 0 0;
+  }
+  .minted-title {
+    font-family: ${FONT_SERIF};
+    font-size: 1.05rem;
+    margin: 0 0 0.3rem;
+    color: ${PALETTE.fg};
+  }
+  .minted-warn { font-size: 0.85rem; margin: 0 0 0.6rem; color: ${PALETTE.fg}; }
+  .minted-banner .copy-row { margin: 0.4rem 0; }
+  .minted-banner .copy-row code { font-size: 0.72rem; }
+  .minted-hint { font-size: 0.8rem; color: ${PALETTE.fgMuted}; margin: 0.4rem 0 0; }
+
+  .mint-error-banner {
+    border: 1px solid ${PALETTE.danger};
+    background: ${PALETTE.dangerSoft};
+    color: ${PALETTE.danger};
+    border-radius: 8px;
+    padding: 0.7rem 1rem;
+    margin: 1.25rem 0 0;
+    font-size: 0.88rem;
+  }
+
   code {
     font-family: ${FONT_MONO};
     background: ${PALETTE.bgSoft};
@@ -633,10 +871,14 @@ const STYLES = `
     code { background: #1f1c18; color: #e8e4dc; }
     .copy-row code { background: transparent; }
     .section { border-top-color: #3a362f; }
-    .mcp-method, .vault-notes-cta { border-top-color: #3a362f; }
+    .mcp-method, .vault-notes-cta, .token-mint { border-top-color: #3a362f; }
     .brand-tag { border-color: #3a362f; color: #a8a29a; }
     .copy-row { background: #1f1c18; border-color: #3a362f; }
     .btn-secondary, .btn-copy { color: #e8e4dc; border-color: #3a362f; }
     .btn-secondary:hover, .btn-copy:hover { background: #1f1c18; border-color: ${PALETTE.accent}; }
+    .token-mint > summary { color: #f0ece4; }
+    .token-mint-sub, .token-mint-intro, .mint-verbs legend, .minted-hint { color: #a8a29a; }
+    .mint-verbs { border-color: #3a362f; }
+    .minted-title, .minted-warn { color: #f0ece4; }
   }
 `;

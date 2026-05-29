@@ -59,9 +59,11 @@ import { isTotpEnrolled } from "./two-factor-store.ts";
 import {
   PASSWORD_MAX_LEN,
   UserNotFoundError,
+  type VaultVerb,
   getUserById,
   isFirstAdmin,
   validatePassword,
+  vaultVerbsForUserVault,
   verifyPassword,
 } from "./users.ts";
 
@@ -490,6 +492,15 @@ export function handleAccountHomeGet(req: Request, deps: AccountHomeDeps): Respo
   const adminFlag = isFirstAdmin(deps.db, user.id);
   const csrf = ensureCsrfToken(req);
   const extra: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
+  // Per-vault mintable verbs for the "mint an access token" affordance on each
+  // tile. Reads the assignment role (today always write → ["read", "write"])
+  // so the UI only ever offers a verb the POST handler would accept. Empty for
+  // the admin / no-vault branches (no assigned vaults to iterate).
+  const mintableVerbs: Record<string, VaultVerb[]> = {};
+  for (const v of user.assignedVaults) {
+    const verbs = vaultVerbsForUserVault(deps.db, user.id, v);
+    if (verbs && verbs.length > 0) mintableVerbs[v] = verbs;
+  }
   return htmlResponse(
     renderAccountHome({
       username: user.username,
@@ -499,6 +510,7 @@ export function handleAccountHomeGet(req: Request, deps: AccountHomeDeps): Respo
       isFirstAdmin: adminFlag,
       csrfToken: csrf.token,
       twoFactorEnabled: isTotpEnrolled(deps.db, user.id),
+      mintableVerbs,
     }),
     200,
     extra,
