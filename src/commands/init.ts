@@ -299,7 +299,7 @@ async function promptExposeChoice(
   log("Do you want to expose it publicly so you can reach it from other devices?");
   const mark = (c: ExposeChoice) => (c === defaultChoice ? " (default)" : "");
   log(`  1) No — keep it loopback-only${mark("none")}`);
-  log(`  2) Yes via Tailscale Funnel (private to your devices)${mark("tailnet")}`);
+  log(`  2) Yes, private to your tailnet (Tailscale \`serve\`)${mark("tailnet")}`);
   log(`  3) Yes via Cloudflare Tunnel (public HTTPS, your own domain)${mark("cloudflare")}`);
   log("");
 
@@ -554,7 +554,7 @@ async function runExposureChoice(
 ): Promise<number> {
   if (choice === "none") return 0;
   if (choice === "tailnet") {
-    ctx.log("Setting up Tailscale Funnel…");
+    ctx.log("Setting up private tailnet access (Tailscale `serve`)…");
     return await ctx.exposeTailnetImpl();
   }
   // cloudflare
