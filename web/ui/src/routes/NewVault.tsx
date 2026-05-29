@@ -70,12 +70,13 @@ export function NewVault() {
   };
 
   if (state.kind === "created") {
-    return (
-      <CreatedView
-        result={state.result}
-        onDone={() => navigate(`/${encodeURIComponent(state.result.name)}`)}
-      />
-    );
+    // Dismiss → vaults list. There is no per-vault detail route in the
+    // SPA (App.tsx routes are /, /vaults, /vaults/new, /modules, …); the
+    // old `/${name}` target resolved to e.g. `/work` and fell through to
+    // the catch-all "404 — back to vaults". `/vaults` is the real,
+    // existing post-create landing surface. Caught during team onboarding
+    // — "Done — I've saved the token" 404'd after every vault create.
+    return <CreatedView result={state.result} onDone={() => navigate("/vaults")} />;
   }
 
   return (
@@ -182,7 +183,9 @@ function CreatedView({
             <code>parachute-vault mint-token</code>.
           </p>
           <div className="actions">
-            <Link to={`/${encodeURIComponent(result.name)}`}>
+            {/* No per-vault detail route exists — land on the vaults list
+                (same fix as the 201 "Done" path above). */}
+            <Link to="/vaults">
               <button type="button">Continue</button>
             </Link>
           </div>
