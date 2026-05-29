@@ -362,6 +362,51 @@ describe("parachute start", () => {
     }
   });
 
+  test("self-heals a stale-loopback vault/.env from a cloudflare expose-state on restart", async () => {
+    // Existing-broken-deploy shape: a Cloudflare deploy whose vault/.env had a
+    // loopback PARACHUTE_HUB_ORIGIN baked in (or was unset and a prior run
+    // wrote loopback). expose-state.json carries the real public origin. A
+    // plain `parachute start vault` must rewrite vault/.env to the public
+    // origin so the daemon stops 401ing hub tokens — the self-heal half of the
+    // Cloudflare 401 fix.
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writeFileSync(
+        join(h.configDir, "expose-state.json"),
+        JSON.stringify({
+          version: 1,
+          layer: "public",
+          mode: "subdomain",
+          canonicalFqdn: "gitcoin-parachute.unforced.dev",
+          port: 1939,
+          funnel: false,
+          entries: [{ kind: "proxy", mount: "/", target: "http://localhost:1939", service: "hub" }],
+          hubOrigin: "https://gitcoin-parachute.unforced.dev",
+        }),
+      );
+      // Pre-seed vault/.env with a stale loopback value (the broken state).
+      mkdirSync(join(h.configDir, "vault"), { recursive: true });
+      writeFileSync(
+        join(h.configDir, "vault", ".env"),
+        "PARACHUTE_HUB_ORIGIN=http://127.0.0.1:1939\n",
+      );
+      const spawner = makeSpawner([4242]);
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      expect(readEnvFileValues(join(h.configDir, "vault", ".env")).PARACHUTE_HUB_ORIGIN).toBe(
+        "https://gitcoin-parachute.unforced.dev",
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("does NOT persist a loopback origin into vault/.env (would shadow a later exposure)", async () => {
     const h = makeHarness();
     try {
