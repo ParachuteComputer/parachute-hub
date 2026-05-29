@@ -77,6 +77,10 @@
  *                                                 reachable directly to rotate)
  *   /account/2fa                  (GET + POST) → user self-service 2FA enroll/disenroll
  *                                                 (hub#473; QR + backup codes)
+ *   /account/vault-token/<name>   (POST)       → friend mints a scoped
+ *                                                 vault:<name>:read|write bearer for
+ *                                                 an ASSIGNED vault (headless clients;
+ *                                                 session + assignment + scope-capped)
  *   /admin/config*                             → 301 → /admin/vaults (legacy
  *                                                portal retired post-SPA-rework)
  *
@@ -113,6 +117,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pkg from "../package.json" with { type: "json" };
+import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
 import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
 import { handleListGrants, handleRevokeGrant } from "./admin-grants.ts";
 import {
@@ -2084,6 +2089,23 @@ export function hubFetch(
       if (req.method === "GET") return handleTwoFactorGet(req, twoFactorDeps);
       if (req.method === "POST") return handleTwoFactorPost(req, twoFactorDeps);
       return new Response("method not allowed", { status: 405 });
+    }
+
+    // /account/vault-token/<name> — friend-facing scoped vault token mint.
+    // POST-only, session-gated, assignment-capped: a non-admin friend mints a
+    // `vault:<name>:read|write` bearer for a vault they're ASSIGNED to, for
+    // scripts / headless clients that can't do browser OAuth. The handler
+    // enforces session → assignment → scope-cap (never `:admin`, never a
+    // vault outside the assignment, never a broader verb than the role
+    // grants) + CSRF + per-user rate limit. Must precede the `/account/`
+    // match below (more specific prefix). See `account-vault-token.ts`.
+    if (pathname.startsWith("/account/vault-token/")) {
+      if (!getDb) return dbNotConfigured();
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+      const vaultName = decodeURIComponent(pathname.slice("/account/vault-token/".length));
+      const db = getDb();
+      const hubOrigin = resolveIssuer(req, db, configuredIssuer);
+      return handleAccountVaultTokenPost(req, vaultName, { db, hubOrigin });
     }
 
     // /account/ — friend-facing user home (multi-user Phase 1 follow-up).

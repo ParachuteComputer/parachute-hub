@@ -93,6 +93,22 @@ export const CHANGE_PASSWORD_MAX_ATTEMPTS = 3;
 export const TOTP_WINDOW_MS = 15 * 60 * 1000;
 /** `/login/2fa` attempts allowed per window. 6th within the window is denied. */
 export const TOTP_MAX_ATTEMPTS = 5;
+/**
+ * `POST /account/vault-token/<name>` window length: 10 minutes. The endpoint
+ * is session-gated and assignment-capped (a friend can only mint
+ * `vault:<assigned>:read|write`), so this limiter isn't the primary defense —
+ * it's a floor that stops a compromised session (stolen cookie) from
+ * machine-gunning the registry with mint rows. Keyed by user-id (identity is
+ * established by the session before the limiter is reached), same posture as
+ * the change-password limiter.
+ */
+export const VAULT_TOKEN_MINT_WINDOW_MS = 10 * 60 * 1000;
+/**
+ * `POST /account/vault-token/<name>` attempts allowed per window. A friend
+ * minting a token for a script does it a handful of times at most; 10 per 10
+ * minutes is generous for a human and still chokes a stolen-cookie flood.
+ */
+export const VAULT_TOKEN_MINT_MAX_ATTEMPTS = 10;
 /** Sentinel for the IP-extraction priority chain when nothing parsed. */
 export const UNKNOWN_IP_SENTINEL = "unknown";
 
@@ -219,6 +235,18 @@ export const changePasswordRateLimiter = new RateLimiter(
 export const totpRateLimiter = new RateLimiter(TOTP_MAX_ATTEMPTS, TOTP_WINDOW_MS);
 
 /**
+ * `POST /account/vault-token/<name>` rate limiter — per-user, 10 attempts /
+ * 10 min (friend vault-token mint). Keyed by user-id (session-gated endpoint,
+ * identity established before this limiter is reached). Separate bucket from
+ * change-password so a token-mint flurry and a password-change flurry don't
+ * share a window.
+ */
+export const vaultTokenMintRateLimiter = new RateLimiter(
+  VAULT_TOKEN_MINT_MAX_ATTEMPTS,
+  VAULT_TOKEN_MINT_WINDOW_MS,
+);
+
+/**
  * Backwards-compat shim for hub#188's call sites: the original
  * top-level `checkAndRecord` was the login limiter. New code should
  * reach into `loginRateLimiter.checkAndRecord` directly.
@@ -237,6 +265,7 @@ export function __resetForTests(): void {
   loginRateLimiter.reset();
   changePasswordRateLimiter.reset();
   totpRateLimiter.reset();
+  vaultTokenMintRateLimiter.reset();
 }
 
 /**

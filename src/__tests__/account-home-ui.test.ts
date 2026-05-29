@@ -262,4 +262,138 @@ describe("renderAccountHome", () => {
     // The escaped vault name also flows into the connect command + endpoint.
     expect(html).toContain("parachute-&lt;vault&gt;");
   });
+
+  // --- friend vault-token mint affordance (the new surface) ----------------
+
+  test("mint affordance — read+write tile offers both verbs, POSTs to the right path", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["work"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { work: ["read", "write"] },
+    });
+    // The collapsible mint block is present, framed as secondary (headless).
+    expect(html).toContain('data-testid="token-mint"');
+    expect(html).toContain("Mint an access token");
+    expect(html).toContain("for scripts / headless clients");
+    // Both verb radios render.
+    expect(html).toContain('data-testid="mint-verb-read"');
+    expect(html).toContain('data-testid="mint-verb-write"');
+    // Form POSTs to the per-vault endpoint with the CSRF token embedded.
+    expect(html).toContain('action="/account/vault-token/work"');
+    expect(html).toContain('method="POST"');
+    expect(html).toContain('data-testid="mint-form"');
+    expect(html).toContain(CSRF);
+    // Recommends the no-token path as default.
+    expect(html).toContain("no-token");
+  });
+
+  test("mint affordance — a read-only role offers ONLY the read verb", () => {
+    // Today every assignment is write-role, but the renderer is verb-blind to
+    // the role: it shows exactly the verbs it's handed. A read-only cap must
+    // never surface a write radio (the server would reject it anyway).
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["work"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { work: ["read"] },
+    });
+    expect(html).toContain('data-testid="mint-verb-read"');
+    expect(html).not.toContain('data-testid="mint-verb-write"');
+  });
+
+  test("mint affordance — never offers an admin verb", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["work"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { work: ["read", "write"] },
+    });
+    expect(html).not.toContain('value="admin"');
+    expect(html).not.toContain('data-testid="mint-verb-admin"');
+  });
+
+  test("mint affordance — absent when no mintable verbs (admin / no-vault / unmapped role)", () => {
+    // Admin branch: no tiles at all, so no mint block.
+    const admin = renderAccountHome({
+      username: "admin",
+      assignedVaults: [],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: true,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    expect(admin).not.toContain('data-testid="token-mint"');
+    // Assigned vault but empty verb list (fail-closed unknown role) → no block.
+    const empty = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["work"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { work: [] },
+    });
+    expect(empty).not.toContain('data-testid="token-mint"');
+  });
+
+  test("minted-token banner — shows the token once with a save-it warning, no revoke claim", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["work"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { work: ["read", "write"] },
+      mintedToken: {
+        vaultName: "work",
+        verb: "read",
+        token: "eyJhbGciOi.FAKE.TOKEN",
+        expiresInDays: 90,
+      },
+    });
+    expect(html).toContain('data-testid="minted-token-banner"');
+    expect(html).toContain("eyJhbGciOi.FAKE.TOKEN");
+    expect(html).toContain('data-testid="copy-minted-token"');
+    // Explicit "won't be shown again" + the scope + the TTL.
+    expect(html).toContain("won't be shown again");
+    expect(html).toContain("vault:work:read");
+    expect(html).toContain("90 days");
+    // No false revoke-yourself promise (no friend-facing revoke today).
+    expect(html).toContain("ask the hub operator");
+  });
+
+  test("mint error banner — surfaces an inline authorization error", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["work"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { work: ["read", "write"] },
+      mintError: 'You\'re not assigned to a vault named "other".',
+    });
+    expect(html).toContain('data-testid="mint-error-banner"');
+    expect(html).toContain("not assigned");
+    // Error render must NOT also show a token.
+    expect(html).not.toContain('data-testid="minted-token-banner"');
+  });
 });
