@@ -783,6 +783,159 @@ describe("parachute start", () => {
       h.cleanup();
     }
   });
+
+  // hub#487 — readiness gating beyond the bare liveness settle. Aaron hit this
+  // on a fresh EC2 box: `parachute start vault` printed "✓ vault started" while
+  // the process died ~instantly on EADDRINUSE (an orphan held 1940), and
+  // `parachute status` then showed it inactive.
+
+  /**
+   * A stub spawner that also seeds the service's log file with `content`, so
+   * the readiness-failure path's log-tail + EADDRINUSE detection can read a
+   * realistic boot error. Mirrors how the real spawner appends stdout/stderr
+   * to the logfile.
+   */
+  function makeSpawnerWithLog(pid: number, content: string): SpawnerStub {
+    const calls: SpawnerStub["calls"] = [];
+    return {
+      calls,
+      spawn(cmd, logFile, opts) {
+        calls.push({ cmd: [...cmd], logFile, env: opts?.env, cwd: opts?.cwd });
+        // The start path calls ensureLogPath() before spawn, so logFile's
+        // parent dir already exists — just write the simulated boot output.
+        writeFileSync(logFile, content);
+        return pid;
+      },
+    };
+  }
+
+  test("hub#487: EADDRINUSE in the log → port-in-use message + log tail, not ✓", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const spawner = makeSpawnerWithLog(
+        4242,
+        "booting vault…\nerror: listen EADDRINUSE: address already in use 0.0.0.0:1940\n",
+      );
+      const lines: string[] = [];
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        alive: () => false, // process died right after the EADDRINUSE throw
+        sleep: async () => {},
+        startSettleMs: 1,
+        log: (l) => lines.push(l),
+      });
+      expect(code).toBe(1);
+      expect(readPid("vault", h.configDir)).toBeUndefined();
+      const out = lines.join("\n");
+      expect(out).toMatch(/port 1940 is already in use/);
+      expect(out).toMatch(/lsof -ti:1940/);
+      // The real boot error is surfaced inline so the operator doesn't have to
+      // go tail the log themselves.
+      expect(out).toMatch(/EADDRINUSE/);
+      expect(out).not.toMatch(/✓ vault started/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub#487: process survives settle but never binds its port → failure with log tail", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const spawner = makeSpawnerWithLog(4242, "vault crashed mid-boot\n");
+      const lines: string[] = [];
+      let aliveCalls = 0;
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        // Alive through the settle + first readiness poll, then dies — the
+        // slow-EADDRINUSE / crash-after-boot shape.
+        alive: () => {
+          aliveCalls++;
+          return aliveCalls <= 1;
+        },
+        sleep: async () => {},
+        startSettleMs: 1,
+        startReadyMs: 50,
+        startReadyPollMs: 1,
+        portListening: async () => false, // never binds
+        log: (l) => lines.push(l),
+      });
+      expect(code).toBe(1);
+      expect(readPid("vault", h.configDir)).toBeUndefined();
+      const out = lines.join("\n");
+      expect(out).toMatch(/✗ vault failed to start/);
+      expect(out).toMatch(/exited during startup/);
+      expect(out).not.toMatch(/✓ vault started/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub#487: alive but port silent past the window → non-fatal warning, exit 0", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const spawner = makeSpawner([4242]);
+      const lines: string[] = [];
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        alive: () => true, // stays up the whole time
+        sleep: async () => {},
+        startSettleMs: 1,
+        startReadyMs: 10,
+        startReadyPollMs: 1,
+        portListening: async () => false, // slow boot — not listening yet
+        log: (l) => lines.push(l),
+      });
+      // A slow-but-alive daemon isn't a hard failure — we warn rather than fail.
+      expect(code).toBe(0);
+      expect(readPid("vault", h.configDir)).toBe(4242);
+      const out = lines.join("\n");
+      expect(out).toMatch(/port 1940 isn't accepting connections yet/);
+      expect(out).not.toMatch(/✓ vault started/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub#487: alive + port listening → success", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const spawner = makeSpawner([4242]);
+      const lines: string[] = [];
+      let probeCalls = 0;
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        alive: () => true,
+        sleep: async () => {},
+        startSettleMs: 1,
+        startReadyMs: 50,
+        startReadyPollMs: 1,
+        // Not listening on the first poll, bound on the second — exercises the
+        // poll loop rather than an instant true.
+        portListening: async () => {
+          probeCalls++;
+          return probeCalls >= 2;
+        },
+        log: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      expect(readPid("vault", h.configDir)).toBe(4242);
+      expect(lines.join("\n")).toMatch(/✓ vault started \(pid 4242\)/);
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 describe("parachute stop", () => {
