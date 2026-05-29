@@ -217,11 +217,13 @@ describe("cli per-subcommand help", () => {
     expect(stderr).toMatch(/parachute install vault/);
   });
 
-  test("vault tokens create in non-TTY passes through without prompting", async () => {
-    // Spawned-subprocess stdio is piped, so isTtyInteractive() returns false
-    // and the command falls through to the passthrough. Clearing PATH forces
-    // ENOENT — same probe as the `vault no-args` test. If we regressed into
-    // prompting, this subprocess would hang on stdin instead of exiting 127.
+  test("vault tokens create forwards verbatim to parachute-vault", async () => {
+    // The guided interactive wrapper was removed with the pvt_* DROP (vault
+    // #412 / hub#466) — `vault tokens create` now always forwards transparently
+    // to parachute-vault (which exits 1 with migration guidance on a real box).
+    // Clearing PATH forces ENOENT — same probe as the `vault no-args` test.
+    // If we ever re-introduced a hub-side prompt, this subprocess would hang on
+    // stdin instead of exiting 127.
     const proc = Bun.spawn([process.execPath, CLI, "vault", "tokens", "create"], {
       stdout: "pipe",
       stderr: "pipe",

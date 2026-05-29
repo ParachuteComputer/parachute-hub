@@ -233,11 +233,13 @@ function printAuthGuidance(log: (line: string) => void, vaultUrl: string): void 
   log("    then point your connector at:");
   log(`    ${vaultUrl}`);
   log("");
-  log("  Scripts / machines:");
-  log("    parachute vault tokens create       # creates a pvt_… bearer token");
-  log("    Authorization: Bearer pvt_…         # attach to every request");
+  log("  Scripts / machines (hub-issued JWT — set the owner password first):");
+  log("    parachute auth mint-token --scope vault:<name>:read   # or :write");
+  log("    Authorization: Bearer <hub-jwt>     # attach the printed token to every request");
+  log("    (or: Admin → Vaults → Connect mints one and shows the header for you)");
   log("");
-  log("Neither is a prerequisite for the other. Full auth reference:");
+  log("The owner password gates both paths — browser sign-in and minting tokens.");
+  log("Full auth reference:");
   log(`  ${AUTH_DOC_URL}`);
 }
 

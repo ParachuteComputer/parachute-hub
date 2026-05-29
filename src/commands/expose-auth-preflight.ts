@@ -2,20 +2,28 @@
  * Post-exposure auth nudge. Runs after `parachute expose public` successfully
  * brings a tunnel up (TTY only). The tunnel is already live; this is purely
  * advisory — we never error the exposure flow regardless of what the user
- * chooses. The goal is to catch the "fresh vault, just went public, no
- * password or tokens set" trap before someone else finds it first.
+ * chooses. The goal is to catch the "fresh vault, just went public, no auth
+ * configured" trap before someone else finds it first.
  *
- * Four states we branch on, based on {@link VaultAuthStatus}:
+ * The load-bearing signal is the **owner password**. Post-pvt_*-DROP (vault
+ * #412 / hub#466), the vault `tokens` table holds only vestigial pvt_* rows;
+ * a non-zero count no longer means "API auth is configured." Access is now
+ * hub-issued JWTs, minted against the operator's identity — and minting that
+ * identity requires the owner password (browser OAuth) or the operator token
+ * that `set-password` seeds. So "has an owner password" is the single gate
+ * that tells us whether *any* authenticated access is reachable. We branch
+ * purely on password + 2FA; we no longer count vault-DB rows for the auth
+ * decision.
  *
- *   - neither password nor tokens: loud warning + offer to set up each.
+ * Three states we branch on, based on {@link VaultAuthStatus}:
+ *
+ *   - no owner password: loud warning — the exposure is wide open. Offer to
+ *     set a password (+ 2FA), and point at the hub-JWT mint path for clients.
  *   - password, no 2FA: shorter "recommend 2FA" nudge.
- *   - tokens but no password: OAuth isn't set up; offer to add a password.
- *   - `tokenCount === null`: couldn't read the DB; advisory only, no prompts
- *     that depend on token state.
- *   - all set: one-line "looks good" (the quiet path).
+ *   - password + 2FA: one-line "looks good" (the quiet path).
  *
  * Defaults are always "skip" — Enter declines every prompt. User can always
- * run `parachute auth …` or `parachute vault tokens create` later.
+ * run `parachute auth set-password` / `parachute auth mint-token …` later.
  */
 
 import { createInterface } from "node:readline/promises";
@@ -106,10 +114,25 @@ async function offerTotp(r: Resolved): Promise<void> {
   }
 }
 
-async function offerTokenCreate(r: Resolved): Promise<void> {
-  if (await yesNo(r, "Create an API token now?")) {
-    await runCmd(r, ["parachute", "vault", "tokens", "create"], "parachute vault tokens create");
-  }
+/**
+ * Programmatic / headless clients don't use a password — they carry a
+ * hub-issued JWT. We don't auto-mint one here (it needs a scope, and the
+ * operator should choose read vs write per client), so this is guidance,
+ * not a prompt. Mint paths, in order of how most operators reach them:
+ *
+ *   - Admin SPA → Vaults → "Connect" card (mints + shows the header command).
+ *   - `parachute auth mint-token --scope vault:<name>:<verb>` (pipeable JWT).
+ *
+ * The old affordance ran `parachute vault tokens create`, which exits 1
+ * post-DROP (vault no longer mints pvt_* tokens) — we never offer it.
+ */
+function printTokenGuidance(r: Resolved): void {
+  const name = r.status.vaultNames[0] ?? "<name>";
+  r.log("");
+  r.log("For programmatic / headless clients (scripts, CI), mint a hub token:");
+  r.log("  • Admin → Vaults → Connect  (mints a scope-narrow token + copy-paste header)");
+  r.log(`  • parachute auth mint-token --scope vault:${name}:read   # or :write`);
+  r.log("    → attach the printed JWT as  Authorization: Bearer <hub-jwt>");
 }
 
 function printDivider(r: Resolved): void {
@@ -118,24 +141,27 @@ function printDivider(r: Resolved): void {
 }
 
 /**
- * `neither password nor tokens`: the exposure is wide open — anyone who
- * finds the URL can talk to the vault. The loudest warning we draw.
+ * `no owner password`: the exposure is wide open — without a password,
+ * nobody can sign in and no hub JWT can be minted, so there's no auth gate
+ * at all. The loudest warning we draw.
  */
 async function handleWideOpen(r: Resolved): Promise<void> {
   printDivider(r);
-  r.log("⚠  No owner password and no API tokens are configured.");
+  r.log("⚠  No owner password is configured.");
   r.log("   The tunnel is reachable from the public internet RIGHT NOW.");
   r.log("   Anyone with the URL can make requests until you set auth up.");
   r.log("");
-  r.log("Recommended: set an owner password (enables the browser sign-in flow)");
-  r.log("and/or create an API token (for programmatic clients).");
+  r.log("Recommended: set an owner password — it's the gate for both browser");
+  r.log("sign-in (OAuth) and minting hub tokens for programmatic clients.");
   r.log("");
   await offerOwnerPassword(r);
   // Offer 2FA regardless of the password step outcome: we can't observe it
   // from outside the subprocess, and vault itself will reject a 2fa enroll
   // if there's no password yet, surfacing the real error to the user.
   await offerTotp(r);
-  await offerTokenCreate(r);
+  // Programmatic-client guidance is informational (no auto-mint) — print it
+  // so the operator knows the headless path exists, not the dead pvt_* one.
+  printTokenGuidance(r);
   printDivider(r);
 }
 
@@ -151,52 +177,24 @@ async function handlePasswordNoTotp(r: Resolved): Promise<void> {
 }
 
 /**
- * `tokens exist, no password`: vault is authenticated for API clients but
- * nobody can sign in through a browser — the hub's OAuth flow is dead in
- * the water. Offer to fix.
- */
-async function handleTokensNoPassword(r: Resolved): Promise<void> {
-  r.log("");
-  r.log("ℹ  API tokens exist, but no owner password is set.");
-  r.log("   Browser sign-in (OAuth) won't work until you add one.");
-  await offerOwnerPassword(r);
-}
-
-/**
- * `tokenCount === null`: SQLite probe failed (DB missing, locked, schema
- * drift, whatever). Don't guess; don't prompt on token state. Nudge 2FA
- * if we know the password is set, otherwise stay quiet.
- */
-async function handleUnknownTokens(r: Resolved): Promise<void> {
-  r.log("");
-  r.log("ℹ  Couldn't read vault token state (vault may be locked or offline).");
-  r.log("   Run `parachute vault tokens list` to check token config yourself.");
-  if (r.status.hasOwnerPassword && !r.status.hasTotp) {
-    r.log("");
-    r.log("   (While you're here: owner password is set, 2FA is not.)");
-    await offerTotp(r);
-  }
-}
-
-/**
- * `all set`: password + 2FA + at least one token. Keep it tight.
+ * `all set`: owner password + 2FA. Keep it tight. (We don't assert on
+ * tokens — a hub JWT is minted on demand, not a standing prerequisite.)
  */
 function handleAllGood(r: Resolved): void {
   r.log("");
-  r.log("✓  Auth config looks good (password + 2FA + API tokens).");
+  r.log("✓  Auth config looks good (owner password + 2FA).");
 }
 
 /**
  * Pick the branch. Pure function of the status — keeps test coverage trivial.
+ *
+ * Owner-password-centric since the pvt_* DROP (hub#466): `tokenCount` is no
+ * longer consulted — those rows are vestigial and minting access now flows
+ * through the owner password, not a standing vault token. Three states.
  */
-function classify(
-  s: VaultAuthStatus,
-): "wide-open" | "password-no-totp" | "tokens-no-password" | "unknown-tokens" | "all-good" {
-  if (s.tokenCount === null) return "unknown-tokens";
-  const hasTokens = s.tokenCount > 0;
-  if (!s.hasOwnerPassword && !hasTokens) return "wide-open";
-  if (!s.hasOwnerPassword && hasTokens) return "tokens-no-password";
-  if (s.hasOwnerPassword && !s.hasTotp) return "password-no-totp";
+function classify(s: VaultAuthStatus): "wide-open" | "password-no-totp" | "all-good" {
+  if (!s.hasOwnerPassword) return "wide-open";
+  if (!s.hasTotp) return "password-no-totp";
   return "all-good";
 }
 
@@ -208,12 +206,6 @@ export async function runAuthPreflight(opts: AuthPreflightOpts = {}): Promise<vo
       return;
     case "password-no-totp":
       await handlePasswordNoTotp(r);
-      return;
-    case "tokens-no-password":
-      await handleTokensNoPassword(r);
-      return;
-    case "unknown-tokens":
-      await handleUnknownTokens(r);
       return;
     case "all-good":
       handleAllGood(r);
