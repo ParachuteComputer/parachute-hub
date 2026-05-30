@@ -70,18 +70,20 @@ COPY . .
 # --ignore-scripts to keep the install layer source-independent).
 RUN bun run build:spa
 
-# Build the workspace package dists. `@openparachute/depcheck` is imported at
-# boot (src/cli.ts) and its `exports` resolve to `./dist/index.js`. The install
-# above ran `--ignore-scripts` (so no build hook fired) and the host's `dist/`
-# is `.dockerignore`d — without an explicit build here the runtime stage copies
-# a package with no `dist/`, Bun can't resolve the module, and the hub crashes
-# on boot before binding :1939 (caught by the container smoke after the depcheck
-# `bun`→src exports condition was dropped — that condition had been masking this
-# by resolving to `src/` under Bun). scope-guard built too for parity. Both are
-# tsc-only (no bundler), and the runtime stage's `COPY --from=builder packages`
-# carries the emitted `dist/` along (inter-stage COPY ignores `.dockerignore`).
-RUN (cd packages/depcheck && bun run build) \
- && (cd packages/scope-guard && bun run build)
+# Build every workspace package's `dist/` before the runtime stage copies
+# `packages/`. `@openparachute/depcheck` is imported at boot (src/cli.ts) and
+# its `exports` resolve to `./dist/index.js`; the install above ran
+# `--ignore-scripts` (no build hook) and the host's `dist/` is `.dockerignore`d,
+# so without a build here the runtime image ships a package with no `dist/`, Bun
+# can't resolve the module, and the hub crashes on boot before binding :1939
+# (the container smoke caught this after depcheck's `bun`→src exports condition
+# was dropped — that condition had masked it by resolving to `src/` under Bun).
+# Looping over every package keeps this self-healing as the workspace grows
+# rather than enumerating the one package that happens to be boot-imported today
+# (every package in `packages/` is a tsc-only lib with a `build` script). The
+# runtime stage's `COPY --from=builder packages` carries the emitted `dist/`
+# along (inter-stage COPY ignores `.dockerignore`).
+RUN for pkg in packages/*/; do (cd "$pkg" && bun run build); done
 
 # ---- Runtime stage --------------------------------------------------------
 
