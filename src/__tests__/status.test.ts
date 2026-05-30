@@ -76,6 +76,42 @@ describe("status", () => {
     }
   });
 
+  test("persisted lastStartError surfaces on a continuation line", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      upsertService(
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/"],
+          health: "/health",
+          version: "0.2.4",
+          lastStartError: {
+            error_type: "missing_dependency",
+            error_description: "parachute-vault is required ...",
+            binary: "parachute-vault",
+            install: { generic: "parachute install vault" },
+          },
+        },
+        path,
+      );
+      const lines: string[] = [];
+      await status({
+        manifestPath: path,
+        // Probe refuses (service down) — the row is failing, and the
+        // start-error note explains why.
+        fetchImpl: async () => {
+          throw new Error("ECONNREFUSED");
+        },
+        print: (l) => lines.push(l),
+      });
+      const out = lines.join("\n");
+      expect(out).toMatch(/failed to start: parachute-vault not installed/);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("any-failing returns 1 and surfaces probe detail on continuation line", async () => {
     const { path, cleanup } = makeTempPath();
     try {

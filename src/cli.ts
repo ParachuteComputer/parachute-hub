@@ -6,6 +6,7 @@
  * Run `parachute --help` or `parachute <subcommand> --help` for usage.
  */
 
+import { MissingDependencyError } from "@openparachute/depcheck";
 import pkg from "../package.json" with { type: "json" };
 import { CloudflaredStateError } from "./cloudflare/state.ts";
 import { auth } from "./commands/auth.ts";
@@ -784,6 +785,14 @@ async function run(argv: string[]): Promise<number> {
   try {
     return await main(argv);
   } catch (err) {
+    if (err instanceof MissingDependencyError) {
+      // A required external binary wasn't on PATH (git / tailscale / tail /
+      // …). Print the friendly install block to stderr. interactive:true so
+      // the operator at a terminal sees the "ask your sysadmin" trailer; the
+      // message was already formatted at construction, so we just emit it.
+      console.error(err.message);
+      return 1;
+    }
     if (err instanceof ServicesManifestError) {
       console.error(`services.json is malformed: ${err.message}`);
       console.error("Fix or remove the file, then re-run.");

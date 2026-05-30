@@ -1,6 +1,11 @@
 import { existsSync, openSync, readFileSync } from "node:fs";
 import { Socket } from "node:net";
 import { join } from "node:path";
+import {
+  MissingDependencyError,
+  ensureExecutable,
+  rethrowIfMissing,
+} from "@openparachute/depcheck";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { readEnvFileValues } from "../env-file.ts";
 import { readExposeState } from "../expose-state.ts";
@@ -35,7 +40,12 @@ import {
   knownServices,
   shortNameForManifest,
 } from "../service-spec.ts";
-import { type ServiceEntry, readManifest } from "../services-manifest.ts";
+import {
+  type ServiceEntry,
+  clearStartError,
+  readManifest,
+  recordStartError,
+} from "../services-manifest.ts";
 import { persistVaultHubOrigin, selfHealVaultHubOrigin } from "../vault-hub-origin-env.ts";
 
 /**
@@ -270,6 +280,21 @@ export interface LifecycleOpts {
    * `ensureHubRunning` and `lifecycle.stop("hub")` dispatches to
    * `stopHub`. Tests inject stubs to avoid spawning real bun processes.
    */
+  /**
+   * PATH-resolution seam for the start preflight (`@openparachute/depcheck`
+   * `ensureExecutable`). Production uses the real `Bun.which`; a missing
+   * startCmd binary then surfaces the friendly missing-dependency UX +
+   * persists it to services.json.
+   *
+   * Defaulting policy mirrors `startSettleMs`: when a stub `spawner` is
+   * injected (the test path) `which` defaults to a permissive resolver
+   * (`() => "<stub>"`) so existing stub-spawner tests don't trip the preflight
+   * against binaries that aren't on the test host's PATH (`parachute-vault`,
+   * `notes-serve`). Production (no spawner override) gets the real `Bun.which`.
+   * Tests that want to exercise the missing-binary branch inject `which`
+   * explicitly (e.g. `which: () => null`).
+   */
+  which?: (cmd: string) => string | null;
   hub?: {
     ensureRunning?: (opts: EnsureHubOpts) => Promise<EnsureHubResult>;
     stop?: (opts: StopHubOpts) => Promise<boolean>;
@@ -303,6 +328,7 @@ interface Resolved {
   portListening: PortListeningFn;
   startReadyMs: number;
   startReadyPollMs: number;
+  which: (cmd: string) => string | null;
   hubOrigin: string | undefined;
   ensureHub: (opts: EnsureHubOpts) => Promise<EnsureHubResult>;
   stopHubFn: (opts: StopHubOpts) => Promise<boolean>;
@@ -368,6 +394,12 @@ function resolve(opts: LifecycleOpts): Resolved {
       opts.startReadyMs ??
       (opts.spawner === undefined || opts.portListening !== undefined ? 4000 : 0),
     startReadyPollMs: opts.startReadyPollMs ?? 200,
+    // Same defaulting policy as startSettleMs/startReadyMs: production (no
+    // spawner override) preflights with the real Bun.which; stub-spawner tests
+    // get a permissive resolver so the preflight doesn't trip against binaries
+    // that aren't on the test host's PATH. Explicit `which` always wins.
+    which:
+      opts.which ?? (opts.spawner === undefined ? Bun.which : () => "/stub/bin/preflight-skipped"),
     hubOrigin: resolveHubOrigin(opts.hubOrigin, configDir),
     ensureHub: opts.hub?.ensureRunning ?? ensureHubRunning,
     stopHubFn: opts.hub?.stop ?? stopHub,
@@ -602,15 +634,57 @@ export async function start(svc: string | undefined, opts: LifecycleOpts = {}): 
     if (entry.installDir) spawnerOpts.cwd = entry.installDir;
     const passOpts =
       spawnerOpts.env !== undefined || spawnerOpts.cwd !== undefined ? spawnerOpts : undefined;
+
+    // Pre-flight the startCmd binary (`@openparachute/depcheck`) so a missing
+    // executable surfaces the friendly install UX inline AND is persisted onto
+    // the services.json row, so a *later* `parachute status` (a separate
+    // invocation that only reads the manifest) + the SPA modules pane show
+    // "vault: failed to start — parachute-vault not installed" with install
+    // info, rather than a bare "failed"/orphan-timeout. The binary is `cmd[0]`
+    // (e.g. `parachute-vault` for an npm install, `bun` for a bun-linked one).
+    const startBinary = cmd[0];
+    if (startBinary) {
+      try {
+        ensureExecutable(startBinary, { which: r.which });
+      } catch (err) {
+        if (err instanceof MissingDependencyError) {
+          failures++;
+          r.log(`✗ ${short} failed to start:`);
+          for (const line of err.message.split("\n")) r.log(`  ${line}`);
+          recordStartError(entry.name, err.toWire(), r.manifestPath);
+          continue;
+        }
+        throw err;
+      }
+    }
+
     let pid: number;
     try {
       pid = r.spawner.spawn(cmd, logFile, passOpts);
     } catch (err) {
+      // Belt-and-suspenders: a missing binary that slipped past the pre-flight
+      // (race) still becomes a MissingDependencyError via rethrowIfMissing.
+      if (startBinary) {
+        try {
+          rethrowIfMissing(err, startBinary);
+        } catch (missing) {
+          if (missing instanceof MissingDependencyError) {
+            failures++;
+            r.log(`✗ ${short} failed to start:`);
+            for (const line of missing.message.split("\n")) r.log(`  ${line}`);
+            recordStartError(entry.name, missing.toWire(), r.manifestPath);
+            continue;
+          }
+        }
+      }
       failures++;
       const msg = err instanceof Error ? err.message : String(err);
       r.log(`✗ ${short} failed to start: ${msg}`);
       continue;
     }
+    // A successful spawn clears any stale start-error recorded from a prior
+    // missing-dependency failure so `parachute status` doesn't keep showing it.
+    clearStartError(entry.name, r.manifestPath);
     writePid(short, pid, r.configDir);
 
     // Boot-readiness gating (hub#194 + hub#487). A spawn returning a pid only
@@ -946,11 +1020,19 @@ export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
       spawn(cmd) {
         // Inherit env so `tail` sees PATH, etc. Bun.spawn defaults to empty
         // env — see api-modules-ops.ts:defaultRun.
-        const proc = Bun.spawn([...cmd], {
-          stdio: ["ignore", "inherit", "inherit"],
-          env: process.env,
-        });
-        return proc.pid;
+        try {
+          const proc = Bun.spawn([...cmd], {
+            stdio: ["ignore", "inherit", "inherit"],
+            env: process.env,
+          });
+          return proc.pid;
+        } catch (err) {
+          // A missing `tail` (minimal container without coreutils) surfaces
+          // the friendly install UX instead of a raw spawn throw. The CLI
+          // top-level catch in cli.ts renders the MissingDependencyError.
+          rethrowIfMissing(err, "tail");
+          throw err;
+        }
       },
     };
     spawner.spawn(["tail", "-n", String(lines), "-f", path], path);

@@ -6,9 +6,11 @@ import {
   type ServiceEntry,
   ServicesManifestError,
   type UiSubUnit,
+  clearStartError,
   findService,
   readManifest,
   readManifestLenient,
+  recordStartError,
   removeService,
   upsertService,
   writeManifest,
@@ -1410,9 +1412,27 @@ describe("readManifestLenient — skips bad entries instead of throwing (hub#406
         path,
         JSON.stringify({
           services: [
-            { name: "parachute-vault", port: 1940, paths: ["/vault/default"], health: "/vault/default/health", version: "0.4.8-rc.10" },
-            { name: "parachute-surface", port: 1946, paths: ["/surface"], health: "/surface/healthz", version: "0.2.0-rc.13" },
-            { name: "widget", port: 0, paths: ["/widget"], health: "/widget/health", version: "0.0.1" },
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.8-rc.10",
+            },
+            {
+              name: "parachute-surface",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.2.0-rc.13",
+            },
+            {
+              name: "widget",
+              port: 0,
+              paths: ["/widget"],
+              health: "/widget/health",
+              version: "0.0.1",
+            },
           ],
         }),
       );
@@ -1479,12 +1499,110 @@ describe("readManifestLenient — skips bad entries instead of throwing (hub#406
       writeFileSync(
         path,
         JSON.stringify({
-          services: [{ name: "widget", port: 0, paths: ["/widget"], health: "/widget/health", version: "0.0.1" }],
+          services: [
+            {
+              name: "widget",
+              port: 0,
+              paths: ["/widget"],
+              health: "/widget/health",
+              version: "0.0.1",
+            },
+          ],
         }),
       );
       expect(() => readManifest(path)).toThrow(ServicesManifestError);
     } finally {
       cleanup();
     }
+  });
+
+  describe("lastStartError", () => {
+    const wire = {
+      error_type: "missing_dependency",
+      error_description: "parachute-vault is required ...",
+      binary: "parachute-vault",
+      why: "run the Vault module Hub supervises",
+      docs_url: "https://parachute.computer",
+      install: { generic: "parachute install vault" },
+      sysadmin_hint: "Or ask your system administrator to install it for you.",
+    };
+
+    test("recordStartError persists the wire + stamps `at`", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(vault, path);
+        recordStartError("parachute-vault", wire, path);
+        const entry = readManifest(path).services.find((s) => s.name === "parachute-vault");
+        expect(entry?.lastStartError?.error_type).toBe("missing_dependency");
+        expect(entry?.lastStartError?.binary).toBe("parachute-vault");
+        expect(entry?.lastStartError?.install?.generic).toBe("parachute install vault");
+        expect(entry?.lastStartError?.at).toBeDefined();
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("recordStartError is a no-op when the row is absent", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(vault, path);
+        recordStartError("parachute-scribe", wire, path);
+        const scribe = readManifest(path).services.find((s) => s.name === "parachute-scribe");
+        expect(scribe).toBeUndefined();
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("clearStartError removes a recorded error", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        upsertService(vault, path);
+        recordStartError("parachute-vault", wire, path);
+        clearStartError("parachute-vault", path);
+        const entry = readManifest(path).services.find((s) => s.name === "parachute-vault");
+        expect(entry?.lastStartError).toBeUndefined();
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("lastStartError round-trips through validation", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        const withErr: ServiceEntry = {
+          ...vault,
+          lastStartError: { ...wire, at: "2026-05-29T00:00:00Z" },
+        };
+        upsertService(withErr, path);
+        const entry = readManifest(path).services.find((s) => s.name === "parachute-vault");
+        expect(entry?.lastStartError).toEqual({ ...wire, at: "2026-05-29T00:00:00Z" });
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("a malformed lastStartError is dropped, not thrown (diagnostic field)", () => {
+      const { path, cleanup } = makeTempPath();
+      try {
+        writeFileSync(
+          path,
+          JSON.stringify({
+            services: [
+              {
+                ...vault,
+                // missing error_description → invalid shape → dropped
+                lastStartError: { error_type: "missing_dependency" },
+              },
+            ],
+          }),
+        );
+        const entry = readManifest(path).services.find((s) => s.name === "parachute-vault");
+        expect(entry).toBeDefined();
+        expect(entry?.lastStartError).toBeUndefined();
+      } finally {
+        cleanup();
+      }
+    });
   });
 });

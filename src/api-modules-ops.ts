@@ -35,6 +35,7 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
+import { MissingDependencyError, type MissingDependencyWire } from "@openparachute/depcheck";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import { isLinked as defaultIsLinked } from "./bun-link.ts";
 import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
@@ -49,11 +50,7 @@ import {
   getSpec,
   synthesizeManifestForKnownModule,
 } from "./service-spec.ts";
-import {
-  findService,
-  readManifestLenient,
-  removeService,
-} from "./services-manifest.ts";
+import { findService, readManifestLenient, removeService } from "./services-manifest.ts";
 import type { ModuleState, SpawnRequest, Supervisor } from "./supervisor.ts";
 import { WELL_KNOWN_PATH, type regenerateWellKnown } from "./well-known.ts";
 
@@ -81,6 +78,15 @@ export interface Operation {
   log: string[];
   /** Error message when status is `failed`. Mirrored from the underlying throw. */
   error?: string;
+  /**
+   * Structured error detail when the failure is a known typed error — today
+   * only `MissingDependencyError.toWire()` (a missing external binary like
+   * `bun` / `git` during install). The operations-polling SPA switches on
+   * `error_detail.error_type === "missing_dependency"` to render a dedicated
+   * install card; the plain `error` string is the fallback for everything
+   * else. Wire shape matches `@openparachute/depcheck`'s `MissingDependencyWire`.
+   */
+  error_detail?: MissingDependencyWire;
   startedAt: string;
   finishedAt?: string;
 }
@@ -89,7 +95,11 @@ export interface OperationsRegistry {
   create(kind: OperationKind, short: string): Operation;
   get(id: string): Operation | undefined;
   /** Append a log line + (optionally) advance status. */
-  update(id: string, patch: Partial<Pick<Operation, "status" | "error">>, logLine?: string): void;
+  update(
+    id: string,
+    patch: Partial<Pick<Operation, "status" | "error" | "error_detail">>,
+    logLine?: string,
+  ): void;
 }
 
 /**
@@ -122,11 +132,16 @@ class InMemoryOperationsRegistry implements OperationsRegistry {
     return this.ops.get(id);
   }
 
-  update(id: string, patch: Partial<Pick<Operation, "status" | "error">>, logLine?: string): void {
+  update(
+    id: string,
+    patch: Partial<Pick<Operation, "status" | "error" | "error_detail">>,
+    logLine?: string,
+  ): void {
     const op = this.ops.get(id);
     if (!op) return;
     if (patch.status) op.status = patch.status;
     if (patch.error !== undefined) op.error = patch.error;
+    if (patch.error_detail !== undefined) op.error_detail = patch.error_detail;
     if (logLine) op.log.push(logLine);
     if (patch.status === "succeeded" || patch.status === "failed") {
       op.finishedAt = this.clock().toISOString();
@@ -520,11 +535,35 @@ export async function handleInstall(
   // immediately + the work runs in the background. Errors get logged
   // to the operation; nothing throws back to the request handler.
   void runInstall(op.id, short, spec, deps, bodyChannel).catch((err) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    registry.update(op.id, { status: "failed", error: msg }, `install failed: ${msg}`);
+    failOperation(registry, op.id, "install", err);
   });
 
   return acceptedOp(op.id);
+}
+
+/**
+ * Mark an async op failed, attaching the structured `error_detail` wire when
+ * the underlying throw is a `MissingDependencyError` (a missing external
+ * binary like `bun` / `git` during install). The operations-polling SPA reads
+ * `error_detail` to render the dedicated install card; the plain `error`
+ * string is the fallback for every other failure.
+ */
+function failOperation(
+  registry: OperationsRegistry,
+  opId: string,
+  verb: string,
+  err: unknown,
+): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (err instanceof MissingDependencyError) {
+    registry.update(
+      opId,
+      { status: "failed", error: msg, error_detail: err.toWire() },
+      `${verb} failed: ${err.binary} not installed`,
+    );
+    return;
+  }
+  registry.update(opId, { status: "failed", error: msg }, `${verb} failed: ${msg}`);
 }
 
 /**
@@ -722,8 +761,7 @@ export async function handleUpgrade(
   const spec = specFor(short);
 
   void runUpgrade(op.id, short, spec, deps).catch((err) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    registry.update(op.id, { status: "failed", error: msg }, `upgrade failed: ${msg}`);
+    failOperation(registry, op.id, "upgrade", err);
   });
   return acceptedOp(op.id);
 }

@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isBinaryNotFoundError, lookupDep } from "@openparachute/depcheck";
 import type { Runner } from "../tailscale/run.ts";
 
 export const DEFAULT_CLOUDFLARED_HOME = join(homedir(), ".cloudflared");
@@ -10,28 +11,20 @@ export const DEFAULT_CLOUDFLARED_HOME = join(homedir(), ".cloudflared");
  * "binary not on PATH" errors — anything else (EACCES from a non-executable
  * file, corrupted binary, etc.) propagates so we don't silently report
  * "not installed" when something more specific is wrong.
+ *
+ * The not-found matcher is `@openparachute/depcheck`'s `isBinaryNotFoundError`
+ * — the single source of truth across the ecosystem (this used to be a local
+ * copy that drifted from vault's `git-preflight.ts`). Pass the binary name so
+ * a not-found message about an unrelated file isn't mis-attributed.
  */
 export async function isCloudflaredInstalled(runner: Runner): Promise<boolean> {
   try {
     const { code } = await runner(["cloudflared", "--version"]);
     return code === 0;
   } catch (err) {
-    if (isBinaryNotFoundError(err)) return false;
+    if (isBinaryNotFoundError(err, "cloudflared")) return false;
     throw err;
   }
-}
-
-function isBinaryNotFoundError(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  const e = err as { code?: unknown; message?: unknown };
-  if (e.code === "ENOENT") return true;
-  // Bun.spawn's error shape varies across versions; fall back to message
-  // string matching so we catch "Executable not found in $PATH" and
-  // "ENOENT" variants without pinning to one runtime detail.
-  if (typeof e.message === "string") {
-    return /ENOENT|not found|No such file/i.test(e.message);
-  }
-  return false;
 }
 
 /**
@@ -61,30 +54,37 @@ export function isCloudflaredLoggedIn(cloudflaredHome: string = DEFAULT_CLOUDFLA
  *   other  → the binary-download path is still the best generic answer
  *
  * The `arch` parameter is the architecture string in `process.arch`
- * shape (`x64`, `arm64`, `arm`). Mapped to the suffix cloudflared uses
- * in its release artifacts (`amd64`, `arm64`, `arm`). Unknown arches
- * fall through to a generic pointer at the releases page.
+ * shape (`x64`, `arm64`, `arm`). The static-binary curl recipe + the arch
+ * mapping now live in `@openparachute/depcheck`'s `cloudflared` registry
+ * entry (`install.linuxBinaryUrl`) — the single source of truth shared with
+ * the structured `MissingDependencyError` UX. This function keeps its own
+ * prose (the surrounding "works across distros" framing the expose flow
+ * prints) but derives the URL + arch support from the registry so the two
+ * can't drift. A `undefined` recipe (arch with no published artifact) is the
+ * signal to fall through to the generic releases pointer rather than
+ * fabricating a 404-bound URL.
  */
 export function cloudflaredInstallHint(
   platform: NodeJS.Platform = process.platform,
   arch: NodeJS.Architecture = process.arch,
 ): string {
+  const releasesUrl = "https://github.com/cloudflare/cloudflared/releases/latest";
   if (platform === "darwin") {
     return [
       "Install cloudflared:",
       "  brew install cloudflared",
       "",
       "(or download a static binary from",
-      "  https://github.com/cloudflare/cloudflared/releases/latest)",
+      `  ${releasesUrl})`,
     ].join("\n");
   }
   if (platform === "linux") {
-    const suffix = linuxArtifactSuffix(arch);
-    if (suffix) {
+    const downloadUrl = cloudflaredLinuxDownloadUrl(arch);
+    if (downloadUrl) {
       return [
         "Install cloudflared (static binary — works across distros):",
-        `  curl -L -o /usr/local/bin/cloudflared \\`,
-        `    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${suffix}`,
+        "  curl -L -o /usr/local/bin/cloudflared \\",
+        `    ${downloadUrl}`,
         "  sudo chmod +x /usr/local/bin/cloudflared",
         "  cloudflared --version",
         "",
@@ -93,33 +93,28 @@ export function cloudflaredInstallHint(
     }
     return [
       "Install cloudflared from the official binary release:",
-      "  https://github.com/cloudflare/cloudflared/releases/latest",
+      `  ${releasesUrl}`,
       `(pick the linux-* artifact matching your architecture; your arch is "${arch}")`,
     ].join("\n");
   }
-  return [
-    "Install cloudflared from the official binary release:",
-    "  https://github.com/cloudflare/cloudflared/releases/latest",
-  ].join("\n");
+  return ["Install cloudflared from the official binary release:", `  ${releasesUrl}`].join("\n");
 }
 
 /**
- * Map a Node `process.arch` to the suffix Cloudflare uses for its
- * cloudflared-linux-* release artifacts. Returns undefined for arches
- * that don't have a published artifact (we surface a generic pointer
- * in that case instead of fabricating a download URL that 404s).
+ * Pull the cloudflared-linux-<suffix> download URL for an arch out of the
+ * depcheck registry's static-binary recipe. The registry recipe is a
+ * multi-line `curl … / chmod … / version` block; we extract the single
+ * `https://…/cloudflared-linux-<suffix>` line so this function's own prose
+ * wraps the canonical URL. Returns undefined when the arch has no published
+ * artifact (registry recipe is undefined) — the caller then uses the generic
+ * pointer. Keeps the arch→suffix mapping in exactly one place (the registry).
  */
-function linuxArtifactSuffix(arch: NodeJS.Architecture): string | undefined {
-  switch (arch) {
-    case "x64":
-      return "amd64";
-    case "arm64":
-      return "arm64";
-    case "arm":
-      return "arm";
-    case "ia32":
-      return "386";
-    default:
-      return undefined;
-  }
+function cloudflaredLinuxDownloadUrl(arch: NodeJS.Architecture): string | undefined {
+  const recipe = lookupDep("cloudflared")?.install.linuxBinaryUrl?.(arch);
+  if (!recipe) return undefined;
+  const urlLine = recipe
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.startsWith("https://"));
+  return urlLine;
 }
