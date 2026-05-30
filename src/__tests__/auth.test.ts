@@ -1751,6 +1751,26 @@ describe("parachute auth mint-token", () => {
     }
   });
 
+  test("--ephemeral is mutually exclusive with the deprecated --ttl too", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "vault:read", "--ephemeral", "--ttl", "1h"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("--ephemeral");
+      expect(stdout).toBe("");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
   // closes #215 reviewer F1 — privilege-diffusion guard on the CLI mint path.
   test("CLI mint-token rejects parachute:host:auth (non-requestable scope)", async () => {
     const tmp = makeTmp();

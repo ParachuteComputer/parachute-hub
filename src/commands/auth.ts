@@ -894,7 +894,7 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   if (!flags.scope) {
     console.error("parachute auth mint-token: --scope is required");
     console.error(
-      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--expires-in <seconds>] [--sub <sub>] [--permissions <json>]",
+      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--ephemeral | --expires-in <seconds>] [--sub <sub>] [--permissions <json>]",
     );
     return 1;
   }
