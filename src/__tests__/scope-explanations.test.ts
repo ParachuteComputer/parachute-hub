@@ -60,10 +60,18 @@ describe("explainScope", () => {
     expect(explainScope("vault:*:write")?.level).toBe("write");
   });
 
-  test("doesn't promote a per-vault admin (vault:<name>:admin) into an explained scope", () => {
-    // vault:<name>:admin is NON_REQUESTABLE — never appears on the consent
-    // screen. Explicitly not in the verb-pattern, so explainScope returns null.
-    expect(explainScope("vault:default:admin")).toBeNull();
+  // Single-consent change (2026-05-29): vault:<name>:admin is now REQUESTABLE
+  // and reaches the consent screen, so explainScope MUST resolve it to the
+  // vault:admin explanation (level "admin"). This is load-bearing: it makes
+  // scopeIsAdmin("vault:<name>:admin") return true, which the same-hub and
+  // trust-by-name auto-mint gates rely on to keep admin consent-gated.
+  test("resolves a per-vault admin (vault:<name>:admin) to the vault:admin explanation", () => {
+    expect(explainScope("vault:default:admin")?.label).toBe(
+      SCOPE_EXPLANATIONS["vault:admin"]?.label,
+    );
+    expect(explainScope("vault:default:admin")?.level).toBe("admin");
+    expect(explainScope("vault:my-techne_2:admin")?.level).toBe("admin");
+    expect(explainScope("vault:*:admin")?.level).toBe("admin");
   });
 });
 
@@ -72,6 +80,17 @@ describe("scopeIsAdmin", () => {
     expect(scopeIsAdmin("vault:admin")).toBe(true);
     expect(scopeIsAdmin("hub:admin")).toBe(true);
     expect(scopeIsAdmin("parachute:host:admin")).toBe(true);
+  });
+
+  // Single-consent change (2026-05-29): the named per-vault admin form must
+  // be recognized as admin. LOAD-BEARING — the same-hub auto-trust gate
+  // (`!hasAdminScope`) and the trust-by-client_name gate
+  // (`!requestedScopes.some(scopeIsAdmin)`) rely on this to keep a named admin
+  // grant consent-gated instead of silently auto-minting it.
+  test("true for named per-vault admin (vault:<name>:admin)", () => {
+    expect(scopeIsAdmin("vault:work:admin")).toBe(true);
+    expect(scopeIsAdmin("vault:default:admin")).toBe(true);
+    expect(scopeIsAdmin("vault:my-techne_2:admin")).toBe(true);
   });
 
   test("false for non-admin and unknown scopes", () => {
@@ -120,16 +139,26 @@ describe("isRequestableScope", () => {
     expect(isRequestableScope("notes:something-new")).toBe(true);
   });
 
-  // Per-vault admin scopes are pattern-matched as non-requestable so the
-  // public OAuth flow can never mint vault:<name>:admin — only the local
-  // session-cookie endpoint at /admin/vault-admin-token/<name> can.
-  test("false for any vault:<name>:admin scope", () => {
-    expect(isRequestableScope("vault:default:admin")).toBe(false);
-    expect(isRequestableScope("vault:work:admin")).toBe(false);
-    expect(isRequestableScope("vault:my-techne_2:admin")).toBe(false);
+  // Single-consent change (2026-05-29): per-vault admin scopes are now
+  // requestable via the public OAuth flow. The anti-privesc cap at the mint
+  // choke-point (`capScopesToUserAuthority`) keeps a non-owner from actually
+  // being granted admin — but the scope is no longer rejected up front, so
+  // Claude MCP (consenting as the owner) can mint a vault admin token.
+  test("true for any vault:<name>:admin scope (single-consent change)", () => {
+    expect(isRequestableScope("vault:default:admin")).toBe(true);
+    expect(isRequestableScope("vault:work:admin")).toBe(true);
+    expect(isRequestableScope("vault:my-techne_2:admin")).toBe(true);
   });
 
-  test("vault:<name>:read|write stays requestable (only :admin is locked down)", () => {
+  test("host-level operator scopes stay non-requestable", () => {
+    // The asymmetry the single-consent change preserved: per-vault admin is
+    // now requestable (capped at mint), but host-wide operator authority is
+    // still operator-only-mintable.
+    expect(isRequestableScope("parachute:host:admin")).toBe(false);
+    expect(isRequestableScope("parachute:host:auth")).toBe(false);
+  });
+
+  test("vault:<name>:read|write stays requestable", () => {
     expect(isRequestableScope("vault:default:read")).toBe(true);
     expect(isRequestableScope("vault:work:write")).toBe(true);
   });
