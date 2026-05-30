@@ -12,12 +12,24 @@
  *     plaintext exactly once. The token endpoint enforces client_secret per
  *     RFC 6749 §3.2.1 (closes #72).
  *
- * Approval gate (closes #74): every row carries a `status` of `pending` or
- * `approved`. New self-registrations default to `pending`; only registrations
- * that authenticate with an operator token bearing `hub:admin` (the install-
- * time path for first-party modules) land as `approved`. The OAuth flow
- * rejects `pending` clients at `/oauth/authorize` and `/oauth/token`. An
- * operator promotes a pending client via `parachute auth approve-client`.
+ * Status column (`pending` | `approved`): every row carries one. New
+ * self-registrations default to `pending`; registrations that authenticate
+ * with an operator token bearing `hub:admin` (the install-time path for
+ * first-party modules) land as `approved`.
+ *
+ * Single-consent change (2026-05-29): the separate operator "approve this
+ * client" gate was retired. The user's OAuth consent IS the authorization —
+ * `handleAuthorizeGet` now session-gates a `pending` client: a request
+ * carrying a valid session auto-approves the client (status → `approved`,
+ * audit-logged) and FALLS THROUGH to the normal consent screen; a session-
+ * less request still renders the unauth "App not yet approved" page whose
+ * sign-in CTA round-trips back to authorize (after login the user re-enters
+ * with a session → auto-approve → consent). The `status` column, the DCR
+ * `pending` default, the `/oauth/token` pending rejection, and the
+ * `parachute auth approve-client` / SPA approve surfaces all persist but are
+ * near-vestigial — kept for defense-in-depth and back-compat. Motivation:
+ * Notes/Claude DCR a fresh `client_id` per instance, so a per-client_id
+ * approval gate re-prompted the operator constantly.
  */
 import type { Database } from "bun:sqlite";
 import { createHash, randomBytes, randomUUID } from "node:crypto";

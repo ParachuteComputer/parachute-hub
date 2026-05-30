@@ -138,23 +138,39 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Per-vault `vault:<name>:admin` scopes are also non-requestable via the
- * public OAuth flow: they let the holder mint, revoke, and rotate tokens
- * for a specific vault instance, which is operator-only territory.
+ * Per-vault `vault:<name>:admin` scopes ARE requestable via the public OAuth
+ * flow (single-consent change, 2026-05-29). A user may grant a named vault's
+ * admin scope to an OAuth client — e.g. Claude MCP minting an admin token for
+ * a vault — but only within the one guardrail that survives the simplification:
+ * a user may only delegate authority they themselves hold. That guardrail is
+ * enforced at the shared mint choke-point (`capScopesToUserAuthority` applied
+ * inside `issueAuthCodeRedirect` in `oauth-handlers.ts`): an OAuth flow caps
+ * named vault verbs to those the consenting user actually holds on that vault.
+ * `vaultVerbsForRole` never returns `admin` for an assigned (read/write) user,
+ * so admin is dropped for everyone except the hub owner (isFirstAdmin) — who
+ * holds admin everywhere by construction. An admin-only request from a
+ * non-owner is refused outright (never minted as a zero-scope token).
  *
- * They are mintable by operator-proving local paths, all of which require
- * already-established authority (never third-party consent):
+ * `vault:<name>:admin` also remains mintable by operator-proving local paths,
+ * all of which require already-established authority:
  *   - the session-cookie-gated `/admin/vault-admin-token/:name` endpoint
  *     (the vault SPA's Manage link + setup wizard); and
  *   - `POST /api/auth/mint-token` under the capability-attenuation model —
- *     a `parachute:host:admin` bearer (box-wide → one-vault) or a
- *     `vault:<name>:admin` bearer (same-vault subset). The same model governs
- *     `POST /api/auth/revoke-token` (revoke what you could mint). See
- *     `canGrant` in `scope-attenuation.ts` and the guards in
- *     `api-mint-token.ts` / `api-revoke-token.ts`.
+ *     a `parachute:host:auth` bearer (any requestable scope, now incl.
+ *     `vault:<name>:admin` — an intentional de-escalation widening that
+ *     landed with the single-consent change), a `parachute:host:admin`
+ *     bearer (box-wide → one-vault), or a `vault:<name>:admin` bearer
+ *     (same-vault subset). The same model governs `POST /api/auth/revoke-token`
+ *     (revoke what you could mint). See `canGrant` in `scope-attenuation.ts`
+ *     and the guards in `api-mint-token.ts` / `api-revoke-token.ts`.
  *
- * Pattern-based because the set is open-ended — every vault instance the
- * operator creates implies a new scope, and we don't want to enumerate them.
+ * The matcher is pattern-based because the set is open-ended — every vault
+ * instance the operator creates implies a new scope, and we don't want to
+ * enumerate them. It is still used by `isVaultAdminScope` (the mint-token
+ * de-escalation recognizer) and `explainScope` / `VAULT_VERB_RE` (so the
+ * consent screen renders the admin badge and `scopeIsAdmin` recognizes the
+ * named admin form — load-bearing: the same-hub and trust-by-name auto-mint
+ * gates rely on `scopeIsAdmin` to keep admin consent-gated).
  */
 const VAULT_ADMIN_RE = /^vault:[a-zA-Z0-9_-]+:admin$/;
 
@@ -240,7 +256,12 @@ export function isWellFormedOrNonVaultScope(scope: string): boolean {
 
 /** True when the scope is non-requestable via the public OAuth flow. */
 export function isNonRequestableScope(scope: string): boolean {
-  return NON_REQUESTABLE_SCOPES.has(scope) || VAULT_ADMIN_RE.test(scope);
+  // Per-vault `vault:<name>:admin` is NO LONGER globally non-requestable
+  // (single-consent change, 2026-05-29). It flows through the public OAuth
+  // consent path and through `canGrant` rule 1, capped to the consenting
+  // user's held authority at the `issueAuthCodeRedirect` choke-point. Only
+  // the host-level operator scopes stay non-requestable here.
+  return NON_REQUESTABLE_SCOPES.has(scope);
 }
 
 /** True when the scope can appear in a public `/oauth/authorize` request. */
@@ -261,17 +282,24 @@ export function isRequestableScope(scope: string): boolean {
  * shape we use on the operator approval page where no per-user vault has
  * been selected yet (a specific vault is chosen during sign-in).
  *
- * Verb-only — admin verbs on a per-vault basis (`vault:<name>:admin`) are
- * `NON_REQUESTABLE_SCOPES` by policy and never reach the consent screen, so
- * we don't substitute for them here. Read / write get the matching label.
+ * Includes `admin` (single-consent change, 2026-05-29). `vault:<name>:admin`
+ * is now requestable via OAuth, so it reaches the consent screen and MUST get
+ * the `vault:admin` explanation (level `"admin"`) — both so the consent UI
+ * renders the admin badge and so `scopeIsAdmin("vault:<name>:admin")` returns
+ * true. That second effect is LOAD-BEARING: the same-hub auto-trust gate
+ * (`!hasAdminScope`) and the trust-by-client_name gate
+ * (`!requestedScopes.some(scopeIsAdmin)`) rely on `scopeIsAdmin` recognizing
+ * the named admin form to keep admin grants consent-gated (never silently
+ * auto-minted). If this regex dropped `admin`, those gates would treat a
+ * named admin scope as non-admin and auto-mint it.
  */
-const VAULT_VERB_RE = /^vault:[a-zA-Z0-9_*-]+:(read|write)$/;
+const VAULT_VERB_RE = /^vault:[a-zA-Z0-9_*-]+:(read|write|admin)$/;
 
 export function explainScope(scope: string): ScopeExplanation | null {
   const direct = SCOPE_EXPLANATIONS[scope];
   if (direct) return direct;
   if (VAULT_VERB_RE.test(scope)) {
-    const verb = scope.split(":")[2] as "read" | "write";
+    const verb = scope.split(":")[2] as "read" | "write" | "admin";
     return SCOPE_EXPLANATIONS[`vault:${verb}`] ?? null;
   }
   return null;

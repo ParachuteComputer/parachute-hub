@@ -382,10 +382,14 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     }
   });
 
-  // The de-escalation exception is gated on host:admin specifically. A
-  // bearer that only holds `parachute:host:auth` (the narrow auth scope-set)
-  // can mint verb scopes but NOT vault-admin — that would be an escalation.
-  test("400 invalid_scope when auth-only bearer mints vault:<name>:admin", async () => {
+  // Single-consent change (2026-05-29) — INTENTIONAL canGrant widening. Once
+  // `vault:<name>:admin` became requestable (`isNonRequestableScope` dropped
+  // the per-vault-admin clause), canGrant rule 1 (`!isNonRequestableScope` +
+  // bearer holds `parachute:host:auth`) now ADMITS it. A `parachute:host:auth`
+  // bearer is an on-box operator credential, so minting a vault-pinned admin
+  // from it is a de-escalation, not an escalation. Pinned here so the widening
+  // is deliberate, not an accidental regression.
+  test("200 when auth-only bearer mints vault:<name>:admin (intentional canGrant widening)", async () => {
     const h = makeHarness();
     try {
       const { db, userId } = await bootstrap(h.dir);
@@ -398,10 +402,12 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
           jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
           { db, issuer: ISSUER },
         );
-        expect(resp.status).toBe(400);
-        const body = (await resp.json()) as { error: string; error_description: string };
-        expect(body.error).toBe("invalid_scope");
-        expect(body.error_description).toContain("vault:work:admin");
+        expect(resp.status).toBe(200);
+        const body = (await resp.json()) as { scope: string; token: string };
+        expect(body.scope).toBe("vault:work:admin");
+        const validated = await validateAccessToken(db, body.token, ISSUER);
+        expect(validated.payload.aud).toBe("vault.work");
+        expect(validated.payload.scope).toBe("vault:work:admin");
       } finally {
         db.close();
       }
@@ -765,7 +771,10 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
       }
     });
 
-    test("host:auth-only bearer mints vault:work:admin → 400 (rule 1 doesn't cover admin)", async () => {
+    test("host:auth-only bearer mints vault:work:admin → 200 (single-consent: rule 1 now covers admin)", async () => {
+      // Single-consent change (2026-05-29): vault:<name>:admin is requestable
+      // now, so canGrant rule 1 admits it for a host:auth bearer. De-escalation
+      // from an on-box operator credential — intentional widening.
       const h = makeHarness();
       try {
         const { db, userId } = await bootstrap(h.dir);
@@ -775,9 +784,9 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
             jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
             { db, issuer: ISSUER },
           );
-          expect(resp.status).toBe(400);
-          const body = (await resp.json()) as { error: string };
-          expect(body.error).toBe("invalid_scope");
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { scope: string };
+          expect(body.scope).toBe("vault:work:admin");
         } finally {
           db.close();
         }
@@ -993,10 +1002,12 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
       }
     });
 
-    // The existing non-requestable behaviour is unchanged: a host:auth-only
-    // bearer minting the well-formed `vault:work:admin` is still 400 (rule 1
-    // doesn't cover admin) — this path is reached AFTER the shape guard passes.
-    test("host:auth-only bearer minting vault:work:admin → 400 (non-requestable, unchanged)", async () => {
+    // Contrast with the malformed forms above: a WELL-FORMED `vault:work:admin`
+    // clears the shape guard, and (single-consent change, 2026-05-29) now mints
+    // 200 via canGrant rule 1 for a host:auth bearer. The malformed forms are
+    // rejected by the shape guard BEFORE canGrant; this one passes the guard
+    // and is admitted.
+    test("host:auth-only bearer minting well-formed vault:work:admin → 200 (clears shape guard, mints)", async () => {
       const h = makeHarness();
       try {
         const { db, userId } = await bootstrap(h.dir);
@@ -1006,11 +1017,9 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
             jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
             { db, issuer: ISSUER },
           );
-          expect(resp.status).toBe(400);
-          const body = (await resp.json()) as { error: string; error_description: string };
-          expect(body.error).toBe("invalid_scope");
-          // Not the malformed-shape message — it cleared the shape guard.
-          expect(body.error_description).toContain("not grantable");
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { scope: string };
+          expect(body.scope).toBe("vault:work:admin");
         } finally {
           db.close();
         }

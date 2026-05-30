@@ -4296,7 +4296,14 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
     }
   });
 
-  test("session valid + matching Origin → page renders WITH approve form + CSRF token", async () => {
+  test("session valid + matching Origin on pending client → auto-approves + renders CONSENT (single-consent change)", async () => {
+    // Single-consent change (2026-05-29): the separate inline operator-approve
+    // form is retired from the GET-on-pending path. A pending client + valid
+    // session now auto-approves (status → approved, audit-logged) and falls
+    // straight through to the user's consent screen — ONE consent, not a
+    // two-step approve-then-consent. The inline-approve POST endpoint
+    // (`handleApproveClientPost`) still exists for the SPA / cross-origin
+    // surfaces (tested below), but the GET path no longer renders the form.
     const { db, cleanup } = await makeDb();
     try {
       const user = await createUser(db, "owner", "pw");
@@ -4312,31 +4319,21 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
           origin: ISSUER,
         },
       });
-      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
-      expect(res.status).toBe(403);
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // Consent render (200) — NOT the old 403 approve-pending page.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
       const html = await res.text();
-      expect(html).toContain("App not yet approved");
-      // The form posts to the approve endpoint
-      expect(html).toContain('action="/oauth/authorize/approve"');
-      expect(html).toContain('name="client_id"');
-      expect(html).toContain(`value="${reg.client.clientId}"`);
-      // CSRF token present in the form
-      expect(html).toContain(`value="${TEST_CSRF}"`);
-      // return_to carries the original authorize URL so the post-approve
-      // redirect lands the operator back on the same flow.
-      expect(html).toContain('name="return_to"');
-      expect(html).toContain("/oauth/authorize?");
-      expect(html).toContain("rt-208"); // state echoed via return_to URL
-      // Display fields present so operator can verify what they're approving.
+      expect(html).toContain("Approve");
       expect(html).toContain("MyApp");
-      expect(html).toContain(reg.client.clientId);
-      expect(html).toContain("https://app.example/cb");
-      // Authed branch shows only the one-click Approve form — the unauth
-      // Sign-in CTA and shareable-link block do NOT render here.
-      expect(html).not.toContain("Sign in as admin to approve");
-      expect(html).not.toContain("Or send this link to your hub admin");
-      // CLI hint also gone in this branch (approval-UX rc.19).
-      expect(html).not.toContain("parachute auth approve-client");
+      // The inline approve FORM is gone from this path.
+      expect(html).not.toContain('action="/oauth/authorize/approve"');
+      expect(html).not.toContain("App not yet approved");
+      // The pending client was auto-approved (consent IS the authorization).
+      expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
     } finally {
       cleanup();
     }
@@ -4697,10 +4694,13 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
     }
   });
 
-  test("end-to-end: GET (pending) → POST approve → GET (now approved) renders consent", async () => {
-    // The full redirect chain. Sessions and CSRF carry across all three
-    // requests in the same cookie. The final GET sees status=approved and
-    // renders the consent screen.
+  test("single-consent: GET (pending) + session → auto-approves + renders consent in ONE step", async () => {
+    // Single-consent change (2026-05-29): the old GET(pending)→POST approve→
+    // GET(approved) three-step chain collapses to ONE step. A pending client +
+    // valid session auto-approves on the first GET and lands the user directly
+    // on the consent screen. The separate POST approve endpoint still exists
+    // for the cross-origin SPA case (tested above) but the in-flow operator no
+    // longer needs it.
     const { db, cleanup } = await makeDb();
     try {
       const user = await createUser(db, "owner", "pw");
@@ -4713,57 +4713,19 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       const cookie = `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`;
       const authorizeHref = pendingAuthorizeUrl(reg.client.clientId);
 
-      // Step 1: GET /oauth/authorize on a pending client renders the approve form.
-      const getRes = handleAuthorizeGet(
-        db,
-        new Request(authorizeHref, { headers: { cookie, origin: ISSUER } }),
-        { issuer: ISSUER },
-      );
-      expect(getRes.status).toBe(403);
-      const getHtml = await getRes.text();
-      expect(getHtml).toContain('action="/oauth/authorize/approve"');
-
-      // Pull the return_to value the form would submit. It's the path+search
-      // of the authorize URL.
-      const authorizeUrlParsed = new URL(authorizeHref);
-      const returnTo = `${authorizeUrlParsed.pathname}${authorizeUrlParsed.search}`;
-
-      // Step 2: POST the approve form.
-      const postForm = new URLSearchParams({
-        __csrf: TEST_CSRF,
-        client_id: reg.client.clientId,
-        return_to: returnTo,
-      });
-      const postRes = await handleApproveClientPost(
-        db,
-        new Request(`${ISSUER}/oauth/authorize/approve`, {
-          method: "POST",
-          body: postForm,
-          headers: {
-            "content-type": "application/x-www-form-urlencoded",
-            cookie,
-            origin: ISSUER,
-          },
-        }),
-        { issuer: ISSUER },
-      );
-      expect(postRes.status).toBe(302);
-      expect(postRes.headers.get("location")).toBe(returnTo);
-
-      // Step 3: GET /oauth/authorize again — now the client is approved, so
-      // the operator lands on the consent screen.
-      const reentryRes = handleAuthorizeGet(
+      const res = handleAuthorizeGet(
         db,
         new Request(authorizeHref, { headers: { cookie, origin: ISSUER } }),
         { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest },
       );
-      expect(reentryRes.status).toBe(200);
-      const consentHtml = await reentryRes.text();
-      // Consent screen markers (renderConsent uses these).
-      // Page h1: "Approve <client>?" per design-system.md §5 (was "Authorize").
+      // Consent screen, in one step — no 403 approve-pending, no POST needed.
+      expect(res.status).toBe(200);
+      const consentHtml = await res.text();
       expect(consentHtml).toContain('name="__action" value="consent"');
       expect(consentHtml).toContain("Approve");
       expect(consentHtml).toContain("RoundTrip");
+      // Client auto-approved as a side effect of the consent render.
+      expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
     } finally {
       cleanup();
     }
@@ -7142,7 +7104,14 @@ describe("handleAuthorizeGet — trust-by-client_name auto-approve (hub#409)", (
     }
   });
 
-  test("falls through to approve-pending when requested scope is NOT covered by prior grant (superset)", async () => {
+  test("scope NOT covered by prior client_name grant (superset) → single CONSENT render (single-consent change)", async () => {
+    // Single-consent change (2026-05-29): the separate operator approval gate
+    // is retired. A pending client + valid session auto-approves and falls
+    // through. Trust-by-name carry-over only fires when the prior grant covers
+    // the new scopes; here WRITE wasn't covered, so no silent carry-over — the
+    // user sees ONE consent screen (200) instead of the old 403 approve-pending
+    // page. The fresh client_id is now approved (the user's consent is the
+    // authorization).
     const { db, cleanup } = await makeDb();
     try {
       const user = await createUser(db, "owner", "pw");
@@ -7181,11 +7150,12 @@ describe("handleAuthorizeGet — trust-by-client_name auto-approve (hub#409)", (
         issuer: ISSUER,
         loadServicesManifest: fixtureLoadServicesManifest,
       });
-      // Approve-pending render — 403 — because the new scope wasn't trusted
-      expect(res.status).toBe(403);
-      expect(await res.text()).toContain("App not yet approved");
-      // The fresh client_id stays pending
-      expect(getClient(db, fresh.client.clientId)?.status).toBe("pending");
+      // Consent render (200) — not the old 403 approve-pending page.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      expect(await res.text()).toContain("vault:default:write");
+      // The fresh client_id is auto-approved (consent IS the authorization).
+      expect(getClient(db, fresh.client.clientId)?.status).toBe("approved");
     } finally {
       cleanup();
     }
@@ -7231,7 +7201,11 @@ describe("handleAuthorizeGet — trust-by-client_name auto-approve (hub#409)", (
     }
   });
 
-  test("falls through when client_name is missing/empty (can't match a prior grant)", async () => {
+  test("client_name missing → no trust carry-over, but session still auto-approves → single CONSENT (single-consent change)", async () => {
+    // Single-consent change (2026-05-29): with no client_name, the trust-by-
+    // name carry-over can't match, so there's no silent skip — but a valid
+    // session still auto-approves the pending client and falls through to ONE
+    // consent screen (200), rather than the old 403 approve-pending page.
     const { db, cleanup } = await makeDb();
     try {
       const user = await createUser(db, "owner", "pw");
@@ -7268,8 +7242,10 @@ describe("handleAuthorizeGet — trust-by-client_name auto-approve (hub#409)", (
         issuer: ISSUER,
         loadServicesManifest: fixtureLoadServicesManifest,
       });
-      expect(res.status).toBe(403);
-      expect(getClient(db, fresh.client.clientId)?.status).toBe("pending");
+      // Consent render (200), and the fresh client is auto-approved.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      expect(getClient(db, fresh.client.clientId)?.status).toBe("approved");
     } finally {
       cleanup();
     }
@@ -7991,7 +7967,14 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
     }
   });
 
-  test("non-requestable scope still refused even with a resource (vault:admin → vault:jon:admin blocked)", async () => {
+  test("resource-bound vault:admin → vault:jon:admin now requestable; OWNER consents (single-consent change)", async () => {
+    // Single-consent change (2026-05-29): `vault:<name>:admin` is requestable
+    // now. Narrowing turns the resource-bound `vault:admin` into
+    // `vault:jon:admin`, which reaches the consent screen rather than being
+    // refused at the non-requestable gate. The consenting user here is the
+    // owner (first user = isFirstAdmin), who holds admin everywhere, so the
+    // anti-privesc cap at the mint choke-point admits it. The consent screen
+    // renders the narrowed admin scope with its admin badge.
     const { db, cleanup } = await makeDb();
     try {
       const user = await createUser(db, "owner", "pw");
@@ -8018,12 +8001,576 @@ describe("RFC 8707 resource binding — vault-bound MCP (fix #461)", () => {
         ),
         RESOURCE_DEPS,
       );
-      // Narrowing turns vault:admin → vault:jon:admin which is NON-requestable;
-      // the gate rejects via redirect with invalid_scope.
-      expect(res.status).toBe(302);
-      const loc = res.headers.get("location") ?? "";
-      expect(loc).toContain("error=invalid_scope");
-      expect(loc).toContain("vault%3Ajon%3Aadmin");
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Consent renders the narrowed named admin scope with the admin badge.
+      expect(html).toContain("vault:jon:admin");
+      expect(html).toContain("badge-admin");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Single OAuth consent + grantable vault:<name>:admin with delegate-only-what-
+// you-hold cap (2026-05-29). Three changes land together:
+//   1. The separate operator client-approval gate is retired — a pending
+//      client + valid session auto-approves and falls through to ONE consent.
+//   2. `vault:<name>:admin` is requestable via OAuth (capped at mint).
+//   3. Anti-privesc verb-cap at the SINGLE mint choke-point
+//      (`issueAuthCodeRedirect`): a non-owner may only delegate vault verbs
+//      they themselves hold; un-held verbs (notably admin) are DROPPED, and an
+//      admin-only request from a non-owner is REFUSED (never a zero-scope mint).
+// ───────────────────────────────────────────────────────────────────────────
+describe("single OAuth consent + grantable vault admin + delegate-only cap (2026-05-29)", () => {
+  const TTL_S = Math.floor(SESSION_TTL_MS / 1000);
+
+  // The hub manifest must contain the vaults the assigned users target.
+  const CAP_MANIFEST: ServicesManifest = {
+    services: [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/work", "/vault/other"],
+        health: "/health",
+        version: "0.6.0",
+      },
+    ],
+  };
+  const capDeps = {
+    issuer: ISSUER,
+    loadServicesManifest: () => CAP_MANIFEST,
+    hubBoundOrigins: () => [ISSUER],
+  };
+
+  // Build + submit a consent form, returning the raw Response. `userIsOwner`
+  // just documents intent; identity comes from the session cookie.
+  async function submitConsent(
+    db: Awaited<ReturnType<typeof makeDb>>["db"],
+    sessionId: string,
+    clientId: string,
+    scope: string,
+    challenge: string,
+    extra: Record<string, string> = {},
+  ): Promise<Response> {
+    const form = new URLSearchParams({
+      __action: "consent",
+      __csrf: TEST_CSRF,
+      approve: "yes",
+      client_id: clientId,
+      redirect_uri: "https://app.example/cb",
+      response_type: "code",
+      scope,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      ...extra,
+    });
+    return handleAuthorizePost(
+      db,
+      new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(sessionId, TTL_S)}`,
+        },
+      }),
+      capDeps,
+    );
+  }
+
+  async function redeemToScopeAud(
+    db: Awaited<ReturnType<typeof makeDb>>["db"],
+    code: string,
+    clientId: string,
+    verifier: string,
+  ): Promise<{ scope: string; aud: unknown }> {
+    const tokenForm = new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      client_id: clientId,
+      redirect_uri: "https://app.example/cb",
+      code_verifier: verifier,
+    });
+    const tokenRes = await handleToken(
+      db,
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: tokenForm,
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      capDeps,
+    );
+    expect(tokenRes.status).toBe(200);
+    const body = (await tokenRes.json()) as { access_token: string; scope: string };
+    const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+    return { scope: body.scope, aud: payload.aud };
+  }
+
+  // Test 1 — pending client + session → consent renders (200), client flipped approved.
+  test("[1] pending client + session → consent renders (200) + client flipped approved", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "Claude",
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:work:read",
+        }),
+        { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+      );
+      const res = handleAuthorizeGet(db, req, capDeps);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      expect(await res.text()).not.toContain("App not yet approved");
+      expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Test 4 — post-login round-trip: a session-less GET renders the unauth
+  // pending page whose CTA points at /login?next=<authorize URL>; re-entering
+  // WITH a session lands on consent.
+  test("[4] post-login round-trip → unauth pending CTA, then consent after login", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "Claude",
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const href = authorizeUrl({
+        client_id: reg.client.clientId,
+        redirect_uri: "https://app.example/cb",
+        response_type: "code",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        scope: "vault:work:read",
+        state: "rt-login",
+      });
+      // Session-less: unauth pending page with the login round-trip CTA.
+      const unauth = handleAuthorizeGet(db, new Request(href), capDeps);
+      expect(unauth.status).toBe(403);
+      const unauthHtml = await unauth.text();
+      expect(unauthHtml).toContain("App not yet approved");
+      const u = new URL(href);
+      const returnTo = `${u.pathname}${u.search}`;
+      expect(unauthHtml).toContain(`/login?next=${encodeURIComponent(returnTo)}`);
+      // After login (now carrying a session) → consent renders.
+      const authed = handleAuthorizeGet(
+        db,
+        new Request(href, {
+          headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` },
+        }),
+        capDeps,
+      );
+      expect(authed.status).toBe(200);
+      expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Test 6 — owner + vault:<name>:admin → consent renders, admin badge shown.
+  test("[6] owner + scope=vault:work:admin → consent renders (no invalid_scope) + admin badge", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:work:admin",
+          }),
+          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+        ),
+        capDeps,
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("vault:work:admin");
+      expect(html).toContain("badge-admin");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Test 7 — owner consents to vault:<name>:admin → token scope + aud correct.
+  test("[7] owner consents to vault:work:admin → token scope=vault:work:admin, aud=vault.work", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:work:admin",
+        challenge,
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      expect(code).toBeTruthy();
+      const { scope, aud } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope).toBe("vault:work:admin");
+      expect(aud).toBe("vault.work");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Test 9 — privesc: read/write assigned (non-owner) user requests
+  // vault:work:admin + vault:work:write → admin DROPPED, token has write only,
+  // recorded grant lacks admin.
+  test("[9] non-owner read/write user requests admin+write → admin DROPPED (write only), grant lacks admin", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw"); // first user = owner; consumes the admin slot.
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]); // role=write → verbs [read, write]
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:work:admin vault:work:write",
+        challenge,
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const { scope, aud } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      // admin dropped; write kept.
+      expect(scope.split(" ").sort()).toEqual(["vault:work:write"]);
+      expect(aud).toBe("vault.work");
+      // Recorded grant lacks admin.
+      const grant = findGrant(db, friend.id, reg.client.clientId);
+      expect(grant?.scopes).toContain("vault:work:write");
+      expect(grant?.scopes).not.toContain("vault:work:admin");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Test 10 — non-owner admin-ONLY request → REFUSED (clear error), no token.
+  test("[10] non-owner admin-only request → REFUSED with invalid_scope, no token minted", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:work:admin",
+        challenge,
+      );
+      // Capping leaves an EMPTY scope set → refuse (no zero-scope token).
+      expect(consentRes.status).toBe(302);
+      const loc = new URL(consentRes.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("error")).toBe("invalid_scope");
+      expect(loc.searchParams.get("code")).toBeNull();
+      // No grant recorded.
+      expect(findGrant(db, friend.id, reg.client.clientId)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Test 11 — non-owner unnamed vault:admin + picks assigned vault → after
+  // narrowing, admin dropped (cap runs post-narrow).
+  test("[11] non-owner unnamed vault:admin + picks assigned vault → admin dropped post-narrow", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]);
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      // Unnamed vault:admin + vault:write, picker resolves to "work".
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:admin vault:write",
+        challenge,
+        { vault_pick: "work" },
+      );
+      // narrowVaultScopes → vault:work:admin + vault:work:write; cap drops
+      // admin (non-owner doesn't hold it), keeps write → mints write only.
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      expect(code).toBeTruthy();
+      const { scope } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ").sort()).toEqual(["vault:work:write"]);
+      const grant = findGrant(db, friend.id, reg.client.clientId);
+      expect(grant?.scopes).toContain("vault:work:write");
+      expect(grant?.scopes).not.toContain("vault:work:admin");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Test 12 — owner same request as test 9 → admin GRANTED (contrast).
+  test("[12] owner requests admin+write → admin GRANTED (owner bypasses the cap)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const consentRes = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:work:admin vault:work:write",
+        challenge,
+      );
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+      const { scope } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ").sort()).toEqual(["vault:work:admin", "vault:work:write"]);
+      const grant = findGrant(db, owner.id, reg.client.clientId);
+      expect(grant?.scopes).toContain("vault:work:admin");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Test 13 — same-hub client + session + vault:<name>:admin → does NOT
+  // silently mint; consent renders (relies on scopeIsAdmin recognizing the
+  // named admin form).
+  test("[13] same-hub client + vault:work:admin → consent renders (not silent-mint)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:work:admin",
+          }),
+          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+        ),
+        capDeps,
+      );
+      // Consent (200), NOT a silent 302 redirect with code.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      // No grant auto-recorded (the same-hub gate did not fire).
+      expect(findGrant(db, owner.id, reg.client.clientId)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Test 14 — trust-by-name: a prior NON-admin same-name grant + a new request
+  // that ADDS vault:<name>:admin → does NOT auto-promote; consent renders.
+  test("[14] trust-by-name + new admin scope → no auto-promote, consent renders", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const prior = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        clientName: "Claude",
+      });
+      // Prior NON-admin grant under the same client_name.
+      recordGrant(db, owner.id, prior.client.clientId, ["vault:work:read", "vault:work:admin"]);
+      const fresh = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "pending",
+        clientName: "Claude",
+      });
+      const { challenge } = makePkce();
+      // New request includes admin — even though a prior same-name grant
+      // happens to list it, the trust gate excludes admin (scopeIsAdmin), so
+      // it must not silently carry over.
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: fresh.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:work:read vault:work:admin",
+          }),
+          {
+            headers: {
+              cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}`,
+              origin: ISSUER,
+            },
+          },
+        ),
+        capDeps,
+      );
+      // Consent (200), not a silent 302 redirect.
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Test 15 — bypass-proof: a non-owner with NO prior admin grant cannot reach
+  // issueAuthCodeRedirect with an admin scope via ANY path (skip-consent /
+  // same-hub / consent). Assert no grants row ever contains an un-held admin
+  // verb across each path.
+  test("[15] bypass-proof: no mint path ever records an un-held admin verb for a non-owner", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]); // verbs [read, write] only
+      const session = createSession(db, { userId: friend.id });
+
+      // Path A — consent-submit with admin+write → admin dropped, recorded grant
+      // lacks admin.
+      const regConsent = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      {
+        const { challenge } = makePkce();
+        await submitConsent(
+          db,
+          session.id,
+          regConsent.client.clientId,
+          "vault:work:admin vault:work:write",
+          challenge,
+        );
+        const g = findGrant(db, friend.id, regConsent.client.clientId);
+        expect(g?.scopes ?? []).not.toContain("vault:work:admin");
+      }
+
+      // Path B — same-hub client requesting admin → consent renders (admin gate
+      // blocks the silent path); no grant recorded with admin.
+      const regSameHub = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      {
+        const { challenge } = makePkce();
+        const res = handleAuthorizeGet(
+          db,
+          new Request(
+            authorizeUrl({
+              client_id: regSameHub.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              response_type: "code",
+              code_challenge: challenge,
+              code_challenge_method: "S256",
+              scope: "vault:work:admin",
+            }),
+            { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+          ),
+          capDeps,
+        );
+        expect(res.status).toBe(200); // consent, not silent-mint
+        const g = findGrant(db, friend.id, regSameHub.client.clientId);
+        expect(g?.scopes ?? []).not.toContain("vault:work:admin");
+      }
+
+      // Path C — skip-consent: even if a grant row were somehow seeded with an
+      // admin verb, the cap at issueAuthCodeRedirect drops it before minting AND
+      // re-records the capped set. Seed a poisoned grant, drive skip-consent,
+      // and assert the minted token + the (re-recorded) grant carry no admin.
+      const regSkip = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      recordGrant(db, friend.id, regSkip.client.clientId, ["vault:work:write", "vault:work:admin"]);
+      {
+        const { verifier, challenge } = makePkce();
+        // Request only the held write scope so skip-consent fires (covered by
+        // the seeded grant) and routes through issueAuthCodeRedirect.
+        const res = handleAuthorizeGet(
+          db,
+          new Request(
+            authorizeUrl({
+              client_id: regSkip.client.clientId,
+              redirect_uri: "https://app.example/cb",
+              response_type: "code",
+              code_challenge: challenge,
+              code_challenge_method: "S256",
+              scope: "vault:work:write",
+            }),
+            { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+          ),
+          capDeps,
+        );
+        expect(res.status).toBe(302); // skip-consent silent mint of the held scope
+        const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+        const { scope } = await redeemToScopeAud(db, code ?? "", regSkip.client.clientId, verifier);
+        expect(scope.split(" ")).not.toContain("vault:work:admin");
+      }
     } finally {
       cleanup();
     }

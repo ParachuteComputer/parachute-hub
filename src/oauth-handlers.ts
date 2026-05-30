@@ -87,7 +87,13 @@ import {
   parseSessionCookie,
 } from "./sessions.ts";
 import { isTotpEnrolled } from "./two-factor-store.ts";
-import { getUserById, getUserByUsername, isFirstAdmin, verifyPassword } from "./users.ts";
+import {
+  getUserById,
+  getUserByUsername,
+  isFirstAdmin,
+  vaultVerbsForUserVault,
+  verifyPassword,
+} from "./users.ts";
 import { listVaultNames } from "./vault-names.ts";
 import { isVaultEntry, shortName, vaultInstanceNameFor } from "./well-known.ts";
 
@@ -828,7 +834,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       parsed.state,
     );
   }
-  const client = getClient(db, parsed.clientId);
+  let client = getClient(db, parsed.clientId);
   if (!client) {
     // Can't safely redirect — we don't trust the redirect_uri until we've
     // matched it against a registered client. Render an HTML error that
@@ -839,7 +845,71 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     return unknownClientResponse(parsed.clientId, parsed.redirectUri, deps);
   }
   if (client.status !== "approved") {
-    return pendingClientResponse(db, req, client, url, deps);
+    // Single-consent change (2026-05-29): the separate operator "approve this
+    // client" gate is retired — the user's OAuth consent IS the authorization.
+    // A request carrying a valid session auto-approves the pending client and
+    // FALLS THROUGH into the normal consent path below (resource-narrow →
+    // non-requestable gate → skip-consent / same-hub → consent render). A
+    // session-less request still renders the unauth "App not yet approved"
+    // page (`pendingClientResponse`), whose sign-in CTA (`loginNextUrl`)
+    // round-trips back to this authorize URL; after login the user re-enters
+    // WITH a session → hits this auto-approve branch → consent.
+    //
+    // We resolve the session via the same `parseSessionCookie` + `findSession`
+    // pair the consent path uses below (not `findActiveSession`) so the
+    // auto-approve predicate and the consent render agree on session identity.
+    const earlySessionId = parseSessionCookie(req.headers.get("cookie"));
+    const earlySession = earlySessionId ? findSession(db, earlySessionId) : null;
+    if (!earlySession) {
+      return pendingClientResponse(db, req, client, url, deps);
+    }
+    console.log(
+      `[oauth] auto-approved client on user consent (single-consent) client_id=${client.clientId} user_id=${earlySession.userId} (2026-05-29)`,
+    );
+    approveClient(db, client.clientId);
+
+    // Trust-by-client_name carry-over (hub#409, preserved through the
+    // single-consent change). Notes/Claude DCR a fresh client_id per session;
+    // when the user has a prior grant under the SAME client_name that covers
+    // the requested scopes, re-link must stay SILENT. The skip-consent gate
+    // below keys on (user, client_id) and the fresh client_id has no grant
+    // yet — so we re-record that prior coverage onto the fresh client_id here.
+    // The mint downstream goes through `issueAuthCodeRedirect`, which caps to
+    // held authority, so this carry-over can never silently re-grant an
+    // un-held verb. Guarded identically to the in-`pendingClientResponse`
+    // block: same-origin + non-empty client_name + non-admin requested scopes
+    // (`scopeIsAdmin` recognizes the named admin form now — load-bearing) +
+    // prior-grant coverage. When it doesn't apply, fall through to the consent
+    // render (the single-consent payoff: one consent screen, then silent).
+    const earlyRequested = parsed.scope.split(" ").filter((s) => s.length > 0);
+    if (
+      isSameOriginRequest(req, resolveBoundOrigins(deps)) &&
+      client.clientName &&
+      earlyRequested.length > 0 &&
+      !earlyRequested.some(scopeIsAdmin) &&
+      isCoveredByGrantForClientName(db, earlySession.userId, client.clientName, earlyRequested)
+    ) {
+      console.log(
+        `[oauth] carried prior client_name trust onto fresh client_id=${client.clientId} client_name=${JSON.stringify(client.clientName)} user_id=${earlySession.userId} scopes=${earlyRequested.join(" ")} (hub#409)`,
+      );
+      recordGrant(
+        db,
+        earlySession.userId,
+        client.clientId,
+        earlyRequested,
+        deps.now?.() ?? new Date(),
+      );
+    }
+
+    // Re-fetch so `client.status` reflects `approved` for the rest of this
+    // function (the same-hub gate and consent props read `client`). Fall
+    // through on success; if the refresh somehow failed, render the unauth
+    // pending page defensively (should never happen given approveClient).
+    const refreshed = getClient(db, client.clientId);
+    if (!refreshed || refreshed.status !== "approved") {
+      return pendingClientResponse(db, req, client, url, deps);
+    }
+    client = refreshed;
   }
   try {
     requireRegisteredRedirectUri(client, parsed.redirectUri);
@@ -1033,10 +1103,13 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     console.log(
       `[oauth] auto-approved same-hub client client_id=${client.clientId} user_id=${session.userId} scopes=${requestedScopes.join(" ")} (hub#312)`,
     );
-    // Record the grant so the next /authorize for this (user, client, scopes)
-    // hits the standard skip-consent path (#75) — keeps the audit story
-    // consistent between same-hub and externally-approved flows.
-    recordGrant(db, session.userId, client.clientId, requestedScopes);
+    // The grant is recorded INSIDE issueAuthCodeRedirect with the CAPPED
+    // scopes (single choke-point, single source of truth) so the next
+    // /authorize for this (user, client, scopes) hits the standard
+    // skip-consent path (#75) — and can never replay an un-held verb. The
+    // `!hasAdminScope` guard above already keeps admin scopes off this path
+    // (they fall through to consent), so the cap is a no-op here for the
+    // common case, but it still runs unconditionally for defense in depth.
     return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
   }
 
@@ -1050,10 +1123,77 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
 }
 
 /**
- * Mint an auth code and redirect to the client's redirect_uri. Shared by
- * the consent-submit path (`handleConsentSubmit`) and the skip-consent path
- * in `handleAuthorizeGet` (#75). Caller is responsible for having already
- * validated the client + redirect_uri + scopes.
+ * Anti-privilege-escalation cap (THE security crux of the single-consent
+ * change, 2026-05-29). A user may only delegate authority they themselves
+ * hold: the OAuth consent that authorizes a client must never grant a named
+ * vault verb the consenting user doesn't actually hold on that vault.
+ *
+ * For each scope shaped `vault:<name>:<verb>` (verb ∈ VAULT_VERBS) when the
+ * user is NOT the hub owner, the verb is admitted only if it appears in
+ * `vaultVerbsForUserVault(db, userId, name)` (the verbs the user holds on
+ * that vault, derived from their `user_vaults` role). Otherwise the scope is
+ * DROPPED. Non-vault scopes and unnamed `vault:<verb>` (which never reach
+ * mint without picker-narrowing) pass through untouched.
+ *
+ * The owner (`isFirstAdmin`) bypasses the cap entirely — they hold admin on
+ * every vault by construction (admin posture is the unrestricted sentinel;
+ * see `vaultScopeForUser`). Owner=isFirstAdmin is the Phase-1 definition of
+ * "holds admin everywhere"; revisit when multi-admin lands.
+ *
+ * Security argument (documented at the call site too):
+ *   - The authority source of truth today is `isFirstAdmin` for owner-wide
+ *     authority and `user_vaults.role` (via `vaultVerbsForRole`) for assigned
+ *     users.
+ *   - `vaultVerbsForRole` provably never returns `admin` for an assigned user
+ *     (it maps write→[read,write], read→[read], unknown→[]), so this helper
+ *     drops `vault:<name>:admin` for every non-owner BY CONSTRUCTION — without
+ *     hardcoding "drop admin". It reads the held verb set and admits only
+ *     held verbs, so it's forward-compatible: if a future role ever granted
+ *     admin, the cap would admit it automatically.
+ *   - Applied inside `issueAuthCodeRedirect` (the single choke-point ALL mint
+ *     paths funnel through: consent-submit, skip-consent, and same-hub
+ *     auto-trust), the CAPPED set is what gets both recorded (`recordGrant`)
+ *     and minted (`issueAuthCode`). No mint path can bypass it, and a later
+ *     skip-consent flow can never replay an un-held admin verb because it was
+ *     never recorded.
+ */
+function capScopesToUserAuthority(
+  db: Database,
+  userId: string,
+  scopes: readonly string[],
+  opts: { userIsAdmin: boolean },
+): string[] {
+  if (opts.userIsAdmin) return [...scopes];
+  return scopes.filter((s) => {
+    const parts = s.split(":");
+    if (parts.length !== 3 || parts[0] !== "vault") return true; // non-named — pass through
+    const name = parts[1];
+    const verb = parts[2];
+    if (name === undefined || verb === undefined || !VAULT_VERBS.has(verb)) return true;
+    // Named vault verb requested by a non-owner: admit only if the user holds
+    // it. `vaultVerbsForUserVault` returns null for an unassigned vault (drop)
+    // or the held verb list (today read/write only — never admin).
+    const held = vaultVerbsForUserVault(db, userId, name);
+    return held !== null && (held as readonly string[]).includes(verb);
+  });
+}
+
+/**
+ * Mint an auth code and redirect to the client's redirect_uri. The SINGLE
+ * mint choke-point — shared by the consent-submit path (`handleConsentSubmit`),
+ * the skip-consent path (#75), and the same-hub auto-trust path (hub#312) in
+ * `handleAuthorizeGet`. Caller is responsible for having already validated the
+ * client + redirect_uri and for having narrowed unnamed `vault:<verb>` scopes
+ * to their named form (so the cap below sees final shapes).
+ *
+ * Two responsibilities live here so NO mint path can bypass them:
+ *   1. Anti-privilege-escalation cap (`capScopesToUserAuthority`): a non-owner
+ *      can only delegate vault verbs they hold; un-held verbs (notably admin)
+ *      are dropped. An admin-only request from a non-owner caps to EMPTY → we
+ *      refuse with `invalid_scope` rather than mint a zero-scope token.
+ *   2. Grant recording (`recordGrant`) with the CAPPED scopes — so a later
+ *      skip-consent flow can never replay an un-held verb. UNION semantics
+ *      make this idempotent for the skip-consent re-entry.
  */
 function issueAuthCodeRedirect(
   db: Database,
@@ -1062,11 +1202,37 @@ function issueAuthCodeRedirect(
   userId: string,
   deps: OAuthDeps,
 ): Response {
+  // Anti-privesc cap at the single choke-point. Runs AFTER any narrowing the
+  // callers did (unnamed `vault:admin` → `vault:<picked>:admin`), so it sees
+  // the final named shapes. Owner (isFirstAdmin) bypasses — holds admin
+  // everywhere by construction.
+  const userIsAdmin = isFirstAdmin(db, userId);
+  const cappedScopes = capScopesToUserAuthority(db, userId, scopes, { userIsAdmin });
+
+  // Drop-not-refuse UX, with one hard floor: if capping leaves an EMPTY set
+  // (e.g. a non-owner requested ONLY `vault:<name>:admin`, which they don't
+  // hold), never mint a zero-scope token — refuse with a clear invalid_scope.
+  // A request that started empty (no scopes at all) is a separate, legitimate
+  // "session token only" case the consent UI supports, so we only refuse when
+  // the cap itself removed every scope.
+  if (cappedScopes.length === 0 && scopes.length > 0) {
+    return oauthErrorRedirect(
+      params.redirectUri,
+      "invalid_scope",
+      "You can grant only the access you hold on this vault; an admin grant requires hub-owner authority.",
+      params.state,
+    );
+  }
+
+  // Record the grant with the CAPPED scopes (single source of truth) so
+  // skip-consent re-entry can never widen back to an un-held verb.
+  recordGrant(db, userId, params.clientId, cappedScopes, deps.now?.() ?? new Date());
+
   const code = issueAuthCode(db, {
     clientId: params.clientId,
     userId,
     redirectUri: params.redirectUri,
-    scopes,
+    scopes: cappedScopes,
     codeChallenge: params.codeChallenge,
     codeChallengeMethod: params.codeChallengeMethod,
     now: deps.now,
@@ -1456,12 +1622,12 @@ async function handleConsentSubmit(
     }
   }
 
-  // Record (or extend) the grant so the next /oauth/authorize for this
-  // (user, client) with these scopes — or any subset — can skip the consent
-  // screen (#75). UNION semantics: if the user previously granted [a, b, c]
-  // and now grants [a, d], the row becomes [a, b, c, d]. Subset re-flows
-  // still match.
-  recordGrant(db, session.userId, client.clientId, scopes, deps.now?.() ?? new Date());
+  // The grant is recorded (or extended) INSIDE issueAuthCodeRedirect with the
+  // CAPPED scopes — the single mint choke-point owns both the anti-privesc cap
+  // and the recordGrant so no path can record an un-held verb. UNION semantics
+  // there mean a subset re-flow still matches a prior grant, and an admin-only
+  // request from a non-owner caps to empty → refused (no zero-scope token).
+  // (#75 skip-consent depends on this recording.)
   return issueAuthCodeRedirect(db, params, scopes, session.userId, deps);
 }
 
