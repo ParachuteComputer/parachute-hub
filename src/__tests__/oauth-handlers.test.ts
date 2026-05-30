@@ -609,6 +609,106 @@ describe("handleAuthorizeGet — vault picker", () => {
   });
 });
 
+describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes (scary-consent fix)", () => {
+  // claude.ai connecting to ONE vault reads the hub's whole-hub AS-metadata
+  // `scopes_supported` and over-requests the full catalog. Bound to the vault
+  // resource (`aud=vault.<name>`), scribe/channel/hub scopes are unusable, so
+  // they must be DROPPED before consent — Aaron hit them as "a fuck ton of
+  // privileges that don't make sense" (scribe isn't even installed here).
+  const FOREIGN_AND_VAULT =
+    "vault:read vault:write scribe:transcribe scribe:admin channel:send hub:admin";
+
+  test("session consent for a vault MCP resource drops scribe/channel/hub scopes", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "Claude",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: FOREIGN_AND_VAULT,
+          resource: `${ISSUER}/vault/default/mcp`,
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // Renders consent (200) — NOT a 302 invalid_scope. Pre-fix the
+      // pass-through left non-requestable `hub:admin` + `scribe:admin` in the
+      // request, which the gate would reject; dropping them clears the gate.
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Vault scopes survive, narrowed to the bound vault → picker is gone.
+      expect(html).not.toContain("Pick a vault");
+      expect(html).toContain("Create, edit, and delete notes, tags, and attachments."); // vault:write
+      // The foreign scopes are gone.
+      expect(html).not.toContain("Send audio to Scribe for transcription."); // scribe:transcribe
+      expect(html).not.toContain("Manage Scribe configuration"); // scribe:admin
+      expect(html).not.toContain("Post messages to your Channel."); // channel:send
+      expect(html).not.toContain("Manage hub identity"); // hub:admin
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("session-less 'App not yet approved' page also drops foreign scopes", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "Claude",
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read scribe:transcribe channel:send",
+          resource: `${ISSUER}/vault/default/mcp`,
+        }),
+        // No session cookie → the unauth pending page renders.
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(403);
+      const html = await res.text();
+      expect(html).toContain("App not yet approved");
+      // Foreign scopes absent from the rendered rows...
+      expect(html).not.toContain("Send audio to Scribe for transcription.");
+      expect(html).not.toContain("Post messages to your Channel.");
+      // ...and from the login round-trip URL embedded in the page (the
+      // narrowed scope was written back onto `url` before this render).
+      expect(html).not.toContain("scribe:transcribe");
+      expect(html).not.toContain("channel:send");
+      expect(html).not.toContain("scribe%3Atranscribe");
+      expect(html).not.toContain("channel%3Asend");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 describe("handleAuthorizePost — vault picker", () => {
   test("approve with vault_pick narrows vault:read → vault:<picked>:read in the issued JWT", async () => {
     const { db, cleanup } = await makeDb();

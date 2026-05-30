@@ -844,6 +844,47 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     // localStorage, the recovery is "clear that key and reload the SPA").
     return unknownClientResponse(parsed.clientId, parsed.redirectUri, deps);
   }
+
+  // RFC 8707 resource binding. When the client named a per-vault MCP resource
+  // (`<origin>/vault/<name>/mcp` or its PRM URL), narrow the requested scopes
+  // to that vault BEFORE the pending/consent branches below, so EVERY
+  // downstream consumer sees the narrowed set:
+  //
+  //   1. The consent screen — and the session-less "App not yet approved"
+  //      page (`pendingClientResponse`) — shows ONLY that vault's scopes
+  //      instead of the whole-hub catalog. Narrowing DROPS non-vault scopes
+  //      (`scribe:*`, `channel:send`, `hub:admin`) outright: the token this
+  //      flow mints is stamped `aud=vault.<name>`, so they're unusable inside
+  //      it and only inflate the consent surface — the exact "scary consent"
+  //      a friend hit connecting Claude to ONE vault (scribe isn't even
+  //      installed; `channel:send` is meaningless to them).
+  //   2. The minted token carries the named scope, so `inferAudience` stamps
+  //      `aud=vault.<name>` and a current-line vault accepts it (an unnamed
+  //      `vault:read` token is rejected by `findBroadVaultScopes`).
+  //   3. The trust-by-client_name coverage checks (the auto-approve branch
+  //      below + the one inside `pendingClientResponse`) compare the narrowed
+  //      request against the narrowed prior grant. Before this ran early they
+  //      compared the RAW whole-hub request against a vault-only grant, never
+  //      matched, and re-prompted consent every session for a client the
+  //      operator had already approved.
+  //
+  // We rewrite both `parsed.scope` (consent/grant/mint read it) AND the `url`
+  // scope param (`pendingClientResponse` + its login round-trip read it off
+  // the URL) so the two never diverge. Re-entry after login re-narrows
+  // idempotently (no foreign scopes left to drop).
+  //
+  // No resource, or one that isn't a per-vault MCP resource (off-origin,
+  // malformed, non-vault path) → `boundVault` is null and the flow is
+  // byte-for-byte the pre-#461 behavior (manual picker, etc.).
+  const boundVault = resolveResourceVault(parsed.resource, resolveBoundOrigins(deps));
+  if (boundVault) {
+    parsed.scope = narrowResourceVaultScopes(
+      parsed.scope.split(" ").filter((s) => s.length > 0),
+      boundVault,
+    ).join(" ");
+    url.searchParams.set("scope", parsed.scope);
+  }
+
   if (client.status !== "approved") {
     // Single-consent change (2026-05-29): the separate operator "approve this
     // client" gate is retired — the user's OAuth consent IS the authorization.
@@ -919,41 +960,6 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       "The redirect_uri does not match any URI registered for this app.",
       400,
     );
-  }
-
-  // RFC 8707 resource binding. When the client named a per-vault MCP
-  // resource (`<origin>/vault/<name>/mcp` or its PRM URL), narrow the
-  // requested vault verbs to the named `vault:<name>:<verb>` form BEFORE any
-  // downstream processing. Two effects:
-  //
-  //   1. The consent screen shows ONLY that vault's scopes (the picker locks
-  //      to <name>) instead of the whole-hub catalog — a friend connecting to
-  //      one vault no longer sees `hub:admin`, `scribe:admin`, or every other
-  //      vault's verbs.
-  //   2. The minted token carries the named scope, so `inferAudience` stamps
-  //      `aud=vault.<name>` and a current-line vault accepts it (an unnamed
-  //      `vault:read` token is rejected by `findBroadVaultScopes`).
-  //
-  // Narrowing happens before the non-requestable gate (below) on purpose: if
-  // a resource-bound client somehow asked for `vault:admin`, narrowing makes
-  // it `vault:<name>:admin`, which IS non-requestable — so the gate correctly
-  // blocks it. Read/write narrow to the requestable named form. Non-vault
-  // scopes and already-named scopes for other vaults pass through unchanged.
-  //
-  // No resource, or a resource that isn't one of our per-vault MCP resources
-  // (off-origin, malformed, non-vault path) → `boundVault` is null and the
-  // flow is byte-for-byte the pre-#461 behavior (manual picker, etc.).
-  const boundVault = resolveResourceVault(parsed.resource, resolveBoundOrigins(deps));
-  if (boundVault) {
-    const narrowed = narrowResourceVaultScopes(
-      parsed.scope.split(" ").filter((s) => s.length > 0),
-      boundVault,
-    );
-    // Rewrite `parsed.scope` so the narrowed named scopes flow through every
-    // downstream consumer: the login-redirect query round-trip, the consent
-    // props + hidden inputs, the skip-consent grant lookup, and the
-    // auth-code mint.
-    parsed.scope = narrowed.join(" ");
   }
 
   // Operator-only scope gate (#96). Reject any request that names a scope

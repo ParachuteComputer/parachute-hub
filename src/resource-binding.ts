@@ -109,26 +109,41 @@ function decodeVaultName(segment: string): string | null {
 }
 
 /**
- * Rewrite the requested scope list for a resource-bound vault flow.
+ * Rewrite the requested scope list for a resource-bound vault flow, returning
+ * ONLY scopes usable in the resulting vault-audience token:
  *
  *   - unnamed `vault:<verb>`        → `vault:<name>:<verb>` (the narrow,
  *     audience-correct shape vault accepts);
  *   - already-named `vault:<other>:<verb>` is LEFT UNTOUCHED — a client that
  *     explicitly named a different vault is not silently re-pointed; the
  *     downstream picker / assignment defenses decide whether that's allowed.
- *   - non-vault scopes (`scribe:transcribe`, `hub:admin`, …) pass through
- *     unchanged — resource-binding only narrows the vault verbs.
+ *   - non-vault scopes (`scribe:*`, `channel:send`, `hub:admin`, …) are
+ *     DROPPED. This flow mints a token stamped `aud=vault.<name>` (RFC 8707),
+ *     so a scribe/channel/hub scope inside it is unusable — keeping it only
+ *     inflates the consent surface a friend sees when connecting ONE vault.
+ *     That "scary consent" is the failure mode this module exists to kill
+ *     (see the header docstring): the verb-narrowing alone left the foreign
+ *     scopes riding through, so a client that over-requests the whole-hub
+ *     catalog (claude.ai reads it from the AS-metadata `scopes_supported`)
+ *     still surfaced `scribe:admin` + `channel:send` on the consent screen.
+ *     A client that genuinely wants a scribe token runs a separate flow
+ *     naming the scribe resource.
  *
- * Idempotent: a scope already shaped `vault:<name>:<verb>` for THIS name is
- * returned as-is, so re-running over a narrowed list is a no-op.
+ * Idempotent: an already-narrowed list contains only `vault:` scopes, so a
+ * second pass has nothing left to drop and `vault:<name>:<verb>` for THIS name
+ * is returned as-is.
  */
 export function narrowResourceVaultScopes(scopes: readonly string[], vaultName: string): string[] {
-  return scopes.map((s) => {
+  const out: string[] = [];
+  for (const s of scopes) {
     const parts = s.split(":");
+    if (parts[0] !== "vault") continue; // drop scribe:/channel:/hub:/… — foreign to a vault-audience token
     const verb = parts[1];
-    if (parts.length === 2 && parts[0] === "vault" && verb && VAULT_VERBS.has(verb)) {
-      return `vault:${vaultName}:${verb}`;
+    if (parts.length === 2 && verb && VAULT_VERBS.has(verb)) {
+      out.push(`vault:${vaultName}:${verb}`);
+    } else {
+      out.push(s); // already-named (incl. other vaults) or malformed vault scope — downstream defenses decide
     }
-    return s;
-  });
+  }
+  return out;
 }

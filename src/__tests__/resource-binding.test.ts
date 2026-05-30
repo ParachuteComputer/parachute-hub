@@ -77,16 +77,42 @@ describe("narrowResourceVaultScopes", () => {
     expect(narrowResourceVaultScopes(["vault:other:read"], "jon")).toEqual(["vault:other:read"]);
   });
 
-  test("passes non-vault scopes through unchanged", () => {
-    expect(narrowResourceVaultScopes(["scribe:transcribe", "vault:read"], "jon")).toEqual([
-      "scribe:transcribe",
-      "vault:jon:read",
-    ]);
+  test("drops non-vault scopes — unusable in a vault-audience token", () => {
+    // A vault-bound flow mints `aud=vault.jon`; scribe/channel/hub scopes
+    // inside that token are dead weight, so they're removed rather than shown
+    // on the consent screen.
+    expect(
+      narrowResourceVaultScopes(
+        ["scribe:transcribe", "channel:send", "hub:admin", "vault:read"],
+        "jon",
+      ),
+    ).toEqual(["vault:jon:read"]);
   });
 
-  test("narrows the admin verb too (gate happens downstream)", () => {
-    // narrowResourceVaultScopes only rewrites shape; the non-requestable gate
-    // (`vault:<name>:admin`) blocks it afterward.
+  test("a one-vault connection drops the whole-hub catalog claude.ai over-requests", () => {
+    // claude.ai reads the hub AS-metadata `scopes_supported` (the full
+    // catalog) and requests all of it. Bound to one vault, only that vault's
+    // verbs survive — no scribe (uninstalled) or channel:send on the consent.
+    // Regression lock for the "scary consent" bug.
+    expect(
+      narrowResourceVaultScopes(
+        [
+          "vault:read",
+          "vault:write",
+          "vault:admin",
+          "scribe:admin",
+          "scribe:transcribe",
+          "channel:send",
+          "hub:admin",
+        ],
+        "default",
+      ),
+    ).toEqual(["vault:default:read", "vault:default:write", "vault:default:admin"]);
+  });
+
+  test("narrows the admin verb too (requestable-scope gate decides downstream)", () => {
+    // narrowResourceVaultScopes only rewrites shape; `vault:<name>:admin` is
+    // requestable post-#484, so this named form survives the downstream gate.
     expect(narrowResourceVaultScopes(["vault:admin"], "jon")).toEqual(["vault:jon:admin"]);
   });
 
