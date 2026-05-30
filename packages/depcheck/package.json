@@ -1,26 +1,19 @@
 {
   "name": "@openparachute/depcheck",
-  "version": "0.1.0-rc.1",
+  "version": "0.1.0-rc.2",
   "description": "Canonical missing-dependency UX for Parachute modules: a dependency registry, a message formatter, and ENOENT spawn-error helpers shared across vault / scribe / runner / hub.",
   "license": "AGPL-3.0",
   "type": "module",
   "publishConfig": {
-    "access": "public",
-    "//": "Override exports at publish time: the published tarball ships dist/ only (no src/), so the dev-only `bun`→src condition is dropped. Published Bun + Node consumers both resolve dist.",
-    "exports": {
-      ".": {
-        "types": "./dist/index.d.ts",
-        "import": "./dist/index.js"
-      }
-    }
+    "access": "public"
   },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "//": "exports MUST match scope-guard: NO `bun` condition. npm does not honor publishConfig.exports, so a `bun`→src condition would ship in the published package, and Bun consumers (hub) would resolve src/index.ts which the tarball doesn't include (files: dist only) → 'Cannot find module'. dist is built locally + shipped, so `import`→dist resolves under both Bun and Node. (Caught on the rc.1→rc.2 deploy.)",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "bun": "./src/index.ts",
       "import": "./dist/index.js"
     }
   },
