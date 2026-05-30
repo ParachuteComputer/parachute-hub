@@ -8542,12 +8542,12 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
   // Test 9 — privesc: read/write assigned (non-owner) user requests
   // vault:work:admin + vault:work:write → admin DROPPED, token has write only,
   // recorded grant lacks admin.
-  test("[9] non-owner read/write user requests admin+write → admin DROPPED (write only), grant lacks admin", async () => {
+  test("[9] non-owner ASSIGNED to the vault requests admin+write → BOTH granted (assigned users hold admin)", async () => {
     const { db, cleanup } = await makeDb();
     try {
       await createUser(db, "owner", "pw"); // first user = owner; consumes the admin slot.
       const friend = await createUser(db, "friend", "pw", { allowMulti: true });
-      setUserVaults(db, friend.id, ["work"]); // role=write → verbs [read, write]
+      setUserVaults(db, friend.id, ["work"]); // role=write → verbs [read, write, admin]
       const session = createSession(db, { userId: friend.id });
       const reg = registerClient(db, {
         redirectUris: ["https://app.example/cb"],
@@ -8564,20 +8564,20 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       expect(consentRes.status).toBe(302);
       const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
       const { scope, aud } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
-      // admin dropped; write kept.
-      expect(scope.split(" ").sort()).toEqual(["vault:work:write"]);
+      // Assigned user holds admin on their own vault → BOTH kept (2026-05-30 policy).
+      expect(scope.split(" ").sort()).toEqual(["vault:work:admin", "vault:work:write"]);
       expect(aud).toBe("vault.work");
-      // Recorded grant lacks admin.
+      // Recorded grant includes admin.
       const grant = findGrant(db, friend.id, reg.client.clientId);
       expect(grant?.scopes).toContain("vault:work:write");
-      expect(grant?.scopes).not.toContain("vault:work:admin");
+      expect(grant?.scopes).toContain("vault:work:admin");
     } finally {
       cleanup();
     }
   });
 
   // Test 10 — non-owner admin-ONLY request → REFUSED (clear error), no token.
-  test("[10] non-owner admin-only request → REFUSED with invalid_scope, no token minted", async () => {
+  test("[10] non-owner assigned, admin-only request → GRANTED (holds admin on their vault)", async () => {
     const { db, cleanup } = await makeDb();
     try {
       await createUser(db, "owner", "pw");
@@ -8588,7 +8588,7 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
         redirectUris: ["https://app.example/cb"],
         status: "approved",
       });
-      const { challenge } = makePkce();
+      const { verifier, challenge } = makePkce();
       const consentRes = await submitConsent(
         db,
         session.id,
@@ -8596,14 +8596,17 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
         "vault:work:admin",
         challenge,
       );
-      // Capping leaves an EMPTY scope set → refuse (no zero-scope token).
+      // Assigned user holds admin on their vault → minted, not refused.
       expect(consentRes.status).toBe(302);
       const loc = new URL(consentRes.headers.get("location") ?? "");
       expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
-      expect(loc.searchParams.get("error")).toBe("invalid_scope");
-      expect(loc.searchParams.get("code")).toBeNull();
-      // No grant recorded.
-      expect(findGrant(db, friend.id, reg.client.clientId)).toBeNull();
+      const code = loc.searchParams.get("code");
+      expect(code).toBeTruthy();
+      const { scope, aud } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope.split(" ")).toEqual(["vault:work:admin"]);
+      expect(aud).toBe("vault.work");
+      const grant = findGrant(db, friend.id, reg.client.clientId);
+      expect(grant?.scopes).toContain("vault:work:admin");
     } finally {
       cleanup();
     }
@@ -8611,7 +8614,7 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
 
   // Test 11 — non-owner unnamed vault:admin + picks assigned vault → after
   // narrowing, admin dropped (cap runs post-narrow).
-  test("[11] non-owner unnamed vault:admin + picks assigned vault → admin dropped post-narrow", async () => {
+  test("[11] non-owner unnamed vault:admin + picks assigned vault → admin KEPT post-narrow", async () => {
     const { db, cleanup } = await makeDb();
     try {
       await createUser(db, "owner", "pw");
@@ -8632,16 +8635,16 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
         challenge,
         { vault_pick: "work" },
       );
-      // narrowVaultScopes → vault:work:admin + vault:work:write; cap drops
-      // admin (non-owner doesn't hold it), keeps write → mints write only.
+      // narrowVaultScopes → vault:work:admin + vault:work:write; cap KEEPS
+      // both (assigned user holds admin on their picked vault) → mints both.
       expect(consentRes.status).toBe(302);
       const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
       expect(code).toBeTruthy();
       const { scope } = await redeemToScopeAud(db, code ?? "", reg.client.clientId, verifier);
-      expect(scope.split(" ").sort()).toEqual(["vault:work:write"]);
+      expect(scope.split(" ").sort()).toEqual(["vault:work:admin", "vault:work:write"]);
       const grant = findGrant(db, friend.id, reg.client.clientId);
       expect(grant?.scopes).toContain("vault:work:write");
-      expect(grant?.scopes).not.toContain("vault:work:admin");
+      expect(grant?.scopes).toContain("vault:work:admin");
     } finally {
       cleanup();
     }
@@ -8770,35 +8773,41 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
   // issueAuthCodeRedirect with an admin scope via ANY path (skip-consent /
   // same-hub / consent). Assert no grants row ever contains an un-held admin
   // verb across each path.
-  test("[15] bypass-proof: no mint path ever records an un-held admin verb for a non-owner", async () => {
+  test("[15] bypass-proof: no mint path grants admin on a vault the user is NOT assigned", async () => {
     const { db, cleanup } = await makeDb();
     try {
       await createUser(db, "owner", "pw");
       const friend = await createUser(db, "friend", "pw", { allowMulti: true });
-      setUserVaults(db, friend.id, ["work"]); // verbs [read, write] only
+      // Assigned to "work" only → holds work:read/write/admin, but NOT "other"
+      // (which exists in CAP_MANIFEST). "other" is the un-held boundary.
+      setUserVaults(db, friend.id, ["work"]);
       const session = createSession(db, { userId: friend.id });
 
-      // Path A — consent-submit with admin+write → admin dropped, recorded grant
-      // lacks admin.
+      // Path A — consent-submit admin on the UNASSIGNED "other" → the cap
+      // empties the set (friend doesn't hold it) → invalid_scope refusal, no
+      // grant. (Granting admin on the user's OWN assigned vault is exercised by
+      // [9]/[10]; here we isolate the un-held boundary.)
       const regConsent = registerClient(db, {
         redirectUris: ["https://app.example/cb"],
         status: "approved",
       });
       {
         const { challenge } = makePkce();
-        await submitConsent(
+        const res = await submitConsent(
           db,
           session.id,
           regConsent.client.clientId,
-          "vault:work:admin vault:work:write",
+          "vault:other:admin",
           challenge,
         );
-        const g = findGrant(db, friend.id, regConsent.client.clientId);
-        expect(g?.scopes ?? []).not.toContain("vault:work:admin");
+        // The consent-submit assignment gate rejects a request naming a vault
+        // the user isn't assigned (400) — refused before any mint, no grant.
+        expect(res.status).toBe(400);
+        expect(findGrant(db, friend.id, regConsent.client.clientId)).toBeNull();
       }
 
-      // Path B — same-hub client requesting admin → consent renders (admin gate
-      // blocks the silent path); no grant recorded with admin.
+      // Path B — same-hub client requesting admin on the UNASSIGNED "other" →
+      // consent renders (admin gate blocks the silent path); no grant with it.
       const regSameHub = registerClient(db, {
         redirectUris: ["https://app.example/cb"],
         status: "approved",
@@ -8815,7 +8824,7 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
               response_type: "code",
               code_challenge: challenge,
               code_challenge_method: "S256",
-              scope: "vault:work:admin",
+              scope: "vault:other:admin",
             }),
             { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
           ),
@@ -8823,22 +8832,23 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
         );
         expect(res.status).toBe(200); // consent, not silent-mint
         const g = findGrant(db, friend.id, regSameHub.client.clientId);
-        expect(g?.scopes ?? []).not.toContain("vault:work:admin");
+        expect(g?.scopes ?? []).not.toContain("vault:other:admin");
       }
 
-      // Path C — skip-consent: even if a grant row were somehow seeded with an
-      // admin verb, the cap at issueAuthCodeRedirect drops it before minting AND
-      // re-records the capped set. Seed a poisoned grant, drive skip-consent,
-      // and assert the minted token + the (re-recorded) grant carry no admin.
+      // Path C — skip-consent: a grant row seeded with an UNASSIGNED-vault admin
+      // verb. The cap at issueAuthCodeRedirect is the authority, not the grant
+      // row — request only the held write scope (skip-consent fires) and the
+      // minted token carries no other:admin (the un-held verb never rides along).
       const regSkip = registerClient(db, {
         redirectUris: ["https://app.example/cb"],
         status: "approved",
       });
-      recordGrant(db, friend.id, regSkip.client.clientId, ["vault:work:write", "vault:work:admin"]);
+      recordGrant(db, friend.id, regSkip.client.clientId, [
+        "vault:work:write",
+        "vault:other:admin",
+      ]);
       {
         const { verifier, challenge } = makePkce();
-        // Request only the held write scope so skip-consent fires (covered by
-        // the seeded grant) and routes through issueAuthCodeRedirect.
         const res = handleAuthorizeGet(
           db,
           new Request(
@@ -8857,37 +8867,36 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
         expect(res.status).toBe(302); // skip-consent silent mint of the held scope
         const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
         const { scope } = await redeemToScopeAud(db, code ?? "", regSkip.client.clientId, verifier);
-        expect(scope.split(" ")).not.toContain("vault:work:admin");
+        expect(scope.split(" ")).not.toContain("vault:other:admin");
       }
     } finally {
       cleanup();
     }
   });
 
-  // Reviewer fold (security-relevant): test 15 path C only requested `write`
-  // against the poisoned client, which proves the cap doesn't *re-record* an
-  // un-held verb. This case requests `vault:work:admin` DIRECTLY against a
-  // client whose grant row ALREADY lists `vault:work:admin` (poisoned). The
-  // skip-consent gate fires (the requested admin scope IS covered by the
-  // poisoned grant) and routes through issueAuthCodeRedirect — where the CAP,
-  // not the grant lookup, drops the admin verb. Admin-only request → caps to
-  // EMPTY → invalid_scope refusal, no code, no token. This pins that the
-  // cap-before-issueAuthCode invariant holds even when a stale admin grant
-  // would otherwise satisfy the coverage check.
-  test("[15b] non-owner requests admin DIRECTLY against a POISONED-grant client → cap refuses, no admin token", async () => {
+  // Reviewer fold (security-relevant): test 15 path C only requested the held
+  // `write` scope, proving the cap doesn't re-record an un-held verb. This case
+  // requests admin on the UNASSIGNED "other" vault DIRECTLY against a client
+  // whose grant row already lists `vault:other:admin` (poisoned). The
+  // skip-consent gate fires (the requested scope IS covered by the poisoned
+  // grant) and routes through issueAuthCodeRedirect — where the CAP, not the
+  // grant lookup, drops the un-held verb. Admin-only request → caps to EMPTY →
+  // invalid_scope refusal, no code, no token. Pins that the cap-before-
+  // issueAuthCode invariant holds even when a stale grant satisfies coverage.
+  test("[15b] non-owner requests admin on an UNASSIGNED vault against a POISONED-grant client → cap refuses", async () => {
     const { db, cleanup } = await makeDb();
     try {
       await createUser(db, "owner", "pw");
       const friend = await createUser(db, "friend", "pw", { allowMulti: true });
-      setUserVaults(db, friend.id, ["work"]); // verbs [read, write] only — never admin
+      setUserVaults(db, friend.id, ["work"]); // holds work:* (incl. admin) — NOT "other"
       const session = createSession(db, { userId: friend.id });
       const reg = registerClient(db, {
         redirectUris: ["https://app.example/cb"],
         status: "approved",
       });
-      // Poisoned grant: already lists vault:work:admin (so the skip-consent
-      // coverage check would pass for a direct admin request).
-      recordGrant(db, friend.id, reg.client.clientId, ["vault:work:write", "vault:work:admin"]);
+      // Poisoned grant: already lists vault:other:admin (so the skip-consent
+      // coverage check would pass for a direct other:admin request).
+      recordGrant(db, friend.id, reg.client.clientId, ["vault:work:write", "vault:other:admin"]);
 
       const { challenge } = makePkce();
       const res = handleAuthorizeGet(
@@ -8899,14 +8908,14 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
             response_type: "code",
             code_challenge: challenge,
             code_challenge_method: "S256",
-            scope: "vault:work:admin",
+            scope: "vault:other:admin",
             state: "poisoned-direct",
           }),
           { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
         ),
         capDeps,
       );
-      // The cap leaves an EMPTY set (non-owner doesn't hold admin) → refuse.
+      // The cap leaves an EMPTY set (friend isn't assigned "other") → refuse.
       // 302 to redirect_uri with invalid_scope and NO code — no token minted.
       expect(res.status).toBe(302);
       const loc = new URL(res.headers.get("location") ?? "");

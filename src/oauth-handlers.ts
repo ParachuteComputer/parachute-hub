@@ -1193,12 +1193,14 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
  *   - The authority source of truth today is `isFirstAdmin` for owner-wide
  *     authority and `user_vaults.role` (via `vaultVerbsForRole`) for assigned
  *     users.
- *   - `vaultVerbsForRole` provably never returns `admin` for an assigned user
- *     (it maps write→[read,write], read→[read], unknown→[]), so this helper
- *     drops `vault:<name>:admin` for every non-owner BY CONSTRUCTION — without
- *     hardcoding "drop admin". It reads the held verb set and admits only
- *     held verbs, so it's forward-compatible: if a future role ever granted
- *     admin, the cap would admit it automatically.
+ *   - `vaultVerbsForRole` maps write→[read,write,admin] (2026-05-30: any
+ *     assigned user holds FULL vault authority, incl. admin), read→[read],
+ *     unknown→[]. This helper reads the held verb set and admits ONLY held
+ *     verbs — no hardcoded allow/deny of admin. So an assigned user gets
+ *     `vault:<their-vault>:admin`, while a user gets NOTHING for a vault they
+ *     aren't assigned (held=null → every verb dropped). The cap is the
+ *     forward-compatible single source: it admitted admin automatically the
+ *     moment the role mapping changed — no edit here was needed.
  *   - Applied inside `issueAuthCodeRedirect` (the single choke-point ALL mint
  *     paths funnel through: consent-submit, skip-consent, and same-hub
  *     auto-trust), the CAPPED set is what gets both recorded (`recordGrant`)

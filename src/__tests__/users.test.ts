@@ -740,10 +740,13 @@ describe("getFirstAdminId / isFirstAdmin", () => {
 
 describe("vaultVerbsForRole / vaultVerbsForUserVault (friend token-mint cap)", () => {
   test("vaultVerbsForRole maps roles to verbs, fails closed on unknown", () => {
-    expect(vaultVerbsForRole("write")).toEqual(["read", "write"]);
+    // Assigned users (role=write, today's default) hold FULL vault authority
+    // incl. admin (2026-05-30 policy: any assigned user gets admin). A
+    // deliberate read-only assignment stays read-only. Unknown role strings
+    // (including the literal "admin") map to [] — only the recognised roles
+    // grant verbs; never silently default to write.
+    expect(vaultVerbsForRole("write")).toEqual(["read", "write", "admin"]);
     expect(vaultVerbsForRole("read")).toEqual(["read"]);
-    // Unknown / future roles grant NO mintable verb — never silently
-    // default to write. `admin` is explicitly NOT a mintable role here.
     expect(vaultVerbsForRole("admin")).toEqual([]);
     expect(vaultVerbsForRole("owner")).toEqual([]);
     expect(vaultVerbsForRole("")).toEqual([]);
@@ -757,8 +760,9 @@ describe("vaultVerbsForRole / vaultVerbsForUserVault (friend token-mint cap)", (
         allowMulti: true,
         assignedVaults: ["work"],
       });
-      // createUser/setUserVaults insert role='write' today → read+write.
-      expect(vaultVerbsForUserVault(db, friend.id, "work")).toEqual(["read", "write"]);
+      // createUser/setUserVaults insert role='write' today → read+write+admin
+      // (assigned users hold full vault authority, 2026-05-30 policy).
+      expect(vaultVerbsForUserVault(db, friend.id, "work")).toEqual(["read", "write", "admin"]);
     } finally {
       cleanup();
     }
