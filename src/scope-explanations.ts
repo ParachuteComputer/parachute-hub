@@ -45,6 +45,12 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     label: "Full vault access plus configuration changes (rotate tokens, change settings).",
     level: "admin",
   },
+  // Optional-module scopes (scribe / channel). These are in FIRST_PARTY_SCOPES
+  // (= Object.keys(this map)) but the modules may not be installed — so they're
+  // GATED in `OPTIONAL_MODULE_SCOPES` (oauth-handlers.ts) and only advertised in
+  // `scopes_supported` when the service is in services.json. If you add scopes
+  // for another optional module here, add a matching gate there too, or a
+  // vault-only hub will over-advertise them (the bug behind hub#489).
   "scribe:transcribe": {
     label: "Send audio to Scribe for transcription.",
     level: "write",
