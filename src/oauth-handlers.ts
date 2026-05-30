@@ -388,13 +388,53 @@ function oauthErrorRedirect(
  *
  * Closes hub#393.
  */
+
+/**
+ * Optional first-party modules whose scopes `FIRST_PARTY_SCOPES` carries
+ * statically (it's `Object.keys(SCOPE_EXPLANATIONS)`), paired with the
+ * services.json entry that means "installed." Vault + hub are core and always
+ * advertised; these are the modules a hub may not have.
+ */
+const OPTIONAL_MODULE_SCOPES: ReadonlyArray<readonly [prefix: string, service: string]> = [
+  ["scribe:", "parachute-scribe"],
+  ["channel:", "parachute-channel"],
+];
+
+/**
+ * The scope set to advertise in `scopes_supported` (RFC 8414 + RFC 9728): the
+ * requestable declared scopes, minus any OPTIONAL module's scopes when that
+ * module isn't installed.
+ *
+ * Why: `FIRST_PARTY_SCOPES` is static, so a vault-only hub still advertised
+ * `scribe:*` + `channel:send`. Discovery clients list the advertised catalog
+ * verbatim — claude.ai's connector UI showed a friend connecting ONE vault a
+ * request for Scribe + Channel access the hub can't even honor. So advertise an
+ * optional module's scopes only when its service is present in services.json.
+ * (Trims the ADVERTISEMENT only; issuance/validation still use the full
+ * `loadDeclaredScopes` set, and the per-vault PRM stays vault-narrowed.)
+ */
+function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManifest): string[] {
+  const installed = new Set(manifest.services.map((s) => s.name));
+  return Array.from(declared)
+    .filter(isRequestableScope)
+    .filter((scope) => {
+      for (const [prefix, service] of OPTIONAL_MODULE_SCOPES) {
+        if (scope.startsWith(prefix) && !installed.has(service)) return false;
+      }
+      return true;
+    });
+}
+
 export function protectedResourceMetadata(deps: OAuthDeps): Response {
   const iss = deps.issuer;
   const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
   return jsonResponse({
     resource: iss,
     authorization_servers: [iss],
-    scopes_supported: Array.from(declared).filter(isRequestableScope),
+    scopes_supported: advertisedScopes(
+      declared,
+      (deps.loadServicesManifest ?? readServicesManifest)(),
+    ),
     bearer_methods_supported: ["header"],
     resource_documentation: "https://parachute.computer",
     // Intentional omission: `resource_signing_alg_values_supported` +
@@ -435,7 +475,10 @@ export function authorizationServerMetadata(deps: OAuthDeps): Response {
     // — RFC 8414 §2 frames `scopes_supported` as "the OAuth 2.0 [...] scope
     // values that this authorization server supports" for clients to request.
     // Advertising what we always reject would mislead clients.
-    scopes_supported: Array.from(declared).filter(isRequestableScope),
+    scopes_supported: advertisedScopes(
+      declared,
+      (deps.loadServicesManifest ?? readServicesManifest)(),
+    ),
   });
 }
 

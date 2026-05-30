@@ -95,7 +95,10 @@ function fixtureLoadServicesManifest(): ServicesManifest {
 
 describe("authorizationServerMetadata", () => {
   test("emits RFC 8414 fields rooted at the issuer", async () => {
-    const res = authorizationServerMetadata({ issuer: ISSUER });
+    const res = authorizationServerMetadata({
+      issuer: ISSUER,
+      loadServicesManifest: fixtureLoadServicesManifest,
+    });
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.issuer).toBe(ISSUER);
@@ -110,15 +113,21 @@ describe("authorizationServerMetadata", () => {
     const scopesSupported = body.scopes_supported as string[];
     expect(scopesSupported).toContain("vault:read");
     expect(scopesSupported).toContain("vault:admin");
-    expect(scopesSupported).toContain("scribe:transcribe");
+    expect(scopesSupported).toContain("scribe:transcribe"); // scribe is in the fixture manifest
     expect(scopesSupported).toContain("hub:admin");
+    // channel isn't in the fixture manifest → its scopes aren't advertised
+    // (hub#…: optional-module scopes only surface when the module is installed).
+    expect(scopesSupported).not.toContain("channel:send");
   });
 
   test("does NOT advertise non-requestable operator-only scopes", async () => {
     // #96: parachute:host:admin is operator-only. RFC 8414 §2 frames
     // scopes_supported as scopes a client *can* request — advertising what
     // we always reject would mislead clients.
-    const res = authorizationServerMetadata({ issuer: ISSUER });
+    const res = authorizationServerMetadata({
+      issuer: ISSUER,
+      loadServicesManifest: fixtureLoadServicesManifest,
+    });
     const body = (await res.json()) as Record<string, unknown>;
     const scopesSupported = body.scopes_supported as string[];
     expect(scopesSupported).not.toContain("parachute:host:admin");
@@ -143,6 +152,7 @@ describe("authorizationServerMetadata", () => {
     const res = authorizationServerMetadata({
       issuer: ISSUER,
       loadDeclaredScopes: () => declared,
+      loadServicesManifest: fixtureLoadServicesManifest,
     });
     const body = (await res.json()) as Record<string, unknown>;
     const scopesSupported = body.scopes_supported as string[];
@@ -157,11 +167,84 @@ describe("authorizationServerMetadata", () => {
     // NON_REQUESTABLE filter still applies even when the scope is declared
     expect(scopesSupported).not.toContain("parachute:host:admin");
   });
+
+  test("advertises an optional module's scopes only when it's installed", async () => {
+    // FIRST_PARTY_SCOPES carries scribe:* + channel:send statically. On a
+    // vault-only hub they must NOT be advertised — a discovery client (e.g.
+    // claude.ai's connector UI) lists the catalog verbatim, so a friend
+    // connecting one vault was shown Scribe + Channel access the hub can't
+    // honor. Vault + hub are core and always advertised.
+    const declared = new Set<string>([
+      "vault:read",
+      "vault:write",
+      "vault:admin",
+      "scribe:transcribe",
+      "scribe:admin",
+      "channel:send",
+      "hub:admin",
+    ]);
+    const vaultOnly = {
+      services: [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/health",
+          version: "0.5.1",
+        },
+      ],
+    };
+    const res = authorizationServerMetadata({
+      issuer: ISSUER,
+      loadDeclaredScopes: () => declared,
+      loadServicesManifest: () => vaultOnly as unknown as ServicesManifest,
+    });
+    const scopes = ((await res.json()) as Record<string, unknown>).scopes_supported as string[];
+    // core scopes survive
+    expect(scopes).toContain("vault:read");
+    expect(scopes).toContain("vault:admin");
+    expect(scopes).toContain("hub:admin");
+    // uninstalled optional-module scopes are dropped
+    expect(scopes).not.toContain("scribe:transcribe");
+    expect(scopes).not.toContain("scribe:admin");
+    expect(scopes).not.toContain("channel:send");
+
+    // ...but once scribe is installed, its scopes ARE advertised again.
+    const withScribe = {
+      services: [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/health",
+          version: "0.5.1",
+        },
+        {
+          name: "parachute-scribe",
+          port: 1943,
+          paths: ["/scribe"],
+          health: "/health",
+          version: "0.4.5",
+        },
+      ],
+    };
+    const res2 = authorizationServerMetadata({
+      issuer: ISSUER,
+      loadDeclaredScopes: () => declared,
+      loadServicesManifest: () => withScribe as unknown as ServicesManifest,
+    });
+    const scopes2 = ((await res2.json()) as Record<string, unknown>).scopes_supported as string[];
+    expect(scopes2).toContain("scribe:transcribe");
+    expect(scopes2).not.toContain("channel:send"); // channel still not installed
+  });
 });
 
 describe("protectedResourceMetadata (RFC 9728, closes hub#393)", () => {
   test("emits the required RFC 9728 fields rooted at the issuer", async () => {
-    const res = protectedResourceMetadata({ issuer: ISSUER });
+    const res = protectedResourceMetadata({
+      issuer: ISSUER,
+      loadServicesManifest: fixtureLoadServicesManifest,
+    });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/application\/json/);
     const body = (await res.json()) as Record<string, unknown>;
@@ -185,6 +268,7 @@ describe("protectedResourceMetadata (RFC 9728, closes hub#393)", () => {
     const res = protectedResourceMetadata({
       issuer: ISSUER,
       loadDeclaredScopes: () => declared,
+      loadServicesManifest: fixtureLoadServicesManifest,
     });
     const body = (await res.json()) as Record<string, unknown>;
     const scopes = body.scopes_supported as string[];
@@ -3904,7 +3988,10 @@ describe("refresh-token rotation + /oauth/revoke (#73)", () => {
   });
 
   test("authorizationServerMetadata advertises revocation_endpoint", async () => {
-    const res = authorizationServerMetadata({ issuer: ISSUER });
+    const res = authorizationServerMetadata({
+      issuer: ISSUER,
+      loadServicesManifest: fixtureLoadServicesManifest,
+    });
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.revocation_endpoint).toBe(`${ISSUER}/oauth/revoke`);
   });
