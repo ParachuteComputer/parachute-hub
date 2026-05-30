@@ -1696,7 +1696,56 @@ describe("parachute auth mint-token", () => {
       expect(stdout.trim().split(".").length).toBe(3);
       expect(stderr).toContain("--ttl is deprecated");
       expect(stderr).toContain("--expires-in");
-      expect(stderr).toContain("0.6.0");
+      expect(stderr).toContain("future release");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--ephemeral mints a short-lived (1h) token", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "vault:default:read", "--ephemeral"], deps),
+      );
+      expect(code).toBe(0);
+      const token = stdout.trim();
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const validated = await validateAccessToken(db, token);
+        const exp = validated.payload.exp as number;
+        const iat = validated.payload.iat as number;
+        expect(exp - iat).toBe(60 * 60);
+      } finally {
+        db.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--ephemeral is mutually exclusive with --expires-in", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = {
+        dbPath: tmp.dbPath,
+        configDir: tmp.dir,
+        isInteractive: () => false,
+      };
+      await captureOutput(() => auth(["set-password", "--password", "pw"], deps));
+      const { code, stdout, stderr } = await captureOutput(() =>
+        auth(["mint-token", "--scope", "vault:read", "--ephemeral", "--expires-in", "3600"], deps),
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("--ephemeral");
+      // No token leaked to stdout on the conflict error.
+      expect(stdout).toBe("");
     } finally {
       tmp.cleanup();
     }
