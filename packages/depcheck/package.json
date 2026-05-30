@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/depcheck",
-  "version": "0.1.0-rc.2",
+  "version": "0.1.0",
   "description": "Canonical missing-dependency UX for Parachute modules: a dependency registry, a message formatter, and ENOENT spawn-error helpers shared across vault / scribe / runner / hub.",
   "license": "AGPL-3.0",
   "type": "module",
@@ -10,14 +10,18 @@
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "//": "exports MUST match scope-guard: NO `bun` condition. npm does not honor publishConfig.exports, so a `bun`→src condition would ship in the published package, and Bun consumers (hub) would resolve src/index.ts which the tarball doesn't include (files: dist only) → 'Cannot find module'. dist is built locally + shipped, so `import`→dist resolves under both Bun and Node. (Caught on the rc.1→rc.2 deploy.)",
+  "//": "exports MUST match scope-guard: NO `bun` condition. npm does not honor publishConfig.exports, so a `bun`\u2192src condition would ship in the published package, and Bun consumers (hub) would resolve src/index.ts which the tarball doesn't include (files: dist only) \u2192 'Cannot find module'. dist is built locally + shipped, so `import`\u2192dist resolves under both Bun and Node. (Caught on the rc.1\u2192rc.2 deploy.)",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/ParachuteComputer/parachute-hub.git",

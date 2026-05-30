@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/hub",
-  "version": "0.5.14-rc.21",
+  "version": "0.6.0",
   "description": "parachute \u2014 the local hub for the Parachute ecosystem (discovery, ports, lifecycle, soon OAuth).",
   "license": "AGPL-3.0",
   "publishConfig": {
@@ -45,7 +45,7 @@
   },
   "dependencies": {
     "@node-rs/argon2": "^2.0.2",
-    "@openparachute/depcheck": "0.1.0-rc.2",
+    "@openparachute/depcheck": "0.1.0",
     "jose": "^6.2.2",
     "otpauth": "^9.5.0",
     "qrcode": "^1.5.4"
