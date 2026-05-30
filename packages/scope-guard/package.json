@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/scope-guard",
-  "version": "0.4.0-rc.2",
+  "version": "0.4.0",
   "description": "Hub-issued JWT validation for Parachute resource servers (vault, scribe, parachute-agent, third-party modules).",
   "license": "AGPL-3.0",
   "type": "module",
@@ -16,7 +16,11 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/ParachuteComputer/parachute-hub.git",
