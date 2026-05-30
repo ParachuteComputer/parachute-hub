@@ -1186,14 +1186,26 @@ function capScopesToUserAuthority(
  * client + redirect_uri and for having narrowed unnamed `vault:<verb>` scopes
  * to their named form (so the cap below sees final shapes).
  *
- * Two responsibilities live here so NO mint path can bypass them:
+ * This is the single choke-point for two responsibilities, so NO mint path can
+ * bypass them:
  *   1. Anti-privilege-escalation cap (`capScopesToUserAuthority`): a non-owner
  *      can only delegate vault verbs they hold; un-held verbs (notably admin)
  *      are dropped. An admin-only request from a non-owner caps to EMPTY → we
- *      refuse with `invalid_scope` rather than mint a zero-scope token.
- *   2. Grant recording (`recordGrant`) with the CAPPED scopes — so a later
- *      skip-consent flow can never replay an un-held verb. UNION semantics
- *      make this idempotent for the skip-consent re-entry.
+ *      refuse with `invalid_scope` rather than mint a zero-scope token. EVERY
+ *      auth code is minted through here, so the cap runs before every mint —
+ *      even when a stale `grants` row already lists an un-held admin verb (the
+ *      cap, not the grant lookup, is what blocks the mint).
+ *   2. Grant recording (`recordGrant`) with the CAPPED scopes for THIS mint —
+ *      so a later skip-consent flow re-entering with the same (user, client)
+ *      can never replay an un-held verb. UNION semantics make this idempotent.
+ *
+ * Not the ONLY `recordGrant` call in this module, though: two other guarded
+ * fast-path records exist — the trust-by-client_name auto-promote in
+ * `pendingClientResponse` (~L585) and the auto-approve carry-over in
+ * `handleAuthorizeGet` (~L895). Both are gated by `!some(scopeIsAdmin)`, so
+ * neither can ever record an admin verb, and any mint they unlock still flows
+ * back through this function's cap. So the invariant "no minted token, and no
+ * grant row, ever carries an un-held admin verb" holds across all paths.
  */
 function issueAuthCodeRedirect(
   db: Database,

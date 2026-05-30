@@ -8575,4 +8575,67 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
       cleanup();
     }
   });
+
+  // Reviewer fold (security-relevant): test 15 path C only requested `write`
+  // against the poisoned client, which proves the cap doesn't *re-record* an
+  // un-held verb. This case requests `vault:work:admin` DIRECTLY against a
+  // client whose grant row ALREADY lists `vault:work:admin` (poisoned). The
+  // skip-consent gate fires (the requested admin scope IS covered by the
+  // poisoned grant) and routes through issueAuthCodeRedirect — where the CAP,
+  // not the grant lookup, drops the admin verb. Admin-only request → caps to
+  // EMPTY → invalid_scope refusal, no code, no token. This pins that the
+  // cap-before-issueAuthCode invariant holds even when a stale admin grant
+  // would otherwise satisfy the coverage check.
+  test("[15b] non-owner requests admin DIRECTLY against a POISONED-grant client → cap refuses, no admin token", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]); // verbs [read, write] only — never admin
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      // Poisoned grant: already lists vault:work:admin (so the skip-consent
+      // coverage check would pass for a direct admin request).
+      recordGrant(db, friend.id, reg.client.clientId, ["vault:work:write", "vault:work:admin"]);
+
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:work:admin",
+            state: "poisoned-direct",
+          }),
+          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+        ),
+        capDeps,
+      );
+      // The cap leaves an EMPTY set (non-owner doesn't hold admin) → refuse.
+      // 302 to redirect_uri with invalid_scope and NO code — no token minted.
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("error")).toBe("invalid_scope");
+      expect(loc.searchParams.get("code")).toBeNull();
+      expect(loc.searchParams.get("state")).toBe("poisoned-direct");
+
+      // The re-record with the capped (empty) set never happens on the refuse
+      // path, so the poisoned grant is untouched — but crucially, NO mint
+      // occurred. Verify no auth code row was issued for this client.
+      const codeRows = db
+        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM auth_codes WHERE client_id = ?")
+        .get(reg.client.clientId);
+      expect(codeRows?.n ?? 0).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
 });
