@@ -70,6 +70,21 @@ COPY . .
 # --ignore-scripts to keep the install layer source-independent).
 RUN bun run build:spa
 
+# Build every workspace package's `dist/` before the runtime stage copies
+# `packages/`. `@openparachute/depcheck` is imported at boot (src/cli.ts) and
+# its `exports` resolve to `./dist/index.js`; the install above ran
+# `--ignore-scripts` (no build hook) and the host's `dist/` is `.dockerignore`d,
+# so without a build here the runtime image ships a package with no `dist/`, Bun
+# can't resolve the module, and the hub crashes on boot before binding :1939
+# (the container smoke caught this after depcheck's `bun`→src exports condition
+# was dropped — that condition had masked it by resolving to `src/` under Bun).
+# Looping over every package keeps this self-healing as the workspace grows
+# rather than enumerating the one package that happens to be boot-imported today
+# (every package in `packages/` is a tsc-only lib with a `build` script). The
+# runtime stage's `COPY --from=builder packages` carries the emitted `dist/`
+# along (inter-stage COPY ignores `.dockerignore`).
+RUN for pkg in packages/*/; do (cd "$pkg" && bun run build); done
+
 # ---- Runtime stage --------------------------------------------------------
 
 FROM oven/bun:${BUN_VERSION}-alpine AS runtime
