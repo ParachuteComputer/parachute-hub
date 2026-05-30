@@ -120,10 +120,13 @@ Usage:
                                        Mint a fresh ~/.parachute/operator.token
                                        (set = install|start|expose|auth|vault|admin,
                                        default admin)
-  parachute auth mint-token --scope <scope> [--aud <aud>] [--expires-in <seconds>]
+  parachute auth mint-token --scope <scope> [--aud <aud>]
+                                            [--ephemeral | --expires-in <seconds>]
                                             [--sub <sub>] [--permissions <json>]
                                        Mint a scope-narrow JWT against the
                                        operator's identity (stdout = JWT).
+                                       --ephemeral = short-lived (1h), ideal for
+                                       scripting; default lifetime is 90d.
                                        --ttl <duration> is the deprecated
                                        alias (use --expires-in seconds).
   parachute auth revoke-token <jti>    Mark a registry-row token revoked
@@ -194,6 +197,12 @@ audience defaults via the same inference rule the OAuth flow uses
 colon-prefixed scope's namespace, fallback \`hub\`). Lifetime defaults
 to 90d, caps at 365d.
 
+--ephemeral mints a short-lived (1h) token — the right default for
+scripting, where the credential only needs to outlive the script run.
+Prefer it over a long-lived token for one-off automation:
+\`parachute auth mint-token --scope vault:default:read --ephemeral\`.
+Mutually exclusive with --expires-in / --ttl.
+
 --scope accepts space-separated multi-scope (e.g.
 \`--scope "vault:default:read agent:wovenboulder:invoke"\`).
 
@@ -201,7 +210,7 @@ to 90d, caps at 365d.
 \`--expires-in 86400\` for 1 day). The legacy \`--ttl\` flag accepts a
 duration suffix (\`90d\` / \`24h\` / \`30m\` / \`60s\`) and is supported as
 a deprecated alias; passing it emits a one-line stderr deprecation
-notice. \`--ttl\` will be removed in 0.6.0.
+notice. \`--ttl\` will be removed in a future release.
 
 --permissions accepts a JSON object encoding fine-grained constraints
 beyond OAuth scope (e.g.
@@ -748,6 +757,8 @@ interface MintTokenFlags {
   permissions?: string;
   /** True when --ttl was used (deprecated alias). Triggers a one-line stderr warning. */
   ttlDeprecationSeen?: boolean;
+  /** --ephemeral: short-lived token (EPHEMERAL_TTL_SECONDS), the scripting default. */
+  ephemeral?: boolean;
   error?: string;
 }
 
@@ -759,6 +770,7 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
   let sub: string | undefined;
   let permissions: string | undefined;
   let ttlDeprecationSeen = false;
+  let ephemeral = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--scope") {
@@ -805,6 +817,8 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
     } else if (a?.startsWith("--permissions=")) {
       permissions = a.slice("--permissions=".length);
       if (!permissions) return { error: "--permissions requires a value" };
+    } else if (a === "--ephemeral") {
+      ephemeral = true;
     } else {
       return { error: `unknown flag "${a}"` };
     }
@@ -812,11 +826,21 @@ function parseMintTokenFlags(args: readonly string[]): MintTokenFlags {
   if (ttl !== undefined && expiresIn !== undefined) {
     return { error: "pass --expires-in OR --ttl, not both (--ttl is the deprecated alias)" };
   }
-  return { scope, aud, ttl, expiresIn, sub, permissions, ttlDeprecationSeen };
+  if (ephemeral && (ttl !== undefined || expiresIn !== undefined)) {
+    return {
+      error: "pass --ephemeral OR an explicit lifetime (--expires-in/--ttl), not both",
+    };
+  }
+  return { scope, aud, ttl, expiresIn, sub, permissions, ttlDeprecationSeen, ephemeral };
 }
 
 const MINT_TOKEN_TTL_DEFAULT_SECONDS = 90 * 24 * 60 * 60;
 const MINT_TOKEN_TTL_MAX_SECONDS = 365 * 24 * 60 * 60;
+// --ephemeral: short-lived token for scripting, where the credential only needs
+// to outlive the script run. 1h is long enough to mint → iterate → run, short
+// enough that a leaked scripting token isn't a standing liability like the 90d
+// default would be.
+const EPHEMERAL_TTL_SECONDS = 60 * 60;
 
 /**
  * Parse a Go-ish duration string: integer + one of d/h/m/s. Caps at 365d.
@@ -870,7 +894,7 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   if (!flags.scope) {
     console.error("parachute auth mint-token: --scope is required");
     console.error(
-      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--expires-in <seconds>] [--sub <sub>] [--permissions <json>]",
+      "usage: parachute auth mint-token --scope <scope> [--aud <aud>] [--ephemeral | --expires-in <seconds>] [--sub <sub>] [--permissions <json>]",
     );
     return 1;
   }
@@ -918,7 +942,11 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   }
 
   let ttlSeconds = MINT_TOKEN_TTL_DEFAULT_SECONDS;
-  if (flags.expiresIn) {
+  if (flags.ephemeral) {
+    // Short-lived scripting default — takes precedence (the parse layer already
+    // rejected --ephemeral alongside an explicit --expires-in/--ttl).
+    ttlSeconds = EPHEMERAL_TTL_SECONDS;
+  } else if (flags.expiresIn) {
     const parsed = parseExpiresIn(flags.expiresIn);
     if ("error" in parsed) {
       console.error(`parachute auth mint-token: ${parsed.error}`);
@@ -935,7 +963,7 @@ async function runMintToken(args: readonly string[], deps: AuthDeps): Promise<nu
   }
   if (flags.ttlDeprecationSeen) {
     console.error(
-      "parachute auth mint-token: --ttl is deprecated; use --expires-in <seconds> instead (will be removed in 0.6.0)",
+      "parachute auth mint-token: --ttl is deprecated; use --expires-in <seconds> instead (will be removed in a future release)",
     );
   }
 
