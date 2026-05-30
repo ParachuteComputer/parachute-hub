@@ -21,7 +21,7 @@ import {
   readOperatorTokenFile,
 } from "../operator-token.ts";
 import { ensureLogPath, logPath, readPid, writePid } from "../process-state.ts";
-import { upsertService } from "../services-manifest.ts";
+import { readManifest, upsertService } from "../services-manifest.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 
 interface Harness {
@@ -192,6 +192,87 @@ describe("parachute start", () => {
       expect(spawner.calls[0]?.logFile).toBe(logPath("vault", h.configDir));
       expect(readPid("vault", h.configDir)).toBe(4242);
       expect(logs.join("\n")).toMatch(/vault started \(pid 4242\)/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("missing startCmd binary → friendly missing-dependency message + no spawn", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const spawner = makeSpawner([4242]);
+      const logs: string[] = [];
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        // Force the preflight's missing-binary branch: parachute-vault not on PATH.
+        which: () => null,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(1);
+      // Preflight fired before the spawn — the stub spawner is never called.
+      expect(spawner.calls).toHaveLength(0);
+      const out = logs.join("\n");
+      expect(out).toMatch(/vault failed to start/);
+      // The friendly install block names the binary + its install path.
+      expect(out).toContain("parachute-vault is required to run the Vault module Hub supervises");
+      expect(out).toContain("parachute install vault");
+      expect(readPid("vault", h.configDir)).toBeUndefined();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("missing startCmd binary persists lastStartError so a later status surfaces it", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner: makeSpawner([4242]),
+        which: () => null,
+        log: () => {},
+      });
+      const entry = readManifest(h.manifestPath).services.find((s) => s.name === "parachute-vault");
+      expect(entry?.lastStartError?.error_type).toBe("missing_dependency");
+      expect(entry?.lastStartError?.binary).toBe("parachute-vault");
+      expect(entry?.lastStartError?.at).toBeDefined();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a successful start clears a previously-recorded lastStartError", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      // First start fails (binary missing) → records the error.
+      await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner: makeSpawner([1]),
+        which: () => null,
+        log: () => {},
+      });
+      expect(
+        readManifest(h.manifestPath).services.find((s) => s.name === "parachute-vault")
+          ?.lastStartError,
+      ).toBeDefined();
+      // Second start succeeds (binary present via the permissive default which
+      // — stub spawner path) → clears the recorded error.
+      await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner: makeSpawner([4242]),
+        log: () => {},
+      });
+      expect(
+        readManifest(h.manifestPath).services.find((s) => s.name === "parachute-vault")
+          ?.lastStartError,
+      ).toBeUndefined();
     } finally {
       h.cleanup();
     }

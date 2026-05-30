@@ -1,0 +1,42 @@
+{
+  "name": "@openparachute/depcheck",
+  "version": "0.1.0-rc.1",
+  "description": "Canonical missing-dependency UX for Parachute modules: a dependency registry, a message formatter, and ENOENT spawn-error helpers shared across vault / scribe / runner / hub.",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "publishConfig": {
+    "access": "public",
+    "//": "Override exports at publish time: the published tarball ships dist/ only (no src/), so the dev-only `bun`→src condition is dropped. Published Bun + Node consumers both resolve dist.",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js"
+      }
+    }
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "bun": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ParachuteComputer/parachute-hub.git",
+    "directory": "packages/depcheck"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "bun run build",
+    "test": "bun test src",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

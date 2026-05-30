@@ -344,6 +344,50 @@ describe("Modules — install flow", () => {
     });
   });
 
+  it("renders the missing-dependency install card when an install op fails on a missing binary", async () => {
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [moduleRow("vault")],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    vi.mocked(api.installModule).mockResolvedValue("op-dep");
+    vi.mocked(api.getModuleOperation).mockResolvedValue({
+      id: "op-dep",
+      kind: "install",
+      short: "vault",
+      status: "failed",
+      log: ["install failed: bun not installed"],
+      error: "bun is required ...",
+      error_detail: {
+        error: "missing_dependency",
+        error_type: "missing_dependency",
+        error_description: "bun is required ...",
+        binary: "bun",
+        why: "run Parachute modules",
+        docs_url: "https://bun.sh",
+        install: { generic: "curl -fsSL https://bun.sh/install | bash" },
+        sysadmin_hint: "Or ask your system administrator to install it for you.",
+      },
+      startedAt: "2026-05-18T00:00:00Z",
+      finishedAt: "2026-05-18T00:00:01Z",
+    });
+
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+    fireEvent.click(
+      within(screen.getByTestId("installable-section")).getByRole("button", { name: /install/i }),
+    );
+
+    // The structured failure renders the dedicated install card (and the
+    // missing_dependency op is PINNED — not auto-dropped — so the operator
+    // has time to copy the command).
+    await waitFor(() => expect(screen.getByTestId("missing-dependency-card")).toBeInTheDocument(), {
+      timeout: 2000,
+    });
+    expect(screen.getByText("bun isn't installed")).toBeInTheDocument();
+    expect(screen.getByText("curl -fsSL https://bun.sh/install | bash")).toBeInTheDocument();
+  });
+
   it("hides the install card while the install op is pending (avoids duplicate spawn)", async () => {
     // Catalog still shows vault as not-installed (the install hasn't
     // completed + the catalog hasn't been re-fetched yet). The pending

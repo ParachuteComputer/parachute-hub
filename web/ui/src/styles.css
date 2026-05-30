@@ -1198,3 +1198,79 @@ a.btn:hover {
   font-size: 0.8rem;
   padding: 0.35rem 0.85rem;
 }
+
+/* Missing-dependency install card (MissingDependencyCard.tsx). Rendered in
+   the Modules operations banner when an install/op fails because a required
+   external binary isn't on PATH. Leans on the existing error/warn tokens so
+   it reads as "actionable problem" without a new palette. */
+.depcard-wrap {
+  margin-top: 0.6rem;
+}
+.depcard {
+  border: 1px solid var(--warn);
+  background: var(--warn-soft);
+  border-radius: 8px;
+  padding: 0.9rem 1rem;
+}
+.depcard-heading {
+  margin: 0 0 0.25rem;
+  font-size: 1rem;
+}
+.depcard-why {
+  margin: 0 0 0.75rem;
+  font-size: 0.9rem;
+}
+.depcard-installs-label {
+  margin: 0 0 0.4rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.depcard-install {
+  margin-bottom: 0.55rem;
+}
+.depcard-install.preferred .depcard-os {
+  color: var(--accent);
+  font-weight: 600;
+}
+.depcard-os {
+  display: block;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-muted);
+  margin-bottom: 0.2rem;
+}
+.depcard-cmd {
+  display: flex;
+  align-items: stretch;
+  gap: 0.4rem;
+}
+.depcard-cmd-text {
+  flex: 1;
+  margin: 0;
+  padding: 0.45rem 0.6rem;
+  background: var(--card-bg, #fff);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+.depcard-copy {
+  flex: 0 0 auto;
+  font-size: 0.8rem;
+  padding: 0.35rem 0.7rem;
+  align-self: flex-start;
+}
+.depcard-docs {
+  margin: 0.5rem 0 0.4rem;
+  font-size: 0.88rem;
+}
+.depcard-hint {
+  margin: 0;
+  font-size: 0.82rem;
+}
+.depcard-fallback {
+  color: var(--error);
+  font-size: 0.9rem;
+}

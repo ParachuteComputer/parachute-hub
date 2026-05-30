@@ -146,6 +146,14 @@ interface StatusRow {
    * stale-after-rebuild row without comparing columns by eye.
    */
   staleNote?: string;
+  /**
+   * Persisted last-start failure (`lastStartError`, written by the lifecycle
+   * start preflight when a startCmd binary is missing). Surfaced on a
+   * continuation line so a *later* `parachute status` explains why the row
+   * isn't active — "failed to start: <binary> not installed" — rather than
+   * just showing it inactive. Cleared on the next successful start.
+   */
+  startErrorNote?: string;
 }
 
 /**
@@ -264,6 +272,17 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
         ? `STALE: services.json cached ${entry.version}; live package.json ${source.livePackageVersion}`
         : undefined;
 
+      // Persisted last-start failure (lifecycle preflight wrote a missing-
+      // dependency wire). Surface a one-line summary; the full install recipe
+      // lives in services.json + the admin SPA card. Keeps `parachute status`
+      // scannable while still telling the operator "this is why it's down."
+      const startErrorNote =
+        entry.lastStartError !== undefined
+          ? entry.lastStartError.binary !== undefined
+            ? `failed to start: ${entry.lastStartError.binary} not installed — run \`parachute status\` detail or see /admin/modules for install steps`
+            : `failed to start: ${entry.lastStartError.error_description.split("\n")[0]}`
+          : undefined;
+
       // Only skip probe when we know the process is dead (PID file was
       // present but kill(pid, 0) failed). "unknown" status (no PID file)
       // still probes — externally-managed services should report health.
@@ -287,6 +306,7 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
           skipped: true,
           driftWarning,
           staleNote,
+          startErrorNote,
         };
       }
 
@@ -324,6 +344,7 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
         skipped: false,
         driftWarning,
         staleNote,
+        startErrorNote,
       };
     }),
   );
@@ -378,6 +399,7 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
     }
     if (row.driftWarning) print(`  ! ${row.driftWarning}`);
     if (row.staleNote) print(`  ! ${row.staleNote}`);
+    if (row.startErrorNote) print(`  ! ${row.startErrorNote}`);
   }
 
   /**

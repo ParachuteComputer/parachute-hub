@@ -28,6 +28,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { renderOperationError } from "../components/MissingDependencyCard.tsx";
 import {
   type ModuleInstallChannel,
   type ModuleListing,
@@ -56,6 +57,8 @@ interface PendingOp {
   log: string[];
   status: ModuleOperation["status"];
   error?: string;
+  /** Structured error detail (missing_dependency) — drives the install card. */
+  errorDetail?: ModuleOperation["error_detail"];
 }
 
 const POLL_INTERVAL_MS = 1000;
@@ -105,17 +108,31 @@ export function Modules() {
             setPendingOps((prev) =>
               prev.map((q) =>
                 q.operationId === op.id
-                  ? { ...q, log: op.log, status: op.status, error: op.error }
+                  ? {
+                      ...q,
+                      log: op.log,
+                      status: op.status,
+                      error: op.error,
+                      errorDetail: op.error_detail,
+                    }
                   : q,
               ),
             );
             if (op.status === "succeeded" || op.status === "failed") {
-              // Terminal — drop after a beat so the operator can see
-              // the final log line, then refresh the catalog.
-              setTimeout(() => {
-                setPendingOps((prev) => prev.filter((q) => q.operationId !== op.id));
+              // A missing-dependency failure carries an install card the
+              // operator needs time to read + copy — keep it pinned (they
+              // dismiss it by acting + re-installing). Everything else drops
+              // after a beat so the final log line is visible, then refresh.
+              const pinned =
+                op.status === "failed" && op.error_detail?.error_type === "missing_dependency";
+              if (!pinned) {
+                setTimeout(() => {
+                  setPendingOps((prev) => prev.filter((q) => q.operationId !== op.id));
+                  void refreshCatalog();
+                }, 1500);
+              } else {
                 void refreshCatalog();
-              }, 1500);
+              }
             }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -325,7 +342,13 @@ export function Modules() {
             {pendingOps.map((p) => (
               <li key={p.operationId}>
                 <code>{p.short}</code> · {p.kind} · status: {p.status}
-                {p.error ? ` · error: ${p.error}` : null}
+                {/* Structured missing-dependency failures render a dedicated
+                    install card; other errors fall back to the plain string. */}
+                {p.status === "failed" && (p.errorDetail || p.error) ? (
+                  <div className="depcard-wrap">
+                    {renderOperationError({ error: p.error, errorDetail: p.errorDetail })}
+                  </div>
+                ) : null}
                 {p.log.length > 0 && (
                   <details>
                     <summary>{p.log.length} log line(s)</summary>

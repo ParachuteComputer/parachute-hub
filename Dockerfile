@@ -50,10 +50,11 @@ FROM oven/bun:${BUN_VERSION}-alpine AS builder
 WORKDIR /app
 
 # Copy manifests first so Docker layer-caches the install step across
-# source-only changes. Includes the scope-guard workspace package and the
-# web/ui frontend workspace.
+# source-only changes. Includes the scope-guard + depcheck workspace packages
+# and the web/ui frontend workspace.
 COPY package.json bun.lock ./
 COPY packages/scope-guard/package.json packages/scope-guard/
+COPY packages/depcheck/package.json packages/depcheck/
 COPY web/ui/package.json web/ui/bun.lock web/ui/
 
 # Install with the lockfile pinned. `--frozen-lockfile` matches CI; the

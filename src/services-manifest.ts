@@ -185,6 +185,39 @@ export interface ServiceEntry {
    * with display metadata attached.
    */
   uis?: Record<string, UiSubUnit>;
+  /**
+   * Last `parachute start` failure that's still actionable, persisted so a
+   * *subsequent* `parachute status` (a separate invocation that only reads
+   * this manifest) + the admin SPA can surface it. Today the only writer is
+   * the lifecycle start preflight when a startCmd binary is missing from PATH
+   * (`@openparachute/depcheck` `MissingDependencyError.toWire()`): the row
+   * shows "failed to start — <binary> not installed" with the install info
+   * instead of a bare orphan-timeout. Cleared on the next successful start.
+   *
+   * Stored as the structured `missing_dependency` wire so the SPA can render
+   * the dedicated install card; `parachute status` reads `error_description`.
+   * Validated as a pass-through object (shape owned by depcheck) rather than
+   * re-typed field-by-field here.
+   */
+  lastStartError?: ServiceEntryStartError;
+}
+
+/**
+ * Persisted start-failure detail on a ServiceEntry. Mirrors depcheck's
+ * `MissingDependencyWire` for the missing-dependency case; `error_type` is
+ * left open so a future non-dependency start failure could reuse the field.
+ */
+export interface ServiceEntryStartError {
+  error_type: string;
+  error_description: string;
+  /** Present for `error_type: "missing_dependency"`. */
+  binary?: string;
+  why?: string | null;
+  docs_url?: string | null;
+  install?: { darwin?: string; linux?: string; generic?: string };
+  sysadmin_hint?: string;
+  /** ISO timestamp of when the failure was recorded. */
+  at?: string;
 }
 
 export interface ServicesManifest {
@@ -251,6 +284,7 @@ function validateEntry(raw: unknown, where: string): ServiceEntry {
   }
   const uis = e.uis;
   const validatedUis = validateUis(uis, where);
+  const validatedStartError = validateStartError(e.lastStartError, where);
   const entry: ServiceEntry = { name, port, paths: paths as string[], health, version };
   if (displayName !== undefined) entry.displayName = displayName;
   if (tagline !== undefined) entry.tagline = tagline;
@@ -258,7 +292,46 @@ function validateEntry(raw: unknown, where: string): ServiceEntry {
   if (installDir !== undefined) entry.installDir = installDir;
   if (stripPrefix !== undefined) entry.stripPrefix = stripPrefix;
   if (validatedUis !== undefined) entry.uis = validatedUis;
+  if (validatedStartError !== undefined) entry.lastStartError = validatedStartError;
   return entry;
+}
+
+/**
+ * Validate the optional `lastStartError` field. `undefined` round-trips
+ * unchanged. A present value must be an object carrying the two required
+ * string fields (`error_type`, `error_description`); the remaining fields
+ * (the missing-dependency detail) pass through with light type-narrowing so
+ * the SPA install card has them, but we never hard-fail an otherwise-valid
+ * row on a malformed start-error — it's diagnostic metadata, not a contract
+ * field. A malformed value is dropped rather than thrown.
+ */
+function validateStartError(raw: unknown, _where: string): ServiceEntryStartError | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.error_type !== "string" || typeof r.error_description !== "string") {
+    return undefined;
+  }
+  const out: ServiceEntryStartError = {
+    error_type: r.error_type,
+    error_description: r.error_description,
+  };
+  if (typeof r.binary === "string") out.binary = r.binary;
+  if (typeof r.why === "string" || r.why === null) out.why = r.why as string | null;
+  if (typeof r.docs_url === "string" || r.docs_url === null) {
+    out.docs_url = r.docs_url as string | null;
+  }
+  if (r.install && typeof r.install === "object" && !Array.isArray(r.install)) {
+    const ins = r.install as Record<string, unknown>;
+    const install: { darwin?: string; linux?: string; generic?: string } = {};
+    if (typeof ins.darwin === "string") install.darwin = ins.darwin;
+    if (typeof ins.linux === "string") install.linux = ins.linux;
+    if (typeof ins.generic === "string") install.generic = ins.generic;
+    out.install = install;
+  }
+  if (typeof r.sysadmin_hint === "string") out.sysadmin_hint = r.sysadmin_hint;
+  if (typeof r.at === "string") out.at = r.at;
+  return out;
 }
 
 /**
@@ -762,4 +835,43 @@ export function findService(
   // still 500'd after the bulk lenient-sweep because findService was
   // missed.
   return readManifestLenient(path).services.find((s) => s.name === name);
+}
+
+/**
+ * Persist a `lastStartError` onto the named row so a later `parachute status`
+ * + the admin SPA surface it. No-op if the row isn't present (e.g. a service
+ * that failed to start before its first self-registration wrote a row — the
+ * inline `parachute start` message already told the operator). Lenient read
+ * so a malformed sibling row doesn't block recording an unrelated failure.
+ */
+export function recordStartError(
+  name: string,
+  err: ServiceEntryStartError,
+  path: string = SERVICES_MANIFEST_PATH,
+): void {
+  if (!existsSync(path)) return;
+  const current = readManifestLenient(path);
+  const idx = current.services.findIndex((s) => s.name === name);
+  if (idx < 0) return;
+  const row = current.services[idx];
+  if (!row) return;
+  current.services[idx] = {
+    ...row,
+    lastStartError: { ...err, at: err.at ?? new Date().toISOString() },
+  };
+  writeManifest(current, path);
+}
+
+/** Clear a row's persisted `lastStartError` (called on a successful start).
+ * No-op when the row is absent or already clean. */
+export function clearStartError(name: string, path: string = SERVICES_MANIFEST_PATH): void {
+  if (!existsSync(path)) return;
+  const current = readManifestLenient(path);
+  const idx = current.services.findIndex((s) => s.name === name);
+  if (idx < 0) return;
+  const row = current.services[idx];
+  if (!row || row.lastStartError === undefined) return;
+  const { lastStartError: _drop, ...rest } = row;
+  current.services[idx] = rest;
+  writeManifest(current, path);
 }

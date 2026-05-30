@@ -760,6 +760,24 @@ export async function listModules(): Promise<ModulesCatalog> {
 export type ModuleOperationKind = "install" | "upgrade" | "restart" | "uninstall";
 export type ModuleOperationStatus = "pending" | "running" | "succeeded" | "failed";
 
+/**
+ * Structured missing-dependency error wire (matches the hub's
+ * `@openparachute/depcheck` `MissingDependencyWire` + `proxy-error-ui.ts`
+ * envelope). When an install/op fails because a required external binary
+ * (`bun` / `git` / …) isn't on PATH, the operation carries this so the SPA
+ * renders a dedicated install card instead of a raw error string.
+ */
+export interface MissingDependencyWire {
+  error: "missing_dependency";
+  error_type: "missing_dependency";
+  error_description: string;
+  binary: string;
+  why: string | null;
+  docs_url: string | null;
+  install: { darwin?: string; linux?: string; generic?: string };
+  sysadmin_hint: string;
+}
+
 export interface ModuleOperation {
   id: string;
   kind: ModuleOperationKind;
@@ -767,6 +785,8 @@ export interface ModuleOperation {
   status: ModuleOperationStatus;
   log: string[];
   error?: string;
+  /** Structured error detail for typed failures (today: missing_dependency). */
+  error_detail?: MissingDependencyWire;
   startedAt: string;
   finishedAt?: string;
 }

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { MissingDependencyError, lookupDep } from "@openparachute/depcheck";
 import {
   API_MODULES_OPS_REQUIRED_SCOPE,
   _resetOperationsRegistryForTests,
@@ -627,6 +628,50 @@ describe("POST /api/modules/:short/install", () => {
     const op = (await opRes.json()) as { status: string; error?: string };
     expect(op.status).toBe("failed");
     expect(op.error).toMatch(/bun add -g exited 1/);
+  });
+
+  test("a MissingDependencyError during install attaches the structured error_detail wire", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const deps = {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      supervisor,
+      // Simulate `bun` not being on PATH: the install runner's shell-out
+      // throws the typed missing-dependency error.
+      run: async () => {
+        throw new MissingDependencyError("bun", lookupDep("bun"), {
+          platform: "linux",
+          arch: "x64",
+        });
+      },
+      findGlobalInstall: () => null,
+      isLinked: TEST_DEFAULT_NOT_LINKED,
+    };
+    const res = await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      deps,
+    );
+    const body = (await res.json()) as { operation_id: string };
+    await new Promise((r) => setTimeout(r, 10));
+    const opRes = await handleOperationGet(
+      getReq(`/api/modules/operations/${body.operation_id}`, {
+        authorization: `Bearer ${bearer}`,
+      }),
+      body.operation_id,
+      deps,
+    );
+    const op = (await opRes.json()) as {
+      status: string;
+      error?: string;
+      error_detail?: { error_type: string; binary: string };
+    };
+    expect(op.status).toBe("failed");
+    expect(op.error_detail?.error_type).toBe("missing_dependency");
+    expect(op.error_detail?.binary).toBe("bun");
   });
 
   test("skips bun add -g when package is already bun-linked (smoke 2026-05-27 finding 1)", async () => {
