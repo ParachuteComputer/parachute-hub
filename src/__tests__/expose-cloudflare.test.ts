@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { InstallResult, RemoveResult } from "../cloudflare/connector-service.ts";
 import {
   type CloudflaredTunnelRecord,
   findTunnelRecord,
@@ -1743,5 +1744,276 @@ describe("exposeCloudflareOff", () => {
         env.cleanup();
       }
     });
+  });
+});
+
+describe("reboot-persistent connector service wiring", () => {
+  // The default tunnel name for vault.example.com (#491 per-hostname derivation).
+  const DERIVED = "parachute-vault-example-com";
+
+  function upRunner(uuid: string, derived = DERIVED) {
+    return queueRunner([
+      { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" }, // --version
+      { code: 0, stdout: "[]", stderr: "" }, // tunnel list
+      {
+        code: 0,
+        stdout: `Created tunnel ${derived} with id ${uuid}\n`,
+        stderr: "",
+      }, // tunnel create
+      { code: 0, stdout: "", stderr: "" }, // route dns
+    ]);
+  }
+
+  test("up installs the connector service (no duplicate transient spawn) + records serviceManaged", async () => {
+    const env = makeEnv();
+    try {
+      const uuid = "aaaaaaaa-0000-0000-0000-000000000001";
+      const { runner } = upRunner(uuid);
+      const { spawner, seen } = fakeSpawner(91000);
+      const installCalls: { tunnelName: string; configPath: string }[] = [];
+      const installService = (args: {
+        tunnelName: string;
+        configPath: string;
+        logPath: string;
+      }): InstallResult => {
+        installCalls.push({ tunnelName: args.tunnelName, configPath: args.configPath });
+        return {
+          outcome: "installed",
+          kind: "launchd",
+          servicePath: "/home/op/Library/LaunchAgents/x.plist",
+          messages: ["Installed launchd LaunchAgent — starts on boot."],
+        };
+      };
+      const logs: string[] = [];
+
+      const code = await exposeCloudflareUp("vault.example.com", {
+        runner,
+        spawner,
+        // The service-spawned connector (93333) is alive; no prior record exists
+        // so the orphan sweep finds nothing else to kill.
+        alive: (pid) => pid === 93333,
+        kill: () => {},
+        // Service manages the connector; report a live pid so the up-path
+        // records it WITHOUT spawning a transient one.
+        connectorPids: () => [93333],
+        installService,
+        log: (l) => logs.push(l),
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
+        now: () => new Date("2026-05-31T00:00:00Z"),
+      });
+
+      expect(code).toBe(0);
+      // Service install was attempted with the derived tunnel name + the
+      // config path we wrote.
+      expect(installCalls).toHaveLength(1);
+      expect(installCalls[0]!.tunnelName).toBe(DERIVED);
+      expect(installCalls[0]!.configPath).toBe(env.configPath);
+      // Exactly one connector: the service owns it, so NO transient spawn ran
+      // (connectorPids surfaced the service-spawned pid).
+      expect(seen).toHaveLength(0);
+
+      const state = readCloudflaredState(env.statePath);
+      const rec = findTunnelRecord(state, DERIVED);
+      expect(rec?.serviceManaged).toBe(true);
+      // Recorded pid is the service-spawned connector's pid (from connectorPids).
+      expect(rec?.pid).toBe(93333);
+
+      const joined = logs.join("\n");
+      expect(joined).toContain("Installed launchd LaunchAgent");
+      // Success copy: runs on boot, no "re-run after a reboot" nag.
+      expect(joined).toContain("runs on boot");
+      expect(joined).not.toContain("does NOT survive a reboot");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("service-managed but connector not yet visible → transient spawn keeps a live pid", async () => {
+    const env = makeEnv();
+    try {
+      const uuid = "aaaaaaaa-0000-0000-0000-000000000002";
+      const { runner } = upRunner(uuid);
+      const { spawner, seen } = fakeSpawner(91500);
+      const installService = (): InstallResult => ({
+        outcome: "installed",
+        kind: "systemd-user",
+        servicePath: "/home/op/.config/systemd/user/x.service",
+        messages: [],
+      });
+
+      const code = await exposeCloudflareUp("vault.example.com", {
+        runner,
+        spawner,
+        alive: () => false,
+        kill: () => {},
+        // Service is enabled but its connector isn't visible to pgrep yet.
+        connectorPids: () => [],
+        installService,
+        log: () => {},
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
+        now: () => new Date("2026-05-31T00:00:00Z"),
+      });
+
+      expect(code).toBe(0);
+      // Belt-and-suspenders: a transient connector was spawned so the state
+      // record carries a live pid + connectivity is immediate. Still marked
+      // serviceManaged (the service takes over on reboot).
+      expect(seen).toHaveLength(1);
+      const rec = findTunnelRecord(readCloudflaredState(env.statePath), DERIVED);
+      expect(rec?.pid).toBe(91500);
+      expect(rec?.serviceManaged).toBe(true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("graceful fallback: when install fails, transient spawn + honest reboot caveat", async () => {
+    const env = makeEnv();
+    try {
+      const uuid = "aaaaaaaa-0000-0000-0000-000000000003";
+      const { runner } = upRunner(uuid);
+      const { spawner, seen } = fakeSpawner(92000);
+      const installService = (): InstallResult => ({
+        outcome: "fallback",
+        messages: ["launchctl not found; using a transient connector (won't survive a reboot)."],
+      });
+      const logs: string[] = [];
+
+      const code = await exposeCloudflareUp("vault.example.com", {
+        runner,
+        spawner,
+        alive: () => false,
+        kill: () => {},
+        connectorPids: () => [],
+        installService,
+        log: (l) => logs.push(l),
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        skipHub: true,
+        now: () => new Date("2026-05-31T00:00:00Z"),
+      });
+
+      expect(code).toBe(0);
+      // Transient connector spawned (the fallback).
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toEqual(["cloudflared", "tunnel", "--config", env.configPath, "run"]);
+      const rec = findTunnelRecord(readCloudflaredState(env.statePath), DERIVED);
+      expect(rec?.serviceManaged).toBeUndefined();
+      const joined = logs.join("\n");
+      // The install fallback warning surfaced + the honest reboot caveat.
+      expect(joined).toContain("won't survive a reboot");
+      expect(joined).toContain("does NOT survive a reboot");
+      expect(joined).toContain("parachute expose public --cloudflare --domain vault.example.com");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("re-up is idempotent: install runs again, no duplicate state record", async () => {
+    const env = makeEnv();
+    try {
+      const installCount = { n: 0 };
+      const installService = (): InstallResult => {
+        installCount.n++;
+        return { outcome: "installed", kind: "launchd", servicePath: "/x.plist", messages: [] };
+      };
+      const runOnce = async (uuid: string) => {
+        const { runner } = upRunner(uuid);
+        const { spawner } = fakeSpawner(90000 + installCount.n);
+        return exposeCloudflareUp("vault.example.com", {
+          runner,
+          spawner,
+          alive: () => false,
+          kill: () => {},
+          connectorPids: () => [94000 + installCount.n],
+          installService,
+          log: () => {},
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+          now: () => new Date("2026-05-31T00:00:00Z"),
+        });
+      };
+
+      expect(await runOnce("aaaaaaaa-0000-0000-0000-000000000004")).toBe(0);
+      expect(await runOnce("aaaaaaaa-0000-0000-0000-000000000004")).toBe(0);
+      // Install attempted on each up (idempotent — the module overwrites + reloads).
+      expect(installCount.n).toBe(2);
+      // Exactly one tunnel record, keyed by name (re-up replaces, not appends).
+      const state = readCloudflaredState(env.statePath);
+      expect(Object.keys(state?.tunnels ?? {})).toEqual([DERIVED]);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("off removes the connector service for the torn-down tunnel", async () => {
+    const env = makeEnv();
+    try {
+      // Seed a service-managed tunnel record.
+      const record: CloudflaredTunnelRecord = {
+        pid: 95000,
+        tunnelUuid: "bbbbbbbb-0000-0000-0000-000000000001",
+        tunnelName: DERIVED,
+        hostname: "vault.example.com",
+        startedAt: "2026-05-31T00:00:00.000Z",
+        configPath: env.configPath,
+        serviceManaged: true,
+      };
+      writeCloudflaredState(withTunnelRecord(undefined, record), env.statePath);
+
+      const removeCalls: string[] = [];
+      const removeService = (args: { tunnelName: string }): RemoveResult => {
+        removeCalls.push(args.tunnelName);
+        return { removed: true, messages: [`Removed launchd LaunchAgent for ${args.tunnelName}.`] };
+      };
+      const killed: number[] = [];
+      const logs: string[] = [];
+
+      const code = await exposeCloudflareOff({
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        alive: () => true,
+        kill: (pid) => killed.push(pid),
+        connectorPids: () => [],
+        removeService,
+        log: (l) => logs.push(l),
+      });
+
+      expect(code).toBe(0);
+      // The boot service was removed for the torn-down tunnel...
+      expect(removeCalls).toEqual([DERIVED]);
+      // ...AND the connector pid was SIGTERM'd (removal stops the service so it
+      // won't restart it).
+      expect(killed).toContain(95000);
+      expect(existsSync(env.statePath)).toBe(false);
+      expect(logs.join("\n")).toContain("Removed launchd LaunchAgent");
+    } finally {
+      env.cleanup();
+    }
   });
 });

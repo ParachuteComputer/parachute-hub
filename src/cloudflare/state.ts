@@ -25,6 +25,14 @@ export interface CloudflaredTunnelRecord {
   startedAt: string;
   /** Absolute path to the cloudflared config.yml driving this tunnel. */
   configPath: string;
+  /**
+   * True when a reboot-persistent OS service (launchd/systemd) owns this
+   * connector (0.6.2). Drives the off-path to remove the service (not just
+   * SIGTERM the pid — a still-enabled service would otherwise restart the
+   * connector it just killed). Optional + defaults false so pre-0.6.2 state
+   * files (and the transient-fallback path) validate + read as unmanaged.
+   */
+  serviceManaged?: boolean;
 }
 
 /**
@@ -64,7 +72,7 @@ function validateRecord(raw: unknown, path: string): CloudflaredTunnelRecord {
     throw new CloudflaredStateError(`${path}: tunnel record must be an object`);
   }
   const r = raw as Record<string, unknown>;
-  return {
+  const record: CloudflaredTunnelRecord = {
     pid: requirePositiveInt(r, "pid", path),
     tunnelUuid: requireString(r, "tunnelUuid", path),
     tunnelName: requireString(r, "tunnelName", path),
@@ -72,6 +80,10 @@ function validateRecord(raw: unknown, path: string): CloudflaredTunnelRecord {
     startedAt: requireString(r, "startedAt", path),
     configPath: requireString(r, "configPath", path),
   };
+  // Optional — present from 0.6.2 onward. A non-boolean (or absent) value
+  // reads as unmanaged so legacy state files keep validating.
+  if (r.serviceManaged === true) record.serviceManaged = true;
+  return record;
 }
 
 function validate(raw: unknown, path: string): CloudflaredState {
