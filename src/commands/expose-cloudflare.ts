@@ -8,6 +8,13 @@ import {
   writeConfig,
 } from "../cloudflare/config.ts";
 import {
+  type ConnectorServiceDeps,
+  type InstallResult,
+  type RemoveResult,
+  installConnectorService,
+  removeConnectorService,
+} from "../cloudflare/connector-service.ts";
+import {
   DEFAULT_CLOUDFLARED_HOME,
   cloudflaredInstallHint,
   isCloudflaredInstalled,
@@ -256,6 +263,27 @@ export interface ExposeCloudflareOpts {
    */
   connectorPids?: ConnectorPidsFn;
   /**
+   * Install/remove the reboot-persistent connector OS service (launchd on
+   * macOS, systemd on Linux). Injectable so tests drive the install/remove
+   * without touching real launchctl/systemctl or `~/Library/LaunchAgents`.
+   * Defaults: the up-path installs (falls back to a transient `proc.unref()`
+   * connector when the tool is absent); the off / legacy-sweep paths remove.
+   * Tests inject fakes to assert the generated service file + command sequence.
+   */
+  installService?: (args: {
+    tunnelName: string;
+    configPath: string;
+    logPath: string;
+  }) => InstallResult;
+  removeService?: (args: { tunnelName: string }) => RemoveResult;
+  /**
+   * Override the side-effect deps the default install/remove implementations
+   * use (platform, getuid, fs, run). Only consulted when `installService` /
+   * `removeService` aren't injected directly. Lets a test pin `platform` /
+   * `getuid` while still exercising the real install/remove logic.
+   */
+  connectorServiceDeps?: ConnectorServiceDeps;
+  /**
    * Resolve a hostname to its addresses, for the post-route DNS self-diagnosis
    * (hub#487). Returns the resolved IPs (empty when NXDOMAIN / not yet live).
    * Best-effort and non-fatal — a failure to resolve never blocks the expose.
@@ -355,6 +383,12 @@ interface Resolved {
   alive: AliveFn;
   kill: KillFn;
   connectorPids: ConnectorPidsFn;
+  installService: (args: {
+    tunnelName: string;
+    configPath: string;
+    logPath: string;
+  }) => InstallResult;
+  removeService: (args: { tunnelName: string }) => RemoveResult;
   resolveHost: ResolveHostFn;
   log: (line: string) => void;
   manifestPath: string;
@@ -408,6 +442,39 @@ function resolve(opts: ExposeCloudflareOpts, tunnelNameDefault: string): Resolve
     // gets the real `pgrep` sweep + DNS diagnosis.
     connectorPids:
       opts.connectorPids ?? (opts.spawner === undefined ? defaultConnectorPids : () => []),
+    // Reboot-persistent connector seam. Defaulting policy mirrors
+    // `connectorPids`/`resolveHost`: when a test injects a stub `spawner` (and
+    // no explicit service seam), default to an inert "fallback" so existing
+    // stub-spawner suites keep exercising the transient-spawn path without
+    // touching real launchctl/systemctl. Production (no spawner override) gets
+    // the real install/remove. An explicit `installService`/`removeService`
+    // always wins; `connectorServiceDeps` lets a test pin platform/getuid
+    // while running the real install/remove logic.
+    installService:
+      opts.installService ??
+      (opts.spawner === undefined || opts.connectorServiceDeps !== undefined
+        ? (args) =>
+            installConnectorService({
+              ...args,
+              ...(opts.connectorServiceDeps !== undefined
+                ? { deps: opts.connectorServiceDeps }
+                : {}),
+            })
+        : () => ({
+            outcome: "fallback",
+            messages: [],
+          })),
+    removeService:
+      opts.removeService ??
+      (opts.spawner === undefined || opts.connectorServiceDeps !== undefined
+        ? (args) =>
+            removeConnectorService({
+              ...args,
+              ...(opts.connectorServiceDeps !== undefined
+                ? { deps: opts.connectorServiceDeps }
+                : {}),
+            })
+        : () => ({ removed: false, messages: [] })),
     resolveHost:
       opts.resolveHost ??
       (opts.spawner === undefined ? defaultResolveHost : async () => ["104.16.0.1"]),
@@ -718,6 +785,12 @@ export async function exposeCloudflareUp(
   if (r.tunnelName !== DEFAULT_TUNNEL_NAME) {
     const legacy = findTunnelRecord(stateBefore, DEFAULT_TUNNEL_NAME);
     if (legacy) {
+      // Remove any boot service for the legacy shared tunnel before killing its
+      // connector, so a service doesn't restart the connector we're migrating
+      // away from. Best-effort + idempotent (no-op when no service file exists,
+      // which is the common pre-0.6.2 case).
+      const legacyRemoval = r.removeService({ tunnelName: DEFAULT_TUNNEL_NAME });
+      for (const line of legacyRemoval.messages) r.log(line);
       if (r.alive(legacy.pid)) {
         try {
           r.kill(legacy.pid, "SIGTERM");
@@ -735,10 +808,48 @@ export async function exposeCloudflareUp(
     }
   }
 
-  const pid = r.spawner.spawn(
-    ["cloudflared", "tunnel", "--config", r.configPath, "run"],
-    r.logPath,
-  );
+  // Install the reboot-persistent connector OS service (launchd / systemd) so
+  // the connector survives a reboot — replacing the bare `proc.unref()` spawn
+  // that died on restart (0.6.2). When the service installs successfully it
+  // *becomes* the connector: it spawns + supervises `cloudflared tunnel run`,
+  // so we do NOT also leave a duplicate transient connector — exactly one
+  // process serves the config we wrote. We then discover the service-spawned
+  // connector's pid (by UUID/config match) to record in state so the next
+  // up-path's orphan sweep + the off-path's kill target the right process.
+  //
+  // Graceful fallback: if the service tool is missing / the install fails, we
+  // fall back to the prior transient `proc.unref()` spawn and warn it won't
+  // survive a reboot. The expose never hard-fails because the service didn't
+  // take.
+  const installResult = r.installService({
+    tunnelName: r.tunnelName,
+    configPath: r.configPath,
+    logPath: r.logPath,
+  });
+  for (const line of installResult.messages) r.log(line);
+
+  let pid: number;
+  let serviceManaged = false;
+  if (installResult.outcome === "installed") {
+    serviceManaged = true;
+    // The service (`enable --now` / `bootstrap` with RunAtLoad) already started
+    // the connector; discover its pid for the state record so the next up-path's
+    // orphan sweep + the off-path's kill target the right process. In practice
+    // the connector is up by the time we look here.
+    const managedPids = r.connectorPids(tunnel.id, r.configPath).filter((p) => r.alive(p));
+    if (managedPids.length > 0) {
+      pid = managedPids[0]!;
+    } else {
+      // Service is enabled (survives reboot) but we couldn't see its connector
+      // yet. Spawn a transient one so state carries a live pid + connectivity
+      // is immediate; the service takes over on the next reboot regardless.
+      pid = r.spawner.spawn(["cloudflared", "tunnel", "--config", r.configPath, "run"], r.logPath);
+    }
+  } else {
+    // Fallback: no boot service. Spawn the transient connector (won't survive
+    // a reboot — warned below).
+    pid = r.spawner.spawn(["cloudflared", "tunnel", "--config", r.configPath, "run"], r.logPath);
+  }
 
   const record: CloudflaredTunnelRecord = {
     pid,
@@ -747,6 +858,9 @@ export async function exposeCloudflareUp(
     hostname,
     startedAt: r.now().toISOString(),
     configPath: r.configPath,
+    // Only serialize the flag when true — keep the state JSON clean for the
+    // common (transient-fallback) case; absent reads as unmanaged.
+    ...(serviceManaged ? { serviceManaged: true } : {}),
   };
   writeCloudflaredState(withTunnelRecord(migratedState, record), r.statePath);
 
@@ -833,12 +947,21 @@ export async function exposeCloudflareUp(
   r.log(`  OAuth:   ${hubOrigin}`);
   r.log(`  Logs:    ${r.logPath}`);
   r.log("");
-  // Honest reboot caveat: the connector is a detached background process, not
-  // yet a launchd/systemd service, so it does NOT survive a reboot (durable
-  // connector is a tracked follow-up). Re-running the same command brings it
-  // back idempotently — same hostname → same dedicated tunnel.
-  r.log("Note: the connector runs in the background but does not survive a reboot yet. After a");
-  r.log(`reboot, re-run:  parachute expose public --cloudflare --domain ${hostname}`);
+  if (serviceManaged) {
+    // The connector is now an OS service (launchd LaunchAgent on macOS, systemd
+    // unit on Linux), so it starts on boot — no need to re-run expose after a
+    // reboot. `parachute expose public --cloudflare off` stops + removes it.
+    r.log("The connector runs on boot (via launchd/systemd) — it survives reboots. Re-running");
+    r.log("the same command is still idempotent (same hostname → same dedicated tunnel).");
+  } else {
+    // Honest reboot caveat for the fallback path: the boot service couldn't be
+    // installed (tool missing / unsupported platform / install failed — see the
+    // warning printed above), so the connector is a detached background process
+    // that does NOT survive a reboot. Re-running the same command brings it back.
+    r.log("Note: a boot service couldn't be installed (see above), so the connector runs in the");
+    r.log("background but does NOT survive a reboot. After a reboot, re-run:");
+    r.log(`  parachute expose public --cloudflare --domain ${hostname}`);
+  }
   r.log("");
   r.log("Point a claude.ai / ChatGPT connector at:");
   r.log(`  ${vaultUrl}`);
@@ -869,6 +992,16 @@ function teardownOne(
   state: CloudflaredState | undefined,
   record: CloudflaredTunnelRecord,
 ): { state: CloudflaredState | undefined; code: number } {
+  // Remove the reboot-persistent connector service FIRST (when one owns this
+  // tunnel) so a still-enabled launchd/systemd service doesn't immediately
+  // restart the connector we SIGTERM below. `removeConnectorService` is
+  // idempotent + best-effort: a missing service file is a no-op (covers
+  // transient-fallback tunnels and pre-0.6.2 records, which carry no service).
+  // We always attempt it — even when `serviceManaged` is unset — so a record
+  // written before this field existed, or an out-of-band service file, still
+  // gets swept. The removal stops the service, after which the SIGTERM is final.
+  const removal = r.removeService({ tunnelName: record.tunnelName });
+  for (const line of removal.messages) r.log(line);
   if (r.alive(record.pid)) {
     try {
       r.kill(record.pid, "SIGTERM");

@@ -310,8 +310,11 @@ function renderVaultCard(opts: VaultCardOpts): string {
           <p class="vault-notes-cta">
             <a class="btn btn-primary" href="https://notes.parachute.computer/add?url=${vaultUrlForAdd}"
                target="_blank" rel="noopener" data-testid="open-notes-cta">Open Notes ↗</a>
+            <a class="btn btn-secondary" href="https://notes.parachute.computer/import?url=${vaultUrlForAdd}"
+               target="_blank" rel="noopener" data-testid="import-notes-cta">Import notes ↗</a>
             <span class="vault-notes-cta-sub">Prefer a browser UI? Open Notes to browse +
-               capture in this vault.</span>
+               capture in this vault — or jump straight to bulk-importing Markdown/Obsidian
+               notes into it.</span>
           </p>
           ${tokenMintBlock}
         </div>`;

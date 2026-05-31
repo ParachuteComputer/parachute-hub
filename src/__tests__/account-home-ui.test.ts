@@ -74,6 +74,40 @@ describe("renderAccountHome", () => {
     expect(html).toContain('data-testid="connect-any-client-hint"');
     // Notes CTA still present, now framed as the browser-UI option.
     expect(html).toContain('data-testid="open-notes-cta"');
+    // Import-notes CTA deep-links to the Notes-UI /import route for the same
+    // vault, mirroring the Open-Notes target-resolution (same hosted origin,
+    // same `?url=${hubOrigin}/vault/<name>` vault-targeting param).
+    expect(html).toContain(`https://notes.parachute.computer/import?url=${encodedVaultUrl}`);
+    expect(html).toContain('data-testid="import-notes-cta"');
+  });
+
+  test("assigned-vault branch — import-notes CTA gated alongside open-notes (no dead link)", () => {
+    // Both CTAs render together for an assigned vault and are absent together
+    // in the no-vault branches — so we never surface an Import link that points
+    // at a vault the user can't reach.
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    expect(html).toContain('data-testid="open-notes-cta"');
+    expect(html).toContain('data-testid="import-notes-cta"');
+
+    const adminHtml = renderAccountHome({
+      username: "admin",
+      assignedVaults: [],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: true,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    expect(adminHtml).not.toContain('data-testid="import-notes-cta"');
+    expect(adminHtml).not.toContain("notes.parachute.computer/import");
   });
 
   test("assigned-vault branch — trailing slash on hubOrigin is normalized", () => {
