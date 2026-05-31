@@ -119,12 +119,16 @@ describe("exposeCloudflareUp", () => {
     const env = makeEnv();
     try {
       const uuid = "2c1a7c7e-1234-5678-9abc-def012345678";
+      // Default tunnel name is now per-hostname (#491): vault.example.com →
+      // parachute-vault-example-com. Each machine gets its own dedicated tunnel
+      // so account-wide tunnels don't collide across boxes.
+      const derived = "parachute-vault-example-com";
       const { runner, calls } = queueRunner([
         { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" }, // --version preflight
         { code: 0, stdout: "[]", stderr: "" }, // tunnel list (none yet)
         {
           code: 0,
-          stdout: `Tunnel credentials written to ${env.cloudflaredHome}/${uuid}.json.\nCreated tunnel parachute with id ${uuid}\n`,
+          stdout: `Tunnel credentials written to ${env.cloudflaredHome}/${uuid}.json.\nCreated tunnel ${derived} with id ${uuid}\n`,
           stderr: "",
         }, // tunnel create
         { code: 0, stdout: "", stderr: "" }, // route dns
@@ -158,14 +162,14 @@ describe("exposeCloudflareUp", () => {
       ]);
       expect(calls[0]!.cmd).toEqual(["cloudflared", "--version"]);
       expect(calls[1]!.cmd).toEqual(["cloudflared", "tunnel", "list", "--output", "json"]);
-      expect(calls[2]!.cmd).toEqual(["cloudflared", "tunnel", "create", "parachute"]);
+      expect(calls[2]!.cmd).toEqual(["cloudflared", "tunnel", "create", derived]);
       expect(calls[3]!.cmd).toEqual([
         "cloudflared",
         "tunnel",
         "route",
         "dns",
         "--overwrite-dns",
-        "parachute",
+        derived,
         "vault.example.com",
       ]);
       expect(seen[0]).toEqual(["cloudflared", "tunnel", "--config", env.configPath, "run"]);
@@ -174,10 +178,10 @@ describe("exposeCloudflareUp", () => {
       expect(state).toEqual({
         version: 2,
         tunnels: {
-          parachute: {
+          [derived]: {
             pid: 42000,
             tunnelUuid: uuid,
-            tunnelName: "parachute",
+            tunnelName: derived,
             hostname: "vault.example.com",
             startedAt: "2026-04-22T12:00:00.000Z",
             configPath: env.configPath,
@@ -248,6 +252,10 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
+        // Pin the legacy shared name so this test's substance (expose-state
+        // write) is isolated from the per-hostname-derivation change (#491);
+        // the queued runner output names the "parachute" tunnel.
+        tunnelName: "parachute",
       });
 
       expect(code).toBe(0);
@@ -419,6 +427,10 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
+        // Pin the legacy name: the queued `tunnel list` reports a "parachute"
+        // tunnel, so reuse only happens when we look it up by that name. The
+        // per-hostname default (#491) is exercised in the happy-path test.
+        tunnelName: "parachute",
       });
       expect(code).toBe(0);
       // No `tunnel create` — only list + route.
@@ -604,6 +616,10 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
+        // Pin the legacy name so reuse (queued "parachute" list) drives the
+        // route-dns failure under test, not a tunnel-create from the
+        // per-hostname default (#491).
+        tunnelName: "parachute",
       });
 
       expect(code).toBe(1);
@@ -656,6 +672,10 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
+        // Pin the legacy name so the prior record (keyed "parachute") matches
+        // this invocation's tunnel — the orphan-sweep behavior under test is
+        // independent of the per-hostname-derivation change (#491).
+        tunnelName: "parachute",
       });
 
       expect(code).toBe(0);
@@ -712,6 +732,9 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
+        // Pin the legacy name so the prior record (keyed "parachute") matches —
+        // the orphan-sweep behavior under test is independent of #491.
+        tunnelName: "parachute",
       });
 
       expect(code).toBe(0);
@@ -757,6 +780,9 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
+        // Pin the legacy name so reuse drives the DNS-diagnosis path under test
+        // (queued "parachute" list), not a create from the #491 default.
+        tunnelName: "parachute",
       });
 
       expect(code).toBe(0); // non-fatal — the expose still completes
@@ -801,6 +827,9 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
+        // Pin the legacy name so reuse drives the shadowed-DNS path under test
+        // (queued "parachute" list), not a create from the #491 default.
+        tunnelName: "parachute",
       });
 
       expect(code).toBe(0);
@@ -841,6 +870,9 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
+        // Pin the legacy name so reuse drives the no-warning path under test
+        // (queued "parachute" list), not a create from the #491 default.
+        tunnelName: "parachute",
       });
 
       expect(code).toBe(0);
@@ -857,13 +889,15 @@ describe("exposeCloudflareUp", () => {
     try {
       const uuidA = "aaaa1111-aaaa-1111-aaaa-111111111111";
       const uuidB = "bbbb2222-bbbb-2222-bbbb-222222222222";
-      // Up #1 — default name "parachute"
+      // Up #1 — per-hostname default (#491): alpha.example.com →
+      // parachute-alpha-example-com.
+      const derivedA = "parachute-alpha-example-com";
       const r1 = queueRunner([
         { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
         { code: 0, stdout: "[]", stderr: "" },
         {
           code: 0,
-          stdout: `Created tunnel parachute with id ${uuidA}\n`,
+          stdout: `Created tunnel ${derivedA} with id ${uuidA}\n`,
           stderr: "",
         },
         { code: 0, stdout: "", stderr: "" },
@@ -881,10 +915,11 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
-        // Omit configPath/logPath so they're per-tunnel-derived — but the
-        // derivation now resolves against the tmp `configDir` above, so the
-        // generated config.yml lands under tmp, not the operator's real
-        // ~/.parachute/cloudflared/parachute/.
+        // Omit configPath/logPath AND tunnelName so the name is the per-hostname
+        // derived default (#491) and the paths are per-tunnel-derived against
+        // the tmp `configDir` above — so the generated config.yml lands under
+        // tmp/cloudflared/parachute-alpha-example-com/, not the operator's real
+        // ~/.parachute.
       });
       expect(code1).toBe(0);
 
@@ -916,25 +951,227 @@ describe("exposeCloudflareUp", () => {
       });
       expect(code2).toBe(0);
 
-      // Both tunnels should be present in state, keyed by tunnel name.
+      // Both tunnels should be present in state, keyed by tunnel name: the
+      // per-hostname derived name for #1, the explicit override for #2.
       const state = readCloudflaredState(env.statePath);
-      expect(Object.keys(state?.tunnels ?? {}).sort()).toEqual(["parachute", "second"]);
-      expect(findTunnelRecord(state, "parachute")?.hostname).toBe("alpha.example.com");
+      expect(Object.keys(state?.tunnels ?? {}).sort()).toEqual([derivedA, "second"]);
+      expect(findTunnelRecord(state, derivedA)?.hostname).toBe("alpha.example.com");
       expect(findTunnelRecord(state, "second")?.hostname).toBe("beta.example.com");
       expect(findTunnelRecord(state, "second")?.pid).toBe(50002);
 
       // Each tunnel should have written its own config file at the per-tunnel
       // path under `~/.parachute/cloudflared/<tunnelName>/config.yml`.
-      const cfgA = findTunnelRecord(state, "parachute")?.configPath ?? "";
+      const cfgA = findTunnelRecord(state, derivedA)?.configPath ?? "";
       const cfgB = findTunnelRecord(state, "second")?.configPath ?? "";
       expect(cfgA).not.toBe(cfgB);
-      expect(cfgA.endsWith("/parachute/config.yml")).toBe(true);
+      expect(cfgA.endsWith(`/${derivedA}/config.yml`)).toBe(true);
       expect(cfgB.endsWith("/second/config.yml")).toBe(true);
       expect(existsSync(cfgA)).toBe(true);
       expect(existsSync(cfgB)).toBe(true);
     } finally {
       env.cleanup();
     }
+  });
+
+  describe("#491: per-hostname tunnel naming + legacy migration", () => {
+    test("explicit --tunnel-name overrides the per-hostname default", async () => {
+      const env = makeEnv();
+      try {
+        const uuid = "11112222-3333-4444-5555-666677778888";
+        const { runner, calls } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+          { code: 0, stdout: "[]", stderr: "" },
+          { code: 0, stdout: `Created tunnel custom-name with id ${uuid}\n`, stderr: "" },
+          { code: 0, stdout: "", stderr: "" },
+        ]);
+        const { spawner } = fakeSpawner(43000);
+
+        const code = await exposeCloudflareUp("our.parachute.computer", {
+          runner,
+          spawner,
+          alive: () => false,
+          kill: () => {},
+          log: () => {},
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+          tunnelName: "custom-name",
+        });
+
+        expect(code).toBe(0);
+        // The explicit name wins — NOT the derived parachute-our-parachute-computer.
+        expect(calls[2]!.cmd).toEqual(["cloudflared", "tunnel", "create", "custom-name"]);
+        const state = readCloudflaredState(env.statePath);
+        expect(findTunnelRecord(state, "custom-name")?.hostname).toBe("our.parachute.computer");
+        expect(findTunnelRecord(state, "parachute-our-parachute-computer")).toBeUndefined();
+      } finally {
+        env.cleanup();
+      }
+    });
+
+    test("legacy-sweep: stops a live shared 'parachute' connector when migrating to a derived name", async () => {
+      const env = makeEnv();
+      try {
+        // A box that was exposed under the old shared "parachute" tunnel.
+        const legacy: CloudflaredTunnelRecord = {
+          pid: 70001,
+          tunnelUuid: "legacy-uuid",
+          tunnelName: "parachute",
+          hostname: "our.parachute.computer",
+          startedAt: "2026-05-01T00:00:00.000Z",
+          configPath: "/tmp/legacy/parachute/config.yml",
+        };
+        writeCloudflaredState({ version: 2, tunnels: { parachute: legacy } }, env.statePath);
+
+        const uuid = "99990000-1111-2222-3333-444455556666";
+        const { runner } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+          { code: 0, stdout: "[]", stderr: "" }, // new derived tunnel doesn't exist yet
+          {
+            code: 0,
+            stdout: `Created tunnel parachute-our-parachute-computer with id ${uuid}\n`,
+            stderr: "",
+          },
+          { code: 0, stdout: "", stderr: "" }, // route dns (--overwrite-dns repoints the CNAME)
+        ]);
+        const { spawner } = fakeSpawner(70100);
+        const killed: number[] = [];
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("our.parachute.computer", {
+          runner,
+          spawner,
+          // The legacy connector (70001) is alive; the new spawn is 70100.
+          alive: (pid) => pid === 70001,
+          kill: (pid) => killed.push(pid),
+          connectorPids: () => [],
+          resolveHost: async () => ["104.16.0.1"],
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+        });
+
+        expect(code).toBe(0);
+        // The legacy shared connector got SIGTERM'd.
+        expect(killed).toContain(70001);
+        const joined = logs.join("\n");
+        expect(joined).toContain("Stopped legacy shared-tunnel connector");
+        expect(joined).toContain("migrated our.parachute.computer to dedicated tunnel");
+        // The legacy "parachute" record is gone; only the new derived one remains.
+        const state = readCloudflaredState(env.statePath);
+        expect(findTunnelRecord(state, "parachute")).toBeUndefined();
+        expect(findTunnelRecord(state, "parachute-our-parachute-computer")?.pid).toBe(70100);
+      } finally {
+        env.cleanup();
+      }
+    });
+
+    test("legacy-sweep: does NOT fire when no legacy 'parachute' record exists", async () => {
+      const env = makeEnv();
+      try {
+        const uuid = "aaaa9999-1111-2222-3333-444455556666";
+        const { runner } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+          { code: 0, stdout: "[]", stderr: "" },
+          {
+            code: 0,
+            stdout: `Created tunnel parachute-our-parachute-computer with id ${uuid}\n`,
+            stderr: "",
+          },
+          { code: 0, stdout: "", stderr: "" },
+        ]);
+        const { spawner } = fakeSpawner(70200);
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("our.parachute.computer", {
+          runner,
+          spawner,
+          alive: () => false,
+          kill: () => {},
+          connectorPids: () => [],
+          resolveHost: async () => ["104.16.0.1"],
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+        });
+
+        expect(code).toBe(0);
+        expect(logs.join("\n")).not.toContain("Stopped legacy shared-tunnel connector");
+      } finally {
+        env.cleanup();
+      }
+    });
+
+    test("legacy-sweep: does NOT fire when the derived name IS 'parachute' (no migration)", async () => {
+      // A live "parachute" record AND an invocation that resolves to the
+      // "parachute" name (here via explicit --tunnel-name parachute) must not
+      // self-sweep — the connector we'd kill is the very one we're about to
+      // reuse. Reuse-flow: queued list reports the parachute tunnel.
+      const env = makeEnv();
+      try {
+        const uuid = "bbbb8888-1111-2222-3333-444455556666";
+        const legacy: CloudflaredTunnelRecord = {
+          pid: 71001,
+          tunnelUuid: uuid,
+          tunnelName: "parachute",
+          hostname: "our.parachute.computer",
+          startedAt: "2026-05-01T00:00:00.000Z",
+          configPath: env.configPath,
+        };
+        writeCloudflaredState({ version: 2, tunnels: { parachute: legacy } }, env.statePath);
+
+        const { runner } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+          { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
+          { code: 0, stdout: "", stderr: "" }, // route dns
+        ]);
+        const { spawner } = fakeSpawner(71100);
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("our.parachute.computer", {
+          runner,
+          spawner,
+          alive: () => true,
+          kill: () => {},
+          connectorPids: () => [],
+          resolveHost: async () => ["104.16.0.1"],
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+          tunnelName: "parachute",
+        });
+
+        expect(code).toBe(0);
+        // No legacy-migration log line: we resolved TO "parachute", so there's
+        // nothing to migrate away from.
+        expect(logs.join("\n")).not.toContain("Stopped legacy shared-tunnel connector");
+      } finally {
+        env.cleanup();
+      }
+    });
   });
 
   // 2FA-enrollment warning (#186). The cloudflare path is always public —
@@ -1347,5 +1584,104 @@ describe("exposeCloudflareOff", () => {
     } finally {
       env.cleanup();
     }
+  });
+
+  describe("#491: state-driven off (no --tunnel-name)", () => {
+    test("0 tunnels → 'Nothing to tear down' (exit 0)", async () => {
+      const env = makeEnv();
+      try {
+        const logs: string[] = [];
+        const code = await exposeCloudflareOff({
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          log: (l) => logs.push(l),
+        });
+        expect(code).toBe(0);
+        expect(logs.join("\n")).toContain("Nothing to tear down");
+      } finally {
+        env.cleanup();
+      }
+    });
+
+    test("exactly 1 tunnel → tears it down by reading state (even a derived non-'parachute' name)", async () => {
+      const env = makeEnv();
+      try {
+        const record: CloudflaredTunnelRecord = {
+          pid: 80001,
+          tunnelUuid: "derived-uuid",
+          tunnelName: "parachute-our-parachute-computer",
+          hostname: "our.parachute.computer",
+          startedAt: "2026-05-20T10:00:00.000Z",
+          configPath: "/tmp/derived/config.yml",
+        };
+        writeCloudflaredState(
+          { version: 2, tunnels: { "parachute-our-parachute-computer": record } },
+          env.statePath,
+        );
+
+        const killed: number[] = [];
+        const code = await exposeCloudflareOff({
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          alive: () => true,
+          kill: (pid) => killed.push(pid),
+          log: () => {},
+          // No tunnelName — resolved from state.
+        });
+        expect(code).toBe(0);
+        expect(killed).toEqual([80001]);
+        expect(existsSync(env.statePath)).toBe(false);
+      } finally {
+        env.cleanup();
+      }
+    });
+
+    test("≥2 tunnels → tears down ALL of them and lists each", async () => {
+      const env = makeEnv();
+      try {
+        const recordA: CloudflaredTunnelRecord = {
+          pid: 81001,
+          tunnelUuid: "aaaa-uuid",
+          tunnelName: "parachute-alpha-example-com",
+          hostname: "alpha.example.com",
+          startedAt: "2026-05-20T10:00:00.000Z",
+          configPath: "/tmp/alpha/config.yml",
+        };
+        const recordB: CloudflaredTunnelRecord = {
+          pid: 81002,
+          tunnelUuid: "bbbb-uuid",
+          tunnelName: "parachute-beta-example-com",
+          hostname: "beta.example.com",
+          startedAt: "2026-05-20T11:00:00.000Z",
+          configPath: "/tmp/beta/config.yml",
+        };
+        writeCloudflaredState(
+          withTunnelRecord(withTunnelRecord(undefined, recordA), recordB),
+          env.statePath,
+        );
+
+        const killed: number[] = [];
+        const logs: string[] = [];
+        const code = await exposeCloudflareOff({
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          alive: () => true,
+          kill: (pid) => killed.push(pid),
+          log: (l) => logs.push(l),
+          // No tunnelName — bare `off` means "stop all public Cloudflare exposure".
+        });
+        expect(code).toBe(0);
+        // Both connectors stopped.
+        expect(killed.sort()).toEqual([81001, 81002]);
+        // State fully cleared (no tunnels remain).
+        expect(existsSync(env.statePath)).toBe(false);
+        const joined = logs.join("\n");
+        expect(joined).toContain("Tearing down all 2 recorded Cloudflare tunnels");
+        expect(joined).toContain("parachute-alpha-example-com");
+        expect(joined).toContain("parachute-beta-example-com");
+      } finally {
+        env.cleanup();
+      }
+    });
   });
 });

@@ -159,7 +159,8 @@ function extractNamedFlag(
  *                                       fall through to today's Tailscale
  *                                       default (CI escape hatch, #29)
  *   --domain=<host>           hostname for the Cloudflare path
- *   --tunnel-name=<name>      named tunnel override (#32)
+ *   --tunnel-name=<name>      named tunnel override (#32); defaults to a
+ *                                       per-hostname dedicated name (#491)
  *
  * Returns the stripped argv so the layer/action parser sees `[layer, action?]`
  * regardless of flag placement. `--tailnet` + `--cloudflare` together is

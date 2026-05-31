@@ -369,8 +369,13 @@ Flags:
   --domain <hostname>     fully-qualified hostname to route through the tunnel
                           (e.g. vault.example.com). The apex must be a zone on
                           your Cloudflare account.
-  --tunnel-name <name>    Cloudflare tunnel name (default: \`parachute\`).
-                          Use to coexist multiple named tunnels on one box.
+  --tunnel-name <name>    Cloudflare tunnel name. Defaults to a per-hostname
+                          name (e.g. vault.example.com → parachute-vault-example-com)
+                          so each machine gets its OWN dedicated tunnel —
+                          Cloudflare tunnels are account-wide, and sharing one
+                          across machines collides their connectors. You don't
+                          need to create the tunnel yourself; expose does it.
+                          Override only to pin a specific name.
   --skip-provider-check   bypass non-TTY auto-detect, default to Tailscale
                           Funnel as before. Intended for CI / scripts whose
                           environment is already pre-flighted.
