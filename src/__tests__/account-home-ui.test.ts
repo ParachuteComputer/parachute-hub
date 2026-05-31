@@ -310,7 +310,9 @@ describe("renderAccountHome", () => {
     expect(html).not.toContain('data-testid="mint-verb-write"');
   });
 
-  test("mint affordance — never offers an admin verb", () => {
+  test("mint affordance — offers the admin verb when the user holds it", () => {
+    // 2026-05-30: assigned users hold read/write/admin on their vault, so the
+    // mint form offers admin (the live `vaultVerbsForUserVault` returns it).
     const html = renderAccountHome({
       username: "alice",
       assignedVaults: ["work"],
@@ -319,10 +321,10 @@ describe("renderAccountHome", () => {
       isFirstAdmin: false,
       csrfToken: CSRF,
       twoFactorEnabled: false,
-      mintableVerbs: { work: ["read", "write"] },
+      mintableVerbs: { work: ["read", "write", "admin"] },
     });
-    expect(html).not.toContain('value="admin"');
-    expect(html).not.toContain('data-testid="mint-verb-admin"');
+    expect(html).toContain('value="admin"');
+    expect(html).toContain('data-testid="mint-verb-admin"');
   });
 
   test("mint affordance — absent when no mintable verbs (admin / no-vault / unmapped role)", () => {

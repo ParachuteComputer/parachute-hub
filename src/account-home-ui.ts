@@ -384,7 +384,12 @@ function renderTokenMintBlock(
   const radios = verbs
     .map((verb, i) => {
       const checked = i === 0 ? " checked" : "";
-      const label = verb === "read" ? "Read-only" : "Read + write";
+      const label =
+        verb === "read"
+          ? "Read-only"
+          : verb === "admin"
+            ? "Full (read, write, rotate tokens + config)"
+            : "Read + write";
       return `
               <label class="mint-verb-option">
                 <input type="radio" name="verb" value="${verb}"${checked}
