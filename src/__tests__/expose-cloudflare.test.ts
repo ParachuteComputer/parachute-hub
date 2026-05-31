@@ -1119,6 +1119,66 @@ describe("exposeCloudflareUp", () => {
       }
     });
 
+    test("legacy-sweep: drops a DEAD legacy 'parachute' record without killing, when migrating", async () => {
+      const env = makeEnv();
+      try {
+        // A leftover shared-tunnel record whose connector is no longer running.
+        const deadLegacy: CloudflaredTunnelRecord = {
+          pid: 72001,
+          tunnelUuid: "dead-legacy-uuid",
+          tunnelName: "parachute",
+          hostname: "our.parachute.computer",
+          startedAt: "2026-05-01T00:00:00.000Z",
+          configPath: "/tmp/legacy/parachute/config.yml",
+        };
+        writeCloudflaredState({ version: 2, tunnels: { parachute: deadLegacy } }, env.statePath);
+
+        const uuid = "cccc7777-1111-2222-3333-444455556666";
+        const { runner } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+          { code: 0, stdout: "[]", stderr: "" },
+          {
+            code: 0,
+            stdout: `Created tunnel parachute-our-parachute-computer with id ${uuid}\n`,
+            stderr: "",
+          },
+          { code: 0, stdout: "", stderr: "" },
+        ]);
+        const { spawner } = fakeSpawner(72100);
+        const killed: number[] = [];
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("our.parachute.computer", {
+          runner,
+          spawner,
+          alive: () => false, // nothing alive — including the dead legacy pid
+          kill: (pid) => killed.push(pid),
+          connectorPids: () => [],
+          resolveHost: async () => ["104.16.0.1"],
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+        });
+
+        expect(code).toBe(0);
+        // Connector wasn't alive → nothing killed, no sweep log.
+        expect(killed).not.toContain(72001);
+        expect(logs.join("\n")).not.toContain("Stopped legacy shared-tunnel connector");
+        // …but the stale dead record is cleared, leaving only the new derived one.
+        const state = readCloudflaredState(env.statePath);
+        expect(findTunnelRecord(state, "parachute")).toBeUndefined();
+        expect(findTunnelRecord(state, "parachute-our-parachute-computer")?.pid).toBe(72100);
+      } finally {
+        env.cleanup();
+      }
+    });
+
     test("legacy-sweep: does NOT fire when the derived name IS 'parachute' (no migration)", async () => {
       // A live "parachute" record AND an invocation that resolves to the
       // "parachute" name (here via explicit --tunnel-name parachute) must not

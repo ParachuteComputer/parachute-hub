@@ -64,7 +64,10 @@ export function deriveTunnelName(hostname: string): string {
   // the full hostname. Reserve room for the prefix + "-" + 8 hex chars.
   const suffix = `-${shortStableHash(hostname)}`;
   const room = MAX_TUNNEL_NAME - TUNNEL_NAME_PREFIX.length - suffix.length;
-  return `${TUNNEL_NAME_PREFIX}${body.slice(0, room)}${suffix}`;
+  // Strip any trailing hyphen the truncation left behind (e.g. a slice that
+  // lands on a dot-turned-hyphen) so the body doesn't abut the suffix as `--`.
+  const truncated = body.slice(0, room).replace(/-+$/, "");
+  return `${TUNNEL_NAME_PREFIX}${truncated}${suffix}`;
 }
 
 /**

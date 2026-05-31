@@ -275,9 +275,12 @@ export interface ExposeCloudflareOpts {
    */
   exposeStatePath?: string;
   /**
-   * Tunnel name targeted by this invocation. Defaults to `parachute` —
-   * the canonical single-tunnel name. Override to run multiple tunnels on
-   * one box (#32).
+   * Tunnel name targeted by this invocation. The up-path defaults to a
+   * per-hostname derived name (`deriveTunnelName(hostname)`) so each machine
+   * gets its own tunnel and account-wide tunnels don't collide across boxes
+   * (#491). Override to pin a specific name (e.g. multiple tunnels on one
+   * box, #32). The off-path resolves the name from `cloudflared-state.json`
+   * when omitted (it has no hostname to derive from).
    */
   tunnelName?: string;
   /**
@@ -714,16 +717,21 @@ export async function exposeCloudflareUp(
   let migratedState = stateBefore;
   if (r.tunnelName !== DEFAULT_TUNNEL_NAME) {
     const legacy = findTunnelRecord(stateBefore, DEFAULT_TUNNEL_NAME);
-    if (legacy && r.alive(legacy.pid)) {
-      try {
-        r.kill(legacy.pid, "SIGTERM");
-      } catch {
-        // Already gone between read and kill — fine; we drop the record below.
+    if (legacy) {
+      if (r.alive(legacy.pid)) {
+        try {
+          r.kill(legacy.pid, "SIGTERM");
+        } catch {
+          // Already gone between read and kill — fine; we drop the record below.
+        }
+        r.log(
+          `Stopped legacy shared-tunnel connector (migrated ${hostname} to dedicated tunnel ${r.tunnelName}).`,
+        );
       }
+      // Drop the legacy shared-tunnel record whether or not its connector was
+      // still alive. A dead record would otherwise linger across re-exposes
+      // until the next `off`; clearing it here keeps state tidy (#491 review).
       migratedState = withoutTunnelRecord(stateBefore, DEFAULT_TUNNEL_NAME);
-      r.log(
-        `Stopped legacy shared-tunnel connector (migrated ${hostname} to dedicated tunnel ${r.tunnelName}).`,
-      );
     }
   }
 
@@ -888,8 +896,15 @@ function teardownOne(
   r.log(
     `  Tunnel "${record.tunnelName}" (${record.tunnelUuid}) remains defined in Cloudflare; re-running`,
   );
+  // Only suggest `--tunnel-name` for a custom name. The auto-derived name
+  // (and the legacy shared "parachute" name) need no flag — re-running with
+  // just --domain re-derives the per-hostname name (and migrates a legacy
+  // record off the shared tunnel), which is exactly what we want.
+  const isAutoName =
+    record.tunnelName === deriveTunnelName(record.hostname) ||
+    record.tunnelName === DEFAULT_TUNNEL_NAME;
   r.log(
-    `  \`parachute expose public --cloudflare --domain ${record.hostname}${record.tunnelName === DEFAULT_TUNNEL_NAME ? "" : ` --tunnel-name ${record.tunnelName}`}\` reuses it.`,
+    `  \`parachute expose public --cloudflare --domain ${record.hostname}${isAutoName ? "" : ` --tunnel-name ${record.tunnelName}`}\` reuses it.`,
   );
   return { state: withoutTunnelRecord(state, record.tunnelName), code: 0 };
 }
