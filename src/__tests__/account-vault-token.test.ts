@@ -10,7 +10,8 @@
  *   - UNassigned vault      → 403 (cannot mint for a vault not in the
  *                             user's `user_vaults` assignment — blocks
  *                             cross-vault).
- *   - `admin` verb          → rejected (not in the form vocabulary).
+ *   - `admin` verb          → minted for an ASSIGNED vault (2026-05-30:
+ *                             assigned users hold full vault authority).
  *   - Broader/garbage verb  → rejected.
  *   - First admin           → 403 (no `user_vaults` rows → unrestricted
  *                             admins use the SPA path, not this one).

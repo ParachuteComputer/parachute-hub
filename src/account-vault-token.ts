@@ -21,12 +21,10 @@
  *      `vaultVerbsForUserVault` (which returns `null` for an unassigned
  *      vault), NOT from the verb-blind `assignedVaults` array.
  *   3. **Scope cap.** The requested verb MUST be one the user's assignment
- *      role permits, and may only ever be `read` or `write` — NEVER `admin`,
- *      never a broader scope than the user holds. `vaultVerbsForUserVault`
- *      returns the role's verb set (today always `["read", "write"]` since
- *      every assignment is `role = 'write'`); a verb outside that set → 403.
- *      `admin` is not in the form's vocabulary at all and is rejected at the
- *      parse step as an invalid verb.
+ *      role permits. As of 2026-05-30 an assigned user holds the full set
+ *      `["read", "write", "admin"]` on their vault (`vaultVerbsForUserVault`),
+ *      so this surface mints admin tokens too — consistent with the OAuth
+ *      flow. A verb outside the held set, or for an unassigned vault, → 403.
  *
  * The first admin (unrestricted, empty `assignedVaults`) has no `user_vaults`
  * rows, so gate 2 returns `null` for every vault and the admin gets a 403
@@ -199,9 +197,10 @@ export async function handleAccountVaultTokenPost(
     return renderHome(400, { mintError: `"${vaultName}" is not a valid vault name.` });
   }
 
-  // Verb parse — must be exactly one of read/write. `admin` (or anything
-  // else) is not in this surface's vocabulary and is rejected here, well
-  // before authority is even consulted.
+  // Verb parse — must be one of read/write/admin (this surface's vocabulary).
+  // Anything else is rejected here, well before authority is even consulted;
+  // the per-vault authority cap (gate 3 below) then drops verbs the user
+  // doesn't actually hold.
   const verbRaw = form.get("verb");
   const verb = typeof verbRaw === "string" ? verbRaw : "";
   if (!ALLOWED_VERBS.includes(verb as VaultVerb)) {
