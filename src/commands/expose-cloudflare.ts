@@ -1,7 +1,12 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
-import { DEFAULT_TUNNEL_NAME, cloudflaredPathsFor, writeConfig } from "../cloudflare/config.ts";
+import {
+  DEFAULT_TUNNEL_NAME,
+  cloudflaredPathsFor,
+  deriveTunnelName,
+  writeConfig,
+} from "../cloudflare/config.ts";
 import {
   DEFAULT_CLOUDFLARED_HOME,
   cloudflaredInstallHint,
@@ -10,6 +15,7 @@ import {
 } from "../cloudflare/detect.ts";
 import {
   CLOUDFLARED_STATE_PATH,
+  type CloudflaredState,
   type CloudflaredTunnelRecord,
   clearCloudflaredState,
   findTunnelRecord,
@@ -269,9 +275,12 @@ export interface ExposeCloudflareOpts {
    */
   exposeStatePath?: string;
   /**
-   * Tunnel name targeted by this invocation. Defaults to `parachute` —
-   * the canonical single-tunnel name. Override to run multiple tunnels on
-   * one box (#32).
+   * Tunnel name targeted by this invocation. The up-path defaults to a
+   * per-hostname derived name (`deriveTunnelName(hostname)`) so each machine
+   * gets its own tunnel and account-wide tunnels don't collide across boxes
+   * (#491). Override to pin a specific name (e.g. multiple tunnels on one
+   * box, #32). The off-path resolves the name from `cloudflared-state.json`
+   * when omitted (it has no hostname to derive from).
    */
   tunnelName?: string;
   /**
@@ -366,8 +375,20 @@ interface Resolved {
   restartService: (short: string) => Promise<number>;
 }
 
-function resolve(opts: ExposeCloudflareOpts): Resolved {
-  const tunnelName = opts.tunnelName ?? DEFAULT_TUNNEL_NAME;
+/**
+ * Resolve options into the fully-defaulted `Resolved` shape.
+ *
+ * `tunnelNameDefault` is the fallback tunnel name when the caller didn't pass
+ * an explicit `opts.tunnelName`. The up-path passes `deriveTunnelName(hostname)`
+ * so each machine/hostname gets its OWN dedicated tunnel (#491) — sharing one
+ * account-wide tunnel across boxes collides their connectors. An explicit
+ * `--tunnel-name` always wins (operators can override). The off-path has no
+ * hostname to derive from, so it resolves the name from state before calling
+ * in (see `exposeCloudflareOff`) and only relies on this default as a last
+ * resort.
+ */
+function resolve(opts: ExposeCloudflareOpts, tunnelNameDefault: string): Resolved {
+  const tunnelName = opts.tunnelName ?? tunnelNameDefault;
   const configDir = opts.configDir ?? CONFIG_DIR;
   // Derive per-tunnel config/log paths from the *resolved* configDir, not the
   // real `CONFIG_DIR`. When a test threads a tmp `configDir` but omits explicit
@@ -489,7 +510,12 @@ export async function exposeCloudflareUp(
   hostname: string,
   opts: ExposeCloudflareOpts = {},
 ): Promise<number> {
-  const r = resolve(opts);
+  // Default to a per-hostname dedicated tunnel (#491). An explicit
+  // `--tunnel-name` still wins (handled inside `resolve`). Deriving from the
+  // hostname keeps re-expose idempotent (same hostname → same name → reuse the
+  // tunnel created last time) and stops two machines from colliding on the
+  // single account-wide `"parachute"` tunnel.
+  const r = resolve(opts, deriveTunnelName(hostname));
 
   if (!isValidTunnelName(r.tunnelName)) {
     r.log(
@@ -591,6 +617,9 @@ export async function exposeCloudflareUp(
       return reportCloudflaredError(err, r.log);
     }
     r.log(`✓ Created tunnel ${tunnel.id}`);
+    r.log(
+      "  Each machine gets its own dedicated tunnel — you don't need to run `cloudflared tunnel create` separately; expose does it.",
+    );
   } else {
     r.log(`✓ Reusing existing tunnel "${r.tunnelName}" (${tunnel.id})`);
   }
@@ -672,6 +701,40 @@ export async function exposeCloudflareUp(
     }
   }
 
+  // Legacy shared-tunnel migration sweep (#491). Aaron's running boxes were
+  // exposed under the old single account-wide `"parachute"` tunnel; the bug
+  // was that a second box reusing that name collided connectors. Now that the
+  // default is per-hostname, a box upgrading and re-exposing will create/route
+  // a NEW dedicated tunnel — but the OLD `"parachute"` connector is still
+  // running, still registered on the shared tunnel, still able to pick up
+  // load-balanced requests for OTHER hosts. Kill it + drop its state record so
+  // the box self-heals immediately on this expose instead of at the next
+  // reboot. Only fires when (a) we actually migrated AWAY from "parachute"
+  // (the new derived name differs) and (b) a live legacy record exists.
+  // `routeDns` above already used `--overwrite-dns`, so this hostname's CNAME
+  // has been repointed to the new tunnel — the legacy connector can't serve it
+  // anymore regardless; this just stops it from serving anyone else's.
+  let migratedState = stateBefore;
+  if (r.tunnelName !== DEFAULT_TUNNEL_NAME) {
+    const legacy = findTunnelRecord(stateBefore, DEFAULT_TUNNEL_NAME);
+    if (legacy) {
+      if (r.alive(legacy.pid)) {
+        try {
+          r.kill(legacy.pid, "SIGTERM");
+        } catch {
+          // Already gone between read and kill — fine; we drop the record below.
+        }
+        r.log(
+          `Stopped legacy shared-tunnel connector (migrated ${hostname} to dedicated tunnel ${r.tunnelName}).`,
+        );
+      }
+      // Drop the legacy shared-tunnel record whether or not its connector was
+      // still alive. A dead record would otherwise linger across re-exposes
+      // until the next `off`; clearing it here keeps state tidy (#491 review).
+      migratedState = withoutTunnelRecord(stateBefore, DEFAULT_TUNNEL_NAME);
+    }
+  }
+
   const pid = r.spawner.spawn(
     ["cloudflared", "tunnel", "--config", r.configPath, "run"],
     r.logPath,
@@ -685,7 +748,7 @@ export async function exposeCloudflareUp(
     startedAt: r.now().toISOString(),
     configPath: r.configPath,
   };
-  writeCloudflaredState(withTunnelRecord(stateBefore, record), r.statePath);
+  writeCloudflaredState(withTunnelRecord(migratedState, record), r.statePath);
 
   // Persist the shared cross-provider expose record. Without this, the
   // Tailscale path was the only one writing expose-state.json — so after a
@@ -763,11 +826,19 @@ export async function exposeCloudflareUp(
 
   r.log("");
   r.log(`✓ Cloudflare tunnel up (pid ${pid}).`);
+  r.log(`  Tunnel:  ${r.tunnelName} (dedicated to this machine)`);
   r.log(`  Open:    ${baseUrl}/`);
   r.log(`  Admin:   ${baseUrl}/admin/`);
   r.log(`  Vault:   ${vaultUrl}`);
   r.log(`  OAuth:   ${hubOrigin}`);
   r.log(`  Logs:    ${r.logPath}`);
+  r.log("");
+  // Honest reboot caveat: the connector is a detached background process, not
+  // yet a launchd/systemd service, so it does NOT survive a reboot (durable
+  // connector is a tracked follow-up). Re-running the same command brings it
+  // back idempotently — same hostname → same dedicated tunnel.
+  r.log("Note: the connector runs in the background but does not survive a reboot yet. After a");
+  r.log(`reboot, re-run:  parachute expose public --cloudflare --domain ${hostname}`);
   r.log("");
   r.log("Point a claude.ai / ChatGPT connector at:");
   r.log(`  ${vaultUrl}`);
@@ -784,30 +855,27 @@ export async function exposeCloudflareUp(
   return 0;
 }
 
-export async function exposeCloudflareOff(opts: ExposeCloudflareOpts = {}): Promise<number> {
-  const r = resolve(opts);
-  const stateBefore = readCloudflaredState(r.statePath);
-  const record = findTunnelRecord(stateBefore, r.tunnelName);
-  if (!record) {
-    if (stateBefore && Object.keys(stateBefore.tunnels).length > 0) {
-      const others = listTunnelRecords(stateBefore)
-        .map((t) => t.tunnelName)
-        .join(", ");
-      r.log(
-        `No Cloudflare exposure recorded for tunnel "${r.tunnelName}". Other tunnels: ${others}.`,
-      );
-    } else {
-      r.log("No Cloudflare exposure recorded. Nothing to tear down.");
-    }
-    return 0;
-  }
+/**
+ * Tear down ONE tunnel record: SIGTERM its connector, sweep any orphan
+ * connectors for it (hub#487), drop its state record, and emit the
+ * reuse-hint copy. Pure-ish over `r` + the current state: returns the state
+ * with the record removed (or undefined when that empties it) plus an exit
+ * code, so the caller commits the disk write once after tearing down one or
+ * many tunnels. The connector kill is non-fatal-on-already-gone, fatal only
+ * when SIGTERM itself errors on a live pid.
+ */
+function teardownOne(
+  r: Resolved,
+  state: CloudflaredState | undefined,
+  record: CloudflaredTunnelRecord,
+): { state: CloudflaredState | undefined; code: number } {
   if (r.alive(record.pid)) {
     try {
       r.kill(record.pid, "SIGTERM");
-      r.log(`✓ Stopped cloudflared (pid ${record.pid}).`);
+      r.log(`✓ Stopped cloudflared (pid ${record.pid}, tunnel "${record.tunnelName}").`);
     } catch (err) {
       r.log(`✗ Failed to stop cloudflared: ${err instanceof Error ? err.message : String(err)}`);
-      return 1;
+      return { state, code: 1 };
     }
   } else {
     r.log(`cloudflared (pid ${record.pid}) wasn't running; clearing stale state.`);
@@ -824,9 +892,80 @@ export async function exposeCloudflareOff(opts: ExposeCloudflareOpts = {}): Prom
       // Already gone between probe and kill — fine.
     }
   }
-  const stateAfter = withoutTunnelRecord(stateBefore, r.tunnelName);
-  if (stateAfter) {
-    writeCloudflaredState(stateAfter, r.statePath);
+  r.log(`  ${record.hostname} is no longer reachable through this machine.`);
+  r.log(
+    `  Tunnel "${record.tunnelName}" (${record.tunnelUuid}) remains defined in Cloudflare; re-running`,
+  );
+  // Only suggest `--tunnel-name` for a custom name. The auto-derived name
+  // (and the legacy shared "parachute" name) need no flag — re-running with
+  // just --domain re-derives the per-hostname name (and migrates a legacy
+  // record off the shared tunnel), which is exactly what we want.
+  const isAutoName =
+    record.tunnelName === deriveTunnelName(record.hostname) ||
+    record.tunnelName === DEFAULT_TUNNEL_NAME;
+  r.log(
+    `  \`parachute expose public --cloudflare --domain ${record.hostname}${isAutoName ? "" : ` --tunnel-name ${record.tunnelName}`}\` reuses it.`,
+  );
+  return { state: withoutTunnelRecord(state, record.tunnelName), code: 0 };
+}
+
+export async function exposeCloudflareOff(opts: ExposeCloudflareOpts = {}): Promise<number> {
+  // The off-path has no hostname to derive a name from. When `--tunnel-name`
+  // is set we use it; otherwise we resolve from cloudflared-state.json (below).
+  // `DEFAULT_TUNNEL_NAME` is only the inert `resolve` fallback here — the
+  // state-driven branch never relies on it.
+  const r = resolve(opts, DEFAULT_TUNNEL_NAME);
+  const stateBefore = readCloudflaredState(r.statePath);
+  const records = listTunnelRecords(stateBefore);
+
+  // Decide which records to tear down.
+  //   - explicit `--tunnel-name` → exactly that one (or a not-found message).
+  //   - no flag, 0 tunnels        → nothing to do.
+  //   - no flag, exactly 1        → that one.
+  //   - no flag, ≥2               → ALL of them. A bare `expose public
+  //     --cloudflare off` means "stop all public Cloudflare exposure on this
+  //     machine"; tearing down only one would leave the box half-exposed with
+  //     no obvious signal which tunnel survived.
+  let targets: CloudflaredTunnelRecord[];
+  if (opts.tunnelName !== undefined) {
+    const record = findTunnelRecord(stateBefore, r.tunnelName);
+    if (!record) {
+      if (records.length > 0) {
+        const others = records.map((t) => t.tunnelName).join(", ");
+        r.log(
+          `No Cloudflare exposure recorded for tunnel "${r.tunnelName}". Other tunnels: ${others}.`,
+        );
+      } else {
+        r.log("No Cloudflare exposure recorded. Nothing to tear down.");
+      }
+      return 0;
+    }
+    targets = [record];
+  } else {
+    if (records.length === 0) {
+      r.log("No Cloudflare exposure recorded. Nothing to tear down.");
+      return 0;
+    }
+    if (records.length > 1) {
+      r.log(
+        `Tearing down all ${records.length} recorded Cloudflare tunnels: ${records
+          .map((t) => t.tunnelName)
+          .join(", ")}.`,
+      );
+    }
+    targets = records;
+  }
+
+  let state = stateBefore;
+  let failed = false;
+  for (const record of targets) {
+    const result = teardownOne(r, state, record);
+    state = result.state;
+    if (result.code !== 0) failed = true;
+  }
+
+  if (state) {
+    writeCloudflaredState(state, r.statePath);
   } else {
     clearCloudflaredState(r.statePath);
   }
@@ -834,17 +973,10 @@ export async function exposeCloudflareOff(opts: ExposeCloudflareOpts = {}): Prom
   // downstream consumers stop resolving the now-dead public URL (mirrors the
   // up-path write above + the Tailscale off-path's expose-state teardown). When
   // other tunnels survive we leave it — a later off for the last one clears it.
-  if (!stateAfter) {
+  if (!state) {
     clearExposeState(r.exposeStatePath);
   }
-  r.log(`  ${record.hostname} is no longer reachable through this machine.`);
-  r.log(
-    `  Tunnel "${record.tunnelName}" (${record.tunnelUuid}) remains defined in Cloudflare; re-running`,
-  );
-  r.log(
-    `  \`parachute expose public --cloudflare --domain ${record.hostname}${record.tunnelName === DEFAULT_TUNNEL_NAME ? "" : ` --tunnel-name ${record.tunnelName}`}\` reuses it.`,
-  );
-  return 0;
+  return failed ? 1 : 0;
 }
 
 function reportCloudflaredError(err: unknown, log: (line: string) => void): number {
