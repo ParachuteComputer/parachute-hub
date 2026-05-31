@@ -152,10 +152,13 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
  * enforced at the shared mint choke-point (`capScopesToUserAuthority` applied
  * inside `issueAuthCodeRedirect` in `oauth-handlers.ts`): an OAuth flow caps
  * named vault verbs to those the consenting user actually holds on that vault.
- * `vaultVerbsForRole` never returns `admin` for an assigned (read/write) user,
- * so admin is dropped for everyone except the hub owner (isFirstAdmin) — who
- * holds admin everywhere by construction. An admin-only request from a
- * non-owner is refused outright (never minted as a zero-scope token).
+ * `vaultVerbsForRole` returns admin for an assigned user (2026-05-30: any
+ * assigned user holds full vault authority on their own vault), so a non-owner
+ * can delegate `vault:<their-vault>:admin` to their client. The cap still
+ * drops admin (and every verb) for a vault the user is NOT assigned to
+ * (held=null), and an admin-only request the cap empties is refused outright
+ * (never minted as a zero-scope token). The hub owner (isFirstAdmin) holds
+ * admin everywhere by construction.
  *
  * `vault:<name>:admin` also remains mintable by operator-proving local paths,
  * all of which require already-established authority:

@@ -10,7 +10,8 @@
  *   - UNassigned vault      → 403 (cannot mint for a vault not in the
  *                             user's `user_vaults` assignment — blocks
  *                             cross-vault).
- *   - `admin` verb          → rejected (not in the form vocabulary).
+ *   - `admin` verb          → minted for an ASSIGNED vault (2026-05-30:
+ *                             assigned users hold full vault authority).
  *   - Broader/garbage verb  → rejected.
  *   - First admin           → 403 (no `user_vaults` rows → unrestricted
  *                             admins use the SPA path, not this one).
@@ -245,17 +246,19 @@ describe("handleAccountVaultTokenPost — authorization gates (adversarial)", ()
     expect(res.status).toBe(403);
   });
 
-  test("admin verb is rejected — never mints vault:<name>:admin", async () => {
+  test("200 mints vault:<name>:admin when verb=admin (assigned users hold admin, 2026-05-30)", async () => {
     const { cookie, csrfToken } = await seedFriend(["work"]);
     const res = await handleAccountVaultTokenPost(
       mintReq("work", { cookie, csrfToken, verb: "admin" }),
       "work",
       deps(),
     );
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).not.toContain('data-testid="minted-token-banner"');
-    expect(html).not.toContain("vault:work:admin");
+    const token = html.match(/data-testid="minted-token-value">([^<]+)</)?.[1] as string;
+    const validated = await validateAccessToken(harness.db, token, ISSUER);
+    const scopeClaim = (validated.payload as { scope?: string }).scope ?? "";
+    expect(scopeClaim.split(/\s+/)).toEqual(["vault:work:admin"]);
   });
 
   test("a garbage / broader verb is rejected", async () => {

@@ -146,30 +146,37 @@ function readVaultsForUser(db: Database, userId: string): string[] {
 
 /**
  * The per-vault verbs a `user_vaults.role` grants. The schema's `role`
- * column is `TEXT NOT NULL DEFAULT 'write'` and is reserved forward-compat
- * for per-vault role granularity (see the v10 migration note in
- * `hub-db.ts`). Today every assignment is created with `role = 'write'`, so
- * the only live mapping is `write → {read, write}`. The function is the
- * single place the verb-cap lives so a future role taxonomy (`read`-only,
- * `admin`, etc.) lands here without the friend-mint path having to change.
+ * column is `TEXT NOT NULL DEFAULT 'write'`; today every assignment is created
+ * with `role = 'write'`. This is the single place the verb-cap lives, so the
+ * OAuth mint cap (`capScopesToUserAuthority`) and the `/account` mint UI both
+ * read authority from here.
+ *
+ * **Assigned users hold FULL vault authority (read + write + admin)** as of
+ * 2026-05-30 (Aaron's call: "any assigned user gets admin"). The point of the
+ * multi-user flow is that someone given a vault — owned or shared — can connect
+ * their own client (e.g. Claude MCP) to it and grant everything they'd want,
+ * including `vault:<name>:admin` (token creation + config). Owner-vs-shared is
+ * NOT distinguished today; a shared user gets admin too (explicit trade-off).
  *
  * Mapping:
- *   - `write` (today's only value)  → `["read", "write"]`
- *   - `read`                        → `["read"]`
+ *   - `write` (today's default)     → `["read", "write", "admin"]`
+ *   - `read` (forward-compat)       → `["read"]` — a *deliberate* read-only
+ *     assignment stays read-only even under the any-assigned-user-gets-admin
+ *     policy. Not created by any flow today.
  *   - anything else (unknown role)  → `[]` — fail closed. An unrecognised
  *     role grants no minting authority rather than silently defaulting to
  *     write. (Defense-in-depth: a hand-edited / future row with a role this
- *     code doesn't understand should not be treated as broad write.)
+ *     code doesn't understand should not be treated as broad.)
  *
- * `admin` is intentionally NOT mapped to a `vault:<name>:admin` mint here —
- * the friend-facing token mint is capped at read/write by design. A
- * future per-vault-admin friend grant would route through the
- * vault-admin-token path, not this one.
+ * Scope of the widening: this only affects `vault:<name>:<verb>` for vaults
+ * the user is assigned. Hub-level admin (`hub:admin`) + host operator scopes
+ * (`parachute:host:*`) are NOT vault scopes and remain ungrantable by
+ * non-admins — the cap's named-vault branch is the only thing this touches.
  */
-export type VaultVerb = "read" | "write";
+export type VaultVerb = "read" | "write" | "admin";
 
 export function vaultVerbsForRole(role: string): VaultVerb[] {
-  if (role === "write") return ["read", "write"];
+  if (role === "write") return ["read", "write", "admin"];
   if (role === "read") return ["read"];
   return [];
 }
