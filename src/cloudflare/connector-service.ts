@@ -362,16 +362,27 @@ function installSystemd(
   const messages: string[] = [];
 
   // Non-root: enable linger so the user unit runs without an active login
-  // (i.e. after a reboot before the operator logs back in). Best-effort —
-  // linger may be unavailable (no logind, container without it); a failure
-  // just means the unit only runs while the user is logged in, so we warn
-  // rather than fall back entirely.
+  // (i.e. after a reboot before the operator logs back in). Strictly
+  // best-effort — linger may be unavailable: `loginctl` absent entirely (a
+  // container with systemd but no logind), or present-but-failing. Either way
+  // we keep the install (a user unit is still better than a transient spawn)
+  // and warn. The probe + try/catch matter because production `Bun.spawnSync`
+  // THROWS on ENOENT — without the guard a box that has systemctl but not
+  // loginctl would propagate the spawn error out and hard-fail the expose.
   if (!root && userName) {
-    const linger = deps.run(["loginctl", "enable-linger", userName]);
-    if (linger.code !== 0) {
-      messages.push(
-        "Note: could not enable lingering (loginctl enable-linger) — the connector will run while you're logged in but may not start on a cold boot before login.",
-      );
+    const lingerWarning =
+      "Note: could not enable lingering (loginctl enable-linger) — the connector will run while you're logged in but may not start on a cold boot before login. To run on cold boot without an active login, re-run this command as root (installs a system unit that needs no linger).";
+    if (deps.which("loginctl") === null) {
+      messages.push(lingerWarning);
+    } else {
+      try {
+        const linger = deps.run(["loginctl", "enable-linger", userName]);
+        if (linger.code !== 0) messages.push(lingerWarning);
+      } catch {
+        // loginctl vanished between probe and run, or threw (ENOENT/EACCES) —
+        // never fatal; linger is a best-effort nicety.
+        messages.push(lingerWarning);
+      }
     }
   }
 

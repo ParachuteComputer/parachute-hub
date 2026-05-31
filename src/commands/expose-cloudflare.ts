@@ -858,7 +858,9 @@ export async function exposeCloudflareUp(
     hostname,
     startedAt: r.now().toISOString(),
     configPath: r.configPath,
-    serviceManaged,
+    // Only serialize the flag when true — keep the state JSON clean for the
+    // common (transient-fallback) case; absent reads as unmanaged.
+    ...(serviceManaged ? { serviceManaged: true } : {}),
   };
   writeCloudflaredState(withTunnelRecord(migratedState, record), r.statePath);
 

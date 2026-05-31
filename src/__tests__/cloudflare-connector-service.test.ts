@@ -273,6 +273,68 @@ describe("installConnectorService — Linux systemd", () => {
     });
     expect(result.outcome).toBe("installed");
     expect(result.messages.join(" ")).toContain("could not enable lingering");
+    // The warning is actionable — points at the root/system-unit path (EC2 /
+    // headless case).
+    expect(result.messages.join(" ")).toContain("re-run this command as root");
+  });
+
+  test("non-root: systemctl present but loginctl ABSENT → installs, warns, never throws", () => {
+    // The real robustness gap: production `Bun.spawnSync(["loginctl",…])`
+    // THROWS on ENOENT. With systemctl present but loginctl missing (a
+    // container with systemd but no logind), the unguarded linger call would
+    // propagate that throw out and hard-fail the whole expose. The `which`
+    // probe must skip the call and degrade to a soft warning.
+    let lingerRan = false;
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      userName: () => "op",
+      which: (b) => {
+        if (b === "cloudflared") return CF_BIN;
+        if (b === "systemctl") return "/usr/bin/systemctl";
+        if (b === "loginctl") return null; // absent
+        return null;
+      },
+      run: (cmd) => {
+        if (cmd[0] === "loginctl") lingerRan = true;
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    const result = installConnectorService({
+      tunnelName: TUNNEL,
+      configPath: CONFIG,
+      logPath: LOG,
+      deps: f.deps,
+    });
+    expect(result.outcome).toBe("installed");
+    expect(result.kind).toBe("systemd-user");
+    // loginctl was NOT invoked (the probe short-circuited it).
+    expect(lingerRan).toBe(false);
+    expect(result.messages.join(" ")).toContain("could not enable lingering");
+    expect(result.messages.join(" ")).toContain("re-run this command as root");
+  });
+
+  test("non-root: loginctl present but the run THROWS → caught, installs, warns", () => {
+    // Belt-and-suspenders for the race where loginctl passes the `which` probe
+    // but the spawn itself throws (binary removed between probe and run, or an
+    // EACCES). The try/catch keeps it non-fatal.
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      userName: () => "op",
+      run: (cmd) => {
+        if (cmd[0] === "loginctl") throw new Error("spawn loginctl ENOENT");
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    const result = installConnectorService({
+      tunnelName: TUNNEL,
+      configPath: CONFIG,
+      logPath: LOG,
+      deps: f.deps,
+    });
+    expect(result.outcome).toBe("installed");
+    expect(result.messages.join(" ")).toContain("could not enable lingering");
   });
 
   test("graceful fallback when systemctl is absent", () => {
