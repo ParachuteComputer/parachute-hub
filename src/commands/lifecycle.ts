@@ -1,5 +1,4 @@
 import { existsSync, openSync, readFileSync } from "node:fs";
-import { Socket } from "node:net";
 import { join } from "node:path";
 import {
   MissingDependencyError,
@@ -22,6 +21,7 @@ import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { HUB_ORIGIN_ENV, deriveHubOrigin } from "../hub-origin.ts";
 import { ModuleManifestError, readModuleManifest } from "../module-manifest.ts";
 import { type OperatorIssuerHealStatus, selfHealOperatorTokenIssuer } from "../operator-token.ts";
+import { type PortListeningFn, defaultPortListening } from "../port-probe.ts";
 import {
   type AliveFn,
   clearPid,
@@ -98,42 +98,16 @@ export type KillFn = (pid: number, signal: NodeJS.Signals | number) => void;
 export type SleepFn = (ms: number) => Promise<void>;
 
 /**
- * "Is something listening on this TCP port on loopback?" seam. Pairs with the
- * spawn-then-die settle (hub#194) to catch the *other* silent-start failure
- * shape (hub#487): a service that lives long enough to clear the liveness
- * check but never binds its port because the port is already held (EADDRINUSE
- * from an orphan). The recorded pid stays alive (vault's process supervisor
- * retries / lingers) so `alive(pid)` says "running" while `parachute status`
- * shows it inactive because nothing answers on the port.
- *
- * Tests inject a deterministic stub; production uses `defaultPortListening`.
+ * Port-readiness probe seam + its production impl now live in `port-probe.ts`
+ * (design 2026-06-01 §6.5) so the supervisor can share the exact same TCP
+ * connect-probe without dragging lifecycle's heavy import graph. Re-exported
+ * here so this module's public API (and its tests) are unchanged. Pairs with
+ * the spawn-then-die settle (hub#194) to catch the alive-but-never-bound shape
+ * (hub#487): a service that clears the liveness check but never binds its port
+ * because it's already held — `alive(pid)` says "running" while `status` shows
+ * it inactive because nothing answers on the port.
  */
-export type PortListeningFn = (port: number) => Promise<boolean>;
-
-/**
- * Connect-probe: open a TCP socket to 127.0.0.1:<port> and see if it's
- * accepted. A successful connect means *something* is listening; we close
- * immediately. Connection refused / timeout means nothing is bound yet.
- * `node:net` rather than `Bun.connect` because the latter has no clean
- * "connection refused → false" without a custom socket handler, and the net
- * Socket's `error`/`connect` events map directly onto the boolean we want.
- */
-export const defaultPortListening: PortListeningFn = (port) =>
-  new Promise((resolve) => {
-    const socket = new Socket();
-    let settled = false;
-    const done = (listening: boolean) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(listening);
-    };
-    socket.setTimeout(1000);
-    socket.once("connect", () => done(true));
-    socket.once("timeout", () => done(false));
-    socket.once("error", () => done(false));
-    socket.connect(port, "127.0.0.1");
-  });
+export { type PortListeningFn, defaultPortListening };
 
 /**
  * Group-aware liveness: returns true if the process group (pgid == pid)

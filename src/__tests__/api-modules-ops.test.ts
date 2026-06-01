@@ -7,6 +7,7 @@ import {
   API_MODULES_OPS_REQUIRED_SCOPE,
   _resetOperationsRegistryForTests,
   handleInstall,
+  handleLogs,
   handleOperationGet,
   handleRestart,
   handleStart,
@@ -90,6 +91,11 @@ function makeIdleSupervisor(): {
   spawns: SpawnRequest[];
 } {
   const spawns: SpawnRequest[] = [];
+  // Track each spawned proc by pid so the injected group-aware `killFn` can
+  // forward the signal to the right fake (post-hub#88, `stop()` signals via
+  // `killFn`, not `proc.kill` — so without this seam the fake's `exited` never
+  // resolves and `stop`/`restart` time out).
+  const byPid = new Map<number, SupervisedProc & { kill: () => void }>();
   const spawnFn = (req: SpawnRequest): SupervisedProc => {
     spawns.push(req);
     // The fake's `exited` resolves when kill() is called, mirroring a
@@ -99,15 +105,22 @@ function makeIdleSupervisor(): {
     const exited = new Promise<number | null>((r) => {
       resolveExit = r;
     });
-    return {
+    const proc: SupervisedProc & { kill: () => void } = {
       pid: 7777,
       exited,
       stdout: null,
       stderr: null,
       kill: () => resolveExit(0),
     };
+    byPid.set(proc.pid, proc);
+    return proc;
   };
-  return { supervisor: new Supervisor({ spawnFn }), spawns };
+  // Mirrors production's group-aware kill: the supervisor passes the leader
+  // pid, we forward to the matching fake's `kill` (which resolves `exited`).
+  const killFn = (pid: number): void => {
+    byPid.get(Math.abs(pid))?.kill();
+  };
+  return { supervisor: new Supervisor({ spawnFn, killFn }), spawns };
 }
 
 function writeManifest(path: string, services: unknown[]): void {
@@ -1627,5 +1640,134 @@ describe("well-known regen after module ops", () => {
     const second = readFileSync(wkPath, "utf8");
 
     expect(second).toBe(first);
+  });
+});
+
+describe("GET /api/modules/:short/logs (§6.5 ring-buffer tap)", () => {
+  let h: Harness;
+  beforeEach(async () => {
+    h = await makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  /**
+   * Supervisor whose child exposes a controllable stdout stream so the test
+   * can push lines into the ring buffer, then tap them through the endpoint.
+   */
+  function makeEmittingSupervisor(): {
+    supervisor: Supervisor;
+    emit: (chunk: string) => void;
+  } {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stdout = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    const enc = new TextEncoder();
+    const spawnFn = (): SupervisedProc => ({
+      pid: 4321,
+      exited: new Promise<number | null>(() => {}),
+      stdout,
+      stderr: null,
+      kill: () => {},
+    });
+    return {
+      supervisor: new Supervisor({ spawnFn, killFn: () => {} }),
+      emit: (chunk) => controller.enqueue(enc.encode(chunk)),
+    };
+  }
+
+  function logsDeps(supervisor: Supervisor) {
+    return { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, configDir: h.dir, supervisor };
+  }
+
+  test("401 on missing bearer", async () => {
+    const { supervisor } = makeEmittingSupervisor();
+    const res = await handleLogs(
+      getReq("/api/modules/vault/logs", {}),
+      "vault",
+      logsDeps(supervisor),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("403 on bearer without parachute:host:admin (host-admin gated)", async () => {
+    const { supervisor } = makeEmittingSupervisor();
+    const bearer = await mintBearer(h, ["parachute:host:auth"]);
+    const res = await handleLogs(
+      getReq("/api/modules/vault/logs", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      logsDeps(supervisor),
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("405 on non-GET", async () => {
+    const { supervisor } = makeEmittingSupervisor();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleLogs(
+      postReq("/api/modules/vault/logs", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      logsDeps(supervisor),
+    );
+    expect(res.status).toBe(405);
+  });
+
+  test("404 not_supervised for a module that isn't supervised", async () => {
+    const { supervisor } = makeEmittingSupervisor();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleLogs(
+      getReq("/api/modules/vault/logs", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      logsDeps(supervisor),
+    );
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("not_supervised");
+  });
+
+  test("replays the ring buffer (lines emitted before the tap) as lines + text", async () => {
+    const { supervisor, emit } = makeEmittingSupervisor();
+    await supervisor.start({ short: "vault", cmd: ["parachute-vault", "serve"] });
+    // Output happens BEFORE the operator opens the logs view.
+    emit("booting\n");
+    emit("FATAL: boom\n");
+    await new Promise((r) => setTimeout(r, 20));
+
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleLogs(
+      getReq("/api/modules/vault/logs", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      logsDeps(supervisor),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { short: string; lines: string[]; text: string };
+    expect(body.short).toBe("vault");
+    expect(body.lines).toEqual(["[vault] booting\n", "[vault] FATAL: boom\n"]);
+    expect(body.text).toBe("[vault] booting\n[vault] FATAL: boom\n");
+  });
+
+  test("?follow=1 streams the buffered replay first (text/plain)", async () => {
+    const { supervisor, emit } = makeEmittingSupervisor();
+    await supervisor.start({ short: "vault", cmd: ["parachute-vault", "serve"] });
+    emit("pre-connect line\n");
+    await new Promise((r) => setTimeout(r, 20));
+
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleLogs(
+      getReq("/api/modules/vault/logs?follow=1", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      logsDeps(supervisor),
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/plain");
+    // Read the first chunk — it must contain the replayed buffer line.
+    const reader = res.body!.getReader();
+    const { value } = await reader.read();
+    const text = new TextDecoder().decode(value);
+    expect(text).toContain("[vault] pre-connect line\n");
+    await reader.cancel();
   });
 });

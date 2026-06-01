@@ -29,7 +29,36 @@
  * services.json on boot).
  */
 
+import {
+  MissingDependencyError,
+  type MissingDependencyWire,
+  ensureExecutable,
+  rethrowIfMissing,
+} from "@openparachute/depcheck";
+import { type PortListeningFn, defaultPortListening } from "./port-probe.ts";
+
 export type ModuleStatus = "starting" | "running" | "stopped" | "crashed" | "restarting";
+
+/**
+ * Structured start-failure detail recorded onto `ModuleState` (§6.5). Mirrors
+ * depcheck's `MissingDependencyWire` for the missing-dependency case and the
+ * services.json-row `ServiceEntryStartError` shape `commands/lifecycle.ts`
+ * records, so `status` / the SPA keep the SAME friendly missing-dependency
+ * surface whether a module was started via the detached path or the
+ * supervisor. `error_type` is left open for a future non-dependency failure.
+ */
+export interface ModuleStartError {
+  readonly error_type: string;
+  readonly error_description: string;
+  /** Present for `error_type: "missing_dependency"`. */
+  readonly binary?: string;
+  readonly why?: string | null;
+  readonly docs_url?: string | null;
+  readonly install?: { darwin?: string; linux?: string; generic?: string };
+  readonly sysadmin_hint?: string;
+  /** ISO timestamp of when the failure was recorded. */
+  readonly at: string;
+}
 
 export interface ModuleState {
   /** Short name (vault / notes / scribe / …). */
@@ -46,6 +75,15 @@ export interface ModuleState {
   readonly lastCrashAt?: string;
   /** Exit code of the most recent crash. */
   readonly lastExitCode?: number | null;
+  /**
+   * Structured start-failure detail (§6.5). Set when a preflight
+   * `MissingDependencyError` aborts the spawn, OR when a spawned child stays
+   * alive but never binds its port within the readiness window
+   * (started-but-unbound, hub#487). Cleared on a clean, port-confirmed start.
+   * The `status` enum is intentionally NOT extended (proxy-state Mode-1 + the
+   * SPA read `running`); this field carries the friendly diagnostic instead.
+   */
+  readonly startError?: ModuleStartError;
 }
 
 export interface SpawnRequest {
@@ -98,9 +136,30 @@ export interface SupervisorOpts {
    */
   readonly output?: (line: string) => void;
   /**
+   * Cap, in bytes, of the per-module log ring buffer (§6.5). The supervisor
+   * keeps the most-recent ~`logBufferBytes` of each child's output so a
+   * `GET /api/modules/:short/logs` tap can replay the boot/crash lines that
+   * happened *before* the reader connected — the detached path got this for
+   * free via the per-service logfile; the supervisor streams-and-discards, so
+   * without a buffer the crash cause (the most important line) is lost. The
+   * oldest whole lines are dropped once the cap is exceeded. Default 64 KiB.
+   */
+  readonly logBufferBytes?: number;
+  /**
    * Test seam over `Bun.spawn`. Returns a Subprocess-shaped handle.
    */
   readonly spawnFn?: SpawnFn;
+  /**
+   * Group-aware kill seam (hub#88). Production sends the signal to the child's
+   * whole process group (`process.kill(-pid, signal)`) so wrapped startCmds
+   * like `pnpm exec tsx server.ts` reap the tsx grandchild — not just the
+   * wrapper that would otherwise leave the grandchild bound to the port →
+   * EADDRINUSE on restart. Pairs with `defaultSpawnFn`'s `detached: true`
+   * (each child is its own process-group leader, `pid === pgid`). Defaults to
+   * {@link defaultKillGroup}; tests inject a stub so they stay deterministic
+   * (no real signals) and can assert the negative pid (group send) was used.
+   */
+  readonly killFn?: KillFn;
   /**
    * Test seam over wall-clock. Production passes `Date.now`.
    */
@@ -110,6 +169,40 @@ export interface SupervisorOpts {
    * with `setTimeout`. Tests stub to advance time deterministically.
    */
   readonly sleep?: (ms: number) => Promise<void>;
+  /**
+   * Port-readiness probe (§6.5). After a child spawns, the supervisor polls
+   * this until the module's port (from `req.env.PORT`) binds, to catch the
+   * alive-but-never-bound shape (hub#487). Defaults to `defaultPortListening`
+   * (a loopback TCP connect). Tests inject a deterministic stub.
+   *
+   * Defaulting policy (mirrors `commands/lifecycle.ts`): the readiness gate is
+   * SKIPPED unless this is the production path (no `spawnFn` override) OR a
+   * test explicitly opts in by injecting `portListening` / `startReadyMs`.
+   * Without that guard, every existing stub-spawner test (fake procs that
+   * never bind a real port) would block the full readiness window.
+   */
+  readonly portListening?: PortListeningFn;
+  /**
+   * How long the post-spawn port-readiness gate polls before recording a
+   * `started-but-unbound` start-error, in ms. Default 4000 on the production
+   * path; 0 (skipped) on the stub-spawner test path unless `portListening` /
+   * `startReadyMs` is set explicitly.
+   */
+  readonly startReadyMs?: number;
+  /** Poll interval while waiting for the port to bind, in ms. Default 200. */
+  readonly startReadyPollMs?: number;
+  /**
+   * PATH-resolution seam for the pre-spawn `ensureExecutable` preflight
+   * (`@openparachute/depcheck`). Production uses the real `Bun.which`; a
+   * missing startCmd binary then aborts the spawn with a structured
+   * `MissingDependencyError` recorded onto `ModuleState.startError`.
+   *
+   * Defaulting policy mirrors the readiness gate: a stub `spawnFn` (test path)
+   * gets a permissive resolver so the preflight doesn't trip on binaries
+   * absent from the test host's PATH; production gets the real `Bun.which`.
+   * Tests exercising the missing-binary branch inject `which: () => null`.
+   */
+  readonly which?: (cmd: string) => string | null;
 }
 
 /**
@@ -118,6 +211,12 @@ export interface SupervisorOpts {
  * and pipe-able stdout/stderr.
  */
 export type SpawnFn = (req: SpawnRequest) => SupervisedProc;
+
+/**
+ * Group-aware kill seam. Sends `signal` to the process group rooted at `pid`.
+ * Production uses {@link defaultKillGroup}; tests inject a stub.
+ */
+export type KillFn = (pid: number, signal: NodeJS.Signals | number) => void;
 
 /**
  * The minimal Subprocess shape the supervisor depends on. Bun's real
@@ -135,6 +234,46 @@ const DEFAULT_MAX_RESTARTS = 3;
 const DEFAULT_RESTART_WINDOW_MS = 60_000;
 const DEFAULT_RESTART_DELAY_MS = 500;
 const DEFAULT_KILL_TIMEOUT_MS = 5_000;
+const DEFAULT_LOG_BUFFER_BYTES = 64 * 1024;
+const DEFAULT_START_READY_MS = 4_000;
+const DEFAULT_START_READY_POLL_MS = 200;
+
+/**
+ * Bounded, line-oriented ring buffer (§6.5). Holds the most-recent lines of a
+ * module's output up to `maxBytes`; pushing past the cap drops whole lines
+ * from the front (oldest-first) until it fits. Bounding by bytes (not line
+ * count) keeps a chatty module from pinning unbounded memory regardless of
+ * line length. Each pushed string is already a single prefixed line from
+ * `pumpLines` (it includes its trailing newline).
+ */
+export class LogRingBuffer {
+  private readonly lines: string[] = [];
+  private bytes = 0;
+
+  constructor(private readonly maxBytes: number) {}
+
+  push(line: string): void {
+    this.lines.push(line);
+    this.bytes += Buffer.byteLength(line);
+    // Drop oldest whole lines until we're back under the cap. A single line
+    // larger than the cap is kept (we never split a line) — the alternative
+    // (dropping it) would lose exactly the long stack-trace we most want.
+    while (this.bytes > this.maxBytes && this.lines.length > 1) {
+      const dropped = this.lines.shift();
+      if (dropped !== undefined) this.bytes -= Buffer.byteLength(dropped);
+    }
+  }
+
+  /** Snapshot of the buffered lines, oldest-first. */
+  snapshot(): string[] {
+    return [...this.lines];
+  }
+
+  /** Buffered lines joined into a single string (the wire/tail shape). */
+  text(): string {
+    return this.lines.join("");
+  }
+}
 
 /**
  * Per-module supervisor. Owns the spawn → watch → restart loop.
@@ -151,15 +290,30 @@ export class Supervisor {
   private readonly modules = new Map<string, ModuleEntry>();
 
   constructor(opts: SupervisorOpts = {}) {
+    // Defaulting policy for the port-readiness gate + preflight (§6.5),
+    // mirroring `commands/lifecycle.ts`: production (no `spawnFn` override) gets
+    // the real 4s readiness window + `Bun.which` preflight. The stub-spawner
+    // test path gets 0 (skipped) + a permissive `which` UNLESS a test opts in
+    // explicitly (injecting `portListening` / `startReadyMs` / `which`) — so
+    // existing fake-proc tests (which never bind a real port) don't block.
+    const isProductionPath = opts.spawnFn === undefined;
+    const readinessOptedIn = opts.portListening !== undefined || opts.startReadyMs !== undefined;
     this.opts = {
       maxRestarts: opts.maxRestarts ?? DEFAULT_MAX_RESTARTS,
       restartWindowMs: opts.restartWindowMs ?? DEFAULT_RESTART_WINDOW_MS,
       restartDelayMs: opts.restartDelayMs ?? DEFAULT_RESTART_DELAY_MS,
       killTimeoutMs: opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS,
       output: opts.output ?? ((line) => process.stdout.write(line)),
+      logBufferBytes: opts.logBufferBytes ?? DEFAULT_LOG_BUFFER_BYTES,
       spawnFn: opts.spawnFn ?? defaultSpawnFn,
+      killFn: opts.killFn ?? defaultKillGroup,
       now: opts.now ?? Date.now,
       sleep: opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
+      portListening: opts.portListening ?? defaultPortListening,
+      startReadyMs:
+        opts.startReadyMs ?? (isProductionPath || readinessOptedIn ? DEFAULT_START_READY_MS : 0),
+      startReadyPollMs: opts.startReadyPollMs ?? DEFAULT_START_READY_POLL_MS,
+      which: opts.which ?? (isProductionPath ? Bun.which : () => "/stub/bin/preflight-skipped"),
     };
   }
 
@@ -175,6 +329,9 @@ export class Supervisor {
       return existing.state;
     }
     // Crashed → operator intent is "try again." Wipe the budget.
+    // A fresh ring buffer per entry — `start` is a clean spawn (the crash-
+    // respawn path in `handleExit` reuses the existing entry + buffer, so a
+    // crashed module's boot/crash lines survive into the restart for replay).
     const entry: ModuleEntry = {
       req,
       state: {
@@ -183,10 +340,115 @@ export class Supervisor {
         restartsInWindow: 0,
       },
       crashStamps: [],
+      logs: new LogRingBuffer(this.opts.logBufferBytes),
     };
     this.modules.set(req.short, entry);
-    this.spawnAndWatch(entry);
+
+    // Pre-spawn preflight (§6.5): resolve the startCmd binary on PATH before
+    // spawning a doomed child. A missing binary records a structured
+    // `MissingDependencyError` onto state (the same friendly missing-dependency
+    // surface `commands/lifecycle.ts` records) and aborts — no spawn. Mirrors
+    // `lifecycle.start`'s `ensureExecutable` preflight.
+    const startBinary = req.cmd[0];
+    if (startBinary) {
+      try {
+        ensureExecutable(startBinary, { which: this.opts.which });
+      } catch (err) {
+        if (err instanceof MissingDependencyError) {
+          entry.state = {
+            ...entry.state,
+            status: "crashed",
+            pid: undefined,
+            startError: startErrorFromWire(err.toWire(), this.opts.now),
+          };
+          return entry.state;
+        }
+        throw err;
+      }
+    }
+
+    // Belt-and-suspenders for a spawn that slips past the preflight (binary
+    // removed between check + spawn, or a path that didn't preflight): a
+    // not-found spawn throw becomes the same structured MissingDependencyError
+    // recorded onto state, not a throw out of `start`. Mirrors
+    // `lifecycle.start`'s `rethrowIfMissing` catch.
+    try {
+      this.spawnAndWatch(entry);
+    } catch (err) {
+      if (startBinary) {
+        try {
+          rethrowIfMissing(err, startBinary);
+        } catch (missing) {
+          if (missing instanceof MissingDependencyError) {
+            entry.state = {
+              ...entry.state,
+              status: "crashed",
+              pid: undefined,
+              startError: startErrorFromWire(missing.toWire(), this.opts.now),
+            };
+            return entry.state;
+          }
+        }
+      }
+      throw err;
+    }
+
+    // Post-spawn port-readiness gate (§6.5, hub#487). A returned pid only
+    // proves the kernel forked the process; it says nothing about whether the
+    // module bound its port. Poll the port (from req.env.PORT) up to
+    // `startReadyMs`. On success: clear any prior startError. On timeout while
+    // the child is still alive: record a `started-but-unbound` structured
+    // start-error WITHOUT touching the `running` status enum (proxy-state
+    // Mode-1 + the SPA read `running`) — the friendly diagnostic rides the
+    // startError field. A child that died during the window is left to the
+    // crash watcher (`handleExit`), which owns the restart budget.
+    await this.awaitPortReadiness(entry);
     return entry.state;
+  }
+
+  /**
+   * Poll the module's port until it binds or `startReadyMs` elapses (§6.5).
+   * Skipped when the gate is disabled (stub-spawner test path) or the request
+   * carries no `PORT`. Records / clears `state.startError` accordingly; never
+   * mutates `state.status` (see `start`).
+   */
+  private async awaitPortReadiness(entry: ModuleEntry): Promise<void> {
+    if (this.opts.startReadyMs <= 0) return;
+    const portStr = entry.req.env?.PORT;
+    const port = portStr ? Number(portStr) : Number.NaN;
+    if (!Number.isFinite(port) || port <= 0) return; // No port to probe.
+
+    const deadline = this.opts.now() + this.opts.startReadyMs;
+    while (this.opts.now() < deadline) {
+      // The child may have crashed during the window — `handleExit` owns that
+      // (budget / restart). Stop probing; don't overwrite a crash with a
+      // port-readiness verdict.
+      if (entry.stopRequested || entry.state.status !== "running") return;
+      if (await this.opts.portListening(port)) {
+        // Bound → healthy. Clear any stale started-but-unbound error.
+        if (entry.state.startError) {
+          const { startError: _drop, ...rest } = entry.state;
+          entry.state = rest;
+        }
+        return;
+      }
+      await this.opts.sleep(this.opts.startReadyPollMs);
+    }
+
+    // Window elapsed, still alive but never bound — record the structured
+    // started-but-unbound error so `status` / the SPA show why, not a silently
+    // healthy `running`. Keep `running` (the process IS up); the diagnostic is
+    // the startError field.
+    if (entry.state.status === "running" && !entry.stopRequested) {
+      entry.state = {
+        ...entry.state,
+        startError: {
+          error_type: "started_but_unbound",
+          error_description: `${entry.req.short} started (pid ${entry.state.pid}) but is not listening on port ${port} after ${this.opts.startReadyMs}ms — it may still be coming up, or the port is held by another process.`,
+          at: new Date(this.opts.now()).toISOString(),
+        },
+      };
+    }
   }
 
   /**
@@ -216,7 +478,13 @@ export class Supervisor {
     const proc = entry.proc;
     if (proc) {
       try {
-        proc.kill("SIGTERM");
+        // Group-aware kill (hub#88): signal the child's whole process group
+        // via `killFn` (default `defaultKillGroup` → `process.kill(-pid)`) so
+        // a wrapped startCmd's grandchild is reaped too, not just the wrapper.
+        // Mirrors `commands/lifecycle.ts`'s `defaultKill` repointing of
+        // `defaultSpawner`'s detached children. Without it, the grandchild
+        // stays bound to the port → restart hits EADDRINUSE.
+        this.opts.killFn(proc.pid, "SIGTERM");
       } catch {
         // Process may already be dead — fall through.
       }
@@ -234,7 +502,9 @@ export class Supervisor {
             `[supervisor] ${entry.req.short} did not exit ${this.opts.killTimeoutMs}ms after SIGTERM — escalating to SIGKILL.\n`,
           );
           try {
-            proc.kill("SIGKILL");
+            // Group-aware SIGKILL escalation — same `killFn` seam as the
+            // SIGTERM above so the whole group is reaped, not just the leader.
+            this.opts.killFn(proc.pid, "SIGKILL");
           } catch {
             // Process may already be dead between the timeout firing
             // and us reaching kill() — fall through to the await.
@@ -287,13 +557,17 @@ export class Supervisor {
   private spawnAndWatch(entry: ModuleEntry): void {
     const proc = this.opts.spawnFn(entry.req);
     entry.proc = proc;
+    // Clear any stale startError from a prior attempt — a fresh running pid is
+    // the new ground truth; the readiness gate re-records if it still doesn't
+    // bind.
+    const { startError: _drop, ...prev } = entry.state;
     entry.state = {
-      ...entry.state,
+      ...prev,
       status: "running",
       pid: proc.pid,
       startedAt: new Date(this.opts.now()).toISOString(),
     };
-    this.pipeOutput(entry.req.short, proc);
+    this.pipeOutput(entry, proc);
     void proc.exited.then((exitCode) => this.handleExit(entry, exitCode));
   }
 
@@ -348,16 +622,34 @@ export class Supervisor {
   }
 
   /**
-   * Tap a child's stdout + stderr into the supervisor's `output`
-   * callback (hub's stdout by default), prefixing each line with the
-   * module's short name. Line-buffered: partial chunks accumulate
-   * until a newline arrives so multi-byte log lines don't get
-   * scrambled across modules.
+   * Recent buffered output for a supervised module (§6.5), oldest-first, each
+   * element a prefixed line. Returns `undefined` for a module that isn't
+   * supervised (no entry) so a `GET /api/modules/:short/logs` handler can
+   * distinguish "not supervised" (404) from "supervised but quiet" (empty
+   * array). Survives a crash-respawn (same entry/buffer), so the boot/crash
+   * lines that preceded the reader connecting are replayable — the whole point.
    */
-  private pipeOutput(short: string, proc: SupervisedProc): void {
-    const prefix = `[${short}] `;
-    if (proc.stdout) void pumpLines(proc.stdout, prefix, this.opts.output);
-    if (proc.stderr) void pumpLines(proc.stderr, prefix, this.opts.output);
+  logs(short: string): string[] | undefined {
+    return this.modules.get(short)?.logs.snapshot();
+  }
+
+  /**
+   * Tap a child's stdout + stderr into the supervisor's `output` callback
+   * (hub's stdout by default) AND the per-module ring buffer (§6.5),
+   * prefixing each line with the module's short name. Line-buffered: partial
+   * chunks accumulate until a newline arrives so multi-byte log lines don't
+   * get scrambled across modules. The buffer is fed the same prefixed lines
+   * the live stream gets, so a later `/logs` tap replays exactly what hub's
+   * stdout already showed.
+   */
+  private pipeOutput(entry: ModuleEntry, proc: SupervisedProc): void {
+    const prefix = `[${entry.req.short}] `;
+    const sink = (line: string): void => {
+      this.opts.output(line);
+      entry.logs.push(line);
+    };
+    if (proc.stdout) void pumpLines(proc.stdout, prefix, sink);
+    if (proc.stderr) void pumpLines(proc.stderr, prefix, sink);
   }
 }
 
@@ -367,6 +659,8 @@ interface ModuleEntry {
   proc?: SupervisedProc;
   crashStamps: number[];
   stopRequested?: boolean;
+  /** Bounded ring buffer of recent prefixed output lines (§6.5). */
+  logs: LogRingBuffer;
 }
 
 async function pumpLines(
@@ -402,7 +696,20 @@ async function pumpLines(
 
 const defaultSpawnFn: SpawnFn = (req) => {
   const spawnOpts: Parameters<typeof Bun.spawn>[1] = {
+    // Keep stdout/stderr explicitly piped — the supervisor pumps child output
+    // into hub's log (`pipeOutput`/`pumpLines`) + the per-module ring buffer.
+    // `detached: true` does NOT detach explicitly-piped stdio, so these stay
+    // wired even though the child gets its own process group below.
     stdio: ["ignore", "pipe", "pipe"],
+    // Spawn in a fresh process group (pid == pgid) so `killFn` (→
+    // `process.kill(-pid, sig)`) reaches every descendant, not just the
+    // wrapper. Without this, wrapped startCmds like `pnpm exec tsx server.ts`
+    // leave the tsx grandchild bound to the port after stop → restart hits
+    // EADDRINUSE (hub#88). Mirrors `commands/lifecycle.ts`'s `defaultSpawner`,
+    // which set `detached: true` for exactly this reason. We do NOT `unref()`:
+    // the supervisor must stay attached for the lifecycle (watch `exited`,
+    // pump output, reap on stop).
+    detached: true,
     // Inherit env so supervised module sees PATH, HOME, PARACHUTE_HOME, etc.
     // Bun.spawn defaults to empty env — see api-modules-ops.ts:defaultRun.
     // Per-call `req.env` overrides merge on top below.
@@ -412,4 +719,43 @@ const defaultSpawnFn: SpawnFn = (req) => {
   if (req.env) spawnOpts.env = { ...process.env, ...req.env };
   const proc = Bun.spawn([...req.cmd], spawnOpts);
   return proc as unknown as SupervisedProc;
+};
+
+/**
+ * Map a depcheck `MissingDependencyWire` onto the `ModuleStartError` shape
+ * recorded on `ModuleState` (§6.5), stamping `at`. The wire's field names
+ * already match (binary / why / docs_url / install / sysadmin_hint), so this
+ * is a stamp + passthrough — keeping the supervisor's start-error surface
+ * identical to the services.json `ServiceEntryStartError` the detached path
+ * records, so the SPA renders the same install card from either source.
+ */
+function startErrorFromWire(wire: MissingDependencyWire, now: () => number): ModuleStartError {
+  return {
+    error_type: wire.error_type,
+    error_description: wire.error_description,
+    binary: wire.binary,
+    why: wire.why,
+    docs_url: wire.docs_url,
+    install: wire.install,
+    sysadmin_hint: wire.sysadmin_hint,
+    at: new Date(now()).toISOString(),
+  };
+}
+
+/**
+ * Production group-aware kill (hub#88). Sends `signal` to the entire process
+ * group rooted at `pid` (the negative-pid syscall) so a wrapped startCmd's
+ * grandchildren are reaped alongside the wrapper. Mirrors
+ * `commands/lifecycle.ts`'s `defaultKill`: on ESRCH the group is already gone
+ * (or the child predates the detached-spawn change and has no group with that
+ * pgid) — fall back to a bare-pid signal so the caller's intent still lands
+ * when there's a positive-pid process to receive it.
+ */
+export const defaultKillGroup: KillFn = (pid, signal) => {
+  try {
+    process.kill(-pid, signal);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+    process.kill(pid, signal);
+  }
 };
