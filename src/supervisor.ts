@@ -98,6 +98,16 @@ export interface SupervisorOpts {
    */
   readonly output?: (line: string) => void;
   /**
+   * Cap, in bytes, of the per-module log ring buffer (§6.5). The supervisor
+   * keeps the most-recent ~`logBufferBytes` of each child's output so a
+   * `GET /api/modules/:short/logs` tap can replay the boot/crash lines that
+   * happened *before* the reader connected — the detached path got this for
+   * free via the per-service logfile; the supervisor streams-and-discards, so
+   * without a buffer the crash cause (the most important line) is lost. The
+   * oldest whole lines are dropped once the cap is exceeded. Default 64 KiB.
+   */
+  readonly logBufferBytes?: number;
+  /**
    * Test seam over `Bun.spawn`. Returns a Subprocess-shaped handle.
    */
   readonly spawnFn?: SpawnFn;
@@ -152,6 +162,44 @@ const DEFAULT_MAX_RESTARTS = 3;
 const DEFAULT_RESTART_WINDOW_MS = 60_000;
 const DEFAULT_RESTART_DELAY_MS = 500;
 const DEFAULT_KILL_TIMEOUT_MS = 5_000;
+const DEFAULT_LOG_BUFFER_BYTES = 64 * 1024;
+
+/**
+ * Bounded, line-oriented ring buffer (§6.5). Holds the most-recent lines of a
+ * module's output up to `maxBytes`; pushing past the cap drops whole lines
+ * from the front (oldest-first) until it fits. Bounding by bytes (not line
+ * count) keeps a chatty module from pinning unbounded memory regardless of
+ * line length. Each pushed string is already a single prefixed line from
+ * `pumpLines` (it includes its trailing newline).
+ */
+export class LogRingBuffer {
+  private readonly lines: string[] = [];
+  private bytes = 0;
+
+  constructor(private readonly maxBytes: number) {}
+
+  push(line: string): void {
+    this.lines.push(line);
+    this.bytes += Buffer.byteLength(line);
+    // Drop oldest whole lines until we're back under the cap. A single line
+    // larger than the cap is kept (we never split a line) — the alternative
+    // (dropping it) would lose exactly the long stack-trace we most want.
+    while (this.bytes > this.maxBytes && this.lines.length > 1) {
+      const dropped = this.lines.shift();
+      if (dropped !== undefined) this.bytes -= Buffer.byteLength(dropped);
+    }
+  }
+
+  /** Snapshot of the buffered lines, oldest-first. */
+  snapshot(): string[] {
+    return [...this.lines];
+  }
+
+  /** Buffered lines joined into a single string (the wire/tail shape). */
+  text(): string {
+    return this.lines.join("");
+  }
+}
 
 /**
  * Per-module supervisor. Owns the spawn → watch → restart loop.
@@ -174,6 +222,7 @@ export class Supervisor {
       restartDelayMs: opts.restartDelayMs ?? DEFAULT_RESTART_DELAY_MS,
       killTimeoutMs: opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS,
       output: opts.output ?? ((line) => process.stdout.write(line)),
+      logBufferBytes: opts.logBufferBytes ?? DEFAULT_LOG_BUFFER_BYTES,
       spawnFn: opts.spawnFn ?? defaultSpawnFn,
       killFn: opts.killFn ?? defaultKillGroup,
       now: opts.now ?? Date.now,
@@ -193,6 +242,9 @@ export class Supervisor {
       return existing.state;
     }
     // Crashed → operator intent is "try again." Wipe the budget.
+    // A fresh ring buffer per entry — `start` is a clean spawn (the crash-
+    // respawn path in `handleExit` reuses the existing entry + buffer, so a
+    // crashed module's boot/crash lines survive into the restart for replay).
     const entry: ModuleEntry = {
       req,
       state: {
@@ -201,6 +253,7 @@ export class Supervisor {
         restartsInWindow: 0,
       },
       crashStamps: [],
+      logs: new LogRingBuffer(this.opts.logBufferBytes),
     };
     this.modules.set(req.short, entry);
     this.spawnAndWatch(entry);
@@ -319,7 +372,7 @@ export class Supervisor {
       pid: proc.pid,
       startedAt: new Date(this.opts.now()).toISOString(),
     };
-    this.pipeOutput(entry.req.short, proc);
+    this.pipeOutput(entry, proc);
     void proc.exited.then((exitCode) => this.handleExit(entry, exitCode));
   }
 
@@ -374,16 +427,34 @@ export class Supervisor {
   }
 
   /**
-   * Tap a child's stdout + stderr into the supervisor's `output`
-   * callback (hub's stdout by default), prefixing each line with the
-   * module's short name. Line-buffered: partial chunks accumulate
-   * until a newline arrives so multi-byte log lines don't get
-   * scrambled across modules.
+   * Recent buffered output for a supervised module (§6.5), oldest-first, each
+   * element a prefixed line. Returns `undefined` for a module that isn't
+   * supervised (no entry) so a `GET /api/modules/:short/logs` handler can
+   * distinguish "not supervised" (404) from "supervised but quiet" (empty
+   * array). Survives a crash-respawn (same entry/buffer), so the boot/crash
+   * lines that preceded the reader connecting are replayable — the whole point.
    */
-  private pipeOutput(short: string, proc: SupervisedProc): void {
-    const prefix = `[${short}] `;
-    if (proc.stdout) void pumpLines(proc.stdout, prefix, this.opts.output);
-    if (proc.stderr) void pumpLines(proc.stderr, prefix, this.opts.output);
+  logs(short: string): string[] | undefined {
+    return this.modules.get(short)?.logs.snapshot();
+  }
+
+  /**
+   * Tap a child's stdout + stderr into the supervisor's `output` callback
+   * (hub's stdout by default) AND the per-module ring buffer (§6.5),
+   * prefixing each line with the module's short name. Line-buffered: partial
+   * chunks accumulate until a newline arrives so multi-byte log lines don't
+   * get scrambled across modules. The buffer is fed the same prefixed lines
+   * the live stream gets, so a later `/logs` tap replays exactly what hub's
+   * stdout already showed.
+   */
+  private pipeOutput(entry: ModuleEntry, proc: SupervisedProc): void {
+    const prefix = `[${entry.req.short}] `;
+    const sink = (line: string): void => {
+      this.opts.output(line);
+      entry.logs.push(line);
+    };
+    if (proc.stdout) void pumpLines(proc.stdout, prefix, sink);
+    if (proc.stderr) void pumpLines(proc.stderr, prefix, sink);
   }
 }
 
@@ -393,6 +464,8 @@ interface ModuleEntry {
   proc?: SupervisedProc;
   crashStamps: number[];
   stopRequested?: boolean;
+  /** Bounded ring buffer of recent prefixed output lines (§6.5). */
+  logs: LogRingBuffer;
 }
 
 async function pumpLines(

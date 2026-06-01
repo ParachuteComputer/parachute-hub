@@ -857,6 +857,109 @@ export async function handleRestart(
 }
 
 /**
+ * GET /api/modules/:short/logs — synchronous.
+ *
+ * Serves the supervisor's bounded per-module ring buffer (§6.5): the most
+ * recent output the child wrote, INCLUDING the boot/crash lines that happened
+ * before the caller connected — which a naive connect-time SSE tap would lose
+ * (and which are "likely the most important one — the exit cause"). This is
+ * the §6 endpoint Phase 3 will repoint `parachute logs <svc>` onto.
+ *
+ * Returns the buffer as both a joined `text` blob and a `lines` array (the CLI
+ * tail wants the blob; a structured consumer wants lines). A module that isn't
+ * supervised returns 404 `not_supervised`, matching the `restart` handler's
+ * error contract for the same state — the caller can fall through to `start`.
+ *
+ * `?follow=1` is accepted as a best-effort streaming tap: we replay the buffer
+ * first (the must-have), then stream subsequent lines as `text/plain` chunks.
+ * The buffer replay is what captures the crash cause; the follow tail is the
+ * nice-to-have. Without `follow`, it's a one-shot JSON snapshot.
+ */
+export async function handleLogs(
+  req: Request,
+  short: CuratedModuleShort,
+  deps: ApiModulesOpsDeps,
+): Promise<Response> {
+  if (req.method !== "GET") return jsonError(405, "method_not_allowed", "use GET");
+  const authFail = await authorize(req, deps);
+  if (authFail) return authFail;
+
+  const lines = deps.supervisor.logs(short);
+  if (lines === undefined) {
+    // Same shape + status as `restart` for a not-supervised module, so the
+    // CLI client can treat both identically (fall through to `start`).
+    return jsonError(
+      404,
+      "not_supervised",
+      `${short} is not currently supervised — install or start it first`,
+    );
+  }
+
+  const follow = new URL(req.url).searchParams.get("follow");
+  if (follow === "1" || follow === "true") {
+    return streamModuleLogs(short, lines, deps);
+  }
+
+  // One-shot snapshot: the buffered lines as both a joined blob + the array.
+  return jsonOk({ short, lines, text: lines.join("") });
+}
+
+/**
+ * Best-effort follow stream (§6.5 nice-to-have). Replays the buffered lines
+ * (the must-have — captures the boot/crash cause) then forwards subsequent
+ * output as `text/plain` chunks by subscribing to a tee of the supervisor's
+ * live tap. The buffer replay is guaranteed; the live tail is opportunistic
+ * (it ends when the client disconnects or the module stops). Implemented via
+ * a polling diff of the ring buffer so it stays decoupled from `pumpLines`'
+ * internal sink and needs no new supervisor wiring.
+ */
+function streamModuleLogs(
+  short: CuratedModuleShort,
+  initial: string[],
+  deps: ApiModulesOpsDeps,
+): Response {
+  const encoder = new TextEncoder();
+  let lastLen = initial.length;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      // Replay the buffered lines first — the boot/crash cause.
+      for (const line of initial) controller.enqueue(encoder.encode(line));
+      timer = setInterval(() => {
+        const current = deps.supervisor.logs(short);
+        if (current === undefined) {
+          // Module went away (uninstalled / never-supervised) — end the stream.
+          if (timer) clearInterval(timer);
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
+          return;
+        }
+        // The ring buffer may have dropped old lines off the front; only
+        // forward genuinely-new tail lines. If the buffer shrank below our
+        // cursor (eviction), reset to its current length to avoid replaying.
+        if (current.length < lastLen) lastLen = current.length;
+        for (let i = lastLen; i < current.length; i++) {
+          const line = current[i];
+          if (line !== undefined) controller.enqueue(encoder.encode(line));
+        }
+        lastLen = current.length;
+      }, 500);
+    },
+    cancel() {
+      // Stop polling when the consumer disconnects.
+      if (timer) clearInterval(timer);
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+/**
  * POST /api/modules/:short/upgrade — async.
  *
  * Runs `bun add -g @openparachute/<svc>@latest` then restarts the

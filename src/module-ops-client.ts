@@ -234,6 +234,56 @@ async function pollOperation(
   }
 }
 
+/** Terminal shape returned by {@link fetchModuleLogs}. */
+export interface ModuleLogsResult {
+  /** The short name the logs belong to. */
+  readonly short: string;
+  /** Buffered lines, oldest-first (each includes its trailing newline). */
+  readonly lines: string[];
+  /** The same lines joined — the tail-blob shape `parachute logs` will print. */
+  readonly text: string;
+}
+
+/**
+ * Read a supervised module's recent output from the hub's per-module ring
+ * buffer (`GET /api/modules/:short/logs`, §6.5). Additive — this does NOT wire
+ * into the `parachute logs` CLI command (that cutover is Phase 3); it's the
+ * transport+credential seam Phase 3 will call.
+ *
+ * Reuses the same operator.token→Bearer path as {@link driveModuleOp} (read,
+ * never mint). The buffer replay includes the boot/crash lines that preceded
+ * the call — the must-have that a connect-time stream would miss.
+ *
+ * Throws:
+ *   - {@link NoOperatorTokenError} — no operator.token on disk.
+ *   - {@link OperatorTokenExpiredError} — token fully expired (actionable msg).
+ *   - {@link ModuleOpHttpError} — hub answered non-2xx (e.g. `not_supervised`).
+ */
+export async function fetchModuleLogs(
+  short: string,
+  deps: DriveModuleOpDeps,
+): Promise<ModuleLogsResult> {
+  const doFetch = deps.fetch ?? fetch;
+  const baseUrl = (deps.baseUrl ?? DEFAULT_HUB_BASE_URL).replace(/\/+$/, "");
+  const bearer = await resolveOperatorBearer(deps);
+
+  const res = await doFetch(`${baseUrl}/api/modules/${short}/logs`, {
+    method: "GET",
+    headers: { authorization: `Bearer ${bearer}` },
+  });
+  const body = await parseJsonSafe(res);
+  if (res.status < 200 || res.status >= 300) {
+    const { error, error_description } = asErrorBody(body);
+    throw new ModuleOpHttpError(res.status, error, error_description);
+  }
+  const b = (body ?? {}) as { lines?: unknown; text?: unknown };
+  const lines = Array.isArray(b.lines)
+    ? b.lines.filter((l): l is string => typeof l === "string")
+    : [];
+  const text = typeof b.text === "string" ? b.text : lines.join("");
+  return { short, lines, text };
+}
+
 async function parseJsonSafe(res: Response): Promise<unknown> {
   try {
     return await res.json();

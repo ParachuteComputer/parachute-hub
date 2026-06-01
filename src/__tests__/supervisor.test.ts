@@ -682,6 +682,96 @@ describe("Supervisor output multiplexing", () => {
   });
 });
 
+describe("Supervisor per-module log ring buffer (§6.5)", () => {
+  test("replays output emitted BEFORE the reader connects (boot/crash-line capture)", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({ spawnFn: spawner.spawn, killFn: noopKill });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    // Lines arrive (incl. a "crash cause") BEFORE anyone taps the logs.
+    proc.emitStdout("booting vault\n");
+    proc.emitStderr("FATAL: port already in use\n");
+    await tick(20);
+
+    // Reader connects AFTER the fact — the buffer must still have them.
+    const logs = sup.logs("vault");
+    expect(logs).toEqual(["[vault] booting vault\n", "[vault] FATAL: port already in use\n"]);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("buffer is bounded — oldest lines drop once the byte cap is exceeded", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    // Tiny cap so a handful of lines overflows it. Each prefixed line below is
+    // well over a few bytes, so the cap evicts oldest-first.
+    const sup = new Supervisor({ spawnFn: spawner.spawn, killFn: noopKill, logBufferBytes: 40 });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    proc.emitStdout("line-1\n");
+    proc.emitStdout("line-2\n");
+    proc.emitStdout("line-3\n");
+    proc.emitStdout("line-4\n");
+    await tick(20);
+
+    const logs = sup.logs("vault") ?? [];
+    // The oldest line(s) were evicted; the newest survives.
+    expect(logs.at(-1)).toBe("[vault] line-4\n");
+    expect(logs).not.toContain("[vault] line-1\n");
+    // Total buffered bytes stay at/under the cap (modulo the always-kept tail).
+    const totalBytes = logs.reduce((n, l) => n + Buffer.byteLength(l), 0);
+    expect(totalBytes).toBeLessThanOrEqual(40);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("logs() returns undefined for a not-supervised module (404 contract)", () => {
+    const sup = new Supervisor({ spawnFn: () => makeFakeProc(0), killFn: noopKill });
+    expect(sup.logs("nope")).toBeUndefined();
+  });
+
+  test("buffer survives a crash-respawn so the crash cause stays replayable", async () => {
+    const first = makeFakeProc(101);
+    const second = makeFakeProc(102);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    first.emitStderr("crash cause: boom\n");
+    await tick(20);
+    // Crash → supervisor respawns within budget (reuses the same entry/buffer).
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    second.emitStdout("recovered\n");
+    await tick(20);
+
+    const logs = sup.logs("vault") ?? [];
+    // Both the pre-crash cause and the post-respawn line are present.
+    expect(logs).toContain("[vault] crash cause: boom\n");
+    expect(logs).toContain("[vault] recovered\n");
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+});
+
 describe("Supervisor.list + get", () => {
   test("list returns snapshot of all supervised modules", async () => {
     const vault = makeFakeProc(101);

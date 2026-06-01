@@ -9,6 +9,7 @@ import {
   ModuleOpHttpError,
   NoOperatorTokenError,
   driveModuleOp,
+  fetchModuleLogs,
   resolveOperatorBearer,
 } from "../module-ops-client.ts";
 import { issueOperatorToken } from "../operator-token.ts";
@@ -327,5 +328,86 @@ describe("driveModuleOp — async operation polling", () => {
     });
     expect(calls[0]?.headers["content-type"]).toBe("application/json");
     expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({ channel: "rc" });
+  });
+});
+
+describe("fetchModuleLogs", () => {
+  let h: Harness;
+  afterEach(() => h.cleanup());
+
+  test("GETs the /logs endpoint with the operator bearer and returns lines + text", async () => {
+    h = await makeHarnessWithToken();
+    const { fetch: f, calls } = fakeFetch([
+      {
+        status: 200,
+        body: {
+          short: "vault",
+          lines: ["[vault] booting\n", "[vault] ready\n"],
+          text: "[vault] booting\n[vault] ready\n",
+        },
+      },
+    ]);
+    const result = await fetchModuleLogs("vault", {
+      db: h.db,
+      issuer: ISSUER,
+      configDir: h.dir,
+      fetch: f,
+    });
+
+    // Hit the right URL with a GET + Bearer.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe(`${DEFAULT_HUB_BASE_URL}/api/modules/vault/logs`);
+    expect(calls[0]?.method).toBe("GET");
+    expect(calls[0]?.headers.authorization).toMatch(/^Bearer /);
+
+    expect(result.short).toBe("vault");
+    expect(result.lines).toEqual(["[vault] booting\n", "[vault] ready\n"]);
+    expect(result.text).toBe("[vault] booting\n[vault] ready\n");
+  });
+
+  test("no operator token → NoOperatorTokenError before any fetch", async () => {
+    h = await makeHarnessNoToken();
+    const { fetch: f, calls } = fakeFetch([{ status: 200, body: { lines: [] } }]);
+    let err: unknown;
+    try {
+      await fetchModuleLogs("vault", { db: h.db, issuer: ISSUER, configDir: h.dir, fetch: f });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(NoOperatorTokenError);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("non-2xx (not_supervised) → ModuleOpHttpError carrying status + code", async () => {
+    h = await makeHarnessWithToken();
+    const { fetch: f } = fakeFetch([
+      {
+        status: 404,
+        body: { error: "not_supervised", error_description: "vault is not currently supervised" },
+      },
+    ]);
+    let err: unknown;
+    try {
+      await fetchModuleLogs("vault", { db: h.db, issuer: ISSUER, configDir: h.dir, fetch: f });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ModuleOpHttpError);
+    expect((err as ModuleOpHttpError).status).toBe(404);
+    expect((err as ModuleOpHttpError).code).toBe("not_supervised");
+  });
+
+  test("falls back to joining lines when the body omits text", async () => {
+    h = await makeHarnessWithToken();
+    const { fetch: f } = fakeFetch([
+      { status: 200, body: { short: "scribe", lines: ["a\n", "b\n"] } },
+    ]);
+    const result = await fetchModuleLogs("scribe", {
+      db: h.db,
+      issuer: ISSUER,
+      configDir: h.dir,
+      fetch: f,
+    });
+    expect(result.text).toBe("a\nb\n");
   });
 });

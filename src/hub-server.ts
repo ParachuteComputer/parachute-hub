@@ -143,6 +143,7 @@ import { handleApiModulesConfig, parseModulesConfigPath } from "./api-modules-co
 import {
   getDefaultOperationsRegistry,
   handleInstall,
+  handleLogs,
   handleOperationGet,
   handleRestart,
   handleStart,
@@ -1875,6 +1876,8 @@ export function hubFetch(
           return handleStop(req, match.short, opsDeps);
         case "restart":
           return handleRestart(req, match.short, opsDeps);
+        case "logs":
+          return handleLogs(req, match.short, opsDeps);
         case "upgrade":
           return handleUpgrade(req, match.short, opsDeps);
         case "uninstall":
