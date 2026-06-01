@@ -795,7 +795,7 @@ export async function handleStart(
     ...(deps.spawnEnv ? { extraEnv: deps.spawnEnv } : {}),
   });
 
-  const state = await deps.supervisor.start(spawnReq as SpawnRequest);
+  const state = await deps.supervisor.start(spawnReq);
   return jsonOk({ short, state });
 }
 
@@ -940,6 +940,9 @@ function streamModuleLogs(
         // The ring buffer may have dropped old lines off the front; only
         // forward genuinely-new tail lines. If the buffer shrank below our
         // cursor (eviction), reset to its current length to avoid replaying.
+        // Limitation: new lines written during a heavy eviction burst (a chatty
+        // module overflowing the 64KiB cap between two polls) may be skipped in
+        // the live tail — use the one-shot snapshot (no ?follow) for crash investigation.
         if (current.length < lastLen) lastLen = current.length;
         for (let i = lastLen; i < current.length; i++) {
           const line = current[i];

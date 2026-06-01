@@ -722,15 +722,6 @@ const defaultSpawnFn: SpawnFn = (req) => {
 };
 
 /**
- * Production group-aware kill (hub#88). Sends `signal` to the entire process
- * group rooted at `pid` (the negative-pid syscall) so a wrapped startCmd's
- * grandchildren are reaped alongside the wrapper. Mirrors
- * `commands/lifecycle.ts`'s `defaultKill`: on ESRCH the group is already gone
- * (or the child predates the detached-spawn change and has no group with that
- * pgid) — fall back to a bare-pid signal so the caller's intent still lands
- * when there's a positive-pid process to receive it.
- */
-/**
  * Map a depcheck `MissingDependencyWire` onto the `ModuleStartError` shape
  * recorded on `ModuleState` (§6.5), stamping `at`. The wire's field names
  * already match (binary / why / docs_url / install / sysadmin_hint), so this
@@ -751,6 +742,15 @@ function startErrorFromWire(wire: MissingDependencyWire, now: () => number): Mod
   };
 }
 
+/**
+ * Production group-aware kill (hub#88). Sends `signal` to the entire process
+ * group rooted at `pid` (the negative-pid syscall) so a wrapped startCmd's
+ * grandchildren are reaped alongside the wrapper. Mirrors
+ * `commands/lifecycle.ts`'s `defaultKill`: on ESRCH the group is already gone
+ * (or the child predates the detached-spawn change and has no group with that
+ * pgid) — fall back to a bare-pid signal so the caller's intent still lands
+ * when there's a positive-pid process to receive it.
+ */
 export const defaultKillGroup: KillFn = (pid, signal) => {
   try {
     process.kill(-pid, signal);

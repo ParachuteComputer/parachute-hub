@@ -157,6 +157,13 @@ export async function bootSupervisedModules(
       ...(opts.hubOrigin !== undefined ? { hubOrigin: opts.hubOrigin } : {}),
     });
 
+    // Serial await, not Promise.all: `supervisor.start` now carries a bounded
+    // post-spawn port-readiness gate (DEFAULT_START_READY_MS), so boot latency
+    // is the SUM of each slow-binding module's gate wait before `Bun.serve`
+    // comes up. Intentional — sequential boot keeps the start-error/install-card
+    // surface ordered and avoids a thundering-herd of port probes. Don't switch
+    // to `Promise.all` without accounting for the gate (it'd overlap the waits
+    // but also fire N concurrent readiness probes mid-boot).
     await supervisor.start(req);
     log(`[supervisor] ${short}: started (cmd=${cmd.join(" ")}).`);
     results.push({ short, entryName: entry.name, status: "started" });
