@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type LifecycleOpts,
   defaultAlive,
   defaultKill,
   defaultSpawner,
@@ -14,7 +15,14 @@ import {
 import { readEnvFileValues } from "../env-file.ts";
 import { writeHubPort } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import type { HubUnitManagerOpResult } from "../hub-unit.ts";
 import { validateAccessToken } from "../jwt-sign.ts";
+import {
+  type ModuleOp,
+  ModuleOpHttpError,
+  type ModuleOpResult,
+  NoOperatorTokenError,
+} from "../module-ops-client.ts";
 import {
   OPERATOR_TOKEN_SCOPE_SET_CLAIM,
   issueOperatorToken,
@@ -1857,6 +1865,421 @@ describe("parachute start|stop|restart hub", () => {
       });
       expect(code).toBe(0);
       expect(log).toEqual(["hub line one", "hub line two"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3b dual-dispatch (design §3.3): when a hub UNIT is installed, the verbs
+// drive the running supervisor / platform manager; when no unit is installed,
+// the existing detached arm is taken UNCHANGED. These suites exercise both arms
+// via injected `supervisor` seams (unit arm) and a stub spawner (detached arm).
+// ---------------------------------------------------------------------------
+
+interface SupervisorStub {
+  opts: NonNullable<LifecycleOpts["supervisor"]>;
+  driveCalls: Array<{ short: string; op: ModuleOp }>;
+  ensureCalls: Array<{ port?: number }>;
+  stopHubCalls: number;
+  restartHubCalls: number;
+  healthProbes: number;
+}
+
+/**
+ * Build a `supervisor` seam that forces the unit-installed arm and records the
+ * supervisor / manager calls. `driveResponder` lets a test return a result or
+ * throw a module-ops error per (short, op). The default responder returns a
+ * benign sync-op result. `health` controls `probeHubHealth`.
+ */
+function makeSupervisorStub(opts?: {
+  health?: boolean;
+  ensureOutcome?: "already-up" | "started" | "no-unit" | "no-manager" | "timeout" | "start-failed";
+  ensureMessages?: string[];
+  driveResponder?: (short: string, op: ModuleOp) => ModuleOpResult | Promise<ModuleOpResult>;
+  stopHubResult?: HubUnitManagerOpResult;
+  restartHubResult?: HubUnitManagerOpResult;
+}): SupervisorStub {
+  const driveCalls: Array<{ short: string; op: ModuleOp }> = [];
+  const ensureCalls: Array<{ port?: number }> = [];
+  const stub: SupervisorStub = {
+    driveCalls,
+    ensureCalls,
+    stopHubCalls: 0,
+    restartHubCalls: 0,
+    healthProbes: 0,
+    opts: {
+      unitInstalled: true,
+      // openDb is never exercised by the stub driveModuleOp, but the dispatch
+      // opens+closes it around the call — hand back a no-op closer.
+      openDb: () => ({ close() {} }) as unknown as import("bun:sqlite").Database,
+      driveModuleOp: async (short, op) => {
+        driveCalls.push({ short, op });
+        if (opts?.driveResponder) return await opts.driveResponder(short, op);
+        return { status: 200, body: { short, state: { status: "running" } } };
+      },
+      ensureHubUnit: async (o) => {
+        ensureCalls.push({ port: o.port });
+        return {
+          outcome: opts?.ensureOutcome ?? "already-up",
+          port: o.port ?? 1939,
+          messages: opts?.ensureMessages ?? [],
+        };
+      },
+      stopHubUnit: () => {
+        stub.stopHubCalls++;
+        return opts?.stopHubResult ?? { outcome: "ok", messages: [] };
+      },
+      restartHubUnit: () => {
+        stub.restartHubCalls++;
+        return opts?.restartHubResult ?? { outcome: "ok", messages: [] };
+      },
+      probeHubHealth: async () => {
+        stub.healthProbes++;
+        return opts?.health ?? true;
+      },
+    },
+  };
+  return stub;
+}
+
+describe("Phase 3b dual-dispatch — start", () => {
+  test("module svc, unit-installed → ensureHubUnit then driveModuleOp(start)", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub();
+      const log: string[] = [];
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(0);
+      expect(sup.ensureCalls).toHaveLength(1);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "start" }]);
+      expect(log.join("\n")).toMatch(/✓ vault started/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("no svc, unit-installed → ensureHubUnit only (boots all modules), no driveModuleOp", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub();
+      const code = await start(undefined, {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(0);
+      expect(sup.ensureCalls).toHaveLength(1);
+      expect(sup.driveCalls).toHaveLength(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("module svc, NO unit → existing detached spawner path (unchanged)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const spawner = makeSpawner([4242]);
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        log: () => {},
+        // supervisor omitted → detached arm, deterministically.
+      });
+      expect(code).toBe(0);
+      expect(spawner.calls).toHaveLength(1);
+      expect(spawner.calls[0]?.cmd).toEqual(["parachute-vault", "serve"]);
+      expect(readPid("vault", h.configDir)).toBe(4242);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("module svc, NoOperatorTokenError → actionable message surfaced (not raw-thrown)", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub({
+        driveResponder: () => {
+          throw new NoOperatorTokenError();
+        },
+      });
+      const log: string[] = [];
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(1);
+      expect(log.join("\n")).toMatch(/no operator token/);
+      expect(log.join("\n")).toMatch(/parachute auth rotate-operator/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("module svc, 400 not_installed → actionable install hint", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub({
+        driveResponder: () => {
+          throw new ModuleOpHttpError(400, "not_installed", "vault is not installed");
+        },
+      });
+      const log: string[] = [];
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(1);
+      expect(log.join("\n")).toMatch(/not installed/);
+      expect(log.join("\n")).toMatch(/parachute install vault/);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("Phase 3b dual-dispatch — stop", () => {
+  test("module svc, hub UP → driveModuleOp(stop), no ensureHubUnit", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub({ health: true });
+      const log: string[] = [];
+      const code = await stop("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(0);
+      expect(sup.healthProbes).toBe(1);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "stop" }]);
+      expect(sup.ensureCalls).toHaveLength(0); // never start the hub just to stop a module
+      expect(log.join("\n")).toMatch(/✓ vault stopped/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("module svc, hub DOWN → success WITHOUT starting the hub or driving stop", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub({ health: false });
+      const log: string[] = [];
+      const code = await stop("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(0);
+      expect(sup.healthProbes).toBe(1);
+      expect(sup.driveCalls).toHaveLength(0); // nothing to stop — module already down
+      expect(sup.ensureCalls).toHaveLength(0); // did NOT ensureHubUnit
+      expect(log.join("\n")).toMatch(/already stopped/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("stop hub → platform manager (stopHubUnit), never a PID signal", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub();
+      // A kill seam that fails the test if ANY PID signal is sent.
+      const kill = () => {
+        throw new Error("stop hub must NOT signal a PID — it must go through the manager");
+      };
+      const log: string[] = [];
+      const code = await stop("hub", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        kill,
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(0);
+      expect(sup.stopHubCalls).toBe(1);
+      expect(sup.healthProbes).toBe(0);
+      expect(log.join("\n")).toMatch(/✓ hub stopped/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("no svc, unit-installed → stop the hub unit (manager)", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub();
+      const code = await stop(undefined, {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(0);
+      expect(sup.stopHubCalls).toBe(1);
+      expect(sup.driveCalls).toHaveLength(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("module svc, NO unit → existing detached stop path (unchanged)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writePid("vault", 4242, h.configDir);
+      const killed: Array<{ pid: number; sig: NodeJS.Signals | number }> = [];
+      const code = await stop("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        kill: (pid, sig) => killed.push({ pid, sig }),
+        alive: (() => {
+          let n = 0;
+          return () => n++ < 1; // alive once (for the SIGTERM), then dead.
+        })(),
+        log: () => {},
+        // supervisor omitted → detached arm.
+      });
+      expect(code).toBe(0);
+      expect(killed[0]).toEqual({ pid: 4242, sig: "SIGTERM" });
+      expect(readPid("vault", h.configDir)).toBeUndefined();
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("Phase 3b dual-dispatch — restart", () => {
+  test("module svc, unit-installed → ensureHubUnit then driveModuleOp(restart)", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub();
+      const log: string[] = [];
+      const code = await restart("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(0);
+      expect(sup.ensureCalls).toHaveLength(1);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
+      expect(log.join("\n")).toMatch(/✓ vault restarted/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("404 not_supervised on restart → fall through to driveModuleOp(start)", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub({
+        driveResponder: (_short, op) => {
+          if (op === "restart") {
+            throw new ModuleOpHttpError(404, "not_supervised", "vault is not currently supervised");
+          }
+          return { status: 200, body: { short: "vault", state: { status: "running" } } };
+        },
+      });
+      const log: string[] = [];
+      const code = await restart("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(0);
+      // restart was attempted, then start as the 404-fallthrough (§6.2).
+      expect(sup.driveCalls).toEqual([
+        { short: "vault", op: "restart" },
+        { short: "vault", op: "start" },
+      ]);
+      expect(log.join("\n")).toMatch(/✓ vault started/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("restart hub → platform manager (restartHubUnit), never a PID signal", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub();
+      const kill = () => {
+        throw new Error("restart hub must NOT signal a PID — it must go through the manager");
+      };
+      const log: string[] = [];
+      const code = await restart("hub", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+        kill,
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(0);
+      expect(sup.restartHubCalls).toBe(1);
+      expect(sup.driveCalls).toHaveLength(0); // NOT a per-module fan-out
+      expect(log.join("\n")).toMatch(/✓ hub restarted/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("no svc, unit-installed → restart the hub unit (manager), not a fan-out", async () => {
+    const h = makeHarness();
+    try {
+      const sup = makeSupervisorStub();
+      const code = await restart(undefined, {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        supervisor: sup.opts,
+      });
+      expect(code).toBe(0);
+      expect(sup.restartHubCalls).toBe(1);
+      expect(sup.driveCalls).toHaveLength(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("module svc, NO unit → existing detached stop-then-start path (unchanged)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writePid("vault", 4242, h.configDir);
+      const spawner = makeSpawner([7777]);
+      const killed: Array<{ pid: number; sig: NodeJS.Signals | number }> = [];
+      const code = await restart("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        kill: (pid, sig) => killed.push({ pid, sig }),
+        // Stale 4242 is dead (stop's stale-pid path cleans up without a kill);
+        // freshly spawned 7777 is alive past the post-spawn settle (hub#194).
+        // Per-pid differentiation, mirroring the existing detached-restart test.
+        alive: (pid) => pid === 7777,
+        sleep: async () => {},
+        log: () => {},
+        // supervisor omitted → detached arm (stop then start).
+      });
+      expect(code).toBe(0);
+      expect(killed).toHaveLength(0); // stale pid → detached cleanup, no kill
+      expect(spawner.calls).toHaveLength(1); // detached start ran (NOT the supervisor)
+      expect(readPid("vault", h.configDir)).toBe(7777);
     } finally {
       h.cleanup();
     }
