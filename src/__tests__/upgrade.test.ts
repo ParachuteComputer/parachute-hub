@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UpgradeRunner } from "../commands/upgrade.ts";
 import { compareVersions, defaultRunner, detectChannel, upgrade } from "../commands/upgrade.ts";
+import type { HubUnitDeps, HubUnitManagerOpResult } from "../hub-unit.ts";
 import { upsertService } from "../services-manifest.ts";
 
 interface RunCall {
@@ -1213,6 +1214,205 @@ describe("parachute upgrade", () => {
       });
       const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
       expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@next"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4 dual-dispatch (design §5): when a hub UNIT is installed, `upgrade hub`
+// rewrites the binary as usual then RESTARTS THE UNIT via the platform manager
+// (`restartHubUnit`), NOT the detached `restartFn` (stopHub/ensureHubRunning).
+// The manager tears down the old hub (children die) and starts the new binary,
+// which re-boots every module. No-unit → the unchanged detached restart.
+// ---------------------------------------------------------------------------
+
+describe("Phase 4 upgrade-hub dual-dispatch", () => {
+  test("upgrade hub unit-managed → binary rewrite + restartHubUnit (manager), NOT detached restartFn", async () => {
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.6.3-rc.1" });
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            // Channel auto-detected as @rc from the installed -rc version.
+            writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.6.3-rc.2" });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          // Not a git checkout → npm-install branch.
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "fatal: not a git repository\n" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      let restartFnCalled = false;
+      let restartHubUnitCalls = 0;
+      const logs: string[] = [];
+      const code = await upgrade("hub", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        // The detached restart path must NOT be taken on the unit arm.
+        restartFn: async () => {
+          restartFnCalled = true;
+          return 0;
+        },
+        // Avoid a real registry round-trip in the downgrade guard.
+        resolveChannelVersion: async () => null,
+        supervisor: {
+          unitInstalled: true,
+          restartHubUnit: (_deps: HubUnitDeps): HubUnitManagerOpResult => {
+            restartHubUnitCalls++;
+            return { outcome: "ok", messages: [] };
+          },
+        },
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      // The binary was rewritten via bun add -g @rc…
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@rc"]);
+      // …and the restart went through the platform manager, not the detached PID path.
+      expect(restartHubUnitCalls).toBe(1);
+      expect(restartFnCalled).toBe(false);
+      expect(logs.join("\n")).toMatch(/restarted the hub unit/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("upgrade hub NO unit → detached restartFn (unchanged)", async () => {
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.8" });
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.5.9" });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      let restartedShort: string | undefined;
+      let restartHubUnitCalls = 0;
+      const code = await upgrade("hub", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async (svc) => {
+          restartedShort = svc;
+          return 0;
+        },
+        resolveChannelVersion: async () => null,
+        // supervisor block present but unit NOT installed → detached arm.
+        supervisor: {
+          unitInstalled: false,
+          restartHubUnit: (_deps: HubUnitDeps): HubUnitManagerOpResult => {
+            restartHubUnitCalls++;
+            return { outcome: "ok", messages: [] };
+          },
+        },
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      // The detached restartFn ran; the manager restart did NOT.
+      expect(restartedShort).toBe("hub");
+      expect(restartHubUnitCalls).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("sweep stays hub-first; hub restart uses the manager, module restarts route through lifecycle", async () => {
+    const h = makeHarness();
+    try {
+      // Hub install dir + a vault module in services.json — sweep upgrades both.
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.6.3-rc.1" });
+      const vaultInstallDir = join(h.installRoot, "vault");
+      writePackageJson(vaultInstallDir, { name: "@openparachute/vault", version: "0.6.3-rc.1" });
+      seedVault(h.manifestPath, vaultInstallDir, "0.6.3-rc.1");
+
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            const spec = cmd[3] ?? "";
+            if (spec.startsWith("@openparachute/hub")) {
+              writePackageJson(hubInstallDir, {
+                name: "@openparachute/hub",
+                version: "0.6.3-rc.2",
+              });
+            } else if (spec.startsWith("@openparachute/vault")) {
+              writePackageJson(vaultInstallDir, {
+                name: "@openparachute/vault",
+                version: "0.6.3-rc.2",
+              });
+            }
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const restartOrder: string[] = [];
+      let restartHubUnitCalls = 0;
+      const code = await upgrade(undefined, {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) => {
+          if (pkg === "@openparachute/hub") return join(hubInstallDir, "package.json");
+          if (pkg === "@openparachute/vault") return join(vaultInstallDir, "package.json");
+          return null;
+        },
+        // Module restarts (vault) go through lifecycle's restart with a
+        // supervisor block; the stub records the order so we can assert hub-first.
+        restartFn: async (svc) => {
+          restartOrder.push(svc);
+          return 0;
+        },
+        resolveChannelVersion: async () => null,
+        supervisor: {
+          unitInstalled: true,
+          restartHubUnit: (_deps: HubUnitDeps): HubUnitManagerOpResult => {
+            restartHubUnitCalls++;
+            restartOrder.push("hub-unit");
+            return { outcome: "ok", messages: [] };
+          },
+        },
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      // Hub-first: the hub unit restart precedes the vault module restart.
+      expect(restartOrder[0]).toBe("hub-unit");
+      expect(restartOrder).toContain("vault");
+      expect(restartOrder.indexOf("hub-unit")).toBeLessThan(restartOrder.indexOf("vault"));
+      expect(restartHubUnitCalls).toBe(1);
     } finally {
       h.cleanup();
     }
