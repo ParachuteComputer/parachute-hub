@@ -1,6 +1,18 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import {
+  type ManagedUnit,
+  type ManagedUnitDeps,
+  type ManagedUnitInstallResult,
+  type ManagedUnitMessages,
+  type ManagedUnitRemoveResult,
+  type ServiceCommandResult,
+  defaultManagedUnitDeps,
+  installManagedUnit,
+  launchdPlistPathForLabel,
+  removeManagedUnit,
+  renderManagedLaunchdPlist,
+  renderManagedSystemdUnit,
+  systemdUnitPathForName,
+} from "../managed-unit.ts";
 
 /**
  * Reboot-persistent cloudflared connector.
@@ -25,10 +37,20 @@ import { dirname, join } from "node:path";
  *     `/etc/systemd/system/parachute-cloudflared-<tunnelName>.service`,
  *     `systemctl enable --now`. No linger needed — system units run on boot.
  *
- * Everything is behind an injectable `ConnectorServiceDeps` seam (mirrors the
- * `Runner`/`CloudflaredSpawner`/`KillFn` injection in expose-cloudflare.ts) so
- * tests drive the install/remove without touching real launchctl/systemctl or
- * the operator's home directory.
+ * As of Phase 2b of the hub-as-supervisor unification, the per-platform
+ * install/remove/render machinery lives in `src/managed-unit.ts` as a reusable
+ * `ManagedUnit` abstraction (so the hub unit can reuse it — design §4.1). This
+ * module is now a thin connector-specific layer over that machinery: it builds
+ * the connector's `ManagedUnit` descriptor (empty env, no crash-loop ceiling —
+ * which keeps its rendered output BYTE-IDENTICAL to the pre-extraction code, the
+ * hard constraint since the connector is live on production) and supplies the
+ * connector-flavored install/remove messages. The public exports below keep
+ * their original signatures so `expose-cloudflare.ts` and the connector tests
+ * need no behavioral change.
+ *
+ * Everything is behind an injectable deps seam (re-exported `ConnectorServiceDeps`
+ * = the generalized `ManagedUnitDeps`) so tests drive the install/remove without
+ * touching real launchctl/systemctl or the operator's home directory.
  *
  * Service name keyed by the same per-host tunnel name the 0.6.1 work derives
  * (`deriveTunnelName`), so install / remove always target the connector for
@@ -36,74 +58,23 @@ import { dirname, join } from "node:path";
  */
 
 /** Synchronous command result from the injected service runner. */
-export interface ServiceCommandResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
+export type { ServiceCommandResult };
 
 /**
- * Injectable side-effect seam for the connector-service module. Production
- * wires the real fs / os / child-process implementations (`defaultServiceDeps`);
- * tests inject fakes to assert generated file content + the install/remove
- * command sequence without a live launchctl/systemctl.
+ * Injectable side-effect seam for the connector-service module. This is the
+ * generalized `ManagedUnitDeps` re-exported under the connector's historical
+ * name so `expose-cloudflare.ts` + the connector tests are unchanged.
  */
-export interface ConnectorServiceDeps {
-  /** `process.platform`. */
-  platform: NodeJS.Platform;
-  /**
-   * Effective uid. Linux uses `0 === root` to pick a system vs user systemd
-   * unit. `undefined` (Windows / platforms without getuid) → treated as
-   * non-root. macOS ignores this (LaunchAgents are always per-user).
-   */
-  getuid: () => number | undefined;
-  /** `$HOME`. */
-  homeDir: () => string;
-  /** Username for the linger call + systemd unit `User=` (system unit). */
-  userName: () => string;
-  /** Resolve a binary to an absolute path (launchd/systemd don't inherit PATH). */
-  which: (binary: string) => string | null;
-  /** Run launchctl/systemctl/loginctl synchronously. */
-  run: (cmd: readonly string[]) => ServiceCommandResult;
-  /** Write a service file (creates parent dirs). */
-  writeFile: (path: string, content: string) => void;
-  /** Remove a service file if present (no-op when absent). */
-  removeFile: (path: string) => void;
-  /** Read a service file, or undefined when absent. */
-  readFile: (path: string) => string | undefined;
-  /** True when the path exists. */
-  exists: (path: string) => boolean;
-}
+export type ConnectorServiceDeps = ManagedUnitDeps;
 
-export const defaultServiceDeps: ConnectorServiceDeps = {
-  platform: process.platform,
-  getuid: () => (typeof process.getuid === "function" ? process.getuid() : undefined),
-  homeDir: () => homedir(),
-  userName: () => process.env.USER ?? process.env.LOGNAME ?? process.env.USERNAME ?? "",
-  which: (binary) => Bun.which(binary),
-  run: (cmd) => {
-    const proc = Bun.spawnSync([...cmd], { env: process.env });
-    return {
-      code: proc.exitCode ?? 1,
-      stdout: proc.stdout?.toString() ?? "",
-      stderr: proc.stderr?.toString() ?? "",
-    };
-  },
-  writeFile: (path, content) => {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, content);
-  },
-  removeFile: (path) => {
-    if (existsSync(path)) rmSync(path, { force: true });
-  },
-  readFile: (path) => (existsSync(path) ? readFileSync(path, "utf8") : undefined),
-  exists: (path) => existsSync(path),
-};
+export const defaultServiceDeps: ConnectorServiceDeps = defaultManagedUnitDeps;
 
 /** Reverse-DNS prefix for the launchd label + plist filename. */
 const LAUNCHD_LABEL_PREFIX = "computer.parachute.cloudflared";
 /** systemd unit name prefix. */
 const SYSTEMD_UNIT_PREFIX = "parachute-cloudflared-";
+/** Provenance comment baked into every rendered connector unit file. */
+const CONNECTOR_HEADER = "Generated by parachute expose public --cloudflare — do not edit by hand.";
 
 /** launchd label for a tunnel (also the plist basename, minus `.plist`). */
 export function launchdLabel(tunnelName: string): string {
@@ -112,7 +83,7 @@ export function launchdLabel(tunnelName: string): string {
 
 /** launchd plist path under the user's LaunchAgents dir. */
 export function launchdPlistPath(tunnelName: string, home: string): string {
-  return join(home, "Library", "LaunchAgents", `${launchdLabel(tunnelName)}.plist`);
+  return launchdPlistPathForLabel(launchdLabel(tunnelName), home);
 }
 
 /** systemd unit name (with `.service` suffix). */
@@ -122,23 +93,37 @@ export function systemdUnitName(tunnelName: string): string {
 
 /** systemd unit path — user-level under $HOME, system-level under /etc. */
 export function systemdUnitPath(tunnelName: string, home: string, root: boolean): string {
-  return root
-    ? join("/etc/systemd/system", systemdUnitName(tunnelName))
-    : join(home, ".config", "systemd", "user", systemdUnitName(tunnelName));
-}
-
-/** XML-escape a string for safe inclusion in a plist `<string>` element. */
-function plistEscape(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return systemdUnitPathForName(systemdUnitName(tunnelName), home, root);
 }
 
 /**
- * Render the launchd LaunchAgent plist. `RunAtLoad` starts the connector on
- * load (and on login/boot once bootstrapped); `KeepAlive` restarts it if it
- * exits. We pass `cloudflaredPath` (the resolved absolute binary) as argv[0]
- * because launchd does not search `$PATH`. Logs go to the same per-tunnel log
- * file the transient spawn used, so `parachute status`/the operator find them
- * in one place.
+ * Build the connector's `ManagedUnit` descriptor. Empty `env` + no `crashLoop`
+ * are what keep the rendered output byte-identical to the pre-extraction code.
+ * `runAsInvokingUserOnSystemUnit: true` reproduces the connector's historical
+ * `User=` pin on the root/system unit.
+ */
+function connectorUnit(opts: {
+  tunnelName: string;
+  cloudflaredPath: string;
+  configPath: string;
+  logPath: string;
+}): ManagedUnit {
+  return {
+    launchdLabel: launchdLabel(opts.tunnelName),
+    systemdUnitName: systemdUnitName(opts.tunnelName),
+    headerComment: CONNECTOR_HEADER,
+    systemdDescription: `Parachute Cloudflare connector (${opts.tunnelName})`,
+    execStart: [opts.cloudflaredPath, "tunnel", "--config", opts.configPath, "run"],
+    env: {},
+    logPath: opts.logPath,
+    runAsInvokingUserOnSystemUnit: true,
+  };
+}
+
+/**
+ * Render the launchd LaunchAgent plist. Thin wrapper over the generalized
+ * renderer with the connector's descriptor — preserved signature so existing
+ * callers/tests are unchanged.
  */
 export function renderLaunchdPlist(opts: {
   tunnelName: string;
@@ -146,39 +131,13 @@ export function renderLaunchdPlist(opts: {
   configPath: string;
   logPath: string;
 }): string {
-  const { tunnelName, cloudflaredPath, configPath, logPath } = opts;
-  const args = [cloudflaredPath, "tunnel", "--config", configPath, "run"];
-  const argXml = args.map((a) => `    <string>${plistEscape(a)}</string>`).join("\n");
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Generated by parachute expose public --cloudflare — do not edit by hand. -->
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${plistEscape(launchdLabel(tunnelName))}</string>
-  <key>ProgramArguments</key>
-  <array>
-${argXml}
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>${plistEscape(logPath)}</string>
-  <key>StandardErrorPath</key>
-  <string>${plistEscape(logPath)}</string>
-</dict>
-</plist>
-`;
+  return renderManagedLaunchdPlist(connectorUnit(opts));
 }
 
 /**
- * Render a systemd unit. `Restart=always` mirrors launchd's KeepAlive;
- * `WantedBy` differs by scope (system → multi-user.target; user →
- * default.target). The system unit pins `User=` so the connector doesn't run
- * as root unnecessarily when we know the invoking user. `ExecStart` uses the
- * resolved absolute `cloudflaredPath` (systemd doesn't search a login `$PATH`).
+ * Render a systemd unit. Thin wrapper over the generalized renderer — preserved
+ * signature (`{ root, userName }` threaded through) so existing callers/tests
+ * are unchanged.
  */
 export function renderSystemdUnit(opts: {
   tunnelName: string;
@@ -188,25 +147,8 @@ export function renderSystemdUnit(opts: {
   root: boolean;
   userName: string;
 }): string {
-  const { tunnelName, cloudflaredPath, configPath, root, userName } = opts;
-  const execStart = `${cloudflaredPath} tunnel --config ${configPath} run`;
-  const userLine = root && userName ? `User=${userName}\n` : "";
-  const wantedBy = root ? "multi-user.target" : "default.target";
-  return `# Generated by parachute expose public --cloudflare — do not edit by hand.
-[Unit]
-Description=Parachute Cloudflare connector (${tunnelName})
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-${userLine}ExecStart=${execStart}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=${wantedBy}
-`;
+  const { root, userName } = opts;
+  return renderManagedSystemdUnit(connectorUnit(opts), { root, userName });
 }
 
 export interface InstallResult {
@@ -231,6 +173,29 @@ export interface ConnectorServiceOpts {
   deps?: ConnectorServiceDeps;
 }
 
+/** Connector-flavored install/remove messages, supplied to the generalized installer. */
+function connectorMessages(): ManagedUnitMessages {
+  const lingerWarning =
+    "Note: could not enable lingering (loginctl enable-linger) — the connector will run while you're logged in but may not start on a cold boot before login. To run on cold boot without an active login, re-run this command as root (installs a system unit that needs no linger).";
+  return {
+    launchctlMissing: "launchctl not found; using a transient connector (won't survive a reboot).",
+    systemctlMissing: "systemctl not found; using a transient connector (won't survive a reboot).",
+    lingerWarning,
+    writeFailedPrefix:
+      "Failed to write service file; using a transient connector (won't survive a reboot)",
+    launchctlLoadFailedPrefix:
+      "launchctl could not load the connector service; using a transient connector (won't survive a reboot)",
+    daemonReloadFailedPrefix:
+      "systemctl daemon-reload failed; using a transient connector (won't survive a reboot)",
+    enableFailedPrefix:
+      "systemctl enable --now failed; using a transient connector (won't survive a reboot)",
+    launchdInstalled: (label) =>
+      `Installed launchd LaunchAgent ${label} — the connector now starts on login/boot.`,
+    systemdInstalled: (unitName, root) =>
+      `Installed systemd ${root ? "system" : "user"} unit ${unitName} — the connector now starts on boot.`,
+  };
+}
+
 /**
  * Install (or refresh) the reboot-persistent connector service for one tunnel
  * and start it. Idempotent: re-installing overwrites the service file and
@@ -251,172 +216,27 @@ export function installConnectorService(opts: ConnectorServiceOpts): InstallResu
       messages: ["Could not resolve the cloudflared binary path; skipping boot-service install."],
     };
   }
-
-  if (deps.platform === "darwin") {
-    return installLaunchd({ ...opts, deps, cloudflaredPath });
-  }
-  if (deps.platform === "linux") {
-    return installSystemd({ ...opts, deps, cloudflaredPath });
-  }
-  return {
-    outcome: "fallback",
-    messages: [
-      `Boot-persistent connector isn't supported on ${deps.platform}; using a transient connector.`,
-    ],
-  };
-}
-
-function installLaunchd(
-  opts: ConnectorServiceOpts & { deps: ConnectorServiceDeps; cloudflaredPath: string },
-): InstallResult {
-  const { deps, tunnelName, configPath, logPath, cloudflaredPath } = opts;
-  if (deps.which("launchctl") === null) {
-    return {
-      outcome: "fallback",
-      messages: ["launchctl not found; using a transient connector (won't survive a reboot)."],
-    };
-  }
-  const home = deps.homeDir();
-  const plistPath = launchdPlistPath(tunnelName, home);
-  const label = launchdLabel(tunnelName);
-  const uid = deps.getuid() ?? 0;
-  const domain = `gui/${uid}`;
-
-  try {
-    deps.writeFile(
-      plistPath,
-      renderLaunchdPlist({ tunnelName, cloudflaredPath, configPath, logPath }),
-    );
-  } catch (err) {
+  if (deps.platform !== "darwin" && deps.platform !== "linux") {
     return {
       outcome: "fallback",
       messages: [
-        `Failed to write LaunchAgent (${err instanceof Error ? err.message : String(err)}); using a transient connector (won't survive a reboot).`,
+        `Boot-persistent connector isn't supported on ${deps.platform}; using a transient connector.`,
       ],
     };
   }
 
-  // Re-install must be idempotent: bootout any prior load (ignore failure when
-  // nothing's loaded), then bootstrap the freshly-written plist. `bootstrap`
-  // both loads AND starts (RunAtLoad), so no separate `kickstart` is needed on
-  // the happy path; we add a `kickstart -k` to force a restart when the label
-  // was already bootstrapped (bootstrap is a no-op then).
-  deps.run(["launchctl", "bootout", `${domain}/${label}`]);
-  const boot = deps.run(["launchctl", "bootstrap", domain, plistPath]);
-  if (boot.code !== 0) {
-    // Older macOS (or a sandboxed context) may not accept `bootstrap`; fall back
-    // to the legacy `load -w`, then to a transient connector.
-    const legacy = deps.run(["launchctl", "load", "-w", plistPath]);
-    if (legacy.code !== 0) {
-      deps.removeFile(plistPath);
-      return {
-        outcome: "fallback",
-        messages: [
-          `launchctl could not load the connector service (${boot.stderr.trim() || legacy.stderr.trim() || "unknown error"}); using a transient connector (won't survive a reboot).`,
-        ],
-      };
-    }
-  } else {
-    deps.run(["launchctl", "kickstart", "-k", `${domain}/${label}`]);
-  }
-
-  return {
-    outcome: "installed",
-    kind: "launchd",
-    servicePath: plistPath,
-    messages: [`Installed launchd LaunchAgent ${label} — the connector now starts on login/boot.`],
-  };
-}
-
-function installSystemd(
-  opts: ConnectorServiceOpts & { deps: ConnectorServiceDeps; cloudflaredPath: string },
-): InstallResult {
-  const { deps, tunnelName, configPath, logPath, cloudflaredPath } = opts;
-  if (deps.which("systemctl") === null) {
-    return {
-      outcome: "fallback",
-      messages: ["systemctl not found; using a transient connector (won't survive a reboot)."],
-    };
-  }
-  const root = (deps.getuid() ?? 1000) === 0;
-  const home = deps.homeDir();
-  const unitName = systemdUnitName(tunnelName);
-  const unitPath = systemdUnitPath(tunnelName, home, root);
-  const userName = deps.userName();
-
-  try {
-    deps.writeFile(
-      unitPath,
-      renderSystemdUnit({ tunnelName, cloudflaredPath, configPath, logPath, root, userName }),
-    );
-  } catch (err) {
-    return {
-      outcome: "fallback",
-      messages: [
-        `Failed to write systemd unit (${err instanceof Error ? err.message : String(err)}); using a transient connector (won't survive a reboot).`,
-      ],
-    };
-  }
-
-  const scope = root ? [] : ["--user"];
-  const messages: string[] = [];
-
-  // Non-root: enable linger so the user unit runs without an active login
-  // (i.e. after a reboot before the operator logs back in). Strictly
-  // best-effort — linger may be unavailable: `loginctl` absent entirely (a
-  // container with systemd but no logind), or present-but-failing. Either way
-  // we keep the install (a user unit is still better than a transient spawn)
-  // and warn. The probe + try/catch matter because production `Bun.spawnSync`
-  // THROWS on ENOENT — without the guard a box that has systemctl but not
-  // loginctl would propagate the spawn error out and hard-fail the expose.
-  if (!root && userName) {
-    const lingerWarning =
-      "Note: could not enable lingering (loginctl enable-linger) — the connector will run while you're logged in but may not start on a cold boot before login. To run on cold boot without an active login, re-run this command as root (installs a system unit that needs no linger).";
-    if (deps.which("loginctl") === null) {
-      messages.push(lingerWarning);
-    } else {
-      try {
-        const linger = deps.run(["loginctl", "enable-linger", userName]);
-        if (linger.code !== 0) messages.push(lingerWarning);
-      } catch {
-        // loginctl vanished between probe and run, or threw (ENOENT/EACCES) —
-        // never fatal; linger is a best-effort nicety.
-        messages.push(lingerWarning);
-      }
-    }
-  }
-
-  const reload = deps.run(["systemctl", ...scope, "daemon-reload"]);
-  if (reload.code !== 0) {
-    deps.removeFile(unitPath);
-    return {
-      outcome: "fallback",
-      messages: [
-        `systemctl daemon-reload failed (${reload.stderr.trim() || "unknown error"}); using a transient connector (won't survive a reboot).`,
-      ],
-    };
-  }
-  const enable = deps.run(["systemctl", ...scope, "enable", "--now", unitName]);
-  if (enable.code !== 0) {
-    deps.removeFile(unitPath);
-    deps.run(["systemctl", ...scope, "daemon-reload"]);
-    return {
-      outcome: "fallback",
-      messages: [
-        `systemctl enable --now failed (${enable.stderr.trim() || "unknown error"}); using a transient connector (won't survive a reboot).`,
-      ],
-    };
-  }
-
-  messages.unshift(
-    `Installed systemd ${root ? "system" : "user"} unit ${unitName} — the connector now starts on boot.`,
-  );
-  return {
-    outcome: "installed",
-    kind: root ? "systemd-system" : "systemd-user",
-    servicePath: unitPath,
-    messages,
-  };
+  const result: ManagedUnitInstallResult = installManagedUnit({
+    unit: connectorUnit({
+      tunnelName: opts.tunnelName,
+      cloudflaredPath,
+      configPath: opts.configPath,
+      logPath: opts.logPath,
+    }),
+    deps,
+    messages: connectorMessages(),
+    // start: true (default) — the connector's behavior is unchanged.
+  });
+  return result;
 }
 
 export interface RemoveResult {
@@ -440,39 +260,12 @@ export function removeConnectorService(opts: {
   deps?: ConnectorServiceDeps;
 }): RemoveResult {
   const deps = opts.deps ?? defaultServiceDeps;
-  const { tunnelName } = opts;
-
-  if (deps.platform === "darwin") {
-    const home = deps.homeDir();
-    const plistPath = launchdPlistPath(tunnelName, home);
-    if (!deps.exists(plistPath)) return { removed: false, messages: [] };
-    const uid = deps.getuid() ?? 0;
-    const label = launchdLabel(tunnelName);
-    // bootout unloads + stops; ignore its exit (nothing-loaded is fine).
-    deps.run(["launchctl", "bootout", `gui/${uid}/${label}`]);
-    deps.removeFile(plistPath);
-    return {
-      removed: true,
-      messages: [`Removed launchd LaunchAgent ${label}.`],
-    };
-  }
-
-  if (deps.platform === "linux") {
-    const root = (deps.getuid() ?? 1000) === 0;
-    const home = deps.homeDir();
-    const unitName = systemdUnitName(tunnelName);
-    const unitPath = systemdUnitPath(tunnelName, home, root);
-    if (!deps.exists(unitPath)) return { removed: false, messages: [] };
-    const scope = root ? [] : ["--user"];
-    // disable --now stops + removes the enable symlink; ignore exit (best-effort).
-    deps.run(["systemctl", ...scope, "disable", "--now", unitName]);
-    deps.removeFile(unitPath);
-    deps.run(["systemctl", ...scope, "daemon-reload"]);
-    return {
-      removed: true,
-      messages: [`Removed systemd unit ${unitName}.`],
-    };
-  }
-
-  return { removed: false, messages: [] };
+  const result: ManagedUnitRemoveResult = removeManagedUnit({
+    launchdLabel: launchdLabel(opts.tunnelName),
+    systemdUnitName: systemdUnitName(opts.tunnelName),
+    deps,
+    removedLaunchdMessage: (label) => `Removed launchd LaunchAgent ${label}.`,
+    removedSystemdMessage: (unitName) => `Removed systemd unit ${unitName}.`,
+  });
+  return result;
 }
