@@ -15,9 +15,12 @@ import {
   exposeCloudflareOff,
   exposeCloudflareUp,
 } from "../commands/expose-cloudflare.ts";
+import type { ExposeSupervisorOpts } from "../commands/expose-supervisor.ts";
 import { readEnvFileValues } from "../env-file.ts";
 import { readExposeState } from "../expose-state.ts";
 import { writeHubPort } from "../hub-control.ts";
+import type { EnsureHubUnitOpts } from "../hub-unit.ts";
+import { type ModuleOp, ModuleOpHttpError } from "../module-ops-client.ts";
 import type { CommandResult, Runner } from "../tailscale/run.ts";
 
 // Default seeded hub port used by tests with `skipHub: true`. The cloudflared
@@ -2012,6 +2015,157 @@ describe("reboot-persistent connector service wiring", () => {
       expect(killed).toContain(95000);
       expect(existsSync(env.statePath)).toBe(false);
       expect(logs.join("\n")).toContain("Removed launchd LaunchAgent");
+    } finally {
+      env.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4 dual-dispatch (design §4.3): unit-managed → "ensure the hub" ensures
+// the UNIT (not a detached spawn) and the post-route vault restart drives the
+// running Supervisor over the loopback module-ops API (firing the operator-
+// token self-heal). The cloudflared CONNECTOR unit is unchanged. The no-unit
+// arm keeps today's `persistVaultHubOrigin` + `restartService` behavior.
+// ---------------------------------------------------------------------------
+
+interface CfExposeSupervisorStub {
+  opts: ExposeSupervisorOpts;
+  ensureCalls: number;
+  driveCalls: Array<{ short: string; op: ModuleOp }>;
+  selfHealCalls: Array<{ issuer: string }>;
+}
+
+function makeCfSupervisorStub(opts?: {
+  ensureOutcome?: "already-up" | "started" | "no-manager";
+  driveThrows?: () => unknown;
+}): CfExposeSupervisorStub {
+  const stub: CfExposeSupervisorStub = {
+    ensureCalls: 0,
+    driveCalls: [],
+    selfHealCalls: [],
+    opts: {
+      unitInstalled: true,
+      openDb: () => ({ close() {} }) as unknown as import("bun:sqlite").Database,
+      ensureHubUnit: async (o: EnsureHubUnitOpts) => {
+        stub.ensureCalls++;
+        return { outcome: opts?.ensureOutcome ?? "already-up", port: o.port ?? 1939, messages: [] };
+      },
+      driveModuleOp: async (short, op) => {
+        stub.driveCalls.push({ short, op });
+        if (opts?.driveThrows) throw opts.driveThrows();
+        return { status: 200, body: { short, state: { status: "running" } } };
+      },
+      selfHealOperatorTokenIssuer: async (_db, o) => {
+        stub.selfHealCalls.push({ issuer: o.issuer });
+        return { kind: "fresh" };
+      },
+    },
+  };
+  return stub;
+}
+
+describe("Phase 4 cloudflare expose dual-dispatch — unit-managed", () => {
+  test("unit-managed → ensureHubUnit (not detached) + supervised vault restart + operator-token self-heal", async () => {
+    const env = makeEnv();
+    try {
+      const uuid = "ffffffff-0000-0000-0000-0000000000a4";
+      const { runner } = queueRunner([
+        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" }, // --version
+        { code: 0, stdout: "[]", stderr: "" }, // tunnel list
+        {
+          code: 0,
+          stdout: `Tunnel credentials written to ${env.cloudflaredHome}/${uuid}.json.\nCreated tunnel parachute with id ${uuid}\n`,
+          stderr: "",
+        }, // tunnel create
+        { code: 0, stdout: "", stderr: "" }, // route dns
+      ]);
+      const { spawner } = fakeSpawner(42400);
+      const sup = makeCfSupervisorStub();
+      const restarted: string[] = [];
+      const logs: string[] = [];
+
+      const code = await exposeCloudflareUp("gitcoin-parachute.unforced.dev", {
+        runner,
+        spawner,
+        alive: () => false,
+        kill: () => {},
+        log: (l) => logs.push(l),
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        // No skipHub → the unit arm's ensureHubUnit runs (via the stub, no real hub).
+        // Inert connector install so the cloudflared connector path is unchanged.
+        installService: () => ({ outcome: "fallback", messages: [] }),
+        // This detached restart seam must NOT be called on the unit arm.
+        restartService: async (short) => {
+          restarted.push(short);
+          return 0;
+        },
+        supervisor: sup.opts,
+      });
+
+      expect(code).toBe(0);
+      // Ensured the hub UNIT (the stub), never the detached spawn.
+      expect(sup.ensureCalls).toBe(1);
+      // Vault restart drove the running Supervisor, NOT the detached restartService.
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
+      expect(restarted).toEqual([]);
+      // Operator-token issuer self-heal fired toward the public origin.
+      expect(sup.selfHealCalls).toHaveLength(1);
+      expect(sup.selfHealCalls[0]?.issuer).toBe("https://gitcoin-parachute.unforced.dev");
+      // Durable .env still written (the helper persists it for vault).
+      expect(readEnvFileValues(join(env.configDir, "vault", ".env")).PARACHUTE_HUB_ORIGIN).toBe(
+        "https://gitcoin-parachute.unforced.dev",
+      );
+      expect(logs.join("\n")).toMatch(/hub unit up/);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("unit-managed: a not_supervised vault (404) is not a failure", async () => {
+    const env = makeEnv();
+    try {
+      const uuid = "ffffffff-0000-0000-0000-0000000000a5";
+      const { runner } = queueRunner([
+        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+        { code: 0, stdout: "[]", stderr: "" },
+        {
+          code: 0,
+          stdout: `Tunnel credentials written to ${env.cloudflaredHome}/${uuid}.json.\nCreated tunnel parachute with id ${uuid}\n`,
+          stderr: "",
+        },
+        { code: 0, stdout: "", stderr: "" },
+      ]);
+      const { spawner } = fakeSpawner(42401);
+      const sup = makeCfSupervisorStub({
+        driveThrows: () => new ModuleOpHttpError(404, "not_supervised", "vault is not supervised"),
+      });
+
+      const code = await exposeCloudflareUp("gitcoin-parachute.unforced.dev", {
+        runner,
+        spawner,
+        alive: () => false,
+        kill: () => {},
+        log: () => {},
+        manifestPath: env.manifestPath,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        configPath: env.configPath,
+        logPath: env.logPath,
+        cloudflaredHome: env.cloudflaredHome,
+        configDir: env.configDir,
+        installService: () => ({ outcome: "fallback", messages: [] }),
+        supervisor: sup.opts,
+      });
+
+      expect(code).toBe(0);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
     } finally {
       env.cleanup();
     }
