@@ -2,10 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ExposeSupervisorOpts } from "../commands/expose-supervisor.ts";
 import { exposePublic, exposeTailnet } from "../commands/expose.ts";
 import { readEnvFileValues } from "../env-file.ts";
 import { readExposeState, writeExposeState } from "../expose-state.ts";
 import type { EnsureHubOpts, HubSpawner, StopHubOpts } from "../hub-control.ts";
+import type { EnsureHubUnitOpts } from "../hub-unit.ts";
+import { type ModuleOp, ModuleOpHttpError } from "../module-ops-client.ts";
 import { writePid } from "../process-state.ts";
 import { upsertService } from "../services-manifest.ts";
 import type { Runner } from "../tailscale/run.ts";
@@ -1675,6 +1678,253 @@ describe("expose: vault routing fully internal to hub", () => {
         .filter((c) => c[0] === "tailscale" && c[1] === "serve" && c.includes("--bg"))
         .map((c) => c.find((a) => a.startsWith("--set-path=")));
       expect(mounts).toEqual(["--set-path=/"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4 dual-dispatch (design §4.3): when a hub UNIT is installed, `expose`
+// ensures the hub UNIT (not a detached spawn), the post-expose vault restart
+// drives the running Supervisor over the loopback module-ops API (firing the
+// operator-token + vault `.env` self-heal), and `expose off` leaves the hub
+// RUNNING (D3 — a managed hub with Restart=always/KeepAlive would just respawn
+// a stopped one). The no-unit arm keeps today's behavior unchanged.
+// ---------------------------------------------------------------------------
+
+interface ExposeSupervisorStub {
+  opts: ExposeSupervisorOpts;
+  ensureCalls: Array<{ port?: number }>;
+  driveCalls: Array<{ short: string; op: ModuleOp }>;
+  selfHealCalls: Array<{ issuer: string }>;
+}
+
+/**
+ * Build an expose `supervisor` seam that forces the unit-installed arm and
+ * records the `ensureHubUnit` / `driveModuleOp` / operator-token-self-heal
+ * calls. `driveThrows` makes a module-op throw a chosen error; `ensureOutcome`
+ * controls the ensure-hub result.
+ */
+function makeExposeSupervisorStub(opts?: {
+  ensureOutcome?: "already-up" | "started" | "no-unit" | "no-manager" | "timeout" | "start-failed";
+  ensurePort?: number;
+  driveThrows?: (short: string, op: ModuleOp) => unknown;
+}): ExposeSupervisorStub {
+  const ensureCalls: Array<{ port?: number }> = [];
+  const driveCalls: Array<{ short: string; op: ModuleOp }> = [];
+  const selfHealCalls: Array<{ issuer: string }> = [];
+  return {
+    ensureCalls,
+    driveCalls,
+    selfHealCalls,
+    opts: {
+      unitInstalled: true,
+      // openDb is opened+closed around the drive/self-heal — hand back a no-op closer.
+      openDb: () => ({ close() {} }) as unknown as import("bun:sqlite").Database,
+      ensureHubUnit: async (o: EnsureHubUnitOpts) => {
+        ensureCalls.push({ port: o.port });
+        return {
+          outcome: opts?.ensureOutcome ?? "already-up",
+          port: opts?.ensurePort ?? o.port ?? 1939,
+          messages: [],
+        };
+      },
+      driveModuleOp: async (short, op) => {
+        driveCalls.push({ short, op });
+        if (opts?.driveThrows) throw opts.driveThrows(short, op);
+        return { status: 200, body: { short, state: { status: "running" } } };
+      },
+      selfHealOperatorTokenIssuer: async (_db, o) => {
+        selfHealCalls.push({ issuer: o.issuer });
+        return { kind: "fresh" };
+      },
+    },
+  };
+}
+
+describe("Phase 4 expose dual-dispatch — unit-managed", () => {
+  test("expose up unit-managed → ensureHubUnit (not detached spawn) + driveModuleOp(restart) for vault", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const sup = makeExposeSupervisorStub();
+      const logs: string[] = [];
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        wellKnownDir: h.wellKnownDir,
+        configDir: h.configDir,
+        servicePortProbe: allServicesUp,
+        supervisor: sup.opts,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      // Ensured the hub UNIT (the detached hub spawner was never invoked).
+      expect(sup.ensureCalls).toHaveLength(1);
+      // Post-expose vault restart drove the supervisor, not lifecycle.restart.
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
+      // The operator-token issuer self-heal fired toward the public origin.
+      expect(sup.selfHealCalls).toHaveLength(1);
+      expect(sup.selfHealCalls[0]?.issuer).toMatch(/^https:\/\//);
+      expect(logs.join("\n")).toMatch(/hub unit up/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("expose up unit-managed: ensureHubUnit failure aborts before exposing", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner, calls } = makeRunner();
+      const sup = makeExposeSupervisorStub({ ensureOutcome: "no-manager" });
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        wellKnownDir: h.wellKnownDir,
+        configDir: h.configDir,
+        servicePortProbe: allServicesUp,
+        supervisor: sup.opts,
+        log: () => {},
+      });
+      expect(code).toBe(1);
+      // Never ran the tailscale bringup — we bailed on the failed ensure.
+      expect(calls.filter((c) => c[0] === "tailscale" && c[1] === "serve")).toHaveLength(0);
+      expect(sup.driveCalls).toHaveLength(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("expose up unit-managed: a not_supervised vault (404) is not a failure", async () => {
+    const h = makeHarness();
+    try {
+      seedServices(h.manifestPath);
+      const { runner } = makeRunner();
+      const sup = makeExposeSupervisorStub({
+        driveThrows: () => new ModuleOpHttpError(404, "not_supervised", "vault is not supervised"),
+      });
+      const code = await exposeTailnet("up", {
+        runner,
+        manifestPath: h.manifestPath,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        wellKnownDir: h.wellKnownDir,
+        configDir: h.configDir,
+        servicePortProbe: allServicesUp,
+        supervisor: sup.opts,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("expose off unit-managed → exposure torn down, hub NOT stopped, no 'hub stopped' line", async () => {
+    const h = makeHarness();
+    try {
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: false,
+          entries: [{ kind: "proxy", mount: "/", target: "http://127.0.0.1:1939", service: "hub" }],
+        },
+        h.statePath,
+      );
+      writePid("hub", 4242, h.configDir);
+      const { runner, calls } = makeRunner();
+      const sup = makeExposeSupervisorStub();
+      // A kill / stopHub seam that fails the test if the hub is signalled.
+      const logs: string[] = [];
+      const code = await exposeTailnet("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        wellKnownDir: h.wellKnownDir,
+        configDir: h.configDir,
+        // If the hub stop path ran, this kill seam would be called and throw.
+        hubStopOpts: {
+          kill: () => {
+            throw new Error("expose off unit-managed must NOT stop the hub");
+          },
+          alive: () => true,
+          sleep: async () => {},
+          now: () => 0,
+        },
+        supervisor: sup.opts,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      // The exposure layer was torn down…
+      expect(calls.every((c) => c[c.length - 1] === "off" || c[1] === "version")).toBe(true);
+      expect(existsSync(h.statePath)).toBe(false);
+      // …but the hub was left running: no stop, no "hub stopped" line.
+      expect(logs.join("\n")).not.toMatch(/hub stopped/);
+      expect(logs.join("\n")).toMatch(/exposure removed/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("expose off NO unit → hub stopped (detached arm unchanged)", async () => {
+    const h = makeHarness();
+    try {
+      writeExposeState(
+        {
+          version: 1,
+          layer: "tailnet",
+          mode: "path",
+          canonicalFqdn: "parachute.taildf9ce2.ts.net",
+          port: 443,
+          funnel: false,
+          entries: [{ kind: "proxy", mount: "/", target: "http://127.0.0.1:1939", service: "hub" }],
+        },
+        h.statePath,
+      );
+      writePid("hub", 4242, h.configDir);
+      const { runner } = makeRunner();
+      const signals: NodeJS.Signals[] = [];
+      let aliveNow = true;
+      const logs: string[] = [];
+      const code = await exposeTailnet("off", {
+        runner,
+        statePath: h.statePath,
+        wellKnownPath: h.wellKnownPath,
+        hubPath: h.hubPath,
+        wellKnownDir: h.wellKnownDir,
+        configDir: h.configDir,
+        hubStopOpts: {
+          kill: (_pid, sig) => {
+            signals.push(sig as NodeJS.Signals);
+            aliveNow = false;
+          },
+          alive: () => aliveNow,
+          sleep: async () => {},
+          now: () => 0,
+        },
+        // supervisor omitted → detached arm, deterministically.
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      // The detached arm still stops the hub.
+      expect(signals).toContain("SIGTERM");
+      expect(logs.join("\n")).toMatch(/hub stopped/);
     } finally {
       h.cleanup();
     }

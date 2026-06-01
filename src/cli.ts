@@ -532,7 +532,14 @@ async function main(argv: string[]): Promise<number> {
         const { exposeCloudflareUp, exposeCloudflareOff } = await import(
           "./commands/expose-cloudflare.ts"
         );
-        const cfOpts = flagExtract.tunnelName ? { tunnelName: flagExtract.tunnelName } : {};
+        // `supervisor: {}` opts into the Phase 4 dual-dispatch (design §4.3): on
+        // a box with a hub unit installed, ensure the unit + drive the running
+        // supervisor for the post-expose vault restart, and leave the hub running
+        // on `off`; on a legacy detached box (no unit), the unchanged path.
+        const cfOpts = {
+          supervisor: {},
+          ...(flagExtract.tunnelName ? { tunnelName: flagExtract.tunnelName } : {}),
+        };
         if (action === "off") {
           return await exposeCloudflareOff(cfOpts);
         }
@@ -544,7 +551,14 @@ async function main(argv: string[]): Promise<number> {
           // doesn't block on an invisible prompt.
           if (isTtyInteractive()) {
             const { exposePublicInteractive } = await import("./commands/expose-interactive.ts");
-            return await exposePublicInteractive({ preselect: "cloudflare" });
+            // Thread `supervisor: {}` into BOTH provider opts so the interactive
+            // path takes the Phase 4 unit-arm on a unit-managed box regardless of
+            // which provider the operator picks (design §4.3).
+            return await exposePublicInteractive({
+              preselect: "cloudflare",
+              exposeOpts: { supervisor: {} },
+              cloudflareOpts: { supervisor: {} },
+            });
           }
           console.error("parachute expose public --cloudflare: --domain <hostname> is required.");
           console.error("Example: parachute expose public --cloudflare --domain vault.example.com");
@@ -561,7 +575,14 @@ async function main(argv: string[]): Promise<number> {
         return await exposeCloudflareUp(flagExtract.domain, cfOpts);
       }
 
-      const exposeOpts = hubExtract.hubOrigin ? { hubOrigin: hubExtract.hubOrigin } : {};
+      // `supervisor: {}` opts into the Phase 4 dual-dispatch (design §4.3): on a
+      // box with a hub unit installed, ensure the unit (not a detached spawn) +
+      // drive the running supervisor for the post-expose vault restart, and leave
+      // the hub running on `off`; on a legacy detached box, the unchanged path.
+      const exposeOpts = {
+        supervisor: {},
+        ...(hubExtract.hubOrigin ? { hubOrigin: hubExtract.hubOrigin } : {}),
+      };
 
       // `--tailnet` is the explicit Tailscale Funnel pin — bypass both the
       // interactive picker and the non-TTY auto-pick. Goes straight to
@@ -576,7 +597,9 @@ async function main(argv: string[]): Promise<number> {
       // hands back to the flag-driven entry points.
       if (layer === "public" && action === "up" && isTtyInteractive()) {
         const { exposePublicInteractive } = await import("./commands/expose-interactive.ts");
-        return await exposePublicInteractive({ exposeOpts });
+        // `exposeOpts` already carries `supervisor: {}`; thread it into the
+        // Cloudflare branch too so the unit-arm applies regardless of pick.
+        return await exposePublicInteractive({ exposeOpts, cloudflareOpts: { supervisor: {} } });
       }
 
       // Non-TTY auto-pick: detect which provider is configured and run it.
@@ -595,7 +618,12 @@ async function main(argv: string[]): Promise<number> {
       // guessing intent.
       if (layer === "public" && action === "up" && !flagExtract.skipProviderCheck) {
         const { exposePublicAutoPick } = await import("./commands/expose-public-auto.ts");
-        return await exposePublicAutoPick({ tailscaleOpts: exposeOpts });
+        // `tailscaleOpts` carries `supervisor: {}`; thread it into the Cloudflare
+        // branch too so the Phase 4 unit-arm applies regardless of auto-pick.
+        return await exposePublicAutoPick({
+          tailscaleOpts: exposeOpts,
+          cloudflareOpts: { supervisor: {} },
+        });
       }
 
       // `expose public off` (no `--cloudflare`) auto-detects which provider is
@@ -604,7 +632,16 @@ async function main(argv: string[]): Promise<number> {
       // remember which provider they brought up last.
       if (layer === "public" && action === "off") {
         const { runExposePublicOffAutoDetect } = await import("./commands/expose-off-auto.ts");
-        return await runExposePublicOffAutoDetect({ tailscaleOffOpts: exposeOpts });
+        // `tailscaleOffOpts` carries `supervisor: {}`; thread it into the
+        // Cloudflare teardown leg too so the Phase 4 supervisor resolution is
+        // consistent across both providers on the auto-detect path (matching
+        // the explicit `--cloudflare off` branch above). Harmless today
+        // (exposeCloudflareOff has no stopHub call) but keeps `supervisor: {}`
+        // threaded everywhere.
+        return await runExposePublicOffAutoDetect({
+          tailscaleOffOpts: exposeOpts,
+          cloudflareOffOpts: { supervisor: {} },
+        });
       }
 
       // `--skip-provider-check` fallthrough: pin to today's Tailscale-Funnel
@@ -692,7 +729,11 @@ async function main(argv: string[]): Promise<number> {
         );
         return 1;
       }
-      const upgradeOpts: Parameters<typeof upgrade>[1] = {};
+      // `supervisor: {}` opts into the Phase 4 dual-dispatch (design §5): on a
+      // box with a hub unit installed, `upgrade hub` rewrites the binary then
+      // restarts the UNIT via the platform manager (children re-boot from
+      // services.json); on a legacy detached box, the unchanged restart path.
+      const upgradeOpts: Parameters<typeof upgrade>[1] = { supervisor: {} };
       if (tagExtract.tag) upgradeOpts.tag = tagExtract.tag;
       if (channelExtract.value === "rc" || channelExtract.value === "latest") {
         upgradeOpts.channel = channelExtract.value;
