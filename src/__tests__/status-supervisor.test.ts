@@ -40,7 +40,15 @@ const STUB_INSTALL_SOURCE = {
   readGitHead: () => undefined,
 };
 
-/** A throwaway db handle the seams never actually read (fetchModuleStates is stubbed). */
+/**
+ * A throwaway db handle exposing ONLY `{ close }`. This is intentionally minimal:
+ * on the supervisor status path the db is never READ — module states come from
+ * the API (`fetchModuleStates`, stubbed here), and `buildSupervisorRows` only
+ * opens the handle to pass it through + `close()` it in `finally`. The
+ * `as unknown as Database` cast at the call site widens this to the full type;
+ * if a future change adds a real db read on this path, it will fail at RUNTIME
+ * (missing method) rather than typecheck — so wire the needed method in here.
+ */
 function fakeOpenDb(): { close: () => void } {
   return { close: () => {} };
 }

@@ -642,9 +642,16 @@ function mapSupervisorStatus(status: string | null): {
       // (skipped) so a mid-restart module doesn't flip `status` to exit 1.
       return { stateLabel: "pending", healthy: true, skipped: true };
     default:
-      // stopped / null / unknown — operator-stopped or never started. Expected,
-      // not a failure (skipped) — same exit semantics as the detached arm's
-      // `inactive` rows.
+      // stopped / null / unknown — operator-stopped or never started. The
+      // `skipped: true` + `healthy: false` pairing is DELIBERATE, not a mismatch:
+      //   - `healthy: false` is honest — an inactive module is genuinely not
+      //     serving (so a detail renderer can style it as down, not green).
+      //   - `skipped: true` keeps the exit-code check (`rows.some(r => !r.skipped
+      //     && !r.healthy)` at the call site, ~:385) from counting an
+      //     operator-stopped module as a FAILURE — `parachute stop vault` then
+      //     `status` must still exit 0.
+      // This is the same combination + exit semantics the detached arm uses for
+      // its `inactive` (operator-stopped) rows.
       return { stateLabel: "inactive", healthy: false, skipped: true };
   }
 }

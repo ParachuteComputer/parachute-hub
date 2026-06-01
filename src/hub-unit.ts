@@ -388,6 +388,11 @@ function mapSystemdActiveToken(token: string): HubUnitState {
       return "active";
     case "activating":
     case "reloading":
+    // `deactivating` (an in-flight stop transition) deliberately maps to
+    // `activating` → our `pending` vocabulary: it's a transient transition, not
+    // a terminal state. During a `parachute stop hub` the unit may momentarily
+    // read `pending` here before settling to `inactive` — the next status poll
+    // resolves it. Better a brief "pending" than flapping to a false "active".
     case "deactivating":
       return "activating";
     case "failed":
@@ -432,6 +437,12 @@ function parseLaunchctlPrint(stdout: string): HubUnitStateResult {
     return { state: "inactive", lastExitCode, ...(detail ? { detail } : {}) };
   }
   // No state and no exit-code line — the descriptor told us nothing usable.
+  // Distinguish `unknown` (non-empty but unparseable stdout — e.g. a future
+  // macOS `launchctl print` field layout we don't recognize) from `inactive`
+  // (empty/absent body — the label isn't loaded). This is deliberate: a new
+  // layout must NOT be misread as a false `inactive` (which would tell the
+  // operator the hub is stopped when it may well be running) — `unknown` keeps
+  // the raw `detail` for diagnosis instead.
   return detail ? { state: "unknown", detail } : { state: "inactive" };
 }
 
