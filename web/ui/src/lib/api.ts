@@ -1355,6 +1355,93 @@ export async function getHubStatus(): Promise<HubStatus> {
   return (await res.json()) as HubStatus;
 }
 
+/**
+ * SPA-driven hub self-upgrade (design 2026-06-01 §5.3 / D4). The hub is NOT a
+ * supervised module, so it has a dedicated endpoint pair:
+ *   - POST /api/hub/upgrade        → 202 { operation_id, target_version, channel, mode }
+ *   - GET  /api/hub/upgrade/status → poll the on-disk status the detached helper writes
+ *
+ * `mode` is the §5.3 in-place-vs-redeploy detection: `in-place` means the hub
+ * was rewritten + (about to be) restarted; `redeploy-required` means the hub is
+ * image-pinned (Render/Fly) and the operator must redeploy from their dashboard
+ * — the SPA shows that instead of a false "upgraded."
+ */
+export type HubUpgradeMode = "in-place" | "redeploy-required";
+export type HubUpgradeChannel = "rc" | "latest";
+
+export interface HubUpgradeAccepted {
+  operation_id: string;
+  target_version: string | null;
+  channel: HubUpgradeChannel;
+  mode: HubUpgradeMode;
+}
+
+export type HubUpgradePhase =
+  | "pending"
+  | "running"
+  | "restarting"
+  | "succeeded"
+  | "failed"
+  | "redeploy-required";
+
+export interface HubUpgradeStatus {
+  operation_id: string;
+  phase: HubUpgradePhase;
+  mode: HubUpgradeMode;
+  current_version: string;
+  target_version: string | null;
+  channel: HubUpgradeChannel;
+  log: string[];
+  error?: string;
+  started_at: string;
+  finished_at?: string;
+}
+
+/**
+ * POST /api/hub/upgrade — kick off the hub self-upgrade. Returns the 202 body.
+ * The optional `channel` is the closed enum the backend validates (rc|latest);
+ * omit it to let the hub auto-detect from its current version.
+ */
+export async function startHubUpgrade(channel?: HubUpgradeChannel): Promise<HubUpgradeAccepted> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/hub/upgrade", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+      ...(channel ? { "content-type": "application/json" } : {}),
+    },
+    ...(channel ? { body: JSON.stringify({ channel }) } : {}),
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as HubUpgradeAccepted;
+}
+
+/**
+ * GET /api/hub/upgrade/status — poll the on-disk upgrade status. Returns null
+ * when no upgrade has been started (404) — the SPA treats that as "idle." A
+ * network error during the hub restart is expected (the hub is down); callers
+ * should swallow it and keep polling `/health` + `/api/hub` for the new version.
+ */
+export async function getHubUpgradeStatus(): Promise<HubUpgradeStatus | null> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/hub/upgrade/status", {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 404) return null;
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as HubUpgradeStatus;
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const text = await res.text();
