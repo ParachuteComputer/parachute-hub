@@ -39,6 +39,7 @@ import { MissingDependencyError, type MissingDependencyWire } from "@openparachu
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import { isLinked as defaultIsLinked } from "./bun-link.ts";
 import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
+import { buildModuleSpawnRequest } from "./commands/serve-boot.ts";
 import { getModuleInstallChannel } from "./hub-settings.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import { readModuleManifest } from "./module-manifest.ts";
@@ -456,6 +457,11 @@ async function spawnSupervised(
   // anchors the child's iss expectation to the same value hub mints with.
   //
   // `deps.spawnEnv` still wins (test seam + first-boot vault-name pass-through).
+  //
+  // No per-service `.env` here, by design: the install path runs before the
+  // operator has had a chance to write `configDir/<short>/.env`, so install
+  // spawns with install-env only. The per-service `.env` is layered in by
+  // `buildModuleSpawnRequest` (serve-boot.ts) on the next `boot` or `start`.
   const childEnv: Record<string, string> = {
     PORT: String(entry.port),
     ...(deps.issuer ? { PARACHUTE_HUB_ORIGIN: deps.issuer } : {}),
@@ -711,6 +717,115 @@ export async function runInstall(
   });
 
   registry.update(opId, { status: "succeeded" }, `${short} installed + spawned (pid ${state.pid})`);
+}
+
+/**
+ * POST /api/modules/:short/start — synchronous.
+ *
+ * A pure `supervisor.start(req)` of an ALREADY-INSTALLED module, using
+ * the same boot-derived SpawnRequest `bootSupervisedModules` builds
+ * (PORT / per-service .env / PARACHUTE_HUB_ORIGIN injection via the
+ * shared `buildModuleSpawnRequest`). This is the §3.3 endpoint Phase 3
+ * will repoint `parachute start <svc>` onto.
+ *
+ * Explicitly NOT an install: it does not run `bun add -g`, seed
+ * services.json, stamp installDir, or refresh well-known. If the module
+ * isn't in services.json (never installed) it returns 400 `not_installed`
+ * with an actionable hint — not a silent install. If services.json
+ * carries the row but no startCmd is resolvable (CLI-only module,
+ * unreadable module.json), it returns 422 `no_start_cmd`.
+ *
+ * Synchronous like restart: `supervisor.start` returns the new state in
+ * the body; no operation poll needed. Idempotent — starting an
+ * already-running module returns its existing state (the supervisor's
+ * own idempotent `start`).
+ */
+export async function handleStart(
+  req: Request,
+  short: CuratedModuleShort,
+  deps: ApiModulesOpsDeps,
+): Promise<Response> {
+  if (req.method !== "POST") return jsonError(405, "method_not_allowed", "use POST");
+  const authFail = await authorize(req, deps);
+  if (authFail) return authFail;
+
+  const spec = specFor(short);
+
+  // Pure-spawn precondition: the module must already be installed
+  // (present in services.json). `start` never installs — that's the
+  // install endpoint's job, which is far heavier (bun add -g / seed /
+  // stamp). A missing row is an operator error worth a clear message.
+  const entry = findService(spec.manifestName, deps.manifestPath);
+  if (!entry) {
+    return jsonError(
+      400,
+      "not_installed",
+      `${short} is not installed (no services.json entry) — install it first via POST /api/modules/${short}/install`,
+    );
+  }
+
+  // KNOWN_MODULES shorts (vault / scribe / runner): module.json is the
+  // canonical source for startCmd. Re-resolve from
+  // `<installDir>/.parachute/module.json` when installDir is stamped so the
+  // module is authoritative for its own spawn cmd — mirroring runInstall's
+  // post-bun-add re-resolve. Falls back to the imperative `extras.startCmd`
+  // carried by `spec` when installDir is absent or module.json is unreadable.
+  let spawnSpec: ServiceSpec = spec;
+  if (entry.installDir && KNOWN_MODULES[short]) {
+    const resolved = await resolveSpawnSpec(short, entry.installDir);
+    if (resolved) spawnSpec = resolved;
+  }
+
+  const cmd = spawnSpec.startCmd?.(entry);
+  if (!cmd || cmd.length === 0) {
+    return jsonError(
+      422,
+      "no_start_cmd",
+      `${short} has no resolvable startCmd (CLI-only module, or <installDir>/.parachute/module.json missing a startCmd)`,
+    );
+  }
+
+  // Build the SpawnRequest identically to the serve-boot path so `start`
+  // and boot produce the same child env (PORT / .env / HUB_ORIGIN). The
+  // test-seam / first-boot `spawnEnv` rides the shared helper's `extraEnv`
+  // and wins last, matching `spawnSupervised`'s precedence.
+  const spawnReq = buildModuleSpawnRequest(short, entry, cmd, {
+    configDir: deps.configDir,
+    ...(deps.issuer ? { hubOrigin: deps.issuer } : {}),
+    ...(deps.spawnEnv ? { extraEnv: deps.spawnEnv } : {}),
+  });
+
+  const state = await deps.supervisor.start(spawnReq as SpawnRequest);
+  return jsonOk({ short, state });
+}
+
+/**
+ * POST /api/modules/:short/stop — synchronous.
+ *
+ * A pure `supervisor.stop(short)` — SIGTERM the child, await exit (with
+ * SIGKILL escalation), mark `stopped`. Distinct from uninstall, which
+ * stops-then-removes the services.json row + `bun remove`s the package.
+ * `stop` leaves the module installed; it's the §3.3 endpoint Phase 3
+ * will repoint `parachute stop <svc>` onto.
+ *
+ * Idempotent: stopping a not-supervised module returns 200 with a
+ * `stopped: false` flag (nothing to stop) rather than erroring — the
+ * caller's intent ("ensure it's not running") is already satisfied.
+ */
+export async function handleStop(
+  req: Request,
+  short: CuratedModuleShort,
+  deps: ApiModulesOpsDeps,
+): Promise<Response> {
+  if (req.method !== "POST") return jsonError(405, "method_not_allowed", "use POST");
+  const authFail = await authorize(req, deps);
+  if (authFail) return authFail;
+
+  const state = await deps.supervisor.stop(short);
+  if (!state) {
+    return jsonOk({ short, stopped: false });
+  }
+  return jsonOk({ short, stopped: true, state });
 }
 
 /**

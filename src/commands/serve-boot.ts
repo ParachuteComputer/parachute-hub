@@ -47,6 +47,62 @@ export interface BootedModule {
   readonly reason?: string;
 }
 
+export interface SpawnReqShape {
+  short: string;
+  cmd: readonly string[];
+  cwd?: string;
+  env?: Record<string, string>;
+}
+
+export interface BuildSpawnRequestOpts {
+  /** Config dir ($PARACHUTE_HOME). Used to read the module's per-service `.env`. */
+  readonly configDir: string;
+  /** Canonical hub origin → child env `PARACHUTE_HUB_ORIGIN`. Skipped when absent. */
+  readonly hubOrigin?: string;
+  /**
+   * Extra env merged on top of the derived env (PORT / .env / HUB_ORIGIN).
+   * Wins over all of them. Used by the API `start` handler's test seam +
+   * first-boot vault-name pass-through (`spawnEnv`). Empty/absent on the
+   * boot path.
+   */
+  readonly extraEnv?: Record<string, string>;
+}
+
+/**
+ * Build the `Supervisor.start` request for a single module, identically on
+ * both the serve-boot path and the `POST /api/modules/:short/start` handler.
+ *
+ * Env layering (later wins):
+ *   1. `PORT` from the services.json `entry.port` — overrides hub's own PORT
+ *      so supervised children honor their canonical port assignment
+ *      (hub#356/#357).
+ *   2. per-service `.env` at `<configDir>/<short>/.env` — operator-configured
+ *      values (e.g. scribe provider keys) override the bare PORT.
+ *   3. `PARACHUTE_HUB_ORIGIN` = `opts.hubOrigin` — anchors the child's `iss`
+ *      expectation to the value hub mints with (hub#365).
+ *   4. `opts.extraEnv` — test seam / first-boot pass-through; wins last.
+ *
+ * `cwd` is set to `entry.installDir` when present (third-party modules ship
+ * relative startCmds that need it; first-party fallbacks use absolute / PATH
+ * binaries so cwd is a no-op there).
+ */
+export function buildModuleSpawnRequest(
+  short: string,
+  entry: ServiceEntry,
+  cmd: readonly string[],
+  opts: BuildSpawnRequestOpts,
+): SpawnReqShape {
+  const fileEnv = readEnvFileValues(join(opts.configDir, short, ".env"));
+  const env: Record<string, string> = { PORT: String(entry.port), ...fileEnv };
+  if (opts.hubOrigin) env[HUB_ORIGIN_ENV] = opts.hubOrigin;
+  if (opts.extraEnv) Object.assign(env, opts.extraEnv);
+
+  const req: SpawnReqShape = { short, cmd };
+  if (entry.installDir) req.cwd = entry.installDir;
+  if (Object.keys(env).length > 0) req.env = env;
+  return req;
+}
+
 /**
  * Walk services.json, spawn every manageable module via the
  * supervisor. Returns a per-module decision log so the caller can
@@ -92,31 +148,14 @@ export async function bootSupervisedModules(
       continue;
     }
 
-    // PORT override (hub#357 — third spawn site missed by hub#356).
-    // Without this, modules that read process.env.PORT (vault, scribe)
-    // inherit hub's PORT from Bun.spawn's env: process.env default and
-    // crash EADDRINUSE on hub's port. Container deploy was still broken
-    // after #356 because this BOOT path runs on hub startup before the
-    // supervisor's other spawn paths see any traffic. fileEnv wins on
-    // collision so per-service .env can still override.
-    const fileEnv = readEnvFileValues(join(opts.configDir, short, ".env"));
-    const env: Record<string, string> = { PORT: String(entry.port), ...fileEnv };
-    if (opts.hubOrigin) env[HUB_ORIGIN_ENV] = opts.hubOrigin;
-
-    const req: {
-      short: string;
-      cmd: readonly string[];
-      cwd?: string;
-      env?: Record<string, string>;
-    } = {
-      short,
-      cmd,
-    };
-    // Third-party modules ship clean relative startCmds — cwd:
-    // installDir makes them resolve. First-party fallbacks use
-    // absolute / PATH binaries so cwd is a no-op there.
-    if (entry.installDir) req.cwd = entry.installDir;
-    if (Object.keys(env).length > 0) req.env = env;
+    // PORT override (hub#357 — third spawn site missed by hub#356), per-service
+    // .env merge, and PARACHUTE_HUB_ORIGIN propagation (hub#365) all live in the
+    // shared `buildModuleSpawnRequest` so the `POST /api/modules/:short/start`
+    // handler builds an identical request (design 2026-06-01 §3.3).
+    const req = buildModuleSpawnRequest(short, entry, cmd, {
+      configDir: opts.configDir,
+      ...(opts.hubOrigin !== undefined ? { hubOrigin: opts.hubOrigin } : {}),
+    });
 
     await supervisor.start(req);
     log(`[supervisor] ${short}: started (cmd=${cmd.join(" ")}).`);
