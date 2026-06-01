@@ -454,7 +454,11 @@ async function main(argv: string[]): Promise<number> {
         console.log(statusHelp());
         return 0;
       }
-      return await status();
+      // Pass an empty `supervisor` block so `status` takes the Phase 3c
+      // dual-dispatch: on a box with a hub unit installed it reads the platform
+      // manager + the running supervisor; on a legacy detached box it falls back
+      // to the pidfile readout (design §6.4). Tests drive the seams directly.
+      return await status({ supervisor: {} });
 
     case "expose": {
       const hubExtract = extractHubOrigin(rest);
