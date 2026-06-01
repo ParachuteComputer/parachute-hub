@@ -240,6 +240,107 @@ function tailHubUnitLog(deps: HubUnitDeps, lines: number): string[] {
   return out;
 }
 
+/** Outcome of a `stop hub` / `restart hub` via the platform manager (§3.3). */
+export type HubUnitManagerOpOutcome =
+  /** The manager command succeeded (the unit was stopped / restarted). */
+  | "ok"
+  /** No service manager (systemd/launchd) is available. */
+  | "no-manager"
+  /** No hub unit is installed. */
+  | "no-unit"
+  /** The platform manager rejected the command (carries its stderr). */
+  | "failed";
+
+export interface HubUnitManagerOpResult {
+  outcome: HubUnitManagerOpOutcome;
+  /** Human-readable lines the caller should surface. */
+  messages: string[];
+}
+
+/**
+ * Stop the hub UNIT via the platform manager (design §3.3 `stop hub` row).
+ *
+ * MUST go through the manager — NEVER a PID signal. launchd `KeepAlive` and
+ * systemd `Restart=always` would immediately respawn a killed PID (R17), so a
+ * `kill` would be silently undone. The manager call deregisters the unit's
+ * keep-alive intent so the hub actually stays down:
+ *   - launchd  → `launchctl bootout gui/<uid>/<label>` (unloads + stops; a
+ *     subsequent `start hub` re-bootstraps via the install path / `init`).
+ *   - systemd  → `systemctl [--user] stop <unit>` (Restart=always does not
+ *     re-trigger on an explicit `stop`).
+ *
+ * Children die with the hub (`serve`'s stop() SIGTERMs all supervised children
+ * before `server.stop()`), so stopping the unit stops every module too.
+ *
+ * Returns a structured outcome; the caller maps it to exit code + messaging.
+ * Does NOT install a unit when none exists, and does NOT signal any PID.
+ */
+export function stopHubUnit(deps: HubUnitDeps): HubUnitManagerOpResult {
+  if (!hasServiceManager(deps)) {
+    return { outcome: "no-manager", messages: [NO_MANAGER_MESSAGE] };
+  }
+  if (!isHubUnitInstalled(deps)) {
+    return { outcome: "no-unit", messages: [NO_UNIT_MESSAGE] };
+  }
+  let res: ServiceCommandResult;
+  if (deps.platform === "darwin") {
+    const uid = deps.getuid() ?? 0;
+    // bootout unloads + stops the LaunchAgent so KeepAlive can't resurrect it.
+    res = deps.run(["launchctl", "bootout", `gui/${uid}/${HUB_LAUNCHD_LABEL}`]);
+  } else {
+    const root = (deps.getuid() ?? 1000) === 0;
+    const scope = root ? [] : ["--user"];
+    res = deps.run(["systemctl", ...scope, "stop", HUB_SYSTEMD_UNIT_NAME]);
+  }
+  if (res.code !== 0) {
+    const detail = res.stderr.trim() || res.stdout.trim() || "unknown error";
+    return {
+      outcome: "failed",
+      messages: [`failed to stop the hub unit via the service manager (${detail})`],
+    };
+  }
+  return { outcome: "ok", messages: [] };
+}
+
+/**
+ * Restart the hub UNIT via the platform manager (design §3.3 `restart hub`
+ * row). MUST go through the manager — NEVER a PID signal (same R17 reasoning as
+ * {@link stopHubUnit}). NOT a per-module fan-out: restarting the hub tears down
+ * all supervised children and re-boots every module from `services.json`, so a
+ * unit restart is already a total restart of the box's modules.
+ *   - launchd  → `launchctl kickstart -k gui/<uid>/<label>` (force-restart;
+ *     the same command the start path uses, which on an already-loaded unit
+ *     kills + relaunches).
+ *   - systemd  → `systemctl [--user] restart <unit>`.
+ *
+ * Returns a structured outcome; the caller maps it to exit code + messaging.
+ */
+export function restartHubUnit(deps: HubUnitDeps): HubUnitManagerOpResult {
+  if (!hasServiceManager(deps)) {
+    return { outcome: "no-manager", messages: [NO_MANAGER_MESSAGE] };
+  }
+  if (!isHubUnitInstalled(deps)) {
+    return { outcome: "no-unit", messages: [NO_UNIT_MESSAGE] };
+  }
+  let res: ServiceCommandResult;
+  if (deps.platform === "darwin") {
+    const uid = deps.getuid() ?? 0;
+    res = deps.run(["launchctl", "kickstart", "-k", `gui/${uid}/${HUB_LAUNCHD_LABEL}`]);
+  } else {
+    const root = (deps.getuid() ?? 1000) === 0;
+    const scope = root ? [] : ["--user"];
+    res = deps.run(["systemctl", ...scope, "restart", HUB_SYSTEMD_UNIT_NAME]);
+  }
+  if (res.code !== 0) {
+    const detail = res.stderr.trim() || res.stdout.trim() || "unknown error";
+    return {
+      outcome: "failed",
+      messages: [`failed to restart the hub unit via the service manager (${detail})`],
+    };
+  }
+  return { outcome: "ok", messages: [] };
+}
+
 /**
  * Ensure the hub UNIT is up (design §3.2). Probe `/health`; if down, start the
  * unit via the platform manager; wait for readiness; surface the unit log on

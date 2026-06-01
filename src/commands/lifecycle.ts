@@ -19,7 +19,28 @@ import {
 } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { HUB_ORIGIN_ENV, deriveHubOrigin } from "../hub-origin.ts";
+import {
+  type EnsureHubUnitOpts,
+  type EnsureHubUnitResult,
+  HUB_UNIT_DEFAULT_PORT,
+  type HubUnitDeps,
+  type HubUnitManagerOpResult,
+  defaultHubUnitDeps,
+  ensureHubUnit as ensureHubUnitImpl,
+  isHubUnitInstalled,
+  restartHubUnit as restartHubUnitImpl,
+  stopHubUnit as stopHubUnitImpl,
+} from "../hub-unit.ts";
 import { ModuleManifestError, readModuleManifest } from "../module-manifest.ts";
+import {
+  type DriveModuleOpDeps,
+  type ModuleOp,
+  ModuleOpHttpError,
+  type ModuleOpResult,
+  NoOperatorTokenError,
+  OperatorTokenExpiredError,
+  driveModuleOp as driveModuleOpImpl,
+} from "../module-ops-client.ts";
 import { type OperatorIssuerHealStatus, selfHealOperatorTokenIssuer } from "../operator-token.ts";
 import { type PortListeningFn, defaultPortListening } from "../port-probe.ts";
 import {
@@ -285,6 +306,58 @@ export interface LifecycleOpts {
       log: (line: string) => void;
     }) => Promise<OperatorIssuerHealStatus>;
   };
+  /**
+   * Phase 3b supervisor-path seams (design §3.3). When a hub UNIT is installed
+   * (launchd/systemd/container — detected via {@link isHubUnitInstalled}),
+   * `start/stop/restart` drive the RUNNING hub's in-process Supervisor over the
+   * loopback module-ops API instead of spawning detached pidfile daemons. The
+   * detached arm (`spawner`/`hub.ensureRunning`/`hub.stop`) remains the no-unit
+   * fallback until Phase 5 retires it.
+   *
+   * Everything here is injectable so tests can (a) force the unit-installed
+   * branch without a real launchd/systemd, and (b) assert the module-ops /
+   * manager calls without a live hub. Production wires the real
+   * {@link driveModuleOp} / {@link ensureHubUnit} / {@link stopHubUnit} /
+   * {@link restartHubUnit} against an opened hub.db + the resolved hub origin.
+   */
+  supervisor?: {
+    /**
+     * Is a hub unit installed (the dual-dispatch discriminant)? Production
+     * uses `isHubUnitInstalled(hubUnitDeps)`. Tests set this `true`/`false`
+     * directly to pick the branch deterministically. When set, it wins over
+     * the `hubUnitDeps`-derived detection.
+     */
+    unitInstalled?: boolean;
+    /** Deps for the real `isHubUnitInstalled` probe + the hub-unit manager ops. */
+    hubUnitDeps?: HubUnitDeps;
+    /** Drive a per-module op against the running hub (reads operator.token). */
+    driveModuleOp?: (
+      short: string,
+      op: ModuleOp,
+      deps: DriveModuleOpDeps,
+    ) => Promise<ModuleOpResult>;
+    /** Ensure the hub unit is up before a module op (§3.2). */
+    ensureHubUnit?: (opts: EnsureHubUnitOpts) => Promise<EnsureHubUnitResult>;
+    /** Stop the hub unit via the platform manager (NEVER a PID signal, §3.3). */
+    stopHubUnit?: (deps: HubUnitDeps) => HubUnitManagerOpResult;
+    /** Restart the hub unit via the platform manager (NEVER a PID signal, §3.3). */
+    restartHubUnit?: (deps: HubUnitDeps) => HubUnitManagerOpResult;
+    /**
+     * Probe whether the loopback hub answers `/health`. Used by `stop <svc>`:
+     * if the hub is down, the supervised module is already down (children die
+     * with the hub) → report "already stopped" WITHOUT starting the hub.
+     * Production reuses the hub-unit deps' `probeHealth`.
+     */
+    probeHubHealth?: (port: number) => Promise<boolean>;
+    /**
+     * Open the hub DB used to validate/auto-rotate the operator token in
+     * `driveModuleOp`. Production opens `<configDir>/hub.db`; tests inject an
+     * in-memory/seeded db. Returns a handle the caller closes.
+     */
+    openDb?: (configDir: string) => import("bun:sqlite").Database;
+    /** Loopback hub base URL override (default derives from the hub port). */
+    baseUrl?: string;
+  };
 }
 
 interface Resolved {
@@ -311,6 +384,21 @@ interface Resolved {
     configDir: string;
     log: (line: string) => void;
   }) => Promise<OperatorIssuerHealStatus>;
+  sup: ResolvedSupervisor;
+}
+
+/** Resolved Phase 3b supervisor-path seams (see `LifecycleOpts.supervisor`). */
+interface ResolvedSupervisor {
+  /** Whether a hub unit is installed — the dual-dispatch discriminant. */
+  unitInstalled: boolean;
+  hubUnitDeps: HubUnitDeps;
+  driveModuleOp: (short: string, op: ModuleOp, deps: DriveModuleOpDeps) => Promise<ModuleOpResult>;
+  ensureHubUnit: (opts: EnsureHubUnitOpts) => Promise<EnsureHubUnitResult>;
+  stopHubUnit: (deps: HubUnitDeps) => HubUnitManagerOpResult;
+  restartHubUnit: (deps: HubUnitDeps) => HubUnitManagerOpResult;
+  probeHubHealth: (port: number) => Promise<boolean>;
+  openDb: (configDir: string) => import("bun:sqlite").Database;
+  baseUrl: string | undefined;
 }
 
 /**
@@ -378,7 +466,58 @@ function resolve(opts: LifecycleOpts): Resolved {
     ensureHub: opts.hub?.ensureRunning ?? ensureHubRunning,
     stopHubFn: opts.hub?.stop ?? stopHub,
     selfHealOperatorTokenFn: opts.hub?.selfHealOperatorToken ?? defaultSelfHealOperatorToken,
+    sup: resolveSupervisor(opts.supervisor),
   };
+}
+
+/**
+ * Resolve the Phase 3b supervisor-path seams (the dual-dispatch arm).
+ *
+ * The discriminant `unitInstalled` decides which arm a verb takes:
+ *   - When the caller PROVIDES a `supervisor` block (even `{}`, which the
+ *     production CLI dispatch passes), `unitInstalled` is the explicit override
+ *     if set, else the real `isHubUnitInstalled` probe over the hub-unit deps —
+ *     so on a box with a launchd/systemd hub unit the verbs drive the running
+ *     supervisor, and on a legacy detached box they take the detached arm.
+ *   - When the caller OMITS `supervisor` entirely (the shape of every existing
+ *     lifecycle test, which never opts into the new path), `unitInstalled`
+ *     defaults to `false` → the detached arm. This keeps those tests
+ *     DETERMINISTIC regardless of whether the test host happens to have a real
+ *     hub unit installed. New Phase 3b tests opt into the supervisor arm by
+ *     passing `supervisor: { unitInstalled: true, … }`.
+ */
+function resolveSupervisor(opts: LifecycleOpts["supervisor"]): ResolvedSupervisor {
+  const hubUnitDeps = opts?.hubUnitDeps ?? defaultHubUnitDeps;
+  // No `supervisor` block at all → detached arm, deterministically. Only probe
+  // the real filesystem when the caller opted into the new path (production CLI
+  // passes `supervisor: {}`; tests pass the seams they want to assert).
+  const unitInstalled =
+    opts === undefined ? false : (opts.unitInstalled ?? isHubUnitInstalled(hubUnitDeps));
+  return {
+    unitInstalled,
+    hubUnitDeps,
+    driveModuleOp: opts?.driveModuleOp ?? driveModuleOpImpl,
+    ensureHubUnit: opts?.ensureHubUnit ?? ensureHubUnitImpl,
+    stopHubUnit: opts?.stopHubUnit ?? stopHubUnitImpl,
+    restartHubUnit: opts?.restartHubUnit ?? restartHubUnitImpl,
+    probeHubHealth: opts?.probeHubHealth ?? hubUnitDeps.probeHealth,
+    openDb: opts?.openDb ?? ((configDir) => openHubDb(hubDbPath(configDir))),
+    baseUrl: opts?.baseUrl,
+  };
+}
+
+/**
+ * Resolve the hub origin used as the operator token's `iss` validator in the
+ * supervisor path. Unlike {@link resolveHubOrigin} (which returns `undefined`
+ * for pure loopback so the spawn env omits PARACHUTE_HUB_ORIGIN), the operator
+ * token ALWAYS carries an `iss`, so this falls back to the canonical loopback
+ * origin. Mirrors `commands/auth.ts`'s `resolveHubIssuer` so the issuer the CLI
+ * validates the token against matches what `auth rotate-operator` minted under.
+ */
+function resolveOperatorTokenIssuer(hubOrigin: string | undefined, configDir: string): string {
+  if (hubOrigin) return hubOrigin;
+  const port = readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT;
+  return `http://127.0.0.1:${port}`;
 }
 
 /**
@@ -548,6 +687,12 @@ async function resolveTargets(
 
 export async function start(svc: string | undefined, opts: LifecycleOpts = {}): Promise<number> {
   const r = resolve(opts);
+  // Phase 3b dual-dispatch (design §3.3). On a box with a hub unit installed,
+  // drive the RUNNING supervisor; otherwise fall through to the unchanged
+  // detached arm below. Phase 5 deletes the else-arm — keep this a clean
+  // top-level branch so that deletion is a one-liner.
+  if (r.sup.unitInstalled) return startViaSupervisor(svc, r);
+  // --- no-unit detached fallback (unchanged; preserved until Phase 5) ---
   if (svc === HUB_SVC) return startHubSvc(r);
   const picked = await resolveTargets(svc, r.manifestPath);
   if ("error" in picked) {
@@ -789,6 +934,10 @@ function persistVaultHubOriginForStart(r: Resolved): void {
 
 export async function stop(svc: string | undefined, opts: LifecycleOpts = {}): Promise<number> {
   const r = resolve(opts);
+  // Phase 3b dual-dispatch (design §3.3). Unit-installed → drive the supervisor
+  // / platform manager; else the unchanged detached arm below.
+  if (r.sup.unitInstalled) return stopViaSupervisor(svc, r);
+  // --- no-unit detached fallback (unchanged; preserved until Phase 5) ---
   if (svc === HUB_SVC) return stopHubSvc(r);
   const picked = await resolveTargets(svc, r.manifestPath);
   if ("error" in picked) {
@@ -840,9 +989,197 @@ export async function stop(svc: string | undefined, opts: LifecycleOpts = {}): P
 }
 
 export async function restart(svc: string | undefined, opts: LifecycleOpts = {}): Promise<number> {
+  const r = resolve(opts);
+  // Phase 3b dual-dispatch (design §3.3). Unit-installed → drive the supervisor
+  // / platform manager (with the 404-fallthrough for modules, §6.2); else the
+  // unchanged detached stop-then-start below.
+  if (r.sup.unitInstalled) return restartViaSupervisor(svc, r);
+  // --- no-unit detached fallback (unchanged; preserved until Phase 5) ---
   const stopCode = await stop(svc, opts);
   if (stopCode !== 0) return stopCode;
   return await start(svc, opts);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3b supervisor-path verb dispatch (design §3.3).
+//
+// These are the NEW arm of the dual-dispatch: when a hub unit is installed,
+// `start/stop/restart` drive the RUNNING hub's in-process Supervisor over the
+// loopback module-ops API (per-module verbs) or the platform manager (hub
+// verbs / no-svc). The detached arm above is untouched and Phase 5 deletes it
+// + this comment block's `unitInstalled` guard, collapsing to this path only.
+// ---------------------------------------------------------------------------
+
+/**
+ * Drive a single module-op against the running hub, mapping the module-ops
+ * client's errors to actionable CLI output (§3.1). Opens hub.db (to validate /
+ * auto-rotate the operator token), resolves the issuer the token was minted
+ * under, and closes the db afterward. Returns the result on success; on a
+ * surfaced error returns `undefined` so the caller can decide (e.g. the restart
+ * 404-fallthrough). Re-throws nothing the caller can't handle: the operator-
+ * token / HTTP errors are caught here and printed.
+ */
+async function driveSupervisorOp(
+  short: string,
+  op: ModuleOp,
+  r: Resolved,
+): Promise<{ result?: ModuleOpResult; httpError?: ModuleOpHttpError; failed: boolean }> {
+  const issuer = resolveOperatorTokenIssuer(r.hubOrigin, r.configDir);
+  const db = r.sup.openDb(r.configDir);
+  try {
+    const deps: DriveModuleOpDeps = {
+      db,
+      issuer,
+      configDir: r.configDir,
+      ...(r.sup.baseUrl !== undefined ? { baseUrl: r.sup.baseUrl } : {}),
+    };
+    const result = await r.sup.driveModuleOp(short, op, deps);
+    return { result, failed: false };
+  } catch (err) {
+    if (err instanceof NoOperatorTokenError || err instanceof OperatorTokenExpiredError) {
+      // Surface the already-actionable message (don't raw-throw a 401, §3.1).
+      r.log(`✗ ${short}: ${err.message}`);
+      return { failed: true };
+    }
+    if (err instanceof ModuleOpHttpError) {
+      // Return the typed HTTP error so the caller can branch (404-fallthrough,
+      // not_installed hint). Callers that don't branch print it via
+      // `surfaceModuleOpHttpError`.
+      return { httpError: err, failed: true };
+    }
+    // Unknown error — surface its message rather than crashing the CLI.
+    r.log(`✗ ${short}: ${err instanceof Error ? err.message : String(err)}`);
+    return { failed: true };
+  } finally {
+    db.close();
+  }
+}
+
+/** Print a module-ops HTTP error with an actionable hint for the known codes. */
+function surfaceModuleOpHttpError(short: string, err: ModuleOpHttpError, r: Resolved): void {
+  if (err.status === 400 && err.code === "not_installed") {
+    r.log(
+      `✗ ${short} is not installed — run \`parachute install ${short}\` first, then \`parachute start ${short}\`.`,
+    );
+    return;
+  }
+  r.log(`✗ ${short}: ${err.message}`);
+}
+
+/**
+ * Ensure the hub unit is up, mapping `ensureHubUnit`'s structured outcome to a
+ * CLI exit signal. Returns true when the hub is up (already-up / started),
+ * false when it isn't (and the messages were surfaced). The `no-unit` outcome
+ * shouldn't reach here under the dual-dispatch (we only take the supervisor arm
+ * when a unit IS installed), but it's handled defensively.
+ */
+async function ensureHubForOp(r: Resolved, port: number): Promise<boolean> {
+  const ensured = await r.sup.ensureHubUnit({
+    port,
+    deps: r.sup.hubUnitDeps,
+    log: r.log,
+  });
+  if (ensured.outcome === "already-up" || ensured.outcome === "started") return true;
+  for (const m of ensured.messages) r.log(m);
+  return false;
+}
+
+/** `start <svc>` / `start` (no svc) over the supervisor (§3.3). */
+async function startViaSupervisor(svc: string | undefined, r: Resolved): Promise<number> {
+  const port = readHubPort(r.configDir) ?? HUB_UNIT_DEFAULT_PORT;
+  // `start hub` / `start` (no svc): ensure the hub unit is up — it transitively
+  // boots every installed module from services.json via bootSupervisedModules.
+  if (svc === HUB_SVC || svc === undefined) {
+    const up = await ensureHubForOp(r, port);
+    if (!up) return 1;
+    r.log(svc === HUB_SVC ? "✓ hub is up." : "✓ hub is up (all installed modules booted).");
+    return 0;
+  }
+  // `start <svc>`: ensure the hub is up first (chicken-and-egg §3.2), then drive
+  // a pure supervisor.start of the already-installed module.
+  if (!(await ensureHubForOp(r, port))) return 1;
+  const { result, httpError, failed } = await driveSupervisorOp(svc, "start", r);
+  if (httpError) {
+    surfaceModuleOpHttpError(svc, httpError, r);
+    return 1;
+  }
+  if (failed || !result) return 1;
+  r.log(`✓ ${svc} started.`);
+  return 0;
+}
+
+/** `stop <svc>` / `stop` (no svc) over the supervisor / platform manager (§3.3). */
+async function stopViaSupervisor(svc: string | undefined, r: Resolved): Promise<number> {
+  const port = readHubPort(r.configDir) ?? HUB_UNIT_DEFAULT_PORT;
+  // `stop hub` / `stop` (no svc): stop the hub UNIT via the platform manager.
+  // MUST go through the manager — a PID signal would be undone by launchd
+  // KeepAlive / systemd Restart=always (R17). Children die with the hub.
+  if (svc === HUB_SVC || svc === undefined) {
+    const res = r.sup.stopHubUnit(r.sup.hubUnitDeps);
+    for (const m of res.messages) r.log(m);
+    if (res.outcome === "ok") {
+      r.log("✓ hub stopped (all supervised modules stopped with it).");
+      return 0;
+    }
+    return 1;
+  }
+  // `stop <svc>`: a supervised module dies WITH the hub. If the hub isn't
+  // reachable, the module is already down — report success WITHOUT starting the
+  // hub (do NOT ensureHubUnit just to stop one module). Only when the hub is up
+  // do we drive the supervisor's stop.
+  if (!(await r.sup.probeHubHealth(port))) {
+    r.log(`${svc} already stopped (the hub isn't running, so its modules are down).`);
+    return 0;
+  }
+  const { httpError, failed, result } = await driveSupervisorOp(svc, "stop", r);
+  if (httpError) {
+    surfaceModuleOpHttpError(svc, httpError, r);
+    return 1;
+  }
+  if (failed || !result) return 1;
+  r.log(`✓ ${svc} stopped.`);
+  return 0;
+}
+
+/** `restart <svc>` / `restart` (no svc) over the supervisor / manager (§3.3). */
+async function restartViaSupervisor(svc: string | undefined, r: Resolved): Promise<number> {
+  // `restart hub` / `restart` (no svc): restart the hub UNIT via the platform
+  // manager. NOT a per-module fan-out — restarting the hub re-boots all modules
+  // anyway. MUST go through the manager (never a PID signal, R17).
+  if (svc === HUB_SVC || svc === undefined) {
+    const res = r.sup.restartHubUnit(r.sup.hubUnitDeps);
+    for (const m of res.messages) r.log(m);
+    if (res.outcome === "ok") {
+      r.log("✓ hub restarted (all modules re-booted).");
+      return 0;
+    }
+    return 1;
+  }
+  // `restart <svc>`: ensure the hub is up, then drive supervisor.restart.
+  const port = readHubPort(r.configDir) ?? HUB_UNIT_DEFAULT_PORT;
+  if (!(await ensureHubForOp(r, port))) return 1;
+  const restartRes = await driveSupervisorOp(svc, "restart", r);
+  if (restartRes.httpError) {
+    // 404-fallthrough (§6.2): a module that isn't currently supervised (crashed
+    // out of budget, skipped at boot, installed out-of-band) returns 404
+    // `not_supervised`. `restart` must be total over module state (matching the
+    // detached stop+start), so fall through to a pure `start`.
+    if (restartRes.httpError.status === 404 && restartRes.httpError.code === "not_supervised") {
+      const startRes = await driveSupervisorOp(svc, "start", r);
+      if (startRes.httpError) {
+        surfaceModuleOpHttpError(svc, startRes.httpError, r);
+        return 1;
+      }
+      if (startRes.failed || !startRes.result) return 1;
+      r.log(`✓ ${svc} started.`);
+      return 0;
+    }
+    surfaceModuleOpHttpError(svc, restartRes.httpError, r);
+    return 1;
+  }
+  if (restartRes.failed || !restartRes.result) return 1;
+  r.log(`✓ ${svc} restarted.`);
+  return 0;
 }
 
 /**

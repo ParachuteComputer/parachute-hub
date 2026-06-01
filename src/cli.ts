@@ -624,7 +624,13 @@ async function main(argv: string[]): Promise<number> {
         console.error(`parachute start: ${hubExtract.error}`);
         return 1;
       }
-      const startOpts = hubExtract.hubOrigin ? { hubOrigin: hubExtract.hubOrigin } : {};
+      // `supervisor: {}` opts into the Phase 3b dual-dispatch: on a box with a
+      // hub unit installed, drive the running supervisor; on a legacy detached
+      // box (no unit), fall through to the unchanged detached path (design §3.3).
+      const startOpts = {
+        supervisor: {},
+        ...(hubExtract.hubOrigin ? { hubOrigin: hubExtract.hubOrigin } : {}),
+      };
       return await start(hubExtract.rest[0], startOpts);
     }
 
@@ -633,7 +639,7 @@ async function main(argv: string[]): Promise<number> {
         console.log(stopHelp());
         return 0;
       }
-      return await stop(rest[0]);
+      return await stop(rest[0], { supervisor: {} });
     }
 
     case "restart": {
@@ -641,7 +647,7 @@ async function main(argv: string[]): Promise<number> {
         console.log(restartHelp());
         return 0;
       }
-      return await restart(rest[0]);
+      return await restart(rest[0], { supervisor: {} });
     }
 
     case "upgrade": {

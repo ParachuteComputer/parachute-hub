@@ -5,6 +5,8 @@ import {
   NO_UNIT_MESSAGE,
   ensureHubUnit,
   installAndStartHubUnit,
+  restartHubUnit,
+  stopHubUnit,
 } from "../hub-unit.ts";
 import {
   HUB_LAUNCHD_LABEL,
@@ -341,5 +343,101 @@ describe("installAndStartHubUnit — init bringup (§3.3 / §4.2)", () => {
     });
     expect(res.outcome).toBe("timeout");
     expect(res.messages.join("\n")).toContain("EADDRINUSE");
+  });
+});
+
+describe("stopHubUnit — manager-only hub stop (§3.3, R17)", () => {
+  test("systemd user: `systemctl --user stop` (NEVER a PID signal)", () => {
+    const f = fakeDeps({ platform: "linux", getuid: () => 1000, installedUnit: true });
+    const res = stopHubUnit(f.deps);
+    expect(res.outcome).toBe("ok");
+    expect(f.calls).toEqual([["systemctl", "--user", "stop", HUB_UNIT]]);
+    // No `kill`-shaped call — the manager is the only thing driven.
+    expect(f.calls.flat()).not.toContain("kill");
+  });
+
+  test("systemd root: `systemctl stop` (no --user scope)", () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 0,
+      userName: () => "root",
+      installedUnit: true,
+    });
+    const res = stopHubUnit(f.deps);
+    expect(res.outcome).toBe("ok");
+    expect(f.calls).toEqual([["systemctl", "stop", HUB_UNIT]]);
+  });
+
+  test("launchd: `launchctl bootout gui/<uid>/<label>` (KeepAlive can't resurrect)", () => {
+    const f = fakeDeps({ platform: "darwin", getuid: () => 501, installedUnit: true });
+    const res = stopHubUnit(f.deps);
+    expect(res.outcome).toBe("ok");
+    expect(f.calls).toEqual([["launchctl", "bootout", `gui/501/${HUB_LABEL}`]]);
+    // Specifically NOT `launchctl kill` / a PID signal.
+    expect(f.calls.flat()).not.toContain("kill");
+  });
+
+  test("no unit installed → no-unit, no manager call", () => {
+    const f = fakeDeps({ platform: "linux", getuid: () => 1000 /* installedUnit: false */ });
+    const res = stopHubUnit(f.deps);
+    expect(res.outcome).toBe("no-unit");
+    expect(res.messages).toEqual([NO_UNIT_MESSAGE]);
+    expect(f.calls).toEqual([]);
+  });
+
+  test("no service manager → no-manager", () => {
+    const f = fakeDeps({ platform: "linux", which: () => null, installedUnit: true });
+    const res = stopHubUnit(f.deps);
+    expect(res.outcome).toBe("no-manager");
+    expect(res.messages).toEqual([NO_MANAGER_MESSAGE]);
+  });
+
+  test("manager rejects the command → failed, carries stderr", () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      runResults: [{ code: 1, stdout: "", stderr: "unit not loaded" }],
+    });
+    const res = stopHubUnit(f.deps);
+    expect(res.outcome).toBe("failed");
+    expect(res.messages.join("\n")).toContain("unit not loaded");
+  });
+});
+
+describe("restartHubUnit — manager-only hub restart (§3.3, R17)", () => {
+  test("systemd user: `systemctl --user restart` (NEVER a PID signal)", () => {
+    const f = fakeDeps({ platform: "linux", getuid: () => 1000, installedUnit: true });
+    const res = restartHubUnit(f.deps);
+    expect(res.outcome).toBe("ok");
+    expect(f.calls).toEqual([["systemctl", "--user", "restart", HUB_UNIT]]);
+    expect(f.calls.flat()).not.toContain("kill");
+  });
+
+  test("launchd: `launchctl kickstart -k gui/<uid>/<label>`", () => {
+    const f = fakeDeps({ platform: "darwin", getuid: () => 501, installedUnit: true });
+    const res = restartHubUnit(f.deps);
+    expect(res.outcome).toBe("ok");
+    expect(f.calls).toEqual([["launchctl", "kickstart", "-k", `gui/501/${HUB_LABEL}`]]);
+    expect(f.calls.flat()).not.toContain("kill");
+  });
+
+  test("no unit installed → no-unit", () => {
+    const f = fakeDeps({ platform: "linux", getuid: () => 1000 });
+    const res = restartHubUnit(f.deps);
+    expect(res.outcome).toBe("no-unit");
+    expect(f.calls).toEqual([]);
+  });
+
+  test("manager rejects → failed, carries stderr", () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      runResults: [{ code: 1, stdout: "", stderr: "job failed" }],
+    });
+    const res = restartHubUnit(f.deps);
+    expect(res.outcome).toBe("failed");
+    expect(res.messages.join("\n")).toContain("job failed");
   });
 });
