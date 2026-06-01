@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MissingDependencyError, lookupDep } from "@openparachute/depcheck";
@@ -838,6 +838,27 @@ describe("POST /api/modules/:short/start", () => {
     expect(spawns.length).toBe(1);
     expect(spawns[0]?.env?.PORT).toBe("1940");
     expect(spawns[0]?.env?.PARACHUTE_HUB_ORIGIN).toBe(ISSUER);
+  });
+
+  test("start layers the per-service .env into the supervisor spawn env", async () => {
+    // The boot-derived spawn contract (buildModuleSpawnRequest) reads
+    // `<configDir>/<short>/.env` and merges it into the child env. This is
+    // the asymmetry the spawnSupervised doc comment calls out: install spawns
+    // with install-env only; the operator-written `.env` is layered in on the
+    // next `start` / boot. Prove a distinctive var written to vault's `.env`
+    // reaches the recorded SpawnRequest.
+    seedVault(1940);
+    mkdirSync(join(h.dir, "vault"), { recursive: true });
+    writeFileSync(join(h.dir, "vault", ".env"), "MY_CUSTOM_VAR=sentinel123\n");
+    const { supervisor, spawns } = makeIdleSupervisor();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    await handleStart(
+      postReq("/api/modules/vault/start", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, configDir: h.dir, supervisor },
+    );
+    expect(spawns.length).toBe(1);
+    expect(spawns[0]?.env?.MY_CUSTOM_VAR).toBe("sentinel123");
   });
 
   test("400 not_installed when the module isn't in services.json (no silent install)", async () => {

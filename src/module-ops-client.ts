@@ -175,10 +175,14 @@ export async function driveModuleOp(
   // Async op (install / upgrade): 202 + { operation_id } → poll to terminal.
   if (res.status === 202) {
     const operationId = extractOperationId(body);
-    if (operationId) {
-      const terminal = await pollOperation(operationId, bearer, baseUrl, doFetch, deps);
-      return { status: res.status, body: terminal, operationId };
+    if (!operationId) {
+      // 202 means "accepted, poll for completion" — but with no operation_id
+      // there's nothing to poll. Silently returning the 202 would strand the
+      // caller on an incomplete op; surface it as a hard failure instead.
+      throw new ModuleOpFailedError("hub returned 202 but no operation_id in body");
     }
+    const terminal = await pollOperation(operationId, bearer, baseUrl, doFetch, deps);
+    return { status: res.status, body: terminal, operationId };
   }
 
   // Sync op (start / stop / restart / uninstall) — body is the final state.

@@ -457,6 +457,11 @@ async function spawnSupervised(
   // anchors the child's iss expectation to the same value hub mints with.
   //
   // `deps.spawnEnv` still wins (test seam + first-boot vault-name pass-through).
+  //
+  // No per-service `.env` here, by design: the install path runs before the
+  // operator has had a chance to write `configDir/<short>/.env`, so install
+  // spawns with install-env only. The per-service `.env` is layered in by
+  // `buildModuleSpawnRequest` (serve-boot.ts) on the next `boot` or `start`.
   const childEnv: Record<string, string> = {
     PORT: String(entry.port),
     ...(deps.issuer ? { PARACHUTE_HUB_ORIGIN: deps.issuer } : {}),

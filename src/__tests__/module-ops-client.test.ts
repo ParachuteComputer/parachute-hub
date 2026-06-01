@@ -273,6 +273,44 @@ describe("driveModuleOp — async operation polling", () => {
     expect((err as Error).message).toBe("bun add -g exited 1");
   });
 
+  test("poll timeout: a never-succeeding op rejects with ModuleOpFailedError (no silent 2min hang)", async () => {
+    h = await makeHarnessWithToken();
+    // POST returns 202 + operation_id; every GET poll returns an in-progress
+    // op that never reaches `succeeded`. fakeFetch clamps the index to the
+    // last response, so all polls past the first see "running".
+    const { fetch: f } = fakeFetch([
+      { status: 202, body: { operation_id: "op-x" } },
+      { status: 200, body: { id: "op-x", status: "running" } },
+    ]);
+    // Clock seam: each call jumps 1s. With a 50ms timeout the deadline is
+    // (first-now + 50), and the second `now()` (the in-loop deadline check)
+    // is already 1s past it — so the loop bails before sleeping again.
+    let t = 0;
+    const now = () => {
+      const d = new Date(t);
+      t += 1_000;
+      return d;
+    };
+    let err: unknown;
+    try {
+      await driveModuleOp("vault", "install", {
+        db: h.db,
+        issuer: ISSUER,
+        configDir: h.dir,
+        fetch: f,
+        sleep: async () => {},
+        now,
+        pollTimeoutMs: 50,
+        pollIntervalMs: 10,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ModuleOpFailedError);
+    expect((err as Error).message).toContain("did not complete within");
+    expect((err as Error).message).toContain("op-x");
+  });
+
   test("passes an optional JSON body through on the POST", async () => {
     h = await makeHarnessWithToken();
     const { fetch: f, calls } = fakeFetch([
