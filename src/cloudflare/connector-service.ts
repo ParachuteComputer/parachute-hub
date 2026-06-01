@@ -189,9 +189,11 @@ function connectorMessages(): ManagedUnitMessages {
       "systemctl daemon-reload failed; using a transient connector (won't survive a reboot)",
     enableFailedPrefix:
       "systemctl enable --now failed; using a transient connector (won't survive a reboot)",
-    launchdInstalled: (label) =>
+    // The connector always installs with start:true, so the `started` param these
+    // callbacks receive is unused here — the message is always the "starts now" variant.
+    launchdInstalled: (label, _started) =>
       `Installed launchd LaunchAgent ${label} — the connector now starts on login/boot.`,
-    systemdInstalled: (unitName, root) =>
+    systemdInstalled: (unitName, root, _started) =>
       `Installed systemd ${root ? "system" : "user"} unit ${unitName} — the connector now starts on boot.`,
   };
 }

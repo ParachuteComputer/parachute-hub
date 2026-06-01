@@ -358,7 +358,10 @@ describe("installManagedUnit — start:boolean (§7.1)", () => {
       "computer.parachute.cloudflared.hub-ignored.plist",
       "computer.parachute.hub.plist",
     );
+    // The plist is written to the correct path AND carries the rendered content
+    // (not just an empty key) — start:false skips the launch but still installs.
     expect(f.files.has(plistPath)).toBe(true);
+    expect(f.files.get(plistPath)).toBe(renderManagedLaunchdPlist(hubUnit(f.deps)));
     // No launchctl bootout/bootstrap/kickstart in start:false mode.
     expect(f.calls.some((c) => c[0] === "launchctl")).toBe(false);
   });
@@ -414,6 +417,16 @@ describe("buildHubManagedUnit — §4.1 hub-unit shape", () => {
     ]);
     expect(unit.crashLoop).toEqual({ intervalSec: 300, burst: 5, throttleIntervalSec: 10 });
     expect(unit.runAsInvokingUserOnSystemUnit).toBe(true);
+  });
+
+  test("throws (fail-loud) when bun is unresolvable — never bakes a broken ExecStart", () => {
+    // launchd/systemd don't search $PATH; a literal "bun" fallback would produce
+    // a unit that fails to start with a cryptic error. Refuse to build it.
+    const f = fakeDeps({
+      platform: "linux",
+      which: (b) => (b === "bun" ? null : `/usr/bin/${b}`),
+    });
+    expect(() => hubUnit(f.deps)).toThrow(/'bun' not found on PATH/);
   });
 
   test("env carries the 4 vars and INTENTIONALLY OMITS PARACHUTE_HUB_ORIGIN", () => {

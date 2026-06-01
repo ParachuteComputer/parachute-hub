@@ -388,6 +388,10 @@ function installLaunchdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
     // install-without-start: the plist is on disk + will load on next login/boot
     // (RunAtLoad), but we do NOT bootstrap/kickstart it now, so no process is
     // started in this call (design §7.1 — avoid racing port 1939 during cutover).
+    // We also deliberately do NOT bootout any prior service: the CALLER (the
+    // Phase 5 migrate cutover) owns stopping the detached/prior process before
+    // installing this unit. Do not add a pre-bootout/stop here — it would break
+    // the §7.1 ordering the caller relies on to avoid the double-spawn race.
     return {
       outcome: "installed",
       kind: "launchd",
@@ -493,6 +497,10 @@ function installSystemdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
     // install-without-start: the unit file is on disk + daemon-reloaded, but we
     // do NOT `enable --now` it, so no process is started in this call and the
     // unit is not yet enabled for boot (design §7.1 — avoid racing port 1939).
+    // We also deliberately do NOT stop any prior service: the CALLER (the Phase 5
+    // migrate cutover) owns stopping the detached/prior process before installing
+    // this unit. Do not add a pre-stop here — it would break the §7.1 ordering the
+    // caller relies on to avoid the double-spawn race.
     outMessages.unshift(messages.systemdInstalled(unitName, root, false));
     return {
       outcome: "installed",
@@ -632,8 +640,17 @@ export interface BuildHubManagedUnitOpts {
 export function buildHubManagedUnit(opts: BuildHubManagedUnitOpts): ManagedUnit {
   const deps = opts.deps ?? defaultManagedUnitDeps;
   const port = opts.port ?? 1939;
-  // launchd does not search $PATH; resolve bun to an absolute path at build time.
-  const bunPath = deps.which("bun") ?? "bun";
+  // launchd/systemd do not search $PATH; resolve bun to an absolute path at build
+  // time. Fail loud if it can't be resolved — falling back to the literal "bun"
+  // would bake a non-functional ExecStart/ProgramArguments[0] into the unit
+  // (cryptic start-time failure), so refuse to build a broken unit. (cliPath is
+  // caller-supplied as an absolute path, not which-resolved, so it needs no guard.)
+  const bunPath = deps.which("bun");
+  if (bunPath === null) {
+    throw new Error(
+      "cannot build hub unit: 'bun' not found on PATH — install bun or ensure it is resolvable",
+    );
+  }
   return {
     launchdLabel: HUB_LAUNCHD_LABEL,
     systemdUnitName: HUB_SYSTEMD_UNIT_NAME,
