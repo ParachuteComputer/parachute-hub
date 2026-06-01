@@ -1,0 +1,345 @@
+import { describe, expect, test } from "bun:test";
+import {
+  type HubUnitDeps,
+  NO_MANAGER_MESSAGE,
+  NO_UNIT_MESSAGE,
+  ensureHubUnit,
+  installAndStartHubUnit,
+} from "../hub-unit.ts";
+import {
+  HUB_LAUNCHD_LABEL,
+  HUB_SYSTEMD_UNIT_NAME,
+  type ServiceCommandResult,
+  launchdPlistPathForLabel,
+  systemdUnitPathForName,
+} from "../managed-unit.ts";
+
+// Use the SHARED exported unit identifiers (not local re-declarations) so the
+// assertions can't silently pass if the canonical label/unit name ever drifts.
+const HUB_LABEL = HUB_LAUNCHD_LABEL;
+const HUB_UNIT = HUB_SYSTEMD_UNIT_NAME;
+
+interface FakeState {
+  deps: HubUnitDeps;
+  calls: string[][];
+  files: Map<string, string>;
+}
+
+/**
+ * Build a fully-stubbed {@link HubUnitDeps}. No launchctl/systemctl/socket/HTTP
+ * call touches the real OS — every side effect is recorded in `calls` / `files`.
+ * `probeHealth` / `portListening` accept arrays so a test can script the
+ * "down at first, up after start" readiness sequence.
+ */
+function fakeDeps(
+  over: Partial<HubUnitDeps> & {
+    runResults?: ServiceCommandResult[];
+    healthSeq?: boolean[];
+    listeningSeq?: boolean[];
+    installedUnit?: boolean;
+  } = {},
+): FakeState {
+  const calls: string[][] = [];
+  const files = new Map<string, string>();
+  let runIdx = 0;
+  let healthIdx = 0;
+  let listeningIdx = 0;
+  const ok: ServiceCommandResult = { code: 0, stdout: "", stderr: "" };
+
+  const platform: NodeJS.Platform = over.platform ?? "linux";
+  const getuid = over.getuid ?? (() => 1000);
+  const homeDir = over.homeDir ?? (() => "/home/op");
+
+  // Optionally seed the unit file so isHubUnitInstalled() sees it.
+  if (over.installedUnit) {
+    const home = homeDir();
+    if (platform === "darwin") {
+      files.set(launchdPlistPathForLabel(HUB_LABEL, home), "<plist/>");
+    } else {
+      const root = (getuid() ?? 1000) === 0;
+      files.set(systemdUnitPathForName(HUB_UNIT, home, root), "[Unit]");
+    }
+  }
+
+  const deps: HubUnitDeps = {
+    platform,
+    getuid,
+    homeDir,
+    userName: over.userName ?? (() => "op"),
+    which:
+      over.which ??
+      ((b) => {
+        if (b === "bun") return "/home/op/.bun/bin/bun";
+        if (b === "launchctl" || b === "systemctl" || b === "loginctl" || b === "journalctl") {
+          return `/usr/bin/${b}`;
+        }
+        return null;
+      }),
+    run:
+      over.run ??
+      ((cmd) => {
+        calls.push([...cmd]);
+        const r = over.runResults?.[runIdx++];
+        return r ?? ok;
+      }),
+    writeFile: over.writeFile ?? ((p, c) => void files.set(p, c)),
+    removeFile: over.removeFile ?? ((p) => void files.delete(p)),
+    readFile: over.readFile ?? ((p) => files.get(p)),
+    exists: over.exists ?? ((p) => files.has(p)),
+    probeHealth:
+      over.probeHealth ??
+      (async () => {
+        const seq = over.healthSeq;
+        if (!seq) return false;
+        return seq[Math.min(healthIdx++, seq.length - 1)] ?? false;
+      }),
+    portListening:
+      over.portListening ??
+      (async () => {
+        const seq = over.listeningSeq;
+        if (!seq) return true;
+        return seq[Math.min(listeningIdx++, seq.length - 1)] ?? false;
+      }),
+    sleep: over.sleep ?? (async () => {}),
+  };
+  return { deps, calls, files };
+}
+
+describe("ensureHubUnit — §3.2 algorithm", () => {
+  test("hub already up: /health 200 → returns already-up, NO manager call", async () => {
+    const f = fakeDeps({ healthSeq: [true] });
+    const res = await ensureHubUnit({ port: 1939, deps: f.deps, readyPollMs: 0 });
+    expect(res.outcome).toBe("already-up");
+    expect(res.port).toBe(1939);
+    // No systemctl/launchctl invocation at all — the probe short-circuited.
+    expect(f.calls).toEqual([]);
+  });
+
+  test("hub down, unit present (systemd user): starts the unit + readiness poll succeeds", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      healthSeq: [false],
+      listeningSeq: [true],
+    });
+    const res = await ensureHubUnit({ port: 1939, deps: f.deps, readyPollMs: 0 });
+    expect(res.outcome).toBe("started");
+    // systemctl --user start parachute-hub.service was driven.
+    expect(f.calls).toContainEqual(["systemctl", "--user", "start", "parachute-hub.service"]);
+  });
+
+  test("hub down, unit present (systemd root): no --user scope", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 0,
+      userName: () => "root",
+      installedUnit: true,
+      healthSeq: [false],
+      listeningSeq: [true],
+    });
+    const res = await ensureHubUnit({ port: 1939, deps: f.deps, readyPollMs: 0 });
+    expect(res.outcome).toBe("started");
+    expect(f.calls).toContainEqual(["systemctl", "start", "parachute-hub.service"]);
+  });
+
+  test("hub down, unit present (launchd): kickstart -k gui/<uid>/<label>", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      healthSeq: [false],
+      listeningSeq: [true],
+    });
+    const res = await ensureHubUnit({ port: 1939, deps: f.deps, readyPollMs: 0 });
+    expect(res.outcome).toBe("started");
+    expect(f.calls).toContainEqual([
+      "launchctl",
+      "kickstart",
+      "-k",
+      "gui/501/computer.parachute.hub",
+    ]);
+  });
+
+  test("no unit installed → actionable 'run parachute migrate' error, no manager call", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      installedUnit: false,
+      healthSeq: [false],
+    });
+    const res = await ensureHubUnit({ port: 1939, deps: f.deps, readyPollMs: 0 });
+    expect(res.outcome).toBe("no-unit");
+    expect(res.messages).toContain(NO_UNIT_MESSAGE);
+    // Did NOT try to start anything.
+    expect(f.calls).toEqual([]);
+  });
+
+  test("no manager at all (linux, no systemctl) → actionable foreground-serve message", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      installedUnit: true, // even with a unit file, no systemctl = no manager
+      healthSeq: [false],
+      which: () => null, // nothing resolvable
+    });
+    const res = await ensureHubUnit({ port: 1939, deps: f.deps, readyPollMs: 0 });
+    expect(res.outcome).toBe("no-manager");
+    expect(res.messages).toContain(NO_MANAGER_MESSAGE);
+    expect(f.calls).toEqual([]);
+  });
+
+  test("readiness timeout: surfaces the unit log (journald), does not hang", async () => {
+    const journalLog = "May 31 hub: boot failed: corrupt hub.db";
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      healthSeq: [false],
+      listeningSeq: [false], // never binds
+      run: (cmd) => {
+        // journalctl tail returns the boot error; start returns ok.
+        if (cmd[0] === "journalctl") {
+          return { code: 0, stdout: journalLog, stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    const res = await ensureHubUnit({
+      port: 1939,
+      deps: f.deps,
+      readyTimeoutMs: 0, // immediate deadline → one poll then timeout
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("timeout");
+    const joined = res.messages.join("\n");
+    expect(joined).toContain("did not become ready");
+    expect(joined).toContain(journalLog);
+  });
+
+  test("manager start command fails → start-failed with stderr surfaced", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      healthSeq: [false],
+      run: (cmd) => {
+        if (cmd.includes("start")) {
+          return { code: 1, stdout: "", stderr: "Unit parachute-hub.service not found." };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    const res = await ensureHubUnit({ port: 1939, deps: f.deps, readyPollMs: 0 });
+    expect(res.outcome).toBe("start-failed");
+    expect(res.messages.join("\n")).toContain("Unit parachute-hub.service not found.");
+  });
+});
+
+describe("installAndStartHubUnit — init bringup (§3.3 / §4.2)", () => {
+  test("installs the hub unit (start:true) + waits readiness → started", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      listeningSeq: [true],
+    });
+    const res = await installAndStartHubUnit({
+      parachuteHome: "/home/op/.parachute",
+      cliPath: "/home/op/parachute-hub/src/cli.ts",
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("started");
+    expect(res.install.outcome).toBe("installed");
+    // The systemd unit file was written, carrying the captured PARACHUTE_HOME
+    // and the serve ExecStart.
+    const unitPath = systemdUnitPathForName(HUB_UNIT, "/home/op", false);
+    const written = f.files.get(unitPath);
+    expect(written).toBeDefined();
+    expect(written).toContain("Environment=PARACHUTE_HOME=/home/op/.parachute");
+    expect(written).toContain("src/cli.ts serve");
+    // enable --now drove the start.
+    expect(f.calls).toContainEqual([
+      "systemctl",
+      "--user",
+      "enable",
+      "--now",
+      "parachute-hub.service",
+    ]);
+  });
+
+  test("launchd default on Mac (D2): writes the LaunchAgent plist + bootstraps", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      homeDir: () => "/Users/op",
+      listeningSeq: [true],
+    });
+    const res = await installAndStartHubUnit({
+      parachuteHome: "/Users/op/.parachute",
+      cliPath: "/Users/op/parachute-hub/src/cli.ts",
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("started");
+    const plistPath = launchdPlistPathForLabel(HUB_LABEL, "/Users/op");
+    const plist = f.files.get(plistPath);
+    expect(plist).toBeDefined();
+    expect(plist).toContain("<string>serve</string>");
+    expect(plist).toContain("computer.parachute.hub");
+  });
+
+  test("captures a NON-default PARACHUTE_HOME (§4.2)", async () => {
+    const f = fakeDeps({ platform: "linux", getuid: () => 1000, listeningSeq: [true] });
+    await installAndStartHubUnit({
+      parachuteHome: "/custom/home/.parachute",
+      cliPath: "/home/op/parachute-hub/src/cli.ts",
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    const unitPath = systemdUnitPathForName(HUB_UNIT, "/home/op", false);
+    expect(f.files.get(unitPath)).toContain("Environment=PARACHUTE_HOME=/custom/home/.parachute");
+  });
+
+  test("no service manager → no-manager outcome, NOTHING installed or spawned", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      which: () => null, // no systemctl
+      listeningSeq: [true],
+    });
+    const res = await installAndStartHubUnit({
+      parachuteHome: "/home/op/.parachute",
+      cliPath: "/home/op/parachute-hub/src/cli.ts",
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("no-manager");
+    expect(res.messages).toContain(NO_MANAGER_MESSAGE);
+    // No unit file written, no command run.
+    expect(f.files.size).toBe(0);
+    expect(f.calls).toEqual([]);
+  });
+
+  test("install succeeds but hub never binds → timeout with the unit log", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      listeningSeq: [false], // never binds
+      run: (cmd) => {
+        if (cmd[0] === "journalctl") {
+          return { code: 0, stdout: "hub: EADDRINUSE 1939", stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    const res = await installAndStartHubUnit({
+      parachuteHome: "/home/op/.parachute",
+      cliPath: "/home/op/parachute-hub/src/cli.ts",
+      deps: f.deps,
+      readyTimeoutMs: 0,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("timeout");
+    expect(res.messages.join("\n")).toContain("EADDRINUSE");
+  });
+});

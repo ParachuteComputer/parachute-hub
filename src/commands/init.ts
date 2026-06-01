@@ -33,17 +33,18 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
-import {
-  type EnsureHubOpts,
-  HUB_DEFAULT_PORT,
-  HUB_SVC,
-  ensureHubRunning,
-  readHubPort,
-} from "../hub-control.ts";
+import { type EnsureHubOpts, HUB_DEFAULT_PORT, HUB_SVC, readHubPort } from "../hub-control.ts";
+import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { deriveHubOrigin } from "../hub-origin.ts";
+import { ensureHubUnit, installAndStartHubUnit } from "../hub-unit.ts";
+import { issueOperatorToken, readOperatorTokenFile } from "../operator-token.ts";
 import { type AliveFn, defaultAlive, processState } from "../process-state.ts";
 import { findService, readManifestLenient } from "../services-manifest.ts";
+import { listUsers } from "../users.ts";
 import { type InstallOpts, install as defaultInstall } from "./install.ts";
 
 /** The three options the exposure prompt offers — also the `--expose` flag's domain. */
@@ -52,6 +53,17 @@ export type ExposeChoice = "none" | "tailnet" | "cloudflare";
 /** Where to continue setup after init finishes. CLI walks prompts in the terminal; browser opens /admin/setup. */
 export type WizardChoice = "browser" | "cli";
 
+/**
+ * Outcome of the post-bringup operator-token guarantee (design §3.1):
+ *   - `minted`     — no token on disk + a hub user existed → minted + wrote one.
+ *   - `present`    — a token already existed on disk → left it alone.
+ *   - `no-user`    — no token + no hub user yet (fresh box pre-wizard); the
+ *                    wizard's account step will mint it. NOT an error.
+ *   - `mint-failed`— a mint was attempted but failed (DB unavailable, etc.);
+ *                    non-fatal — the wizard / `auth rotate-operator` can retry.
+ */
+export type OperatorTokenGuaranteeStatus = "minted" | "present" | "no-user" | "mint-failed";
+
 export interface InitOpts {
   configDir?: string;
   manifestPath?: string;
@@ -59,10 +71,28 @@ export interface InitOpts {
   /** Test seam: `processState` liveness check. */
   alive?: AliveFn;
   /**
-   * Test seam: `ensureHubRunning` shim. Production uses the real one;
-   * tests pass a stub that records calls without spawning.
+   * Hub-bringup shim. Phase 3a cutover: production now INSTALLS + STARTS the
+   * hub *unit* (launchd on Mac, systemd on Linux) via `installAndStartHubUnit`
+   * and waits for readiness — it no longer spawns a detached `bun hub-server.ts`
+   * (`defaultEnsureHubViaUnit`). The return shape (`{ pid, port, started }`) is
+   * preserved so the downstream init flow (URL resolution, wizard hand-off) is
+   * unchanged; `pid` is `0` on the unit path (a unit-managed hub has no
+   * pidfile). Tests pass a stub that records the call without touching the OS.
+   * Design §3.3 (init row), §4.1/§4.2, appendix (c).
    */
   ensureHub?: (opts: EnsureHubOpts) => Promise<{ pid: number; port: number; started: boolean }>;
+  /**
+   * Test seam: guarantee an operator token exists once the hub is up (design
+   * §3.1 / §3.3). Production reads `operator.token`; if absent AND a hub user
+   * already exists, it mints + writes one so a later per-module verb never
+   * 401s. Returns a short status so init can log what happened. Tests stub it
+   * to assert the mint-when-absent / skip-when-present behavior without a DB.
+   */
+  guaranteeOperatorToken?: (ctx: {
+    configDir: string;
+    hubPort: number;
+    log: (line: string) => void;
+  }) => Promise<OperatorTokenGuaranteeStatus>;
   /** Test seam: expose-state reader. */
   readExposeStateFn?: () => ExposeState | undefined;
   /** Test seam: TTY check (production reads `process.stdin.isTTY`). */
@@ -245,6 +275,161 @@ async function defaultExposeCloudflare(): Promise<number> {
 }
 
 /**
+ * Absolute path to this hub checkout's `src/cli.ts` — the entry the hub unit's
+ * `ExecStart`/`ProgramArguments` runs `serve` against. Resolved from
+ * `import.meta.url` (this file is `src/commands/init.ts`, so `cli.ts` is one
+ * directory up). On the bun-linked dev path this points into the checkout; on
+ * an npm install it points into the installed package — either way the unit
+ * runs the same on-disk entry the operator is invoking right now.
+ */
+function defaultHubCliPath(): string {
+  return fileURLToPath(new URL("../cli.ts", import.meta.url));
+}
+
+/**
+ * Production hub-bringup for the Phase 3a cutover (design §3.3 init row,
+ * appendix c). REPLACES the detached `ensureHubRunning` spawn:
+ *
+ *   1. Probe the loopback hub. If it already answers, return started:false
+ *      WITHOUT touching the unit (init is idempotent — a re-run against a live
+ *      hub shouldn't reinstall/restart it).
+ *   2. Otherwise INSTALL + START the hub unit via `installAndStartHubUnit`:
+ *      `buildHubManagedUnit` captures the operator's CURRENT `PARACHUTE_HOME`
+ *      (§4.2 — derived from the resolved `configDir`, not the hard-coded
+ *      default), resolves abs bun + the abs cli.ts entry, launchd-by-default on
+ *      Mac (D2) / systemd-system-if-root-else-user+linger on Linux. Then waits
+ *      for hub readiness, surfacing the unit log on timeout (§3.2 step 5).
+ *   3. On a host with NO service manager (container / init-less), throw an
+ *      actionable error — the container runtime CMD is `serve`, not `init`
+ *      (§3.2 step 4). NEVER fall back to a detached spawn.
+ *
+ * Returns the `{ pid, port, started }` shape init's downstream flow expects;
+ * `pid` is `0` because a unit-managed hub has no pidfile (the platform manager
+ * owns the process).
+ */
+async function defaultEnsureHubViaUnit(opts: EnsureHubOpts): Promise<{
+  pid: number;
+  port: number;
+  started: boolean;
+}> {
+  const configDir = opts.configDir ?? CONFIG_DIR;
+  const port = opts.startPort ?? HUB_DEFAULT_PORT;
+  const log = opts.log ?? (() => {});
+
+  // First try the lighter ensure-path (§3.2): probe /health → if up, done with
+  // no install; if a unit is already installed but down, just start it. This
+  // keeps a re-run of `init` idempotent — it won't pointlessly rewrite the unit
+  // file when the hub is already answering or the unit already exists.
+  const ensured = await ensureHubUnit({ port, log });
+  if (ensured.outcome === "already-up") {
+    return { pid: 0, port: ensured.port, started: false };
+  }
+  if (ensured.outcome === "started") {
+    return { pid: 0, port: ensured.port, started: true };
+  }
+  if (ensured.outcome === "no-manager") {
+    // Container / init-less host — can't host a unit. Foreground `serve` is the
+    // runtime here, not `init` (§3.2 step 4). Surface + bail; never spawn.
+    throw new Error(ensured.messages.join("\n"));
+  }
+  // `no-unit` (the fresh-box case init exists to handle) → INSTALL + start the
+  // unit, then wait for readiness (§3.3 init row, §4.1/§4.2). `start-failed` /
+  // `timeout` from the start-existing-unit path also fall through to a clean
+  // (re)install attempt here — overwriting the unit file is idempotent.
+  const result = await installAndStartHubUnit({
+    // Capture the operator's CURRENT PARACHUTE_HOME (the resolved configDir),
+    // NOT the hard-coded default (§4.2).
+    parachuteHome: configDir,
+    cliPath: defaultHubCliPath(),
+    port,
+    log,
+  });
+
+  if (result.outcome === "started") {
+    return { pid: 0, port: result.port, started: true };
+  }
+  // NB: `installAndStartHubUnit` never returns `already-up` — only the lighter
+  // `ensureHubUnit` probe (handled above) reports already-up. The "hub already
+  // running, started:false" signal is therefore produced solely by the
+  // `ensureHubUnit` arm above; reaching here means we genuinely tried to
+  // install + start the unit.
+  // no-manager / timeout / start-failed → actionable error. The init caller
+  // catches this and prints the message + `parachute logs hub` hint.
+  throw new Error(result.messages.join("\n") || `hub unit bringup failed (${result.outcome}).`);
+}
+
+/**
+ * Resolve the issuer to mint the operator token under. At init time the hub is
+ * reachable on loopback (just installed); prefer the live expose-state origin
+ * (rare during init, but honored if a prior `expose` ran), else the loopback
+ * origin. Mirrors `commands/auth.ts`'s `resolveHubIssuer` so a token minted at
+ * init validates the same way one minted by `auth rotate-operator` would.
+ */
+function resolveInitIssuer(configDir: string, hubPort: number): string {
+  const state = readExposeState(join(configDir, "expose-state.json"));
+  if (state?.hubOrigin) return state.hubOrigin;
+  return (
+    deriveHubOrigin({ exposeFqdn: state?.canonicalFqdn, hubPort }) ?? `http://127.0.0.1:${hubPort}`
+  );
+}
+
+/**
+ * Production operator-token guarantee (design §3.1 / §3.3). Under the unified
+ * model every per-module verb is an authenticated module-ops call, so the
+ * steady-state operator needs an `operator.token` on disk. init guarantees it:
+ *
+ *   - Token already on disk → leave it (`present`). The hub remains the sole
+ *     minter; we never mint-in-parallel (§3.1).
+ *   - No token + a hub user already exists → mint under the default (`admin`)
+ *     scope-set + write it 0600 (`minted`).
+ *   - No token + no hub user yet (the common fresh-box case — init runs BEFORE
+ *     the wizard creates first-admin) → `no-user`. NOT an error. Note the
+ *     wizard's account step does NOT write this on-disk token — it mints an
+ *     in-DB single-use *display* token (deleted once the done-screen reads it).
+ *     Today the on-disk `operator.token` is written only by `parachute auth
+ *     set-password` / `auth rotate-operator`, so a fresh box that finishes the
+ *     wizard without running either still has no on-disk token. Phase 3b closes
+ *     this gap: the per-module verbs that require the operator token land there
+ *     and carry the fresh-box mint with them.
+ *
+ * Failures are non-fatal (`mint-failed`): a DB hiccup shouldn't block init when
+ * `auth rotate-operator` can retry.
+ */
+async function defaultGuaranteeOperatorToken(ctx: {
+  configDir: string;
+  hubPort: number;
+  log: (line: string) => void;
+}): Promise<OperatorTokenGuaranteeStatus> {
+  const existing = await readOperatorTokenFile(ctx.configDir);
+  if (existing) return "present";
+
+  const db = openHubDb(hubDbPath(ctx.configDir));
+  try {
+    const owner = listUsers(db)[0];
+    if (!owner) {
+      // Fresh box: no first-admin yet. The wizard mints the token when it
+      // creates the admin. Nothing to do here, and definitely not an error.
+      return "no-user";
+    }
+    const issued = await issueOperatorToken(db, owner.id, {
+      dir: ctx.configDir,
+      issuer: resolveInitIssuer(ctx.configDir, ctx.hubPort),
+    });
+    ctx.log(`✓ Operator token written to ${issued.path} (mode 0600).`);
+    return "minted";
+  } catch (err) {
+    ctx.log(
+      `⚠ Couldn't mint an operator token (${
+        err instanceof Error ? err.message : String(err)
+      }); run \`parachute auth rotate-operator\` later if a CLI command reports a missing token.`,
+    );
+    return "mint-failed";
+  } finally {
+    db.close();
+  }
+}
+
+/**
  * Default impl for the vault-module install step (hub#168 Cut 1). Calls
  * install("vault", { noCreate: true, noStart: true, …}) with a quiet log
  * shim that re-emits each line under an `[install vault] ` prefix so the
@@ -347,7 +532,11 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   const manifestPath = opts.manifestPath ?? SERVICES_MANIFEST_PATH;
   const log = opts.log ?? ((line) => console.log(line));
   const alive = opts.alive ?? defaultAlive;
-  const ensureHub = opts.ensureHub ?? ensureHubRunning;
+  // Phase 3a cutover: production installs + starts the hub UNIT (not a detached
+  // spawn). The `ensureHub` seam is preserved for tests (and the return shape is
+  // unchanged); only the production default flipped.
+  const ensureHub = opts.ensureHub ?? defaultEnsureHubViaUnit;
+  const guaranteeOperatorToken = opts.guaranteeOperatorToken ?? defaultGuaranteeOperatorToken;
   const readExposeStateFn = opts.readExposeStateFn ?? (() => readExposeState());
   const isTty = opts.isTty ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
   const prompt = opts.prompt ?? defaultPrompt;
@@ -363,17 +552,32 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   log("");
 
   // Step 1: hub running?
+  // NB: under the Phase 3a unit-managed hub there is no pidfile, so
+  // `processState(HUB_SVC)` reports not-running on EVERY init re-run even when
+  // the hub is live. We therefore don't decide the "already running" message
+  // from `processState` here — `ensureHub` probes `/health` and reports the
+  // truth via `result.started` (false ⇒ already up, true ⇒ we started it). Only
+  // when `processState` finds a real (legacy detached) pidfile do we report the
+  // pid directly without a bringup call.
   const hubState = processState(HUB_SVC, configDir, alive);
   let hubPort: number | undefined;
   if (hubState.status === "running") {
     hubPort = readHubPort(configDir);
     log(`✓ Hub already running (pid ${hubState.pid}${hubPort ? `, port ${hubPort}` : ""}).`);
   } else {
-    log("Hub not running — starting it now…");
     try {
       const result = await ensureHub({ configDir, log: () => {} });
       hubPort = result.port;
-      log(`✓ Hub started (pid ${result.pid}, port ${result.port}).`);
+      if (result.started) {
+        // Genuinely installed/started the unit. A unit-managed hub has no
+        // meaningful CLI-visible pid, so report only the port (no misleading
+        // `pid 0` sentinel).
+        log(`✓ Hub unit started (port ${result.port}).`);
+      } else {
+        // The hub was already answering `/health` — `ensureHub` touched
+        // nothing. Honest re-run messaging: no "starting it now", no `pid 0`.
+        log(`✓ Hub already running (port ${result.port}).`);
+      }
     } catch (err) {
       log(`✗ Hub failed to start: ${err instanceof Error ? err.message : String(err)}`);
       log("");
@@ -388,6 +592,15 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   // that didn't write a port file). The hub binds 1939 unless explicitly
   // overridden, so the fallback is almost always correct.
   if (hubPort === undefined) hubPort = HUB_DEFAULT_PORT;
+
+  // Step 1.5: guarantee an operator token exists (design §3.1 / §3.3). Under
+  // the unified model every per-module verb is an authenticated module-ops
+  // call, so the steady-state operator needs an `operator.token` on disk — the
+  // mint-on-init guarantee closes the bootstrap so a later verb never 401s.
+  // On a fresh box (no first-admin yet) this is a no-op (`no-user`): the wizard
+  // mints it when it creates the admin. Non-fatal either way — init continues
+  // to the wizard regardless.
+  await guaranteeOperatorToken({ configDir, hubPort, log });
 
   // Step 2: exposure chain. Skipped when already exposed, in non-TTY,
   // or when --no-expose-prompt was passed. `--expose <choice>` jumps

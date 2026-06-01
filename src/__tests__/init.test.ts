@@ -103,10 +103,53 @@ describe("init", () => {
       expect(code).toBe(0);
       expect(calls).toEqual(["ensureHub"]);
       const joined = logs.join("\n");
-      expect(joined).toContain("Hub not running — starting it now");
-      expect(joined).toContain("Hub started (pid 5555, port 1939)");
+      // A genuinely-started unit reports the port only — no `pid 0` sentinel,
+      // no misleading "starting it now" preamble.
+      expect(joined).toContain("Hub unit started (port 1939)");
+      expect(joined).not.toContain("pid 0");
+      expect(joined).not.toContain("starting it now");
       expect(joined).toContain("http://127.0.0.1:1939/admin/");
       expect(joined).toContain("finish setup in the admin wizard");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("unit-managed re-run against a live hub logs 'already running', not 'pid 0'", async () => {
+    // A unit-managed hub writes no pidfile, so `processState(HUB_SVC)` reports
+    // not-running on every re-run — but `ensureHub` probes /health and returns
+    // started:false when the hub is already up. The log must be honest: no
+    // "starting it now", no "Hub unit started", no `pid 0` sentinel.
+    const h = makeHarness();
+    try {
+      writeHubPort(1939, h.configDir);
+      const calls: string[] = [];
+      const logs: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        // No pidfile (unit-managed) → processState reports not-running.
+        alive: () => false,
+        ensureHub: async () => {
+          calls.push("ensureHub");
+          // Hub already answered /health — ensureHubUnit's already-up arm.
+          return { pid: 0, port: 1939, started: false };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "darwin",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      // ensureHub IS called (processState can't see a unit-managed hub) but
+      // reports started:false.
+      expect(calls).toEqual(["ensureHub"]);
+      const joined = logs.join("\n");
+      expect(joined).toContain("Hub already running (port 1939)");
+      expect(joined).not.toContain("pid 0");
+      expect(joined).not.toContain("starting it now");
+      expect(joined).not.toContain("Hub unit started");
     } finally {
       h.cleanup();
     }
@@ -874,6 +917,180 @@ describe("init exposure chain", () => {
         exposeChoice: "cloudflare",
       });
       expect(code).toBe(2);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 3a cutover (design §3.3 init row, §3.1, §4.1/§4.2): init installs +
+  // starts the hub UNIT (not a detached spawn) and guarantees an operator
+  // token. The `ensureHub` + `guaranteeOperatorToken` seams stay injectable;
+  // these tests drive them as stubs (and exercise the REAL operator-token
+  // guarantee against a seeded hub DB).
+  // -------------------------------------------------------------------------
+
+  test("calls guaranteeOperatorToken after the hub is up, then falls through to the wizard", async () => {
+    const h = makeHarness();
+    try {
+      const order: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        ensureHub: async () => {
+          order.push("ensureHub");
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        guaranteeOperatorToken: async (ctx) => {
+          order.push("guaranteeOperatorToken");
+          // The hub is up before the token guarantee runs (§3.2 step 4 — read
+          // the token AFTER readiness so we don't race the start-hub iss
+          // self-heal).
+          expect(ctx.hubPort).toBe(1939);
+          return "present";
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      // hub-up first, then token guarantee — in that order.
+      expect(order).toEqual(["ensureHub", "guaranteeOperatorToken"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("real guarantee: MINTS the operator token when absent + a hub user exists", async () => {
+    const h = makeHarness();
+    try {
+      const { openHubDb, hubDbPath } = await import("../hub-db.ts");
+      const { createUser } = await import("../users.ts");
+      const { readOperatorTokenFile } = await import("../operator-token.ts");
+      // Seed a first-admin so the guarantee has someone to mint for.
+      const db = openHubDb(hubDbPath(h.configDir));
+      await createUser(db, "owner", "owner-password-123");
+      db.close();
+
+      // No operator.token yet.
+      expect(await readOperatorTokenFile(h.configDir)).toBeNull();
+
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        // No guaranteeOperatorToken seam → exercises the REAL default.
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      // The default minted + wrote the token.
+      expect(await readOperatorTokenFile(h.configDir)).not.toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("real guarantee: does NOT double-mint when a token already exists", async () => {
+    const h = makeHarness();
+    try {
+      const { openHubDb, hubDbPath } = await import("../hub-db.ts");
+      const { createUser } = await import("../users.ts");
+      const { writeOperatorTokenFile, readOperatorTokenFile } = await import(
+        "../operator-token.ts"
+      );
+      const db = openHubDb(hubDbPath(h.configDir));
+      await createUser(db, "owner", "owner-password-123");
+      db.close();
+      // Plant a sentinel token on disk.
+      await writeOperatorTokenFile("SENTINEL.PRE-EXISTING.TOKEN", h.configDir);
+
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      // Untouched — the guarantee left the pre-existing token in place.
+      expect(await readOperatorTokenFile(h.configDir)).toBe("SENTINEL.PRE-EXISTING.TOKEN");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("real guarantee: no hub user yet → no token minted, init still succeeds (no-user, not an error)", async () => {
+    const h = makeHarness();
+    try {
+      const { readOperatorTokenFile } = await import("../operator-token.ts");
+      // No user seeded — the common fresh-box case where init runs before the
+      // wizard creates first-admin.
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      // No token (the wizard mints it when the admin is created).
+      expect(await readOperatorTokenFile(h.configDir)).toBeNull();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub-unit bringup failure (e.g. no service manager) → init exits 1 with the actionable message", async () => {
+    const h = makeHarness();
+    try {
+      const logs: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => false,
+        // Mirror what the production default throws when there's no manager.
+        ensureHub: async () => {
+          throw new Error(
+            "no service manager (systemd/launchd) found — run `parachute serve` in the foreground, or use a platform that provides one",
+          );
+        },
+        guaranteeOperatorToken: async () => "no-user",
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(1);
+      const joined = logs.join("\n");
+      expect(joined).toContain("no service manager (systemd/launchd) found");
+      expect(joined).toContain("parachute logs hub");
     } finally {
       h.cleanup();
     }
