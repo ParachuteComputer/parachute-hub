@@ -67,7 +67,13 @@ import {
 } from "./hub-settings.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import { escapeHtml } from "./oauth-ui.ts";
-import { mintOperatorToken } from "./operator-token.ts";
+import {
+  type IssueOperatorTokenResult,
+  type MintOperatorTokenOpts,
+  issueOperatorToken,
+  mintOperatorToken,
+  readOperatorTokenFile,
+} from "./operator-token.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { findService, readManifestLenient } from "./services-manifest.ts";
 import {
@@ -377,6 +383,22 @@ export interface SetupWizardDeps {
    * `readExposeStateFn` seam.
    */
   readExposeStateFn?: () => ExposeState | undefined;
+  /**
+   * Test seam for the fresh-box operator-token closure (design §3.1 /
+   * Phase 3b Deliverable A). After the wizard creates the first admin, it
+   * persists `~/.parachute/operator.token` so the box has a CLI operator
+   * credential the moment it gains an admin — without it, the Phase 3b
+   * per-module verbs (`parachute start/stop/restart <svc>` driving the
+   * supervisor) would 401 on a freshly-bootstrapped box. Production omits
+   * this and uses the real {@link issueOperatorToken}; tests inject a stub
+   * to assert the call (or to make it throw and prove a token-write failure
+   * never fails account creation).
+   */
+  issueOperatorToken?: (
+    db: Database,
+    userId: string,
+    opts: MintOperatorTokenOpts & { dir?: string },
+  ) => Promise<IssueOperatorTokenResult>;
 }
 
 /**
@@ -1888,6 +1910,16 @@ export async function handleSetupAccountPost(
     // any racer who saw it over the operator's shoulder during the
     // window between log-print and form-submit.
     if (requireToken) consumeBootstrapToken();
+    // Fresh-box operator-token closure (design §3.1 / Phase 3b Deliverable A).
+    // The box now has its first admin — persist `operator.token` so it has a
+    // CLI operator credential immediately. Without it, the Phase 3b per-module
+    // verbs (start/stop/restart <svc> driving the supervisor over the
+    // module-ops API) would 401 on a box bootstrapped purely through the
+    // wizard. Runs AFTER the admin row + bootstrap-token are committed so a
+    // half-written admin never gains a token; guarded so an existing token is
+    // never clobbered; wrapped so a token-write failure NEVER fails the
+    // account creation the operator just completed.
+    await ensureOperatorTokenForFirstAdmin(deps, user.id);
     const session = createSession(deps.db, { userId: user.id });
     const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
       secure: isHttpsRequest(req),
@@ -1924,6 +1956,50 @@ export async function handleSetupAccountPost(
       }),
       400,
     );
+  }
+}
+
+/**
+ * Persist `~/.parachute/operator.token` for the just-created first admin
+ * (design §3.1 / Phase 3b Deliverable A). The 3a reviewer flagged that a fresh
+ * `init`→wizard flow ends with NO operator token on disk, so the Phase 3b
+ * per-module verbs — `parachute start/stop/restart <svc>`, which now drive the
+ * supervisor over the host-admin-gated module-ops API — would 401 on such a
+ * box. Minting the token here makes the box have a CLI operator credential the
+ * moment it gains an admin.
+ *
+ * Three invariants:
+ *   - Mints under the `admin` scope-set (the default), which carries
+ *     `parachute:host:admin` — exactly the scope `api-modules-ops.ts` gates on.
+ *     `issueOperatorToken` writes it 0600 (`writeOperatorTokenFile`).
+ *   - Guarded by `readOperatorTokenFile() === null`: never clobber a token an
+ *     operator already minted (`auth set-password` / `rotate-operator`, or a
+ *     prior init).
+ *   - Wrapped in try/catch so a token-write failure NEVER fails the account
+ *     creation the operator just completed — they have an admin row + session
+ *     either way, and `parachute auth rotate-operator` is the documented
+ *     recovery for a missing token.
+ *
+ * Uses `deps.issuer` as the `iss` claim — the same origin the rest of the
+ * wizard's mints use (`handleSetupExposePost`). `start hub` self-heals a stale
+ * `iss` later if the box is exposed after init (hub#481), so an init-at-loopback
+ * mint is correct here.
+ */
+async function ensureOperatorTokenForFirstAdmin(
+  deps: SetupWizardDeps,
+  userId: string,
+): Promise<void> {
+  const issue = deps.issueOperatorToken ?? issueOperatorToken;
+  try {
+    const existing = await readOperatorTokenFile(deps.configDir);
+    if (existing !== null) return;
+    await issue(deps.db, userId, { issuer: deps.issuer, dir: deps.configDir });
+  } catch (err) {
+    // Non-fatal: the admin + session were already committed. Log for the
+    // operator's debugging; they can recover with `parachute auth
+    // rotate-operator` from a shell on the box.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[setup-wizard] operator-token closure skipped for new admin: ${msg}`);
   }
 }
 

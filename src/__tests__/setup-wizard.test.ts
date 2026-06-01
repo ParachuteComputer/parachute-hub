@@ -27,6 +27,12 @@ import { type ExposeState, readExposeState, writeExposeState } from "../expose-s
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
 import { getSetting, setSetting } from "../hub-settings.ts";
+import { validateAccessToken } from "../jwt-sign.ts";
+import {
+  OPERATOR_TOKEN_SCOPE_SET_CLAIM,
+  readOperatorTokenFile,
+  writeOperatorTokenFile,
+} from "../operator-token.ts";
 import { writeManifest } from "../services-manifest.ts";
 import { SESSION_COOKIE_NAME } from "../sessions.ts";
 import {
@@ -39,6 +45,7 @@ import {
   handleSetupVaultPost,
   postVaultImportImpl,
 } from "../setup-wizard.ts";
+import { rotateSigningKey } from "../signing-keys.ts";
 import { Supervisor } from "../supervisor.ts";
 import { createUser, getUserByUsername, userCount } from "../users.ts";
 
@@ -1001,6 +1008,129 @@ describe("handleSetupAccountPost", () => {
       expect(post.headers.get("location")).toBe("/admin/setup");
       // Idempotent — no second user got minted.
       expect(userCount(db)).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// --- Phase 3b Deliverable A: fresh-box operator-token closure (§3.1) ------
+//
+// After the wizard creates the first admin, it persists ~/.parachute/operator.token
+// so the box has a CLI operator credential immediately — otherwise the Phase 3b
+// per-module verbs (start/stop/restart <svc> over the module-ops API) would 401.
+
+describe("handleSetupAccountPost — operator-token closure (Phase 3b §3.1)", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  /** Drive a valid account-creation POST against the given deps. */
+  async function createFirstAdmin(
+    db: ReturnType<typeof openHubDb>,
+    deps: Partial<Parameters<typeof handleSetupAccountPost>[1]> = {},
+    username = "ops",
+  ): Promise<Response> {
+    const baseDeps = {
+      db,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      readExposeStateFn: h.readExposeStateFn,
+      issuer: "https://hub.example",
+      registry: getDefaultOperationsRegistry(),
+    };
+    const get = handleSetupGet(req("/admin/setup"), baseDeps);
+    const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+    const form = formBody({
+      username,
+      password: "correct horse battery",
+      password_confirm: "correct horse battery",
+      [CSRF_FIELD_NAME]: csrf,
+    });
+    return handleSetupAccountPost(
+      req("/admin/setup/account", {
+        method: "POST",
+        body: form.body,
+        headers: { ...form.headers, cookie: `${CSRF_COOKIE_NAME}=${csrf}` },
+      }),
+      { ...baseDeps, ...deps },
+    );
+  }
+
+  test("persists operator.token (admin scope-set, carries parachute:host:admin)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      rotateSigningKey(db); // real issuance needs a signing key
+      const post = await createFirstAdmin(db);
+      expect(post.status).toBe(303);
+      // The token file now exists on disk…
+      const token = await readOperatorTokenFile(h.dir);
+      expect(token).not.toBeNull();
+      // …and decodes with the admin scope (the scope module-ops gates on).
+      // The JWT carries the OAuth `scope` claim as a space-delimited string.
+      const { payload } = await validateAccessToken(db, token ?? "", "https://hub.example");
+      const scopes = String(payload.scope ?? "").split(" ");
+      expect(scopes).toContain("parachute:host:admin");
+      expect((payload as Record<string, unknown>)[OPERATOR_TOKEN_SCOPE_SET_CLAIM]).toBe("admin");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("does NOT clobber an existing operator.token", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      rotateSigningKey(db);
+      // Plant a sentinel token before the wizard runs.
+      await writeOperatorTokenFile("sentinel.preexisting.token", h.dir);
+      // Use a stub issuer that fails the test if it's ever called.
+      const post = await createFirstAdmin(db, {
+        issueOperatorToken: async () => {
+          throw new Error("issueOperatorToken must NOT run when a token already exists");
+        },
+      });
+      expect(post.status).toBe(303);
+      // The pre-existing token is untouched.
+      expect(await readOperatorTokenFile(h.dir)).toBe("sentinel.preexisting.token");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("no admin created (already-bootstrapped guard) → no token written", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      rotateSigningKey(db);
+      // An admin already exists, so the wizard's already-bootstrapped guard
+      // returns early (303 to /admin/setup) WITHOUT reaching createUser — and
+      // therefore WITHOUT minting a token. The closure only fires for a
+      // genuinely-created first admin.
+      await createUser(db, "owner", "pw");
+      const post = await createFirstAdmin(db, {}, "interloper");
+      expect(post.status).toBe(303);
+      expect(await readOperatorTokenFile(h.dir)).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("token-write failure is non-fatal — account creation still succeeds", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const post = await createFirstAdmin(db, {
+        issueOperatorToken: async () => {
+          throw new Error("disk full");
+        },
+      });
+      // The admin + session were committed despite the token-write failure.
+      expect(post.status).toBe(303);
+      expect(setCookie(post, SESSION_COOKIE_NAME)).toBeDefined();
+      expect(userCount(db)).toBe(1);
+      // No token landed (the issuer threw), but that didn't fail the request.
+      expect(await readOperatorTokenFile(h.dir)).toBeNull();
     } finally {
       db.close();
     }
