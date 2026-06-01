@@ -1980,10 +1980,13 @@ export async function handleSetupAccountPost(
  *     either way, and `parachute auth rotate-operator` is the documented
  *     recovery for a missing token.
  *
- * Uses `deps.issuer` as the `iss` claim — the same origin the rest of the
- * wizard's mints use (`handleSetupExposePost`). `start hub` self-heals a stale
- * `iss` later if the box is exposed after init (hub#481), so an init-at-loopback
- * mint is correct here.
+ * Uses `deps.issuer` as the `iss` claim — the same pre-resolved origin the rest
+ * of the wizard's mints use (`handleSetupExposePost`). The hub-server derives
+ * that origin the same way `commands/auth.ts:resolveHubIssuer` does — semantically
+ * equivalent, structurally different: this path takes a pre-resolved `deps.issuer`
+ * while `auth.ts` reads expose-state inline at call time. `start hub` self-heals a
+ * stale `iss` later if the box is exposed after init (hub#481), so an
+ * init-at-loopback mint is correct here.
  */
 async function ensureOperatorTokenForFirstAdmin(
   deps: SetupWizardDeps,

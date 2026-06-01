@@ -513,6 +513,10 @@ function resolveSupervisor(opts: LifecycleOpts["supervisor"]): ResolvedSuperviso
  * token ALWAYS carries an `iss`, so this falls back to the canonical loopback
  * origin. Mirrors `commands/auth.ts`'s `resolveHubIssuer` so the issuer the CLI
  * validates the token against matches what `auth rotate-operator` minted under.
+ * The fallback differs cosmetically — here `readHubPort(configDir) ??
+ * HUB_UNIT_DEFAULT_PORT`, in auth.ts `127.0.0.1:${HUB_DEFAULT_PORT}` — but both
+ * resolve to 1939 under canonical-ports today, so they agree in practice.
+ * TODO: consolidate with auth.ts:resolveHubIssuer to prevent drift.
  */
 function resolveOperatorTokenIssuer(hubOrigin: string | undefined, configDir: string): string {
   if (hubOrigin) return hubOrigin;
@@ -995,9 +999,15 @@ export async function restart(svc: string | undefined, opts: LifecycleOpts = {})
   // unchanged detached stop-then-start below.
   if (r.sup.unitInstalled) return restartViaSupervisor(svc, r);
   // --- no-unit detached fallback (unchanged; preserved until Phase 5) ---
-  const stopCode = await stop(svc, opts);
+  // Pass `supervisor: undefined` to the inner stop/start so their own
+  // `resolveSupervisor` short-circuits to `unitInstalled: false` without
+  // re-probing `isHubUnitInstalled` (two redundant `stat`s per call) — we
+  // already resolved no-unit above, so both inner calls would re-take this
+  // same detached arm regardless. Behavior-preserving; just drops the probes.
+  const detachedOpts = { ...opts, supervisor: undefined };
+  const stopCode = await stop(svc, detachedOpts);
   if (stopCode !== 0) return stopCode;
-  return await start(svc, opts);
+  return await start(svc, detachedOpts);
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,6 +1090,13 @@ async function ensureHubForOp(r: Resolved, port: number): Promise<boolean> {
     log: r.log,
   });
   if (ensured.outcome === "already-up" || ensured.outcome === "started") return true;
+  // Defensive / unreachable under dual-dispatch: this arm catches the `no-unit`
+  // outcome (and any other non-up outcome), but we only reach `ensureHubForOp`
+  // on the supervisor path, which is gated on `unitInstalled === true` — the
+  // same `isHubUnitInstalled` probe that makes `ensureHubUnit` return `no-unit`
+  // only when it's false. So `no-unit` can't surface here in production; it's
+  // harmless surface. Candidate for removal in the Phase 5 bridge-collapse —
+  // the deletion sweep should not overlook this branch.
   for (const m of ensured.messages) r.log(m);
   return false;
 }
