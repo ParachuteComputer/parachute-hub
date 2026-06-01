@@ -348,9 +348,11 @@ async function defaultEnsureHubViaUnit(opts: EnsureHubOpts): Promise<{
   if (result.outcome === "started") {
     return { pid: 0, port: result.port, started: true };
   }
-  if (result.outcome === "already-up") {
-    return { pid: 0, port: result.port, started: false };
-  }
+  // NB: `installAndStartHubUnit` never returns `already-up` — only the lighter
+  // `ensureHubUnit` probe (handled above) reports already-up. The "hub already
+  // running, started:false" signal is therefore produced solely by the
+  // `ensureHubUnit` arm above; reaching here means we genuinely tried to
+  // install + start the unit.
   // no-manager / timeout / start-failed → actionable error. The init caller
   // catches this and prints the message + `parachute logs hub` hint.
   throw new Error(result.messages.join("\n") || `hub unit bringup failed (${result.outcome}).`);
@@ -381,11 +383,17 @@ function resolveInitIssuer(configDir: string, hubPort: number): string {
  *   - No token + a hub user already exists → mint under the default (`admin`)
  *     scope-set + write it 0600 (`minted`).
  *   - No token + no hub user yet (the common fresh-box case — init runs BEFORE
- *     the wizard creates first-admin) → `no-user`. NOT an error: the wizard's
- *     account step / `auth set-password` mints it once the admin exists.
+ *     the wizard creates first-admin) → `no-user`. NOT an error. Note the
+ *     wizard's account step does NOT write this on-disk token — it mints an
+ *     in-DB single-use *display* token (deleted once the done-screen reads it).
+ *     Today the on-disk `operator.token` is written only by `parachute auth
+ *     set-password` / `auth rotate-operator`, so a fresh box that finishes the
+ *     wizard without running either still has no on-disk token. Phase 3b closes
+ *     this gap: the per-module verbs that require the operator token land there
+ *     and carry the fresh-box mint with them.
  *
  * Failures are non-fatal (`mint-failed`): a DB hiccup shouldn't block init when
- * the wizard or `auth rotate-operator` can retry.
+ * `auth rotate-operator` can retry.
  */
 async function defaultGuaranteeOperatorToken(ctx: {
   configDir: string;
@@ -544,17 +552,32 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   log("");
 
   // Step 1: hub running?
+  // NB: under the Phase 3a unit-managed hub there is no pidfile, so
+  // `processState(HUB_SVC)` reports not-running on EVERY init re-run even when
+  // the hub is live. We therefore don't decide the "already running" message
+  // from `processState` here — `ensureHub` probes `/health` and reports the
+  // truth via `result.started` (false ⇒ already up, true ⇒ we started it). Only
+  // when `processState` finds a real (legacy detached) pidfile do we report the
+  // pid directly without a bringup call.
   const hubState = processState(HUB_SVC, configDir, alive);
   let hubPort: number | undefined;
   if (hubState.status === "running") {
     hubPort = readHubPort(configDir);
     log(`✓ Hub already running (pid ${hubState.pid}${hubPort ? `, port ${hubPort}` : ""}).`);
   } else {
-    log("Hub not running — starting it now…");
     try {
       const result = await ensureHub({ configDir, log: () => {} });
       hubPort = result.port;
-      log(`✓ Hub started (pid ${result.pid}, port ${result.port}).`);
+      if (result.started) {
+        // Genuinely installed/started the unit. A unit-managed hub has no
+        // meaningful CLI-visible pid, so report only the port (no misleading
+        // `pid 0` sentinel).
+        log(`✓ Hub unit started (port ${result.port}).`);
+      } else {
+        // The hub was already answering `/health` — `ensureHub` touched
+        // nothing. Honest re-run messaging: no "starting it now", no `pid 0`.
+        log(`✓ Hub already running (port ${result.port}).`);
+      }
     } catch (err) {
       log(`✗ Hub failed to start: ${err instanceof Error ? err.message : String(err)}`);
       log("");

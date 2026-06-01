@@ -7,13 +7,17 @@ import {
   installAndStartHubUnit,
 } from "../hub-unit.ts";
 import {
+  HUB_LAUNCHD_LABEL,
+  HUB_SYSTEMD_UNIT_NAME,
   type ServiceCommandResult,
   launchdPlistPathForLabel,
   systemdUnitPathForName,
 } from "../managed-unit.ts";
 
-const HUB_LABEL = "computer.parachute.hub";
-const HUB_UNIT = "parachute-hub.service";
+// Use the SHARED exported unit identifiers (not local re-declarations) so the
+// assertions can't silently pass if the canonical label/unit name ever drifts.
+const HUB_LABEL = HUB_LAUNCHD_LABEL;
+const HUB_UNIT = HUB_SYSTEMD_UNIT_NAME;
 
 interface FakeState {
   deps: HubUnitDeps;

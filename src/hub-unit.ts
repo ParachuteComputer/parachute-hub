@@ -220,6 +220,13 @@ function tailHubUnitLog(deps: HubUnitDeps, lines: number): string[] {
       }
     }
     if (deps.platform === "darwin") {
+      // NOTE: `launchctl print` emits the service STATE DESCRIPTOR (load state,
+      // last exit code, pid, env), NOT a log tail — unlike the systemd arm's
+      // `journalctl -n 50` which is a genuine tail of the unit's output. It's
+      // still diagnostically useful (a crash-looping unit shows its last exit
+      // code here), but it won't show the hub's recent stderr. The richer
+      // launchd equivalent is `log show --predicate 'process == "bun"' --last 5m`
+      // (or scoped by the unit's logPath) — a future refinement; not wired now.
       const uid = deps.getuid() ?? 0;
       const r = deps.run(["launchctl", "print", `gui/${uid}/${HUB_LAUNCHD_LABEL}`]);
       if (r.code === 0 && r.stdout.trim().length > 0) {

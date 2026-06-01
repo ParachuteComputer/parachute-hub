@@ -103,10 +103,53 @@ describe("init", () => {
       expect(code).toBe(0);
       expect(calls).toEqual(["ensureHub"]);
       const joined = logs.join("\n");
-      expect(joined).toContain("Hub not running — starting it now");
-      expect(joined).toContain("Hub started (pid 5555, port 1939)");
+      // A genuinely-started unit reports the port only — no `pid 0` sentinel,
+      // no misleading "starting it now" preamble.
+      expect(joined).toContain("Hub unit started (port 1939)");
+      expect(joined).not.toContain("pid 0");
+      expect(joined).not.toContain("starting it now");
       expect(joined).toContain("http://127.0.0.1:1939/admin/");
       expect(joined).toContain("finish setup in the admin wizard");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("unit-managed re-run against a live hub logs 'already running', not 'pid 0'", async () => {
+    // A unit-managed hub writes no pidfile, so `processState(HUB_SVC)` reports
+    // not-running on every re-run — but `ensureHub` probes /health and returns
+    // started:false when the hub is already up. The log must be honest: no
+    // "starting it now", no "Hub unit started", no `pid 0` sentinel.
+    const h = makeHarness();
+    try {
+      writeHubPort(1939, h.configDir);
+      const calls: string[] = [];
+      const logs: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        // No pidfile (unit-managed) → processState reports not-running.
+        alive: () => false,
+        ensureHub: async () => {
+          calls.push("ensureHub");
+          // Hub already answered /health — ensureHubUnit's already-up arm.
+          return { pid: 0, port: 1939, started: false };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "darwin",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      // ensureHub IS called (processState can't see a unit-managed hub) but
+      // reports started:false.
+      expect(calls).toEqual(["ensureHub"]);
+      const joined = logs.join("\n");
+      expect(joined).toContain("Hub already running (port 1939)");
+      expect(joined).not.toContain("pid 0");
+      expect(joined).not.toContain("starting it now");
+      expect(joined).not.toContain("Hub unit started");
     } finally {
       h.cleanup();
     }
