@@ -42,8 +42,13 @@ import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES } from "./service-spec.ts";
 // still required) and the latter for vault/scribe/runner (post-FALLBACK
 // retirement, hub#310). The local helper hides the split from the rest of
 // this file.
-import { type UiSubUnit, type UiSubUnitStatus, readManifest, readManifestLenient } from "./services-manifest.ts";
-import type { ModuleState, Supervisor } from "./supervisor.ts";
+import {
+  type UiSubUnit,
+  type UiSubUnitStatus,
+  readManifest,
+  readManifestLenient,
+} from "./services-manifest.ts";
+import type { ModuleStartError, ModuleState, Supervisor } from "./supervisor.ts";
 
 /**
  * Resolve a curated module to the display + install bootstrap data the
@@ -174,6 +179,16 @@ interface ModuleWireShape {
   latest_version: string | null;
   supervisor_status: ModuleState["status"] | null;
   pid: number | null;
+  /**
+   * Structured supervisor start-failure detail (§6.5 / §6.4), when the
+   * supervisor recorded one for this module — a preflight `MissingDependencyError`
+   * or the alive-but-never-bound shape (hub#487). Mirrors the services.json
+   * `lastStartError` the detached path persists, so `parachute status` and the
+   * SPA keep the SAME friendly missing-dependency surface (#188) whether a
+   * module was started via the supervisor or the detached path. Null when the
+   * module started cleanly (or the hub is in pidfile/CLI mode with no supervisor).
+   */
+  supervisor_start_error: ModuleStartError | null;
   /**
    * The path on disk where the module is installed, if known. Surfaces
    * the BUN_INSTALL or bun-link install location for operator debug —
@@ -477,6 +492,7 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
       latest_version: latestByShort.get(short) ?? null,
       supervisor_status: state?.status ?? null,
       pid: state?.pid ?? null,
+      supervisor_start_error: state?.startError ?? null,
       install_dir: installed?.installDir ?? null,
       uis: toUisWireShape(installed?.uis),
       management_url: managementUrlByShort.get(short) ?? null,

@@ -5,6 +5,7 @@ import {
   NO_UNIT_MESSAGE,
   ensureHubUnit,
   installAndStartHubUnit,
+  queryHubUnitState,
   restartHubUnit,
   stopHubUnit,
 } from "../hub-unit.ts";
@@ -439,5 +440,135 @@ describe("restartHubUnit — manager-only hub restart (§3.3, R17)", () => {
     const res = restartHubUnit(f.deps);
     expect(res.outcome).toBe("failed");
     expect(res.messages.join("\n")).toContain("job failed");
+  });
+});
+
+describe("queryHubUnitState — §6.4 hub-row manager query", () => {
+  test("no service manager → no-manager (nothing to query)", () => {
+    const f = fakeDeps({ platform: "linux", which: () => null });
+    expect(queryHubUnitState(f.deps).state).toBe("no-manager");
+  });
+
+  test("manager present but no unit installed → no-unit", () => {
+    const f = fakeDeps({ platform: "linux", installedUnit: false });
+    expect(queryHubUnitState(f.deps).state).toBe("no-unit");
+  });
+
+  test("systemd is-active → active", () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      runResults: [{ code: 0, stdout: "active\n", stderr: "" }],
+    });
+    const r = queryHubUnitState(f.deps);
+    expect(r.state).toBe("active");
+    // user-scope is-active was driven.
+    expect(f.calls).toContainEqual(["systemctl", "--user", "is-active", HUB_UNIT]);
+  });
+
+  test("systemd is-active → failed (nonzero exit, stdout token classified)", () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      // is-active exits 3 for a failed unit; the state word is on stdout.
+      runResults: [{ code: 3, stdout: "failed\n", stderr: "" }],
+    });
+    expect(queryHubUnitState(f.deps).state).toBe("failed");
+  });
+
+  test("systemd is-active → inactive", () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      runResults: [{ code: 3, stdout: "inactive\n", stderr: "" }],
+    });
+    expect(queryHubUnitState(f.deps).state).toBe("inactive");
+  });
+
+  test("systemd is-active → activating maps to activating", () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      runResults: [{ code: 3, stdout: "activating\n", stderr: "" }],
+    });
+    expect(queryHubUnitState(f.deps).state).toBe("activating");
+  });
+
+  test("systemd root scope → no --user", () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 0,
+      userName: () => "root",
+      installedUnit: true,
+      runResults: [{ code: 0, stdout: "active\n", stderr: "" }],
+    });
+    queryHubUnitState(f.deps);
+    expect(f.calls).toContainEqual(["systemctl", "is-active", HUB_UNIT]);
+  });
+
+  test("launchd print: state = running → active (+ last exit code parsed)", () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      runResults: [
+        {
+          code: 0,
+          stdout:
+            "computer.parachute.hub = {\n\tstate = running\n\tpid = 4242\n\tlast exit code = 0\n}",
+          stderr: "",
+        },
+      ],
+    });
+    const r = queryHubUnitState(f.deps);
+    expect(r.state).toBe("active");
+    expect(r.lastExitCode).toBe(0);
+    expect(f.calls).toContainEqual(["launchctl", "print", "gui/501/computer.parachute.hub"]);
+  });
+
+  test("launchd print: not running + nonzero last exit code → failed", () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      runResults: [
+        {
+          code: 0,
+          stdout: "computer.parachute.hub = {\n\tstate = not running\n\tlast exit code = 78\n}",
+          stderr: "",
+        },
+      ],
+    });
+    const r = queryHubUnitState(f.deps);
+    expect(r.state).toBe("failed");
+    expect(r.lastExitCode).toBe(78);
+  });
+
+  test("launchd print: label not loaded (empty stdout) → inactive, never throws", () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      runResults: [{ code: 1, stdout: "", stderr: "Could not find service" }],
+    });
+    expect(queryHubUnitState(f.deps).state).toBe("inactive");
+  });
+
+  test("a thrown manager run never escapes — degrades to unknown", () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      run: () => {
+        throw new Error("spawn EPERM");
+      },
+    });
+    const r = queryHubUnitState(f.deps);
+    expect(r.state).toBe("unknown");
+    expect(r.detail).toContain("spawn EPERM");
   });
 });

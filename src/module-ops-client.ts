@@ -284,6 +284,89 @@ export async function fetchModuleLogs(
   return { short, lines, text };
 }
 
+/**
+ * One module's run-state as read from `GET /api/modules` — the subset
+ * `parachute status` needs to render a module row from the RUNNING supervisor
+ * (design §6.4 module rows). Snake-case mirrors the wire shape (`api-modules.ts`
+ * `ModuleWireShape`); we keep only the supervisor-derived fields here.
+ */
+export interface ModuleStateSnapshot {
+  readonly short: string;
+  readonly installed: boolean;
+  readonly installed_version: string | null;
+  /**
+   * Supervisor run-status (`running` / `stopped` / `crashed` / `starting` /
+   * `restarting`), or null when the module isn't tracked by the supervisor
+   * (e.g. never booted, skipped at boot, or no supervisor on this hub).
+   */
+  readonly supervisor_status: string | null;
+  readonly pid: number | null;
+  /**
+   * Structured start-error the supervisor recorded (missing-dependency /
+   * started-but-unbound). Passed through verbatim so `status` can render the
+   * SAME friendly missing-dependency note the detached path shows (#188).
+   */
+  readonly supervisor_start_error: unknown | null;
+}
+
+/** Terminal shape returned by {@link fetchModuleStates}. */
+export interface ModuleStatesResult {
+  /** Whether the running hub has a supervisor wired in (`supervisor_available`). */
+  readonly supervisorAvailable: boolean;
+  /** Per-module supervisor snapshots, keyed by short name in array order. */
+  readonly modules: ModuleStateSnapshot[];
+}
+
+/**
+ * Read the RUNNING hub's per-module supervisor states via `GET /api/modules`
+ * (design §6.4 module rows). The operator token's `admin` scope-set carries
+ * `parachute:host:auth` (the scope `/api/modules` gates on), so the same
+ * read-never-mint operator-token→Bearer path {@link driveModuleOp} uses
+ * authenticates this read.
+ *
+ * Used by `parachute status` on a UNIT-MANAGED box to source module rows from
+ * the live supervisor instead of pidfiles. It is read-only and bounded; the
+ * CALLER is responsible for degrading gracefully (hub down → don't call this;
+ * no token → catch {@link NoOperatorTokenError}) so `status` never hangs/crashes.
+ *
+ * Throws:
+ *   - {@link NoOperatorTokenError} — no operator.token on disk.
+ *   - {@link OperatorTokenExpiredError} — token fully expired (actionable msg).
+ *   - {@link ModuleOpHttpError} — hub answered non-2xx.
+ */
+export async function fetchModuleStates(deps: DriveModuleOpDeps): Promise<ModuleStatesResult> {
+  const doFetch = deps.fetch ?? fetch;
+  const baseUrl = (deps.baseUrl ?? DEFAULT_HUB_BASE_URL).replace(/\/+$/, "");
+  const bearer = await resolveOperatorBearer(deps);
+
+  const res = await doFetch(`${baseUrl}/api/modules`, {
+    method: "GET",
+    // `/api/modules` parses the scheme-cased `Bearer ` prefix; match it exactly.
+    headers: { authorization: `Bearer ${bearer}` },
+  });
+  const body = await parseJsonSafe(res);
+  if (res.status < 200 || res.status >= 300) {
+    const { error, error_description } = asErrorBody(body);
+    throw new ModuleOpHttpError(res.status, error, error_description);
+  }
+  const b = (body ?? {}) as { modules?: unknown; supervisor_available?: unknown };
+  const supervisorAvailable = b.supervisor_available === true;
+  const modules: ModuleStateSnapshot[] = Array.isArray(b.modules)
+    ? b.modules
+        .filter((m): m is Record<string, unknown> => !!m && typeof m === "object")
+        .map((m) => ({
+          short: typeof m.short === "string" ? m.short : "",
+          installed: m.installed === true,
+          installed_version: typeof m.installed_version === "string" ? m.installed_version : null,
+          supervisor_status: typeof m.supervisor_status === "string" ? m.supervisor_status : null,
+          pid: typeof m.pid === "number" ? m.pid : null,
+          supervisor_start_error:
+            m.supervisor_start_error !== undefined ? (m.supervisor_start_error ?? null) : null,
+        }))
+    : [];
+  return { supervisorAvailable, modules };
+}
+
 async function parseJsonSafe(res: Response): Promise<unknown> {
   try {
     return await res.json();

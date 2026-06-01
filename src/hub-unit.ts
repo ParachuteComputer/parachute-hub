@@ -342,6 +342,149 @@ export function restartHubUnit(deps: HubUnitDeps): HubUnitManagerOpResult {
 }
 
 /**
+ * Run-state of the hub UNIT as reported by the platform manager (design §6.4).
+ * This is the manager's view — NOT a liveness verdict. The hub answering
+ * `/health` is the liveness signal; the caller (`status`) composes the two
+ * (manager says `active` + `/health` answers → "running"; `active` but no
+ * `/health` yet → "starting/unhealthy"; `failed` → "failed").
+ */
+export type HubUnitState =
+  /** systemd `is-active` → `active`; launchd `print` → `state = running`. */
+  | "active"
+  /** systemd `is-active` → `activating` / `reloading`; launchd transient. */
+  | "activating"
+  /** systemd `is-active` → `failed`; launchd nonzero `last exit code`. */
+  | "failed"
+  /** systemd `is-active` → `inactive` / `dead`; launchd not-running, clean. */
+  | "inactive"
+  /** A hub unit is installed but the manager couldn't classify it. */
+  | "unknown"
+  /** No hub unit file is installed on this platform. */
+  | "no-unit"
+  /**
+   * No on-box service manager exists at all (container runtime / init-less
+   * host). There is nothing to query — `status` reports "container runtime
+   * (managed)" and leans on `/health` for liveness (§6.4).
+   */
+  | "no-manager";
+
+export interface HubUnitStateResult {
+  state: HubUnitState;
+  /** Last exit code, when the manager surfaced one (launchd / failed unit). */
+  lastExitCode?: number;
+  /** Raw manager output (trimmed), for diagnostics on `unknown` / `failed`. */
+  detail?: string;
+}
+
+/**
+ * Map a systemd `systemctl is-active` stdout token to a {@link HubUnitState}.
+ * `is-active` prints exactly one of: `active`, `activating`, `reloading`,
+ * `inactive`, `failed`, `deactivating`, `unknown`. We collapse the transient
+ * tokens onto our smaller vocabulary so `status` doesn't have to know them all.
+ */
+function mapSystemdActiveToken(token: string): HubUnitState {
+  switch (token.trim()) {
+    case "active":
+      return "active";
+    case "activating":
+    case "reloading":
+    case "deactivating":
+      return "activating";
+    case "failed":
+      return "failed";
+    case "inactive":
+    case "dead":
+      return "inactive";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * Parse a launchd `launchctl print gui/<uid>/<label>` state descriptor into a
+ * {@link HubUnitStateResult}. The descriptor is multi-line key/value; we read
+ * the `state = …` line and the `last exit code = …` line. A nonzero last-exit
+ * with the service not running reads as `failed`; `state = running` reads as
+ * `active`; anything else with the unit loaded reads as `inactive`.
+ *
+ * `launchctl print` exits nonzero when the label isn't loaded at all — the
+ * caller treats that as `inactive` (unit installed on disk but not bootstrapped),
+ * since the descriptor body is empty.
+ */
+function parseLaunchctlPrint(stdout: string): HubUnitStateResult {
+  const stateMatch = stdout.match(/^\s*state\s*=\s*(\S+)/im);
+  const exitMatch = stdout.match(/last exit code\s*=\s*(-?\d+)/i);
+  const lastExitCode = exitMatch?.[1] !== undefined ? Number(exitMatch[1]) : undefined;
+  const stateToken = stateMatch?.[1]?.toLowerCase();
+  const detail = stdout.trim().length > 0 ? stdout.trim() : undefined;
+  if (stateToken === "running") {
+    return lastExitCode !== undefined
+      ? { state: "active", lastExitCode, ...(detail ? { detail } : {}) }
+      : { state: "active", ...(detail ? { detail } : {}) };
+  }
+  // Not running: a nonzero recorded last-exit means the unit crashed/failed; a
+  // zero / absent exit means it's loaded-but-idle (inactive). KeepAlive units
+  // that crash-loop surface a nonzero last-exit here even between respawns.
+  if (lastExitCode !== undefined && lastExitCode !== 0) {
+    return { state: "failed", lastExitCode, ...(detail ? { detail } : {}) };
+  }
+  if (lastExitCode !== undefined) {
+    return { state: "inactive", lastExitCode, ...(detail ? { detail } : {}) };
+  }
+  // No state and no exit-code line — the descriptor told us nothing usable.
+  return detail ? { state: "unknown", detail } : { state: "inactive" };
+}
+
+/**
+ * Query the platform manager for the hub unit's run-state (design §6.4 hub
+ * row). This is the `status`-side counterpart to {@link stopHubUnit} /
+ * {@link restartHubUnit}: a READ, never a mutation.
+ *
+ *   - No manager (container / init-less) → `no-manager`. `status` reports
+ *     "container runtime (managed)" — there's nothing on-box to query, and the
+ *     `/health` answer is the liveness signal.
+ *   - No unit file installed → `no-unit` (a legacy detached box that somehow
+ *     reached this read; the dual-dispatch branch in `status` guards against it).
+ *   - systemd → `systemctl [--user] is-active <unit>`; the token maps via
+ *     {@link mapSystemdActiveToken}. `is-active` exits nonzero for non-active
+ *     states, so we read stdout regardless of exit code.
+ *   - launchd → `launchctl print gui/<uid>/<label>`; parsed via
+ *     {@link parseLaunchctlPrint}.
+ *
+ * Never throws — a query failure degrades to `unknown` with the manager's
+ * stderr in `detail`, so `status` can render a sensible row rather than crash.
+ */
+export function queryHubUnitState(deps: HubUnitDeps): HubUnitStateResult {
+  if (!hasServiceManager(deps)) return { state: "no-manager" };
+  if (!isHubUnitInstalled(deps)) return { state: "no-unit" };
+  try {
+    if (deps.platform === "darwin") {
+      const uid = deps.getuid() ?? 0;
+      const r = deps.run(["launchctl", "print", `gui/${uid}/${HUB_LAUNCHD_LABEL}`]);
+      // A nonzero exit with empty stdout means the label isn't loaded — the
+      // unit file is on disk but never bootstrapped. Read as inactive.
+      if (r.stdout.trim().length === 0) {
+        const detail = r.stderr.trim();
+        return detail ? { state: "inactive", detail } : { state: "inactive" };
+      }
+      return parseLaunchctlPrint(r.stdout);
+    }
+    // linux / systemd. `is-active` exits 0 only when active; we classify from
+    // stdout (the state word) regardless of exit code.
+    const root = (deps.getuid() ?? 1000) === 0;
+    const scope = root ? [] : ["--user"];
+    const r = deps.run(["systemctl", ...scope, "is-active", HUB_SYSTEMD_UNIT_NAME]);
+    const token = r.stdout.trim() || r.stderr.trim();
+    if (token.length === 0) return { state: "unknown" };
+    const state = mapSystemdActiveToken(token);
+    return state === "unknown" ? { state, detail: token } : { state };
+  } catch (err) {
+    // A manager-query failure must never crash `status` — degrade to unknown.
+    return { state: "unknown", detail: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
  * Ensure the hub UNIT is up (design §3.2). Probe `/health`; if down, start the
  * unit via the platform manager; wait for readiness; surface the unit log on
  * timeout. Returns a structured outcome — the CALLER decides exit codes /
