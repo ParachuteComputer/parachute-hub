@@ -772,6 +772,149 @@ describe("Supervisor per-module log ring buffer (§6.5)", () => {
   });
 });
 
+describe("Supervisor port-readiness + structured start-error (§6.5)", () => {
+  const reqWithPort = (short: string, port: number): SpawnRequest => ({
+    short,
+    cmd: ["parachute-vault", "serve"],
+    env: { PORT: String(port) },
+  });
+
+  test("(a) module that never binds its port → started-but-unbound start-error, status stays running", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    // portListening always false → the readiness gate times out. Short window +
+    // instant sleep so the test doesn't actually wait.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      portListening: async () => false,
+      startReadyMs: 50,
+      startReadyPollMs: 5,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+
+    // Process IS up (we don't break the running enum — proxy-state/SPA read it)...
+    expect(state.status).toBe("running");
+    // ...but the structured start-error explains it's not actually listening.
+    expect(state.startError?.error_type).toBe("started_but_unbound");
+    expect(state.startError?.error_description).toContain("1940");
+    expect(state.startError?.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("(b) module that binds promptly → no start-error, clean running", async () => {
+    const proc = makeFakeProc(102);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    let probes = 0;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      // First probe says "not yet", second says "bound" — exercises the poll
+      // loop rather than an instant hit.
+      portListening: async () => ++probes >= 2,
+      startReadyMs: 1000,
+      startReadyPollMs: 5,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+
+    expect(state.status).toBe("running");
+    expect(state.startError).toBeUndefined();
+    expect(probes).toBeGreaterThanOrEqual(2);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("(c) preflight MissingDependencyError → structured start-error, NO spawn", async () => {
+    const spawner = makeQueueSpawner();
+    // No proc enqueued — if start() tried to spawn, the queue spawner throws.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      which: () => null, // binary not resolvable → preflight throws
+      portListening: async () => true,
+      startReadyMs: 50,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+
+    // Doomed spawn aborted: status crashed, structured missing-dependency error.
+    expect(state.status).toBe("crashed");
+    expect(state.startError?.error_type).toBe("missing_dependency");
+    expect(state.startError?.binary).toBe("parachute-vault");
+    // Crucially, the supervisor never called the spawner.
+    expect(spawner.calls).toHaveLength(0);
+  });
+
+  test("a clean re-start clears a prior started-but-unbound start-error", async () => {
+    const first = makeFakeProc(201);
+    const second = makeFakeProc(202);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    let bound = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      portListening: async () => bound,
+      startReadyMs: 30,
+      startReadyPollMs: 5,
+      sleep: () => Promise.resolve(),
+    });
+
+    // First start never binds → start-error recorded.
+    const s1 = await sup.start(reqWithPort("vault", 1940));
+    expect(s1.startError?.error_type).toBe("started_but_unbound");
+
+    // Restart with the port now binding → the stale error clears.
+    bound = true;
+    const restartP = sup.restart("vault");
+    first.closeStreams();
+    first.resolveExit(0);
+    const s2 = await restartP;
+    expect(s2?.status).toBe("running");
+    expect(s2?.startError).toBeUndefined();
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test("readiness gate is skipped when the request carries no PORT", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    let probed = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      portListening: async () => {
+        probed = true;
+        return false;
+      },
+      startReadyMs: 1000,
+      sleep: () => Promise.resolve(),
+    });
+    // No env.PORT → nothing to probe; start returns running, no error, no probe.
+    const state = await sup.start({ short: "cli-only", cmd: ["parachute-vault", "serve"] });
+    expect(state.status).toBe("running");
+    expect(state.startError).toBeUndefined();
+    expect(probed).toBe(false);
+
+    proc.closeStreams();
+    sup.stop("cli-only");
+    proc.resolveExit(0);
+  });
+});
+
 describe("Supervisor.list + get", () => {
   test("list returns snapshot of all supervised modules", async () => {
     const vault = makeFakeProc(101);
