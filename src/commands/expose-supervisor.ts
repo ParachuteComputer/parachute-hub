@@ -148,7 +148,7 @@ export function resolveExposeSupervisor(
  * bearer against its per-request issuer — which for a loopback request is the
  * loopback origin — so the operator token must remain validatable there.
  */
-export function resolveExposeOperatorTokenIssuer(
+function resolveExposeOperatorTokenIssuer(
   hubOrigin: string | undefined,
   configDir: string,
 ): string {
@@ -228,8 +228,15 @@ export async function restartHubDependentViaSupervisor(args: {
       );
     }
     // Durable .env persistence + vault-side self-heal (parity with the detached
-    // `persistVaultHubOriginForStart`). `persistVaultHubOrigin` skips loopback /
-    // unchanged values itself.
+    // `persistVaultHubOriginForStart`). Both are called for parity with that
+    // detached path: `persistVaultHubOrigin` is the PRIMARY write — it stamps
+    // the new public origin into vault's `.env` (skipping loopback / unchanged
+    // values itself). `selfHealVaultHubOrigin` is a deliberate no-op in the
+    // normal case here — persist just wrote the public origin, so selfHeal's
+    // `current !== undefined && !isLoopbackOrigin(current)` guard short-circuits.
+    // It only fires for OLD installs where `.env` was left stale-loopback (the
+    // persist write can be skipped on edge cases), keeping the pair behaviorally
+    // identical to the detached path.
     if (short === "vault") {
       persistVaultHubOrigin(configDir, hubOrigin, log);
       selfHealVaultHubOrigin(configDir, log, `${configDir}/expose-state.json`);

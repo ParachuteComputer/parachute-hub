@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { CloudflaredState } from "../cloudflare/state.ts";
+import type { ExposeCloudflareOpts } from "../commands/expose-cloudflare.ts";
 import {
   type ExposePublicOffAutoOpts,
   runExposePublicOffAutoDetect,
@@ -50,6 +51,7 @@ interface Harness {
   prompts: string[];
   tailscaleCalls: number;
   cloudflareCalls: number;
+  cloudflareOpts: ExposeCloudflareOpts[];
 }
 
 function makeHarness(
@@ -70,6 +72,7 @@ function makeHarness(
     prompts: [],
     tailscaleCalls: 0,
     cloudflareCalls: 0,
+    cloudflareOpts: [],
   };
   const answers = [...(input.promptAnswers ?? [])];
   let i = 0;
@@ -88,8 +91,9 @@ function makeHarness(
       harness.tailscaleCalls++;
       return input.tsExitCode ?? 0;
     },
-    exposeCloudflareOffImpl: async () => {
+    exposeCloudflareOffImpl: async (cfOpts) => {
       harness.cloudflareCalls++;
+      harness.cloudflareOpts.push(cfOpts);
       return input.cfExitCode ?? 0;
     },
   };
@@ -271,5 +275,26 @@ describe("runExposePublicOffAutoDetect — both live (non-TTY)", () => {
     expect(harness.tailscaleCalls).toBe(1);
     expect(harness.cloudflareCalls).toBe(1);
     expect(harness.logs).toContain("(non-TTY: tearing down both.)");
+  });
+});
+
+describe("runExposePublicOffAutoDetect — supervisor threading (Phase 4 consistency)", () => {
+  test("cloudflareOffOpts.supervisor reaches the cloudflare teardown leg", async () => {
+    // cli.ts threads `cloudflareOffOpts: { supervisor: {} }` into the
+    // auto-detect off path so the Phase 4 supervisor resolution is consistent
+    // across both providers (matching the explicit `--cloudflare off` branch).
+    // Assert the supervisor block survives the spread-with-tunnelName wrapper
+    // and arrives at the leaf cloudflare-off impl.
+    const { harness, opts } = makeHarness({ cfState: cloudflaredState() });
+    const code = await runExposePublicOffAutoDetect({
+      ...opts,
+      cloudflareOffOpts: { supervisor: {} },
+    });
+    expect(code).toBe(0);
+    expect(harness.cloudflareCalls).toBe(1);
+    expect(harness.cloudflareOpts).toHaveLength(1);
+    expect(harness.cloudflareOpts[0]?.supervisor).toEqual({});
+    // The per-record wrapper still stamps the tunnelName onto the leaf opts.
+    expect(harness.cloudflareOpts[0]?.tunnelName).toBe("vault-tunnel");
   });
 });

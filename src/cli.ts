@@ -632,7 +632,16 @@ async function main(argv: string[]): Promise<number> {
       // remember which provider they brought up last.
       if (layer === "public" && action === "off") {
         const { runExposePublicOffAutoDetect } = await import("./commands/expose-off-auto.ts");
-        return await runExposePublicOffAutoDetect({ tailscaleOffOpts: exposeOpts });
+        // `tailscaleOffOpts` carries `supervisor: {}`; thread it into the
+        // Cloudflare teardown leg too so the Phase 4 supervisor resolution is
+        // consistent across both providers on the auto-detect path (matching
+        // the explicit `--cloudflare off` branch above). Harmless today
+        // (exposeCloudflareOff has no stopHub call) but keeps `supervisor: {}`
+        // threaded everywhere.
+        return await runExposePublicOffAutoDetect({
+          tailscaleOffOpts: exposeOpts,
+          cloudflareOffOpts: { supervisor: {} },
+        });
       }
 
       // `--skip-provider-check` fallthrough: pin to today's Tailscale-Funnel
