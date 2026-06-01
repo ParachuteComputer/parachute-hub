@@ -47,6 +47,8 @@
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
  *   /api/hub                      (GET)        → hub version + uptime + install-source (host:admin)
+ *   /api/hub/upgrade              (POST)       → SPA-driven hub self-upgrade → 202 + detached helper (host:admin, §5.3/D4)
+ *   /api/hub/upgrade/status       (GET)        → poll the on-disk hub-upgrade status (host:admin)
  *   /api/modules                  (GET)        → curated + installed module catalog (host:auth)
  *   /api/modules/channel          (PUT)        → operator channel toggle (host:admin)
  *   /api/modules/:short/install   (POST)       → bun add + spawn (async op)
@@ -136,6 +138,7 @@ import {
   handleAccountChangePasswordPost,
   handleAccountHomeGet,
 } from "./api-account.ts";
+import { handleHubUpgrade, handleHubUpgradeStatus } from "./api-hub-upgrade.ts";
 import { handleApiHub } from "./api-hub.ts";
 import { handleApiMe } from "./api-me.ts";
 import { handleApiMintToken } from "./api-mint-token.ts";
@@ -1740,6 +1743,31 @@ export function hubFetch(
     if (pathname === "/api/me") {
       if (!getDb) return dbNotConfigured();
       return handleApiMe(req, { db: getDb() });
+    }
+
+    // SPA-driven hub self-upgrade (design 2026-06-01 §5.3 / D4). Dedicated
+    // endpoint — the hub is NOT a supervised module (no /api/modules/hub/*),
+    // so it gets its own route. Checked BEFORE the `/api/hub` exact match
+    // below (and the `/api/modules/*` switch) so the more-specific path wins.
+    // Does NOT require a supervisor: the hub upgrades itself via a detached
+    // helper, not the supervisor. Host-admin gated inside the handler (reuses
+    // the same validateAccessToken + scope check the module-ops API uses); the
+    // channel param is a closed enum (rc|latest) — no injection surface.
+    if (pathname === "/api/hub/upgrade") {
+      if (!getDb) return dbNotConfigured();
+      return handleHubUpgrade(req, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        configDir: CONFIG_DIR,
+      });
+    }
+    if (pathname === "/api/hub/upgrade/status") {
+      if (!getDb) return dbNotConfigured();
+      return handleHubUpgradeStatus(req, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        configDir: CONFIG_DIR,
+      });
     }
 
     // Hub version + uptime + install-source — drives the admin SPA's
