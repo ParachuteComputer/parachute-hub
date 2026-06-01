@@ -102,6 +102,17 @@ export interface SupervisorOpts {
    */
   readonly spawnFn?: SpawnFn;
   /**
+   * Group-aware kill seam (hub#88). Production sends the signal to the child's
+   * whole process group (`process.kill(-pid, signal)`) so wrapped startCmds
+   * like `pnpm exec tsx server.ts` reap the tsx grandchild — not just the
+   * wrapper that would otherwise leave the grandchild bound to the port →
+   * EADDRINUSE on restart. Pairs with `defaultSpawnFn`'s `detached: true`
+   * (each child is its own process-group leader, `pid === pgid`). Defaults to
+   * {@link defaultKillGroup}; tests inject a stub so they stay deterministic
+   * (no real signals) and can assert the negative pid (group send) was used.
+   */
+  readonly killFn?: KillFn;
+  /**
    * Test seam over wall-clock. Production passes `Date.now`.
    */
   readonly now?: () => number;
@@ -118,6 +129,12 @@ export interface SupervisorOpts {
  * and pipe-able stdout/stderr.
  */
 export type SpawnFn = (req: SpawnRequest) => SupervisedProc;
+
+/**
+ * Group-aware kill seam. Sends `signal` to the process group rooted at `pid`.
+ * Production uses {@link defaultKillGroup}; tests inject a stub.
+ */
+export type KillFn = (pid: number, signal: NodeJS.Signals | number) => void;
 
 /**
  * The minimal Subprocess shape the supervisor depends on. Bun's real
@@ -158,6 +175,7 @@ export class Supervisor {
       killTimeoutMs: opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS,
       output: opts.output ?? ((line) => process.stdout.write(line)),
       spawnFn: opts.spawnFn ?? defaultSpawnFn,
+      killFn: opts.killFn ?? defaultKillGroup,
       now: opts.now ?? Date.now,
       sleep: opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
     };
@@ -216,7 +234,13 @@ export class Supervisor {
     const proc = entry.proc;
     if (proc) {
       try {
-        proc.kill("SIGTERM");
+        // Group-aware kill (hub#88): signal the child's whole process group
+        // via `killFn` (default `defaultKillGroup` → `process.kill(-pid)`) so
+        // a wrapped startCmd's grandchild is reaped too, not just the wrapper.
+        // Mirrors `commands/lifecycle.ts`'s `defaultKill` repointing of
+        // `defaultSpawner`'s detached children. Without it, the grandchild
+        // stays bound to the port → restart hits EADDRINUSE.
+        this.opts.killFn(proc.pid, "SIGTERM");
       } catch {
         // Process may already be dead — fall through.
       }
@@ -234,7 +258,9 @@ export class Supervisor {
             `[supervisor] ${entry.req.short} did not exit ${this.opts.killTimeoutMs}ms after SIGTERM — escalating to SIGKILL.\n`,
           );
           try {
-            proc.kill("SIGKILL");
+            // Group-aware SIGKILL escalation — same `killFn` seam as the
+            // SIGTERM above so the whole group is reaped, not just the leader.
+            this.opts.killFn(proc.pid, "SIGKILL");
           } catch {
             // Process may already be dead between the timeout firing
             // and us reaching kill() — fall through to the await.
@@ -402,7 +428,20 @@ async function pumpLines(
 
 const defaultSpawnFn: SpawnFn = (req) => {
   const spawnOpts: Parameters<typeof Bun.spawn>[1] = {
+    // Keep stdout/stderr explicitly piped — the supervisor pumps child output
+    // into hub's log (`pipeOutput`/`pumpLines`) + the per-module ring buffer.
+    // `detached: true` does NOT detach explicitly-piped stdio, so these stay
+    // wired even though the child gets its own process group below.
     stdio: ["ignore", "pipe", "pipe"],
+    // Spawn in a fresh process group (pid == pgid) so `killFn` (→
+    // `process.kill(-pid, sig)`) reaches every descendant, not just the
+    // wrapper. Without this, wrapped startCmds like `pnpm exec tsx server.ts`
+    // leave the tsx grandchild bound to the port after stop → restart hits
+    // EADDRINUSE (hub#88). Mirrors `commands/lifecycle.ts`'s `defaultSpawner`,
+    // which set `detached: true` for exactly this reason. We do NOT `unref()`:
+    // the supervisor must stay attached for the lifecycle (watch `exited`,
+    // pump output, reap on stop).
+    detached: true,
     // Inherit env so supervised module sees PATH, HOME, PARACHUTE_HOME, etc.
     // Bun.spawn defaults to empty env — see api-modules-ops.ts:defaultRun.
     // Per-call `req.env` overrides merge on top below.
@@ -412,4 +451,22 @@ const defaultSpawnFn: SpawnFn = (req) => {
   if (req.env) spawnOpts.env = { ...process.env, ...req.env };
   const proc = Bun.spawn([...req.cmd], spawnOpts);
   return proc as unknown as SupervisedProc;
+};
+
+/**
+ * Production group-aware kill (hub#88). Sends `signal` to the entire process
+ * group rooted at `pid` (the negative-pid syscall) so a wrapped startCmd's
+ * grandchildren are reaped alongside the wrapper. Mirrors
+ * `commands/lifecycle.ts`'s `defaultKill`: on ESRCH the group is already gone
+ * (or the child predates the detached-spawn change and has no group with that
+ * pgid) — fall back to a bare-pid signal so the caller's intent still lands
+ * when there's a positive-pid process to receive it.
+ */
+export const defaultKillGroup: KillFn = (pid, signal) => {
+  try {
+    process.kill(-pid, signal);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+    process.kill(pid, signal);
+  }
 };
