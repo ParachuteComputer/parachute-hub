@@ -9,6 +9,8 @@ import {
   handleInstall,
   handleOperationGet,
   handleRestart,
+  handleStart,
+  handleStop,
   handleUninstall,
   handleUpgrade,
   parseModulesPath,
@@ -149,6 +151,17 @@ describe("parseModulesPath", () => {
     expect(parseModulesPath("/api/modules/scribe/upgrade")).toEqual({
       short: "scribe",
       rest: "upgrade",
+    });
+  });
+
+  test("recognizes the Phase 1 start / stop verbs", () => {
+    expect(parseModulesPath("/api/modules/vault/start")).toEqual({
+      short: "vault",
+      rest: "start",
+    });
+    expect(parseModulesPath("/api/modules/scribe/stop")).toEqual({
+      short: "scribe",
+      rest: "stop",
     });
   });
 
@@ -737,6 +750,186 @@ describe("POST /api/modules/:short/install", () => {
     );
     await new Promise((r) => setTimeout(r, 10));
     expect(calls).toContainEqual(["bun", "add", "-g", "@openparachute/vault@latest"]);
+  });
+});
+
+describe("POST /api/modules/:short/start", () => {
+  let h: Harness;
+  beforeEach(async () => {
+    h = await makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  /** Seed a minimal installed vault row (in services.json) for the start tests. */
+  function seedVault(port = 1940): void {
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.0.0-linked",
+      },
+    ]);
+  }
+
+  test("401 on missing bearer", async () => {
+    seedVault();
+    const { supervisor } = makeIdleSupervisor();
+    const res = await handleStart(postReq("/api/modules/vault/start", {}), "vault", {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      supervisor,
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("403 on bearer without parachute:host:admin (host-admin gated)", async () => {
+    seedVault();
+    const { supervisor } = makeIdleSupervisor();
+    const bearer = await mintBearer(h, ["parachute:host:auth"]);
+    const res = await handleStart(
+      postReq("/api/modules/vault/start", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, configDir: h.dir, supervisor },
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("pure supervisor.start of an installed module — NOT install (no bun add)", async () => {
+    seedVault();
+    const { supervisor, spawns } = makeIdleSupervisor();
+    const { run, calls } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleStart(
+      postReq("/api/modules/vault/start", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+      },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { short: string; state: { status: string } };
+    expect(body.short).toBe("vault");
+    expect(["starting", "running"]).toContain(body.state.status);
+    // The supervisor was handed the boot-derived spawn request.
+    expect(spawns.find((s) => s.short === "vault")?.cmd).toEqual(["parachute-vault", "serve"]);
+    // Crucially: start is a PURE spawn — it must NOT run the install path.
+    expect(calls).toEqual([]);
+  });
+
+  test("start carries boot-derived PORT + PARACHUTE_HUB_ORIGIN child env", async () => {
+    seedVault(1940);
+    const { supervisor, spawns } = makeIdleSupervisor();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    await handleStart(
+      postReq("/api/modules/vault/start", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, configDir: h.dir, supervisor },
+    );
+    expect(spawns.length).toBe(1);
+    expect(spawns[0]?.env?.PORT).toBe("1940");
+    expect(spawns[0]?.env?.PARACHUTE_HUB_ORIGIN).toBe(ISSUER);
+  });
+
+  test("400 not_installed when the module isn't in services.json (no silent install)", async () => {
+    // No seedVault — services.json has no vault row.
+    const { supervisor, spawns } = makeIdleSupervisor();
+    const { run, calls } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleStart(
+      postReq("/api/modules/vault/start", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+      },
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("not_installed");
+    // Did NOT spawn + did NOT install.
+    expect(spawns).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("POST /api/modules/:short/stop", () => {
+  let h: Harness;
+  beforeEach(async () => {
+    h = await makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  test("401 on missing bearer", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    const res = await handleStop(postReq("/api/modules/vault/stop", {}), "vault", {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      supervisor,
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("403 on bearer without parachute:host:admin (host-admin gated)", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    const bearer = await mintBearer(h, ["parachute:host:auth"]);
+    const res = await handleStop(
+      postReq("/api/modules/vault/stop", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, configDir: h.dir, supervisor },
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("calls supervisor.stop on a running module → stopped: true", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    await supervisor.start({ short: "vault", cmd: ["parachute-vault", "serve"] });
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleStop(
+      postReq("/api/modules/vault/stop", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, configDir: h.dir, supervisor },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      short: string;
+      stopped: boolean;
+      state: { status: string };
+    };
+    expect(body.short).toBe("vault");
+    expect(body.stopped).toBe(true);
+    expect(body.state.status).toBe("stopped");
+    // Supervisor truly transitioned the module to stopped.
+    expect(supervisor.get("vault")?.status).toBe("stopped");
+  });
+
+  test("idempotent: stopping a not-supervised module → stopped: false (no error)", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleStop(
+      postReq("/api/modules/vault/stop", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, configDir: h.dir, supervisor },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { short: string; stopped: boolean };
+    expect(body.stopped).toBe(false);
   });
 });
 

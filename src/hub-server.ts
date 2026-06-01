@@ -50,6 +50,8 @@
  *   /api/modules                  (GET)        → curated + installed module catalog (host:auth)
  *   /api/modules/channel          (PUT)        → operator channel toggle (host:admin)
  *   /api/modules/:short/install   (POST)       → bun add + spawn (async op)
+ *   /api/modules/:short/start     (POST)       → supervisor.start of an installed module (sync)
+ *   /api/modules/:short/stop      (POST)       → supervisor.stop (sync)
  *   /api/modules/:short/restart   (POST)       → supervisor restart (sync)
  *   /api/modules/:short/upgrade   (POST)       → bun add @<channel> + restart (async op)
  *   /api/modules/:short/uninstall (POST)       → stop child + bun remove + drop row (sync)
@@ -143,6 +145,8 @@ import {
   handleInstall,
   handleOperationGet,
   handleRestart,
+  handleStart,
+  handleStop,
   handleUninstall,
   handleUpgrade,
   parseModulesPath,
@@ -1865,6 +1869,10 @@ export function hubFetch(
       switch (match.rest) {
         case "install":
           return handleInstall(req, match.short, opsDeps);
+        case "start":
+          return handleStart(req, match.short, opsDeps);
+        case "stop":
+          return handleStop(req, match.short, opsDeps);
         case "restart":
           return handleRestart(req, match.short, opsDeps);
         case "upgrade":
