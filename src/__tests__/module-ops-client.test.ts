@@ -10,6 +10,7 @@ import {
   NoOperatorTokenError,
   driveModuleOp,
   fetchModuleLogs,
+  fetchModuleStates,
   resolveOperatorBearer,
 } from "../module-ops-client.ts";
 import { issueOperatorToken } from "../operator-token.ts";
@@ -409,5 +410,147 @@ describe("fetchModuleLogs", () => {
       fetch: f,
     });
     expect(result.text).toBe("a\nb\n");
+  });
+});
+
+describe("fetchModuleStates", () => {
+  let h: Harness;
+  afterEach(() => h.cleanup());
+
+  test("GETs /api/modules with the operator bearer and parses the supervisor fields", async () => {
+    h = await makeHarnessWithToken();
+    const { fetch: f, calls } = fakeFetch([
+      {
+        status: 200,
+        body: {
+          supervisor_available: true,
+          modules: [
+            {
+              short: "vault",
+              installed: true,
+              installed_version: "0.6.2",
+              supervisor_status: "running",
+              pid: 4242,
+              supervisor_start_error: null,
+            },
+            {
+              short: "scribe",
+              installed: false,
+              installed_version: null,
+              supervisor_status: null,
+              pid: null,
+              supervisor_start_error: {
+                error_type: "missing_dependency",
+                binary: "scribe",
+              },
+            },
+          ],
+        },
+      },
+    ]);
+    const result = await fetchModuleStates({
+      db: h.db,
+      issuer: ISSUER,
+      configDir: h.dir,
+      fetch: f,
+    });
+
+    // Hits GET /api/modules with a Bearer.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe(`${DEFAULT_HUB_BASE_URL}/api/modules`);
+    expect(calls[0]?.method).toBe("GET");
+    expect(calls[0]?.headers.authorization).toMatch(/^Bearer /);
+
+    expect(result.supervisorAvailable).toBe(true);
+    expect(result.modules).toHaveLength(2);
+    const vault = result.modules.find((m) => m.short === "vault");
+    expect(vault?.supervisor_status).toBe("running");
+    expect(vault?.pid).toBe(4242);
+    const scribe = result.modules.find((m) => m.short === "scribe");
+    expect(scribe?.supervisor_status).toBeNull();
+    expect((scribe?.supervisor_start_error as { binary?: string } | null)?.binary).toBe("scribe");
+  });
+
+  test("no operator token → NoOperatorTokenError before any fetch", async () => {
+    h = await makeHarnessNoToken();
+    const { fetch: f, calls } = fakeFetch([{ status: 200, body: { modules: [] } }]);
+    let err: unknown;
+    try {
+      await fetchModuleStates({ db: h.db, issuer: ISSUER, configDir: h.dir, fetch: f });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(NoOperatorTokenError);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("non-2xx → ModuleOpHttpError (so the status caller can degrade)", async () => {
+    h = await makeHarnessWithToken();
+    const { fetch: f } = fakeFetch([
+      { status: 403, body: { error: "insufficient_scope", error_description: "lacks scope" } },
+    ]);
+    let err: unknown;
+    try {
+      await fetchModuleStates({ db: h.db, issuer: ISSUER, configDir: h.dir, fetch: f });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ModuleOpHttpError);
+    expect((err as ModuleOpHttpError).status).toBe(403);
+  });
+
+  test("malformed body (no modules array) → empty modules, not a throw", async () => {
+    h = await makeHarnessWithToken();
+    const { fetch: f } = fakeFetch([{ status: 200, body: { supervisor_available: false } }]);
+    const result = await fetchModuleStates({
+      db: h.db,
+      issuer: ISSUER,
+      configDir: h.dir,
+      fetch: f,
+    });
+    expect(result.supervisorAvailable).toBe(false);
+    expect(result.modules).toEqual([]);
+  });
+
+  test("wedged hub (fetch never resolves) → bounded timeout degrades, no hang", async () => {
+    h = await makeHarnessWithToken();
+    // A hub that accepts the connection but never answers: the fetch settles ONLY
+    // when its AbortSignal fires. With a short injected ceiling, fetchModuleStates
+    // must reject within the bound (degrade) rather than hang forever.
+    let signalRef: AbortSignal | undefined;
+    const neverResolving = ((_input: string | URL | Request, init?: RequestInit) => {
+      signalRef = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        // Honor the abort signal the bounded fetch wires in — that's what frees us.
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    }) as unknown as typeof fetch;
+
+    const start = Date.now();
+    let err: unknown;
+    try {
+      await fetchModuleStates({
+        db: h.db,
+        issuer: ISSUER,
+        configDir: h.dir,
+        fetch: neverResolving,
+        statesFetchTimeoutMs: 25, // short injected ceiling — no real wall-clock wait
+      });
+    } catch (e) {
+      err = e;
+    }
+    const elapsed = Date.now() - start;
+
+    // The bounded fetch passed an AbortSignal through to our stub.
+    expect(signalRef).toBeInstanceOf(AbortSignal);
+    // Resolved within the bound (generous slack for runner jitter), did not hang.
+    expect(elapsed).toBeLessThan(2_000);
+    // Degrades through the SAME ModuleOpHttpError path the status caller already
+    // catches → "couldn't read live module state (…)" note + exit 0, never a hang.
+    expect(err).toBeInstanceOf(ModuleOpHttpError);
+    expect((err as ModuleOpHttpError).code).toBe("request_timeout");
+    expect((err as Error).message).toContain("timed out");
   });
 });

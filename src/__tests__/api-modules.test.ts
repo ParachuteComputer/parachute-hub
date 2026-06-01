@@ -325,6 +325,60 @@ describe("GET /api/modules", () => {
     expect(body.supervisor_available).toBe(true);
   });
 
+  test("projects the supervisor's structured startError onto supervisor_start_error (§6.4/#188)", async () => {
+    // The Phase 3c `parachute status` supervisor arm reads this field to show
+    // the SAME friendly missing-dependency note the detached path persists. A
+    // fake supervisor whose list() returns a `crashed` state carrying a
+    // structured `startError` exercises the projection.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.4.5",
+      },
+    ]);
+    const fakeSupervisor = {
+      list: () => [
+        {
+          short: "vault",
+          status: "crashed" as const,
+          restartsInWindow: 1,
+          startError: {
+            error_type: "missing_dependency",
+            error_description: "parachute-vault is required",
+            binary: "parachute-vault",
+            at: "2026-06-01T00:00:00Z",
+          },
+        },
+      ],
+    } as unknown as Supervisor;
+
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      supervisor: fakeSupervisor,
+      fetchLatestVersion: async () => null,
+    });
+    const body = (await res.json()) as {
+      modules: Array<{
+        short: string;
+        supervisor_status: string | null;
+        supervisor_start_error: { binary?: string; error_type?: string } | null;
+      }>;
+    };
+    const vault = body.modules.find((m) => m.short === "vault");
+    expect(vault?.supervisor_status).toBe("crashed");
+    expect(vault?.supervisor_start_error?.binary).toBe("parachute-vault");
+    expect(vault?.supervisor_start_error?.error_type).toBe("missing_dependency");
+    // A module with no supervisor entry surfaces null (uniform wire shape).
+    const scribe = body.modules.find((m) => m.short === "scribe");
+    expect(scribe?.supervisor_start_error).toBeNull();
+  });
+
   test("populates management_url from a relative managementUrl + module mount (hub#342)", async () => {
     // Vault declares `managementUrl: "/admin"` in its module.json — hub
     // resolves that against the entry's mount path (`/vault/default`)
