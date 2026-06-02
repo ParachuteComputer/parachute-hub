@@ -122,6 +122,12 @@ function makeFakeCutover(over: Partial<CutoverDeps> = {}): FakeCutover {
         messages: ["started unit"],
       };
     },
+    // Hermetic default: the stale-unit disable is a no-op (no real
+    // systemctl/launchctl). Tests that exercise #522 override this to trace + act.
+    disableStaleModuleUnits: () => {
+      trace.push("disableStaleUnits");
+      return { actions: [] };
+    },
     ...over,
   };
   // Expose the world via closure for tests that want to manipulate it.
@@ -179,6 +185,43 @@ describe("cutoverToSupervised — happy path (§7.1)", () => {
       // The hub is now supervised + healthy.
       expect(getWorld(fc.deps).hubHealthy).toBe(true);
       expect(getWorld(fc.deps).unitInstalled).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("#522: stale-unit disable runs in the STOP phase — after detached stop, before unit start", async () => {
+    const h = makeHarness();
+    try {
+      seedManifest(h.manifestPath, [{ name: "vault", port: 1940 }]);
+      const fc = makeFakeCutover();
+      const w = getWorld(fc.deps);
+      w.listening.add(1939);
+      w.listening.add(1940);
+      w.alivePids.add(5555);
+      writePid("vault", 5555, h.configDir);
+      const baseKill = fc.deps.kill;
+      fc.deps.kill = (pid, signal) => {
+        baseKill?.(pid, signal);
+        if (pid === 5555) getWorld(fc.deps).listening.delete(1940);
+      };
+      const result = await cutoverToSupervised({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        deps: fc.deps,
+        log: () => {},
+        pollMs: 0,
+      });
+      expect(result.outcome).toBe("migrated");
+      const stopIdx = fc.trace.indexOf("stopHub");
+      const disableIdx = fc.trace.indexOf("disableStaleUnits");
+      const startIdx = fc.trace.indexOf("startUnit");
+      // The disable runs AFTER the detached stop and BEFORE the unit start, so a
+      // KeepAlive/Restart=always unit can't re-grab the port between freeing it
+      // and the supervised module binding it.
+      expect(disableIdx).toBeGreaterThanOrEqual(0);
+      expect(stopIdx).toBeLessThan(disableIdx);
+      expect(disableIdx).toBeLessThan(startIdx);
     } finally {
       h.cleanup();
     }
@@ -443,6 +486,7 @@ describe("cutoverToSupervised — fail-safe recovery states", () => {
 describe("teardownHubUnit (§7.4)", () => {
   test("removes the hub unit (idempotent success path)", () => {
     let removeArgs: { launchdLabel: string; systemdUnitName: string } | undefined;
+    let staleCalled = false;
     const log: string[] = [];
     const res = teardownHubUnit({
       log: (l) => log.push(l),
@@ -450,21 +494,36 @@ describe("teardownHubUnit (§7.4)", () => {
         removeArgs = { launchdLabel: opts.launchdLabel, systemdUnitName: opts.systemdUnitName };
         return { removed: true, messages: [opts.removedSystemdMessage(opts.systemdUnitName)] };
       },
+      // Hermetic stub — no real systemctl/launchctl.
+      disableStaleModuleUnits: () => {
+        staleCalled = true;
+        return { actions: [] };
+      },
     });
     expect(res.removed).toBe(true);
     expect(removeArgs?.launchdLabel).toBe("computer.parachute.hub");
     expect(removeArgs?.systemdUnitName).toBe("parachute-hub.service");
+    // #522: teardown also runs the stale-per-module-autostart disable.
+    expect(staleCalled).toBe(true);
     // Surfaces the fallback hint.
     expect(log.join("\n")).toContain("parachute serve");
   });
 
-  test("no unit installed → no-op, friendly message", () => {
+  test("no unit installed → no-op, friendly message (still runs the stale-unit disable)", () => {
+    let staleCalled = false;
     const log: string[] = [];
     const res = teardownHubUnit({
       log: (l) => log.push(l),
       remove: (): ManagedUnitRemoveResult => ({ removed: false, messages: [] }),
+      disableStaleModuleUnits: () => {
+        staleCalled = true;
+        return { actions: [] };
+      },
     });
     expect(res.removed).toBe(false);
+    // #522: a leftover module autostart must be cleaned even when the hub unit was
+    // never installed (a partial / never-migrated box rolling back).
+    expect(staleCalled).toBe(true);
     expect(log.join("\n")).toContain("nothing to tear down");
   });
 });

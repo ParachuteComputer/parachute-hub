@@ -86,6 +86,11 @@ import { type PortListeningFn, defaultPortListening } from "../port-probe.ts";
 import { type AliveFn, clearPid, readPid } from "../process-state.ts";
 import { shortNameForManifest } from "../service-spec.ts";
 import { type ServiceEntry, readManifestLenient } from "../services-manifest.ts";
+import {
+  type DisableStaleModuleUnitsOpts,
+  type DisableStaleModuleUnitsResult,
+  disableStaleModuleUnits,
+} from "../stale-module-units.ts";
 
 /**
  * Absolute path to this hub checkout's `src/cli.ts` — the entry the hub unit's
@@ -180,6 +185,19 @@ export interface CutoverDeps {
   sleep: (ms: number) => Promise<void>;
   /** The hub-unit deps for install / detect / manager calls. */
   hubUnitDeps: HubUnitDeps;
+  /**
+   * Detect + DISABLE any stale per-module autostart unit (#522 — the load-bearing
+   * fix). A leftover standalone `parachute-<short>.service` (systemd KeepAlive) /
+   * `computer.parachute.<short>` (launchd KeepAlive) from the pre-supervisor era
+   * keeps RESPAWNING an unsupervised module that binds the module's port — the
+   * supervised child then EADDRINUSE-crash-loops. Killing the process is
+   * whack-a-mole (the unit resurrects it); we must disable the UNIT. Run in the
+   * STOP phase (after the per-module detached stop, before the port-free verify)
+   * so the freed port lets the supervised module bind. Ownership-safe (known
+   * module shorts only; hub + cloudflared skipped), idempotent, non-fatal.
+   * Injectable so tests never touch real systemctl/launchctl.
+   */
+  disableStaleModuleUnits: (opts?: DisableStaleModuleUnitsOpts) => DisableStaleModuleUnitsResult;
 }
 
 export interface WriteUnitOpts {
@@ -329,6 +347,7 @@ export const defaultCutoverDeps: CutoverDeps = {
   probeHealth: defaultHubUnitDeps.probeHealth,
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   hubUnitDeps: defaultHubUnitDeps,
+  disableStaleModuleUnits,
 };
 
 export interface CutoverOpts {
@@ -673,6 +692,22 @@ export async function cutoverToSupervised(opts: CutoverOpts = {}): Promise<Cutov
     await stopDetachedModule(target, configDir, deps, timeoutMs, pollMs, log);
   }
 
+  // --- Step 3b (#522): DISABLE stale per-module autostart UNITS. ---
+  // The load-bearing fix for the recurring "port 1940 taken" crash-loop: a
+  // leftover standalone `parachute-<short>.service` (systemd KeepAlive) or
+  // `computer.parachute.<short>` (launchd KeepAlive) from the pre-supervisor era
+  // keeps RESPAWNING an unsupervised module that binds the port — so the
+  // per-module stop above (and the orphan sweep below) is whack-a-mole: the unit
+  // resurrects the process within seconds, serving OLD code. We must DISABLE the
+  // UNIT so the port stays free for the supervised child. MUST run HERE — after
+  // the detached stop, BEFORE the verify-ports-free + unit start — so the freed
+  // port lets the supervised module bind. Ownership-safe (known module shorts
+  // only; hub + cloudflared skipped), idempotent, non-fatal (a failed disable
+  // warns + continues; a system-level unit it can't disable → warn with the
+  // manual sudo command). Every disabled unit is reported.
+  log("Checking for stale per-module autostart units to disable…");
+  deps.disableStaleModuleUnits({ deps: deps.hubUnitDeps, log: (l) => log(l) });
+
   // --- Step 4: §7.2 ORPHAN SWEEP — per services.json port + the hub port. ---
   // The HUB port keeps the pre-existing blind-adopt (mirrors stopHub's 1939
   // orphan-adoption — out of scope for MUST-FIX 2). The MODULE ports get the
@@ -797,6 +832,13 @@ export interface TeardownOpts {
     removedLaunchdMessage: (label: string) => string;
     removedSystemdMessage: (unitName: string) => string;
   }) => ManagedUnitRemoveResult;
+  /**
+   * Test seam: the stale-per-module-autostart disable (#522). Teardown also
+   * disables any leftover standalone module autostart unit so a rollback to
+   * foreground `serve` doesn't leave a competing module respawning at boot.
+   * Injectable so tests never touch real systemctl/launchctl.
+   */
+  disableStaleModuleUnits?: (opts?: DisableStaleModuleUnitsOpts) => DisableStaleModuleUnitsResult;
 }
 
 /**
@@ -815,6 +857,7 @@ export function teardownHubUnit(opts: TeardownOpts = {}): { removed: boolean; me
   const log = opts.log ?? ((line) => console.log(line));
   const deps = opts.deps ?? defaultHubUnitDeps;
   const remove = opts.remove ?? removeManagedUnit;
+  const disableStale = opts.disableStaleModuleUnits ?? disableStaleModuleUnits;
   const res = remove({
     launchdLabel: HUB_LAUNCHD_LABEL,
     systemdUnitName: HUB_SYSTEMD_UNIT_NAME,
@@ -824,6 +867,11 @@ export function teardownHubUnit(opts: TeardownOpts = {}): { removed: boolean; me
     removedSystemdMessage: (unitName) =>
       `Removed systemd unit ${unitName} — the hub no longer starts on boot.`,
   });
+  // #522: also disable any leftover standalone per-module autostart unit so a
+  // rollback to foreground `serve` doesn't leave a competing module respawning at
+  // boot to race whatever the operator brings up next. Ownership-safe (known
+  // module shorts only; hub + cloudflared skipped), idempotent, non-fatal.
+  disableStale({ deps, log });
   if (res.removed) {
     for (const m of res.messages) log(m);
     log("");
