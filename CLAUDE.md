@@ -1,6 +1,6 @@
 # Parachute Hub
 
-`@openparachute/hub` — the local hub for the Parachute ecosystem. The `parachute` binary is one of its surfaces; the long-running daemon (discovery on `:1939`, soon OAuth issuance) is another. Coordinator, not a service: each Parachute package (`vault`, `notes`, `scribe`, `channel`) stays standalone; the hub stitches them together.
+`@openparachute/hub` — the local hub for the Parachute ecosystem. The `parachute` binary is one of its surfaces; the long-running `parachute serve` process (discovery on `:1939`, soon OAuth issuance) is another — it runs under the platform's process manager (launchd / systemd / container runtime) and supervises every installed module as an attached child. Coordinator, not a service: each Parachute package (`vault`, `notes`, `scribe`, `channel`) stays standalone; the hub stitches them together.
 
 Renamed from `@openparachute/cli` / `parachute-cli` on 2026-04-26 — same binary name (`parachute`), same code, broader role. The "CLI" framing was always partial.
 
@@ -9,13 +9,17 @@ User-facing README is the right intro for operators. This file is for agents and
 ## Architecture
 
 ```
-parachute install <svc>   →  bun add -g + init + services.json seed   (src/commands/install.ts)
-parachute start/stop/...  →  spawn detached bun, pidfile + logs       (src/commands/lifecycle.ts)
-parachute status          →  read services.json + probe health        (src/commands/status.ts)
-parachute expose <layer>  →  tailscale serve/funnel + hub proxy       (src/commands/expose.ts)
-parachute migrate         →  sweep legacy ~/.parachute/ layout         (src/commands/migrate.ts)
-parachute vault <args>    →  exec parachute-vault (transparent)        (src/commands/vault.ts)
+parachute serve           →  hub foreground + in-process Supervisor    (src/commands/serve.ts + src/supervisor.ts)
+parachute install <svc>   →  bun add -g + init + services.json seed     (src/commands/install.ts)
+parachute init            →  install + start the hub unit, then wizard  (src/commands/init.ts + src/hub-unit.ts)
+parachute start/stop/...  →  ensure hub unit up, drive the supervisor   (src/commands/lifecycle.ts → module-ops API)
+parachute status          →  platform manager (hub) + supervisor.list() (src/commands/status.ts)
+parachute expose <layer>  →  tailscale serve/funnel (hub stays running) (src/commands/expose.ts)
+parachute migrate         →  --to-supervised cutover / archive sweep    (src/commands/migrate.ts)
+parachute vault <args>    →  exec parachute-vault (transparent)         (src/commands/vault.ts)
 ```
+
+**One runtime: `parachute serve` under a process manager.** The hub runs foreground with an in-process `Supervisor` (`src/supervisor.ts`) that spawns each installed module as an attached child, multiplexes their logs, and crash-restarts them on a budget. That `serve` process is kept alive by the platform's own process manager — **launchd** on a Mac, **systemd** on a Linux VM (installed by `parachute init` / `parachute migrate --to-supervised`), the **container runtime** on Render / Fly. There is **no detached-daemon model** anymore: the per-module `start/stop/restart <svc>` verbs are *clients* of the running supervisor — they ensure the hub unit is up (via `src/hub-unit.ts`), then drive it over the loopback module-ops HTTP API (`src/api-modules-ops.ts`, authenticated with the on-disk operator token, `src/module-ops-client.ts`). Per-module pidfile spawning was retired in Phase 5b; `src/process-state.ts` keeps pidfile *readers* only, for the `migrate` legacy-install detector.
 
 The flat shape matters: each command is a self-contained module in `src/commands/`, wired through `src/cli.ts`'s argv parser. No framework, no plugin system, no global state beyond a handful of pure module constants.
 
@@ -41,7 +45,7 @@ Three surface types sit outside the operator-facing table:
 
 - **`src/service-spec.ts`** — `SERVICE_SPECS` is the registry: which npm package backs each short name, what to run on install/start, the canonical seed entry. Adding a new service = one entry here.
 - **`src/services-manifest.ts`** — `~/.parachute/services.json` read/write. This file is the contract between the CLI and every service; services own the write side, the CLI owns read + exposure. Validation is strict on required fields; optional fields (`displayName`, `tagline`) pass through.
-- **`src/hub-server.ts`** — internal Bun server on port 1939. Serves `/` (discovery page) and `/.well-known/parachute.json`. Spawned by `parachute expose`, stopped when the last layer goes away. Tailscale serve can't directly serve files on macOS (sandboxed), so this loopback proxy is the portable shape.
+- **`src/hub-server.ts`** — the Bun server on port 1939, the thing `parachute serve` runs in the foreground. Serves `/` (discovery page) and `/.well-known/parachute.json`. It's a persistent managed unit (launchd / systemd / container runtime), running whether or not any exposure layer is up — `expose off` tears down only the exposure, not the hub. Tailscale serve can't directly serve files on macOS (sandboxed), so this loopback proxy is the portable shape.
 - **`src/expose-state.ts`** — which layers (tailnet/public) are currently up, persisted to `~/.parachute/expose-state.json`. Lets `expose <layer> off` be precise rather than blowing away everything.
 - **`src/tailscale/`** — thin wrappers around `tailscale serve` / `tailscale funnel`. Shape is pinned to 1.82+ (`funnel` as its own subcommand).
 - **`src/notes-serve.ts`** — tiny Bun static-file server for the @openparachute/notes PWA bundle. Invoked as `bun notes-serve.ts --port <n> [--dist <path>] [--mount <prefix>]`. The `--mount` arg (default `/notes`, derived from `entry.paths[0]` in the service spec) is the path prefix the reverse proxy hands us; the shim strips it before joining with `dist/`. Without the strip, requests for `/notes/sw.js` and `/notes/manifest.webmanifest` get SPA-shelled with `text/html`, the browser never sees them as the SW + manifest, and the PWA install prompt never fires. Pass `--mount ""` (or `--mount /`) when serving at the origin root.

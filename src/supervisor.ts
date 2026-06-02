@@ -1,32 +1,37 @@
 /**
- * Per-module child supervisor for container-mode hub.
+ * The hub's in-process module supervisor — the single runtime everywhere.
  *
- * The on-box flow (`parachute start <svc>`) spawns module daemons
- * detached + unref'd, writes a pidfile, and walks away — process
- * lifecycle becomes the operator's problem (launchd, systemd, or a
- * follow-up `parachute restart`). That shape doesn't work in a
- * container:
+ * As of Phase 5b there is ONE process model: `parachute serve` runs the hub
+ * in the foreground with this Supervisor, and the platform's process manager
+ * (launchd on a Mac, systemd on a Linux VM, the container runtime on Render /
+ * Fly) keeps that `serve` process alive across crashes and reboots. The old
+ * manager-less detached-daemon model (per-module `detached + unref()` spawns
+ * tracked by pidfiles) is retired — the on-box `parachute start/stop/restart
+ * <svc>` verbs are now clients of THIS supervisor, driving it over the
+ * loopback module-ops API (`api-modules-ops.ts` → `commands/lifecycle.ts`).
  *
- *   - There's no external supervisor watching the children. If vault
- *     crashes, nothing brings it back.
- *   - Render's log viewer only surfaces hub's stdout. A detached child
- *     whose stdout goes to `~/.parachute/<svc>/logs/<svc>.log` is
- *     invisible to the operator clicking through the dashboard.
+ * What this supervisor does:
  *
- * This supervisor solves both. It spawns each module attached (no
- * `detached: true`, no `unref()`), pipes their stdout/stderr through a
- * line-prefixing tap into hub's own stdout (`[vault] …`,
- * `[scribe] …`), watches `proc.exited`, and restarts crashed children
- * up to a small budget before giving up + marking the module
- * `crashed`. The budget keeps a wedged-on-boot module from chewing
- * forever; once it's exhausted the operator sees the crash via /api/modules
- * (or, post-1B, the per-module log view).
+ *   - Spawns each module as an attached child in its own process group
+ *     (`detached: true` for group-signalling only; stdio stays piped — see
+ *     `defaultSpawnFn` / `defaultKillGroup`), so a wrapped startCmd's
+ *     grandchildren are reaped on stop/restart (no EADDRINUSE-on-restart).
+ *   - Pipes each child's stdout/stderr through a line-prefixing tap into the
+ *     hub's own stdout (`[vault] …`, `[scribe] …`) and a bounded per-module
+ *     ring buffer, so the operator sees module output in the hub log /
+ *     platform log viewer and `parachute logs <svc>` can replay recent lines.
+ *   - Gates a freshly-spawned module to `running` only once its port binds
+ *     (port-readiness), and records a structured start-error on preflight
+ *     failure, so `status` / the SPA keep the friendly missing-dependency
+ *     surface.
+ *   - Watches `proc.exited` and crash-restarts children up to a small budget
+ *     before marking the module `crashed`. The budget keeps a wedged-on-boot
+ *     module from chewing forever; the hub unit's own StartLimit / Throttle
+ *     bounds the outer keeper.
  *
- * Out of scope for this module: spawning the hub HTTP server itself
- * (that's `Bun.serve` in the same process), driving the on-box
- * `parachute start <svc>` path (still uses `commands/lifecycle.ts`),
- * persisting child state to disk (transient — re-derived from
- * services.json on boot).
+ * Out of scope: supervising the hub HTTP server itself (that's `Bun.serve` in
+ * this same process — the platform manager is the hub's keeper) and persisting
+ * child state to disk (transient — re-derived from services.json on every boot).
  */
 
 import {
