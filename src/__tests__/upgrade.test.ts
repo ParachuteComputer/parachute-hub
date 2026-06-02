@@ -2,9 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { LifecycleOpts } from "../commands/lifecycle.ts";
+import { restart as lifecycleRestart } from "../commands/lifecycle.ts";
 import type { UpgradeRunner } from "../commands/upgrade.ts";
 import { compareVersions, defaultRunner, detectChannel, upgrade } from "../commands/upgrade.ts";
 import type { HubUnitDeps, HubUnitManagerOpResult } from "../hub-unit.ts";
+import { defaultHubUnitDeps } from "../hub-unit.ts";
+import type { MigrateOfferResult } from "../migrate-offer.ts";
 import { upsertService } from "../services-manifest.ts";
 
 interface RunCall {
@@ -1443,6 +1447,118 @@ describe("Phase 4 upgrade-hub dual-dispatch", () => {
       expect(restartOrder).toContain("vault");
       expect(restartOrder.indexOf("hub-unit")).toBeLessThan(restartOrder.indexOf("vault"));
       expect(restartHubUnitCalls).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5b nit: the module-target restart leg of `upgrade` must thread the SAME
+// opts a bare `parachute restart <svc>` does — `supervisor: {}` (real
+// `isHubUnitInstalled` probe, NOT a forced `unitInstalled: true`) +
+// `migrateOffer: { enabled: true }`. On a NO-UNIT box that means the module
+// restart surfaces the actionable "run `parachute migrate --to-supervised`"
+// error / fires the auto-offer, NOT a bare connection-refused from
+// `driveModuleOp`. The other upgrade tests stub `restartFn: async () => 0`, so
+// the supervised arm was never exercised here — this closes that gap by driving
+// the REAL `lifecycle.restart`.
+// ---------------------------------------------------------------------------
+
+describe("Phase 5b: upgrade module-restart on a no-unit box", () => {
+  test("module restart threads supervisor:{} + migrateOffer (no forced unitInstalled), surfaces actionable migrate error — NOT a bare connection-refused", async () => {
+    const h = makeHarness();
+    try {
+      const installDir = join(h.installRoot, "vault");
+      writePackageJson(installDir, { name: "@openparachute/vault", version: "0.4.0" });
+      seedVault(h.manifestPath, installDir, "0.4.0");
+
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          // `bun add -g` rewrites the package.json with a new version → the
+          // module restart leg (`restartTarget`) is reached.
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            writePackageJson(installDir, { name: "@openparachute/vault", version: "0.5.0" });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          // Not a git checkout → npm-install branch.
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "fatal: not a git repository\n" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      // A NO-UNIT box: force `isHubUnitInstalled` → false deterministically
+      // (regardless of the test host) by stubbing the unit-file existence probe.
+      const noUnitDeps: HubUnitDeps = { ...defaultHubUnitDeps, exists: () => false };
+
+      // The supervised arm's loopback module-ops call MUST NOT run on a no-unit
+      // box. If the regressed code forced `unitInstalled: true`, the verb would
+      // skip the probe and hit this — surfacing a bare connection-refused.
+      let driveModuleOpCalled = false;
+      const refuse = async (): Promise<never> => {
+        driveModuleOpCalled = true;
+        throw new Error("connect ECONNREFUSED 127.0.0.1:1939");
+      };
+
+      // Capture the opts `restartTarget` hands `lifecycle.restart`, then delegate
+      // to the REAL `lifecycle.restart` so the no-unit handling actually runs.
+      // The offer is overridden to a deterministic `declined` so the outcome
+      // doesn't depend on the host's stdin-TTY / prior-detached state.
+      let seenOpts: LifecycleOpts | undefined;
+      let offerCalls = 0;
+      const restartFn = async (svc: string, opts: LifecycleOpts): Promise<number> => {
+        seenOpts = opts;
+        return await lifecycleRestart(svc, {
+          ...opts,
+          supervisor: {
+            ...opts.supervisor,
+            hubUnitDeps: noUnitDeps,
+            driveModuleOp: refuse,
+          },
+          migrateOffer: {
+            enabled: opts.migrateOffer?.enabled ?? false,
+            offer: async (): Promise<MigrateOfferResult> => {
+              offerCalls++;
+              return { outcome: "declined" };
+            },
+          },
+        });
+      };
+
+      const logs: string[] = [];
+      const code = await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: () => join(installDir, "package.json"),
+        restartFn,
+        // Upgrade-side supervisor seam: feeds `r.hubUnitDeps`, which
+        // `restartTarget` threads into `lifecycle.restart`'s supervisor block.
+        supervisor: { hubUnitDeps: noUnitDeps },
+        log: (l) => logs.push(l),
+      });
+
+      // The package rewrite + restart attempt happened (non-zero because the box
+      // is un-migrated and the offer was declined — a clean, actionable failure).
+      expect(code).toBe(1);
+
+      // The contract fix: `restartTarget` passes `supervisor` WITHOUT forcing
+      // `unitInstalled: true`, plus an ENABLED migrate offer — exactly what a
+      // bare `parachute restart <svc>` threads.
+      expect(seenOpts).toBeDefined();
+      expect(seenOpts?.supervisor).toBeDefined();
+      expect(seenOpts?.supervisor?.unitInstalled).toBeUndefined();
+      expect(seenOpts?.migrateOffer?.enabled).toBe(true);
+
+      // The no-unit handling ran: the auto-offer fired (real probe → no unit),
+      // and the supervised loopback call was NEVER reached (no connection-refused).
+      expect(offerCalls).toBe(1);
+      expect(driveModuleOpCalled).toBe(false);
+      expect(logs.join("\n")).not.toMatch(/ECONNREFUSED|connection refused/i);
     } finally {
       h.cleanup();
     }

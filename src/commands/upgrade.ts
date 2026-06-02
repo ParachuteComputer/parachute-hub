@@ -574,13 +574,18 @@ function readPackageVersion(pkgJsonPath: string): string | null {
  *     returns once the restart is dispatched; it does not need to outlive the
  *     old hub.
  *   - MODULE target → drive the running Supervisor by handing `lifecycle.restart`
- *     a `supervisor` block (its own dispatch then routes to `supervisor.restart`
- *     with the 404-fallthrough). The hub unit was already restarted hub-first in
- *     the sweep, so it's up to answer.
+ *     the SAME opts a bare `parachute restart <svc>` threads: `supervisor: {}`
+ *     (so the real `isHubUnitInstalled` probe — not a forced override — decides)
+ *     plus `migrateOffer: { enabled: true }`. Its dispatch then routes to
+ *     `supervisor.restart` with the 404-fallthrough. The hub unit was already
+ *     restarted hub-first in the sweep, so it's up to answer.
  *
  * A box with no hub unit takes the actionable migrate path: the hub-target
  * `restartHubUnit` returns `no-unit` (messages surfaced, non-zero), and the
- * module-target `lifecycle.restart` runs its own §7.5 no-unit handling.
+ * module-target `lifecycle.restart` — driven with `supervisor: {}` +
+ * `migrateOffer` — runs `requireSupervisedOrOffer`'s real probe, then the §7.5
+ * auto-offer / actionable "run `parachute migrate --to-supervised`" error,
+ * rather than a bare connection-refused from `driveModuleOp`.
  */
 async function restartTarget(target: ResolvedTarget, r: Resolved): Promise<number> {
   if (target.short === HUB_SVC) {
@@ -592,13 +597,19 @@ async function restartTarget(target: ResolvedTarget, r: Resolved): Promise<numbe
     }
     return 1;
   }
-  // Module target: route through lifecycle's supervisor arm. Passing a
-  // `supervisor` block with `unitInstalled: true` drives `supervisor.restart`
-  // over the loopback module-ops API.
+  // Module target: route through lifecycle's supervisor arm with the SAME opts a
+  // bare `parachute restart <svc>` threads — `supervisor: {}` (let the real
+  // `isHubUnitInstalled` probe decide; do NOT force `unitInstalled: true` and
+  // bypass it) plus `migrateOffer: { enabled: true }`. On a supervised box this
+  // drives `supervisor.restart` over the loopback module-ops API; on a no-unit
+  // box it gets the §7.5 auto-offer / actionable migrate error instead of a bare
+  // connection-refused. `hubUnitDeps` threads through so the real probe + manager
+  // ops use the resolved deps (production defaults; tests inject the seams).
   return await r.restartFn(target.short, {
     manifestPath: r.manifestPath,
     configDir: r.configDir,
-    supervisor: { unitInstalled: true, hubUnitDeps: r.hubUnitDeps },
+    supervisor: { hubUnitDeps: r.hubUnitDeps },
+    migrateOffer: { enabled: true },
   });
 }
 

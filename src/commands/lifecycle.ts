@@ -541,7 +541,7 @@ async function stopViaSupervisor(svc: string | undefined, r: Resolved): Promise<
   // hub (do NOT ensureHubUnit just to stop one module). Only when the hub is up
   // do we drive the supervisor's stop.
   if (!(await r.sup.probeHubHealth(port))) {
-    r.log(`${svc} already stopped (the hub isn't running, so its modules are down).`);
+    r.log(`✓ ${svc} already stopped (the hub isn't running, so its modules are down).`);
     return 0;
   }
   const { httpError, failed, result } = await driveSupervisorOp(svc, "stop", r);
