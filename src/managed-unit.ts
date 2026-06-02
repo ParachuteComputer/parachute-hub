@@ -297,6 +297,18 @@ export interface ManagedUnitInstallResult {
    * what to do (the connector falls back to a transient `proc.unref()` spawn).
    */
   outcome: "installed" | "fallback";
+  /**
+   * On a `fallback`, WHY we fell back — so callers can give an accurate message
+   * instead of conflating the two causes:
+   *   - "no-manager" → no service manager is available here (launchctl/systemctl
+   *     missing, or an unsupported platform). Boot-persistence is impossible.
+   *   - "write-failed" → a manager exists but the install itself failed (couldn't
+   *     write the unit file, daemon-reload / enable / bootstrap returned non-zero).
+   * Undefined when `outcome === "installed"`. The connector ignores this (it only
+   * branches on `outcome`); the Phase 5 cutover reads it to pick `no-manager` vs
+   * `write-failed`.
+   */
+  reason?: "no-manager" | "write-failed";
   /** Which init system installed the service (when outcome === "installed"). */
   kind?: "launchd" | "systemd-user" | "systemd-system" | "unsupported";
   /** Path of the written service file (when outcome === "installed"). */
@@ -355,6 +367,7 @@ export function installManagedUnit(opts: InstallManagedUnitOpts): ManagedUnitIns
   if (deps.platform === "linux") return installSystemdUnit(opts);
   return {
     outcome: "fallback",
+    reason: "no-manager",
     messages: [
       `Boot-persistent unit isn't supported on ${deps.platform}; using a transient process.`,
     ],
@@ -365,7 +378,7 @@ function installLaunchdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
   const { unit, deps, messages } = opts;
   const start = opts.start ?? true;
   if (deps.which("launchctl") === null) {
-    return { outcome: "fallback", messages: [messages.launchctlMissing] };
+    return { outcome: "fallback", reason: "no-manager", messages: [messages.launchctlMissing] };
   }
   const home = deps.homeDir();
   const plistPath = launchdPlistPathForLabel(unit.launchdLabel, home);
@@ -378,6 +391,7 @@ function installLaunchdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
   } catch (err) {
     return {
       outcome: "fallback",
+      reason: "write-failed",
       messages: [
         `${messages.writeFailedPrefix} (${err instanceof Error ? err.message : String(err)}).`,
       ],
@@ -415,6 +429,7 @@ function installLaunchdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
       deps.removeFile(plistPath);
       return {
         outcome: "fallback",
+        reason: "write-failed",
         messages: [
           `${messages.launchctlLoadFailedPrefix} (${boot.stderr.trim() || legacy.stderr.trim() || "unknown error"}).`,
         ],
@@ -436,7 +451,7 @@ function installSystemdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
   const { unit, deps, messages } = opts;
   const start = opts.start ?? true;
   if (deps.which("systemctl") === null) {
-    return { outcome: "fallback", messages: [messages.systemctlMissing] };
+    return { outcome: "fallback", reason: "no-manager", messages: [messages.systemctlMissing] };
   }
   const root = (deps.getuid() ?? 1000) === 0;
   const home = deps.homeDir();
@@ -449,6 +464,7 @@ function installSystemdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
   } catch (err) {
     return {
       outcome: "fallback",
+      reason: "write-failed",
       messages: [
         `${messages.writeFailedPrefix} (${err instanceof Error ? err.message : String(err)}).`,
       ],
@@ -487,6 +503,7 @@ function installSystemdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
     deps.removeFile(unitPath);
     return {
       outcome: "fallback",
+      reason: "write-failed",
       messages: [
         `${messages.daemonReloadFailedPrefix} (${reload.stderr.trim() || "unknown error"}).`,
       ],
@@ -516,6 +533,7 @@ function installSystemdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
     deps.run(["systemctl", ...scope, "daemon-reload"]);
     return {
       outcome: "fallback",
+      reason: "write-failed",
       messages: [`${messages.enableFailedPrefix} (${enable.stderr.trim() || "unknown error"}).`],
     };
   }

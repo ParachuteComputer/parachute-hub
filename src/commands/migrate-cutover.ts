@@ -52,6 +52,7 @@
  * launchctl / lsof / process kills.
  */
 
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import {
@@ -59,7 +60,6 @@ import {
   type KillFn,
   type PidOnPortFn,
   type StopHubOpts,
-  defaultKill,
   defaultPidOnPort,
   stopHub,
 } from "../hub-control.ts";
@@ -83,7 +83,7 @@ import {
   removeManagedUnit,
 } from "../managed-unit.ts";
 import { type PortListeningFn, defaultPortListening } from "../port-probe.ts";
-import { type AliveFn, clearPid, defaultAlive, readPid } from "../process-state.ts";
+import { type AliveFn, clearPid, readPid } from "../process-state.ts";
 import { shortNameForManifest } from "../service-spec.ts";
 import { type ServiceEntry, readManifestLenient } from "../services-manifest.ts";
 
@@ -98,6 +98,38 @@ export function defaultHubCliPath(): string {
 }
 
 /**
+ * Best-effort command-line probe for a pid (the orphan-sweep ownership check).
+ * Returns the process's command line, or undefined when it can't be read. See
+ * `CutoverDeps.ownerOfPid`.
+ */
+export type OwnerProbeFn = (pid: number) => string | undefined;
+
+/**
+ * Production `ownerOfPid`: `ps -o command= -p <pid>` returns the full argv of the
+ * process (one line). macOS + Linux both ship `ps` and accept `-o command=` (the
+ * trailing `=` suppresses the header). Any failure — `ps` missing, pid gone,
+ * permission, garbage — returns undefined so the caller treats the orphan as
+ * UNATTRIBUTABLE (and refuses to kill it). Mirrors `defaultPidOnPort`'s
+ * shell-out-and-swallow shape.
+ */
+export const defaultOwnerOfPid: OwnerProbeFn = (pid) => {
+  try {
+    const result = spawnSync("ps", ["-o", "command=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 2000,
+    });
+    if (result.status !== 0) return undefined;
+    const line = result.stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .find((s) => s.length > 0);
+    return line === undefined || line.length === 0 ? undefined : line;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
  * Injectable side-effect seam for the cutover. Production wires the real
  * implementations; tests inject fakes so no real process is stopped, no real
  * unit installed, no real port probed.
@@ -105,10 +137,20 @@ export function defaultHubCliPath(): string {
 export interface CutoverDeps {
   /** Process-liveness probe (pidfile readers + this = "is the detached proc alive?"). */
   alive: AliveFn;
-  /** Send a signal to a pid (orphan-sweep kill). */
+  /** Send a signal to a pid (orphan-sweep kill). Group-aware (negative-pid) by default. */
   kill: KillFn;
   /** Which pid is bound to a port (orphan-sweep lsof). */
   pidOnPort: PidOnPortFn;
+  /**
+   * Best-effort command-line of a pid (the orphan-sweep ownership probe). Returns
+   * the process's argv joined (e.g. `bun .../server.ts --port 1940`) or undefined
+   * when it can't be read (pid gone, permission, no `ps`). Used by
+   * `sweepOrphanOnPort` to decide whether an orphan holding a MODULE port is
+   * plausibly that parachute module before adopting + killing it — so the cutover
+   * never blind-kills an operator's unrelated process that happens to squat a
+   * declared port. Injectable so tests drive attribution without shelling to `ps`.
+   */
+  ownerOfPid: OwnerProbeFn;
   /** TCP connect-probe for the verify-ports-free + verify-hub-ready steps. */
   portListening: PortListeningFn;
   /** Stop the detached hub (SIGTERM→SIGKILL + 1939 orphan adoption). */
@@ -152,6 +194,17 @@ export interface WriteUnitResult {
   written: boolean;
   /** "installed" (file on disk) or "fallback" (no manager / write failed). */
   outcome: "installed" | "fallback";
+  /**
+   * On a `fallback`, WHY — so the caller maps to the right `CutoverOutcome`
+   * instead of conflating the two causes (the MUST-FIX NIT: a bun-not-found /
+   * write failure previously surfaced as the wrong "no service manager" message,
+   * and the `write-failed` outcome was dead):
+   *   - "no-manager"  → no systemd/launchd here (the supervised model is impossible);
+   *   - "write-failed" → a manager exists but the unit couldn't be written (bun
+   *     unresolvable, write/daemon-reload failure).
+   * Undefined when `outcome === "installed"`.
+   */
+  cause?: "no-manager" | "write-failed";
   messages: string[];
 }
 
@@ -183,10 +236,13 @@ export function defaultWriteUnitWithoutStarting(opts: WriteUnitOpts): WriteUnitR
     });
   } catch (err) {
     // `bun` couldn't be resolved — refuse to bake a broken ExecStart. No unit on
-    // disk: not resumable from here (the caller surfaces it as a hard failure).
+    // disk: not resumable from here. A manager may well exist; this is a WRITE
+    // failure (can't compose a valid unit), NOT a no-manager host — surface it as
+    // such so the operator sees "bun not found / could not write the unit".
     return {
       written: false,
       outcome: "fallback",
+      cause: "write-failed",
       messages: [err instanceof Error ? err.message : String(err)],
     };
   }
@@ -196,21 +252,75 @@ export function defaultWriteUnitWithoutStarting(opts: WriteUnitOpts): WriteUnitR
     messages: hubUnitMessages(),
     start: false,
   });
-  // `installed` → the file is on disk (resumable). `fallback` → no manager /
-  // write failed; the messages explain. We treat a `fallback` whose cause is
-  // "no manager" as not-written (can't host a unit), and a write-failed fallback
-  // likewise — both leave no usable unit on disk.
+  // `installed` → the file is on disk (resumable). `fallback` → either no manager
+  // (host can't host a unit) or the install/write failed (manager present). Thread
+  // the manager's `reason` through so the caller distinguishes them; default to
+  // "write-failed" if (somehow) absent — the conservative non-no-manager message.
   return {
     written: res.outcome === "installed",
     outcome: res.outcome,
+    cause: res.outcome === "fallback" ? (res.reason ?? "write-failed") : undefined,
     messages: res.messages,
   };
 }
 
+/**
+ * Group-aware kill — INLINED from `lifecycle.ts`'s `defaultKill` (NOT imported,
+ * to avoid the import cycle `lifecycle.ts → migrate-offer.ts → migrate-cutover.ts`).
+ * MUST stay byte-equivalent to lifecycle's group-aware kill.
+ *
+ * Modules are spawned `detached: true` by `defaultSpawner` (lifecycle.ts), so the
+ * recorded pid is a process-GROUP leader (pid == pgid). A wrapper startCmd like
+ * `pnpm exec tsx server.ts` leaves the real server as a GRANDCHILD inside that
+ * group. The cutover originally used the BARE-PID `hub-control.ts:defaultKill`
+ * (`process.kill(pid, sig)`), which signals only the wrapper — the tsx grandchild
+ * survives, keeps holding the module's port, `waitPortFree` times out, and the
+ * cutover returns `port-stuck` on the FIRST run for any wrapper-startCmd module
+ * (the exact hub#88 footgun). `process.kill(-pid, sig)` signals the whole group;
+ * ESRCH (legacy pidfile written before detached-spawn, or the leader already
+ * exited and the group emptied) falls back to a bare-pid signal so the intent
+ * still lands when there's a positive-pid process to receive it.
+ */
+const groupAwareKill: KillFn = (pid, signal) => {
+  try {
+    process.kill(-pid, signal);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+    process.kill(pid, signal);
+  }
+};
+
+/**
+ * Group-aware liveness — INLINED from `lifecycle.ts`'s `defaultAlive` (same
+ * import-cycle reason as `groupAwareKill`). Returns true if the process GROUP
+ * (pgid == pid) still has any member, so the stop-then-wait loop keeps polling
+ * until the wrapper AND its grandchild are both gone (the bare-pid
+ * `process-state.ts:defaultAlive` would report the leader dead while the
+ * grandchild lingers, prematurely clearing the pidfile + skipping the SIGKILL
+ * escalation, re-opening the hub#88 port hold). ESRCH on the group probe (legacy
+ * pidfile, or the leader exited and the group emptied) falls back to a bare-pid
+ * check so a positive-pid process is still honored.
+ */
+const groupAwareAlive: AliveFn = (pid) => {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") return true;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 export const defaultCutoverDeps: CutoverDeps = {
-  alive: defaultAlive,
-  kill: defaultKill,
+  alive: groupAwareAlive,
+  kill: groupAwareKill,
   pidOnPort: defaultPidOnPort,
+  ownerOfPid: defaultOwnerOfPid,
   portListening: defaultPortListening,
   stopHub,
   installAndStartHubUnit,
@@ -325,26 +435,96 @@ async function stopDetachedModule(
 }
 
 /**
+ * Decide whether an orphan pid bound to a MODULE port is plausibly attributable
+ * to that parachute module — the MUST-FIX-2 guard against blind-killing an
+ * operator's unrelated process that merely squats a declared port. Attributable
+ * when ANY of:
+ *   - the orphan pid equals the module's RECORDED pid (services.json/pidfile);
+ *   - its command line mentions `parachute` (any parachute-managed process);
+ *   - its command line mentions the module's short name (e.g. `vault`);
+ *   - its command line mentions the module's start command (when known).
+ * An unreadable command line (probe returned undefined) + a non-matching pid is
+ * NOT attributable — we refuse to kill it.
+ */
+function orphanAttributable(args: {
+  orphan: number;
+  recordedPid: number | undefined;
+  short: string;
+  startCmdHint: string | undefined;
+  ownerOfPid: OwnerProbeFn;
+}): { attributable: boolean; cmdline: string | undefined } {
+  const { orphan, recordedPid, short, startCmdHint, ownerOfPid } = args;
+  if (recordedPid !== undefined && orphan === recordedPid) {
+    return { attributable: true, cmdline: undefined };
+  }
+  const cmdline = ownerOfPid(orphan);
+  if (cmdline === undefined) return { attributable: false, cmdline: undefined };
+  const haystack = cmdline.toLowerCase();
+  const needles = [
+    "parachute",
+    short.toLowerCase(),
+    ...(startCmdHint ? [startCmdHint.toLowerCase()] : []),
+  ].filter((n) => n.length > 0);
+  const attributable = needles.some((n) => haystack.includes(n));
+  return { attributable, cmdline };
+}
+
+/**
  * §7.2 orphan sweep: lsof a port, and if a live process is bound to it, adopt +
  * kill it (mirrors stopHub's 1939 orphan-adoption, per-module-port). A
  * stale-pidfile-but-alive module won't be found by `readPid` → without this it
  * stays bound → the supervised re-spawn hits EADDRINUSE.
+ *
+ * MUST-FIX 2 — OWNERSHIP CHECK (module ports only): for a declared MODULE port,
+ * we refuse to kill an orphan unless it's plausibly attributable to that
+ * parachute module (`orphanAttributable`). An operator's own dev server squatting
+ * a module's port must NOT be nuked by the cutover — we emit a clear warning and
+ * leave it; the subsequent verify-ports-free step turns the still-held port into
+ * a `port-stuck` outcome the operator resolves. The HUB port retains the
+ * pre-existing blind-adopt behavior (mirrors `stopHub`'s 1939 orphan-adoption) —
+ * that scope is unchanged; pass `attribute: undefined` for it.
+ *
+ * Returns true when the orphan was adopted + signalled (or there was no orphan),
+ * false when an UNATTRIBUTABLE process was found + deliberately left running.
  */
 function sweepOrphanOnPort(
   port: number,
   label: string,
   deps: CutoverDeps,
   log: (line: string) => void,
-): void {
+  attribute?: { recordedPid: number | undefined; short: string; startCmdHint: string | undefined },
+): boolean {
   const orphan = deps.pidOnPort(port);
-  if (orphan === undefined) return;
-  if (!deps.alive(orphan)) return;
+  if (orphan === undefined) return true;
+  if (!deps.alive(orphan)) return true;
+
+  if (attribute !== undefined) {
+    const { attributable, cmdline } = orphanAttributable({
+      orphan,
+      recordedPid: attribute.recordedPid,
+      short: attribute.short,
+      startCmdHint: attribute.startCmdHint,
+      ownerOfPid: deps.ownerOfPid,
+    });
+    if (!attributable) {
+      const desc = cmdline ? `${cmdline}` : "command line unavailable";
+      log(
+        `  ⚠ port ${port} for ${label} is held by an unrelated process (PID ${orphan}, ${desc}); refusing to kill it.`,
+      );
+      log(
+        "    The cutover only adopts processes it can attribute to this module. Stop that process yourself,",
+      );
+      log("    then re-run `parachute migrate --to-supervised`.");
+      return false;
+    }
+  }
+
   log(`  orphan on ${label} port ${port} (PID ${orphan}) — stopping it.`);
   try {
     deps.kill(orphan, "SIGTERM");
   } catch {
     // Already gone.
-    return;
+    return true;
   }
   // Best-effort SIGKILL follow-up if still alive (no long wait — the
   // verify-ports-free step below polls + escalates the failure if it persists).
@@ -355,6 +535,7 @@ function sweepOrphanOnPort(
       // Racing a just-exited process.
     }
   }
+  return true;
 }
 
 /**
@@ -444,10 +625,13 @@ export async function cutoverToSupervised(opts: CutoverOpts = {}): Promise<Cutov
   });
   for (const m of write.messages) log(`  ${m}`);
   if (!write.written) {
-    if (write.outcome === "fallback") {
+    // Distinguish the two fallback causes (MUST-FIX NIT). Both bail cleanly here —
+    // we're still BEFORE step 3, so nothing has been stopped — but with accurate
+    // messaging so a bun-not-found / write failure doesn't masquerade as a
+    // missing-service-manager host.
+    if (write.cause === "no-manager") {
       // No service manager on this host (container / init-less) — there is no
-      // unit to install; the runtime here is foreground `serve`. Bail cleanly
-      // WITHOUT having stopped anything (we're still before step 3).
+      // unit to install; the runtime here is foreground `serve`.
       return {
         outcome: "no-manager",
         port,
@@ -458,12 +642,15 @@ export async function cutoverToSupervised(opts: CutoverOpts = {}): Promise<Cutov
         ],
       };
     }
-    // The write itself failed (e.g. bun unresolvable). Nothing stopped yet —
-    // safe to bail.
+    // The write itself failed (bun unresolvable, or the manager errored writing
+    // the unit). A manager may exist — this is NOT a no-manager host.
     return {
       outcome: "write-failed",
       port,
-      messages: ["Could not write the hub unit file — no changes made.", ...write.messages],
+      messages: [
+        "Could not write the hub unit file (bun not found, or the service manager errored) — no changes made.",
+        ...write.messages,
+      ],
     };
   }
 
@@ -478,10 +665,21 @@ export async function cutoverToSupervised(opts: CutoverOpts = {}): Promise<Cutov
   }
 
   // --- Step 4: §7.2 ORPHAN SWEEP — per services.json port + the hub port. ---
+  // The HUB port keeps the pre-existing blind-adopt (mirrors stopHub's 1939
+  // orphan-adoption — out of scope for MUST-FIX 2). The MODULE ports get the
+  // ownership check: we read the module's recorded pid (so a still-alive process
+  // we already know about is trivially attributable) and only adopt+kill an
+  // orphan we can attribute to that parachute module; an UNATTRIBUTABLE squatter
+  // is left running with a warning, and the verify-ports-free step turns the
+  // still-held port into `port-stuck`.
   log("Sweeping orphaned processes still bound to declared ports…");
   sweepOrphanOnPort(port, "hub", deps, log);
   for (const target of targets) {
-    sweepOrphanOnPort(target.port, target.short, deps, log);
+    sweepOrphanOnPort(target.port, target.short, deps, log, {
+      recordedPid: readPid(target.short, configDir),
+      short: target.short,
+      startCmdHint: undefined,
+    });
   }
 
   // --- Step 5: VERIFY the hub port + each module port is free. ---

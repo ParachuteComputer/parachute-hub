@@ -6,6 +6,7 @@ import {
   type CutoverDeps,
   type WriteUnitResult,
   cutoverToSupervised,
+  defaultCutoverDeps,
   teardownHubUnit,
 } from "../commands/migrate-cutover.ts";
 import type { HubUnitDeps, InstallAndStartHubUnitResult } from "../hub-unit.ts";
@@ -94,6 +95,9 @@ function makeFakeCutover(over: Partial<CutoverDeps> = {}): FakeCutover {
       world.alivePids.delete(pid);
     },
     pidOnPort: (port) => world.orphanPorts.get(port),
+    // Default ownership probe: unattributable (returns undefined) — hermetic, no
+    // real `ps` shell-out. Tests that exercise the ownership check override it.
+    ownerOfPid: () => undefined,
     portListening: async (port) => world.listening.has(port),
     stopHub: async () => {
       trace.push("stopHub");
@@ -274,7 +278,14 @@ describe("cutoverToSupervised — §7.2 orphan sweep", () => {
     const h = makeHarness();
     try {
       seedManifest(h.manifestPath, [{ name: "vault", port: 1940 }]);
-      const fc = makeFakeCutover();
+      // The orphan IS the stale vault module (its command line is attributable),
+      // so the ownership check (MUST-FIX 2) adopts + kills it.
+      const fc = makeFakeCutover({
+        ownerOfPid: (pid) =>
+          pid === 4242
+            ? "bun /home/op/.bun/install/global/@openparachute/vault/server.ts --port 1940"
+            : undefined,
+      });
       const w = getWorld(fc.deps);
       // vault's pidfile is gone, but an orphan PID 4242 still holds port 1940.
       w.listening.add(1939);
@@ -342,6 +353,7 @@ describe("cutoverToSupervised — fail-safe recovery states", () => {
         writeUnitWithoutStarting: () => ({
           written: false,
           outcome: "fallback",
+          cause: "write-failed",
           messages: ["cannot build hub unit: 'bun' not found on PATH"],
         }),
       });
@@ -354,8 +366,9 @@ describe("cutoverToSupervised — fail-safe recovery states", () => {
         log: () => {},
         pollMs: 0,
       });
-      // A write-fallback is treated as no-manager (can't host a unit here).
-      expect(result.outcome).toBe("no-manager");
+      // A write failure is distinct from no-manager (MUST-FIX NIT) — a manager
+      // may exist; we just couldn't compose/write the unit.
+      expect(result.outcome).toBe("write-failed");
       // FAIL-SAFE: nothing was stopped — we never reached step 3.
       expect(fc.trace).not.toContain("stopHub");
       expect(fc.trace).not.toContain("startUnit");
@@ -453,5 +466,328 @@ describe("teardownHubUnit (§7.4)", () => {
     });
     expect(res.removed).toBe(false);
     expect(log.join("\n")).toContain("nothing to tear down");
+  });
+});
+
+// ===========================================================================
+// MUST-FIX 1 — group-aware kill (hub#88 re-opened in the cutover).
+//
+// Modules are spawned `detached: true` → the recorded pid is a process-GROUP
+// leader. A wrapper startCmd (`pnpm exec tsx server.ts`) leaves the real server
+// as a GRANDCHILD in that group. The cutover used the BARE-pid kill, which
+// signals only the wrapper → the tsx grandchild survives, keeps holding the
+// module port → `waitPortFree` times out → `port-stuck` on the FIRST run. These
+// tests pin the fix: `defaultCutoverDeps.kill` is GROUP-aware (negative pid).
+// ===========================================================================
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+describe("MUST-FIX 1: group-aware kill targets the process GROUP (negative pid)", () => {
+  test("defaultCutoverDeps.kill signals -pid (the whole group), with an ESRCH bare-pid fallback", () => {
+    const calls: Array<{ pid: number; signal: NodeJS.Signals | number }> = [];
+    const realKill = process.kill.bind(process);
+    const spy = (pid: number, signal?: NodeJS.Signals | number) => {
+      calls.push({ pid, signal: signal ?? 0 });
+      // Make the group send (negative pid) succeed so no fallback is taken.
+      return true as unknown as ReturnType<typeof process.kill>;
+    };
+    try {
+      // biome-ignore lint/suspicious/noExplicitAny: test spy on process.kill
+      (process as any).kill = spy;
+      defaultCutoverDeps.kill(4242, "SIGTERM");
+    } finally {
+      // biome-ignore lint/suspicious/noExplicitAny: restore
+      (process as any).kill = realKill;
+    }
+    // The group send fired with the NEGATIVE pid — not the bare pid.
+    expect(calls).toEqual([{ pid: -4242, signal: "SIGTERM" }]);
+  });
+
+  test("ESRCH on the group send falls back to a bare-pid signal (legacy pidfile)", () => {
+    const calls: Array<{ pid: number; signal: NodeJS.Signals | number }> = [];
+    const realKill = process.kill.bind(process);
+    const spy = (pid: number, signal?: NodeJS.Signals | number) => {
+      calls.push({ pid, signal: signal ?? 0 });
+      if (pid < 0) {
+        const err = new Error("no such process") as NodeJS.ErrnoException;
+        err.code = "ESRCH";
+        throw err;
+      }
+      return true as unknown as ReturnType<typeof process.kill>;
+    };
+    try {
+      // biome-ignore lint/suspicious/noExplicitAny: test spy on process.kill
+      (process as any).kill = spy;
+      defaultCutoverDeps.kill(777, "SIGKILL");
+    } finally {
+      // biome-ignore lint/suspicious/noExplicitAny: restore
+      (process as any).kill = realKill;
+    }
+    // First the group send (ESRCH), then the bare-pid fallback.
+    expect(calls).toEqual([
+      { pid: -777, signal: "SIGKILL" },
+      { pid: 777, signal: "SIGKILL" },
+    ]);
+  });
+
+  test("LOAD-BEARING: a wrapper-startCmd grandchild holding the module port is reaped → cutover migrates (NOT port-stuck)", async () => {
+    const h = makeHarness();
+    // Spawn a REAL detached wrapper that backgrounds a long-lived grandchild and
+    // prints the grandchild's pid — faithfully modeling `pnpm exec tsx server.ts`
+    // (a wrapper whose tsx grandchild is the thing actually holding the port). The
+    // wrapper is its own process-group leader (detached: true → pid == pgid).
+    const proc = Bun.spawn(["sh", "-c", "sleep 30 & echo $!; wait"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      detached: true,
+      env: process.env,
+    });
+    const leaderPid = proc.pid; // group leader (the "wrapper")
+    let grandchildPid = -1;
+    try {
+      const { value } = await proc.stdout.getReader().read();
+      grandchildPid = Number.parseInt(
+        new TextDecoder().decode(value ?? new Uint8Array()).trim(),
+        10,
+      );
+      expect(Number.isInteger(grandchildPid)).toBe(true);
+      expect(pidAlive(grandchildPid)).toBe(true);
+
+      seedManifest(h.manifestPath, [{ name: "vault", port: 1940 }]);
+      // vault's pidfile points at the WRAPPER leader (what `parachute start`
+      // recorded); the GRANDCHILD is what actually holds port 1940.
+      writePid("vault", leaderPid, h.configDir);
+
+      const fc = makeFakeCutover({
+        // PRODUCTION group-aware kill + alive (the fix under test) — NOT the
+        // harness fakes. Everything else stays stubbed (no real unit / health).
+        kill: defaultCutoverDeps.kill,
+        alive: defaultCutoverDeps.alive,
+        // The module port reads as HELD while the grandchild is still alive, and
+        // FREE the instant the grandchild dies — real-process backed, so only a
+        // correct group-kill (which reaps the grandchild) frees it.
+        portListening: async (port) => (port === 1940 ? pidAlive(grandchildPid) : false),
+        // No lsof orphan beyond the pidfile path — the stop reaps the group.
+        pidOnPort: () => undefined,
+      });
+      const w = getWorld(fc.deps);
+      w.listening.add(1939); // hub port held; stopHub frees it.
+
+      const result = await cutoverToSupervised({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        deps: fc.deps,
+        log: () => {},
+        pollMs: 1,
+        timeoutMs: 2000,
+      });
+
+      // The grandchild was reaped by the GROUP kill → port 1940 freed → the
+      // cutover proceeded. A bare-pid kill would have left the grandchild alive,
+      // 1940 held, and the outcome `port-stuck` (the hub#88 footgun).
+      expect(result.outcome).toBe("migrated");
+      expect(pidAlive(grandchildPid)).toBe(false);
+    } finally {
+      // Defensive cleanup — both should already be gone on the happy path.
+      try {
+        process.kill(-leaderPid, "SIGKILL");
+      } catch {}
+      if (grandchildPid > 0) {
+        try {
+          process.kill(grandchildPid, "SIGKILL");
+        } catch {}
+      }
+      h.cleanup();
+    }
+  });
+});
+
+// ===========================================================================
+// MUST-FIX 2 — ownership check in the per-module orphan sweep (no blind-kill).
+//
+// `sweepOrphanOnPort` must NOT kill whatever holds a declared MODULE port — only
+// processes plausibly attributable to that parachute module. An operator's own
+// dev server squatting a module port must survive (warning + port-stuck), not be
+// nuked.
+// ===========================================================================
+
+describe("MUST-FIX 2: orphan-sweep ownership check on module ports", () => {
+  test("an orphan attributable to the module (cmdline mentions it) is adopted + killed", async () => {
+    const h = makeHarness();
+    try {
+      seedManifest(h.manifestPath, [{ name: "vault", port: 1940 }]);
+      const fc = makeFakeCutover({
+        // The orphan's command line looks like a parachute vault process.
+        ownerOfPid: (pid) =>
+          pid === 4242
+            ? "bun /home/op/.bun/install/global/@openparachute/vault/server.ts"
+            : undefined,
+      });
+      const w = getWorld(fc.deps);
+      w.listening.add(1939);
+      w.listening.add(1940);
+      w.orphanPorts.set(1940, 4242);
+      w.alivePids.add(4242);
+      const baseKill = fc.deps.kill;
+      fc.deps.kill = (pid, signal) => {
+        baseKill?.(pid, signal);
+        if (pid === 4242) getWorld(fc.deps).listening.delete(1940);
+      };
+      const result = await cutoverToSupervised({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        deps: fc.deps,
+        log: () => {},
+        pollMs: 0,
+      });
+      expect(result.outcome).toBe("migrated");
+      // Attributable → adopted + killed.
+      expect(fc.trace).toContain("kill 4242 SIGTERM");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("an UNATTRIBUTABLE process on a module port is NOT killed → warning + port-stuck", async () => {
+    const h = makeHarness();
+    try {
+      seedManifest(h.manifestPath, [{ name: "vault", port: 1940 }]);
+      const fc = makeFakeCutover({
+        // The orphan is an operator's own dev server — nothing parachute-ish.
+        ownerOfPid: (pid) => (pid === 7777 ? "node /Users/op/my-app/dev-server.js" : undefined),
+      });
+      const w = getWorld(fc.deps);
+      w.listening.add(1939);
+      w.listening.add(1940);
+      // No vault pidfile (so no recorded-pid match) — the squatter is 7777.
+      w.orphanPorts.set(1940, 7777);
+      w.alivePids.add(7777);
+      const log: string[] = [];
+      const result = await cutoverToSupervised({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        deps: fc.deps,
+        log: (l) => log.push(l),
+        pollMs: 0,
+        timeoutMs: 0,
+      });
+      // The cutover refused to nuke the unrelated process → the port stays held →
+      // port-stuck (the operator resolves it).
+      expect(result.outcome).toBe("port-stuck");
+      // The squatter was NEVER signalled.
+      expect(fc.trace).not.toContain("kill 7777 SIGTERM");
+      expect(fc.trace).not.toContain("kill 7777 SIGKILL");
+      expect(getWorld(fc.deps).alivePids.has(7777)).toBe(true);
+      // A clear warning names the unrelated process + refuses.
+      const out = log.join("\n");
+      expect(out).toContain("held by an unrelated process");
+      expect(out).toContain("7777");
+      expect(out).toContain("dev-server.js");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("an orphan whose command line is unreadable is treated as UNATTRIBUTABLE", async () => {
+    const h = makeHarness();
+    try {
+      seedManifest(h.manifestPath, [{ name: "vault", port: 1940 }]);
+      const fc = makeFakeCutover({
+        // ps failed / pid gone → no cmdline, and the pid doesn't match a record.
+        ownerOfPid: () => undefined,
+      });
+      const w = getWorld(fc.deps);
+      w.listening.add(1939);
+      w.listening.add(1940);
+      w.orphanPorts.set(1940, 5050);
+      w.alivePids.add(5050);
+      const result = await cutoverToSupervised({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        deps: fc.deps,
+        log: () => {},
+        pollMs: 0,
+        timeoutMs: 0,
+      });
+      expect(result.outcome).toBe("port-stuck");
+      expect(fc.trace).not.toContain("kill 5050 SIGTERM");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ===========================================================================
+// MUST-FIX NIT — distinguish no-manager from write-failed in the cutover.
+// ===========================================================================
+
+describe("MUST-FIX NIT: no-manager vs write-failed are distinct outcomes", () => {
+  test("bun-not-found (write-failed cause) → write-failed outcome with an accurate message", async () => {
+    const h = makeHarness();
+    try {
+      seedManifest(h.manifestPath, []);
+      const fc = makeFakeCutover({
+        writeUnitWithoutStarting: () => ({
+          written: false,
+          outcome: "fallback",
+          cause: "write-failed",
+          messages: ["cannot build hub unit: 'bun' not found on PATH"],
+        }),
+      });
+      const w = getWorld(fc.deps);
+      w.listening.add(1939);
+      const result = await cutoverToSupervised({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        deps: fc.deps,
+        log: () => {},
+        pollMs: 0,
+      });
+      expect(result.outcome).toBe("write-failed");
+      // NOT the "no service manager" message — names bun / the write failure.
+      const out = result.messages.join("\n");
+      expect(out).toContain("Could not write the hub unit file");
+      expect(out).not.toContain("This host has no service manager");
+      // FAIL-SAFE: nothing stopped (still before step 3).
+      expect(fc.trace).not.toContain("stopHub");
+      expect(fc.trace).not.toContain("startUnit");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("genuine no-manager (no systemd/launchd) → no-manager outcome + service-manager message", async () => {
+    const h = makeHarness();
+    try {
+      seedManifest(h.manifestPath, []);
+      const fc = makeFakeCutover({
+        writeUnitWithoutStarting: () => ({
+          written: false,
+          outcome: "fallback",
+          cause: "no-manager",
+          messages: ["no service manager (launchctl) found on this host"],
+        }),
+      });
+      const w = getWorld(fc.deps);
+      w.listening.add(1939);
+      const result = await cutoverToSupervised({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        deps: fc.deps,
+        log: () => {},
+        pollMs: 0,
+      });
+      expect(result.outcome).toBe("no-manager");
+      expect(result.messages.join("\n")).toContain("This host has no service manager");
+      expect(fc.trace).not.toContain("stopHub");
+    } finally {
+      h.cleanup();
+    }
   });
 });
