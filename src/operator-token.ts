@@ -30,7 +30,12 @@ import type { Database } from "bun:sqlite";
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
 import { configDir } from "./config.ts";
+import { EXPOSE_STATE_PATH, readExposeState } from "./expose-state.ts";
+import { validateHostAdminToken } from "./host-admin-token-validation.ts";
+import { readHubPort } from "./hub-control.ts";
+import { HUB_UNIT_DEFAULT_PORT } from "./hub-unit.ts";
 import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
+import { buildHubBoundOrigins } from "./origin-check.ts";
 import { isLoopbackOrigin } from "./vault-hub-origin-env.ts";
 
 export const OPERATOR_TOKEN_FILENAME = "operator.token";
@@ -279,7 +284,14 @@ export class OperatorTokenExpiredError extends Error {
 }
 
 export interface UseOperatorTokenOpts {
-  /** Hub origin used as `iss` validator. Required. */
+  /**
+   * Hub origin the caller resolved. Required. As of hub#516 this is a SEED of
+   * the known-issuer SET the token's `iss` is validated against
+   * ({@link buildKnownIssuersForOperatorToken}), not the sole `iss` validator —
+   * so a caller that resolves loopback (`status`) still accepts a public-`iss`
+   * operator token from `expose-state.json`, and vice versa. It also remains
+   * the `iss` stamped on an auto-rotated re-mint.
+   */
   issuer: string;
   /** configDir override (where operator.token lives). Defaults to `configDir()`. */
   configDir?: string;
@@ -346,8 +358,77 @@ export interface UsedOperatorToken {
 }
 
 /**
+ * Compose the Fly.io default public origin from `FLY_APP_NAME`, mirroring the
+ * server-side `flyDefaultOrigin` (hub-server.ts) so the client-side
+ * known-issuer set matches the origin the hub stamps tokens with on Fly. Kept
+ * local (a one-liner) rather than imported to avoid pulling hub-server.ts /
+ * serve.ts into the CLI auth path. Fly slugs never contain `/`; anything with
+ * one is spoofed or malformed.
+ */
+function flyDefaultOrigin(env: NodeJS.ProcessEnv): string | undefined {
+  const app = env.FLY_APP_NAME;
+  if (typeof app !== "string" || app.length === 0 || app.includes("/")) return undefined;
+  return `https://${app}.fly.dev`;
+}
+
+/**
+ * Assemble the SET of origins this hub legitimately answers on, from on-disk
+ * client state — the client-side mirror of hub-server.ts's per-request
+ * `buildHubBoundOrigins` call (hub#516). The operator token's `iss` is
+ * validated against this set rather than a single issuer, so a token whose
+ * `iss` is the hub's PUBLIC origin (stamped after `parachute expose`) is
+ * accepted even when the CLI command resolved a loopback `issuer` (the
+ * `status` case) — and vice versa.
+ *
+ * The set is:
+ *   - `seedIssuer` — the issuer the caller resolved (loopback for `status`,
+ *     `r.hubOrigin` / public for lifecycle). Kept as a seed so callers that
+ *     pass a value still contribute it; never the sole gate.
+ *   - loopback aliases — `http://127.0.0.1:<port>` AND `http://localhost:<port>`
+ *     for the hub's port (`readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT`),
+ *     matching the hub's own loopback alias set (`buildHubBoundOrigins`).
+ *   - the expose-state public origin — `expose-state.json`'s `hubOrigin`, the
+ *     public URL the hub stamps on tokens once exposed.
+ *   - the platform/env public origin — `PARACHUTE_HUB_ORIGIN` ∪
+ *     `RENDER_EXTERNAL_URL` ∪ the composed Fly default — for container deploys
+ *     where the public origin comes from the platform, not expose-state.
+ *
+ * Provenance is NOT established here: `validateHostAdminToken` runs the JWKS
+ * signature check FIRST and unconditionally. This set is the belt-and-suspenders
+ * `iss` allowlist layered on top — a foreign `iss` (not loopback / expose /
+ * env) is rejected, and an empty set fails closed.
+ */
+export function buildKnownIssuersForOperatorToken(
+  configDirOverride: string | undefined,
+  seedIssuer: string,
+): readonly string[] {
+  const dir = configDirOverride ?? configDir();
+  const loopbackPort = readHubPort(dir) ?? HUB_UNIT_DEFAULT_PORT;
+  let exposeHubOrigin: string | undefined;
+  try {
+    exposeHubOrigin = readExposeState(join(dir, "expose-state.json"))?.hubOrigin;
+  } catch {
+    // A malformed expose-state.json must never lock the operator out of the
+    // CLI — the seed issuer + loopback aliases already cover legitimate
+    // loopback access; treat it as "no public origin known."
+    exposeHubOrigin = undefined;
+  }
+  const platformOrigin =
+    process.env.PARACHUTE_HUB_ORIGIN ??
+    process.env.RENDER_EXTERNAL_URL ??
+    flyDefaultOrigin(process.env);
+  return buildHubBoundOrigins({
+    issuer: seedIssuer,
+    loopbackPort,
+    ...(exposeHubOrigin !== undefined ? { exposeHubOrigin } : {}),
+    ...(platformOrigin !== undefined ? { platformOrigin } : {}),
+  });
+}
+
+/**
  * The canonical "use the operator token in a CLI flow" helper. Reads
- * `~/.parachute/operator.token`, validates against `db` + `issuer`, and:
+ * `~/.parachute/operator.token`, validates against `db` + the hub's
+ * known-issuer SET, and:
  *
  *   - If the token has fully expired: throws `OperatorTokenExpiredError`
  *     with an actionable message. Does NOT auto-rotate from a dead token —
@@ -397,9 +478,19 @@ export async function useOperatorTokenWithAutoRotate(
   if (!token) return null;
   const now = opts.now ?? (() => new Date());
 
-  // Validation failures (signature mismatch, wrong issuer, missing kid,
-  // expired-by-jose) bubble out for the caller to render the right message.
-  const validated = await validateAccessToken(db, token, opts.issuer);
+  // Validate against the hub's KNOWN-ISSUER SET, not a single `opts.issuer`
+  // (hub#516). The operator token is the hub's OWN self-issued credential; its
+  // `iss` is the hub's loopback origin before `expose` and its PUBLIC origin
+  // after. Callers resolve `opts.issuer` inconsistently — `status` hardcodes
+  // loopback, lifecycle uses `r.hubOrigin` (public when exposed) — so a single
+  // per-issuer check rejected the public-`iss` operator token on `status` even
+  // though `restart` worked. `validateHostAdminToken` (the #517 helper) gates
+  // on the JWKS SIGNATURE first+unconditionally (provenance), then accepts the
+  // `iss` if it's ANY origin the hub legitimately answers on. Validation
+  // failures (signature mismatch, missing kid, expired-by-jose, revoked, or an
+  // `iss` foreign to the whole set) bubble out for the caller to render.
+  const knownIssuers = buildKnownIssuersForOperatorToken(opts.configDir, opts.issuer);
+  const validated = await validateHostAdminToken(db, token, knownIssuers);
   const { payload } = validated;
 
   const exp = typeof payload.exp === "number" ? payload.exp : 0;
