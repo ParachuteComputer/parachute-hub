@@ -439,6 +439,62 @@ describe("migrate — interactive + flag behavior", () => {
     }
   });
 
+  test("§7.3 refuses while a UNIT-MANAGED hub runs (no pidfile, detected via manager)", async () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      // NO hub pidfile — this is a supervised/unit-managed hub. Before the §7.3
+      // fix the refuse-while-running guard FAILED OPEN here and migrate would
+      // archive ~/.parachute out from under the live hub.
+      touch(join(h.configDir, "daily.db"), "X");
+
+      const logs: string[] = [];
+      const code = await migrate({
+        configDir: h.configDir,
+        now: () => APRIL_19,
+        log: (l) => logs.push(l),
+        prompt: async () => {
+          throw new Error("prompt must not be called");
+        },
+        yes: true,
+        isTty: true,
+        // No pidfile alive; the manager reports the hub unit active.
+        alive: () => false,
+        hubUnitState: () => ({ state: "active" }),
+      });
+      expect(code).toBe(1);
+      expect(logs.join("\n")).toMatch(/services are currently running/i);
+      // No archive happened — the guard held.
+      expect(existsSync(join(h.configDir, ".archive-2026-04-19"))).toBe(false);
+      expect(existsSync(join(h.configDir, "daily.db"))).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("§7.3 archive PROCEEDS when the manager reports the hub inactive (no false-positive)", async () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      touch(join(h.configDir, "daily.db"), "X");
+
+      const code = await migrate({
+        configDir: h.configDir,
+        now: () => APRIL_19,
+        log: () => {},
+        yes: true,
+        isTty: true,
+        alive: () => false,
+        hubUnitState: () => ({ state: "inactive" }),
+      });
+      expect(code).toBe(0);
+      // The sweep ran — daily.db is archived.
+      expect(existsSync(join(h.configDir, ".archive-2026-04-19", "daily.db"))).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("refuses non-TTY without --yes (CI / pipe safety)", async () => {
     const h = makeHarness();
     try {
@@ -713,7 +769,83 @@ describe("listRunningServices", () => {
         h.configDir,
         join(h.configDir, "services.json"),
         () => false,
+        // Explicit no-unit stub so this stays deterministic even on a dev box
+        // that happens to have a hub unit installed (the §7.3 manager check).
+        () => ({ state: "no-unit" }),
       );
+      expect(running).toEqual([]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("§7.3 archive-guard: a unit-managed hub (no pidfile) is detected RUNNING via the manager", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      // NO hub pidfile (unit-managed hubs don't write one) → the pidfile check
+      // (alive => false) reports the hub as not-running. Before the fix this
+      // FAILED OPEN. The platform-manager check sees `active` and holds.
+      const running = listRunningServices(
+        h.configDir,
+        join(h.configDir, "services.json"),
+        () => false,
+        () => ({ state: "active" }),
+      );
+      expect(running).toContain("hub");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("§7.3 archive-guard: `activating` also reads as running", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      const running = listRunningServices(
+        h.configDir,
+        join(h.configDir, "services.json"),
+        () => false,
+        () => ({ state: "activating" }),
+      );
+      expect(running).toContain("hub");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("§7.3 archive-guard: `failed` / `inactive` / `no-manager` are NOT running", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      for (const state of ["failed", "inactive", "no-manager", "no-unit", "unknown"] as const) {
+        const running = listRunningServices(
+          h.configDir,
+          join(h.configDir, "services.json"),
+          () => false,
+          () => ({ state }),
+        );
+        expect(running).not.toContain("hub");
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("§7.3 archive-guard: a manager-query that throws never crashes the guard (fails closed-ish)", () => {
+    const h = makeHarness();
+    try {
+      seedSafelist(h.configDir);
+      const running = listRunningServices(
+        h.configDir,
+        join(h.configDir, "services.json"),
+        () => false,
+        () => {
+          throw new Error("systemctl exploded");
+        },
+      );
+      // The throw is swallowed; the pidfile check (no pid) governs → not running.
+      // (The guard must not crash; it just gets no extra signal from the manager.)
       expect(running).toEqual([]);
     } finally {
       h.cleanup();

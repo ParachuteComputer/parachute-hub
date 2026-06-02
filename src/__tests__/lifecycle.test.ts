@@ -17,6 +17,7 @@ import { writeHubPort } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import type { HubUnitManagerOpResult } from "../hub-unit.ts";
 import { validateAccessToken } from "../jwt-sign.ts";
+import type { MigrateOfferOpts, MigrateOfferResult } from "../migrate-offer.ts";
 import {
   type ModuleOp,
   ModuleOpHttpError,
@@ -2280,6 +2281,181 @@ describe("Phase 3b dual-dispatch — restart", () => {
       expect(killed).toHaveLength(0); // stale pid → detached cleanup, no kill
       expect(spawner.calls).toHaveLength(1); // detached start ran (NOT the supervisor)
       expect(readPid("vault", h.configDir)).toBe(7777);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("§7.5 auto-detect-and-offer hook in start/stop/restart", () => {
+  /** A migrate-offer stub recording whether it was called + what it returns. */
+  function makeOfferStub(outcome: MigrateOfferResult["outcome"]): {
+    offer: (opts: MigrateOfferOpts) => Promise<MigrateOfferResult>;
+    calls: number;
+  } {
+    const state = { calls: 0 };
+    return {
+      get calls() {
+        return state.calls;
+      },
+      offer: async () => {
+        state.calls++;
+        return { outcome };
+      },
+    };
+  }
+
+  test("offer disabled by default (omitted) → detached arm, no offer", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const spawner = makeSpawner([4242]);
+      // No migrateOffer block → the §7.5 hook stays OFF (existing-test behavior).
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      // Took the detached arm — spawned vault.
+      expect(spawner.calls).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("start: accept+migrate → re-dispatches through the supervisor (no detached spawn)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const offerStub = makeOfferStub("migrated");
+      const sup = makeSupervisorStub();
+      // Start on the detached arm (unitInstalled:false), with the offer enabled
+      // and the supervisor stub ready for the post-migrate re-dispatch.
+      const spawner = makeSpawner([4242]);
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        log: () => {},
+        supervisor: { ...sup.opts, unitInstalled: false },
+        migrateOffer: { enabled: true, offer: offerStub.offer },
+      });
+      expect(code).toBe(0);
+      expect(offerStub.calls).toBe(1);
+      // The re-dispatch drove the supervisor (NOT a detached spawn).
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "start" }]);
+      expect(spawner.calls).toHaveLength(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("start: declined → falls through to the detached arm", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const offerStub = makeOfferStub("declined");
+      const spawner = makeSpawner([4242]);
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        log: () => {},
+        migrateOffer: { enabled: true, offer: offerStub.offer },
+      });
+      expect(code).toBe(0);
+      expect(offerStub.calls).toBe(1);
+      // Declined → detached spawn still happened.
+      expect(spawner.calls).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("start: migrate-failed → falls through to the detached arm (fail-safe)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const offerStub = makeOfferStub("migrate-failed");
+      const spawner = makeSpawner([4242]);
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        log: () => {},
+        migrateOffer: { enabled: true, offer: offerStub.offer },
+      });
+      // A failed cutover leaves the box detached → the original verb still runs
+      // the detached way (rather than re-dispatching into a supervisor that
+      // isn't up).
+      expect(code).toBe(0);
+      expect(spawner.calls).toHaveLength(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("stop: accept+migrate → re-dispatches through the supervisor", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const offerStub = makeOfferStub("migrated");
+      const sup = makeSupervisorStub();
+      const code = await stop("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        supervisor: { ...sup.opts, unitInstalled: false },
+        migrateOffer: { enabled: true, offer: offerStub.offer },
+      });
+      expect(code).toBe(0);
+      expect(offerStub.calls).toBe(1);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "stop" }]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("restart: accept+migrate → re-dispatches through the supervisor", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const offerStub = makeOfferStub("migrated");
+      const sup = makeSupervisorStub();
+      const code = await restart("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        supervisor: { ...sup.opts, unitInstalled: false },
+        migrateOffer: { enabled: true, offer: offerStub.offer },
+      });
+      expect(code).toBe(0);
+      expect(offerStub.calls).toBe(1);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("offer is NOT made on the supervisor arm (unit already installed)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const offerStub = makeOfferStub("migrated");
+      const sup = makeSupervisorStub(); // unitInstalled: true
+      const code = await start("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        supervisor: sup.opts,
+        migrateOffer: { enabled: true, offer: offerStub.offer },
+      });
+      expect(code).toBe(0);
+      // Supervisor arm taken directly → the offer hook (detached-arm only) never ran.
+      expect(offerStub.calls).toBe(0);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "start" }]);
     } finally {
       h.cleanup();
     }
