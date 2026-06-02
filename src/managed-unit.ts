@@ -648,10 +648,25 @@ export interface BuildHubManagedUnitOpts {
  *
  * Resolves the absolute `bun` path via the `which` seam (launchd/systemd don't
  * search `$PATH` — mirrors how the connector resolves cloudflared). The env
- * carries `PARACHUTE_HOME` / `PORT` / `PATH` / `BUN_INSTALL` — and INTENTIONALLY
- * OMITS `PARACHUTE_HUB_ORIGIN`: baking a stale origin here would re-create the
- * iss-mismatch class; `resolveStartupIssuer` derives it and start-hub self-heals
- * the operator token + vault `.env` to the current origin (design §4.1 comment).
+ * carries `PARACHUTE_BIND_HOST` / `PARACHUTE_HOME` / `PORT` / `PATH` /
+ * `BUN_INSTALL` — and INTENTIONALLY OMITS `PARACHUTE_HUB_ORIGIN`: baking a stale
+ * origin here would re-create the iss-mismatch class; `resolveStartupIssuer`
+ * derives it and start-hub self-heals the operator token + vault `.env` to the
+ * current origin (design §4.1 comment).
+ *
+ * BIND HOST — `PARACHUTE_BIND_HOST=127.0.0.1` is forced here so every
+ * self-hosted supervised hub binds loopback. `parachute serve` itself defaults
+ * the bind host to `0.0.0.0` (serve.ts), which is correct for the container
+ * shape (the platform's HTTP forwarder must reach the hub) but WRONG for a
+ * self-hosted box — bare `serve` would expose the admin/OAuth surfaces on every
+ * interface, contradicting the pre-supervisor detached behavior and the trust
+ * model `layerOf` (hub-server.ts) assumes (header-absent ⇒ "loopback"). The
+ * container path never calls this builder (the Dockerfile pins
+ * `ENV PARACHUTE_BIND_HOST=0.0.0.0` + runs `serve` directly), so it stays
+ * 0.0.0.0. The canonical expose path is unaffected: cloudflared/tailscale dial
+ * `127.0.0.1:<port>` from the same host, and the hub's own proxy targets
+ * `http://127.0.0.1:<port>` (hub-server.ts). An operator who genuinely wants
+ * all-interfaces can override the generated unit; the default is loopback.
  *
  * NOT called by any command in this PR (additive — Phase 3 wires it into `init`).
  */
@@ -676,6 +691,11 @@ export function buildHubManagedUnit(opts: BuildHubManagedUnitOpts): ManagedUnit 
     systemdDescription: "Parachute hub (serve + supervisor)",
     execStart: [bunPath, opts.cliPath, "serve"],
     env: {
+      // Force loopback on every self-hosted supervised hub. serve.ts defaults
+      // to 0.0.0.0 (container-first); a self-hosted box must NOT bare-serve
+      // all-interfaces. Container path bypasses this builder (Dockerfile pins
+      // its own 0.0.0.0). See the docstring for the full trust-model rationale.
+      PARACHUTE_BIND_HOST: "127.0.0.1",
       // PARACHUTE_HOME captured at install time (design §4.2) — NOT the default.
       PARACHUTE_HOME: opts.parachuteHome,
       PORT: String(port),
