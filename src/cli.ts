@@ -14,6 +14,7 @@ import { exposePublic, exposeTailnet } from "./commands/expose.ts";
 import { init } from "./commands/init.ts";
 import { install } from "./commands/install.ts";
 import { logs, restart, start, stop } from "./commands/lifecycle.ts";
+import { cutoverToSupervised, teardownHubUnit } from "./commands/migrate-cutover.ts";
 import { migrate } from "./commands/migrate.ts";
 import { serve } from "./commands/serve.ts";
 import { setup } from "./commands/setup.ts";
@@ -668,8 +669,12 @@ async function main(argv: string[]): Promise<number> {
       // `supervisor: {}` opts into the Phase 3b dual-dispatch: on a box with a
       // hub unit installed, drive the running supervisor; on a legacy detached
       // box (no unit), fall through to the unchanged detached path (design §3.3).
+      // `migrateOffer: { enabled: true }` arms the §7.5 detect-and-offer on the
+      // detached arm (offers the supervised cutover when a prior detached
+      // install is found; never auto-migrates).
       const startOpts = {
         supervisor: {},
+        migrateOffer: { enabled: true },
         ...(hubExtract.hubOrigin ? { hubOrigin: hubExtract.hubOrigin } : {}),
       };
       return await start(hubExtract.rest[0], startOpts);
@@ -680,7 +685,7 @@ async function main(argv: string[]): Promise<number> {
         console.log(stopHelp());
         return 0;
       }
-      return await stop(rest[0], { supervisor: {} });
+      return await stop(rest[0], { supervisor: {}, migrateOffer: { enabled: true } });
     }
 
     case "restart": {
@@ -688,7 +693,7 @@ async function main(argv: string[]): Promise<number> {
         console.log(restartHelp());
         return 0;
       }
-      return await restart(rest[0], { supervisor: {} });
+      return await restart(rest[0], { supervisor: {}, migrateOffer: { enabled: true } });
     }
 
     case "upgrade": {
@@ -762,6 +767,33 @@ async function main(argv: string[]): Promise<number> {
         console.log(migrateHelp());
         return 0;
       }
+      // §7.4 teardown — remove the hub unit (the cutover rollback path).
+      if (rest.includes("--teardown")) {
+        const teardownUnknown = rest.find((a) => a !== "--teardown");
+        if (teardownUnknown !== undefined) {
+          console.error(`parachute migrate: unknown argument "${teardownUnknown}"`);
+          console.error("usage: parachute migrate --teardown");
+          return 1;
+        }
+        teardownHubUnit();
+        return 0;
+      }
+      // §7.1 detached→supervised cutover. Opt-in surface (the archive sweep
+      // below stays the bare `migrate` default — the cutover is destructive-
+      // adjacent and must be asked for, not implicit).
+      if (rest.includes("--to-supervised")) {
+        const cutoverUnknown = rest.find((a) => a !== "--to-supervised");
+        if (cutoverUnknown !== undefined) {
+          console.error(`parachute migrate: unknown argument "${cutoverUnknown}"`);
+          console.error("usage: parachute migrate --to-supervised");
+          return 1;
+        }
+        const result = await cutoverToSupervised();
+        for (const line of result.messages) console.log(line);
+        // "already-migrated" / "migrated" are success; every other outcome is a
+        // recoverable failure that should exit non-zero so scripts can retry.
+        return result.outcome === "migrated" || result.outcome === "already-migrated" ? 0 : 1;
+      }
       const dryRun = rest.includes("--dry-run");
       const list = rest.includes("--list");
       const yes = rest.includes("--yes") || rest.includes("-y");
@@ -770,7 +802,9 @@ async function main(argv: string[]): Promise<number> {
       );
       if (unknown !== undefined) {
         console.error(`parachute migrate: unknown argument "${unknown}"`);
-        console.error("usage: parachute migrate [--list] [--dry-run] [--yes]");
+        console.error(
+          "usage: parachute migrate [--list] [--dry-run] [--yes] [--to-supervised] [--teardown]",
+        );
         return 1;
       }
       return await migrate({ dryRun, list, yes });
