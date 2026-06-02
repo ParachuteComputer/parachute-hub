@@ -77,12 +77,21 @@ export const defaultAlive: AliveFn = (pid: number) => {
 };
 
 /**
- * Three-state rather than two so we don't lie about services we can't see:
+ * Three-state, kept for legacy detection only.
+ *
+ * Phase 5b retired the detached spawners that wrote per-service pidfiles, so in
+ * the steady (supervised) state no module has a pidfile and module run-state
+ * comes from the supervisor (`supervisor.list()`), not from here. This reader
+ * survives so the `migrate` detector (`hasPriorDetachedInstall`) can still
+ * recognize a pre-cutover box, and so `serve` / `parachute stop hub` can find a
+ * serve-mode hub's own `hub` pidfile.
  *
  * - `running` — PID file present, `kill(pid, 0)` succeeds.
  * - `stopped` — PID file present, process gone (stale pidfile, or cleanly shut down).
- * - `unknown` — no PID file. Service may be externally managed (user ran
- *   `parachute-vault serve` directly, or legacy launchd-era). Don't claim stopped.
+ * - `unknown` — no PID file. In a supervised install this is the normal case
+ *   for modules (no pidfile is written); the "externally-managed / legacy
+ *   launchd-era" reading is now purely about detecting a *prior detached*
+ *   install, not a live signal. Don't claim stopped.
  */
 export interface ProcessState {
   status: "running" | "stopped" | "unknown";

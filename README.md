@@ -2,7 +2,7 @@
 
 `@openparachute/hub` — the local hub for the [Parachute](https://parachute.computer) ecosystem. The `parachute` binary is one of its surfaces.
 
-The hub coordinates the modules running on your machine: it installs them, runs them as background processes, exposes them over Tailscale, serves the discovery document at `/.well-known/parachute.json`, and (soon) issues OAuth tokens. Each module (vault, app, scribe, …) stays a standalone package; the hub stitches them together.
+The hub coordinates the modules running on your machine: it installs them, supervises them as child processes (the hub itself runs under your platform's process manager — launchd / systemd / the container runtime), exposes them over Tailscale, serves the discovery document at `/.well-known/parachute.json`, and (soon) issues OAuth tokens. Each module (vault, app, scribe, …) stays a standalone package; the hub stitches them together.
 
 > Previously published as `@openparachute/cli`. Renamed 2026-04-26 to better reflect the role — see [parachute-patterns/hub-as-issuer](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/hub-as-issuer.md). The `parachute` binary name is unchanged.
 
@@ -75,7 +75,9 @@ parachute init
 
 `parachute init` is idempotent — every re-run is safe. End to end it:
 
-1. **Starts the hub** if it isn't already running (port `1939`).
+1. **Installs and starts the hub** as a managed unit (launchd on a Mac,
+   systemd on a Linux VM) on port `1939`, so it survives reboots. Re-runs are
+   no-ops if the unit is already up.
 2. **Offers to expose it** so you can reach the wizard from other devices. In a
    terminal you pick: stay loopback-only, your **tailnet** (`tailscale serve` —
    private to your own Tailscale devices), or a **Cloudflare Tunnel** (public
@@ -108,9 +110,9 @@ UI. Verify the stack any time:
 
 ```sh
 parachute status
-# SERVICE          PORT  VERSION  PROCESS  PID    UPTIME  HEALTH  LATENCY
-# parachute-hub    1939  0.5.14   running  12344  20s     ok      1ms
-# parachute-vault  1940  0.4.5    running  12345  12s     ok      2ms
+# SERVICE          PORT  VERSION  STATE   PID    UPTIME  LATENCY  SOURCE
+# parachute-hub    1939  0.5.14   active  12344  20s     1ms      managed unit (launchd)
+# parachute-vault  1940  0.4.5    active  12345  12s     2ms      npm (0.4.5)
 ```
 
 Vault is up on `127.0.0.1:1940`; Claude Code picks up the MCP on your next
@@ -144,7 +146,7 @@ still work and are additive:
 ```sh
 parachute install vault   # install + register + create first vault + start one module
 parachute setup           # older interactive multi-pick: survey + install vault/notes/scribe
-parachute start vault     # PID + logs tracked under ~/.parachute/vault/
+parachute start vault     # start one module via the running hub's supervisor
 ```
 
 ### Expose across your tailnet
@@ -180,35 +182,77 @@ deleted or reset from the Users page — it changes its own password at
 
 ## Service lifecycle
 
-`parachute start`, `stop`, `restart`, and `logs` manage services as background processes — no launchd, no manual `bun serve`, no hunting for PIDs.
+Parachute runs **one runtime everywhere**: `parachute serve` — the hub in the
+foreground with an in-process supervisor that runs each module as an attached
+child, multiplexes their logs, and restarts crashed ones. That `serve` process
+runs under your platform's own process manager — **launchd** on a Mac,
+**systemd** on a Linux VM, the **container runtime** on Render / Fly — so the
+hub (and every module under it) survives reboots and crashes without you
+SSHing back in.
+
+`parachute init` installs and starts that managed hub unit for you; the
+lifecycle verbs then drive the running supervisor:
 
 ```sh
-parachute start               # start every installed service
-parachute start vault         # just one
-parachute stop                # SIGTERM, then SIGKILL after 10s if stuck
-parachute restart vault       # stop + start
+parachute start               # ensure the hub unit is up (boots every module)
+parachute start vault         # start one module via the running supervisor
+parachute stop vault          # stop one module via the supervisor
+parachute stop                # stop the hub unit (children stop with it)
+parachute restart vault       # restart one module via the supervisor
+parachute restart             # restart the hub unit (re-boots every module)
 parachute logs vault          # last 200 lines
 parachute logs vault -f       # tail (like `tail -f`)
 ```
 
-State lives under `~/.parachute/<service>/`:
+How the verbs map to the model:
 
-- `run/<service>.pid` — child PID; `parachute status` uses this to report running/stopped + uptime
-- `logs/<service>.log` — stdout + stderr (appended)
+- **`start` / `stop` / `restart <svc>`** are clients of the running hub. They
+  ensure the hub unit is up, then call its supervisor over a loopback
+  module-ops API (authenticated with your operator token) to start / stop /
+  restart that one module. There's no per-module daemon to track — the
+  supervisor owns module processes.
+- **`start` (no service)** ensures the hub unit is up; the hub boots every
+  installed module on start, so this brings the whole stack up.
+- **`stop` (no service)** stops the **hub unit** through the platform manager
+  (`launchctl bootout` / `systemctl stop`); the modules are attached children
+  and stop with it.
+- **`restart` (no service)** restarts the **hub unit** (`launchctl kickstart
+  -k` / `systemctl restart`), which re-boots every module — it is *not* a
+  fan-out of per-module restarts.
 
-`parachute start` is idempotent: if the service is already running, it's a no-op. Stale PID files (process died without cleanup) are cleared on the next start. Services whose PID file is absent are treated as *unknown* — status still probes their port, so externally-managed services (e.g. you ran `parachute-vault serve` directly) aren't misreported as stopped.
+`parachute status` shows a hub row even with zero modules installed — that row
+is derived from the platform manager (`launchctl print` / `systemctl
+is-active`, or "container runtime (managed)" on Render / Fly), since the
+supervisor runs the modules but the manager runs the hub.
 
-### Migrating from launchd (pre-launch beta)
+### No process manager installed yet?
 
-If you previously ran vault under launchd, switch to `parachute start`:
+If you've never run `parachute init` (or you're on a legacy install that used
+the old detached-daemon model), the lifecycle verbs will prompt you to run
+`parachute migrate --to-supervised`, which installs the hub unit and moves you
+onto the supervised model. See **Migrating a legacy install** below.
+
+On a host with no process manager at all (a bare container, an init-less
+image), there's no unit to install — run `parachute serve` in the foreground
+instead (this is exactly what the container `CMD` does).
+
+### Migrating a legacy install
+
+Earlier Parachute releases ran each service as an independent detached daemon
+(its own pidfile + log file under `~/.parachute/<service>/`), with no
+supervisor and no reboot survival. To move an existing box onto the supervised
+model:
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/computer.parachute.vault.plist
-rm ~/Library/LaunchAgents/computer.parachute.vault.plist
-parachute start vault
+parachute migrate --to-supervised   # install + start the hub unit, cut over
 ```
 
-An at-login auto-start mode (`parachute start --boot`) is on the post-launch roadmap.
+The cutover is idempotent and re-runnable. It writes the platform unit, stops
+the old detached processes, verifies the canonical ports are free, then starts
+the hub unit and confirms the hub is healthy. To roll it back, `parachute
+migrate --teardown` removes the unit (run that *before* `bun remove -g
+@openparachute/hub` so a removed package doesn't leave a unit pointing at a
+deleted binary).
 
 ### Migrating from pre-CLI installs
 
@@ -225,17 +269,21 @@ Anything swept goes to `~/.parachute/.archive-<YYYY-MM-DD>/` with its original n
 ## Two supported layers (plus an exploratory third)
 
 Each additive; each can be turned off without affecting the layer below.
+Exposure is decoupled from the hub's own lifecycle: `expose` makes the
+already-running hub reachable on a network layer, and `expose <layer> off`
+tears down only that exposure — the hub keeps running as its managed unit
+either way.
 
-- **Local** — services on loopback. Zero config. Browsers treat `localhost` as a secure context, so OAuth, PKCE, and Web Crypto all just work out of the box.
+- **Local** — the hub on loopback. Zero config. Browsers treat `localhost` as a secure context, so OAuth, PKCE, and Web Crypto all just work out of the box.
 - **Tailnet** — `parachute expose tailnet` wraps `tailscale serve` for every registered service. HTTPS via Tailscale's MagicDNS cert. Only machines on your tailnet can reach the URL. **This is the documented shape for the hub today.** Tailnet is already authenticated at the network layer, every user's tailnet is their own, and the OAuth + module access work happening in the hub is being designed against this shape first.
 
 ### Public exposure (exploratory)
 
 `parachute expose public` exists for early testers. It routes each handler through `tailscale funnel` (or, with `--cloudflare`, a named Cloudflare tunnel) so the same URLs become reachable from the public internet. The code path is live and the flag still works, but the public-internet posture (DNS, cross-internet OAuth, Funnel quirks) hasn't been hardened the way tailnet has — expect rough edges.
 
-When the hub's OAuth issuer + per-module scope enforcement land, public will re-enter the documented narrative as "now safe." Until then, prefer tailnet.
+When the hub's OAuth issuer + per-module scope enforcement land, public will re-enter the documented narrative as "now safe." Until then, prefer tailnet. (If you route a public layer through Cloudflare, note their bot-protection / Browser Integrity Check can interfere with OAuth and MCP clients — see the caveat on [parachute.computer](https://parachute.computer).)
 
-Under the hood, tailnet mode uses `tailscale serve` and public mode uses `tailscale funnel`; both write into the same node-level serve config. The CLI records which layer is live so that `expose <other-layer> off` is a no-op rather than a surprise teardown of the active layer.
+Under the hood, tailnet mode uses `tailscale serve` and public mode uses `tailscale funnel`; both write into the same node-level serve config. The CLI records which layer is live so that `expose <other-layer> off` is a no-op rather than a surprise teardown of the active layer. `expose off` only ever tears down exposure — it never stops the hub (the platform manager owns the hub's lifecycle now).
 
 ## Path-routing (and why)
 
@@ -251,7 +299,9 @@ https://parachute.<tailnet>.ts.net/.well-known/parachute.json    ← discovery
 
 The hub page fetches the discovery doc at load, then each service's `/.parachute/info` endpoint for display name, tagline, and icon. Adding a new service is zero CLI code — drop in its manifest entry and the hub picks it up.
 
-Under the hood, `/` and `/.well-known/parachute.json` are proxied by a tiny internal HTTP server (`parachute-hub`) that `parachute expose` spawns on the loopback interface. Tailscale's file-serve mode is sandbox-restricted on macOS, so a localhost proxy is the portable shape. The hub process is stopped automatically when the last exposure layer is torn down; `parachute status` lists it under `(internal)`.
+Under the hood, `/` and `/.well-known/parachute.json` are served by the hub
+process on the loopback interface — the same `parachute serve` process the
+platform manager keeps running. Tailscale's file-serve mode is sandbox-restricted on macOS, so a localhost proxy is the portable shape. The hub is a persistent managed unit: it runs whether or not any exposure layer is up, so `expose tailnet off` / `expose public off` tears down only the *exposure*, leaving the hub serving on loopback. `parachute status` lists the hub row (manager-derived) at the top.
 
 The `/.well-known/parachute.json` document is an always-present descriptor — flat `services[]` array that the hub iterates, plus top-level keys for legacy clients:
 
@@ -402,19 +452,21 @@ Public-internet exposure (`parachute expose public`) is exploratory — see "Pub
 Run `parachute --help` for the top-level list, and `parachute <subcommand> --help` for details on any individual command.
 
 ```
-parachute init                    fresh-install front door: start hub, offer expose,
-                                  install vault module, open the setup wizard
+parachute init                    fresh-install front door: install + start the
+                                  managed hub, offer expose, install vault, wizard
 parachute setup-wizard --hub-url <url>
                                   in-terminal mirror of /admin/setup (Account/Vault/Expose)
 parachute setup                   older interactive multi-pick service installer
 parachute install <service>       install and register a service
-parachute status                  show installed services, process state, health
-parachute start   [service]       start services in the background
-parachute stop    [service]       stop services (SIGTERM → 10s → SIGKILL)
-parachute restart [service]       stop + start
+parachute status                  show installed services, run state, health
+parachute start   [service]       start a module via the supervisor (or ensure the hub is up)
+parachute stop    [service]       stop a module via the supervisor (or the hub unit)
+parachute restart [service]       restart a module via the supervisor (or the hub unit)
+parachute serve                   run the hub + supervisor foregrounded (the runtime)
 parachute logs <service> [-f]     print/tail service logs
 parachute expose tailnet [off]    HTTPS across your tailnet (supported)
 parachute expose public  [off]    HTTPS on the public internet (exploratory)
+parachute migrate --to-supervised move a legacy detached install to the managed hub
 parachute migrate [--dry-run]     archive legacy files at ecosystem root
 parachute vault <args...>         dispatch to parachute-vault
 ```

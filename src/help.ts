@@ -16,15 +16,16 @@ Usage:
   parachute setup                   interactive walk-through: install services + configure
   parachute install <service>       install and register a service
                                     services: ${services}
-  parachute status                  show installed services, process state, health
-  parachute start   [service]       start all services (or one) in the background
-  parachute stop    [service]       stop all services (or one) — SIGTERM then SIGKILL
-  parachute restart [service]       stop + start
+  parachute status                  show installed services, run state, health
+  parachute start   [service]       start a module via the supervisor (or ensure the hub is up)
+  parachute stop    [service]       stop a module via the supervisor (or stop the hub unit)
+  parachute restart [service]       restart a module via the supervisor (or restart the hub unit)
   parachute upgrade [service]       pull / re-install + restart (skips if no changes)
   parachute logs <service> [-f]     print service logs; -f to tail
   parachute expose tailnet [off]    HTTPS across your tailnet (supported)
   parachute expose public  [off]    HTTPS on the public internet (exploratory)
-  parachute serve                   run hub HTTP server foregrounded (for containers)
+  parachute serve                   run the hub + supervisor foregrounded (the runtime)
+  parachute migrate --to-supervised move a legacy detached install to the managed hub
   parachute migrate [--dry-run]     archive legacy files at ecosystem root
   parachute auth <cmd>              identity (set password, manage 2FA)
   parachute vault <args...>         vault-specific ops (tokens, 2fa, config, init,
@@ -123,7 +124,9 @@ What it does:
   get you to that wizard.
 
   Idempotent — every re-run is safe:
-    1. If the hub isn't running, start it.
+    1. Install + start the hub as a managed unit (launchd on a Mac,
+       systemd on a Linux VM) so it survives reboots; no-op if it's
+       already up.
     2. If the hub isn't already exposed, in a terminal, offer to set up
        exposure (Tailscale Funnel, Cloudflare Tunnel, or stay loopback).
        The default highlights "no thanks" on laptops and Cloudflare on
@@ -273,10 +276,16 @@ Usage:
   parachute status
 
 What it does:
-  Reads ~/.parachute/services.json. For each registered service:
-    - checks PID file at ~/.parachute/<svc>/run/<svc>.pid
-    - probes http://localhost:<port><health> (skipped for known-stopped processes)
+  Reads ~/.parachute/services.json. For each registered module:
+    - reads its run state from the running hub's supervisor (supervisor.list())
+    - probes http://localhost:<port><health> (skipped for known-stopped modules)
     - classifies the install source as bun-linked (local checkout) or npm
+
+  The hub gets its own row, derived from the platform process manager
+  (launchd \`launchctl print\` / systemd \`systemctl is-active\`, or
+  "container runtime (managed)" on Render / Fly) — the supervisor runs the
+  modules, but the manager runs the hub. The hub row appears even with zero
+  modules installed.
 
   The STATE column rolls process state + probe result into one of four
   canonical labels (per parachute-patterns/patterns/design-system.md §6):
@@ -293,10 +302,10 @@ What it does:
   HEALTH (ok / down / http <code>). Workstream F collapsed them onto the
   single STATE column the SPA + well-known doc also speak.
 
-  Stopped services render as STATE=inactive and don't count toward the
+  Stopped modules render as STATE=inactive and don't count toward the
   exit code — they're an expected state after fresh install before
-  \`parachute start\`. Running or externally-managed services that fail
-  health checks render as STATE=failing and exit 1.
+  \`parachute start\`. Supervised modules that fail health checks render
+  as STATE=failing and exit 1.
 
   A "STALE: services.json cached … live package.json …" continuation line
   appears under a row when a bun-linked service has been rebuilt but the
@@ -409,39 +418,41 @@ Cloudflare tunnel requirements (--cloudflare):
 }
 
 export function startHelp(): string {
-  return `parachute start — spawn services in the background
+  return `parachute start — start a module via the running hub's supervisor
 
 Usage:
-  parachute start                   start every installed service
-  parachute start <service>         start just that one
-  parachute start hub               start the internal hub (port 1939)
+  parachute start                   ensure the hub is up (boots every module)
+  parachute start <service>         start just that one module
+  parachute start hub               ensure the hub unit is up
 
 What it does:
-  For each target service, spawns its start command detached, redirects
-  stdout+stderr to ~/.parachute/<service>/logs/<service>.log, and records
-  the child PID at ~/.parachute/<service>/run/<service>.pid.
+  \`parachute serve\` is the one runtime — the hub foreground with an
+  in-process supervisor that runs each module as an attached child. These
+  verbs are clients of that running hub:
 
-  Idempotent: if the service is already running, no-op.
-  If a stale PID file exists (process died without cleanup), it's cleared
-  and the service starts fresh.
+  - \`parachute start <service>\` ensures the hub unit is up, then asks its
+    supervisor to start that one module (over the loopback module-ops API,
+    authenticated with your operator token). No per-module daemon is
+    spawned — the supervisor owns the module process.
+  - \`parachute start\` (no service) ensures the hub unit is up. The hub
+    boots every installed module on start, so this brings the whole stack
+    up. On a box with no hub unit yet, it offers to run
+    \`parachute migrate --to-supervised\` (which installs + starts the unit).
+  - \`parachute start hub\` is the same "ensure the hub unit is up."
 
-  \`parachute start hub\` brings up the internal hub directly (normally
-  spawned implicitly by \`parachute expose\`). Useful when restarting a
-  hub that crashed without an active expose layer.
+  Idempotent: starting an already-running module is a no-op.
 
 Flags:
-  --hub-origin <url>    override PARACHUTE_HUB_ORIGIN passed to services
+  --hub-origin <url>    override the hub origin used as the operator token's
+                        \`iss\` validator on the loopback module-ops call
                         (default: current expose-state hub origin, else loopback).
-                        For \`start hub\`, also doubles as the hub's --issuer.
 
 Examples:
   parachute start                   bring everything up
-  parachute start vault             just vault
-  parachute start hub               just the internal hub
+  parachute start vault             just vault, via the supervisor
   parachute logs vault              watch what just started
 
-Start commands by service:
-  hub       bun <cli>/hub-server.ts --port <picked> ...
+Module start commands (run by the supervisor under \`serve\`):
   vault     parachute-vault serve
   scribe    parachute-scribe serve
   app       parachute-app serve
@@ -451,39 +462,45 @@ Start commands by service:
 }
 
 export function stopHelp(): string {
-  return `parachute stop — stop running services cleanly
+  return `parachute stop — stop a module (or the hub) cleanly
 
 Usage:
-  parachute stop                    stop every installed service
-  parachute stop <service>          stop just that one
-  parachute stop hub                stop the internal hub
+  parachute stop                    stop the hub unit (modules stop with it)
+  parachute stop <service>          stop just that one module
+  parachute stop hub                stop the hub unit
 
 What it does:
-  Sends SIGTERM, waits up to 10s for a clean exit, then escalates to
-  SIGKILL if the process is still alive. Removes the PID file on success.
-
-  No-op if the service wasn't running.
-
-  Bare \`parachute stop\` (no service) does NOT stop the hub — that's
-  managed by the active expose layer (or \`parachute stop hub\` directly).
+  - \`parachute stop <service>\` asks the running hub's supervisor to stop
+    that one module (SIGTERM to the module's process group, then SIGKILL if
+    it doesn't exit). No-op if it wasn't running.
+  - \`parachute stop\` (no service) and \`parachute stop hub\` stop the hub
+    UNIT through the platform process manager (\`launchctl bootout\` /
+    \`systemctl stop\`) — never a raw PID signal, which launchd's KeepAlive
+    would just undo. Modules are attached children and stop with the hub.
 
 Examples:
-  parachute stop                    stop everything before sleep
-  parachute stop vault              just vault
-  parachute stop hub                just the internal hub
+  parachute stop vault              just vault, via the supervisor
+  parachute stop                    stop the whole stack (the hub unit)
 `;
 }
 
 export function restartHelp(): string {
-  return `parachute restart — stop then start
+  return `parachute restart — restart a module (or the hub)
 
 Usage:
-  parachute restart                 restart every installed service
-  parachute restart <service>       restart just that one
-  parachute restart hub             restart the internal hub
+  parachute restart                 restart the hub unit (re-boots every module)
+  parachute restart <service>       restart just that one module
+  parachute restart hub             restart the hub unit
 
 What it does:
-  Equivalent to \`parachute stop <svc> && parachute start <svc>\`.
+  - \`parachute restart <service>\` asks the running hub's supervisor to
+    restart that one module. If the module isn't currently supervised
+    (e.g. it crashed out of its restart budget), this falls through to a
+    fresh \`start\` so the verb is total over module state.
+  - \`parachute restart\` (no service) and \`parachute restart hub\` restart
+    the hub UNIT via the platform manager (\`launchctl kickstart -k\` /
+    \`systemctl restart\`), which re-boots every module — it is NOT a
+    fan-out of per-module restarts.
 `;
 }
 
@@ -523,6 +540,13 @@ What it does:
   package.json version unchanged after bun add -g), the restart is skipped.
   Re-running on an up-to-date install is a fast no-op.
 
+  The "restart" step matches the supervised model: upgrading a MODULE
+  restarts it via the running hub's supervisor; \`parachute upgrade hub\`
+  rewrites the binary on disk, then restarts the hub UNIT through the
+  platform manager (\`launchctl kickstart -k\` / \`systemctl restart\`), which
+  re-boots every module onto the new code. From the admin SPA (the no-CLI
+  Render / Fly path) the same hub-upgrade runs via POST /api/hub/upgrade.
+
 Channel detection (hub#332):
   Pre-1.0 governance ships two channels — \`@rc\` (the development chain) and
   \`@latest\` (explicitly-promoted stable). \`parachute upgrade\` reads the
@@ -556,16 +580,23 @@ If no log file exists yet, prints a hint to \`parachute start <service>\`.
 }
 
 export function serveHelp(): string {
-  return `parachute serve — run the hub HTTP server foregrounded
+  return `parachute serve — run the hub + supervisor foregrounded (the runtime)
 
 Usage:
   parachute serve
 
-The container shape. The on-box CLI flow (\`parachute expose\`) spawns the
-hub-server detached and tracks it via pidfile; \`parachute serve\` is the
-inverse — the hub IS the foreground process, lives as long as its
-supervisor wants it to, and exits on signal. Built for Docker / Render /
-systemd, but works fine for a foregrounded local debug too.
+This is the one runtime everywhere. The hub IS the foreground process: it
+runs the HTTP server on port 1939 AND an in-process supervisor that spawns
+every installed module as an attached child, multiplexes their logs into
+its own stdout, and crash-restarts them on a budget. It runs until it gets
+a signal, then SIGTERMs its children and exits.
+
+You don't normally invoke \`serve\` by hand — \`parachute init\` (or
+\`parachute migrate --to-supervised\`) installs it as a managed unit so your
+platform's process manager keeps it alive across crashes and reboots:
+launchd on a Mac, systemd on a Linux VM, the container runtime's CMD on
+Render / Fly. Run it directly only for a foregrounded local debug, or on an
+init-less host that can't host a unit.
 
 Environment:
   PORT                              bind port (default 1939). Render injects
