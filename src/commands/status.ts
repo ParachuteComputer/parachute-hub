@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
-import { HUB_SVC, readHubPort } from "../hub-control.ts";
+import { readHubPort } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
   HUB_UNIT_DEFAULT_PORT,
@@ -8,7 +8,6 @@ import {
   type HubUnitState,
   type HubUnitStateResult,
   defaultHubUnitDeps,
-  isHubUnitInstalled,
   queryHubUnitState as queryHubUnitStateImpl,
 } from "../hub-unit.ts";
 import {
@@ -25,20 +24,13 @@ import {
   OperatorTokenExpiredError,
   fetchModuleStates as fetchModuleStatesImpl,
 } from "../module-ops-client.ts";
-import { type AliveFn, defaultAlive, formatUptime, processState } from "../process-state.ts";
 import { canonicalPortForManifest, getSpec, shortNameForManifest } from "../service-spec.ts";
 import { type ServiceEntry, readManifest } from "../services-manifest.ts";
 
-export type FetchFn = (url: string, init?: RequestInit) => Promise<Response>;
-
 export interface StatusOpts {
   manifestPath?: string;
-  fetchImpl?: FetchFn;
   print?: (line: string) => void;
-  timeoutMs?: number;
   configDir?: string;
-  alive?: AliveFn;
-  now?: () => Date;
   /**
    * Test seam for install-source detection. Production reads the filesystem
    * + shells out to git; tests inject stubs so each case (npm / bun-linked /
@@ -53,32 +45,19 @@ export interface StatusOpts {
    */
   hubSrcDir?: string;
   /**
-   * Phase 3c supervisor-path seams (design §6.4). When a hub UNIT is installed
-   * (launchd/systemd/container — detected via {@link isHubUnitInstalled}),
+   * Supervisor-path seams (design §6.4) — the ONLY runtime as of Phase 5b.
    * `status` reads the hub row from the PLATFORM MANAGER (`queryHubUnitState`)
    * + `/health`, and the module rows from the RUNNING supervisor (`GET
-   * /api/modules` via the operator-token→Bearer path). On a legacy detached box
-   * (no hub unit) it keeps the EXACT pidfile/`processState` behavior, unchanged
-   * until Phase 5 retires it.
+   * /api/modules` via the operator-token→Bearer path). The detached
+   * pidfile/`processState` arm was retired in Phase 5b.
    *
-   * Everything here is injectable so tests force either arm without a real
+   * Everything here is injectable so tests drive it without a real
    * launchd/systemd/socket/HTTP call. Production wires the real machinery; the
    * read paths are bounded + degrade gracefully on every failure (no manager,
    * hub down, no token, API error) so `status` never hangs or crashes.
    */
   supervisor?: {
-    /**
-     * Is a hub unit installed (the dual-dispatch discriminant)? Production uses
-     * `isHubUnitInstalled(hubUnitDeps)`. Tests set this `true`/`false` directly
-     * to pick the branch deterministically. When set, it wins over the
-     * `hubUnitDeps`-derived detection.
-     *
-     * Defaulting: when the caller OMITS the `supervisor` block entirely (every
-     * existing status test), the arm defaults to detached — so those tests stay
-     * deterministic regardless of whether the test host has a real hub unit.
-     */
-    unitInstalled?: boolean;
-    /** Deps for `isHubUnitInstalled` + `queryHubUnitState` + the `/health` probe. */
+    /** Deps for `queryHubUnitState` + the `/health` probe. */
     hubUnitDeps?: HubUnitDeps;
     /** Query the platform manager for the hub unit's run-state (§6.4 hub row). */
     queryHubUnitState?: (deps: HubUnitDeps) => HubUnitStateResult;
@@ -100,54 +79,6 @@ export interface StatusOpts {
     /** Loopback hub base URL override (default derives from the hub port). */
     baseUrl?: string;
   };
-}
-
-export interface ProbeResult {
-  entry: ServiceEntry;
-  healthy: boolean;
-  statusCode?: number;
-  error?: string;
-  latencyMs: number;
-}
-
-export async function probe(
-  entry: ServiceEntry,
-  fetchImpl: FetchFn,
-  timeoutMs: number,
-): Promise<ProbeResult> {
-  const url = `http://localhost:${entry.port}${entry.health}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const start = performance.now();
-  try {
-    const res = await fetchImpl(url, { signal: controller.signal });
-    const latencyMs = Math.round(performance.now() - start);
-    // A 401 is the service replying "I'm up but this endpoint requires auth"
-    // — that's strictly healthy from a liveness perspective. Vault's
-    // canonical health path `/vault/<name>/health` is auth-gated; without
-    // this carve-out, `parachute status` shows vault as "failing" on every
-    // fresh install (first impression UX disaster despite vault being fine).
-    // 5xx → unhealthy; 200-class → healthy; 401 → healthy + auth-gated.
-    // Other 4xx (404 / 400 / etc.) still count as unhealthy — those mean
-    // the configured health path doesn't exist or is shaped wrong.
-    const healthy = res.ok || res.status === 401;
-    return {
-      entry,
-      healthy,
-      statusCode: res.status,
-      latencyMs,
-    };
-  } catch (err) {
-    const latencyMs = Math.round(performance.now() - start);
-    return {
-      entry,
-      healthy: false,
-      error: err instanceof Error ? err.message : String(err),
-      latencyMs,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 function formatRow(cells: string[], widths: number[]): string {
@@ -247,15 +178,11 @@ function urlForEntry(entry: ServiceEntry, short: string | undefined): string | u
 }
 
 /**
- * The MANIFEST-derived portion of a module row — identical regardless of
- * whether the row's run-state comes from a pidfile (detached arm) or the
- * supervisor (Phase 3c). Extracting it keeps the two arms in lockstep on
- * port/version/URL/drift/source/stale and the persisted `lastStartError` note,
- * so the only per-arm difference is the run-state fields (STATE / PID / UPTIME).
+ * The MANIFEST-derived portion of a module row — port/version/URL/drift/source/
+ * stale and the persisted `lastStartError` note. The supervisor read fills in
+ * the run-state fields (STATE / PID / UPTIME) on top.
  *
- * Pure over the manifest entry + install-source deps; no process / network
- * read. Shared so the detached arm stays behavior-identical (existing tests
- * guard it) while the supervisor arm reuses the exact same derivation.
+ * Pure over the manifest entry + install-source deps; no process / network read.
  */
 interface ManifestRowBase {
   short: string | undefined;
@@ -310,197 +237,32 @@ function manifestRowBase(
   return { short, url, driftWarning, sourceLabel, staleNote, manifestStartErrorNote };
 }
 
-function hubRow(
-  configDir: string,
-  alive: AliveFn,
-  nowDate: Date,
-  hubSrcDir: string,
-  installSourceDeps: DetectInstallSourceDeps,
-): StatusRow | undefined {
-  const proc = processState(HUB_SVC, configDir, alive);
-  if (proc.status === "unknown") return undefined;
-  const port = readHubPort(configDir);
-  const portLabel = port !== undefined ? String(port) : "-";
-  // Hub doesn't self-probe (it'd be probing itself over loopback). Treat
-  // "running pidfile" as `active` and "stopped" as `inactive` — the same
-  // STATE rollup every other row uses, just without the probe input.
-  const stateLabel: StateLabel = proc.status === "running" ? "active" : "inactive";
-  const pidLabel = proc.status === "running" && proc.pid !== undefined ? String(proc.pid) : "-";
-  const uptimeLabel =
-    proc.status === "running" && proc.startedAt ? formatUptime(proc.startedAt, nowDate) : "-";
-  const source = detectHubInstallSource(hubSrcDir, installSourceDeps);
-  return {
-    service: "parachute-hub (internal)",
-    port: portLabel,
-    version: source.livePackageVersion ?? "-",
-    stateLabel,
-    pidLabel,
-    uptimeLabel,
-    healthDetail: "-",
-    latencyLabel: "-",
-    sourceLabel: formatInstallSourceLabel(source),
-    url: port !== undefined ? `http://127.0.0.1:${port}` : undefined,
-    healthy: true,
-    skipped: true,
-  };
-}
-
 export async function status(opts: StatusOpts = {}): Promise<number> {
   const manifestPath = opts.manifestPath ?? SERVICES_MANIFEST_PATH;
-  const fetchImpl = opts.fetchImpl ?? fetch;
   const print = opts.print ?? ((line) => console.log(line));
-  const timeoutMs = opts.timeoutMs ?? 1500;
   const configDir = opts.configDir ?? CONFIG_DIR;
-  const alive = opts.alive ?? defaultAlive;
-  const now = opts.now ?? (() => new Date());
   const installSourceDeps = opts.installSourceDeps ?? {};
   const hubSrcDir = opts.hubSrcDir ?? import.meta.dir;
 
   const manifest = readManifest(manifestPath);
 
-  // Phase 3c dual-dispatch (design §6.4). On a box with a hub unit installed
-  // (launchd/systemd/container), read the hub row from the platform manager +
-  // `/health` and the module rows from the RUNNING supervisor; otherwise fall
-  // through to the unchanged detached arm below. Phase 5 deletes the else-arm —
-  // keep this a clean top-level branch so that deletion is a one-liner.
-  //
-  // Branched BEFORE the detached arm's empty-manifest early return: on a
-  // unit-managed box the hub row is meaningful even with zero modules installed
-  // (the hub IS running under a unit), so the supervisor arm renders the hub row
-  // + a "no modules" table rather than the detached "No services installed yet."
+  // Supervised path only (Phase 5b — the detached pidfile arm is retired). Read
+  // the hub row from the platform manager + `/health` and the module rows from
+  // the RUNNING supervisor (§6.4). The hub row is meaningful even with zero
+  // modules installed (the hub runs under a unit), so a "no modules" table is
+  // rendered rather than the old "No services installed yet." early return.
   const sup = resolveStatusSupervisor(opts.supervisor);
-  if (sup.unitInstalled) {
-    const rows = await buildSupervisorRows({
-      manifest,
-      configDir,
-      installSourceDeps,
-      hubSrcDir,
-      sup,
-    });
-    renderRows(rows, print);
-    // The supervisor arm marks a row `healthy: false` + `!skipped` only when the
-    // supervisor (or the hub-row manager/health composition) says so (crashed /
-    // failing) — same exit contract as the detached arm: a stopped/inactive row
-    // is expected (skipped, exit 0), a `failing` one exits 1.
-    const anyUnhealthy = rows.some((r) => !r.skipped && !r.healthy);
-    return anyUnhealthy ? 1 : 0;
-  }
-  // --- no-unit detached fallback (unchanged; preserved until Phase 5) ---
-
-  if (manifest.services.length === 0) {
-    print("No services installed yet.");
-    print("Try: parachute install vault");
-    return 0;
-  }
-
-  const nowDate = now();
-
-  /**
-   * Per-row resolution: look up the short name so we can read PID state,
-   * skip the health probe when the process is known-stopped (ECONNREFUSED
-   * noise isn't informative), and report it as running/stopped + uptime.
-   *
-   * Third-party services we don't know about fall back to probing and show
-   * "-" for process columns.
-   */
-  const rows: StatusRow[] = await Promise.all(
-    manifest.services.map(async (entry) => {
-      // MANIFEST-derived fields shared with the supervisor arm (port/version/
-      // URL/drift/source/stale + the persisted lastStartError note).
-      const {
-        short,
-        url,
-        driftWarning,
-        sourceLabel,
-        staleNote,
-        manifestStartErrorNote: startErrorNote,
-      } = manifestRowBase(entry, installSourceDeps);
-      const proc = short ? processState(short, configDir, alive) : undefined;
-
-      const pidLabel =
-        proc?.status === "running" && proc.pid !== undefined ? String(proc.pid) : "-";
-      const uptimeLabel =
-        proc?.status === "running" && proc.startedAt ? formatUptime(proc.startedAt, nowDate) : "-";
-
-      // Only skip probe when we know the process is dead (PID file was
-      // present but kill(pid, 0) failed). "unknown" status (no PID file)
-      // still probes — externally-managed services should report health.
-      if (proc?.status === "stopped") {
-        return {
-          service: entry.name,
-          port: String(entry.port),
-          version: entry.version,
-          // Operator deliberately stopped (or pidfile-but-dead) maps to
-          // `inactive` per design-system.md §6 — same surface as "never
-          // started." No probe is informative when we know the process
-          // is dead.
-          stateLabel: "inactive",
-          pidLabel,
-          uptimeLabel,
-          healthDetail: "-",
-          latencyLabel: "-",
-          sourceLabel,
-          url,
-          healthy: false,
-          skipped: true,
-          driftWarning,
-          staleNote,
-          startErrorNote,
-        };
-      }
-
-      const p = await probe(entry, fetchImpl, timeoutMs);
-      const healthDetail = p.healthy
-        ? "ok"
-        : p.statusCode !== undefined
-          ? `http ${p.statusCode}`
-          : (p.error ?? "down");
-      // STATE rollup per design-system.md §6:
-      //   - probe ok                  → `active`
-      //   - probe failed              → `failing` (the probe ran, so the
-      //                                 process is up enough to answer or
-      //                                 refuse — it's failing, not stopped)
-      //   - no PID file + probe fails → `failing` too (externally-managed
-      //                                 row that's down is still "failing"
-      //                                 from the operator's view)
-      // The `pending` state isn't reachable from `parachute status` today
-      // — pending-OAuth surfaces in the admin SPA, not the CLI. If a
-      // future surface adds it (e.g. supervisor reports `pending-config`
-      // for unconfigured modules), wire it here.
-      const stateLabel: StateLabel = p.healthy ? "active" : "failing";
-      return {
-        service: entry.name,
-        port: String(entry.port),
-        version: entry.version,
-        stateLabel,
-        pidLabel,
-        uptimeLabel,
-        healthDetail,
-        latencyLabel: `${p.latencyMs}ms`,
-        sourceLabel,
-        url,
-        healthy: p.healthy,
-        skipped: false,
-        driftWarning,
-        staleNote,
-        startErrorNote,
-      };
-    }),
-  );
-
-  // Hub is an internal service — not in services.json, but users notice
-  // when it's dead. Only show it if we've seen it run.
-  const hub = hubRow(configDir, alive, nowDate, hubSrcDir, installSourceDeps);
-  if (hub) rows.push(hub);
-
+  const rows = await buildSupervisorRows({
+    manifest,
+    configDir,
+    installSourceDeps,
+    hubSrcDir,
+    sup,
+  });
   renderRows(rows, print);
-
-  /**
-   * Overall exit: non-zero if any *probed* service is unhealthy. A stopped
-   * service is expected ("I haven't started it yet"), not a failure — users
-   * want `parachute status` to return 0 after a fresh install before they
-   * `parachute start`. Health regressions among running services still 1.
-   */
+  // A row is `healthy: false` + `!skipped` only when the supervisor (or the
+  // hub-row manager/health composition) says so (crashed / failing). A
+  // stopped/inactive row is expected (skipped, exit 0); a `failing` one exits 1.
   const anyUnhealthy = rows.some((r) => !r.skipped && !r.healthy);
   return anyUnhealthy ? 1 : 0;
 }
@@ -563,20 +325,18 @@ function renderRows(rows: StatusRow[], print: (line: string) => void): void {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3c supervisor-path status (design §6.4).
+// Supervisor-path status (design §6.4) — the ONLY runtime as of Phase 5b.
 //
-// When a hub unit is installed, `status` reads the hub row from the PLATFORM
-// MANAGER (`queryHubUnitState`) + a `/health` probe, and the module rows from
-// the RUNNING supervisor (`GET /api/modules` via the operator-token→Bearer
-// path). Every read is bounded + degrades gracefully — `status` is a
-// diagnostic and must NEVER hang or crash regardless of hub/manager/token
-// state. The detached arm above is untouched; Phase 5 deletes it.
+// `status` reads the hub row from the PLATFORM MANAGER (`queryHubUnitState`) +
+// a `/health` probe, and the module rows from the RUNNING supervisor (`GET
+// /api/modules` via the operator-token→Bearer path). Every read is bounded +
+// degrades gracefully — `status` is a diagnostic and must NEVER hang or crash
+// regardless of hub/manager/token state. The detached pidfile arm was retired
+// in Phase 5b.
 // ---------------------------------------------------------------------------
 
-/** Resolved Phase 3c supervisor-path seams (see `StatusOpts.supervisor`). */
+/** Resolved supervisor-path seams (see `StatusOpts.supervisor`). */
 interface ResolvedStatusSupervisor {
-  /** Whether a hub unit is installed — the dual-dispatch discriminant. */
-  unitInstalled: boolean;
   hubUnitDeps: HubUnitDeps;
   queryHubUnitState: (deps: HubUnitDeps) => HubUnitStateResult;
   probeHubHealth: (port: number) => Promise<boolean>;
@@ -586,19 +346,12 @@ interface ResolvedStatusSupervisor {
 }
 
 /**
- * Resolve the Phase 3c supervisor-path seams. Mirrors lifecycle.ts's
- * `resolveSupervisor` discriminant policy:
- *   - No `supervisor` block at all (every existing status test) → detached arm,
- *     deterministically (no real-filesystem probe).
- *   - A `supervisor` block present → explicit `unitInstalled` override if set,
- *     else the real `isHubUnitInstalled` probe over the hub-unit deps.
+ * Resolve the supervisor-path seams. Production passes `supervisor: {}` (or
+ * omits it) and gets the real impls; tests inject the seams they want to assert.
  */
 function resolveStatusSupervisor(opts: StatusOpts["supervisor"]): ResolvedStatusSupervisor {
   const hubUnitDeps = opts?.hubUnitDeps ?? defaultHubUnitDeps;
-  const unitInstalled =
-    opts === undefined ? false : (opts.unitInstalled ?? isHubUnitInstalled(hubUnitDeps));
   return {
-    unitInstalled,
     hubUnitDeps,
     queryHubUnitState: opts?.queryHubUnitState ?? queryHubUnitStateImpl,
     probeHubHealth: opts?.probeHubHealth ?? hubUnitDeps.probeHealth,

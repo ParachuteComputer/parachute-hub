@@ -55,7 +55,6 @@ import {
   type HubUnitDeps,
   type HubUnitManagerOpResult,
   defaultHubUnitDeps,
-  isHubUnitInstalled,
   restartHubUnit as restartHubUnitImpl,
 } from "../hub-unit.ts";
 import { ModuleManifestError } from "../module-manifest.ts";
@@ -209,26 +208,20 @@ export interface UpgradeOpts {
    */
   resolveChannelVersion?: (pkg: string, channel: string) => Promise<string | null>;
   /**
-   * Phase 4 supervisor-path seams (design §5). When a hub UNIT is installed
-   * (launchd/systemd/container — detected via `isHubUnitInstalled`), `upgrade
-   * hub` rewrites the binary as usual then RESTARTS THE UNIT via the platform
-   * manager (`restartHubUnit` — systemctl restart / launchctl kickstart -k),
-   * NOT the detached `stopHub`/`ensureHubRunning` restart: the manager tears
-   * down the old hub (children die), starts the new binary, which re-boots
-   * every module from services.json. Module-target restarts on the unit arm
-   * drive the running Supervisor (lifecycle's own Phase-3b dual-dispatch, fed a
-   * `supervisor` block here). The detached arm (`restartFn` → stopHub/
-   * ensureHubRunning) remains the no-unit fallback until Phase 5.
+   * Supervisor-path seams (design §5) — the ONLY runtime as of Phase 5b.
+   * `upgrade hub` rewrites the binary as usual then RESTARTS THE UNIT via the
+   * platform manager (`restartHubUnit` — systemctl restart / launchctl kickstart
+   * -k): the manager tears down the old hub (children die), starts the new
+   * binary, which re-boots every module from services.json. NEVER a PID-signal
+   * restart (launchd KeepAlive / systemd Restart=always would fight). Module-
+   * target restarts drive the running Supervisor (lifecycle's own dispatch, fed
+   * a `supervisor` block here). The detached restart arm was retired in Phase 5b.
    *
-   * Production CLI dispatch passes `supervisor: {}` so the real
-   * `isHubUnitInstalled` probe decides the arm; omitting it is the detached arm
-   * deterministically (the shape of every existing upgrade test). When set,
-   * `unitInstalled` wins over the `hubUnitDeps`-derived detection.
+   * Production CLI dispatch passes `supervisor: {}`; tests inject the seams they
+   * want to assert.
    */
   supervisor?: {
-    /** Dual-dispatch discriminant override; else the real `isHubUnitInstalled`. */
-    unitInstalled?: boolean;
-    /** Deps for the `isHubUnitInstalled` probe + the `restartHubUnit` manager op. */
+    /** Deps for the `restartHubUnit` manager op. */
     hubUnitDeps?: HubUnitDeps;
     /** Restart the hub unit via the platform manager (never a PID signal, §5). */
     restartHubUnit?: (deps: HubUnitDeps) => HubUnitManagerOpResult;
@@ -258,8 +251,6 @@ interface Resolved {
   channelOverride: "rc" | "latest" | undefined;
   allowDowngrade: boolean;
   resolveChannelVersion: (pkg: string, channel: string) => Promise<string | null>;
-  /** Phase 4 dual-dispatch: is a hub unit installed? */
-  unitInstalled: boolean;
   hubUnitDeps: HubUnitDeps;
   restartHubUnit: (deps: HubUnitDeps) => HubUnitManagerOpResult;
 }
@@ -294,26 +285,19 @@ function resolve(opts: UpgradeOpts): Resolved {
     allowDowngrade: opts.allowDowngrade ?? false,
     resolveChannelVersion:
       opts.resolveChannelVersion ?? ((pkg, channel) => npmViewVersion(pkg, channel, runner)),
-    // Phase 4 dual-dispatch: same discriminant shape as lifecycle's
-    // `resolveSupervisor`. A `supervisor` block (even `{}`) opts into the real
-    // `isHubUnitInstalled` probe; omitting it entirely is the detached arm
-    // deterministically (every existing upgrade test).
+    // Supervisor seams (the only runtime as of Phase 5b). Production passes
+    // `supervisor: {}`; tests inject the seams they want to assert.
     ...resolveUpgradeSupervisor(opts.supervisor),
   };
 }
 
-/** Resolve the Phase 4 supervisor seams for the upgrade path. */
+/** Resolve the supervisor seams for the upgrade path. */
 function resolveUpgradeSupervisor(opts: UpgradeOpts["supervisor"]): {
-  unitInstalled: boolean;
   hubUnitDeps: HubUnitDeps;
   restartHubUnit: (deps: HubUnitDeps) => HubUnitManagerOpResult;
 } {
-  const hubUnitDeps = opts?.hubUnitDeps ?? defaultHubUnitDeps;
-  const unitInstalled =
-    opts === undefined ? false : (opts.unitInstalled ?? isHubUnitInstalled(hubUnitDeps));
   return {
-    unitInstalled,
-    hubUnitDeps,
+    hubUnitDeps: opts?.hubUnitDeps ?? defaultHubUnitDeps,
     restartHubUnit: opts?.restartHubUnit ?? restartHubUnitImpl,
   };
 }
@@ -581,44 +565,41 @@ function readPackageVersion(pkgJsonPath: string): string | null {
 
 /**
  * Restart an upgraded target after its binary/package was rewritten (design §5).
- * Dual-dispatch:
- *   - Unit-managed + HUB target → restart the hub UNIT via the platform manager
+ * Supervised path only (Phase 5b — the detached restart arm is retired):
+ *   - HUB target → restart the hub UNIT via the platform manager
  *     (`restartHubUnit` — systemctl restart / launchctl kickstart -k). The
  *     manager tears down the old hub (children die), starts the new binary,
- *     which re-boots every module from services.json. NEVER stopHub/ensureHub
- *     (a PID-signal restart launchd KeepAlive / systemd Restart=always would
- *     fight). The command returns once the restart is dispatched; it does not
- *     need to outlive the old hub.
- *   - Unit-managed + MODULE target → drive the running Supervisor by handing
- *     `lifecycle.restart` a `supervisor` block (its own Phase-3b dual-dispatch
- *     then routes to `supervisor.restart` with the 404-fallthrough). The hub
- *     unit was already restarted hub-first in the sweep, so it's up to answer.
- *   - No unit (detached) → the unchanged `restartFn` (default `lifecycle.restart`
- *     → stopHub/ensureHubRunning for hub, detached stop+start for modules).
- *     Phase 5 deletes this branch.
+ *     which re-boots every module from services.json. NEVER a PID-signal restart
+ *     (launchd KeepAlive / systemd Restart=always would fight). The command
+ *     returns once the restart is dispatched; it does not need to outlive the
+ *     old hub.
+ *   - MODULE target → drive the running Supervisor by handing `lifecycle.restart`
+ *     a `supervisor` block (its own dispatch then routes to `supervisor.restart`
+ *     with the 404-fallthrough). The hub unit was already restarted hub-first in
+ *     the sweep, so it's up to answer.
+ *
+ * A box with no hub unit takes the actionable migrate path: the hub-target
+ * `restartHubUnit` returns `no-unit` (messages surfaced, non-zero), and the
+ * module-target `lifecycle.restart` runs its own §7.5 no-unit handling.
  */
 async function restartTarget(target: ResolvedTarget, r: Resolved): Promise<number> {
-  if (r.unitInstalled) {
-    if (target.short === HUB_SVC) {
-      const res = r.restartHubUnit(r.hubUnitDeps);
-      for (const m of res.messages) r.log(m);
-      if (res.outcome === "ok") {
-        r.log(`${target.short}: restarted the hub unit (all modules re-booted).`);
-        return 0;
-      }
-      return 1;
+  if (target.short === HUB_SVC) {
+    const res = r.restartHubUnit(r.hubUnitDeps);
+    for (const m of res.messages) r.log(m);
+    if (res.outcome === "ok") {
+      r.log(`${target.short}: restarted the hub unit (all modules re-booted).`);
+      return 0;
     }
-    // Module target: route through lifecycle's supervisor arm. Passing
-    // `supervisor: {}` makes `lifecycle.restart` probe `isHubUnitInstalled`
-    // (true here) and drive `supervisor.restart` over the loopback module-ops
-    // API instead of a detached stop+start.
-    return await r.restartFn(target.short, {
-      manifestPath: r.manifestPath,
-      configDir: r.configDir,
-      supervisor: { unitInstalled: true, hubUnitDeps: r.hubUnitDeps },
-    });
+    return 1;
   }
-  return await r.restartFn(target.short, { manifestPath: r.manifestPath, configDir: r.configDir });
+  // Module target: route through lifecycle's supervisor arm. Passing a
+  // `supervisor` block with `unitInstalled: true` drives `supervisor.restart`
+  // over the loopback module-ops API.
+  return await r.restartFn(target.short, {
+    manifestPath: r.manifestPath,
+    configDir: r.configDir,
+    supervisor: { unitInstalled: true, hubUnitDeps: r.hubUnitDeps },
+  });
 }
 
 async function upgradeLinked(

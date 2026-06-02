@@ -12,12 +12,12 @@ import {
 import { upsertService } from "../services-manifest.ts";
 
 /**
- * Phase 3c (design §6.4): on a UNIT-MANAGED box `status` reads the hub row from
- * the platform manager + `/health` and the module rows from the running
- * supervisor (`GET /api/modules`). Everything below is driven through the
- * `supervisor` seams — no real launchd/systemd/socket/HTTP/db call. The detached
- * arm is exercised separately in `status.test.ts` (those tests omit the
- * `supervisor` block entirely, so they keep the pidfile readout unchanged).
+ * Phase 5b (design §6.4): `status` reads the hub row from the platform manager +
+ * `/health` and the module rows from the running supervisor (`GET /api/modules`)
+ * — the ONLY runtime now that the detached pidfile arm is retired. Everything
+ * below is driven through the `supervisor` seams — no real launchd/systemd/
+ * socket/HTTP/db call. The manifest-derived rendering (URLs, version, persisted
+ * start-error) is covered in `status.test.ts` (also supervised-arm now).
  */
 
 function makeTempPath(): { path: string; cleanup: () => void; configDir: string } {
@@ -90,7 +90,6 @@ function supervisorOpts(configDir: string, path: string, o: SupervisorArmOpts) {
     installSourceDeps: STUB_INSTALL_SOURCE,
     hubSrcDir: "/nonexistent/hub/src",
     supervisor: {
-      unitInstalled: true,
       hubUnitDeps: FAKE_HUB_UNIT_DEPS,
       queryHubUnitState: () => o.managerState,
       probeHubHealth: async () => o.hubHealthy,
@@ -224,7 +223,6 @@ describe("status — Phase 3c supervisor arm: hub row", () => {
         }),
         // Replace the query with one that throws — status must not crash.
         supervisor: {
-          unitInstalled: true,
           hubUnitDeps: FAKE_HUB_UNIT_DEPS,
           queryHubUnitState: () => {
             throw new Error("systemctl exploded");
@@ -498,72 +496,9 @@ describe("status — Phase 3c supervisor arm: module rows", () => {
   });
 });
 
-describe("status — Phase 3c discriminant", () => {
-  test("no supervisor block → detached arm (pidfile readout), supervisor seams untouched", async () => {
-    const { path, configDir, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.6.2" },
-        path,
-      );
-      // No `supervisor` block at all → resolveStatusSupervisor returns
-      // unitInstalled:false → the detached arm. The probe (fetchImpl) runs,
-      // proving we took the pidfile/probe path, not the supervisor path.
-      let probed = false;
-      const lines: string[] = [];
-      const code = await status({
-        manifestPath: path,
-        configDir,
-        installSourceDeps: STUB_INSTALL_SOURCE,
-        hubSrcDir: "/nonexistent/hub/src",
-        fetchImpl: async () => {
-          probed = true;
-          return new Response(null, { status: 200 });
-        },
-        print: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      // The detached arm probes the service's /health endpoint.
-      expect(probed).toBe(true);
-      expect(lines.some((l) => l.includes("parachute-vault"))).toBe(true);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("supervisor block with unitInstalled:false → detached arm (probe runs)", async () => {
-    const { path, configDir, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.6.2" },
-        path,
-      );
-      let probed = false;
-      let queried = false;
-      const code = await status({
-        manifestPath: path,
-        configDir,
-        installSourceDeps: STUB_INSTALL_SOURCE,
-        hubSrcDir: "/nonexistent/hub/src",
-        fetchImpl: async () => {
-          probed = true;
-          return new Response(null, { status: 200 });
-        },
-        supervisor: {
-          unitInstalled: false,
-          queryHubUnitState: () => {
-            queried = true;
-            return { state: "active" };
-          },
-        },
-        print: () => {},
-      });
-      expect(code).toBe(0);
-      // Detached arm: the per-service probe runs and the manager is NOT queried.
-      expect(probed).toBe(true);
-      expect(queried).toBe(false);
-    } finally {
-      cleanup();
-    }
-  });
-});
+// The "Phase 3c discriminant" block (no-supervisor / unitInstalled:false →
+// detached pidfile-probe arm) was removed in Phase 5b: the detached arm is
+// retired, so there is no discriminant — `status` always reads the platform
+// manager + supervisor. The supervisor-path readout is exercised throughout the
+// suites above; a box with no hub unit degrades gracefully (manager `no-unit` /
+// `/health` down → inactive rows), which the hub-row + module-row suites cover.
