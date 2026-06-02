@@ -90,12 +90,22 @@ export function HubUpgradeCard() {
   }, []);
 
   /**
-   * Poll /api/hub for a version change + the upgrade status log. The hub is
+   * Poll /api/hub for the new version + the upgrade status log. The hub is
    * down mid-restart, so both fetches may throw — swallow and keep polling
-   * until the new version answers or the bounded deadline passes.
+   * until the new hub answers or the bounded deadline passes.
+   *
+   * Success is EITHER:
+   *   - the reported version differs from the pre-upgrade version (the common
+   *     case — an actual version bump), OR
+   *   - the hub is healthy again AND its version equals the resolved target
+   *     (handles a NO-OP upgrade: the operator was already on the target, so
+   *     the version never changes — without this arm such an upgrade would hit
+   *     the 120s timeout with misleading "may still be coming up" copy).
+   * When `targetVersion` is unknown (registry miss), we fall back to the
+   * version-changed signal only.
    */
   const pollForNewVersion = useCallback(
-    (previousVersion: string) => {
+    (previousVersion: string, targetVersion: string | null) => {
       deadlineRef.current = Date.now() + UPGRADE_TIMEOUT_MS;
       stopPolling();
       pollRef.current = setInterval(() => {
@@ -112,11 +122,17 @@ export function HubUpgradeCard() {
           } catch {
             // status endpoint unreachable mid-restart — expected.
           }
-          if (newStatus && newStatus.version !== previousVersion) {
-            stopPolling();
-            setHub(newStatus);
-            setState({ kind: "succeeded", newVersion: newStatus.version });
-            return;
+          if (newStatus) {
+            const versionChanged = newStatus.version !== previousVersion;
+            // No-op upgrade: healthy + already on the target version. `newStatus`
+            // answering at all means the hub is healthy (the fetch resolved).
+            const reachedTarget = targetVersion !== null && newStatus.version === targetVersion;
+            if (versionChanged || reachedTarget) {
+              stopPolling();
+              setHub(newStatus);
+              setState({ kind: "succeeded", newVersion: newStatus.version });
+              return;
+            }
           }
           if (upgradeStatus?.phase === "failed") {
             stopPolling();
@@ -149,7 +165,7 @@ export function HubUpgradeCard() {
         return;
       }
       setState({ kind: "upgrading", previousVersion, targetVersion: accepted.target_version });
-      pollForNewVersion(previousVersion);
+      pollForNewVersion(previousVersion, accepted.target_version);
     } catch (err) {
       setState({ kind: "error", message: err instanceof Error ? err.message : String(err) });
     }

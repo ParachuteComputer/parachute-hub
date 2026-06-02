@@ -73,6 +73,7 @@
 
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CONTAINER_HOME } from "./hub-control.ts";
 import {
   type DetectInstallSourceDeps,
   type InstallSource,
@@ -111,10 +112,11 @@ export interface HubUpgradeModeResult {
 /**
  * The Render Blueprint pins `PARACHUTE_HOME=/parachute` — the single most
  * reliable container-mode signal the hub has (mirrors `api-hub.ts`'s
- * container override). Fly uses the same pin via the shared image.
+ * container override; both use the shared `CONTAINER_HOME` constant). Fly uses
+ * the same pin via the shared image.
  */
 function isContainer(env: Record<string, string | undefined>): boolean {
-  return env.PARACHUTE_HOME === "/parachute";
+  return env.PARACHUTE_HOME === CONTAINER_HOME;
 }
 
 /**

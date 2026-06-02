@@ -94,6 +94,33 @@ describe("HubUpgradeCard — in-progress + success", () => {
     );
     expect(screen.getByTestId("hub-upgrade-state-success")).toHaveTextContent("0.6.3-rc.2");
   });
+
+  it("resolves a NO-OP upgrade as success (version unchanged but == target)", async () => {
+    vi.useFakeTimers();
+    // The operator is ALREADY on the target version — the hub restarts on the
+    // SAME version, so the version-changed signal never fires. The
+    // healthy-and-==-target arm must resolve it as success (not a 120s timeout).
+    vi.mocked(api.getHubStatus).mockResolvedValue(mkStatus({ version: "0.6.3-rc.2" }));
+    // The accepted body's target_version equals the current version (no-op).
+    vi.mocked(api.startHubUpgrade).mockResolvedValue(accepted({ target_version: "0.6.3-rc.2" }));
+    vi.mocked(api.getHubUpgradeStatus).mockResolvedValue(null);
+
+    render(<HubUpgradeCard />);
+    await vi.waitFor(() => expect(screen.getByTestId("hub-upgrade-card")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("hub-upgrade-button"));
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("hub-upgrade-state-upgrading")).toBeInTheDocument(),
+    );
+
+    // One poll cycle — healthy + version == target → success, NOT a timeout.
+    await vi.advanceTimersByTimeAsync(2100);
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("hub-upgrade-state-success")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("hub-upgrade-state-success")).toHaveTextContent("0.6.3-rc.2");
+    expect(screen.queryByTestId("hub-upgrade-state-timeout")).toBeNull();
+  });
 });
 
 describe("HubUpgradeCard — timeout", () => {

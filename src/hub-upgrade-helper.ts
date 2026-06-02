@@ -218,11 +218,12 @@ export async function runHubUpgradeHelper(
       // rewrite is done; the runtime will bring it back on the new binary
       // regardless. Record + succeed.
       const msg = err instanceof Error ? err.message : String(err);
-      append(configDir, {}, `hub graceful-exit signal noted as already-gone (${msg})`);
+      append(configDir, operationId, {}, `hub graceful-exit signal noted as already-gone (${msg})`);
     }
   } else {
     append(
       configDir,
+      operationId,
       {},
       "no hub pid provided — relying on the platform runtime's own restart to pick up the new binary",
     );
@@ -241,16 +242,20 @@ function parseArgs(argv: string[]): HubUpgradeHelperArgs | { error: string } {
     const arg = argv[i];
     const next = argv[i + 1];
     switch (arg) {
+      // Each value-bearing flag guards `next !== undefined` so a truncated argv
+      // (flag last in argv, no value) leaves the value unset — surfaced as a
+      // clear "required" error below — rather than silently consuming the next
+      // flag as its value.
       case "--op":
-        operationId = next;
+        if (next !== undefined) operationId = next;
         i++;
         break;
       case "--channel":
-        channel = next;
+        if (next !== undefined) channel = next;
         i++;
         break;
       case "--config-dir":
-        configDir = next;
+        if (next !== undefined) configDir = next;
         i++;
         break;
       case "--hub-pid":
