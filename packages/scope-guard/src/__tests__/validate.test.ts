@@ -284,6 +284,44 @@ describe("createScopeGuard — audience strict-check", () => {
     expect(claims.aud).toBe("vault.first");
     guard.resetJwksCache();
   });
+
+  // hub#511 vault-compat invariant. The hub now widens `aud` to the array
+  // `[vault.<name>, <resource-url>]` when an RFC 8707 `resource` is bound at
+  // the token step (Claude's MCP connector echoes the resource URL). The vault
+  // passes `expectedAudience = "vault.<name>"` and this validator checks
+  // membership — so the array MUST be accepted. This pins the "no vault change
+  // needed" claim: if the validator stopped accepting the array, the hub fix
+  // would ship a token the vault rejects, and this test would fail.
+  test("hub#511: array aud [vault.default, <resource-url>] passes for expectedAudience vault.default", async () => {
+    const guard = makeGuard();
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: ["vault.default", "https://hub.example/vault/default/mcp"],
+    });
+    const claims = await guard.validateHubJwt(token, { expectedAudience: "vault.default" });
+    expect(claims.aud).toBe("vault.default");
+    guard.resetJwksCache();
+  });
+
+  test("hub#511: array aud lacking vault.default still rejected for expectedAudience vault.default", async () => {
+    const guard = makeGuard();
+    // A resource-only array (the vault-name entry missing) must NOT authenticate
+    // — the membership check is what keeps a bound resource from substituting
+    // for the scope-derived audience.
+    const token = await signJwt(kp, {
+      iss: fixture.origin,
+      aud: ["vault.other", "https://hub.example/vault/default/mcp"],
+    });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(token, { expectedAudience: "vault.default" });
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught).toBeInstanceOf(HubJwtError);
+    expect(caught?.code).toBe("audience");
+    guard.resetJwksCache();
+  });
 });
 
 describe("createScopeGuard — failure modes (HubJwtError.code)", () => {
