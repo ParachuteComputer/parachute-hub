@@ -598,12 +598,14 @@ Examples:
 }
 
 export function migrateHelp(): string {
-  return `parachute migrate — archive known-legacy files at the ecosystem root
+  return `parachute migrate — archive legacy root files, or cut over to the supervised model
 
 Usage:
   parachute migrate [--list] [--dry-run] [--yes]
+  parachute migrate --to-supervised
+  parachute migrate --teardown
 
-What it does:
+What it does (the default archive sweep):
   Scans ~/.parachute/ for files and directories that match the
   known-legacy allowlist (daily.db*, server.yaml, channel.log/err,
   channel.start.sh, top-level logs/, tokens.db*, and the legacy lens/
@@ -619,9 +621,11 @@ What it does:
   Dotfiles at the root (.env, .DS_Store, prior .archive-* dirs) are
   never touched.
 
-Safety:
+Archive-sweep safety:
   - Refuses to sweep while any service is running — stop them first
-    (\`parachute stop\`) or preview with \`--list\`.
+    (\`parachute stop\`) or preview with \`--list\`. A hub running under a
+    process-manager unit (the supervised model) is detected as running
+    via the platform manager too, not just its pidfile.
   - SQLite-shape files (\`*.db\`, \`*.db-wal\`, \`*.db-shm\`) get a
     \`[live-db]\` label and pull an extra confirmation; wal/shm
     consistency depends on all three moving together.
@@ -629,14 +633,39 @@ Safety:
     \`[unknown — skipping]\`, with skipped items printed last.
   - In a non-TTY shell (CI / piped), refuses without \`--yes\`.
 
+--to-supervised (detached → supervised cutover):
+  Migrate a legacy detached install (independent \`parachute start\`-spawned
+  daemons) to the supervised model: the hub runs as \`parachute serve\`
+  under your platform's process manager (launchd on macOS, systemd on
+  Linux), survives reboots, and supervises modules as children. The
+  cutover is idempotent + re-runnable, and ordered so it never races the
+  canonical hub port: it writes the unit file WITHOUT starting it, stops
+  the detached hub + modules, sweeps any process still bound to a declared
+  port, verifies the ports are free, THEN starts the unit and verifies the
+  hub is healthy. If anything fails partway it leaves the box recoverable
+  (unit written but not started) and you can simply re-run it. A box with
+  no service manager (a container / init-less host) can't host a unit —
+  run \`parachute serve\` in the foreground there instead.
+
+--teardown (cutover rollback):
+  Remove the hub process-manager unit. Idempotent + best-effort. Use it to
+  roll back a cutover: the unit is removed and you fall back to running the
+  hub with \`parachute serve\` (or re-run \`--to-supervised\` to reinstall it).
+  Run this BEFORE \`bun remove -g @openparachute/hub\` so a removed package
+  doesn't leave a unit pointing at a deleted binary.
+
 Flags:
-  --list        print the plan; make no changes (friendly preview)
-  --dry-run     synonym for --list (kept for back-compat)
-  --yes, -y     skip the confirmation prompt; required in non-TTY shells
+  --list           print the plan; make no changes (friendly preview)
+  --dry-run        synonym for --list (kept for back-compat)
+  --yes, -y        skip the confirmation prompt; required in non-TTY shells
+  --to-supervised  cut over a detached install to the supervised model
+  --teardown       remove the hub unit (cutover rollback)
 
 Examples:
-  parachute migrate --list          see what would move, without touching anything
-  parachute migrate                 interactive sweep (prompts before acting)
-  parachute migrate --yes           sweep without prompting
+  parachute migrate --list            see what would move, without touching anything
+  parachute migrate                   interactive sweep (prompts before acting)
+  parachute migrate --yes             sweep without prompting
+  parachute migrate --to-supervised   move to the supervised (serve-under-manager) model
+  parachute migrate --teardown        remove the hub unit (roll back the cutover)
 `;
 }

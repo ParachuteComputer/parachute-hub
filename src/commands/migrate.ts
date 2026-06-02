@@ -3,6 +3,12 @@ import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { HUB_SVC } from "../hub-control.ts";
+import {
+  type HubUnitDeps,
+  type HubUnitState,
+  defaultHubUnitDeps,
+  queryHubUnitState,
+} from "../hub-unit.ts";
 import { type AliveFn, defaultAlive, processState } from "../process-state.ts";
 import { knownServices, shortNameForManifest } from "../service-spec.ts";
 import { readManifestLenient } from "../services-manifest.ts";
@@ -336,6 +342,31 @@ export async function defaultPrompt(question: string): Promise<string> {
 }
 
 /**
+ * Hub-unit-state query seam for the archive guard (§7.3). Production uses the
+ * real `queryHubUnitState` over `defaultHubUnitDeps`; tests inject a stub so the
+ * unit-managed-hub-detected-as-running path is exercised without a live
+ * systemctl/launchctl. Returns the platform manager's view of the hub unit.
+ */
+export type HubUnitStateQuery = (deps: HubUnitDeps) => { state: HubUnitState };
+
+/**
+ * The §7.3 archive-guard fix: a hub unit is "running, leave it alone" when the
+ * platform manager reports it `active` or `activating`. `failed` / `inactive` /
+ * `no-unit` / `no-manager` / `unknown` are NOT treated as running — those mean
+ * the unit isn't actively holding state at this moment.
+ *
+ * Deliberately conservative on `unknown`: an unparseable manager response is
+ * NOT a license to archive (that would re-introduce the silent fail-open), but
+ * it's also not a clear "running" signal — so we fall through to the pidfile
+ * check (which catches a detached-era hub) rather than blanket-refusing on a
+ * transient manager hiccup. `active`/`activating` is the unambiguous unit-up
+ * signal that the pidfile-only guard missed.
+ */
+function hubUnitReportsRunning(state: HubUnitState): boolean {
+  return state === "active" || state === "activating";
+}
+
+/**
  * Probe whether any managed service (or the hub) is currently running.
  * Returns the list of short names that are live; an empty list means the
  * sweep is safe to proceed.
@@ -343,15 +374,42 @@ export async function defaultPrompt(question: string): Promise<string> {
  * Reads services.json leniently so a malformed entry doesn't block the
  * pre-flight (better to surface "running: vault" + a corrupt-entry warning
  * elsewhere than to refuse migration on an unrelated parsing problem).
+ *
+ * §7.3 archive-guard fix: the hub liveness check is BOTH the pidfile
+ * (`processState(HUB_SVC)`, the detached-era signal) AND the platform manager
+ * (`queryHubUnitState`, the unit-era signal). A unit-managed hub writes NO
+ * pidfile, so `processState(HUB_SVC)` reports it not-running and the
+ * refuse-while-running guard would silently FAIL OPEN — `migrate` could archive
+ * `~/.parachute` out from under a live unit-managed hub. Querying the manager
+ * too closes that hole: an `active`/`activating` hub unit is correctly detected
+ * as running and the guard holds.
  */
 export function listRunningServices(
   configDir: string,
   manifestPath: string,
   alive: AliveFn,
+  hubUnitState: HubUnitStateQuery = queryHubUnitState,
+  hubUnitDeps: HubUnitDeps = defaultHubUnitDeps,
 ): string[] {
   const running: string[] = [];
+  // Detached-era signal: the hub pidfile.
   const hubState = processState(HUB_SVC, configDir, alive);
-  if (hubState.status === "running") running.push(HUB_SVC);
+  let hubRunning = hubState.status === "running";
+  // Unit-era signal (§7.3): the platform manager. A unit-managed hub has no
+  // pidfile, so without this it would fail open. Never throws — `queryHubUnitState`
+  // degrades to `unknown` on a manager hiccup; we only escalate to "running" on
+  // an unambiguous active/activating.
+  if (!hubRunning) {
+    try {
+      const unit = hubUnitState(hubUnitDeps);
+      if (hubUnitReportsRunning(unit.state)) hubRunning = true;
+    } catch {
+      // A manager-query failure must not crash the guard — fall through. The
+      // pidfile check already ran; treat an unqueryable manager as "no extra
+      // signal," neither forcing-running nor opening the gate.
+    }
+  }
+  if (hubRunning) running.push(HUB_SVC);
   let manifest: ReturnType<typeof readManifestLenient>;
   try {
     manifest = readManifestLenient(manifestPath);
@@ -385,6 +443,15 @@ export interface MigrateOpts {
    * non-interactive guard without manipulating real fds.
    */
   isTty?: boolean;
+  /**
+   * Test seam: the §7.3 platform-manager hub-unit-state query used by the
+   * archive guard. Production uses `queryHubUnitState`; tests inject a stub to
+   * exercise the unit-managed-hub-detected-as-running path without a live
+   * systemctl/launchctl.
+   */
+  hubUnitState?: HubUnitStateQuery;
+  /** Test seam: the hub-unit deps passed to `hubUnitState` (default production). */
+  hubUnitDeps?: HubUnitDeps;
 }
 
 export async function migrate(opts: MigrateOpts = {}): Promise<number> {
@@ -397,6 +464,8 @@ export async function migrate(opts: MigrateOpts = {}): Promise<number> {
   const yes = opts.yes ?? false;
   const alive = opts.alive ?? defaultAlive;
   const isTty = opts.isTty ?? Boolean(process.stdin.isTTY);
+  const hubUnitState = opts.hubUnitState ?? queryHubUnitState;
+  const hubUnitDeps = opts.hubUnitDeps ?? defaultHubUnitDeps;
 
   // Refuse-while-running: archiving a path a live daemon owns can corrupt
   // its state. Print the runners and bail before we read the directory.
@@ -404,7 +473,7 @@ export async function migrate(opts: MigrateOpts = {}): Promise<number> {
   // operator may explicitly want to see what would move while things are
   // up.
   if (!dryRun) {
-    const running = listRunningServices(configDir, manifestPath, alive);
+    const running = listRunningServices(configDir, manifestPath, alive, hubUnitState, hubUnitDeps);
     if (running.length > 0) {
       log("parachute migrate: services are currently running — refusing to sweep:");
       for (const short of running) log(`  - ${short}`);
