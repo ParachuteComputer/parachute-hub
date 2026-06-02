@@ -175,6 +175,96 @@ describe("renderAccountHome", () => {
     expect(html).not.toContain('data-testid="mcp-connect"');
   });
 
+  test("get-started card — links to the two onboarding prompts, placed before the vault card", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    // The card renders with both onboarding-prompt links (mirrors the
+    // operator setup-wizard's starter-prompts section).
+    expect(html).toContain('data-testid="get-started-card"');
+    expect(html).toContain("Get started with your AI");
+    expect(html).toContain("https://parachute.computer/onboarding/vault-setup/");
+    expect(html).toContain("https://parachute.computer/onboarding/surface-build/");
+    expect(html).toContain('data-testid="starter-vault-setup"');
+    expect(html).toContain('data-testid="starter-surface-build"');
+    // External links open safely.
+    expect(html).toContain('rel="noopener"');
+    // Placed prominently — before the vault card in document order.
+    expect(html.indexOf('data-testid="get-started-card"')).toBeLessThan(
+      html.indexOf('data-testid="vault-card"'),
+    );
+  });
+
+  test("get-started card — present on every branch (admin + no-vault too)", () => {
+    // The on-ramp is useful regardless of vault-assignment state, so it
+    // renders on all three vault-card branches.
+    const admin = renderAccountHome({
+      username: "admin",
+      assignedVaults: [],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: true,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    expect(admin).toContain('data-testid="get-started-card"');
+
+    const noVault = renderAccountHome({
+      username: "ghost",
+      assignedVaults: [],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    expect(noVault).toContain('data-testid="get-started-card"');
+  });
+
+  test("connect-any-client hint bridges MCP ↔ ChatGPT 'connector' terminology", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    // The "any other client" hint now names the ChatGPT "connector" term so
+    // a friend who only knows that word can find the right place to paste.
+    expect(html).toContain('data-testid="connect-any-client-hint"');
+    expect(html).toContain("connector");
+  });
+
+  test("account card — security actions collapse into a secondary <details>", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    // Username + sign-out stay prominent; change-password + 2FA tuck into a
+    // collapsed "Security & password" details so the card reads calmer.
+    expect(html).toContain('data-testid="account-security"');
+    expect(html).toContain("Security &amp; password");
+    // The security actions live inside the details block (after its summary).
+    const securityIdx = html.indexOf('data-testid="account-security"');
+    expect(securityIdx).toBeGreaterThan(-1);
+    expect(html.indexOf('data-testid="change-password-link"')).toBeGreaterThan(securityIdx);
+    // Sign-out form comes BEFORE the security details — it stays prominent.
+    expect(html.indexOf('data-testid="signout-form"')).toBeLessThan(securityIdx);
+  });
+
   test("account card — change-password link and sign-out form are present", () => {
     const html = renderAccountHome({
       username: "alice",

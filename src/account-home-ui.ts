@@ -174,6 +174,8 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
       )}</div>`
     : "";
 
+  const startedCard = renderGetStartedCard();
+
   const vaultCard = renderVaultCard({
     assignedVaults,
     trimmedOrigin,
@@ -197,10 +199,49 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
       </div>
       ${mintedBanner}
       ${mintErrorBanner}
+      ${startedCard}
       ${vaultCard}
       ${accountCard}
     </div>${COPY_SCRIPT}`;
   return baseDocument(`${username} — Parachute`, body);
+}
+
+/**
+ * The "Get started with your AI" card — the real first stop for a friend
+ * landing on `/account/`. Mirrors the operator setup-wizard's
+ * `renderStarterPromptsSection` (same two parachute.computer/onboarding/*
+ * links + copy) so friends and operators get the same on-ramp. The prompts
+ * live on parachute.computer rather than embedded here so they iterate
+ * without a hub release; this card just links.
+ *
+ * Placed near the top of the page (after any banners, before the vault card)
+ * because "what do I actually do with this?" is the friend's first question —
+ * the connect details below answer "how", this answers "what next".
+ */
+function renderGetStartedCard(): string {
+  return `
+    <section class="section get-started" data-testid="get-started-card">
+      <h2>Get started with your AI</h2>
+      <p>Two ready-made prompts to paste into Claude (or another AI assistant)
+        once your vault is connected — they walk you through it, no setup
+        knowledge needed.</p>
+      <div class="starter-grid">
+        <a class="starter-tile" href="https://parachute.computer/onboarding/vault-setup/"
+           target="_blank" rel="noopener" data-testid="starter-vault-setup">
+          <h3>Set up your vault</h3>
+          <p>Your AI interviews you about where your notes live now and suggests
+            a structure that fits how you think.</p>
+          <span class="starter-cta">Open prompt ↗</span>
+        </a>
+        <a class="starter-tile" href="https://parachute.computer/onboarding/surface-build/"
+           target="_blank" rel="noopener" data-testid="starter-surface-build">
+          <h3>Build a custom UI</h3>
+          <p>Your AI builds you a little web app for your vault — your own way to
+            see and add to it.</p>
+          <span class="starter-cta">Open prompt ↗</span>
+        </a>
+      </div>
+    </section>`;
 }
 
 interface VaultCardOpts {
@@ -303,9 +344,9 @@ function renderVaultCard(opts: VaultCardOpts): string {
                  approve. (Your hub must be reachable from the web for this.)</p>
             </div>
 
-            <p class="mcp-connect-hint" data-testid="connect-any-client-hint">Any other MCP
-               client (Codex, Goose, Cursor, your own agent): point it at the same endpoint
-               above over HTTP.</p>
+            <p class="mcp-connect-hint" data-testid="connect-any-client-hint">Using something
+               else? Point any MCP client at the same endpoint above. (ChatGPT and some other
+               web UIs call these "connectors.")</p>
           </div>
           <p class="vault-notes-cta">
             <a class="btn btn-primary" href="https://notes.parachute.computer/add?url=${vaultUrlForAdd}"
@@ -478,19 +519,24 @@ function renderAccountCard(opts: AccountCardOpts): string {
       <dl class="kv">
         <dt>Username</dt>
         <dd><code>${username}</code></dd>
-        <dt>Two-factor authentication</dt>
-        ${twoFactorStatus}
       </dl>
-      <p>
-        <a class="account-action" href="/account/change-password" data-testid="change-password-link">Change password →</a>
-      </p>
-      <p>
-        ${twoFactorLink}
-      </p>
       <form method="POST" action="/logout" class="signout-form" data-testid="signout-form">
         ${renderCsrfHiddenInput(csrfToken)}
         <button type="submit" class="btn btn-secondary">Sign out</button>
       </form>
+      <details class="account-security" data-testid="account-security">
+        <summary>Security &amp; password</summary>
+        <dl class="kv">
+          <dt>Two-factor authentication</dt>
+          ${twoFactorStatus}
+        </dl>
+        <p>
+          <a class="account-action" href="/account/change-password" data-testid="change-password-link">Change password →</a>
+        </p>
+        <p>
+          ${twoFactorLink}
+        </p>
+      </details>
     </section>`;
 }
 
@@ -604,6 +650,60 @@ const STYLES = `
     margin-top: 1.25rem;
   }
   .section p { margin: 0.4rem 0; }
+
+  .get-started h3 {
+    font-family: ${FONT_SERIF};
+    font-weight: 400;
+    font-size: 1rem;
+    margin: 0 0 0.3rem;
+    color: ${PALETTE.fg};
+  }
+  .starter-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+    margin: 0.75rem 0 0.2rem;
+  }
+  .starter-tile {
+    display: block;
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 8px;
+    padding: 0.8rem 0.9rem;
+    background: ${PALETTE.bgSoft};
+    text-decoration: none;
+    color: inherit;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .starter-tile:hover { border-color: ${PALETTE.accent}; background: ${PALETTE.accentSoft}; }
+  .starter-tile p {
+    font-size: 0.84rem;
+    color: ${PALETTE.fgMuted};
+    margin: 0 0 0.5rem;
+  }
+  .starter-cta {
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: ${PALETTE.accent};
+  }
+  @media (max-width: 480px) {
+    .starter-grid { grid-template-columns: 1fr; }
+  }
+
+  .account-security {
+    margin: 0.9rem 0 0;
+    padding-top: 0.6rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+  }
+  .account-security > summary {
+    cursor: pointer;
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: ${PALETTE.fgMuted};
+    list-style: revert;
+  }
+  .account-security > summary:hover { color: ${PALETTE.fg}; }
+  .account-security .kv { margin-top: 0.6rem; }
+
   .vault-name {
     font-family: ${FONT_MONO};
     font-size: 1rem;
@@ -879,7 +979,14 @@ const STYLES = `
     code { background: #1f1c18; color: #e8e4dc; }
     .copy-row code { background: transparent; }
     .section { border-top-color: #3a362f; }
-    .mcp-method, .vault-notes-cta, .token-mint { border-top-color: #3a362f; }
+    .mcp-method, .vault-notes-cta, .token-mint,
+    .account-security { border-top-color: #3a362f; }
+    .get-started h3 { color: #f0ece4; }
+    .starter-tile { border-color: #3a362f; background: #1f1c18; }
+    .starter-tile:hover { border-color: ${PALETTE.accent}; }
+    .starter-tile p { color: #a8a29a; }
+    .account-security > summary { color: #a8a29a; }
+    .account-security > summary:hover { color: #f0ece4; }
     .brand-tag { border-color: #3a362f; color: #a8a29a; }
     .copy-row { background: #1f1c18; border-color: #3a362f; }
     .btn-secondary, .btn-copy { color: #e8e4dc; border-color: #3a362f; }
