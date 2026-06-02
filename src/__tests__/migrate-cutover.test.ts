@@ -721,6 +721,53 @@ describe("MUST-FIX 2: orphan-sweep ownership check on module ports", () => {
       h.cleanup();
     }
   });
+
+  test("a process whose cmdline contains ONLY the bare module short-name (no 'parachute') is NOT attributed → not killed → port-stuck", async () => {
+    // Regression guard for the #507 re-review nit: the bare short-name needle was
+    // dropped because it false-attributed unrelated processes. The canonical
+    // footgun: a CI `gitlab-runner` squatting the `runner` module's port. Its
+    // cmdline contains the bare short-name "runner" but NOT "parachute", so under
+    // the old loose match the cutover would have KILLED it. Attribution now needs
+    // the `parachute` marker (or a recorded-pid / start-cmd-hint match).
+    const h = makeHarness();
+    try {
+      seedManifest(h.manifestPath, [{ name: "runner", port: 1943 }]);
+      const fc = makeFakeCutover({
+        // A genuine, unrelated CI runner — cmdline carries the bare short-name
+        // "runner" but nothing parachute-ish.
+        ownerOfPid: (pid) =>
+          pid === 8888
+            ? "/usr/local/bin/gitlab-runner run --config /etc/gitlab-runner/config.toml"
+            : undefined,
+      });
+      const w = getWorld(fc.deps);
+      w.listening.add(1939);
+      w.listening.add(1943);
+      // No runner pidfile (no recorded-pid match) — the squatter is 8888.
+      w.orphanPorts.set(1943, 8888);
+      w.alivePids.add(8888);
+      const log: string[] = [];
+      const result = await cutoverToSupervised({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        deps: fc.deps,
+        log: (l) => log.push(l),
+        pollMs: 0,
+        timeoutMs: 0,
+      });
+      // Refused to kill → port stays held → port-stuck.
+      expect(result.outcome).toBe("port-stuck");
+      expect(fc.trace).not.toContain("kill 8888 SIGTERM");
+      expect(fc.trace).not.toContain("kill 8888 SIGKILL");
+      expect(getWorld(fc.deps).alivePids.has(8888)).toBe(true);
+      const out = log.join("\n");
+      expect(out).toContain("held by an unrelated process");
+      expect(out).toContain("8888");
+      expect(out).toContain("gitlab-runner");
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 // ===========================================================================

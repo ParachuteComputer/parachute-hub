@@ -440,11 +440,22 @@ async function stopDetachedModule(
  * operator's unrelated process that merely squats a declared port. Attributable
  * when ANY of:
  *   - the orphan pid equals the module's RECORDED pid (services.json/pidfile);
- *   - its command line mentions `parachute` (any parachute-managed process);
- *   - its command line mentions the module's short name (e.g. `vault`);
- *   - its command line mentions the module's start command (when known).
+ *   - its command line mentions `parachute` (any parachute-managed process —
+ *     the `~/.parachute/...` install path and the `@openparachute/<mod>`
+ *     package name both carry this marker, so it catches every genuine
+ *     parachute-managed module);
+ *   - its command line mentions the module's start command (when a hint is
+ *     supplied — currently always unset at the call site, the seam is kept
+ *     for a future services.json-derived start command).
  * An unreadable command line (probe returned undefined) + a non-matching pid is
  * NOT attributable — we refuse to kill it.
+ *
+ * NOTE: the bare module short-name needle (`vault`/`runner`/`scribe`/`notes`)
+ * was deliberately dropped — on the most destructive command (a process KILL),
+ * a bare short-name is too loose: a `runner` substring matches an unrelated CI
+ * runner squatting the port. The `parachute` marker already attributes every
+ * genuine parachute-managed process, so the short-name arm only widened the
+ * false-positive surface.
  */
 function orphanAttributable(args: {
   orphan: number;
@@ -453,18 +464,16 @@ function orphanAttributable(args: {
   startCmdHint: string | undefined;
   ownerOfPid: OwnerProbeFn;
 }): { attributable: boolean; cmdline: string | undefined } {
-  const { orphan, recordedPid, short, startCmdHint, ownerOfPid } = args;
+  const { orphan, recordedPid, startCmdHint, ownerOfPid } = args;
   if (recordedPid !== undefined && orphan === recordedPid) {
     return { attributable: true, cmdline: undefined };
   }
   const cmdline = ownerOfPid(orphan);
   if (cmdline === undefined) return { attributable: false, cmdline: undefined };
   const haystack = cmdline.toLowerCase();
-  const needles = [
-    "parachute",
-    short.toLowerCase(),
-    ...(startCmdHint ? [startCmdHint.toLowerCase()] : []),
-  ].filter((n) => n.length > 0);
+  const needles = ["parachute", ...(startCmdHint ? [startCmdHint.toLowerCase()] : [])].filter(
+    (n) => n.length > 0,
+  );
   const attributable = needles.some((n) => haystack.includes(n));
   return { attributable, cmdline };
 }
