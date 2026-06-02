@@ -31,6 +31,11 @@ import {
   restartHubUnit as restartHubUnitImpl,
   stopHubUnit as stopHubUnitImpl,
 } from "../hub-unit.ts";
+import {
+  type MigrateOfferOpts,
+  type MigrateOfferResult,
+  offerMigrateToSupervised,
+} from "../migrate-offer.ts";
 import { ModuleManifestError, readModuleManifest } from "../module-manifest.ts";
 import {
   type DriveModuleOpDeps,
@@ -358,6 +363,24 @@ export interface LifecycleOpts {
     /** Loopback hub base URL override (default derives from the hub port). */
     baseUrl?: string;
   };
+  /**
+   * §7.5 auto-detect-and-offer seam. When a verb takes the DETACHED arm (no hub
+   * unit installed) and a prior detached install is detected, the verb offers
+   * the supervised cutover (interactive) or prints the command (non-TTY) BEFORE
+   * doing detached work. Injectable so tests can (a) stub the offer to assert it
+   * fires / migrates / declines, and (b) DISABLE it entirely (`enabled:false`)
+   * so the hundreds of existing detached-arm lifecycle tests don't trip an
+   * interactive prompt. Production wires the real `offerMigrateToSupervised`.
+   *
+   * Default when OMITTED: disabled, so existing tests (which never opt in) stay
+   * deterministic. The production CLI dispatch passes `{ enabled: true }`.
+   */
+  migrateOffer?: {
+    /** Master switch. Default `false` when the whole block is omitted. */
+    enabled?: boolean;
+    /** The offer implementation (default `offerMigrateToSupervised`). */
+    offer?: (opts: MigrateOfferOpts) => Promise<MigrateOfferResult>;
+  };
 }
 
 interface Resolved {
@@ -385,6 +408,11 @@ interface Resolved {
     log: (line: string) => void;
   }) => Promise<OperatorIssuerHealStatus>;
   sup: ResolvedSupervisor;
+  /** §7.5 resolved auto-offer (enabled flag + the offer impl). */
+  migrateOffer: {
+    enabled: boolean;
+    offer: (opts: MigrateOfferOpts) => Promise<MigrateOfferResult>;
+  };
 }
 
 /** Resolved Phase 3b supervisor-path seams (see `LifecycleOpts.supervisor`). */
@@ -467,6 +495,13 @@ function resolve(opts: LifecycleOpts): Resolved {
     stopHubFn: opts.hub?.stop ?? stopHub,
     selfHealOperatorTokenFn: opts.hub?.selfHealOperatorToken ?? defaultSelfHealOperatorToken,
     sup: resolveSupervisor(opts.supervisor),
+    migrateOffer: {
+      // Default OFF when omitted so the existing detached-arm lifecycle tests
+      // (which never opt in) don't trip an interactive prompt. The production
+      // CLI dispatch passes `{ enabled: true }`.
+      enabled: opts.migrateOffer?.enabled ?? false,
+      offer: opts.migrateOffer?.offer ?? offerMigrateToSupervised,
+    },
   };
 }
 
@@ -504,6 +539,40 @@ function resolveSupervisor(opts: LifecycleOpts["supervisor"]): ResolvedSuperviso
     openDb: opts?.openDb ?? ((configDir) => openHubDb(hubDbPath(configDir))),
     baseUrl: opts?.baseUrl,
   };
+}
+
+/**
+ * §7.5 auto-detect-and-offer hook for the detached arm of start/stop/restart.
+ *
+ * Called only AFTER the `r.sup.unitInstalled` branch fell through (we're on the
+ * detached arm). When the offer is enabled, it runs `offerMigrateToSupervised`
+ * (which itself checks "no unit + prior detached" and prompts / prints). Returns
+ * `true` ONLY when the operator accepted AND the cutover succeeded — i.e. the
+ * box is NOW supervised, so the caller should re-dispatch through the supervisor
+ * path. Every other outcome (offer disabled, no-offer, declined, printed in a
+ * non-TTY, migrate-failed) returns `false` → the caller proceeds with the
+ * detached arm unchanged.
+ *
+ * The migrate-failed case deliberately returns `false`: a failed cutover leaves
+ * the box still on the detached model (the cutover is fail-safe + re-runnable),
+ * so the original verb should still run the detached way rather than re-dispatch
+ * into a supervisor that isn't up.
+ */
+async function maybeOfferAndMigrate(r: Resolved): Promise<boolean> {
+  if (!r.migrateOffer.enabled) return false;
+  const result = await r.migrateOffer.offer({
+    configDir: r.configDir,
+    manifestPath: r.manifestPath,
+    log: r.log,
+  });
+  if (result.outcome === "migrated") {
+    // The box is now supervised. Flip the resolved discriminant so the
+    // re-dispatched verb takes the supervisor arm (the unit is freshly
+    // installed; `r.sup.unitInstalled` was resolved as false before the offer).
+    r.sup.unitInstalled = true;
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -696,6 +765,11 @@ export async function start(svc: string | undefined, opts: LifecycleOpts = {}): 
   // detached arm below. Phase 5 deletes the else-arm — keep this a clean
   // top-level branch so that deletion is a one-liner.
   if (r.sup.unitInstalled) return startViaSupervisor(svc, r);
+  // §7.5 auto-detect-and-offer: a box on the detached model (no unit) with a
+  // prior detached install gets offered the supervised cutover. If the operator
+  // accepts + migrates, the box is now supervised — re-dispatch this verb
+  // through the supervisor path. Declined / printed / no-offer → fall through.
+  if (await maybeOfferAndMigrate(r)) return startViaSupervisor(svc, r);
   // --- no-unit detached fallback (unchanged; preserved until Phase 5) ---
   if (svc === HUB_SVC) return startHubSvc(r);
   const picked = await resolveTargets(svc, r.manifestPath);
@@ -941,6 +1015,9 @@ export async function stop(svc: string | undefined, opts: LifecycleOpts = {}): P
   // Phase 3b dual-dispatch (design §3.3). Unit-installed → drive the supervisor
   // / platform manager; else the unchanged detached arm below.
   if (r.sup.unitInstalled) return stopViaSupervisor(svc, r);
+  // §7.5 auto-detect-and-offer (see `start`). On accept+migrate, re-dispatch
+  // through the supervisor path.
+  if (await maybeOfferAndMigrate(r)) return stopViaSupervisor(svc, r);
   // --- no-unit detached fallback (unchanged; preserved until Phase 5) ---
   if (svc === HUB_SVC) return stopHubSvc(r);
   const picked = await resolveTargets(svc, r.manifestPath);
@@ -998,6 +1075,9 @@ export async function restart(svc: string | undefined, opts: LifecycleOpts = {})
   // / platform manager (with the 404-fallthrough for modules, §6.2); else the
   // unchanged detached stop-then-start below.
   if (r.sup.unitInstalled) return restartViaSupervisor(svc, r);
+  // §7.5 auto-detect-and-offer (see `start`). On accept+migrate, re-dispatch
+  // through the supervisor path.
+  if (await maybeOfferAndMigrate(r)) return restartViaSupervisor(svc, r);
   // --- no-unit detached fallback (unchanged; preserved until Phase 5) ---
   // Pass `supervisor: undefined` to the inner stop/start so their own
   // `resolveSupervisor` short-circuits to `unitInstalled: false` without
