@@ -31,6 +31,7 @@ import {
   isModuleInstallChannel,
   setModuleInstallChannel,
 } from "./hub-settings.ts";
+import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import {
   type ModuleManifest,
@@ -116,6 +117,18 @@ export type CuratedModuleShort = (typeof CURATED_MODULES)[number];
 export interface ApiModulesDeps {
   db: Database;
   issuer: string;
+  /**
+   * The SET of origins the hub legitimately answers on — loopback aliases ∪
+   * expose-state public origin ∪ platform/env origin ∪ the per-request
+   * `issuer`. The host-admin bearer's `iss` is validated against THIS set, not
+   * the single per-request `issuer` (hub#516): `parachute status` reads this
+   * endpoint on loopback presenting the operator token, whose `iss` is the
+   * hub's public origin after `expose`. Built via `buildHubBoundOrigins` at the
+   * call site. When absent, falls back to the single-element `[issuer]` set
+   * (the prior strict per-request behavior) so non-HTTP callers / tests are
+   * unaffected.
+   */
+  knownIssuers?: readonly string[];
   manifestPath: string;
   supervisor?: Supervisor;
   /**
@@ -312,10 +325,20 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
     return jsonError(401, "unauthenticated", "empty bearer token");
   }
 
-  // Bearer validation.
+  // Bearer validation. Host-admin (operator / SPA) token: accept the `iss`
+  // against the SET of origins the hub answers on, not the single per-request
+  // issuer (hub#516) — `parachute status` reads this on loopback presenting the
+  // operator token, whose `iss` is the hub's public origin after `expose`. This
+  // surface gates on the non-requestable `parachute:host:auth` scope below, so
+  // the relaxation only ever touches the hub's own self-issued host-admin
+  // credentials and cannot reach an OAuth token's validation.
   let bearerScopes: string[];
   try {
-    const validated = await validateAccessToken(deps.db, bearer, deps.issuer);
+    const validated = await validateHostAdminToken(
+      deps.db,
+      bearer,
+      deps.knownIssuers ?? [deps.issuer],
+    );
     if (typeof validated.payload.sub !== "string" || validated.payload.sub.length === 0) {
       return jsonError(401, "unauthenticated", "bearer token has no sub claim");
     }

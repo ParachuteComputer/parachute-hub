@@ -1783,9 +1783,16 @@ export function hubFetch(
 
     if (pathname === "/api/modules") {
       if (!getDb) return dbNotConfigured();
+      const od = oauthDeps(req);
       const modulesDeps: Parameters<typeof handleApiModules>[1] = {
         db: getDb(),
-        issuer: oauthDeps(req).issuer,
+        issuer: od.issuer,
+        // hub#516: validate the host-admin bearer's `iss` against the SET of
+        // origins the hub answers on (loopback ∪ expose-state ∪ env/platform ∪
+        // per-request issuer), so `parachute status` works on an exposed box
+        // where the operator token carries the public origin but the loopback
+        // request resolves the loopback issuer.
+        knownIssuers: od.hubBoundOrigins(),
         manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
       };
       if (deps?.supervisor !== undefined) modulesDeps.supervisor = deps.supervisor;
@@ -1841,9 +1848,13 @@ export function hubFetch(
       }
       const opId = decodeURIComponent(pathname.slice("/api/modules/operations/".length));
       if (!opId || opId.includes("/")) return new Response("not found", { status: 404 });
+      const od = oauthDeps(req);
       return handleOperationGet(req, opId, {
         db: getDb(),
-        issuer: oauthDeps(req).issuer,
+        issuer: od.issuer,
+        // hub#516: see the `/api/modules` deps note — the CLI polls async ops
+        // on loopback with the operator token (public `iss`).
+        knownIssuers: od.hubBoundOrigins(),
         manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
         configDir: CONFIG_DIR,
         supervisor: deps.supervisor,
@@ -1888,9 +1899,14 @@ export function hubFetch(
       }
       const match = parseModulesPath(pathname);
       if (!match) return new Response("not found", { status: 404 });
+      const od = oauthDeps(req);
       const opsDeps = {
         db: getDb(),
-        issuer: oauthDeps(req).issuer,
+        issuer: od.issuer,
+        // hub#516: the CLI drives start/stop/restart/install/upgrade/uninstall
+        // on loopback with the operator token, whose `iss` is the hub's public
+        // origin after `expose`. Validate against the hub's known-origin set.
+        knownIssuers: od.hubBoundOrigins(),
         manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
         configDir: CONFIG_DIR,
         supervisor: deps.supervisor,

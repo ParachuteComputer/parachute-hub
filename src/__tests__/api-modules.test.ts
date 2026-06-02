@@ -63,6 +63,32 @@ async function mintBearer(h: Harness, scopes: string[]): Promise<string> {
   return signed.token;
 }
 
+/** The hub's public origin after `expose` — what the operator token's `iss` becomes (hub#516). */
+const PUBLIC_ORIGIN = "https://parachute.taildf9ce2.ts.net";
+/** A foreign origin the hub never answers on (hub#516). */
+const FOREIGN_ORIGIN = "https://evil.example.com";
+
+/** Mint a host-admin (operator-shaped) bearer at a chosen `iss` (hub#516). */
+async function mintBearerAtIssuer(h: Harness, scopes: string[], iss: string): Promise<string> {
+  const signed = await signAccessToken(h.db, {
+    sub: h.userId,
+    scopes,
+    audience: "operator",
+    clientId: "parachute-hub",
+    issuer: iss,
+    ttlSeconds: 3600,
+  });
+  recordTokenMint(h.db, {
+    jti: signed.jti,
+    createdVia: "operator_mint",
+    subject: "operator",
+    clientId: "parachute-hub",
+    scopes,
+    expiresAt: signed.expiresAt,
+  });
+  return signed.token;
+}
+
 function writeManifest(path: string, services: unknown[]): void {
   writeFileSync(path, JSON.stringify({ services }));
 }
@@ -145,6 +171,47 @@ describe("GET /api/modules", () => {
     expect(res.status).toBe(403);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("insufficient_scope");
+  });
+
+  // hub#516: `parachute status` reads /api/modules on loopback presenting the
+  // operator token, whose `iss` is the PUBLIC origin after `expose`. The
+  // host-admin bearer's iss is validated against `knownIssuers` (loopback ∪
+  // expose-state public ∪ env), not the single per-request loopback issuer.
+  test("live repro: public-iss operator token on a loopback request → 200 (hub#516)", async () => {
+    const bearer = await mintBearerAtIssuer(h, [API_MODULES_REQUIRED_SCOPE], PUBLIC_ORIGIN);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER, // loopback per-request issuer
+      knownIssuers: [ISSUER, "http://localhost:1939", PUBLIC_ORIGIN],
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+    });
+    expect(res.status).toBe(200);
+  });
+
+  test("FOREIGN-iss operator token → 401 (no widening) (hub#516)", async () => {
+    const bearer = await mintBearerAtIssuer(h, [API_MODULES_REQUIRED_SCOPE], FOREIGN_ORIGIN);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      knownIssuers: [ISSUER, "http://localhost:1939", PUBLIC_ORIGIN],
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+    });
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error_description: string };
+    expect(body.error_description).toMatch(/unexpected "iss" claim value/);
+  });
+
+  test("knownIssuers absent → strict per-request issuer fallback rejects public-iss (hub#516)", async () => {
+    const bearer = await mintBearerAtIssuer(h, [API_MODULES_REQUIRED_SCOPE], PUBLIC_ORIGIN);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER, // no knownIssuers → falls back to [issuer]
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+    });
+    expect(res.status).toBe(401);
   });
 
   test("200 + curated list on fresh container (empty services.json)", async () => {

@@ -70,6 +70,36 @@ async function mintBearer(h: Harness, scopes: string[]): Promise<string> {
   return signed.token;
 }
 
+/**
+ * Mint a host-admin bearer at a chosen `iss` (hub#516). The CLI presents the
+ * operator token on loopback; after `expose` its `iss` is the public origin
+ * while the loopback request resolves the loopback issuer.
+ */
+async function mintBearerAtIssuer(h: Harness, scopes: string[], iss: string): Promise<string> {
+  const signed = await signAccessToken(h.db, {
+    sub: h.userId,
+    scopes,
+    audience: "operator",
+    clientId: "parachute-hub",
+    issuer: iss,
+    ttlSeconds: 3600,
+  });
+  recordTokenMint(h.db, {
+    jti: signed.jti,
+    createdVia: "operator_mint",
+    subject: "operator",
+    clientId: "parachute-hub",
+    scopes,
+    expiresAt: signed.expiresAt,
+  });
+  return signed.token;
+}
+
+/** The hub's public origin after `expose` — what the operator token's `iss` becomes. */
+const PUBLIC_ORIGIN = "https://parachute.taildf9ce2.ts.net";
+/** A foreign origin the hub never answers on. */
+const FOREIGN_ORIGIN = "https://evil.example.com";
+
 function postReq(path: string, headers: Record<string, string>): Request {
   return new Request(`http://localhost${path}`, { method: "POST", headers });
 }
@@ -964,6 +994,97 @@ describe("POST /api/modules/:short/stop", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { short: string; stopped: boolean };
     expect(body.stopped).toBe(false);
+  });
+});
+
+/**
+ * hub#516 — the module-ops `authorize` accepts the operator token's `iss`
+ * against the SET of origins the hub answers on (knownIssuers), not just the
+ * single per-request issuer. Exercised through `handleStop` (the simplest sync
+ * op that goes through `authorize`). The per-request `issuer` here is loopback
+ * (mirroring a loopback CLI request); `knownIssuers` carries loopback + the
+ * public expose-state origin.
+ */
+describe("operator-token iss validation against knownIssuers (hub#516)", () => {
+  let h: Harness;
+  beforeEach(async () => {
+    h = await makeHarness();
+    _resetOperationsRegistryForTests();
+  });
+  afterEach(() => h.cleanup());
+
+  // The live repro: operator token's iss = PUBLIC origin, loopback request
+  // (per-request issuer = loopback), knownIssuers includes the public origin
+  // → ACCEPTED. Was rejected (`unexpected "iss" claim value`) pre-fix.
+  test("live repro: public-iss operator token on a loopback request → ACCEPTED", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    const bearer = await mintBearerAtIssuer(h, [API_MODULES_OPS_REQUIRED_SCOPE], PUBLIC_ORIGIN);
+    const res = await handleStop(
+      postReq("/api/modules/vault/stop", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER, // loopback per-request issuer
+        knownIssuers: [ISSUER, "http://localhost:1939", PUBLIC_ORIGIN],
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+      },
+    );
+    // Not a 401 — authorize passed. (stopped:false because nothing's running.)
+    expect(res.status).toBe(200);
+  });
+
+  test("loopback-iss operator token, loopback knownIssuers → accepted (unchanged)", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    const bearer = await mintBearerAtIssuer(h, [API_MODULES_OPS_REQUIRED_SCOPE], ISSUER);
+    const res = await handleStop(
+      postReq("/api/modules/vault/stop", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        knownIssuers: [ISSUER, "http://localhost:1939"],
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+      },
+    );
+    expect(res.status).toBe(200);
+  });
+
+  test("FOREIGN-iss operator token → 401 (no widening to arbitrary issuers)", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    const bearer = await mintBearerAtIssuer(h, [API_MODULES_OPS_REQUIRED_SCOPE], FOREIGN_ORIGIN);
+    const res = await handleStop(
+      postReq("/api/modules/vault/stop", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        knownIssuers: [ISSUER, "http://localhost:1939", PUBLIC_ORIGIN],
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+      },
+    );
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error_description: string };
+    expect(body.error_description).toMatch(/unexpected "iss" claim value/);
+  });
+
+  test("knownIssuers absent → falls back to strict per-request issuer (back-compat)", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    // Public-iss token, loopback per-request issuer, NO knownIssuers wired →
+    // the strict single-issuer fallback rejects (the pre-fix behavior the
+    // non-HTTP install path relies on).
+    const bearer = await mintBearerAtIssuer(h, [API_MODULES_OPS_REQUIRED_SCOPE], PUBLIC_ORIGIN);
+    const res = await handleStop(
+      postReq("/api/modules/vault/stop", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, configDir: h.dir, supervisor },
+    );
+    expect(res.status).toBe(401);
   });
 });
 

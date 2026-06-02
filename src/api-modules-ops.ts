@@ -40,8 +40,8 @@ import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import { isLinked as defaultIsLinked } from "./bun-link.ts";
 import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
 import { buildModuleSpawnRequest } from "./commands/serve-boot.ts";
+import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import { getModuleInstallChannel } from "./hub-settings.ts";
-import { validateAccessToken } from "./jwt-sign.ts";
 import { readModuleManifest } from "./module-manifest.ts";
 import { refreshWellKnown, stampInstallDirOnRow } from "./post-install.ts";
 import {
@@ -180,6 +180,21 @@ export interface RunOpts {
 export interface ApiModulesOpsDeps {
   db: Database;
   issuer: string;
+  /**
+   * The SET of origins the hub legitimately answers on — loopback aliases ∪
+   * expose-state public origin ∪ platform/env origin ∪ the per-request
+   * `issuer`. The host-admin bearer's `iss` is validated against THIS set, not
+   * the single per-request `issuer` (hub#516): the CLI drives these endpoints
+   * on loopback presenting the operator token, whose `iss` is the hub's public
+   * origin after `expose`. Built via `buildHubBoundOrigins` at the call site.
+   *
+   * Optional for back-compat with callers that don't construct it (the
+   * first-boot wizard's `runInstall`, tests). When absent, `authorize` falls
+   * back to the single-element `[issuer]` set — i.e. the prior strict
+   * per-request behavior — so the relaxation is opt-in at the HTTP call site
+   * and the non-HTTP install path is unaffected.
+   */
+  knownIssuers?: readonly string[];
   manifestPath: string;
   configDir: string;
   supervisor: Supervisor;
@@ -280,7 +295,18 @@ async function authorize(req: Request, deps: ApiModulesOpsDeps): Promise<Respons
   const bearer = auth.slice("Bearer ".length).trim();
   if (!bearer) return jsonError(401, "unauthenticated", "empty bearer token");
   try {
-    const validated = await validateAccessToken(deps.db, bearer, deps.issuer);
+    // Host-admin (operator / SPA) token validation: accept the `iss` against
+    // the SET of origins the hub answers on, not the single per-request issuer
+    // (hub#516). This surface only ever accepts the hub's own self-issued
+    // host-admin credentials (the `parachute:host:admin` scope below is
+    // non-requestable via OAuth), so the relaxation cannot reach an OAuth
+    // token's validation. Falls back to the strict single-issuer set when
+    // `knownIssuers` isn't wired (non-HTTP install path / tests).
+    const validated = await validateHostAdminToken(
+      deps.db,
+      bearer,
+      deps.knownIssuers ?? [deps.issuer],
+    );
     if (typeof validated.payload.sub !== "string" || validated.payload.sub.length === 0) {
       return jsonError(401, "unauthenticated", "bearer token has no sub claim");
     }
