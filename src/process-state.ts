@@ -11,6 +11,13 @@ import { CONFIG_DIR } from "./config.ts";
  * `pid file present` + `process.kill(pid, 0)` succeeds. A stale PID file
  * (process died without cleanup) reads as stopped; writers of the PID
  * file own removing it on clean shutdown.
+ *
+ * Phase 5b retired the detached module/hub spawners that *wrote* per-service
+ * pidfiles. The pidfile READERS (`readPid` / `processState`) are deliberately
+ * kept (design §7.5) so the migrate detector (`hasPriorDetachedInstall`) can
+ * still see a prior detached install for one release. `writePid` / `clearPid`
+ * remain too — `serve` (hub-server.ts) writes its own `hub` pidfile so
+ * `parachute stop hub` / `migrate` can find a serve-mode hub.
  */
 
 export function serviceDir(svc: string, configDir: string = CONFIG_DIR): string {
