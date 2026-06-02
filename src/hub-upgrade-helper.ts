@@ -102,6 +102,7 @@ export interface HubUpgradeHelperDeps {
   /** Append to the on-disk status file (test seam). */
   appendStatus?: (
     configDir: string,
+    operationId: string,
     patch: Partial<Pick<HubUpgradeStatus, "phase" | "error">>,
     logLine?: string,
   ) => void;
@@ -122,9 +123,14 @@ export async function runHubUpgradeHelper(
   const hubUnitDeps = deps.hubUnitDeps ?? defaultHubUnitDeps;
   const signalHub = deps.signalHub ?? ((pid, signal) => process.kill(pid, signal));
   const append = deps.appendStatus ?? appendHubUpgradeStatus;
-  const { configDir } = args;
+  const { configDir, operationId } = args;
 
-  append(configDir, { phase: "running" }, `hub-upgrade helper started (op ${args.operationId})`);
+  append(
+    configDir,
+    operationId,
+    { phase: "running" },
+    `hub-upgrade helper started (op ${operationId})`,
+  );
 
   const unitManaged = unitInstalledFn(hubUnitDeps);
 
@@ -141,7 +147,7 @@ export async function runHubUpgradeHelper(
     channel: args.channel,
     configDir,
     restartFn: async () => 0,
-    log: (line) => append(configDir, {}, line),
+    log: (line) => append(configDir, operationId, {}, line),
   };
 
   let code: number;
@@ -149,13 +155,14 @@ export async function runHubUpgradeHelper(
     code = await upgrade("hub", upgradeOpts);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    append(configDir, { phase: "failed", error: msg }, `hub-upgrade failed: ${msg}`);
+    append(configDir, operationId, { phase: "failed", error: msg }, `hub-upgrade failed: ${msg}`);
     return 1;
   }
 
   if (code !== 0) {
     append(
       configDir,
+      operationId,
       { phase: "failed", error: `upgrade exited ${code}` },
       `hub-upgrade rewrite failed (exit ${code}) — binary NOT restarted`,
     );
@@ -172,10 +179,11 @@ export async function runHubUpgradeHelper(
     // reliably write `succeeded` — the new hub's version is the SPA's success
     // signal (it polls /health + /api/hub), not our file.
     const res = restartUnit(hubUnitDeps);
-    for (const m of res.messages) append(configDir, {}, m);
+    for (const m of res.messages) append(configDir, operationId, {}, m);
     if (res.outcome !== "ok") {
       append(
         configDir,
+        operationId,
         { phase: "failed", error: `hub unit restart ${res.outcome}` },
         `hub binary rewritten but the unit restart ${res.outcome} — restart it manually`,
       );
@@ -183,6 +191,7 @@ export async function runHubUpgradeHelper(
     }
     append(
       configDir,
+      operationId,
       { phase: "restarting" },
       "hub unit restarted via the service manager — the SPA polls /health + version for the new binary",
     );
@@ -197,6 +206,7 @@ export async function runHubUpgradeHelper(
   // the process exits and the runtime brings it back.
   append(
     configDir,
+    operationId,
     { phase: "restarting" },
     "container: signalling the hub to exit gracefully so the runtime restarts it on the new binary",
   );

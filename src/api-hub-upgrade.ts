@@ -58,6 +58,14 @@ import { validateAccessToken } from "./jwt-sign.ts";
 /** Same scope module-ops gates on — destructive host-admin action. */
 export const HUB_UPGRADE_REQUIRED_SCOPE = "parachute:host:admin";
 
+/**
+ * Non-terminal phases — an upgrade in any of these is still in flight, so a
+ * second `POST /api/hub/upgrade` is rejected 409. The terminal phases
+ * (`failed`, `redeploy-required`, and the SPA-inferred `succeeded`) are NOT
+ * here, so a new upgrade may start once the prior op reached one of them.
+ */
+const IN_FLIGHT_PHASES = new Set<HubUpgradeStatus["phase"]>(["pending", "running", "restarting"]);
+
 export interface SpawnHelperArgs {
   operationId: string;
   channel: "rc" | "latest";
@@ -98,6 +106,12 @@ export interface ApiHubUpgradeDeps {
   detectMode?: typeof detectHubUpgradeMode;
   /** Override "now" (test seam). */
   now?: () => Date;
+  /**
+   * Read the current on-disk status (for the 409 in-flight guard). Defaults to
+   * `readHubUpgradeStatus`; injectable so a test can drive the guard without
+   * seeding a real file.
+   */
+  readStatus?: (configDir: string) => HubUpgradeStatus | null;
 }
 
 interface ParsedBody {
@@ -197,6 +211,25 @@ export async function handleHubUpgrade(req: Request, deps: ApiHubUpgradeDeps): P
 
   const parsed = await parseBody(req);
   if (parsed instanceof Response) return parsed;
+
+  // ── 409 in-flight guard ────────────────────────────────────────────────────
+  // The status file is single-slot (one hub, one upgrade). If a prior upgrade
+  // is still in a non-terminal phase (pending/running/restarting), starting a
+  // SECOND would overwrite its operation_id — and a still-running first helper
+  // would then either clobber the new op's status or be silently superseded.
+  // The SPA disables the button while upgrading, but the API must guard
+  // server-side too (a second tab, a stale page, a scripted POST). Reject with
+  // 409 unless the slot is free (no file) or the prior op reached a terminal
+  // phase (failed / redeploy-required / succeeded).
+  const readStatus = deps.readStatus ?? readHubUpgradeStatus;
+  const existing = readStatus(deps.configDir);
+  if (existing && IN_FLIGHT_PHASES.has(existing.phase)) {
+    return jsonError(
+      409,
+      "upgrade_in_flight",
+      `a hub upgrade is already ${existing.phase} (operation ${existing.operation_id}); poll GET /api/hub/upgrade/status or wait for it to finish before starting another`,
+    );
+  }
 
   const hubSrcDir = deps.hubSrcDir ?? dirname(fileURLToPath(import.meta.url));
   const env = deps.env ?? process.env;

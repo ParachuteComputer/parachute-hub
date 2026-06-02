@@ -36,7 +36,13 @@ export type HubUpgradeStatusPhase =
    * write a terminal state (the hub it would report to is being torn down).
    */
   | "restarting"
-  /** Terminal success the helper managed to record before the bounce. */
+  /**
+   * Terminal success. RESERVED / SPA-INFERRED: the helper does NOT write this —
+   * it can't reliably record `succeeded` before the hub bounce tears down the
+   * process. The SPA infers success from `/health` + the reported version
+   * (HubUpgradeCard), not from this phase. Kept in the enum so the SPA success
+   * detection + the 409 in-flight guard's terminal-phase check can reference it.
+   */
   | "succeeded"
   /** Terminal failure (rewrite failed, downgrade refused, etc.). */
   | "failed"
@@ -110,18 +116,33 @@ export function readHubUpgradeStatus(configDir: string): HubUpgradeStatus | null
  * Used by the helper to record progress the SPA polls. A missing file (the
  * endpoint should always seed it first) is a no-op rather than a throw — the
  * helper's job is the upgrade, not bookkeeping.
+ *
+ * OPERATION GUARD: `operationId` is the op the caller (helper) was spawned
+ * with. The status file is single-slot — a newer `POST /api/hub/upgrade` will
+ * overwrite it with a fresh `operation_id`. A still-running helper from the
+ * SUPERSEDED operation must not clobber the newer operation's status with its
+ * stale progress. So we only write when the on-disk `operation_id` still
+ * matches `operationId`; otherwise the append is a NO-OP (the newer operation
+ * owns the slot now). This makes concurrent-upgrade status-file corruption
+ * impossible from the helper side.
  */
 export function appendHubUpgradeStatus(
   configDir: string,
+  operationId: string,
   patch: Partial<Pick<HubUpgradeStatus, "phase" | "error">>,
   logLine?: string,
 ): void {
   const current = readHubUpgradeStatus(configDir);
   if (!current) return;
+  // A newer operation superseded this one — do NOT clobber its status.
+  if (current.operation_id !== operationId) return;
   const next: HubUpgradeStatus = { ...current };
   if (patch.phase) next.phase = patch.phase;
   if (patch.error !== undefined) next.error = patch.error;
   if (logLine) next.log = [...current.log, logLine];
+  // `succeeded` is reserved/SPA-inferred (see HubUpgradeStatusPhase) — the
+  // helper can't reliably write it before the hub bounce, so in practice only
+  // `failed` reaches this branch. Both terminal phases stamp `finished_at`.
   if (patch.phase === "succeeded" || patch.phase === "failed") {
     next.finished_at = new Date().toISOString();
   }

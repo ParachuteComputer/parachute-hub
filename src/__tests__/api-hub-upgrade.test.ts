@@ -25,7 +25,12 @@ import { hubDbPath, openHubDb } from "../hub-db.ts";
 import type { HubUnitDeps, HubUnitManagerOpResult } from "../hub-unit.ts";
 import { runHubUpgradeHelper } from "../hub-upgrade-helper.ts";
 import { detectHubUpgradeMode } from "../hub-upgrade-mode.ts";
-import { readHubUpgradeStatus, writeHubUpgradeStatus } from "../hub-upgrade-status.ts";
+import {
+  type HubUpgradeStatus,
+  appendHubUpgradeStatus,
+  readHubUpgradeStatus,
+  writeHubUpgradeStatus,
+} from "../hub-upgrade-status.ts";
 import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { createUser } from "../users.ts";
@@ -314,6 +319,122 @@ describe("POST /api/hub/upgrade — redeploy-required short-circuit (§5.3)", ()
     const status = readHubUpgradeStatus(harness.dir);
     expect(status?.phase).toBe("redeploy-required");
     expect(status?.mode).toBe("redeploy-required");
+  });
+});
+
+describe("POST /api/hub/upgrade — 409 in-flight guard (concurrent-upgrade)", () => {
+  /** Seed the status file with a prior op in the given phase. */
+  function seedStatus(dir: string, phase: HubUpgradeStatus["phase"], opId = "prior-op"): void {
+    writeHubUpgradeStatus(dir, {
+      operation_id: opId,
+      phase,
+      mode: "in-place",
+      current_version: "0.6.3-rc.1",
+      target_version: "0.6.3-rc.2",
+      channel: "rc",
+      log: [],
+      started_at: new Date().toISOString(),
+    });
+  }
+
+  for (const phase of ["pending", "running", "restarting"] as const) {
+    test(`rejects a second POST while phase=${phase} with 409, no second helper spawned`, async () => {
+      const bearer = await mintBearer(harness, ["parachute:host:admin"]);
+      seedStatus(harness.dir, phase);
+      const { deps, spawned } = baseDeps(harness);
+      const res = await handleHubUpgrade(
+        postReq({ authorization: `Bearer ${bearer}` }, { channel: "rc" }),
+        deps,
+      );
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("upgrade_in_flight");
+      // No second helper spawned; the prior op's status is untouched.
+      expect(spawned.length).toBe(0);
+      const status = readHubUpgradeStatus(harness.dir);
+      expect(status?.operation_id).toBe("prior-op");
+      expect(status?.phase).toBe(phase);
+    });
+  }
+
+  for (const phase of ["failed", "redeploy-required", "succeeded"] as const) {
+    test(`allows a new POST when the prior op is terminal (phase=${phase})`, async () => {
+      const bearer = await mintBearer(harness, ["parachute:host:admin"]);
+      seedStatus(harness.dir, phase);
+      const { deps, spawned } = baseDeps(harness);
+      const res = await handleHubUpgrade(
+        postReq({ authorization: `Bearer ${bearer}` }, { channel: "rc" }),
+        deps,
+      );
+      expect(res.status).toBe(202);
+      // A fresh operation took the slot + spawned its helper.
+      expect(spawned.length).toBe(1);
+      const status = readHubUpgradeStatus(harness.dir);
+      expect(status?.operation_id).not.toBe("prior-op");
+      expect(spawned[0]?.operationId).toBe(status?.operation_id);
+    });
+  }
+
+  test("no prior status file → POST proceeds normally", async () => {
+    const bearer = await mintBearer(harness, ["parachute:host:admin"]);
+    const { deps, spawned } = baseDeps(harness);
+    const res = await handleHubUpgrade(
+      postReq({ authorization: `Bearer ${bearer}` }, { channel: "rc" }),
+      deps,
+    );
+    expect(res.status).toBe(202);
+    expect(spawned.length).toBe(1);
+  });
+});
+
+describe("appendHubUpgradeStatus — operation_id guard (stale-helper isolation)", () => {
+  test("a mismatched operationId is a NO-OP (cannot overwrite a newer op's status)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "phub-append-guard-"));
+    try {
+      // The slot is owned by the NEWER operation "op-2".
+      writeHubUpgradeStatus(dir, {
+        operation_id: "op-2",
+        phase: "pending",
+        mode: "in-place",
+        current_version: "0.6.3-rc.2",
+        target_version: "0.6.3-rc.3",
+        channel: "rc",
+        log: ["op-2 accepted"],
+        started_at: new Date().toISOString(),
+      });
+      // A STALE helper from the superseded "op-1" tries to write — must no-op.
+      appendHubUpgradeStatus(dir, "op-1", { phase: "failed", error: "stale" }, "stale helper line");
+      const after = readHubUpgradeStatus(dir);
+      expect(after?.operation_id).toBe("op-2");
+      expect(after?.phase).toBe("pending"); // NOT "failed"
+      expect(after?.error).toBeUndefined();
+      expect(after?.log).toEqual(["op-2 accepted"]); // stale line NOT appended
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a matching operationId writes (phase advances + log appends)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "phub-append-match-"));
+    try {
+      writeHubUpgradeStatus(dir, {
+        operation_id: "op-1",
+        phase: "pending",
+        mode: "in-place",
+        current_version: "0.6.3-rc.1",
+        target_version: "0.6.3-rc.2",
+        channel: "rc",
+        log: ["accepted"],
+        started_at: new Date().toISOString(),
+      });
+      appendHubUpgradeStatus(dir, "op-1", { phase: "running" }, "helper started");
+      const after = readHubUpgradeStatus(dir);
+      expect(after?.operation_id).toBe("op-1");
+      expect(after?.phase).toBe("running");
+      expect(after?.log).toEqual(["accepted", "helper started"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
