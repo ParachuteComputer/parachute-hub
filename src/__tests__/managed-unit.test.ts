@@ -429,16 +429,30 @@ describe("buildHubManagedUnit — §4.1 hub-unit shape", () => {
     expect(() => hubUnit(f.deps)).toThrow(/'bun' not found on PATH/);
   });
 
-  test("env carries the 4 vars and INTENTIONALLY OMITS PARACHUTE_HUB_ORIGIN", () => {
+  test("env carries the 5 vars and INTENTIONALLY OMITS PARACHUTE_HUB_ORIGIN", () => {
     const f = fakeDeps({ platform: "linux" });
     const unit = hubUnit(f.deps);
     expect(unit.env).toEqual({
+      // Forced loopback (security): a self-hosted supervised hub must NOT inherit
+      // serve.ts's container-first 0.0.0.0 default and bare-serve all-interfaces.
+      PARACHUTE_BIND_HOST: "127.0.0.1",
       PARACHUTE_HOME: "/home/op/.parachute",
       PORT: "1939",
       PATH: "/home/op/.bun/bin:/usr/local/bin:/usr/bin:/bin",
       BUN_INSTALL: "/home/op/.bun",
     });
     expect(unit.env.PARACHUTE_HUB_ORIGIN).toBeUndefined();
+  });
+
+  test("env forces PARACHUTE_BIND_HOST=127.0.0.1 (loopback trust model — never 0.0.0.0)", () => {
+    const f = fakeDeps({ platform: "linux" });
+    const unit = hubUnit(f.deps);
+    // The whole point of the fix: the supervised hub unit binds loopback, NOT
+    // the serve.ts container-first 0.0.0.0 default. Covers both init + migrate
+    // (both route through buildHubManagedUnit) and both platforms (the env is
+    // platform-agnostic; systemd/launchd render shapes are asserted below).
+    expect(unit.env.PARACHUTE_BIND_HOST).toBe("127.0.0.1");
+    expect(unit.env.PARACHUTE_BIND_HOST).not.toBe("0.0.0.0");
   });
 
   test("PARACHUTE_HOME is the captured param, NOT the default (§4.2)", () => {
@@ -473,6 +487,9 @@ describe("buildHubManagedUnit — §4.1 hub-unit shape", () => {
     const unit = renderManagedSystemdUnit(hubUnit(f.deps), { root: true, userName: "op" });
     expect(unit).toContain("Description=Parachute hub (serve + supervisor)");
     expect(unit).toContain("User=op");
+    // Forced loopback bind (security): the supervised hub must bind 127.0.0.1.
+    expect(unit).toContain("Environment=PARACHUTE_BIND_HOST=127.0.0.1");
+    expect(unit).not.toContain("PARACHUTE_BIND_HOST=0.0.0.0");
     expect(unit).toContain("Environment=PARACHUTE_HOME=/home/op/.parachute");
     expect(unit).toContain("Environment=PORT=1939");
     expect(unit).toContain("Environment=PATH=/home/op/.bun/bin:/usr/local/bin:/usr/bin:/bin");
@@ -502,6 +519,9 @@ describe("buildHubManagedUnit — §4.1 hub-unit shape", () => {
     expect(plist).toContain("<string>/home/op/parachute-hub/src/cli.ts</string>");
     expect(plist).toContain("<string>serve</string>");
     expect(plist).toContain("<key>EnvironmentVariables</key>");
+    // Forced loopback bind (security): the supervised hub must bind 127.0.0.1.
+    expect(plist).toContain("<key>PARACHUTE_BIND_HOST</key>\n    <string>127.0.0.1</string>");
+    expect(plist).not.toContain("<string>0.0.0.0</string>");
     expect(plist).toContain("<key>PARACHUTE_HOME</key>\n    <string>/home/op/.parachute</string>");
     expect(plist).toContain("<key>PORT</key>\n    <string>1939</string>");
     expect(plist).toContain("<key>BUN_INSTALL</key>\n    <string>/home/op/.bun</string>");
