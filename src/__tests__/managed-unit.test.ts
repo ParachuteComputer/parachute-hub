@@ -482,7 +482,7 @@ describe("buildHubManagedUnit — §4.1 hub-unit shape", () => {
     expect(unit.env.PORT).toBe("2939");
   });
 
-  test("rendered systemd SYSTEM unit: 4 Environment= vars, User= present, StartLimit present", () => {
+  test("rendered systemd SYSTEM unit: 5 Environment= vars, User= present, StartLimit present", () => {
     const f = fakeDeps({ platform: "linux", getuid: () => 0, userName: () => "op" });
     const unit = renderManagedSystemdUnit(hubUnit(f.deps), { root: true, userName: "op" });
     expect(unit).toContain("Description=Parachute hub (serve + supervisor)");
@@ -511,7 +511,7 @@ describe("buildHubManagedUnit — §4.1 hub-unit shape", () => {
     expect(unit).toContain("WantedBy=default.target");
   });
 
-  test("rendered launchd plist: EnvironmentVariables dict (4 vars) + ThrottleInterval + abs ProgramArguments", () => {
+  test("rendered launchd plist: EnvironmentVariables dict (5 vars) + ThrottleInterval + abs ProgramArguments", () => {
     const f = fakeDeps({ platform: "darwin" });
     const plist = renderManagedLaunchdPlist(hubUnit(f.deps));
     expect(plist).toContain("<key>Label</key>\n  <string>computer.parachute.hub</string>");
