@@ -3,6 +3,8 @@ import { chmodSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ExposeState } from "../expose-state.ts";
+import { writeExposeState } from "../expose-state.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { signAccessToken, validateAccessToken } from "../jwt-sign.ts";
 import {
@@ -14,6 +16,7 @@ import {
   OPERATOR_TOKEN_SCOPE_SETS,
   OPERATOR_TOKEN_SCOPE_SET_CLAIM,
   OPERATOR_TOKEN_TTL_SECONDS,
+  buildKnownIssuersForOperatorToken,
   issueOperatorToken,
   mintOperatorToken,
   operatorTokenPath,
@@ -475,6 +478,280 @@ describe("useOperatorTokenWithAutoRotate (#213)", () => {
     } finally {
       h.cleanup();
     }
+  });
+});
+
+// hub#516 — the operator token's `iss` is the hub's PUBLIC origin after
+// `parachute expose`, but callers resolve `issuer` inconsistently (status →
+// loopback, lifecycle → public). The client-side validation now accepts the
+// token if its `iss` is ANY of the hub's known origins (loopback aliases ∪
+// expose-state public origin ∪ env), gated FIRST on the JWKS signature. These
+// tests pin the four-corner matrix: public-iss accepted with loopback config
+// (the status bug), loopback-iss accepted, foreign-iss rejected, and
+// foreign-SIGNATURE rejected even when its iss is in the known set.
+const PUBLIC_ISSUER = "https://parachute.taildf9ce2.ts.net";
+
+/** Minimal valid expose-state advertising `hubOrigin` (the public origin). */
+function exposeStateForOrigin(hubOrigin: string): ExposeState {
+  return {
+    version: 1,
+    layer: "tailnet",
+    mode: "path",
+    canonicalFqdn: new URL(hubOrigin).host,
+    port: 1939,
+    funnel: false,
+    entries: [],
+    hubOrigin,
+  };
+}
+
+describe("useOperatorTokenWithAutoRotate known-issuer set (hub#516)", () => {
+  // The PARACHUTE_HUB_ORIGIN / RENDER_EXTERNAL_URL / FLY_APP_NAME env vars feed
+  // the platform-origin seed of the known-issuer set. Tests that assert a
+  // public-iss is REJECTED when expose-state is absent must not have a stray
+  // env public origin leaking the iss back in — clear them around each test.
+  function withCleanPlatformEnv<T>(fn: () => T): T {
+    const saved = {
+      hub: process.env.PARACHUTE_HUB_ORIGIN,
+      render: process.env.RENDER_EXTERNAL_URL,
+      fly: process.env.FLY_APP_NAME,
+    };
+    // Computed-key delete (not `delete process.env.FOO`) so biome's noDelete
+    // doesn't fire — matches spawn-env-propagation.test.ts. A `= undefined`
+    // assignment would coerce to the string "undefined" and leak a bogus
+    // origin into the known-issuer set, so a real delete is required here.
+    for (const k of ["PARACHUTE_HUB_ORIGIN", "RENDER_EXTERNAL_URL", "FLY_APP_NAME"]) {
+      delete process.env[k];
+    }
+    try {
+      return fn();
+    } finally {
+      if (saved.hub !== undefined) process.env.PARACHUTE_HUB_ORIGIN = saved.hub;
+      if (saved.render !== undefined) process.env.RENDER_EXTERNAL_URL = saved.render;
+      if (saved.fly !== undefined) process.env.FLY_APP_NAME = saved.fly;
+    }
+  }
+
+  test("accepts a PUBLIC-iss operator token when config resolves loopback (the status bug)", async () => {
+    await withCleanPlatformEnv(async () => {
+      const h = makeHarness();
+      try {
+        const db = openHubDb(hubDbPath(h.dir));
+        try {
+          rotateSigningKey(db);
+          // Mint the operator token under the hub's PUBLIC origin — what
+          // happens on an exposed box (selfHealOperatorTokenIssuer re-mints to
+          // the public iss).
+          const issued = await issueOperatorToken(db, "user-abc", {
+            dir: h.dir,
+            issuer: PUBLIC_ISSUER,
+          });
+          // Expose-state advertises the public origin (so it lands in the
+          // known set). The CALLER resolves loopback (status's hardcoded path).
+          writeExposeState(exposeStateForOrigin(PUBLIC_ISSUER), join(h.dir, "expose-state.json"));
+
+          const used = await useOperatorTokenWithAutoRotate(db, {
+            configDir: h.dir,
+            issuer: TEST_ISSUER, // loopback — the status scenario
+          });
+          expect(used).not.toBeNull();
+          expect(used?.status.kind).toBe("fresh");
+          expect(used?.token).toBe(issued.token);
+          expect(used?.payload.iss).toBe(PUBLIC_ISSUER);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
+  test("accepts a loopback-iss operator token with loopback config", async () => {
+    await withCleanPlatformEnv(async () => {
+      const h = makeHarness();
+      try {
+        const db = openHubDb(hubDbPath(h.dir));
+        try {
+          rotateSigningKey(db);
+          const issued = await issueOperatorToken(db, "user-abc", {
+            dir: h.dir,
+            issuer: TEST_ISSUER,
+          });
+          // No expose-state — known set is loopback aliases only.
+          const used = await useOperatorTokenWithAutoRotate(db, {
+            configDir: h.dir,
+            issuer: TEST_ISSUER,
+          });
+          expect(used).not.toBeNull();
+          expect(used?.status.kind).toBe("fresh");
+          expect(used?.token).toBe(issued.token);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
+  test("rejects a token whose iss is FOREIGN to the known set", async () => {
+    await withCleanPlatformEnv(async () => {
+      const h = makeHarness();
+      try {
+        const db = openHubDb(hubDbPath(h.dir));
+        try {
+          rotateSigningKey(db);
+          // Hub-SIGNED (so the signature gate passes) but stamped with an iss
+          // that's neither loopback nor in expose-state nor env. Must reject.
+          const issued = await issueOperatorToken(db, "user-abc", {
+            dir: h.dir,
+            issuer: "https://evil.example.com",
+          });
+          expect(issued.token.length).toBeGreaterThan(0);
+          // expose-state advertises the PUBLIC origin (not the evil one), so
+          // the foreign iss is not in the known set.
+          writeExposeState(exposeStateForOrigin(PUBLIC_ISSUER), join(h.dir, "expose-state.json"));
+
+          await expect(
+            useOperatorTokenWithAutoRotate(db, { configDir: h.dir, issuer: TEST_ISSUER }),
+          ).rejects.toThrow(/unexpected "iss" claim value/);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
+  test("rejects a FOREIGN-SIGNED token even when its iss is in the known set (signature gate first)", async () => {
+    await withCleanPlatformEnv(async () => {
+      const h = makeHarness();
+      const foreign = makeHarness();
+      try {
+        const db = openHubDb(hubDbPath(h.dir));
+        // A DIFFERENT hub (different signing key) mints a token stamped with an
+        // iss that IS in our known set. The signature won't verify against our
+        // JWKS, so it must be rejected at the signature gate regardless of iss.
+        const foreignDb = openHubDb(hubDbPath(foreign.dir));
+        try {
+          rotateSigningKey(db);
+          rotateSigningKey(foreignDb);
+          const foreignToken = await mintOperatorToken(foreignDb, "user-abc", {
+            issuer: PUBLIC_ISSUER,
+          });
+          await writeOperatorTokenFile(foreignToken.token, h.dir);
+          // Our expose-state advertises PUBLIC_ISSUER — so the iss WOULD pass
+          // the belt-and-suspenders check. The signature gate must still reject.
+          writeExposeState(exposeStateForOrigin(PUBLIC_ISSUER), join(h.dir, "expose-state.json"));
+
+          await expect(
+            useOperatorTokenWithAutoRotate(db, { configDir: h.dir, issuer: TEST_ISSUER }),
+          ).rejects.toThrow();
+        } finally {
+          db.close();
+          foreignDb.close();
+        }
+      } finally {
+        h.cleanup();
+        foreign.cleanup();
+      }
+    });
+  });
+
+  test("expose-state absent: loopback-iss accepted, public-iss rejected (no public origin known)", async () => {
+    await withCleanPlatformEnv(async () => {
+      const h = makeHarness();
+      try {
+        const db = openHubDb(hubDbPath(h.dir));
+        try {
+          rotateSigningKey(db);
+          // A loopback-iss token is accepted (loopback alias is always in the set).
+          const loopbackTok = await issueOperatorToken(db, "user-abc", {
+            dir: h.dir,
+            issuer: TEST_ISSUER,
+          });
+          const usedLoopback = await useOperatorTokenWithAutoRotate(db, {
+            configDir: h.dir,
+            issuer: TEST_ISSUER,
+          });
+          expect(usedLoopback?.token).toBe(loopbackTok.token);
+
+          // Overwrite with a public-iss token. No expose-state, no env public
+          // origin → the public iss is NOT known → reject. (Correct: with no
+          // exposure configured, the hub doesn't legitimately answer on it.)
+          const publicTok = await issueOperatorToken(db, "user-abc", {
+            dir: h.dir,
+            issuer: PUBLIC_ISSUER,
+          });
+          expect(publicTok.token.length).toBeGreaterThan(0);
+          await expect(
+            useOperatorTokenWithAutoRotate(db, { configDir: h.dir, issuer: TEST_ISSUER }),
+          ).rejects.toThrow(/unexpected "iss" claim value/);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
+  test("auto-rotate still fires for a near-expiry token validated via the known set", async () => {
+    await withCleanPlatformEnv(async () => {
+      const h = makeHarness();
+      try {
+        const db = openHubDb(hubDbPath(h.dir));
+        try {
+          rotateSigningKey(db);
+          // Public-iss + 1-day TTL (below the 7d threshold). Validates via the
+          // known set (expose-state public origin), then auto-rotates.
+          const original = await issueOperatorToken(db, "user-abc", {
+            dir: h.dir,
+            issuer: PUBLIC_ISSUER,
+            scopeSet: "start",
+            ttlSeconds: 24 * 60 * 60,
+          });
+          writeExposeState(exposeStateForOrigin(PUBLIC_ISSUER), join(h.dir, "expose-state.json"));
+
+          const used = await useOperatorTokenWithAutoRotate(db, {
+            configDir: h.dir,
+            issuer: PUBLIC_ISSUER, // lifecycle's public-origin scenario
+          });
+          expect(used).not.toBeNull();
+          expect(used?.status.kind).toBe("rotated");
+          expect(used?.rotated?.scopeSet).toBe("start");
+          expect(used?.token).not.toBe(original.token);
+          // Re-mint stamps opts.issuer as the new iss; still validates.
+          const validated = await validateAccessToken(db, used!.token, PUBLIC_ISSUER);
+          expect(validated.payload.iss).toBe(PUBLIC_ISSUER);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
+  test("buildKnownIssuersForOperatorToken includes loopback aliases + expose-state public origin", async () => {
+    await withCleanPlatformEnv(() => {
+      const h = makeHarness();
+      try {
+        writeExposeState(exposeStateForOrigin(PUBLIC_ISSUER), join(h.dir, "expose-state.json"));
+        const set = buildKnownIssuersForOperatorToken(h.dir, TEST_ISSUER);
+        expect(set).toContain("http://127.0.0.1:1939");
+        expect(set).toContain("http://localhost:1939");
+        expect(set).toContain(PUBLIC_ISSUER);
+        // The seed issuer is included too.
+        expect(set).toContain(TEST_ISSUER);
+        // A foreign origin is NOT present.
+        expect(set).not.toContain("https://evil.example.com");
+      } finally {
+        h.cleanup();
+      }
+    });
   });
 });
 
