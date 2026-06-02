@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
+import { CONTAINER_HOME } from "./hub-control.ts";
 import { detectHubInstallSource } from "./install-source.ts";
 
 /**
@@ -120,7 +121,7 @@ export async function handleApiHub(req: Request, deps: ApiHubDeps): Promise<Resp
   // would label this `bun-linked` (the image runs from /app/src, not bun
   // globals), which is technically true but misleading for the operator —
   // "container" is what they actually want to see.
-  const isContainer = env.PARACHUTE_HOME === "/parachute";
+  const isContainer = env.PARACHUTE_HOME === CONTAINER_HOME;
 
   const body: HubStatusResponse = {
     version,

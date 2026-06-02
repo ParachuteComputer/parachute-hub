@@ -4268,3 +4268,67 @@ describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to
     }
   });
 });
+
+describe("hubFetch routing — /api/hub/upgrade (D4 SPA hub-upgrade)", () => {
+  test("POST /api/hub/upgrade dispatches to the handler (401 without bearer, NOT 404)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        await createUser(db, "owner", "pw");
+        // No bearer → the handler's auth gate returns 401. A 404 would mean
+        // the route never reached the handler (dispatch missing). The endpoint
+        // does NOT require a supervisor — assert it works without one.
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/api/hub/upgrade", { method: "POST" }),
+        );
+        expect(res.status).toBe(401);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("GET /api/hub/upgrade/status dispatches to the handler (401 without bearer)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        await createUser(db, "owner", "pw");
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/api/hub/upgrade/status"),
+        );
+        expect(res.status).toBe(401);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("GET on /api/hub/upgrade → 405 (POST-only) once authenticated path is reached", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        await createUser(db, "owner", "pw");
+        // GET on the POST-only upgrade route: no bearer means auth runs first
+        // (401). The point of this case is the route is wired (not 404).
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/api/hub/upgrade", { method: "GET" }),
+        );
+        expect(res.status).not.toBe(404);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});

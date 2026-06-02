@@ -28,6 +28,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { HubUpgradeCard } from "../components/HubUpgradeCard.tsx";
 import { renderOperationError } from "../components/MissingDependencyCard.tsx";
 import {
   type ModuleInstallChannel,
@@ -320,6 +321,16 @@ export function Modules() {
         Install, upgrade, and manage Parachute modules. Available modules are pinned for the v0.6
         release; the marketplace is on the roadmap.
       </p>
+
+      {/*
+        Upgrade-hub affordance (design 2026-06-01 §5.3 / D4). The hub is NOT a
+        supervised module — it's the host — so it isn't a row in the lists
+        below; it sits at the top as its own card. This is the no-shell
+        (Render/Fly) operator's path to upgrade the hub itself. Unlike module
+        upgrades, it does NOT require a supervisor (the hub upgrades itself via
+        a detached helper), so it renders regardless of `supervisor_available`.
+      */}
+      <HubUpgradeCard />
 
       <ChannelToggle
         channel={module_install_channel}

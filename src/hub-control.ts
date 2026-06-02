@@ -31,6 +31,14 @@ export const HUB_SVC = "hub";
 export const HUB_PACKAGE = "@openparachute/hub";
 export const HUB_DEFAULT_PORT = 1939;
 /**
+ * The container `PARACHUTE_HOME` — the Render Blueprint (and the shared Fly
+ * image) pins this exact path. `PARACHUTE_HOME === CONTAINER_HOME` is the most
+ * reliable container-mode signal the hub has. Single source of truth so the
+ * `/api/hub` status surface (`api-hub.ts`) and the in-place-vs-redeploy
+ * detection (`hub-upgrade-mode.ts`) can't drift on the magic path.
+ */
+export const CONTAINER_HOME = "/parachute";
+/**
  * Default fallback range is 1 — the hub binds 1939 or fails. Walking up would
  * steal another Parachute service's slot from the canonical 1939–1949 range.
  * Tests and debug tooling can pass a larger `fallbackRange` explicitly.

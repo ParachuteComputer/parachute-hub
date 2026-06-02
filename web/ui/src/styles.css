@@ -936,6 +936,24 @@ form .field-error {
 }
 
 /*
+ * Upgrade-hub card (design 2026-06-01 §5.3 / D4). Reuses the `.install-card`
+ * shape but sits at the top of /admin/modules as the host's own upgrade
+ * affordance. A subtle accent left-border marks it as the host (not a module
+ * row). The status line (upgrading / success / timeout / redeploy) wraps full
+ * width below the body via the existing `.warn-banner` / `.error-banner`.
+ */
+.hub-upgrade-card {
+  border-left: 3px solid var(--accent);
+  margin-top: 1.25rem;
+}
+.hub-upgrade-card .warn-banner,
+.hub-upgrade-card .error-banner {
+  flex-basis: 100%;
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+}
+
+/*
  * "Configure" link styled to match sibling action buttons on
  * `.module-row .actions`. React-router's <Link> renders an <a>, so
  * default `a` styles take over without these overrides — we want it
