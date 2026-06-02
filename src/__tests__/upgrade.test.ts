@@ -2,9 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { LifecycleOpts } from "../commands/lifecycle.ts";
+import { restart as lifecycleRestart } from "../commands/lifecycle.ts";
 import type { UpgradeRunner } from "../commands/upgrade.ts";
 import { compareVersions, defaultRunner, detectChannel, upgrade } from "../commands/upgrade.ts";
 import type { HubUnitDeps, HubUnitManagerOpResult } from "../hub-unit.ts";
+import { defaultHubUnitDeps } from "../hub-unit.ts";
+import type { MigrateOfferResult } from "../migrate-offer.ts";
 import { upsertService } from "../services-manifest.ts";
 
 interface RunCall {
@@ -84,6 +88,16 @@ function seedVault(manifestPath: string, installDir: string, version = "0.4.0"):
     manifestPath,
   );
 }
+
+/**
+ * Phase 5b: `upgrade hub` always restarts the hub UNIT via the platform manager
+ * (`restartHubUnit`) — the detached restart arm is retired. Hub-upgrade tests
+ * that aren't asserting the restart mechanism itself inject this benign seam so
+ * the manager op succeeds without a real systemd/launchd on the test host.
+ */
+const okHubUnitSupervisor = {
+  restartHubUnit: (): HubUnitManagerOpResult => ({ outcome: "ok" as const, messages: [] }),
+};
 
 describe("parachute upgrade", () => {
   test("errors cleanly when targeting a service that's not installed", async () => {
@@ -588,6 +602,7 @@ describe("parachute upgrade", () => {
       let restartedShort: string | undefined;
       const logs: string[] = [];
       const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -600,7 +615,8 @@ describe("parachute upgrade", () => {
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
-      expect(restartedShort).toBe("hub");
+      // Phase 5b: the hub restarts via the platform manager (okHubUnitSupervisor),
+      // not the detached restartFn — the unit-restart path has its own test.
       const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
       expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@latest"]);
       const joined = logs.join("\n");
@@ -637,6 +653,7 @@ describe("parachute upgrade", () => {
 
       let restartedShort: string | undefined;
       const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath, // file doesn't exist
         configDir: h.configDir,
         runner,
@@ -649,7 +666,8 @@ describe("parachute upgrade", () => {
         log: () => {},
       });
       expect(code).toBe(0);
-      expect(restartedShort).toBe("hub");
+      // Phase 5b: the hub restarts via the platform manager (okHubUnitSupervisor),
+      // not the detached restartFn — the unit-restart path has its own test.
     } finally {
       h.cleanup();
     }
@@ -684,6 +702,7 @@ describe("parachute upgrade", () => {
       let restartedShort: string | undefined;
       const logs: string[] = [];
       const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -696,7 +715,8 @@ describe("parachute upgrade", () => {
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
-      expect(restartedShort).toBe("hub");
+      // Phase 5b: the hub restarts via the platform manager (okHubUnitSupervisor),
+      // not the detached restartFn — the unit-restart path has its own test.
       expect(logs.join("\n")).toMatch(/hub: bun-linked checkout/);
     } finally {
       h.cleanup();
@@ -724,6 +744,7 @@ describe("parachute upgrade", () => {
       };
 
       await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -772,6 +793,15 @@ describe("parachute upgrade", () => {
 
       const restartCalls: string[] = [];
       const code = await upgrade(undefined, {
+        // Phase 5b: the hub restarts via the platform manager (restartHubUnit),
+        // modules via restartFn. Record both into one order list so the hub-first
+        // invariant is still asserted.
+        supervisor: {
+          restartHubUnit: (): HubUnitManagerOpResult => {
+            restartCalls.push("hub");
+            return { outcome: "ok", messages: [] };
+          },
+        },
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -787,7 +817,8 @@ describe("parachute upgrade", () => {
         log: () => {},
       });
       expect(code).toBe(0);
-      // Hub goes first so its dispatcher upgrade isn't preempted.
+      // Hub goes first (manager restart) so its dispatcher upgrade isn't
+      // preempted, then the module restarts route through lifecycle.
       expect(restartCalls).toEqual(["hub", "vault"]);
     } finally {
       h.cleanup();
@@ -842,6 +873,7 @@ describe("parachute upgrade", () => {
       const restartCalls: string[] = [];
       const logs: string[] = [];
       const code = await upgrade(undefined, {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -921,6 +953,7 @@ describe("parachute upgrade", () => {
       };
 
       const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -962,6 +995,7 @@ describe("parachute upgrade", () => {
       };
 
       await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -1004,6 +1038,7 @@ describe("parachute upgrade", () => {
       };
 
       await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -1046,6 +1081,7 @@ describe("parachute upgrade", () => {
       const logs: string[] = [];
       let restartCalled = false;
       const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -1097,6 +1133,7 @@ describe("parachute upgrade", () => {
       };
 
       const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -1154,6 +1191,7 @@ describe("parachute upgrade", () => {
       const logs: string[] = [];
       let restartedShort: string | undefined;
       const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -1169,7 +1207,8 @@ describe("parachute upgrade", () => {
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
-      expect(restartedShort).toBe("hub");
+      // Phase 5b: the hub restarts via the platform manager (okHubUnitSupervisor),
+      // not the detached restartFn — the unit-restart path has its own test.
       const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
       expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@rc"]);
       const joined = logs.join("\n");
@@ -1201,6 +1240,7 @@ describe("parachute upgrade", () => {
       };
 
       await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
@@ -1270,7 +1310,6 @@ describe("Phase 4 upgrade-hub dual-dispatch", () => {
         // Avoid a real registry round-trip in the downgrade guard.
         resolveChannelVersion: async () => null,
         supervisor: {
-          unitInstalled: true,
           restartHubUnit: (_deps: HubUnitDeps): HubUnitManagerOpResult => {
             restartHubUnitCalls++;
             return { outcome: "ok", messages: [] };
@@ -1291,7 +1330,12 @@ describe("Phase 4 upgrade-hub dual-dispatch", () => {
     }
   });
 
-  test("upgrade hub NO unit → detached restartFn (unchanged)", async () => {
+  test("upgrade hub NO unit → restartHubUnit reports no-unit, surfaced as a failure", async () => {
+    // Phase 5b: the detached restart arm is retired. `upgrade hub` always
+    // restarts the hub UNIT via the platform manager; on a box with no unit the
+    // manager op returns `no-unit` (after the binary rewrite), which the verb
+    // surfaces as a non-zero exit with the manager's message — never a detached
+    // spawn.
     const h = makeHarness();
     try {
       const hubInstallDir = join(h.installRoot, "hub");
@@ -1311,33 +1355,24 @@ describe("Phase 4 upgrade-hub dual-dispatch", () => {
         },
       };
 
-      let restartedShort: string | undefined;
-      let restartHubUnitCalls = 0;
+      const logs: string[] = [];
       const code = await upgrade("hub", {
         manifestPath: h.manifestPath,
         configDir: h.configDir,
         runner,
         findGlobalInstall: (pkg) =>
           pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
-        restartFn: async (svc) => {
-          restartedShort = svc;
-          return 0;
-        },
         resolveChannelVersion: async () => null,
-        // supervisor block present but unit NOT installed → detached arm.
         supervisor: {
-          unitInstalled: false,
-          restartHubUnit: (_deps: HubUnitDeps): HubUnitManagerOpResult => {
-            restartHubUnitCalls++;
-            return { outcome: "ok", messages: [] };
-          },
+          restartHubUnit: (_deps: HubUnitDeps): HubUnitManagerOpResult => ({
+            outcome: "no-unit",
+            messages: ["no hub unit installed — run `parachute migrate` to install it"],
+          }),
         },
-        log: () => {},
+        log: (l) => logs.push(l),
       });
-      expect(code).toBe(0);
-      // The detached restartFn ran; the manager restart did NOT.
-      expect(restartedShort).toBe("hub");
-      expect(restartHubUnitCalls).toBe(0);
+      expect(code).toBe(1);
+      expect(logs.join("\n")).toMatch(/no hub unit installed/);
     } finally {
       h.cleanup();
     }
@@ -1398,7 +1433,6 @@ describe("Phase 4 upgrade-hub dual-dispatch", () => {
         },
         resolveChannelVersion: async () => null,
         supervisor: {
-          unitInstalled: true,
           restartHubUnit: (_deps: HubUnitDeps): HubUnitManagerOpResult => {
             restartHubUnitCalls++;
             restartOrder.push("hub-unit");
@@ -1413,6 +1447,118 @@ describe("Phase 4 upgrade-hub dual-dispatch", () => {
       expect(restartOrder).toContain("vault");
       expect(restartOrder.indexOf("hub-unit")).toBeLessThan(restartOrder.indexOf("vault"));
       expect(restartHubUnitCalls).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5b nit: the module-target restart leg of `upgrade` must thread the SAME
+// opts a bare `parachute restart <svc>` does — `supervisor: {}` (real
+// `isHubUnitInstalled` probe, NOT a forced `unitInstalled: true`) +
+// `migrateOffer: { enabled: true }`. On a NO-UNIT box that means the module
+// restart surfaces the actionable "run `parachute migrate --to-supervised`"
+// error / fires the auto-offer, NOT a bare connection-refused from
+// `driveModuleOp`. The other upgrade tests stub `restartFn: async () => 0`, so
+// the supervised arm was never exercised here — this closes that gap by driving
+// the REAL `lifecycle.restart`.
+// ---------------------------------------------------------------------------
+
+describe("Phase 5b: upgrade module-restart on a no-unit box", () => {
+  test("module restart threads supervisor:{} + migrateOffer (no forced unitInstalled), surfaces actionable migrate error — NOT a bare connection-refused", async () => {
+    const h = makeHarness();
+    try {
+      const installDir = join(h.installRoot, "vault");
+      writePackageJson(installDir, { name: "@openparachute/vault", version: "0.4.0" });
+      seedVault(h.manifestPath, installDir, "0.4.0");
+
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          // `bun add -g` rewrites the package.json with a new version → the
+          // module restart leg (`restartTarget`) is reached.
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            writePackageJson(installDir, { name: "@openparachute/vault", version: "0.5.0" });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          // Not a git checkout → npm-install branch.
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "fatal: not a git repository\n" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      // A NO-UNIT box: force `isHubUnitInstalled` → false deterministically
+      // (regardless of the test host) by stubbing the unit-file existence probe.
+      const noUnitDeps: HubUnitDeps = { ...defaultHubUnitDeps, exists: () => false };
+
+      // The supervised arm's loopback module-ops call MUST NOT run on a no-unit
+      // box. If the regressed code forced `unitInstalled: true`, the verb would
+      // skip the probe and hit this — surfacing a bare connection-refused.
+      let driveModuleOpCalled = false;
+      const refuse = async (): Promise<never> => {
+        driveModuleOpCalled = true;
+        throw new Error("connect ECONNREFUSED 127.0.0.1:1939");
+      };
+
+      // Capture the opts `restartTarget` hands `lifecycle.restart`, then delegate
+      // to the REAL `lifecycle.restart` so the no-unit handling actually runs.
+      // The offer is overridden to a deterministic `declined` so the outcome
+      // doesn't depend on the host's stdin-TTY / prior-detached state.
+      let seenOpts: LifecycleOpts | undefined;
+      let offerCalls = 0;
+      const restartFn = async (svc: string, opts: LifecycleOpts): Promise<number> => {
+        seenOpts = opts;
+        return await lifecycleRestart(svc, {
+          ...opts,
+          supervisor: {
+            ...opts.supervisor,
+            hubUnitDeps: noUnitDeps,
+            driveModuleOp: refuse,
+          },
+          migrateOffer: {
+            enabled: opts.migrateOffer?.enabled ?? false,
+            offer: async (): Promise<MigrateOfferResult> => {
+              offerCalls++;
+              return { outcome: "declined" };
+            },
+          },
+        });
+      };
+
+      const logs: string[] = [];
+      const code = await upgrade("vault", {
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: () => join(installDir, "package.json"),
+        restartFn,
+        // Upgrade-side supervisor seam: feeds `r.hubUnitDeps`, which
+        // `restartTarget` threads into `lifecycle.restart`'s supervisor block.
+        supervisor: { hubUnitDeps: noUnitDeps },
+        log: (l) => logs.push(l),
+      });
+
+      // The package rewrite + restart attempt happened (non-zero because the box
+      // is un-migrated and the offer was declined — a clean, actionable failure).
+      expect(code).toBe(1);
+
+      // The contract fix: `restartTarget` passes `supervisor` WITHOUT forcing
+      // `unitInstalled: true`, plus an ENABLED migrate offer — exactly what a
+      // bare `parachute restart <svc>` threads.
+      expect(seenOpts).toBeDefined();
+      expect(seenOpts?.supervisor).toBeDefined();
+      expect(seenOpts?.supervisor?.unitInstalled).toBeUndefined();
+      expect(seenOpts?.migrateOffer?.enabled).toBe(true);
+
+      // The no-unit handling ran: the auto-offer fired (real probe → no unit),
+      // and the supervised loopback call was NEVER reached (no connection-refused).
+      expect(offerCalls).toBe(1);
+      expect(driveModuleOpCalled).toBe(false);
+      expect(logs.join("\n")).not.toMatch(/ECONNREFUSED|connection refused/i);
     } finally {
       h.cleanup();
     }

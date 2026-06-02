@@ -47,20 +47,13 @@ import {
   clearExposeState,
   writeExposeState,
 } from "../expose-state.ts";
-import {
-  type EnsureHubOpts,
-  HUB_DEFAULT_PORT,
-  ensureHubRunning,
-  readHubPort,
-} from "../hub-control.ts";
+import { HUB_DEFAULT_PORT, readHubPort } from "../hub-control.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
 import { HUB_UNIT_DEFAULT_PORT } from "../hub-unit.ts";
-import { type AliveFn, defaultAlive, processState } from "../process-state.ts";
+import { type AliveFn, defaultAlive } from "../process-state.ts";
 import { readManifest } from "../services-manifest.ts";
 import { type Runner, defaultRunner } from "../tailscale/run.ts";
-import { persistVaultHubOrigin } from "../vault-hub-origin-env.ts";
 import type { VaultAuthStatus } from "../vault/auth-status.ts";
-import { WELL_KNOWN_DIR } from "../well-known.ts";
 import { printPublic2FAWarning } from "./expose-2fa-warning.ts";
 import {
   type ExposeSupervisorOpts,
@@ -69,7 +62,6 @@ import {
   resolveExposeSupervisor,
   restartHubDependentViaSupervisor,
 } from "./expose-supervisor.ts";
-import { restart } from "./lifecycle.ts";
 
 const AUTH_DOC_URL =
   "https://github.com/ParachuteComputer/parachute-vault/blob/main/docs/auth-model.md";
@@ -333,8 +325,8 @@ export interface ExposeCloudflareOpts {
   cloudflaredHome?: string;
   /**
    * Config root for hub PID / port / log files. Defaults to `~/.parachute`.
-   * Threaded into `ensureHubRunning` so cloudflared's ingress target stays
-   * in sync with where the hub actually bound.
+   * Threaded through so cloudflared's ingress target stays in sync with where
+   * the hub actually bound.
    */
   configDir?: string;
   /**
@@ -344,22 +336,10 @@ export interface ExposeCloudflareOpts {
    */
   hubOrigin?: string;
   /**
-   * Overrides for hub lifecycle — primarily for tests. Tests pass
-   * `skipHubLifecycle: true` (above) plus a seeded `hub.port` file so the
-   * cloudflare path can resolve a port without actually spawning a hub.
-   */
-  hubEnsureOpts?: Omit<EnsureHubOpts, "configDir" | "wellKnownDir" | "log">;
-  /**
-   * Directory holding hub.html (passed through to the hub server on first
-   * spawn). Defaults to the same `well-known/` resolution the Tailscale
-   * path uses.
-   */
-  wellKnownDir?: string;
-  /**
-   * Skip spawning the hub server. Tests flip this on and pre-seed
+   * Skip ensuring the hub unit. Tests flip this on and pre-seed
    * `<configDir>/hub/run/hub.port` so `readHubPort` can resolve the
-   * cloudflared target without a live process. Production always leaves
-   * this off so the bringup self-heals a missing hub.
+   * cloudflared target without a live hub. Production always leaves this off so
+   * the bringup ensures the hub unit is up.
    */
   skipHub?: boolean;
   now?: () => Date;
@@ -376,26 +356,18 @@ export interface ExposeCloudflareOpts {
    */
   vaultAuthStatus?: VaultAuthStatus;
   /**
-   * Restart a hub-dependent service so it re-reads the new public hub origin.
-   * Mirrors the Tailscale path's `restartService` seam (`expose.ts`). Defaults
-   * to lifecycle `restart`; tests inject a fake to assert the call without
-   * spawning a real daemon. Only invoked for vault (the only `iss`-validating
-   * service) and only when it's already running.
-   */
-  restartService?: (short: string) => Promise<number>;
-  /**
-   * Phase 4 supervisor-path seams (design §4.3). When a hub UNIT is installed,
+   * Supervisor-path seams (design §4.3) — the ONLY runtime as of Phase 5b.
    * "ensure the hub" ensures the UNIT is up (not a detached spawn), and the
    * post-route vault restart drives the running Supervisor over the loopback
    * module-ops API (re-injecting the new public origin + firing the operator-
    * token / vault `.env` self-heal). The cloudflared CONNECTOR unit is
    * unchanged — it already installs/removes its own ManagedUnit
    * (`installConnectorService` / `removeConnectorService`), independent of the
-   * hub's lifecycle. The detached arm (`hubEnsureOpts` / `lifecycle.restart`)
-   * remains the no-unit fallback until Phase 5.
+   * hub's lifecycle.
    *
    * Production CLI dispatch passes `supervisor: {}` so the real
-   * `isHubUnitInstalled` probe decides the arm; omitting it is the detached arm.
+   * `isHubUnitInstalled` probe resolves the seams; tests inject the seams they
+   * want to assert.
    */
   supervisor?: ExposeSupervisorOpts;
 }
@@ -423,13 +395,10 @@ interface Resolved {
   cloudflaredHome: string;
   configDir: string;
   hubOrigin: string | undefined;
-  hubEnsureOpts: Omit<EnsureHubOpts, "configDir" | "wellKnownDir" | "log">;
-  wellKnownDir: string;
   skipHub: boolean;
   now: () => Date;
   vaultHome: string | undefined;
   vaultAuthStatus: VaultAuthStatus | undefined;
-  restartService: (short: string) => Promise<number>;
   sup: ResolvedExposeSupervisor;
 }
 
@@ -512,20 +481,10 @@ function resolve(opts: ExposeCloudflareOpts, tunnelNameDefault: string): Resolve
     cloudflaredHome: opts.cloudflaredHome ?? DEFAULT_CLOUDFLARED_HOME,
     configDir,
     hubOrigin: opts.hubOrigin,
-    hubEnsureOpts: opts.hubEnsureOpts ?? {},
-    wellKnownDir: opts.wellKnownDir ?? WELL_KNOWN_DIR,
     skipHub: opts.skipHub ?? false,
     now: opts.now ?? (() => new Date()),
     vaultHome: opts.vaultHome,
     vaultAuthStatus: opts.vaultAuthStatus,
-    restartService:
-      opts.restartService ??
-      ((short: string) =>
-        restart(short, {
-          manifestPath: opts.manifestPath,
-          configDir,
-          log: opts.log ?? (() => {}),
-        })),
     sup: resolveExposeSupervisor(opts.supervisor),
   };
 }
@@ -680,27 +639,17 @@ export async function exposeCloudflareUp(
       throw new Error("skipHub set but no hub.port on disk — tests must seed one");
     }
     hubPort = existing;
-  } else if (r.sup.unitInstalled) {
-    // Unit-managed (§4.3a): "ensure the hub" = ensure the hub UNIT is up. The
-    // unit pins the canonical 1939 (no walking fallback), so that's the target
-    // cloudflared's ingress proxies to.
+  } else {
+    // §4.3a: "ensure the hub" = ensure the hub UNIT is up. The unit pins the
+    // canonical 1939 (no walking fallback), so that's the target cloudflared's
+    // ingress proxies to. Phase 5b retired the detached `ensureHubRunning`
+    // bringup — a box with no hub unit gets `ensureHubUnit`'s actionable "run
+    // `parachute migrate`" message, never a detached spawn.
     const probePort = readHubPort(r.configDir) ?? HUB_UNIT_DEFAULT_PORT;
     const ensured = await ensureHubUnitForExpose(r.sup, probePort, r.log);
     if (!ensured.ok) return 1;
     hubPort = ensured.port;
     r.log(`✓ hub unit up (port ${hubPort}).`);
-  } else {
-    const hub = await ensureHubRunning({
-      reservedPorts: manifest.services.map((s) => s.port),
-      ...r.hubEnsureOpts,
-      configDir: r.configDir,
-      wellKnownDir: r.wellKnownDir,
-      issuer: hubOrigin,
-      log: r.log,
-    });
-    hubPort = hub.port;
-    if (hub.started) r.log(`✓ hub started (pid ${hub.pid}, port ${hub.port}).`);
-    else r.log(`✓ hub already running (pid ${hub.pid}, port ${hub.port}).`);
   }
   if (hubPort === 0) hubPort = HUB_DEFAULT_PORT;
 
@@ -943,45 +892,29 @@ export async function exposeCloudflareUp(
   // is the public origin) failed the `iss` check → 401 → "You're not signed in
   // to the hub." We mirror the Tailscale path here exactly.
   //
-  // `persistVaultHubOrigin` writes the durable `.env` (skips loopback itself,
-  // so a `--hub-origin http://127.0.0.1` override never bakes a dead issuer in);
-  // the restart makes the running vault re-read it immediately rather than
-  // waiting for the next reboot.
+  // The supervised restart helper writes the durable `.env` (skipping loopback,
+  // so a `--hub-origin http://127.0.0.1` override never bakes a dead issuer in)
+  // and makes the running vault re-read it immediately rather than waiting for
+  // the next reboot.
   //
-  // Phase 4 dual-dispatch (design §4.3c). Unit-managed → drive the restart
-  // through the running Supervisor (`driveModuleOp("vault", "restart")`), which
-  // re-injects the hub's current origin; `restartHubDependentViaSupervisor`
-  // also persists the durable `.env` + self-heals the operator-token issuer, so
-  // we DON'T also call `persistVaultHubOrigin` on this arm (the helper owns it).
-  // No unit → the unchanged detached path: persist `.env` + `lifecycle.restart`
-  // gated on pidfile liveness. Phase 5 deletes the detached branch.
-  if (r.sup.unitInstalled) {
-    r.log("");
-    r.log("Restarting vault to pick up new hub origin…");
-    const rcode = await restartHubDependentViaSupervisor({
-      short: "vault",
-      hubOrigin,
-      configDir: r.configDir,
-      sup: r.sup,
-      log: r.log,
-    });
-    if (rcode !== 0) {
-      r.log(
-        "⚠ vault restart failed. Run manually once the issue is resolved: parachute restart vault",
-      );
-    }
-  } else {
-    persistVaultHubOrigin(r.configDir, hubOrigin, r.log);
-    if (processState("vault", r.configDir, r.alive).status === "running") {
-      r.log("");
-      r.log("Restarting vault to pick up new hub origin…");
-      const rcode = await r.restartService("vault");
-      if (rcode !== 0) {
-        r.log(
-          "⚠ vault restart failed. Run manually once the issue is resolved: parachute restart vault",
-        );
-      }
-    }
+  // §4.3c: drive the restart through the running Supervisor
+  // (`driveModuleOp("vault", "restart")`), which re-injects the hub's current
+  // origin; `restartHubDependentViaSupervisor` also persists the durable `.env`
+  // + self-heals the operator-token issuer. Phase 5b retired the detached
+  // `lifecycle.restart` arm.
+  r.log("");
+  r.log("Restarting vault to pick up new hub origin…");
+  const rcode = await restartHubDependentViaSupervisor({
+    short: "vault",
+    hubOrigin,
+    configDir: r.configDir,
+    sup: r.sup,
+    log: r.log,
+  });
+  if (rcode !== 0) {
+    r.log(
+      "⚠ vault restart failed. Run manually once the issue is resolved: parachute restart vault",
+    );
   }
 
   const baseUrl = `https://${hostname}`;

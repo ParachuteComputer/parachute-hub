@@ -1,22 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type LifecycleOpts,
   defaultAlive,
   defaultKill,
-  defaultSpawner,
   logs,
   restart,
   start,
   stop,
 } from "../commands/lifecycle.ts";
-import { readEnvFileValues } from "../env-file.ts";
-import { writeHubPort } from "../hub-control.ts";
-import { hubDbPath, openHubDb } from "../hub-db.ts";
 import type { HubUnitManagerOpResult } from "../hub-unit.ts";
-import { validateAccessToken } from "../jwt-sign.ts";
 import type { MigrateOfferOpts, MigrateOfferResult } from "../migrate-offer.ts";
 import {
   type ModuleOp,
@@ -24,14 +19,28 @@ import {
   type ModuleOpResult,
   NoOperatorTokenError,
 } from "../module-ops-client.ts";
-import {
-  OPERATOR_TOKEN_SCOPE_SET_CLAIM,
-  issueOperatorToken,
-  readOperatorTokenFile,
-} from "../operator-token.ts";
-import { ensureLogPath, logPath, readPid, writePid } from "../process-state.ts";
-import { readManifest, upsertService } from "../services-manifest.ts";
-import { rotateSigningKey } from "../signing-keys.ts";
+import { ensureLogPath, writePid } from "../process-state.ts";
+import { upsertService } from "../services-manifest.ts";
+
+// ---------------------------------------------------------------------------
+// Phase 5b: the supervised path is the ONLY runtime. The detached spawners were
+// retired, so these suites exercise (a) the supervisor-path dispatch (hub UNIT
+// installed → drive the running supervisor / platform manager), (b) the no-unit
+// path (§7.5 auto-offer / actionable error — NEVER a detached spawn), and (c)
+// the group-aware kill/alive primitives that survive for `logs` + future use.
+//
+// Coverage that MOVED with the retirement (no longer asserted here):
+//   - per-module spawn / env injection / PORT override / cwd / startCmd
+//     resolution / missing-dependency preflight → now the supervisor's job,
+//     asserted in `supervisor.test.ts` + `api-modules-ops.test.ts`.
+//   - hub#194 settle + hub#487 port-readiness → supervisor post-spawn readiness,
+//     asserted in `supervisor.test.ts`.
+//   - process-GROUP spawn (`detached: true`) → the supervisor's group-spawn,
+//     asserted in `supervisor.test.ts` (`defaultKillGroup` + the real round-trip).
+//   - `start|stop|restart hub` via `ensureHubRunning`/`stopHub` → now the
+//     platform-manager path (`ensureHubUnit`/`stopHubUnit`/`restartHubUnit`),
+//     asserted in the dual-dispatch suites below.
+// ---------------------------------------------------------------------------
 
 interface Harness {
   configDir: string;
@@ -60,1824 +69,6 @@ function seedVault(manifestPath: string): void {
     manifestPath,
   );
 }
-
-function seedNotes(manifestPath: string): void {
-  upsertService(
-    {
-      name: "parachute-notes",
-      port: 5173,
-      paths: ["/notes"],
-      health: "/notes/health",
-      version: "0.0.1",
-    },
-    manifestPath,
-  );
-}
-
-interface ThirdPartySeed {
-  installDir: string;
-  manifestName?: string;
-  startCmd?: readonly string[];
-  port?: number;
-}
-
-/**
- * Seed a third-party services.json row + write a `.parachute/module.json` at
- * `installDir`. Mirrors what `parachute install /tmp/foo` produces in
- * production: row carries `installDir`, lifecycle resolves spec from the
- * filesystem.
- */
-function seedThirdParty(
-  manifestPath: string,
-  configDirRoot: string,
-  name: string,
-  opts: ThirdPartySeed,
-): string {
-  const installDir = opts.installDir;
-  mkdirSync(join(installDir, ".parachute"), { recursive: true });
-  const manifest = {
-    name,
-    manifestName: opts.manifestName ?? name,
-    port: opts.port ?? 1944,
-    paths: [`/${name}`],
-    health: `/${name}/health`,
-    ...(opts.startCmd ? { startCmd: opts.startCmd } : {}),
-  };
-  writeFileSync(join(installDir, ".parachute", "module.json"), JSON.stringify(manifest));
-  upsertService(
-    {
-      name: opts.manifestName ?? name,
-      port: opts.port ?? 1944,
-      paths: [`/${name}`],
-      health: `/${name}/health`,
-      version: "0.0.1",
-      installDir,
-    },
-    manifestPath,
-  );
-  return configDirRoot;
-}
-
-interface SpawnerStub {
-  spawn: (
-    cmd: readonly string[],
-    logFile: string,
-    opts?: { env?: Record<string, string>; cwd?: string },
-  ) => number;
-  calls: Array<{
-    cmd: readonly string[];
-    logFile: string;
-    env?: Record<string, string>;
-    cwd?: string;
-  }>;
-}
-
-function makeSpawner(pidSequence: number[]): SpawnerStub {
-  const calls: Array<{
-    cmd: readonly string[];
-    logFile: string;
-    env?: Record<string, string>;
-    cwd?: string;
-  }> = [];
-  let i = 0;
-  return {
-    calls,
-    spawn(cmd, logFile, opts) {
-      calls.push({ cmd: [...cmd], logFile, env: opts?.env, cwd: opts?.cwd });
-      return pidSequence[i++] ?? 99999;
-    },
-  };
-}
-
-describe("parachute start", () => {
-  test("errors cleanly when no services installed", async () => {
-    const h = makeHarness();
-    try {
-      const logs: string[] = [];
-      const code = await start(undefined, {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        log: (l) => logs.push(l),
-      });
-      expect(code).toBe(1);
-      expect(logs.join("\n")).toMatch(/No services installed/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("errors cleanly when targeting an uninstalled service", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const logs: string[] = [];
-      const code = await start("notes", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        log: (l) => logs.push(l),
-      });
-      expect(code).toBe(1);
-      expect(logs.join("\n")).toMatch(/notes isn't installed/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("spawns vault with parachute-vault serve, writes PID", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawner([4242]);
-      const logs: string[] = [];
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: (l) => logs.push(l),
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls).toHaveLength(1);
-      expect(spawner.calls[0]?.cmd).toEqual(["parachute-vault", "serve"]);
-      expect(spawner.calls[0]?.logFile).toBe(logPath("vault", h.configDir));
-      expect(readPid("vault", h.configDir)).toBe(4242);
-      expect(logs.join("\n")).toMatch(/vault started \(pid 4242\)/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("missing startCmd binary → friendly missing-dependency message + no spawn", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawner([4242]);
-      const logs: string[] = [];
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        // Force the preflight's missing-binary branch: parachute-vault not on PATH.
-        which: () => null,
-        log: (l) => logs.push(l),
-      });
-      expect(code).toBe(1);
-      // Preflight fired before the spawn — the stub spawner is never called.
-      expect(spawner.calls).toHaveLength(0);
-      const out = logs.join("\n");
-      expect(out).toMatch(/vault failed to start/);
-      // The friendly install block names the binary + its install path.
-      expect(out).toContain("parachute-vault is required to run the Vault module Hub supervises");
-      expect(out).toContain("parachute install vault");
-      expect(readPid("vault", h.configDir)).toBeUndefined();
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("missing startCmd binary persists lastStartError so a later status surfaces it", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner: makeSpawner([4242]),
-        which: () => null,
-        log: () => {},
-      });
-      const entry = readManifest(h.manifestPath).services.find((s) => s.name === "parachute-vault");
-      expect(entry?.lastStartError?.error_type).toBe("missing_dependency");
-      expect(entry?.lastStartError?.binary).toBe("parachute-vault");
-      expect(entry?.lastStartError?.at).toBeDefined();
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("a successful start clears a previously-recorded lastStartError", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      // First start fails (binary missing) → records the error.
-      await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner: makeSpawner([1]),
-        which: () => null,
-        log: () => {},
-      });
-      expect(
-        readManifest(h.manifestPath).services.find((s) => s.name === "parachute-vault")
-          ?.lastStartError,
-      ).toBeDefined();
-      // Second start succeeds (binary present via the permissive default which
-      // — stub spawner path) → clears the recorded error.
-      await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner: makeSpawner([4242]),
-        log: () => {},
-      });
-      expect(
-        readManifest(h.manifestPath).services.find((s) => s.name === "parachute-vault")
-          ?.lastStartError,
-      ).toBeUndefined();
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("notes start command includes configured port and notes-serve shim path", async () => {
-    const h = makeHarness();
-    try {
-      seedNotes(h.manifestPath);
-      const spawner = makeSpawner([5151]);
-      const code = await start("notes", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      const cmd = spawner.calls[0]?.cmd ?? [];
-      expect(cmd[0]).toBe("bun");
-      expect(cmd.some((a) => a.endsWith("notes-serve.ts"))).toBe(true);
-      const portIdx = cmd.indexOf("--port");
-      expect(portIdx).toBeGreaterThan(-1);
-      expect(cmd[portIdx + 1]).toBe("5173");
-      const mountIdx = cmd.indexOf("--mount");
-      expect(mountIdx).toBeGreaterThan(-1);
-      expect(cmd[mountIdx + 1]).toBe("/notes");
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("no-op when already running", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      const spawner = makeSpawner([9999]);
-      const logs: string[] = [];
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        alive: () => true,
-        log: (l) => logs.push(l),
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls).toHaveLength(0);
-      expect(logs.join("\n")).toMatch(/already running \(pid 4242\)/);
-      expect(readPid("vault", h.configDir)).toBe(4242);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("clears stale PID file before spawning fresh", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      const spawner = makeSpawner([7777]);
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        // Stale 4242 is dead; the freshly spawned 7777 is alive — the
-        // post-spawn settle (hub#194) calls alive(pid) on the new pid,
-        // so we differentiate per-pid rather than blanket-false.
-        alive: (pid) => pid === 7777,
-        sleep: async () => {},
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls).toHaveLength(1);
-      expect(readPid("vault", h.configDir)).toBe(7777);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("start (no svc) targets every installed + known service", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      seedNotes(h.manifestPath);
-      const spawner = makeSpawner([4242, 5151]);
-      const code = await start(undefined, {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls).toHaveLength(2);
-      expect(readPid("vault", h.configDir)).toBe(4242);
-      expect(readPid("notes", h.configDir)).toBe(5151);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("legacy parachute-lens manifest entry still starts under the notes spec", async () => {
-    // Users who installed during the brief Notes→Lens window (Apr 19–22)
-    // will still have `parachute-lens` in services.json until their notes
-    // package next boots and rewrites the row. Without the manifest alias,
-    // shortNameForManifest returns undefined, resolveTargets skips the
-    // entry, and they get "No manageable services" with no hint.
-    const h = makeHarness();
-    try {
-      upsertService(
-        {
-          name: "parachute-lens",
-          port: 5173,
-          paths: ["/lens"],
-          health: "/lens/health",
-          version: "0.0.1",
-        },
-        h.manifestPath,
-      );
-      const spawner = makeSpawner([5151]);
-      const code = await start(undefined, {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls).toHaveLength(1);
-      expect(spawner.calls[0]?.cmd.some((a) => a.endsWith("notes-serve.ts"))).toBe(true);
-      expect(readPid("notes", h.configDir)).toBe(5151);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("passes PARACHUTE_HUB_ORIGIN from expose-state when set", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writeFileSync(
-        join(h.configDir, "expose-state.json"),
-        JSON.stringify({
-          version: 1,
-          layer: "tailnet",
-          mode: "path",
-          canonicalFqdn: "parachute.taildf9ce2.ts.net",
-          port: 443,
-          funnel: false,
-          entries: [],
-          hubOrigin: "https://parachute.taildf9ce2.ts.net",
-        }),
-      );
-      const spawner = makeSpawner([4242]);
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      // PORT is always set by `parachute start` (hub#356) from the
-      // services.json entry. PARACHUTE_HUB_ORIGIN comes from expose-state.
-      expect(spawner.calls[0]?.env).toEqual({
-        PORT: "1940",
-        PARACHUTE_HUB_ORIGIN: "https://parachute.taildf9ce2.ts.net",
-      });
-      // OAuth issuer-mismatch fix: the spawn-env injection above is ephemeral
-      // (lost on the next launchd / systemd boot). `start vault` ALSO persists
-      // the public origin into vault/.env so the out-of-band daemon validates
-      // hub-minted JWTs' `iss` against it. Without this, every reconnect after
-      // a reboot / crash-restart 401s.
-      expect(readEnvFileValues(join(h.configDir, "vault", ".env")).PARACHUTE_HUB_ORIGIN).toBe(
-        "https://parachute.taildf9ce2.ts.net",
-      );
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("self-heals a stale-loopback vault/.env from a cloudflare expose-state on restart", async () => {
-    // Existing-broken-deploy shape: a Cloudflare deploy whose vault/.env had a
-    // loopback PARACHUTE_HUB_ORIGIN baked in (or was unset and a prior run
-    // wrote loopback). expose-state.json carries the real public origin. A
-    // plain `parachute start vault` must rewrite vault/.env to the public
-    // origin so the daemon stops 401ing hub tokens — the self-heal half of the
-    // Cloudflare 401 fix.
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writeFileSync(
-        join(h.configDir, "expose-state.json"),
-        JSON.stringify({
-          version: 1,
-          layer: "public",
-          mode: "subdomain",
-          canonicalFqdn: "gitcoin-parachute.unforced.dev",
-          port: 1939,
-          funnel: false,
-          entries: [{ kind: "proxy", mount: "/", target: "http://localhost:1939", service: "hub" }],
-          hubOrigin: "https://gitcoin-parachute.unforced.dev",
-        }),
-      );
-      // Pre-seed vault/.env with a stale loopback value (the broken state).
-      mkdirSync(join(h.configDir, "vault"), { recursive: true });
-      writeFileSync(
-        join(h.configDir, "vault", ".env"),
-        "PARACHUTE_HUB_ORIGIN=http://127.0.0.1:1939\n",
-      );
-      const spawner = makeSpawner([4242]);
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(readEnvFileValues(join(h.configDir, "vault", ".env")).PARACHUTE_HUB_ORIGIN).toBe(
-        "https://gitcoin-parachute.unforced.dev",
-      );
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("does NOT persist a loopback origin into vault/.env (would shadow a later exposure)", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writeHubPort(1939, h.configDir);
-      const spawner = makeSpawner([4242]);
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      // Loopback is fine to inject into the ephemeral spawn env (local dev),
-      // but persisting it would brick the daemon path once exposure comes up:
-      // the baked loopback would shadow the real origin. So vault/.env stays
-      // absent of the key on a loopback-only start.
-      expect(existsSync(join(h.configDir, "vault", ".env"))).toBe(false);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("falls back to loopback origin from hub.port when not exposed", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writeHubPort(1939, h.configDir);
-      const spawner = makeSpawner([4242]);
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls[0]?.env).toEqual({
-        PORT: "1940",
-        PARACHUTE_HUB_ORIGIN: "http://127.0.0.1:1939",
-      });
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("--hub-origin override wins over expose-state", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writeFileSync(
-        join(h.configDir, "expose-state.json"),
-        JSON.stringify({
-          version: 1,
-          layer: "tailnet",
-          mode: "path",
-          canonicalFqdn: "parachute.taildf9ce2.ts.net",
-          port: 443,
-          funnel: false,
-          entries: [],
-          hubOrigin: "https://parachute.taildf9ce2.ts.net",
-        }),
-      );
-      const spawner = makeSpawner([4242]);
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        hubOrigin: "https://override.example.com/",
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls[0]?.env).toEqual({
-        PORT: "1940",
-        PARACHUTE_HUB_ORIGIN: "https://override.example.com",
-      });
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("omits env when no override, no exposure, no hub port", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawner([4242]);
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      // PORT is always set (hub#356) — even with no override, no exposure,
-      // and no hub.port file, the spawn env carries the canonical PORT
-      // from services.json. Test renamed from "omits env" to reflect
-      // the new minimum-env shape.
-      expect(spawner.calls[0]?.env).toEqual({ PORT: "1940" });
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("merges <configDir>/<svc>/.env into the spawn env", async () => {
-    // Scribe's API key prompt writes GROQ_API_KEY into ~/.parachute/scribe/.env.
-    // Scribe itself doesn't auto-load .env, so `parachute start scribe` has to
-    // forward the values into the child env or the API key won't take effect.
-    const h = makeHarness();
-    try {
-      upsertService(
-        {
-          name: "parachute-scribe",
-          port: 1943,
-          paths: ["/scribe"],
-          health: "/scribe/health",
-          version: "0.1.0",
-        },
-        h.manifestPath,
-      );
-      ensureLogPath("scribe", h.configDir);
-      writeFileSync(
-        join(h.configDir, "scribe", ".env"),
-        'GROQ_API_KEY=gsk_real_value\nQUOTED="quoted_val"\n',
-      );
-      const spawner = makeSpawner([7777]);
-      const code = await start("scribe", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls[0]?.env).toEqual({
-        PORT: "1943",
-        GROQ_API_KEY: "gsk_real_value",
-        QUOTED: "quoted_val",
-      });
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("hub-origin override wins over conflicting key in service .env", async () => {
-    // Defense: `start --hub-origin <url>` is the authoritative source for
-    // PARACHUTE_HUB_ORIGIN. If a service .env happens to have the same key
-    // (e.g. an old hand-edit), the live override should still apply.
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      ensureLogPath("vault", h.configDir);
-      writeFileSync(
-        join(h.configDir, "vault", ".env"),
-        "SCRIBE_AUTH_TOKEN=secret\nPARACHUTE_HUB_ORIGIN=http://stale.local\n",
-      );
-      const spawner = makeSpawner([4242]);
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        hubOrigin: "https://live.example.com",
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls[0]?.env).toEqual({
-        PORT: "1940",
-        SCRIBE_AUTH_TOKEN: "secret",
-        PARACHUTE_HUB_ORIGIN: "https://live.example.com",
-      });
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("third-party module starts via installDir module.json with cwd", async () => {
-    // hub#83: services.json rows that carry installDir resolve their spec
-    // from `<installDir>/.parachute/module.json` at lifecycle time. Spawn
-    // gets cwd=installDir so manifest-declared relative paths work.
-    const h = makeHarness();
-    try {
-      const installDir = join(h.configDir, "_pkg-someapp");
-      seedThirdParty(h.manifestPath, h.configDir, "someapp", {
-        installDir,
-        startCmd: ["bun", "web/server/src/server.ts"],
-        port: 1944,
-      });
-      const spawner = makeSpawner([8080]);
-      const code = await start("someapp", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls).toHaveLength(1);
-      expect(spawner.calls[0]?.cmd).toEqual(["bun", "web/server/src/server.ts"]);
-      expect(spawner.calls[0]?.cwd).toBe(installDir);
-      expect(readPid("someapp", h.configDir)).toBe(8080);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("start: installDir-less third-party row surfaces an actionable error", async () => {
-    // A services.json row whose name isn't first-party AND has no installDir
-    // can't yield a startCmd. Pre-fix this hit the generic "unknown service"
-    // path (misleading — the row exists, just with stale shape). Post-fix
-    // resolveTargets returns the entry with spec=undefined and start prints
-    // an actionable message that points at the real fix (re-install or
-    // upgrade-the-module).
-    const h = makeHarness();
-    try {
-      upsertService(
-        {
-          name: "mystery",
-          port: 1944,
-          paths: ["/mystery"],
-          health: "/mystery/health",
-          version: "0.0.1",
-        },
-        h.manifestPath,
-      );
-      const lines: string[] = [];
-      const code = await start("mystery", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(1);
-      const out = lines.join("\n");
-      expect(out).toMatch(/services\.json entry has no installDir/);
-      expect(out).toMatch(/parachute install <path-to-mystery>/);
-      expect(out).not.toMatch(/unknown service/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("start: name absent from services.json still errors as unknown service", async () => {
-    // The genuinely-unknown path: no first-party fallback, no row in
-    // services.json. Distinguish from the above (row exists but lacks
-    // installDir) so the error message is right-shaped for each.
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const lines: string[] = [];
-      const code = await start("ghost", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(1);
-      expect(lines.join("\n")).toMatch(/unknown service "ghost"/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("start (no svc) sweeps both first-party and third-party rows", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const installDir = join(h.configDir, "_pkg-someapp");
-      seedThirdParty(h.manifestPath, h.configDir, "someapp", {
-        installDir,
-        startCmd: ["bun", "server.ts"],
-        port: 1944,
-      });
-      const spawner = makeSpawner([4242, 8080]);
-      const code = await start(undefined, {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls).toHaveLength(2);
-      const cmds = spawner.calls.map((c) => c.cmd);
-      expect(cmds).toContainEqual(["parachute-vault", "serve"]);
-      expect(cmds).toContainEqual(["bun", "server.ts"]);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("third-party with malformed module.json fails clearly", async () => {
-    const h = makeHarness();
-    try {
-      const installDir = join(h.configDir, "_pkg-broken");
-      mkdirSync(join(installDir, ".parachute"), { recursive: true });
-      writeFileSync(join(installDir, ".parachute", "module.json"), "{ not valid json");
-      upsertService(
-        {
-          name: "broken",
-          port: 1944,
-          paths: ["/broken"],
-          health: "/broken/health",
-          version: "0.0.1",
-          installDir,
-        },
-        h.manifestPath,
-      );
-      const lines: string[] = [];
-      const code = await start("broken", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(1);
-      expect(lines.join("\n")).toMatch(/broken: invalid module\.json/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("hub#194: reports failure when child dies before the settle window", async () => {
-    // The bug: `parachute start notes` reported `✓ notes started (pid X)`
-    // but notes-serve crashed milliseconds later on a Bun.resolveSync
-    // failure, leaving tailnet `/notes/` 502'ing. Fix: after spawn, sleep
-    // ~250ms then re-check alive(pid). If dead, clear pidfile, log
-    // failure, return non-zero. This regression test pins the post-fix
-    // shape with a stub alive that always reports dead and a fast settle.
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawner([4242]);
-      const lines: string[] = [];
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        alive: () => false, // child dies immediately after spawn
-        sleep: async () => {}, // skip the real wait in tests
-        startSettleMs: 1, // any non-zero value engages the check
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(1);
-      expect(spawner.calls).toHaveLength(1);
-      // pidfile is cleared so a follow-up `start` doesn't report
-      // already-running against a corpse.
-      expect(readPid("vault", h.configDir)).toBeUndefined();
-      const out = lines.join("\n");
-      expect(out).toMatch(/✗ vault failed to start/);
-      expect(out).toMatch(/exited within 1ms/);
-      expect(out).toMatch(/Tail the log/);
-      expect(out).not.toMatch(/✓ vault started/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("hub#194: settle path passes when child stays alive past the window", async () => {
-    // Companion to the above — verifies the success-path shape doesn't
-    // regress. Stub alive returns true so the post-spawn check passes,
-    // and we still see the `✓ ... started` line.
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawner([4242]);
-      const lines: string[] = [];
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        alive: () => true,
-        sleep: async () => {},
-        startSettleMs: 1,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      expect(readPid("vault", h.configDir)).toBe(4242);
-      expect(lines.join("\n")).toMatch(/✓ vault started \(pid 4242\)/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("hub#194: settle skipped when startSettleMs is 0", async () => {
-    // Defense — don't regress the test-default policy. With a stub
-    // spawner and no `alive` override, the resolved settle is 0 (see
-    // resolve() in lifecycle.ts), so the post-spawn check is bypassed
-    // entirely and even an `alive: () => false` doesn't matter.
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawner([4242]);
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        startSettleMs: 0,
-        // intentionally omit alive — defaultAlive against a fake pid
-        // would normally report dead, but startSettleMs: 0 skips the
-        // call entirely.
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(readPid("vault", h.configDir)).toBe(4242);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("third-party with no startCmd in module.json reports lifecycle-unsupported", async () => {
-    const h = makeHarness();
-    try {
-      const installDir = join(h.configDir, "_pkg-noop");
-      seedThirdParty(h.manifestPath, h.configDir, "noop", {
-        installDir,
-        port: 1945,
-      });
-      const lines: string[] = [];
-      const code = await start("noop", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(1);
-      expect(lines.join("\n")).toMatch(/lifecycle not yet supported/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  // hub#487 — readiness gating beyond the bare liveness settle. Aaron hit this
-  // on a fresh EC2 box: `parachute start vault` printed "✓ vault started" while
-  // the process died ~instantly on EADDRINUSE (an orphan held 1940), and
-  // `parachute status` then showed it inactive.
-
-  /**
-   * A stub spawner that also seeds the service's log file with `content`, so
-   * the readiness-failure path's log-tail + EADDRINUSE detection can read a
-   * realistic boot error. Mirrors how the real spawner appends stdout/stderr
-   * to the logfile.
-   */
-  function makeSpawnerWithLog(pid: number, content: string): SpawnerStub {
-    const calls: SpawnerStub["calls"] = [];
-    return {
-      calls,
-      spawn(cmd, logFile, opts) {
-        calls.push({ cmd: [...cmd], logFile, env: opts?.env, cwd: opts?.cwd });
-        // The start path calls ensureLogPath() before spawn, so logFile's
-        // parent dir already exists — just write the simulated boot output.
-        writeFileSync(logFile, content);
-        return pid;
-      },
-    };
-  }
-
-  test("hub#487: EADDRINUSE in the log → port-in-use message + log tail, not ✓", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawnerWithLog(
-        4242,
-        "booting vault…\nerror: listen EADDRINUSE: address already in use 0.0.0.0:1940\n",
-      );
-      const lines: string[] = [];
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        alive: () => false, // process died right after the EADDRINUSE throw
-        sleep: async () => {},
-        startSettleMs: 1,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(1);
-      expect(readPid("vault", h.configDir)).toBeUndefined();
-      const out = lines.join("\n");
-      expect(out).toMatch(/port 1940 is already in use/);
-      expect(out).toMatch(/lsof -ti:1940/);
-      // The real boot error is surfaced inline so the operator doesn't have to
-      // go tail the log themselves.
-      expect(out).toMatch(/EADDRINUSE/);
-      expect(out).not.toMatch(/✓ vault started/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("hub#487: process survives settle but never binds its port → failure with log tail", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawnerWithLog(4242, "vault crashed mid-boot\n");
-      const lines: string[] = [];
-      let aliveCalls = 0;
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        // Alive through the settle + first readiness poll, then dies — the
-        // slow-EADDRINUSE / crash-after-boot shape.
-        alive: () => {
-          aliveCalls++;
-          return aliveCalls <= 1;
-        },
-        sleep: async () => {},
-        startSettleMs: 1,
-        startReadyMs: 50,
-        startReadyPollMs: 1,
-        portListening: async () => false, // never binds
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(1);
-      expect(readPid("vault", h.configDir)).toBeUndefined();
-      const out = lines.join("\n");
-      expect(out).toMatch(/✗ vault failed to start/);
-      expect(out).toMatch(/exited during startup/);
-      expect(out).not.toMatch(/✓ vault started/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("hub#487: alive but port silent past the window → non-fatal warning, exit 0", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawner([4242]);
-      const lines: string[] = [];
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        alive: () => true, // stays up the whole time
-        sleep: async () => {},
-        startSettleMs: 1,
-        startReadyMs: 10,
-        startReadyPollMs: 1,
-        portListening: async () => false, // slow boot — not listening yet
-        log: (l) => lines.push(l),
-      });
-      // A slow-but-alive daemon isn't a hard failure — we warn rather than fail.
-      expect(code).toBe(0);
-      expect(readPid("vault", h.configDir)).toBe(4242);
-      const out = lines.join("\n");
-      expect(out).toMatch(/port 1940 isn't accepting connections yet/);
-      expect(out).not.toMatch(/✓ vault started/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("hub#487: alive + port listening → success", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawner([4242]);
-      const lines: string[] = [];
-      let probeCalls = 0;
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        alive: () => true,
-        sleep: async () => {},
-        startSettleMs: 1,
-        startReadyMs: 50,
-        startReadyPollMs: 1,
-        // Not listening on the first poll, bound on the second — exercises the
-        // poll loop rather than an instant true.
-        portListening: async () => {
-          probeCalls++;
-          return probeCalls >= 2;
-        },
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      expect(readPid("vault", h.configDir)).toBe(4242);
-      expect(lines.join("\n")).toMatch(/✓ vault started \(pid 4242\)/);
-    } finally {
-      h.cleanup();
-    }
-  });
-});
-
-describe("parachute stop", () => {
-  test("no-op when nothing is running", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const killed: Array<[number, string | number]> = [];
-      const logs: string[] = [];
-      const code = await stop("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        kill: (pid, sig) => killed.push([pid, sig]),
-        log: (l) => logs.push(l),
-      });
-      expect(code).toBe(0);
-      expect(killed).toHaveLength(0);
-      expect(logs.join("\n")).toMatch(/wasn't running/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("cleans stale PID file without sending any signal", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      const killed: Array<[number, string | number]> = [];
-      const code = await stop("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        kill: (pid, sig) => killed.push([pid, sig]),
-        alive: () => false,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(killed).toHaveLength(0);
-      expect(readPid("vault", h.configDir)).toBeUndefined();
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("SIGTERM + clean exit within window clears PID", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      const killed: Array<[number, string | number]> = [];
-      let aliveCall = 0;
-      const code = await stop("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        kill: (pid, sig) => killed.push([pid, sig]),
-        alive: () => {
-          aliveCall++;
-          return aliveCall === 1;
-        },
-        sleep: async () => {},
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(killed).toEqual([[4242, "SIGTERM"]]);
-      expect(readPid("vault", h.configDir)).toBeUndefined();
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("escalates to SIGKILL when SIGTERM doesn't land", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      const killed: Array<[number, string | number]> = [];
-      let t = 0;
-      const code = await stop("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        kill: (pid, sig) => killed.push([pid, sig]),
-        alive: () => true,
-        sleep: async () => {},
-        now: () => {
-          // Jump past the kill-wait window so the polling loop exits fast.
-          t += 20_000;
-          return t;
-        },
-        killWaitMs: 10_000,
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(killed[0]).toEqual([4242, "SIGTERM"]);
-      expect(killed[killed.length - 1]).toEqual([4242, "SIGKILL"]);
-      expect(readPid("vault", h.configDir)).toBeUndefined();
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("third-party row without installDir: stops via pidfile", async () => {
-    // Graceful-degradation path: an installed-but-stale third-party row
-    // (no installDir field — pre-installDir-contract self-registration)
-    // should still be stoppable. stop only needs the short name to find
-    // the pidfile; spec resolution isn't on the critical path for stop.
-    const h = makeHarness();
-    try {
-      upsertService(
-        {
-          name: "mystery",
-          port: 1944,
-          paths: ["/mystery"],
-          health: "/mystery/health",
-          version: "0.0.1",
-        },
-        h.manifestPath,
-      );
-      writePid("mystery", 4242, h.configDir);
-      const killed: Array<[number, string | number]> = [];
-      let aliveCall = 0;
-      const code = await stop("mystery", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        kill: (pid, sig) => killed.push([pid, sig]),
-        alive: () => {
-          aliveCall++;
-          return aliveCall === 1;
-        },
-        sleep: async () => {},
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(killed).toEqual([[4242, "SIGTERM"]]);
-      expect(readPid("mystery", h.configDir)).toBeUndefined();
-    } finally {
-      h.cleanup();
-    }
-  });
-});
-
-describe("parachute restart", () => {
-  test("stops then starts in sequence", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      const spawner = makeSpawner([7777]);
-      const killed: Array<[number, string | number]> = [];
-      const code = await restart("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        kill: (pid, sig) => killed.push([pid, sig]),
-        // Stale 4242 is dead (stop's stale-pid path skips the kill);
-        // freshly spawned 7777 is alive past the post-spawn settle
-        // (hub#194). Per-pid differentiation rather than blanket-false.
-        alive: (pid) => pid === 7777,
-        sleep: async () => {},
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(killed).toHaveLength(0); // stale pid → cleanup without kill
-      expect(spawner.calls).toHaveLength(1);
-      expect(readPid("vault", h.configDir)).toBe(7777);
-    } finally {
-      h.cleanup();
-    }
-  });
-});
-
-describe("parachute logs", () => {
-  test("hint when no log file exists", async () => {
-    const h = makeHarness();
-    try {
-      const lines: string[] = [];
-      const code = await logs("vault", {
-        configDir: h.configDir,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      expect(lines.join("\n")).toMatch(/no logs yet/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("prints last N lines in one-shot mode", async () => {
-    const h = makeHarness();
-    try {
-      const p = ensureLogPath("vault", h.configDir);
-      const content = Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n");
-      writeFileSync(p, `${content}\n`);
-      const lines: string[] = [];
-      const code = await logs("vault", {
-        configDir: h.configDir,
-        lines: 3,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      expect(lines).toEqual(["line 8", "line 9", "line 10"]);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("unknown service errors cleanly", async () => {
-    const h = makeHarness();
-    try {
-      const lines: string[] = [];
-      const code = await logs("nope", {
-        configDir: h.configDir,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(1);
-      expect(lines.join("\n")).toMatch(/unknown service/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("third-party module name with installDir is recognised", async () => {
-    const h = makeHarness();
-    try {
-      const installDir = join(h.configDir, "_pkg-someapp");
-      seedThirdParty(h.manifestPath, h.configDir, "someapp", {
-        installDir,
-        startCmd: ["bun", "server.ts"],
-      });
-      const p = ensureLogPath("someapp", h.configDir);
-      writeFileSync(p, "someapp line 1\nsomeapp line 2\n");
-      const lines: string[] = [];
-      const code = await logs("someapp", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      expect(lines).toEqual(["someapp line 1", "someapp line 2"]);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("third-party row without installDir: tails by short name", async () => {
-    // Graceful-degradation path: log file is keyed by short name, written by
-    // start. installDir is irrelevant for tailing — the entry just needs to
-    // exist in services.json.
-    const h = makeHarness();
-    try {
-      upsertService(
-        {
-          name: "mystery",
-          port: 1944,
-          paths: ["/mystery"],
-          health: "/mystery/health",
-          version: "0.0.1",
-        },
-        h.manifestPath,
-      );
-      const p = ensureLogPath("mystery", h.configDir);
-      writeFileSync(p, "mystery line 1\nmystery line 2\n");
-      const lines: string[] = [];
-      const code = await logs("mystery", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      expect(lines).toEqual(["mystery line 1", "mystery line 2"]);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("running daemon + missing log file: surfaces alive-but-no-log shape (hub#335)", async () => {
-    // Aaron's #335 reproducer shape: parachute-app daemon was running
-    // (curl proxied 200s, pidfile alive) but `parachute logs app` printed
-    // `parachute start app to begin` — telling the operator to start a
-    // service that was already up. The fix: when the log file is missing
-    // but a live pidfile exists, surface the running pid + the path we
-    // expected instead of the misleading start-hint.
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writePid("vault", 9999, h.configDir);
-      const lines: string[] = [];
-      const code = await logs("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        // pid 9999 is "alive" — simulates the running daemon case.
-        alive: () => true,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      const out = lines.join("\n");
-      expect(out).toMatch(/vault is running \(pid 9999\)/);
-      expect(out).toMatch(/no log file/);
-      expect(out).not.toMatch(/parachute start vault/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("stale pidfile + missing log file: falls through to start hint", async () => {
-    // The other half of the disambiguation: pidfile exists but the process
-    // is gone (stale pidfile, or cleanly shut down). That's effectively
-    // "not running," so the original `parachute start` hint is still the
-    // right message.
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writePid("vault", 9999, h.configDir);
-      const lines: string[] = [];
-      const code = await logs("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        // pid 9999 is "dead" — `processState` returns `stopped`.
-        alive: () => false,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      expect(lines.join("\n")).toMatch(/no logs yet for vault/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("log file exists: prints tail regardless of pidfile state (hub#335)", async () => {
-    // The happy path Aaron's title calls out: when the log file exists,
-    // we tail it — independent of whether the pidfile is present. A
-    // running daemon's logs are useful; a stopped daemon's prior logs are
-    // useful too (post-mortem). Pidfile state only changes the message
-    // when the file is missing.
-    const h = makeHarness();
-    try {
-      const p = ensureLogPath("vault", h.configDir);
-      writeFileSync(p, "vault line a\nvault line b\n");
-      // No pidfile written — verify we still print the tail.
-      const lines: string[] = [];
-      const code = await logs("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        alive: () => false,
-        log: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      expect(lines).toEqual(["vault line a", "vault line b"]);
-    } finally {
-      h.cleanup();
-    }
-  });
-});
-
-describe("process-group lifecycle (hub#88)", () => {
-  // Spawn a wrapper that forks a long-running grandchild (sleep), wait for
-  // both to come up, then check that the wrapper PID equals its PGID — the
-  // post-fix invariant that makes group-kill safe. Without `detached: true`
-  // the child inherits the test runner's PGID and group-kill would target
-  // the wrong tree.
-  test("defaultSpawner puts child in its own process group", async () => {
-    const h = makeHarness();
-    try {
-      const logFile = ensureLogPath("test", h.configDir);
-      const pid = defaultSpawner.spawn(["sh", "-c", "sleep 2 & wait"], logFile);
-      try {
-        // Resolve the child's PGID via ps; the kernel reports it as a
-        // numeric column. PGID == PID means our setsid-equivalent worked.
-        const ps = Bun.spawnSync(["ps", "-o", "pgid=", "-p", String(pid)]);
-        const pgid = Number.parseInt(ps.stdout.toString().trim(), 10);
-        expect(pgid).toBe(pid);
-      } finally {
-        try {
-          process.kill(-pid, "SIGKILL");
-        } catch {}
-      }
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  // The smoking-gun scenario from #88: a wrapper (sh) forks a grandchild
-  // (sleep) that keeps a resource — here, just stays alive. SIGKILL on the
-  // wrapper PID alone leaves the grandchild running. With detached spawn +
-  // group-kill, both go down. We assert by checking the grandchild's PID
-  // is no longer kill-able after `defaultKill`.
-  test("defaultKill takes down the wrapper and its grandchildren together", async () => {
-    const h = makeHarness();
-    try {
-      const logFile = ensureLogPath("test", h.configDir);
-      // Wrapper sh forks `sleep 30 & echo $!` so we capture the grandchild
-      // PID via the log file, then `wait` so the wrapper sticks around as
-      // a parent (mirrors `pnpm exec tsx`'s shape).
-      const wrapperPid = defaultSpawner.spawn(
-        ["sh", "-c", "sleep 30 & echo $! >&2; wait"],
-        logFile,
-      );
-      // Give the grandchild time to start and the log line to flush.
-      await new Promise((r) => setTimeout(r, 200));
-      const log = await Bun.file(logFile).text();
-      const grandchildPid = Number.parseInt(log.trim().split("\n").pop() ?? "", 10);
-      expect(grandchildPid).toBeGreaterThan(0);
-      expect(grandchildPid).not.toBe(wrapperPid);
-      // Both should be alive before kill.
-      expect(() => process.kill(grandchildPid, 0)).not.toThrow();
-
-      defaultKill(wrapperPid, "SIGKILL");
-
-      // Reap + wait for the grandchild to exit; on macOS the kernel may
-      // take a tick to deliver the signal.
-      await new Promise((r) => setTimeout(r, 200));
-      let grandchildStillAlive = true;
-      try {
-        process.kill(grandchildPid, 0);
-      } catch {
-        grandchildStillAlive = false;
-      }
-      expect(grandchildStillAlive).toBe(false);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  // defaultAlive's post-fix semantics: returns true while any group member
-  // is alive (the wrapper stays in the group as long as it's running),
-  // false after the group drains.
-  test("defaultAlive reports group liveness for detached children", async () => {
-    const h = makeHarness();
-    try {
-      const logFile = ensureLogPath("test", h.configDir);
-      const pid = defaultSpawner.spawn(["sh", "-c", "sleep 2"], logFile);
-      try {
-        expect(defaultAlive(pid)).toBe(true);
-      } finally {
-        try {
-          process.kill(-pid, "SIGKILL");
-        } catch {}
-      }
-      // Wait for the kill to drain the group, then re-check.
-      await new Promise((r) => setTimeout(r, 100));
-      expect(defaultAlive(pid)).toBe(false);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  // Legacy pidfile compatibility: a pre-detached pidfile holds a positive
-  // PID whose pgid is the parent shell, not the pid itself. defaultAlive
-  // must fall back to a bare-pid check so the next `stop` actually runs;
-  // defaultKill must fall back to a bare-pid signal so it can be reaped.
-  test("defaultAlive + defaultKill fall back to bare-pid for legacy (non-detached) processes", async () => {
-    // Spawn a non-detached child to simulate a legacy pidfile (pre-fix
-    // start). It shares the test runner's pgid, so kill(-pid, 0) will
-    // ESRCH and we should fall back.
-    const proc = Bun.spawn(["sh", "-c", "sleep 5"], { stdio: ["ignore", "ignore", "ignore"] });
-    const pid = proc.pid;
-    try {
-      expect(defaultAlive(pid)).toBe(true);
-      defaultKill(pid, "SIGKILL");
-      await new Promise((r) => setTimeout(r, 100));
-      expect(defaultAlive(pid)).toBe(false);
-    } finally {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {}
-    }
-  });
-});
-
-/**
- * `parachute start|stop|restart hub` — the bug Aaron filed as hub#166. Hub
- * isn't a row in services.json, so the generic services-manifest path
- * surfaced "unknown service: hub". The fix dispatches `svc === "hub"`
- * straight to hub-control.ts. These tests inject `ensureRunning`/`stop`
- * stubs so we don't actually fork bun.
- */
-describe("parachute start|stop|restart hub", () => {
-  test("start hub: dispatches to ensureHubRunning, propagates configDir + issuer", async () => {
-    const h = makeHarness();
-    try {
-      const log: string[] = [];
-      const ensureCalls: Array<{ configDir?: string; issuer?: string }> = [];
-      const code = await start("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        hubOrigin: "https://hub.example.com",
-        hub: {
-          ensureRunning: async (opts) => {
-            ensureCalls.push({ configDir: opts.configDir, issuer: opts.issuer });
-            return { pid: 4711, port: 1939, started: true };
-          },
-        },
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(0);
-      expect(ensureCalls).toHaveLength(1);
-      expect(ensureCalls[0]).toEqual({
-        configDir: h.configDir,
-        issuer: "https://hub.example.com",
-      });
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("start hub: reports already-running cleanly when ensureHubRunning returns started=false", async () => {
-    const h = makeHarness();
-    try {
-      const log: string[] = [];
-      const code = await start("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        hub: {
-          ensureRunning: async () => ({ pid: 8888, port: 1939, started: false }),
-        },
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(0);
-      expect(log.join("\n")).toMatch(/hub already running \(pid 8888\) on port 1939/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("start hub: surfaces ensureHubRunning errors as exit 1", async () => {
-    const h = makeHarness();
-    try {
-      const log: string[] = [];
-      const code = await start("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        hub: {
-          ensureRunning: async () => {
-            throw new Error("hub: port 1939 unavailable");
-          },
-        },
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(1);
-      expect(log.join("\n")).toMatch(/hub failed to start.*port 1939 unavailable/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  // hub#481 — `start hub` self-heals a stale operator-token issuer. Tests use
-  // the injectable `hub.selfHealOperatorToken` seam to assert the call happens
-  // (and to make it throw without failing start); a separate test drives the
-  // REAL self-heal against an on-disk operator token + hub.db.
-  test("start hub: invokes operator-token self-heal with the resolved issuer + configDir", async () => {
-    const h = makeHarness();
-    try {
-      const log: string[] = [];
-      const calls: Array<{ issuer: string; configDir: string }> = [];
-      const code = await start("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        hubOrigin: "https://hub.example.com",
-        hub: {
-          ensureRunning: async () => ({ pid: 4711, port: 1939, started: true }),
-          selfHealOperatorToken: async (args) => {
-            calls.push({ issuer: args.issuer, configDir: args.configDir });
-            return {
-              kind: "rotated",
-              path: "/x/operator.token",
-              scopeSet: "admin",
-              expiresAt: "z",
-            };
-          },
-        },
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(0);
-      expect(calls).toEqual([{ issuer: "https://hub.example.com", configDir: h.configDir }]);
-      // Rotation emits an operator-facing line.
-      expect(log.join("\n")).toMatch(
-        /refreshed operator\.token issuer → https:\/\/hub\.example\.com/,
-      );
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("start hub: skips operator-token self-heal when no hub origin is resolvable", async () => {
-    const h = makeHarness();
-    try {
-      let called = false;
-      // No hubOrigin override, no expose-state, no hub.port file → resolveHubOrigin
-      // yields undefined, so the self-heal seam must NOT be called.
-      const code = await start("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        hub: {
-          ensureRunning: async () => ({ pid: 4711, port: 1939, started: true }),
-          selfHealOperatorToken: async () => {
-            called = true;
-            return { kind: "absent" };
-          },
-        },
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(called).toBe(false);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("start hub: a thrown error inside operator-token self-heal does NOT fail start", async () => {
-    const h = makeHarness();
-    try {
-      const log: string[] = [];
-      const code = await start("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        hubOrigin: "https://hub.example.com",
-        hub: {
-          ensureRunning: async () => ({ pid: 4711, port: 1939, started: true }),
-          selfHealOperatorToken: async () => {
-            throw new Error("hub.db is locked");
-          },
-        },
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(0);
-      // Degrades to a brief note, not a hard failure.
-      expect(log.join("\n")).toMatch(
-        /operator\.token issuer self-heal skipped \(hub\.db is locked\)/,
-      );
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("start hub: real self-heal re-mints a stale-iss operator token on disk", async () => {
-    const h = makeHarness();
-    try {
-      // Seed signing keys + a stale-iss operator token in the harness configDir's
-      // hub.db / operator.token, then drive the production self-heal seam.
-      const db = openHubDb(hubDbPath(h.configDir));
-      try {
-        rotateSigningKey(db);
-        await issueOperatorToken(db, "user-abc", {
-          dir: h.configDir,
-          issuer: "http://127.0.0.1:1939",
-          scopeSet: "start",
-        });
-      } finally {
-        db.close();
-      }
-
-      const log: string[] = [];
-      const code = await start("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        hubOrigin: "https://gitcoin-parachute.unforced.dev",
-        // No selfHealOperatorToken override → exercises defaultSelfHealOperatorToken
-        // (opens hub.db at <configDir>/hub.db).
-        hub: {
-          ensureRunning: async () => ({ pid: 4711, port: 1939, started: true }),
-        },
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(0);
-      expect(log.join("\n")).toMatch(
-        /refreshed operator\.token issuer → https:\/\/gitcoin-parachute\.unforced\.dev/,
-      );
-
-      // The on-disk token now validates under the new issuer, scope-set preserved.
-      const verifyDb = openHubDb(hubDbPath(h.configDir));
-      try {
-        const onDisk = await readOperatorTokenFile(h.configDir);
-        expect(onDisk).not.toBeNull();
-        const validated = await validateAccessToken(
-          verifyDb,
-          onDisk as string,
-          "https://gitcoin-parachute.unforced.dev",
-        );
-        expect(validated.payload.iss).toBe("https://gitcoin-parachute.unforced.dev");
-        expect(validated.payload[OPERATOR_TOKEN_SCOPE_SET_CLAIM]).toBe("start");
-      } finally {
-        verifyDb.close();
-      }
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("stop hub: dispatches to stopHub, true → '✓ hub stopped'", async () => {
-    const h = makeHarness();
-    try {
-      const log: string[] = [];
-      const stopCalls: Array<{ configDir?: string }> = [];
-      const code = await stop("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        hub: {
-          stop: async (opts) => {
-            stopCalls.push({ configDir: opts.configDir });
-            return true;
-          },
-        },
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(0);
-      expect(stopCalls).toHaveLength(1);
-      expect(stopCalls[0]?.configDir).toBe(h.configDir);
-      expect(log.join("\n")).toMatch(/✓ hub stopped/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("stop hub: false → 'wasn't running' (still exit 0)", async () => {
-    const h = makeHarness();
-    try {
-      const log: string[] = [];
-      const code = await stop("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        hub: { stop: async () => false },
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(0);
-      expect(log.join("\n")).toMatch(/hub wasn't running/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("restart hub: chains stop then start through the same hub seam", async () => {
-    const h = makeHarness();
-    try {
-      const log: string[] = [];
-      const order: string[] = [];
-      const code = await restart("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        hub: {
-          stop: async () => {
-            order.push("stop");
-            return true;
-          },
-          ensureRunning: async () => {
-            order.push("start");
-            return { pid: 5151, port: 1939, started: true };
-          },
-        },
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(0);
-      expect(order).toEqual(["stop", "start"]);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("logs hub: doesn't reject 'hub' as an unknown service", async () => {
-    const h = makeHarness();
-    try {
-      // No log file yet — exercise the "no logs yet" branch, which still
-      // returns 0. Goal of this test is just the unknown-service guard.
-      const log: string[] = [];
-      const code = await logs("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(0);
-      expect(log.join("\n")).toMatch(/no logs yet for hub/);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("logs hub: prints the tail when a log file exists", async () => {
-    const h = makeHarness();
-    try {
-      const path = ensureLogPath("hub", h.configDir);
-      writeFileSync(path, "hub line one\nhub line two\n");
-      const log: string[] = [];
-      const code = await logs("hub", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        log: (l) => log.push(l),
-      });
-      expect(code).toBe(0);
-      expect(log).toEqual(["hub line one", "hub line two"]);
-    } finally {
-      h.cleanup();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Phase 3b dual-dispatch (design §3.3): when a hub UNIT is installed, the verbs
-// drive the running supervisor / platform manager; when no unit is installed,
-// the existing detached arm is taken UNCHANGED. These suites exercise both arms
-// via injected `supervisor` seams (unit arm) and a stub spawner (detached arm).
-// ---------------------------------------------------------------------------
 
 interface SupervisorStub {
   opts: NonNullable<LifecycleOpts["supervisor"]>;
@@ -1945,7 +136,12 @@ function makeSupervisorStub(opts?: {
   return stub;
 }
 
-describe("Phase 3b dual-dispatch — start", () => {
+// ---------------------------------------------------------------------------
+// Supervisor-path dispatch (design §3.3): a hub UNIT is installed → the verbs
+// drive the running supervisor (per-module ops) / platform manager (hub verbs).
+// ---------------------------------------------------------------------------
+
+describe("start — supervisor path", () => {
   test("module svc, unit-installed → ensureHubUnit then driveModuleOp(start)", async () => {
     const h = makeHarness();
     try {
@@ -1979,27 +175,6 @@ describe("Phase 3b dual-dispatch — start", () => {
       expect(code).toBe(0);
       expect(sup.ensureCalls).toHaveLength(1);
       expect(sup.driveCalls).toHaveLength(0);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("module svc, NO unit → existing detached spawner path (unchanged)", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      const spawner = makeSpawner([4242]);
-      const code = await start("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
-        // supervisor omitted → detached arm, deterministically.
-      });
-      expect(code).toBe(0);
-      expect(spawner.calls).toHaveLength(1);
-      expect(spawner.calls[0]?.cmd).toEqual(["parachute-vault", "serve"]);
-      expect(readPid("vault", h.configDir)).toBe(4242);
     } finally {
       h.cleanup();
     }
@@ -2052,7 +227,7 @@ describe("Phase 3b dual-dispatch — start", () => {
   });
 });
 
-describe("Phase 3b dual-dispatch — stop", () => {
+describe("stop — supervisor path", () => {
   test("module svc, hub UP → driveModuleOp(stop), no ensureHubUnit", async () => {
     const h = makeHarness();
     try {
@@ -2099,16 +274,11 @@ describe("Phase 3b dual-dispatch — stop", () => {
     const h = makeHarness();
     try {
       const sup = makeSupervisorStub();
-      // A kill seam that fails the test if ANY PID signal is sent.
-      const kill = () => {
-        throw new Error("stop hub must NOT signal a PID — it must go through the manager");
-      };
       const log: string[] = [];
       const code = await stop("hub", {
         configDir: h.configDir,
         manifestPath: h.manifestPath,
         log: (l) => log.push(l),
-        kill,
         supervisor: sup.opts,
       });
       expect(code).toBe(0);
@@ -2137,34 +307,9 @@ describe("Phase 3b dual-dispatch — stop", () => {
       h.cleanup();
     }
   });
-
-  test("module svc, NO unit → existing detached stop path (unchanged)", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      const killed: Array<{ pid: number; sig: NodeJS.Signals | number }> = [];
-      const code = await stop("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        kill: (pid, sig) => killed.push({ pid, sig }),
-        alive: (() => {
-          let n = 0;
-          return () => n++ < 1; // alive once (for the SIGTERM), then dead.
-        })(),
-        log: () => {},
-        // supervisor omitted → detached arm.
-      });
-      expect(code).toBe(0);
-      expect(killed[0]).toEqual({ pid: 4242, sig: "SIGTERM" });
-      expect(readPid("vault", h.configDir)).toBeUndefined();
-    } finally {
-      h.cleanup();
-    }
-  });
 });
 
-describe("Phase 3b dual-dispatch — restart", () => {
+describe("restart — supervisor path", () => {
   test("module svc, unit-installed → ensureHubUnit then driveModuleOp(restart)", async () => {
     const h = makeHarness();
     try {
@@ -2219,15 +364,11 @@ describe("Phase 3b dual-dispatch — restart", () => {
     const h = makeHarness();
     try {
       const sup = makeSupervisorStub();
-      const kill = () => {
-        throw new Error("restart hub must NOT signal a PID — it must go through the manager");
-      };
       const log: string[] = [];
       const code = await restart("hub", {
         configDir: h.configDir,
         manifestPath: h.manifestPath,
         log: (l) => log.push(l),
-        kill,
         supervisor: sup.opts,
       });
       expect(code).toBe(0);
@@ -2256,38 +397,17 @@ describe("Phase 3b dual-dispatch — restart", () => {
       h.cleanup();
     }
   });
-
-  test("module svc, NO unit → existing detached stop-then-start path (unchanged)", async () => {
-    const h = makeHarness();
-    try {
-      seedVault(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      const spawner = makeSpawner([7777]);
-      const killed: Array<{ pid: number; sig: NodeJS.Signals | number }> = [];
-      const code = await restart("vault", {
-        configDir: h.configDir,
-        manifestPath: h.manifestPath,
-        spawner,
-        kill: (pid, sig) => killed.push({ pid, sig }),
-        // Stale 4242 is dead (stop's stale-pid path cleans up without a kill);
-        // freshly spawned 7777 is alive past the post-spawn settle (hub#194).
-        // Per-pid differentiation, mirroring the existing detached-restart test.
-        alive: (pid) => pid === 7777,
-        sleep: async () => {},
-        log: () => {},
-        // supervisor omitted → detached arm (stop then start).
-      });
-      expect(code).toBe(0);
-      expect(killed).toHaveLength(0); // stale pid → detached cleanup, no kill
-      expect(spawner.calls).toHaveLength(1); // detached start ran (NOT the supervisor)
-      expect(readPid("vault", h.configDir)).toBe(7777);
-    } finally {
-      h.cleanup();
-    }
-  });
 });
 
-describe("§7.5 auto-detect-and-offer hook in start/stop/restart", () => {
+// ---------------------------------------------------------------------------
+// §7.5 no-unit path: a box with NO hub unit gets the auto-offer (when enabled)
+// or the actionable "run `parachute migrate --to-supervised`" error — NEVER a
+// detached spawn (the spawners are retired in Phase 5b). Reworked from the
+// former "fall through to the detached arm" tests: the intent (what happens on
+// a no-unit box) is preserved, but the outcome inverted to single-runtime.
+// ---------------------------------------------------------------------------
+
+describe("§7.5 no-unit path in start/stop/restart", () => {
   /** A migrate-offer stub recording whether it was called + what it returns. */
   function makeOfferStub(outcome: MigrateOfferResult["outcome"]): {
     offer: (opts: MigrateOfferOpts) => Promise<MigrateOfferResult>;
@@ -2305,99 +425,92 @@ describe("§7.5 auto-detect-and-offer hook in start/stop/restart", () => {
     };
   }
 
-  test("offer disabled by default (omitted) → detached arm, no offer", async () => {
+  test("no unit + offer disabled (omitted) → actionable migrate error, exit 1, no spawn", async () => {
     const h = makeHarness();
     try {
       seedVault(h.manifestPath);
-      const spawner = makeSpawner([4242]);
-      // No migrateOffer block → the §7.5 hook stays OFF (existing-test behavior).
+      const log: string[] = [];
+      // No `supervisor` block → unitInstalled defaults to false; no migrateOffer
+      // → the offer hook stays OFF. There is no detached fallback anymore, so the
+      // verb surfaces the actionable command and exits non-zero.
       const code = await start("vault", {
         configDir: h.configDir,
         manifestPath: h.manifestPath,
-        spawner,
-        log: () => {},
+        log: (l) => log.push(l),
       });
-      expect(code).toBe(0);
-      // Took the detached arm — spawned vault.
-      expect(spawner.calls).toHaveLength(1);
+      expect(code).toBe(1);
+      expect(log.join("\n")).toMatch(/No supervised hub unit is installed/);
+      expect(log.join("\n")).toMatch(/parachute migrate --to-supervised/);
     } finally {
       h.cleanup();
     }
   });
 
-  test("start: accept+migrate → re-dispatches through the supervisor (no detached spawn)", async () => {
+  test("start: accept+migrate → dispatches through the supervisor (no detached spawn)", async () => {
     const h = makeHarness();
     try {
       seedVault(h.manifestPath);
       const offerStub = makeOfferStub("migrated");
       const sup = makeSupervisorStub();
-      // Start on the detached arm (unitInstalled:false), with the offer enabled
-      // and the supervisor stub ready for the post-migrate re-dispatch.
-      const spawner = makeSpawner([4242]);
+      // Start on the no-unit arm (unitInstalled:false), with the offer enabled
+      // and the supervisor stub ready for the post-migrate dispatch.
       const code = await start("vault", {
         configDir: h.configDir,
         manifestPath: h.manifestPath,
-        spawner,
         log: () => {},
         supervisor: { ...sup.opts, unitInstalled: false },
         migrateOffer: { enabled: true, offer: offerStub.offer },
       });
       expect(code).toBe(0);
       expect(offerStub.calls).toBe(1);
-      // The re-dispatch drove the supervisor (NOT a detached spawn).
+      // The migrate flipped the box to supervised → the verb drove the supervisor.
       expect(sup.driveCalls).toEqual([{ short: "vault", op: "start" }]);
-      expect(spawner.calls).toHaveLength(0);
     } finally {
       h.cleanup();
     }
   });
 
-  test("start: declined → falls through to the detached arm", async () => {
+  test("start: declined → actionable-error path, exit 1 (no spawn)", async () => {
     const h = makeHarness();
     try {
       seedVault(h.manifestPath);
       const offerStub = makeOfferStub("declined");
-      const spawner = makeSpawner([4242]);
       const code = await start("vault", {
         configDir: h.configDir,
         manifestPath: h.manifestPath,
-        spawner,
         log: () => {},
         migrateOffer: { enabled: true, offer: offerStub.offer },
       });
-      expect(code).toBe(0);
+      // Declined → no migrate, no detached spawn (retired) → non-zero exit. The
+      // offer itself surfaced its own decline guidance, so the verb just bails.
+      expect(code).toBe(1);
       expect(offerStub.calls).toBe(1);
-      // Declined → detached spawn still happened.
-      expect(spawner.calls).toHaveLength(1);
     } finally {
       h.cleanup();
     }
   });
 
-  test("start: migrate-failed → falls through to the detached arm (fail-safe)", async () => {
+  test("start: migrate-failed → actionable-error path, exit 1 (fail-safe, no spawn)", async () => {
     const h = makeHarness();
     try {
       seedVault(h.manifestPath);
       const offerStub = makeOfferStub("migrate-failed");
-      const spawner = makeSpawner([4242]);
       const code = await start("vault", {
         configDir: h.configDir,
         manifestPath: h.manifestPath,
-        spawner,
         log: () => {},
         migrateOffer: { enabled: true, offer: offerStub.offer },
       });
-      // A failed cutover leaves the box detached → the original verb still runs
-      // the detached way (rather than re-dispatching into a supervisor that
-      // isn't up).
-      expect(code).toBe(0);
-      expect(spawner.calls).toHaveLength(1);
+      // A failed cutover leaves the box un-migrated → the verb bails non-zero
+      // (rather than dispatching into a supervisor that isn't up). No spawn.
+      expect(code).toBe(1);
+      expect(offerStub.calls).toBe(1);
     } finally {
       h.cleanup();
     }
   });
 
-  test("stop: accept+migrate → re-dispatches through the supervisor", async () => {
+  test("stop: accept+migrate → dispatches through the supervisor", async () => {
     const h = makeHarness();
     try {
       seedVault(h.manifestPath);
@@ -2418,7 +531,7 @@ describe("§7.5 auto-detect-and-offer hook in start/stop/restart", () => {
     }
   });
 
-  test("restart: accept+migrate → re-dispatches through the supervisor", async () => {
+  test("restart: accept+migrate → dispatches through the supervisor", async () => {
     const h = makeHarness();
     try {
       seedVault(h.manifestPath);
@@ -2453,7 +566,7 @@ describe("§7.5 auto-detect-and-offer hook in start/stop/restart", () => {
         migrateOffer: { enabled: true, offer: offerStub.offer },
       });
       expect(code).toBe(0);
-      // Supervisor arm taken directly → the offer hook (detached-arm only) never ran.
+      // Supervisor arm taken directly → the offer hook (no-unit only) never ran.
       expect(offerStub.calls).toBe(0);
       expect(sup.driveCalls).toEqual([{ short: "vault", op: "start" }]);
     } finally {
@@ -2461,33 +574,257 @@ describe("§7.5 auto-detect-and-offer hook in start/stop/restart", () => {
     }
   });
 
-  test("restart: declined → offer fires EXACTLY ONCE, not three times (MUST-FIX 3)", async () => {
+  test("restart: declined → offer fires EXACTLY ONCE (MUST-FIX 3), exit 1", async () => {
     const h = makeHarness();
     try {
       seedVault(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      // The operator DECLINES the offer. The outer `restart` makes the single
-      // offer, then falls to the detached stop+start. WITHOUT the fix, the offer
-      // block flowed through `...opts` into both inner verbs → 3 offers/prints.
+      // The operator DECLINES the offer. `restart` makes a single offer via the
+      // shared `requireSupervisedOrOffer` gate (no inner stop+start re-offer
+      // anymore — the detached stop-then-start arm is gone).
       const offerStub = makeOfferStub("declined");
-      const spawner = makeSpawner([7777]);
       const code = await restart("vault", {
         configDir: h.configDir,
         manifestPath: h.manifestPath,
-        spawner,
-        // Stale 4242 dead (stop's stale-pid path skips the kill); spawned 7777
-        // alive past the post-spawn settle.
-        alive: (pid) => pid === 7777,
-        sleep: async () => {},
         log: () => {},
         migrateOffer: { enabled: true, offer: offerStub.offer },
       });
-      expect(code).toBe(0);
-      // EXACTLY ONE offer — the outer restart's, not re-offered by inner stop+start.
+      expect(code).toBe(1);
+      // EXACTLY ONE offer.
       expect(offerStub.calls).toBe(1);
-      // The detached restart still happened (declined → detached arm).
-      expect(spawner.calls).toHaveLength(1);
-      expect(readPid("vault", h.configDir)).toBe(7777);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group-aware kill / liveness primitives (hub#88). The detached MODULE spawner
+// that created these process groups is retired (the supervisor's group-spawn +
+// `defaultKillGroup` carry that role now, asserted in `supervisor.test.ts`), but
+// `defaultKill` / `defaultAlive` survive as exported primitives — `logs` uses
+// `defaultAlive`, and the supervisor's reaper mirrors `defaultKill`'s group/
+// bare-pid fallback. These tests spawn a detached fixture process directly (not
+// via the retired spawner) to keep that behavior under test.
+// ---------------------------------------------------------------------------
+
+/** Spawn a detached fixture child (its own process group) for the kill/alive tests. */
+function spawnDetached(cmd: string[]): { pid: number; logFile: string } {
+  const dir = mkdtempSync(join(tmpdir(), "pcli-grp-"));
+  const logFile = ensureLogPath("test", dir);
+  const fd = openSync(logFile, "a");
+  const proc = Bun.spawn(cmd, { stdio: ["ignore", fd, fd], detached: true, env: process.env });
+  proc.unref();
+  return { pid: proc.pid, logFile };
+}
+
+describe("group-aware kill / liveness (hub#88)", () => {
+  test("defaultKill takes down the wrapper and its grandchildren together", async () => {
+    // Wrapper sh forks `sleep 30 & echo $!` so we capture the grandchild PID via
+    // the log file, then `wait` so the wrapper sticks around (mirrors `pnpm exec
+    // tsx`'s shape). SIGKILL on the GROUP reaps both.
+    const { pid: wrapperPid, logFile } = spawnDetached([
+      "sh",
+      "-c",
+      "sleep 30 & echo $! >&2; wait",
+    ]);
+    await new Promise((r) => setTimeout(r, 200));
+    const logText = await Bun.file(logFile).text();
+    const grandchildPid = Number.parseInt(logText.trim().split("\n").pop() ?? "", 10);
+    expect(grandchildPid).toBeGreaterThan(0);
+    expect(grandchildPid).not.toBe(wrapperPid);
+    expect(() => process.kill(grandchildPid, 0)).not.toThrow();
+
+    defaultKill(wrapperPid, "SIGKILL");
+
+    await new Promise((r) => setTimeout(r, 200));
+    let grandchildStillAlive = true;
+    try {
+      process.kill(grandchildPid, 0);
+    } catch {
+      grandchildStillAlive = false;
+    }
+    expect(grandchildStillAlive).toBe(false);
+  });
+
+  test("defaultAlive reports group liveness for detached children", async () => {
+    const { pid } = spawnDetached(["sh", "-c", "sleep 2"]);
+    try {
+      expect(defaultAlive(pid)).toBe(true);
+    } finally {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {}
+    }
+    await new Promise((r) => setTimeout(r, 100));
+    expect(defaultAlive(pid)).toBe(false);
+  });
+
+  test("defaultAlive + defaultKill fall back to bare-pid for legacy (non-detached) processes", async () => {
+    // A non-detached child shares the test runner's pgid, so kill(-pid, 0) will
+    // ESRCH and both must fall back to a bare-pid path.
+    const proc = Bun.spawn(["sh", "-c", "sleep 5"], { stdio: ["ignore", "ignore", "ignore"] });
+    const pid = proc.pid;
+    try {
+      expect(defaultAlive(pid)).toBe(true);
+      defaultKill(pid, "SIGKILL");
+      await new Promise((r) => setTimeout(r, 100));
+      expect(defaultAlive(pid)).toBe(false);
+    } finally {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `parachute logs <svc>` — unchanged by Phase 5b. Reads the per-service logfile
+// keyed by short name (the readers §7.5 keeps). Includes the internal `hub`.
+// ---------------------------------------------------------------------------
+
+describe("parachute logs", () => {
+  test("hint when no log file exists", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log.join("\n")).toMatch(/no logs yet for vault/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("prints last N lines in one-shot mode", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const path = ensureLogPath("vault", h.configDir);
+      writeFileSync(path, "line one\nline two\nline three\n");
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        lines: 2,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log).toEqual(["line two", "line three"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("unknown service errors cleanly", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const log: string[] = [];
+      const code = await logs("nope", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(1);
+      expect(log.join("\n")).toMatch(/unknown service "nope"/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("running daemon + missing log file: surfaces alive-but-no-log shape (hub#335)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      // A pidfile reader still resolves: seed a live pid (this process) so the
+      // running-but-no-logfile diagnostic fires.
+      writePid("vault", process.pid, h.configDir);
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        alive: () => true,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log.join("\n")).toMatch(/is running \(pid .*\) but no log file/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("stale pidfile + missing log file: falls through to start hint", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writePid("vault", 999999, h.configDir);
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        alive: () => false,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log.join("\n")).toMatch(/no logs yet for vault/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("log file exists: prints tail regardless of pidfile state (hub#335)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const path = ensureLogPath("vault", h.configDir);
+      writeFileSync(path, "boot line\n");
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log).toEqual(["boot line"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("logs hub: doesn't reject 'hub' as an unknown service", async () => {
+    const h = makeHarness();
+    try {
+      const log: string[] = [];
+      const code = await logs("hub", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log.join("\n")).toMatch(/no logs yet for hub/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("logs hub: prints the tail when a log file exists", async () => {
+    const h = makeHarness();
+    try {
+      const path = ensureLogPath("hub", h.configDir);
+      writeFileSync(path, "hub line one\nhub line two\n");
+      const log: string[] = [];
+      const code = await logs("hub", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log).toEqual(["hub line one", "hub line two"]);
     } finally {
       h.cleanup();
     }

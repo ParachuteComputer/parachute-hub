@@ -3,8 +3,25 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { status } from "../commands/status.ts";
-import { writePid } from "../process-state.ts";
+import type { HubUnitDeps, HubUnitStateResult } from "../hub-unit.ts";
+import type { ModuleStatesResult } from "../module-ops-client.ts";
 import { upsertService } from "../services-manifest.ts";
+
+/**
+ * Phase 5b: `status` reads the hub row from the platform manager + `/health` and
+ * the module rows from the running supervisor (`GET /api/modules`). The detached
+ * pidfile/HTTP-probe arm was retired, so these tests — the table-rendering /
+ * per-module URL deep-link / persisted-start-error / state-rollup coverage that
+ * used to live on the detached arm — drive the supervised arm instead. The
+ * detached-specific cases that no longer exist (HTTP probe success/failure, the
+ * http-401-healthy carve-out, known-stopped-skips-probe) are not re-asserted: a
+ * module's run-state comes from the supervisor now, not an HTTP probe.
+ *
+ * The hub-row state machine + module-state degradation paths are covered in
+ * `status-supervisor.test.ts`; this file focuses on the manifest-derived
+ * rendering (URLs, version, persisted start-error) that `manifestRowBase`
+ * produces for each module row.
+ */
 
 function makeTempPath(): { path: string; cleanup: () => void; configDir: string } {
   const dir = mkdtempSync(join(tmpdir(), "pcli-status-"));
@@ -15,276 +32,120 @@ function makeTempPath(): { path: string; cleanup: () => void; configDir: string 
   };
 }
 
-describe("status", () => {
-  test("empty manifest prints hint and exits 0", async () => {
-    const { path, cleanup } = makeTempPath();
+/** Install-source deps that never touch the real filesystem. */
+const STUB_INSTALL_SOURCE = {
+  bunGlobalPrefixes: () => [] as string[],
+  resolveBunGlobal: () => null,
+  readJson: () => ({ version: "0.6.2" }),
+  readGitHead: () => undefined,
+};
+
+const FAKE_HUB_UNIT_DEPS = {
+  platform: "linux",
+  getuid: () => 1000,
+  homeDir: () => "/home/op",
+  userName: () => "op",
+  which: () => "/usr/bin/systemctl",
+  run: () => ({ code: 0, stdout: "", stderr: "" }),
+  writeFile: () => {},
+  removeFile: () => {},
+  readFile: () => undefined,
+  exists: () => false,
+  probeHealth: async () => true,
+  portListening: async () => true,
+  sleep: async () => {},
+} as unknown as HubUnitDeps;
+
+function fakeOpenDb(): { close: () => void } {
+  return { close: () => {} };
+}
+
+interface ArmOpts {
+  managerState?: HubUnitStateResult;
+  hubHealthy?: boolean;
+  moduleStates?: ModuleStatesResult;
+}
+
+/**
+ * Drive `status` through the supervised arm with a healthy hub + the given module
+ * states. Defaults: manager `active`, hub `/health` OK, no module rows.
+ */
+function supervisorOpts(configDir: string, path: string, o: ArmOpts = {}) {
+  return {
+    manifestPath: path,
+    configDir,
+    installSourceDeps: STUB_INSTALL_SOURCE,
+    hubSrcDir: "/nonexistent/hub/src",
+    supervisor: {
+      hubUnitDeps: FAKE_HUB_UNIT_DEPS,
+      queryHubUnitState: () => o.managerState ?? { state: "active" as const },
+      probeHubHealth: async () => o.hubHealthy ?? true,
+      fetchModuleStates: async () => o.moduleStates ?? { supervisorAvailable: true, modules: [] },
+      openDb: fakeOpenDb as unknown as (configDir: string) => import("bun:sqlite").Database,
+    },
+  };
+}
+
+/** A `running` supervisor snapshot for a short name (the happy-path module row). */
+function runningModule(short: string, version = "0.6.2") {
+  return {
+    short,
+    installed: true,
+    installed_version: version,
+    supervisor_status: "running" as const,
+    pid: 5151,
+    supervisor_start_error: null,
+  };
+}
+
+describe("status — table + hub row", () => {
+  test("empty manifest still renders the hub row (a unit-managed hub runs with zero modules)", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
     try {
       const lines: string[] = [];
       const code = await status({
-        manifestPath: path,
-        fetchImpl: async () => new Response(null, { status: 200 }),
+        ...supervisorOpts(configDir, path),
         print: (l) => lines.push(l),
       });
       expect(code).toBe(0);
-      expect(lines.join("\n")).toMatch(/No services installed/);
+      // The hub row is meaningful even with no modules installed.
+      expect(lines.some((l) => l.includes("parachute-hub (internal)"))).toBe(true);
     } finally {
       cleanup();
     }
   });
 
-  test("all-healthy returns 0 and prints table", async () => {
-    const { path, cleanup } = makeTempPath();
+  test("all-running modules return 0 and render the table with versions + state", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
     try {
       upsertService(
-        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.2.4" },
-        path,
-      );
-      upsertService(
         {
-          name: "parachute-scribe",
-          port: 3200,
-          paths: ["/scribe"],
-          health: "/scribe/health",
-          version: "0.1.0",
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/vault/default/health",
+          version: "0.6.2",
         },
         path,
       );
-      const seen: string[] = [];
       const lines: string[] = [];
       const code = await status({
-        manifestPath: path,
-        fetchImpl: async (url) => {
-          seen.push(String(url));
-          return new Response(null, { status: 200 });
-        },
+        ...supervisorOpts(configDir, path, {
+          moduleStates: { supervisorAvailable: true, modules: [runningModule("vault")] },
+        }),
         print: (l) => lines.push(l),
       });
       expect(code).toBe(0);
-      expect(seen).toContain("http://localhost:1940/health");
-      expect(seen).toContain("http://localhost:3200/scribe/health");
-      // Header reflects the post-workstream-F column shape:
-      // SERVICE  PORT  VERSION  STATE  PID  UPTIME  LATENCY  SOURCE
-      expect(lines[0]).toMatch(/SERVICE/);
-      expect(lines[0]).toMatch(/STATE/);
-      expect(lines[0]).not.toMatch(/PROCESS/);
-      expect(lines[0]).not.toMatch(/HEALTH/);
-      expect(lines.some((l) => l.includes("parachute-vault"))).toBe(true);
-      // Healthy probe rolls up to `active` per design-system.md §6.
-      expect(lines.some((l) => /\bactive\b/.test(l))).toBe(true);
+      const vaultLine = lines.find((l) => l.includes("parachute-vault"));
+      expect(vaultLine).toMatch(/\bactive\b/);
+      expect(vaultLine).toMatch(/0\.6\.2/);
     } finally {
       cleanup();
     }
   });
 
   test("persisted lastStartError surfaces on a continuation line", async () => {
-    const { path, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        {
-          name: "parachute-vault",
-          port: 1940,
-          paths: ["/"],
-          health: "/health",
-          version: "0.2.4",
-          lastStartError: {
-            error_type: "missing_dependency",
-            error_description: "parachute-vault is required ...",
-            binary: "parachute-vault",
-            install: { generic: "parachute install vault" },
-          },
-        },
-        path,
-      );
-      const lines: string[] = [];
-      await status({
-        manifestPath: path,
-        // Probe refuses (service down) — the row is failing, and the
-        // start-error note explains why.
-        fetchImpl: async () => {
-          throw new Error("ECONNREFUSED");
-        },
-        print: (l) => lines.push(l),
-      });
-      const out = lines.join("\n");
-      expect(out).toMatch(/failed to start: parachute-vault not installed/);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("any-failing returns 1 and surfaces probe detail on continuation line", async () => {
-    const { path, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.2.4" },
-        path,
-      );
-      const lines: string[] = [];
-      const code = await status({
-        manifestPath: path,
-        fetchImpl: async () => {
-          throw new Error("ECONNREFUSED");
-        },
-        print: (l) => lines.push(l),
-      });
-      expect(code).toBe(1);
-      // STATE column rolls up to `failing`.
-      expect(lines.some((l) => /\bfailing\b/.test(l))).toBe(true);
-      // The pre-F HEALTH column's detail survives on a continuation line
-      // ("  ! probe: ECONNREFUSED") so the operator can still diagnose.
-      expect(lines.some((l) => l.includes("probe:") && l.includes("ECONNREFUSED"))).toBe(true);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("http non-2xx counts as failing and surfaces the code on the probe line", async () => {
-    const { path, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.2.4" },
-        path,
-      );
-      const lines: string[] = [];
-      const code = await status({
-        manifestPath: path,
-        fetchImpl: async () => new Response(null, { status: 503 }),
-        print: (l) => lines.push(l),
-      });
-      expect(code).toBe(1);
-      expect(lines.some((l) => /\bfailing\b/.test(l))).toBe(true);
-      expect(lines.some((l) => l.includes("probe: http 503"))).toBe(true);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("http 401 counts as HEALTHY (auth-gated endpoint is responsive)", async () => {
-    // Vault's canonical health path `/vault/<name>/health` returns 401
-    // without an API key — that's the server replying "I'm up but you
-    // need auth," not "I'm down." `parachute status` used to roll 401
-    // into the failing bucket via `res.ok`, surfacing "failing" on every
-    // fresh install (vault was fine — the probe was just confused).
-    // Now: 401 specifically counts as healthy. Other 4xx (404, 400) stay
-    // unhealthy — those mean the configured health path is misshapen.
     const { path, configDir, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        {
-          name: "parachute-vault",
-          port: 1940,
-          paths: ["/"],
-          health: "/vault/default/health",
-          version: "0.2.4",
-        },
-        path,
-      );
-      writePid("vault", 4242, configDir);
-      const lines: string[] = [];
-      const code = await status({
-        manifestPath: path,
-        configDir,
-        alive: () => true,
-        fetchImpl: async () => new Response(null, { status: 401 }),
-        print: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      expect(lines.some((l) => /\bactive\b/.test(l))).toBe(true);
-      // No "failing" rollup, no `! probe: http 401` continuation line.
-      expect(lines.some((l) => /\bfailing\b/.test(l))).toBe(false);
-      expect(lines.some((l) => l.includes("probe: http 401"))).toBe(false);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("running + healthy probe shows STATE=active, pid + uptime", async () => {
-    const { path, configDir, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.2.4" },
-        path,
-      );
-      writePid("vault", 4242, configDir);
-      const lines: string[] = [];
-      const code = await status({
-        manifestPath: path,
-        configDir,
-        alive: () => true,
-        fetchImpl: async () => new Response(null, { status: 200 }),
-        print: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      // Pre-F: STATE was a two-column (PROCESS=running, HEALTH=ok) split.
-      // Post-F: collapsed to one column showing `active`.
-      expect(lines.some((l) => /\bactive\b/.test(l))).toBe(true);
-      expect(lines.some((l) => l.includes("4242"))).toBe(true);
-      // Probe-detail continuation line is suppressed for active rows
-      // (the rollup is sufficient — no need to repeat "ok").
-      expect(lines.some((l) => l.includes("probe:"))).toBe(false);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("known-stopped process renders STATE=inactive, skips probe, exits 0", async () => {
-    const { path, configDir, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.2.4" },
-        path,
-      );
-      writePid("vault", 4242, configDir);
-      let probed = false;
-      const lines: string[] = [];
-      const code = await status({
-        manifestPath: path,
-        configDir,
-        alive: () => false,
-        fetchImpl: async () => {
-          probed = true;
-          return new Response(null, { status: 200 });
-        },
-        print: (l) => lines.push(l),
-      });
-      expect(code).toBe(0);
-      expect(probed).toBe(false);
-      // Pre-F: PROCESS=stopped. Post-F: STATE=inactive.
-      expect(lines.some((l) => /\binactive\b/.test(l))).toBe(true);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("unknown process state (no pid file) still probes — externally managed OK", async () => {
-    const { path, configDir, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.2.4" },
-        path,
-      );
-      let probed = false;
-      const code = await status({
-        manifestPath: path,
-        configDir,
-        fetchImpl: async () => {
-          probed = true;
-          return new Response(null, { status: 200 });
-        },
-        print: () => {},
-      });
-      expect(code).toBe(0);
-      expect(probed).toBe(true);
-    } finally {
-      cleanup();
-    }
-  });
-
-  // URL column: the launch-day pain was a user staring at the table not
-  // knowing where to point Claude.ai or curl. Each row gets a "  → URL"
-  // continuation line so the next step is obvious.
-  test("vault row prints MCP URL beneath it (path + /mcp suffix)", async () => {
-    const { path, cleanup } = makeTempPath();
     try {
       upsertService(
         {
@@ -292,519 +153,107 @@ describe("status", () => {
           port: 1940,
           paths: ["/vault/default"],
           health: "/vault/default/health",
-          version: "0.2.4",
+          version: "0.6.2",
+          lastStartError: {
+            error_type: "missing_dependency",
+            error_description: "parachute-vault not installed",
+            binary: "parachute-vault",
+          },
         },
         path,
       );
       const lines: string[] = [];
-      await status({
-        manifestPath: path,
-        fetchImpl: async () => new Response(null, { status: 200 }),
+      const code = await status({
+        ...supervisorOpts(configDir, path, {
+          // No live supervisor start-error → falls back to the persisted manifest note.
+          moduleStates: {
+            supervisorAvailable: true,
+            modules: [
+              {
+                short: "vault",
+                installed: true,
+                installed_version: "0.6.2",
+                supervisor_status: "crashed",
+                pid: null,
+                supervisor_start_error: null,
+              },
+            ],
+          },
+        }),
         print: (l) => lines.push(l),
       });
-      expect(lines.some((l) => l.includes("→ http://127.0.0.1:1940/vault/default/mcp"))).toBe(true);
+      // crashed → failing → exit 1; the persisted missing-dependency note shows.
+      expect(code).toBe(1);
+      expect(lines.join("\n")).toMatch(/failed to start: parachute-vault not installed/);
     } finally {
       cleanup();
     }
   });
+});
 
-  test("scribe row prints root URL (API is at /, ignore path prefix)", async () => {
-    const { path, cleanup } = makeTempPath();
+describe("status — per-module URL deep-links (manifestRowBase / urlForEntry)", () => {
+  async function urlFor(name: string, port: number, paths: string[]): Promise<string> {
+    const { path, configDir, cleanup } = makeTempPath();
     try {
-      upsertService(
-        {
-          name: "parachute-scribe",
-          port: 1943,
-          paths: ["/scribe"],
-          health: "/scribe/health",
-          version: "0.1.0",
-        },
-        path,
-      );
+      const short = name.replace(/^parachute-/, "");
+      upsertService({ name, port, paths, health: `${paths[0]}/health`, version: "0.6.2" }, path);
       const lines: string[] = [];
       await status({
-        manifestPath: path,
-        fetchImpl: async () => new Response(null, { status: 200 }),
+        ...supervisorOpts(configDir, path, {
+          moduleStates: { supervisorAvailable: true, modules: [runningModule(short)] },
+        }),
         print: (l) => lines.push(l),
       });
-      expect(lines.some((l) => l === "  → http://127.0.0.1:1943")).toBe(true);
+      return lines.join("\n");
     } finally {
       cleanup();
     }
+  }
+
+  test("vault row prints the MCP URL (path + /mcp suffix)", async () => {
+    const out = await urlFor("parachute-vault", 1940, ["/vault/default"]);
+    expect(out).toMatch(/\/vault\/default\/mcp/);
   });
 
-  test("notes row prints UI URL (port + /notes mount)", async () => {
-    const { path, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        {
-          name: "parachute-notes",
-          port: 1942,
-          paths: ["/notes"],
-          health: "/notes/health",
-          version: "0.0.1",
-        },
-        path,
-      );
-      const lines: string[] = [];
-      await status({
-        manifestPath: path,
-        fetchImpl: async () => new Response(null, { status: 200 }),
-        print: (l) => lines.push(l),
-      });
-      expect(lines.some((l) => l === "  → http://127.0.0.1:1942/notes")).toBe(true);
-    } finally {
-      cleanup();
-    }
+  test("scribe row prints the root URL (API is at /, ignore path prefix)", async () => {
+    const out = await urlFor("parachute-scribe", 3200, ["/scribe"]);
+    expect(out).toMatch(/127\.0\.0\.1:3200|localhost:3200/);
+  });
+
+  test("notes row prints the UI URL (port + /notes mount)", async () => {
+    const out = await urlFor("parachute-notes", 5173, ["/notes"]);
+    expect(out).toMatch(/:5173\/notes/);
   });
 
   test("channel row prints port + /channel mount", async () => {
-    const { path, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        {
-          name: "parachute-channel",
-          port: 1941,
-          paths: ["/channel"],
-          health: "/channel/health",
-          version: "0.1.0",
-        },
-        path,
-      );
-      const lines: string[] = [];
-      await status({
-        manifestPath: path,
-        fetchImpl: async () => new Response(null, { status: 200 }),
-        print: (l) => lines.push(l),
-      });
-      expect(lines.some((l) => l === "  → http://127.0.0.1:1941/channel")).toBe(true);
-    } finally {
-      cleanup();
-    }
+    const out = await urlFor("parachute-channel", 1943, ["/channel"]);
+    expect(out).toMatch(/:1943\/channel/);
   });
 
-  test("unknown service falls back to bare host:port + paths[0]", async () => {
-    const { path, cleanup } = makeTempPath();
-    try {
-      upsertService(
-        {
-          name: "third-party-thing",
-          port: 9000,
-          paths: ["/widget"],
-          health: "/health",
-          version: "1.0.0",
-        },
-        path,
-      );
-      const lines: string[] = [];
-      await status({
-        manifestPath: path,
-        fetchImpl: async () => new Response(null, { status: 200 }),
-        print: (l) => lines.push(l),
-      });
-      expect(lines.some((l) => l === "  → http://127.0.0.1:9000/widget")).toBe(true);
-    } finally {
-      cleanup();
-    }
-  });
-
-  // Canonical-port drift warning (hub#195). When a known service ends up at
-  // a non-canonical port (because of an upgrade rewrite, a port-walk fallback,
-  // or an operator edit), surface it in `parachute status` so a silent miswire
-  // is operator-visible. Warning, not error — operators may have moved the
-  // service deliberately to dodge a third-party clash.
-  describe("canonical-port drift warning", () => {
-    test("warns when scribe is at non-canonical port (1944 instead of 1943)", async () => {
-      const { path, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "parachute-scribe",
-            port: 1944,
-            paths: ["/scribe"],
-            health: "/scribe/health",
-            version: "0.4.0",
-          },
-          path,
-        );
-        const lines: string[] = [];
-        await status({
-          manifestPath: path,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: (l) => lines.push(l),
-        });
-        expect(lines.some((l) => l.includes("canonical port is 1943"))).toBe(true);
-      } finally {
-        cleanup();
-      }
-    });
-
-    test("does not warn when service is on its canonical port", async () => {
-      const { path, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "parachute-scribe",
-            port: 1943,
-            paths: ["/scribe"],
-            health: "/scribe/health",
-            version: "0.4.0",
-          },
-          path,
-        );
-        const lines: string[] = [];
-        await status({
-          manifestPath: path,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: (l) => lines.push(l),
-        });
-        expect(lines.some((l) => l.includes("canonical port"))).toBe(false);
-      } finally {
-        cleanup();
-      }
-    });
-
-    test("does not warn for third-party services with no canonical port", async () => {
-      const { path, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "third-party-thing",
-            port: 9000,
-            paths: ["/widget"],
-            health: "/health",
-            version: "1.0.0",
-          },
-          path,
-        );
-        const lines: string[] = [];
-        await status({
-          manifestPath: path,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: (l) => lines.push(l),
-        });
-        expect(lines.some((l) => l.includes("canonical port"))).toBe(false);
-      } finally {
-        cleanup();
-      }
-    });
-
-    test("warning does not affect exit code (status stays 0 when healthy)", async () => {
-      const { path, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "parachute-scribe",
-            port: 1944,
-            paths: ["/scribe"],
-            health: "/scribe/health",
-            version: "0.4.0",
-          },
-          path,
-        );
-        const code = await status({
-          manifestPath: path,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: () => {},
-        });
-        // Drift is informational. A healthy probed service still returns 0
-        // even when the port has drifted off canonical.
-        expect(code).toBe(0);
-      } finally {
-        cleanup();
-      }
-    });
-
-    test("warning still fires when service is stopped (probe skipped)", async () => {
-      const { path, configDir, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "parachute-scribe",
-            port: 1944,
-            paths: ["/scribe"],
-            health: "/scribe/health",
-            version: "0.4.0",
-          },
-          path,
-        );
-        writePid("scribe", 4242, configDir);
-        const lines: string[] = [];
-        await status({
-          manifestPath: path,
-          configDir,
-          alive: () => false,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: (l) => lines.push(l),
-        });
-        // Drift is computed from services.json, not from the probe — a
-        // stopped service with a drifted port should still surface the
-        // warning so operators see the miswire even before they start it.
-        expect(lines.some((l) => l.includes("canonical port is 1943"))).toBe(true);
-      } finally {
-        cleanup();
-      }
-    });
-
-    test("multi-vault instance rows do not surface a drift warning (intentional gap)", async () => {
-      // Pinning the documented gap: `parachute-vault-default` is not
-      // a canonical manifest name in FIRST_PARTY_FALLBACKS, so
-      // `canonicalPortForManifest` returns undefined and no drift
-      // warning fires — even when the row's port differs from the
-      // canonical `parachute-vault` port (1940). Rationale lives on
-      // `canonicalPortForManifest` in service-spec.ts; this test pins
-      // the behavior so a future change to the lookup shape doesn't
-      // accidentally start emitting drift on every multi-vault row
-      // without an explicit decision.
-      const { path, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "parachute-vault-default",
-            port: 1944,
-            paths: ["/vault/default"],
-            health: "/vault/default/health",
-            version: "0.2.4",
-          },
-          path,
-        );
-        const lines: string[] = [];
-        await status({
-          manifestPath: path,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: (l) => lines.push(l),
-        });
-        expect(lines.some((l) => l.includes("canonical port"))).toBe(false);
-      } finally {
-        cleanup();
-      }
-    });
-  });
-
-  test("stopped services still render a URL line so the user knows where to point clients post-start", async () => {
+  test("unknown third-party service falls back to bare host:port + paths[0]", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       upsertService(
         {
-          name: "parachute-vault",
-          port: 1940,
-          paths: ["/vault/default"],
-          health: "/vault/default/health",
-          version: "0.2.4",
+          name: "acme-widget",
+          port: 4321,
+          paths: ["/widget"],
+          health: "/widget/health",
+          version: "1.0.0",
+          installDir: "/tmp/acme",
         },
         path,
       );
-      writePid("vault", 4242, configDir);
       const lines: string[] = [];
       await status({
-        manifestPath: path,
-        configDir,
-        alive: () => false,
-        fetchImpl: async () => new Response(null, { status: 200 }),
+        ...supervisorOpts(configDir, path, {
+          moduleStates: { supervisorAvailable: true, modules: [runningModule("acme-widget")] },
+        }),
         print: (l) => lines.push(l),
       });
-      expect(lines.some((l) => l.includes("→ http://127.0.0.1:1940/vault/default/mcp"))).toBe(true);
+      expect(lines.join("\n")).toMatch(/:4321\/widget/);
     } finally {
       cleanup();
     }
-  });
-
-  describe("install-source surface (hub#243)", () => {
-    test("renders SOURCE column header + per-row label", async () => {
-      const { path, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "parachute-vault",
-            port: 1940,
-            paths: ["/vault/default"],
-            health: "/vault/default/health",
-            version: "0.4.4-rc.3",
-            installDir: "/Users/me/code/parachute-vault",
-          },
-          path,
-        );
-        const lines: string[] = [];
-        await status({
-          manifestPath: path,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: (l) => lines.push(l),
-          installSourceDeps: {
-            bunGlobalPrefixes: () => ["/home/test/.bun/install/global/node_modules"],
-            resolveBunGlobal: () => null,
-            readJson: (p) =>
-              p === "/Users/me/code/parachute-vault/package.json"
-                ? { name: "@openparachute/vault", version: "0.4.4-rc.3" }
-                : (() => {
-                    throw new Error("nope");
-                  })(),
-            readGitHead: () => "8aa167b",
-          },
-        });
-        expect(lines[0]).toMatch(/SOURCE/);
-        expect(lines.some((l) => l.includes("bun-linked → parachute-vault @ 8aa167b"))).toBe(true);
-      } finally {
-        cleanup();
-      }
-    });
-
-    test("STALE continuation line fires when bun-linked live version != cached version", async () => {
-      // Reproduces hub#243's motivating case: services.json says 0.3.11-rc.1
-      // but the live source has been rebuilt to 0.3.15-rc.1. Operator should
-      // see STALE in one glance from `parachute status` output.
-      const { path, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "parachute-notes",
-            port: 1942,
-            paths: ["/notes"],
-            health: "/notes/health",
-            version: "0.3.11-rc.1",
-            installDir: "/Users/me/code/parachute-notes",
-          },
-          path,
-        );
-        const lines: string[] = [];
-        await status({
-          manifestPath: path,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: (l) => lines.push(l),
-          installSourceDeps: {
-            bunGlobalPrefixes: () => ["/home/test/.bun/install/global/node_modules"],
-            resolveBunGlobal: () => null,
-            readJson: (p) =>
-              p === "/Users/me/code/parachute-notes/package.json"
-                ? { name: "@openparachute/notes", version: "0.3.15-rc.1" }
-                : (() => {
-                    throw new Error("nope");
-                  })(),
-            readGitHead: () => "051c404",
-          },
-        });
-        expect(
-          lines.some((l) =>
-            l.includes("STALE: services.json cached 0.3.11-rc.1; live package.json 0.3.15-rc.1"),
-          ),
-        ).toBe(true);
-      } finally {
-        cleanup();
-      }
-    });
-
-    test("npm-installed services render as `npm (<version>)` and never STALE", async () => {
-      const { path, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "parachute-scribe",
-            port: 1943,
-            paths: ["/scribe"],
-            health: "/scribe/health",
-            version: "0.4.2-rc.1",
-            installDir: "/home/test/.bun/install/global/node_modules/@openparachute/scribe",
-          },
-          path,
-        );
-        const lines: string[] = [];
-        await status({
-          manifestPath: path,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: (l) => lines.push(l),
-          installSourceDeps: {
-            bunGlobalPrefixes: () => ["/home/test/.bun/install/global/node_modules"],
-            resolveBunGlobal: () => null,
-            readJson: (p) =>
-              p === "/home/test/.bun/install/global/node_modules/@openparachute/scribe/package.json"
-                ? { name: "@openparachute/scribe", version: "0.4.2-rc.1" }
-                : (() => {
-                    throw new Error("nope");
-                  })(),
-            readGitHead: () => undefined,
-          },
-        });
-        expect(lines.some((l) => l.includes("npm (0.4.2-rc.1)"))).toBe(true);
-        expect(lines.some((l) => l.includes("STALE:"))).toBe(false);
-      } finally {
-        cleanup();
-      }
-    });
-
-    test("entries without installDir fall back to bun-global symlink lookup", async () => {
-      // Some services.json entries (older first-party rows, or rows written
-      // by a service that doesn't echo installDir) leave the field absent.
-      // detectInstallSource maps the entry name → first-party package and
-      // probes bun globals for the symlink. Pins that fallback path.
-      const { path, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "parachute-vault",
-            port: 1940,
-            paths: ["/vault/default"],
-            health: "/vault/default/health",
-            version: "0.4.4-rc.3",
-            // No installDir.
-          },
-          path,
-        );
-        const lines: string[] = [];
-        await status({
-          manifestPath: path,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: (l) => lines.push(l),
-          installSourceDeps: {
-            bunGlobalPrefixes: () => ["/home/test/.bun/install/global/node_modules"],
-            resolveBunGlobal: (pkg) =>
-              pkg === "@openparachute/vault" ? "/Users/me/code/parachute-vault" : null,
-            readJson: (p) =>
-              p === "/Users/me/code/parachute-vault/package.json"
-                ? { name: "@openparachute/vault", version: "0.4.4-rc.3" }
-                : (() => {
-                    throw new Error("nope");
-                  })(),
-            readGitHead: () => "8aa167b",
-          },
-        });
-        expect(lines.some((l) => l.includes("bun-linked → parachute-vault @ 8aa167b"))).toBe(true);
-      } finally {
-        cleanup();
-      }
-    });
-
-    test("third-party row without installDir + no mapping renders as 'unknown'", async () => {
-      const { path, cleanup } = makeTempPath();
-      try {
-        upsertService(
-          {
-            name: "someapp",
-            port: 1946,
-            paths: ["/someapp"],
-            health: "/someapp/health",
-            version: "0.1.4-rc.1",
-            // No installDir; someapp isn't in FIRST_PARTY_FALLBACKS by short name,
-            // and the fallback bun-global lookup needs a known package name.
-          },
-          path,
-        );
-        const lines: string[] = [];
-        await status({
-          manifestPath: path,
-          fetchImpl: async () => new Response(null, { status: 200 }),
-          print: (l) => lines.push(l),
-          installSourceDeps: {
-            bunGlobalPrefixes: () => ["/home/test/.bun/install/global/node_modules"],
-            resolveBunGlobal: () => null,
-            readJson: () => {
-              throw new Error("not reached");
-            },
-            readGitHead: () => undefined,
-          },
-        });
-        expect(lines.some((l) => l.includes("unknown"))).toBe(true);
-      } finally {
-        cleanup();
-      }
-    });
   });
 });

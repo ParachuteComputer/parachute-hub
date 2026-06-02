@@ -1,30 +1,21 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { CONFIG_DIR } from "./config.ts";
-import { hubDbPath } from "./hub-db.ts";
-import {
-  type AliveFn,
-  clearPid,
-  defaultAlive,
-  ensureLogPath,
-  readPid,
-  runDir,
-  writePid,
-} from "./process-state.ts";
-import { WELL_KNOWN_DIR } from "./well-known.ts";
+import { type AliveFn, clearPid, defaultAlive, readPid, runDir } from "./process-state.ts";
 
 /**
- * Lifecycle for the internal hub HTTP server. The hub is *not* a user-facing
- * service (not in services.json) — it's an implementation detail of
- * `parachute expose`, spawned implicitly on bringup and torn down on the
- * final teardown.
+ * Hub identity + port helpers + `stopHub` (the detached-stop path the migrate
+ * cutover still uses). The hub is *not* a user-facing service (not in
+ * services.json). Phase 5b retired the detached `ensureHubRunning` bringup — the
+ * hub now runs under a platform unit (`parachute serve`, see `hub-unit.ts` /
+ * `managed-unit.ts`); `init` brings it up via `installAndStartHubUnit`. This
+ * file keeps `stopHub` (used by `migrate` to stop a legacy detached hub during
+ * the cutover) + the canonical-port readers/writers.
  *
  * The hub lives under `svc = "hub"` in the process-state world, so its PID,
- * logs, and runtime files land at `~/.parachute/hub/{run,logs}/…` alongside
- * every other managed service.
+ * logs, and runtime files land at `~/.parachute/hub/{run,logs}/…`.
  */
 
 export const HUB_SVC = "hub";
@@ -38,14 +29,6 @@ export const HUB_DEFAULT_PORT = 1939;
  * detection (`hub-upgrade-mode.ts`) can't drift on the magic path.
  */
 export const CONTAINER_HOME = "/parachute";
-/**
- * Default fallback range is 1 — the hub binds 1939 or fails. Walking up would
- * steal another Parachute service's slot from the canonical 1939–1949 range.
- * Tests and debug tooling can pass a larger `fallbackRange` explicitly.
- */
-export const HUB_PORT_FALLBACK_RANGE = 1;
-
-const HUB_SERVER_PATH = fileURLToPath(new URL("./hub-server.ts", import.meta.url));
 
 export function hubPortPath(configDir: string = CONFIG_DIR): string {
   return join(runDir(HUB_SVC, configDir), `${HUB_SVC}.port`);
@@ -69,29 +52,6 @@ export function clearHubPort(configDir: string = CONFIG_DIR): void {
   const p = hubPortPath(configDir);
   if (existsSync(p)) rmSync(p, { force: true });
 }
-
-/**
- * Seam over `Bun.spawn`, mirroring the lifecycle Spawner — tests never want
- * to actually fork a process. The real implementation opens the log file,
- * pipes stdout+stderr into it, and detaches.
- */
-export interface HubSpawner {
-  spawn(cmd: readonly string[], logFile: string): number;
-}
-
-export const defaultHubSpawner: HubSpawner = {
-  spawn(cmd, logFile) {
-    const fd = openSync(logFile, "a");
-    // Inherit env so the hub child process sees PATH, HOME, PARACHUTE_HOME,
-    // etc. Bun.spawn defaults to empty env — see api-modules-ops.ts.
-    const proc = Bun.spawn([...cmd], {
-      stdio: ["ignore", fd, fd],
-      env: process.env,
-    });
-    proc.unref();
-    return proc.pid;
-  },
-};
 
 export type HubPortProbe = (port: number) => Promise<boolean>;
 export type KillFn = (pid: number, signal: NodeJS.Signals | number) => void;
@@ -159,124 +119,17 @@ export const defaultPortProbe: HubPortProbe = (port) =>
     server.listen(port, "127.0.0.1");
   });
 
+/**
+ * Ensure-hub options shape. Phase 5b retired the detached `ensureHubRunning`
+ * spawn this used to drive; `init`'s `defaultEnsureHubViaUnit` (hub-unit-backed)
+ * reuses this opts shape for its parameter signature. Only `configDir` /
+ * `startPort` / `log` are read on that path.
+ */
 export interface EnsureHubOpts {
   configDir?: string;
-  wellKnownDir?: string;
-  spawner?: HubSpawner;
-  alive?: AliveFn;
-  probe?: HubPortProbe;
-  sleep?: SleepFn;
-  /**
-   * Look up the PID listening on `port`. Production default uses `lsof`;
-   * tests inject a stub. Used to report which orphan process is holding
-   * the canonical hub port when the bind probe fails — so the operator
-   * has a concrete PID to point `parachute restart hub` at, not just an
-   * "unavailable" error. See hub#287.
-   */
-  pidOnPort?: PidOnPortFn;
-  /** Starting port (default 1939). First port that probe()s true wins. */
+  /** Starting port (default 1939). */
   startPort?: number;
-  /** How many ports to try before giving up (default 20). */
-  fallbackRange?: number;
-  /**
-   * Ports to skip during fallback — typically service ports from services.json
-   * so the hub doesn't steal a port a registered service will bind later.
-   * Probed ports that happen to be listening still fail the probe on their own;
-   * this guards the case where the service isn't running yet.
-   */
-  reservedPorts?: Iterable<number>;
-  /** How long to wait after spawn before claiming readiness. Short — tests set to 0. */
-  readyWaitMs?: number;
-  /**
-   * Public origin to use as the OAuth `iss` claim and as the base for the
-   * authorization-server metadata document. Forwarded to the hub server as
-   * `--issuer <url>`. When omitted, the hub falls back to the request's own
-   * origin — fine for loopback testing, wrong under tailscale where the
-   * request origin is `http://127.0.0.1:<port>`.
-   */
-  issuer?: string;
   log?: (line: string) => void;
-}
-
-export interface EnsureHubResult {
-  pid: number;
-  port: number;
-  /** True when this call spawned the hub; false when it was already running. */
-  started: boolean;
-}
-
-export async function ensureHubRunning(opts: EnsureHubOpts = {}): Promise<EnsureHubResult> {
-  const configDir = opts.configDir ?? CONFIG_DIR;
-  const wellKnownDir = opts.wellKnownDir ?? WELL_KNOWN_DIR;
-  const spawner = opts.spawner ?? defaultHubSpawner;
-  const alive = opts.alive ?? defaultAlive;
-  const probe = opts.probe ?? defaultPortProbe;
-  const sleep = opts.sleep ?? defaultSleep;
-  const pidOnPort = opts.pidOnPort ?? defaultPidOnPort;
-  const startPort = opts.startPort ?? HUB_DEFAULT_PORT;
-  const fallbackRange = opts.fallbackRange ?? HUB_PORT_FALLBACK_RANGE;
-  const reservedPorts = new Set(opts.reservedPorts ?? []);
-  const readyWaitMs = opts.readyWaitMs ?? 150;
-  const log = opts.log ?? (() => {});
-
-  const existingPid = readPid(HUB_SVC, configDir);
-  const existingPort = readHubPort(configDir);
-  if (existingPid !== undefined && alive(existingPid) && existingPort !== undefined) {
-    return { pid: existingPid, port: existingPort, started: false };
-  }
-  // Any stale state (pid without live process, port without pid) — wipe.
-  if (existingPid !== undefined) clearPid(HUB_SVC, configDir);
-  clearHubPort(configDir);
-
-  let chosenPort: number | undefined;
-  for (let i = 0; i < fallbackRange; i++) {
-    const candidate = startPort + i;
-    if (reservedPorts.has(candidate)) continue;
-    if (await probe(candidate)) {
-      chosenPort = candidate;
-      break;
-    }
-  }
-  if (chosenPort === undefined) {
-    // Port is held by *something*. If we can name the PID (lsof on macOS /
-    // Linux), point the operator at `parachute restart hub` — which now
-    // detects and kills the orphan even when hub.port is missing or stale
-    // (hub#287). Without a PID, fall back to the classic lsof hint.
-    const range =
-      fallbackRange === 1 ? `${startPort}` : `${startPort}..${startPort + fallbackRange - 1}`;
-    const orphanPid = fallbackRange === 1 ? pidOnPort(startPort) : undefined;
-    if (orphanPid !== undefined) {
-      throw new Error(
-        `hub: port ${range} unavailable — PID ${orphanPid} is already listening. Run \`parachute restart hub\` to clean up and restart, or \`kill ${orphanPid}\` then \`parachute start hub\`.`,
-      );
-    }
-    throw new Error(
-      `hub: port ${range} unavailable. Run \`lsof -iTCP:${startPort}\` to find what's using it, or pass --hub-port to override.`,
-    );
-  }
-
-  const logFile = ensureLogPath(HUB_SVC, configDir);
-  const cmd = [
-    "bun",
-    HUB_SERVER_PATH,
-    "--port",
-    String(chosenPort),
-    "--well-known-dir",
-    wellKnownDir,
-    "--db",
-    hubDbPath(configDir),
-    ...(opts.issuer ? ["--issuer", opts.issuer] : []),
-  ];
-  const pid = spawner.spawn(cmd, logFile);
-  writePid(HUB_SVC, pid, configDir);
-  writeHubPort(chosenPort, configDir);
-
-  // A tiny grace period so the subsequent `tailscale serve` proxy target
-  // isn't pointed at a not-yet-listening socket.
-  if (readyWaitMs > 0) await sleep(readyWaitMs);
-
-  log(`hub listening on 127.0.0.1:${chosenPort} (pid ${pid}); logs: ${logFile}`);
-  return { pid, port: chosenPort, started: true };
 }
 
 export interface StopHubOpts {

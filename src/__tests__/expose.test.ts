@@ -6,10 +6,8 @@ import type { ExposeSupervisorOpts } from "../commands/expose-supervisor.ts";
 import { exposePublic, exposeTailnet } from "../commands/expose.ts";
 import { readEnvFileValues } from "../env-file.ts";
 import { readExposeState, writeExposeState } from "../expose-state.ts";
-import type { EnsureHubOpts, HubSpawner, StopHubOpts } from "../hub-control.ts";
 import type { EnsureHubUnitOpts } from "../hub-unit.ts";
 import { type ModuleOp, ModuleOpHttpError } from "../module-ops-client.ts";
-import { writePid } from "../process-state.ts";
 import { upsertService } from "../services-manifest.ts";
 import type { Runner } from "../tailscale/run.ts";
 
@@ -57,36 +55,16 @@ function makeRunner(): { runner: Runner; calls: string[][] } {
   return { runner, calls };
 }
 
-function makeHubSpawner(pid: number): { spawner: HubSpawner; calls: string[][] } {
-  const calls: string[][] = [];
-  const spawner: HubSpawner = {
-    spawn(cmd) {
-      calls.push([...cmd]);
-      return pid;
-    },
-  };
-  return { spawner, calls };
-}
-
-/** Default hub overrides for expose tests — no real subprocess, no sleep. */
-function hubEnsureOpts(
-  spawner: HubSpawner,
-): Omit<EnsureHubOpts, "configDir" | "wellKnownDir" | "log"> {
-  return {
-    spawner,
-    alive: () => true,
-    probe: async () => true,
-    readyWaitMs: 0,
-  };
-}
-
-function hubStopOpts(): Omit<StopHubOpts, "configDir" | "log"> {
-  return {
-    kill: () => {},
-    alive: () => false,
-    sleep: async () => {},
-    now: () => 0,
-  };
+/**
+ * A minimal expose `supervisor` seam that forces the unit-installed arm with a
+ * benign `ensureHubUnit → already-up` + no-op `driveModuleOp` / self-heal. Most
+ * expose tests just need the hub-bringup to succeed so they can assert the
+ * tailscale plan / expose-state / well-known behavior; this stub provides that
+ * without a real launchd/systemd or hub. (Phase 5b retired the detached hub
+ * spawner that the old `makeHubSpawner` / `hubEnsureOpts` stubs simulated.)
+ */
+function supervisorUp(): ExposeSupervisorOpts {
+  return makeExposeSupervisorStub().opts;
 }
 
 function seedServices(path: string): void {
@@ -125,7 +103,6 @@ describe("expose tailnet up", () => {
     try {
       seedServices(h.manifestPath);
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposeTailnet("up", {
         runner,
@@ -133,9 +110,8 @@ describe("expose tailnet up", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: (l) => logs.push(l),
       });
@@ -175,31 +151,31 @@ describe("expose tailnet up", () => {
     }
   });
 
-  test("spawns hub server with --port + --well-known-dir", async () => {
+  test("ensures the hub UNIT (not a detached spawn) before exposing", async () => {
+    // Phase 5b: "ensure the hub" = ensure the hub UNIT is up (§4.3a). The old
+    // detached `bun hub-server.ts --port …` spawn is retired — its bringup is now
+    // init's `installAndStartHubUnit` (asserted in init.test.ts / hub-unit.test.ts).
+    // Here we just confirm expose drives the unit-ensure seam, then proceeds.
     const h = makeHarness();
     try {
       seedServices(h.manifestPath);
       const { runner } = makeRunner();
-      const { spawner, calls: hubCalls } = makeHubSpawner(7777);
+      const sup = makeExposeSupervisorStub();
+      const logs: string[] = [];
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: sup.opts,
         servicePortProbe: allServicesUp,
-        log: () => {},
+        log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
-      expect(hubCalls).toHaveLength(1);
-      const cmd = hubCalls[0] ?? [];
-      expect(cmd[0]).toBe("bun");
-      expect(cmd).toContain("--port");
-      expect(cmd).toContain("--well-known-dir");
-      expect(cmd).toContain(h.wellKnownDir);
+      expect(sup.ensureCalls).toHaveLength(1);
+      expect(logs.join("\n")).toMatch(/hub unit up/);
     } finally {
       h.cleanup();
     }
@@ -223,16 +199,14 @@ describe("expose tailnet up", () => {
         h.manifestPath,
       );
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -261,7 +235,6 @@ describe("expose tailnet up", () => {
         h.manifestPath,
       );
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposeTailnet("up", {
         runner,
@@ -269,9 +242,8 @@ describe("expose tailnet up", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: (l) => logs.push(l),
       });
@@ -294,7 +266,6 @@ describe("expose tailnet up", () => {
     const h = makeHarness();
     try {
       const { runner } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposeTailnet("up", {
         runner,
@@ -302,9 +273,8 @@ describe("expose tailnet up", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: (l) => logs.push(l),
       });
@@ -322,7 +292,6 @@ describe("expose tailnet up", () => {
       const runner: Runner = async () => {
         throw new Error("spawn tailscale ENOENT");
       };
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposeTailnet("up", {
         runner,
@@ -330,9 +299,8 @@ describe("expose tailnet up", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: (l) => logs.push(l),
       });
@@ -367,16 +335,14 @@ describe("expose tailnet up", () => {
         h.statePath,
       );
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -398,7 +364,6 @@ describe("expose tailnet up", () => {
     try {
       seedServices(h.manifestPath);
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposeTailnet("up", {
         runner,
@@ -406,9 +371,8 @@ describe("expose tailnet up", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         // vault is up; notes is down.
         servicePortProbe: async (port) => port === 1940,
         log: (l) => logs.push(l),
@@ -447,7 +411,6 @@ describe("expose tailnet up", () => {
         }
         return { code: 0, stdout: "", stderr: "" };
       };
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposeTailnet("up", {
         runner,
@@ -455,9 +418,8 @@ describe("expose tailnet up", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: (l) => logs.push(l),
       });
@@ -476,16 +438,14 @@ describe("expose tailnet up", () => {
     try {
       seedServices(h.manifestPath);
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -523,16 +483,14 @@ describe("expose tailnet up", () => {
         h.manifestPath,
       );
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -552,16 +510,14 @@ describe("expose tailnet up", () => {
     try {
       seedServices(h.manifestPath);
       const { runner } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         hubOrigin: "https://hub.example.com/",
         log: () => {},
@@ -583,7 +539,6 @@ describe("expose tailnet up", () => {
     try {
       seedServices(h.manifestPath);
       const { runner } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposeTailnet("up", {
         runner,
@@ -591,9 +546,8 @@ describe("expose tailnet up", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: (l) => logs.push(l),
         vaultAuthStatus: {
@@ -622,9 +576,7 @@ describe("expose tailnet off", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubStopOpts: hubStopOpts(),
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
@@ -635,7 +587,7 @@ describe("expose tailnet off", () => {
     }
   });
 
-  test("tears down every tracked entry, stops hub, and clears state", async () => {
+  test("tears down every tracked entry + clears state, leaves the hub running (D3)", async () => {
     const h = makeHarness();
     try {
       writeExposeState(
@@ -665,27 +617,15 @@ describe("expose tailnet off", () => {
       );
       await Bun.write(h.wellKnownPath, "{}\n");
       await Bun.write(h.hubPath, "<html/>\n");
-      writePid("hub", 4242, h.configDir);
       const { runner, calls } = makeRunner();
-      const signals: NodeJS.Signals[] = [];
-      let aliveNow = true;
+      const logs: string[] = [];
       const code = await exposeTailnet("off", {
         runner,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubStopOpts: {
-          kill: (_pid, sig) => {
-            signals.push(sig as NodeJS.Signals);
-            aliveNow = false;
-          },
-          alive: () => aliveNow,
-          sleep: async () => {},
-          now: () => 0,
-        },
-        log: () => {},
+        log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
       expect(calls.every((c) => c[c.length - 1] === "off")).toBe(true);
@@ -693,8 +633,10 @@ describe("expose tailnet off", () => {
       expect(existsSync(h.statePath)).toBe(false);
       expect(existsSync(h.wellKnownPath)).toBe(false);
       expect(existsSync(h.hubPath)).toBe(false);
-      // Hub was running and got stopped.
-      expect(signals).toContain("SIGTERM");
+      // D3 (Phase 5b): the hub is a persistent platform unit — `expose off` tears
+      // down only the exposure and leaves the hub running. No "hub stopped" line.
+      expect(logs.join("\n")).not.toMatch(/hub stopped/);
+      expect(logs.join("\n")).toMatch(/exposure removed/);
     } finally {
       h.cleanup();
     }
@@ -732,7 +674,6 @@ describe("expose tailnet off", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
         skipHub: true,
         log: () => {},
@@ -776,9 +717,7 @@ describe("expose tailnet off", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubStopOpts: hubStopOpts(),
         log: (l) => logs.push(l),
       });
       expect(code).toBe(5);
@@ -810,31 +749,19 @@ describe("expose tailnet off", () => {
         },
         h.statePath,
       );
-      writePid("hub", 4242, h.configDir);
       const { runner, calls } = makeRunner();
-      let killCalled = false;
       const logs: string[] = [];
       const code = await exposeTailnet("off", {
         runner,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubStopOpts: {
-          kill: () => {
-            killCalled = true;
-          },
-          alive: () => false,
-          sleep: async () => {},
-          now: () => 0,
-        },
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
       expect(calls).toHaveLength(0);
       expect(existsSync(h.statePath)).toBe(true);
-      expect(killCalled).toBe(false);
       expect(logs.join("\n")).toMatch(/Current exposure is Public/);
     } finally {
       h.cleanup();
@@ -848,7 +775,6 @@ describe("expose public up", () => {
     try {
       seedServices(h.manifestPath);
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposePublic("up", {
         runner,
@@ -856,9 +782,8 @@ describe("expose public up", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: (l) => logs.push(l),
       });
@@ -911,16 +836,14 @@ describe("expose public up", () => {
         h.statePath,
       );
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -959,16 +882,14 @@ describe("expose public up", () => {
         h.statePath,
       );
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposePublic("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -990,7 +911,6 @@ describe("expose public up", () => {
     try {
       seedServices(h.manifestPath);
       const { runner } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposePublic("up", {
         runner,
@@ -998,9 +918,8 @@ describe("expose public up", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: (l) => logs.push(l),
         vaultAuthStatus: {
@@ -1028,7 +947,6 @@ describe("expose public up", () => {
     try {
       seedServices(h.manifestPath);
       const { runner } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposePublic("up", {
         runner,
@@ -1036,9 +954,8 @@ describe("expose public up", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: (l) => logs.push(l),
         vaultAuthStatus: {
@@ -1085,9 +1002,7 @@ describe("expose public off", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubStopOpts: hubStopOpts(),
         log: () => {},
       });
       expect(code).toBe(0);
@@ -1130,9 +1045,7 @@ describe("expose public off", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubStopOpts: hubStopOpts(),
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
@@ -1183,16 +1096,14 @@ describe("expose plan is layer-agnostic — gating moved to hub", () => {
         h.manifestPath,
       );
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -1240,16 +1151,14 @@ describe("expose plan is layer-agnostic — gating moved to hub", () => {
         h.manifestPath,
       );
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -1268,114 +1177,49 @@ describe("expose auto-restart of hub-dependent services", () => {
   // Launch-day bug (2026-04-23): `expose public` updated hubOrigin in
   // expose-state.json, but a vault already running kept its stale
   // PARACHUTE_HUB_ORIGIN in memory, so the OAuth issuer didn't match what
-  // clients saw and claude.ai MCP failed to reach the server. The CLI used
-  // to print a "Restart vault to pick up…" hint that got lost in the wall
-  // of expose output. Auto-restart the service instead.
-  test("restarts vault when vault is running", async () => {
+  // clients saw and claude.ai MCP failed to reach the server. Auto-restart the
+  // service so it picks up the new origin.
+  //
+  // Phase 5b: the restart goes through the running supervisor
+  // (`driveModuleOp("vault", "restart")`), NOT a pidfile-gated detached
+  // `lifecycle.restart`. So the restart is unconditional (the supervisor decides
+  // whether the module is live); the old "skips when not running / stale pidfile"
+  // cases no longer apply — a not-supervised vault surfaces as a 404 the helper
+  // treats as "nothing to restart" (asserted in the Phase 4 dual-dispatch suite).
+  test("restarts vault via the supervisor after expose", async () => {
     const h = makeHarness();
     try {
       seedServices(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
       const { runner } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
-      const restarted: string[] = [];
+      const sup = makeExposeSupervisorStub();
       const code = await exposePublic("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: sup.opts,
         servicePortProbe: allServicesUp,
-        alive: () => true,
-        restartService: async (short) => {
-          restarted.push(short);
-          return 0;
-        },
         log: () => {},
       });
       expect(code).toBe(0);
-      expect(restarted).toEqual(["vault"]);
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
     } finally {
       h.cleanup();
     }
   });
 
-  test("skips restart when vault is not running", async () => {
+  test("restart failure logs a warning but expose still succeeds", async () => {
     const h = makeHarness();
     try {
       seedServices(h.manifestPath);
-      // No writePid → vault has no pidfile → processState returns "unknown".
       const { runner } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
-      const restarted: string[] = [];
-      const code = await exposePublic("up", {
-        runner,
-        manifestPath: h.manifestPath,
-        statePath: h.statePath,
-        wellKnownPath: h.wellKnownPath,
-        hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
-        configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
-        servicePortProbe: allServicesUp,
-        alive: () => true,
-        restartService: async (short) => {
-          restarted.push(short);
-          return 0;
-        },
-        log: () => {},
+      // A non-404 module-op error → surfaced as a warning, non-zero rcode mapped
+      // to a warn-and-continue (expose still exits 0).
+      const sup = makeExposeSupervisorStub({
+        driveThrows: () => new ModuleOpHttpError(500, "internal", "vault restart blew up"),
       });
-      expect(code).toBe(0);
-      expect(restarted).toEqual([]);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("skips restart when pidfile is stale (process dead)", async () => {
-    const h = makeHarness();
-    try {
-      seedServices(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      const { runner } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
-      const restarted: string[] = [];
-      const code = await exposePublic("up", {
-        runner,
-        manifestPath: h.manifestPath,
-        statePath: h.statePath,
-        wellKnownPath: h.wellKnownPath,
-        hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
-        configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
-        servicePortProbe: allServicesUp,
-        // Simulate pid-file-present-but-process-dead. processState returns
-        // "stopped", not "running", so we should skip.
-        alive: () => false,
-        restartService: async (short) => {
-          restarted.push(short);
-          return 0;
-        },
-        log: () => {},
-      });
-      expect(code).toBe(0);
-      expect(restarted).toEqual([]);
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  test("restart failure logs warning but expose still succeeds", async () => {
-    const h = makeHarness();
-    try {
-      seedServices(h.manifestPath);
-      writePid("vault", 4242, h.configDir);
-      const { runner } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const logs: string[] = [];
       const code = await exposePublic("up", {
         runner,
@@ -1383,12 +1227,9 @@ describe("expose auto-restart of hub-dependent services", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: sup.opts,
         servicePortProbe: allServicesUp,
-        alive: () => true,
-        restartService: async () => 1,
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
@@ -1449,9 +1290,7 @@ describe("expose teardown tolerance for already-gone entries", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubStopOpts: hubStopOpts(),
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
@@ -1488,9 +1327,7 @@ describe("expose teardown tolerance for already-gone entries", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubStopOpts: hubStopOpts(),
         log: () => {},
       });
       expect(code).toBe(0);
@@ -1520,9 +1357,7 @@ describe("expose teardown tolerance for already-gone entries", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubStopOpts: hubStopOpts(),
         log: (l) => logs.push(l),
       });
       expect(code).toBe(1);
@@ -1541,7 +1376,6 @@ describe("expose teardown tolerance for already-gone entries", () => {
     try {
       seedServices(h.manifestPath);
       makePublicPriorState(h.statePath, 2);
-      const { spawner } = makeHubSpawner(1111);
       const bringupCalls: string[][] = [];
       const runner: Runner = async (cmd) => {
         if (cmd[0] === "tailscale" && cmd[1] === "version") {
@@ -1572,9 +1406,8 @@ describe("expose teardown tolerance for already-gone entries", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -1610,16 +1443,14 @@ describe("expose: vault routing fully internal to hub", () => {
         h.manifestPath,
       );
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -1660,16 +1491,14 @@ describe("expose: vault routing fully internal to hub", () => {
         h.manifestPath,
       );
       const { runner, calls } = makeRunner();
-      const { spawner } = makeHubSpawner(1111);
       const code = await exposeTailnet("up", {
         runner,
         manifestPath: h.manifestPath,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        hubEnsureOpts: hubEnsureOpts(spawner),
+        supervisor: supervisorUp(),
         servicePortProbe: allServicesUp,
         log: () => {},
       });
@@ -1719,7 +1548,6 @@ function makeExposeSupervisorStub(opts?: {
     driveCalls,
     selfHealCalls,
     opts: {
-      unitInstalled: true,
       // openDb is opened+closed around the drive/self-heal — hand back a no-op closer.
       openDb: () => ({ close() {} }) as unknown as import("bun:sqlite").Database,
       ensureHubUnit: async (o: EnsureHubUnitOpts) => {
@@ -1757,7 +1585,6 @@ describe("Phase 4 expose dual-dispatch — unit-managed", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
         servicePortProbe: allServicesUp,
         supervisor: sup.opts,
@@ -1789,7 +1616,6 @@ describe("Phase 4 expose dual-dispatch — unit-managed", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
         servicePortProbe: allServicesUp,
         supervisor: sup.opts,
@@ -1818,7 +1644,6 @@ describe("Phase 4 expose dual-dispatch — unit-managed", () => {
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
         servicePortProbe: allServicesUp,
         supervisor: sup.opts,
@@ -1846,27 +1671,15 @@ describe("Phase 4 expose dual-dispatch — unit-managed", () => {
         },
         h.statePath,
       );
-      writePid("hub", 4242, h.configDir);
       const { runner, calls } = makeRunner();
       const sup = makeExposeSupervisorStub();
-      // A kill / stopHub seam that fails the test if the hub is signalled.
       const logs: string[] = [];
       const code = await exposeTailnet("off", {
         runner,
         statePath: h.statePath,
         wellKnownPath: h.wellKnownPath,
         hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
         configDir: h.configDir,
-        // If the hub stop path ran, this kill seam would be called and throw.
-        hubStopOpts: {
-          kill: () => {
-            throw new Error("expose off unit-managed must NOT stop the hub");
-          },
-          alive: () => true,
-          sleep: async () => {},
-          now: () => 0,
-        },
         supervisor: sup.opts,
         log: (l) => logs.push(l),
       });
@@ -1882,51 +1695,8 @@ describe("Phase 4 expose dual-dispatch — unit-managed", () => {
     }
   });
 
-  test("expose off NO unit → hub stopped (detached arm unchanged)", async () => {
-    const h = makeHarness();
-    try {
-      writeExposeState(
-        {
-          version: 1,
-          layer: "tailnet",
-          mode: "path",
-          canonicalFqdn: "parachute.taildf9ce2.ts.net",
-          port: 443,
-          funnel: false,
-          entries: [{ kind: "proxy", mount: "/", target: "http://127.0.0.1:1939", service: "hub" }],
-        },
-        h.statePath,
-      );
-      writePid("hub", 4242, h.configDir);
-      const { runner } = makeRunner();
-      const signals: NodeJS.Signals[] = [];
-      let aliveNow = true;
-      const logs: string[] = [];
-      const code = await exposeTailnet("off", {
-        runner,
-        statePath: h.statePath,
-        wellKnownPath: h.wellKnownPath,
-        hubPath: h.hubPath,
-        wellKnownDir: h.wellKnownDir,
-        configDir: h.configDir,
-        hubStopOpts: {
-          kill: (_pid, sig) => {
-            signals.push(sig as NodeJS.Signals);
-            aliveNow = false;
-          },
-          alive: () => aliveNow,
-          sleep: async () => {},
-          now: () => 0,
-        },
-        // supervisor omitted → detached arm, deterministically.
-        log: (l) => logs.push(l),
-      });
-      expect(code).toBe(0);
-      // The detached arm still stops the hub.
-      expect(signals).toContain("SIGTERM");
-      expect(logs.join("\n")).toMatch(/hub stopped/);
-    } finally {
-      h.cleanup();
-    }
-  });
+  // The "expose off NO unit → hub stopped (detached arm)" test was removed: Phase
+  // 5b retired the detached arm, so `expose off` NEVER stops the hub (D3). The
+  // "exposure torn down, hub NOT stopped" invariant is the test above + the
+  // "leaves the hub running (D3)" test in the `expose tailnet off` suite.
 });
