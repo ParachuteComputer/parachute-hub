@@ -158,6 +158,34 @@ describe("validateHostAdminToken (hub#516)", () => {
     }
   });
 
+  // Host-injection defense, made explicit. Simulate an attacker who got their
+  // own issuer into the known-issuers set via a forged Host header (the set is
+  // built from the per-request Host-derived issuer, so `iss ∈ knownIssuers`
+  // holds). They present a token signed by a DIFFERENT hub's key whose `iss`
+  // is exactly that injected origin. It is STILL REJECTED — the signature /
+  // JWKS check (step 1) fails before the `iss ∈ knownIssuers` check (step 2)
+  // is ever reached. This pins that known-issuers acceptance can never bypass
+  // the signature gate: membership in the set is necessary but not sufficient.
+  test("Host-injection: foreign-signed token with iss IN knownIssuers is STILL rejected (signature gate is first)", async () => {
+    const h = await makeH();
+    try {
+      const other = await makeH();
+      try {
+        // Token minted + signed by the OTHER hub at PUBLIC_TS.
+        const foreignSigned = await mintOperatorAt(other, PUBLIC_TS);
+        // The attacker's iss IS in our known set (e.g. injected via Host), yet
+        // validation against OUR JWKS must reject it on the signature check.
+        const knownIssuers = [LOOPBACK, "http://localhost:1939", PUBLIC_TS];
+        expect(knownIssuers).toContain(PUBLIC_TS); // precondition: iss ∈ knownIssuers
+        await expect(validateHostAdminToken(h.db, foreignSigned, knownIssuers)).rejects.toThrow();
+      } finally {
+        other.cleanup();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   // Pin the invariant: OAuth/access-token validation stays STRICT per-request
   // issuer. The relaxation lives only in validateHostAdminToken; the core
   // primitive validateAccessToken(db, token, expectedIssuer) still rejects a

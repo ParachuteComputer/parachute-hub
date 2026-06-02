@@ -74,6 +74,16 @@ export function buildHubBoundOrigins(opts: {
       // Malformed URL — skip.
     }
   };
+  // `opts.issuer` is the PER-REQUEST issuer, which `resolveIssuer` derives
+  // from the request's Host header (hub-server.ts, "closes #245"). Including a
+  // Host-derived value in the known-issuers set is SAFE — it is NOT a
+  // forged-`iss` bypass. Token provenance is signature-gated: the JWKS verify
+  // in `validateAccessToken` / `validateHostAdminToken` runs UNCONDITIONALLY
+  // FIRST, before `iss` is ever checked against this set. So a token whose
+  // `iss` matches an attacker-injected Host (and thus lands in this set) but
+  // which isn't signed by THIS hub's key is still rejected at the signature
+  // step. The known-issuers membership check is belt-and-suspenders layered on
+  // top of the signature gate, never a substitute for it.
   add(opts.issuer);
   add(opts.exposeHubOrigin);
   add(opts.platformOrigin);

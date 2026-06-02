@@ -25,13 +25,13 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import {
   type ModuleInstallChannel,
   getModuleInstallChannel,
   isModuleInstallChannel,
   setModuleInstallChannel,
 } from "./hub-settings.ts";
-import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 import {
   type ModuleManifest,
