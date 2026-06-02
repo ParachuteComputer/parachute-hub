@@ -286,23 +286,22 @@ describe("exposeCloudflareUp", () => {
     }
   });
 
-  test("persists the public hub origin to vault/.env + restarts vault (Cloudflare 401 fix)", async () => {
+  test("persists the public hub origin to vault/.env + restarts vault via the supervisor (Cloudflare 401 fix)", async () => {
     // The Cloudflare 401 P0: the cloudflare path wrote expose-state.json but —
     // unlike the Tailscale path, which auto-restarts vault and so flows the
-    // public origin into vault/.env via lifecycle's persistVaultHubOrigin —
-    // never touched vault's .env or restarted it. The launchd/systemd daemon
-    // kept booting vault with NO PARACHUTE_HUB_ORIGIN → vault fell back to
-    // loopback as its expected issuer → every hub-minted token (iss=public)
-    // failed the iss check → 401. This asserts the durable .env write + the
-    // running-vault restart that mirrors the Tailscale path.
+    // public origin into vault/.env — never touched vault's .env or restarted
+    // it. The launchd/systemd daemon kept booting vault with NO
+    // PARACHUTE_HUB_ORIGIN → vault fell back to loopback as its expected issuer →
+    // every hub-minted token (iss=public) failed the iss check → 401.
+    //
+    // Phase 5b: the restart goes through the running Supervisor
+    // (`driveModuleOp("vault", "restart")`) — the helper also persists the
+    // durable .env. This asserts the durable .env write + the supervised restart
+    // (no longer a pidfile-gated detached restart; the supervisor decides
+    // liveness, and a not-supervised vault surfaces as a tolerated 404 — see the
+    // Phase 4 dual-dispatch suite).
     const env = makeEnv();
     try {
-      // Seed vault as "running" so the restart branch fires. PID lives at
-      // <configDir>/vault/run/vault.pid (see process-state.ts:pidPath).
-      const vaultRun = join(env.configDir, "vault", "run");
-      require("node:fs").mkdirSync(vaultRun, { recursive: true });
-      writeFileSync(join(vaultRun, "vault.pid"), "99001");
-
       const uuid = "ffffffff-0000-0000-0000-000000000006";
       const { runner } = queueRunner([
         { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
@@ -315,61 +314,7 @@ describe("exposeCloudflareUp", () => {
         { code: 0, stdout: "", stderr: "" },
       ]);
       const { spawner } = fakeSpawner(42300);
-      const restarted: string[] = [];
-
-      const code = await exposeCloudflareUp("gitcoin-parachute.unforced.dev", {
-        runner,
-        spawner,
-        // `alive` reports the seeded vault pid as running so processState() ===
-        // "running" and the restart branch executes.
-        alive: (pid) => pid === 99001,
-        kill: () => {},
-        log: () => {},
-        manifestPath: env.manifestPath,
-        statePath: env.statePath,
-        exposeStatePath: env.exposeStatePath,
-        configPath: env.configPath,
-        logPath: env.logPath,
-        cloudflaredHome: env.cloudflaredHome,
-        configDir: env.configDir,
-        skipHub: true,
-        restartService: async (short) => {
-          restarted.push(short);
-          return 0;
-        },
-      });
-
-      expect(code).toBe(0);
-      // Durable half: the public origin is written to vault/.env (NOT loopback,
-      // NOT unset) so the daemon boot path validates iss against it.
-      expect(readEnvFileValues(join(env.configDir, "vault", ".env")).PARACHUTE_HUB_ORIGIN).toBe(
-        "https://gitcoin-parachute.unforced.dev",
-      );
-      // Live half: the running vault is restarted to re-read the new origin.
-      expect(restarted).toEqual(["vault"]);
-    } finally {
-      env.cleanup();
-    }
-  });
-
-  test("persists vault/.env but does NOT restart when vault isn't running", async () => {
-    // No vault pidfile → processState() !== "running" → no restart, but the
-    // durable .env write still happens so the next daemon boot is correct.
-    const env = makeEnv();
-    try {
-      const uuid = "ffffffff-0000-0000-0000-000000000007";
-      const { runner } = queueRunner([
-        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
-        { code: 0, stdout: "[]", stderr: "" },
-        {
-          code: 0,
-          stdout: `Tunnel credentials written to ${env.cloudflaredHome}/${uuid}.json.\nCreated tunnel parachute with id ${uuid}\n`,
-          stderr: "",
-        },
-        { code: 0, stdout: "", stderr: "" },
-      ]);
-      const { spawner } = fakeSpawner(42301);
-      const restarted: string[] = [];
+      const sup = makeCfSupervisorStub();
 
       const code = await exposeCloudflareUp("gitcoin-parachute.unforced.dev", {
         runner,
@@ -385,17 +330,17 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
-        restartService: async (short) => {
-          restarted.push(short);
-          return 0;
-        },
+        supervisor: sup.opts,
       });
 
       expect(code).toBe(0);
+      // Durable half: the public origin is written to vault/.env (NOT loopback,
+      // NOT unset) so the daemon boot path validates iss against it.
       expect(readEnvFileValues(join(env.configDir, "vault", ".env")).PARACHUTE_HUB_ORIGIN).toBe(
         "https://gitcoin-parachute.unforced.dev",
       );
-      expect(restarted).toEqual([]);
+      // Live half: vault is restarted via the supervisor to re-read the new origin.
+      expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
     } finally {
       env.cleanup();
     }
@@ -2045,7 +1990,6 @@ function makeCfSupervisorStub(opts?: {
     driveCalls: [],
     selfHealCalls: [],
     opts: {
-      unitInstalled: true,
       openDb: () => ({ close() {} }) as unknown as import("bun:sqlite").Database,
       ensureHubUnit: async (o: EnsureHubUnitOpts) => {
         stub.ensureCalls++;
@@ -2082,7 +2026,6 @@ describe("Phase 4 cloudflare expose dual-dispatch — unit-managed", () => {
       ]);
       const { spawner } = fakeSpawner(42400);
       const sup = makeCfSupervisorStub();
-      const restarted: string[] = [];
       const logs: string[] = [];
 
       const code = await exposeCloudflareUp("gitcoin-parachute.unforced.dev", {
@@ -2098,23 +2041,17 @@ describe("Phase 4 cloudflare expose dual-dispatch — unit-managed", () => {
         logPath: env.logPath,
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
-        // No skipHub → the unit arm's ensureHubUnit runs (via the stub, no real hub).
+        // No skipHub → the hub-unit ensure runs (via the stub, no real hub).
         // Inert connector install so the cloudflared connector path is unchanged.
         installService: () => ({ outcome: "fallback", messages: [] }),
-        // This detached restart seam must NOT be called on the unit arm.
-        restartService: async (short) => {
-          restarted.push(short);
-          return 0;
-        },
         supervisor: sup.opts,
       });
 
       expect(code).toBe(0);
-      // Ensured the hub UNIT (the stub), never the detached spawn.
+      // Ensured the hub UNIT (the stub), never a detached spawn.
       expect(sup.ensureCalls).toBe(1);
-      // Vault restart drove the running Supervisor, NOT the detached restartService.
+      // Vault restart drove the running Supervisor.
       expect(sup.driveCalls).toEqual([{ short: "vault", op: "restart" }]);
-      expect(restarted).toEqual([]);
       // Operator-token issuer self-heal fired toward the public origin.
       expect(sup.selfHealCalls).toHaveLength(1);
       expect(sup.selfHealCalls[0]?.issuer).toBe("https://gitcoin-parachute.unforced.dev");

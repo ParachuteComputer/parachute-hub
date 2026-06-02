@@ -8,18 +8,10 @@ import {
   readExposeState,
   writeExposeState,
 } from "../expose-state.ts";
-import {
-  type EnsureHubOpts,
-  type StopHubOpts,
-  defaultPortProbe,
-  ensureHubRunning,
-  readHubPort,
-  stopHub,
-} from "../hub-control.ts";
+import { defaultPortProbe, readHubPort } from "../hub-control.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
 import { HUB_UNIT_DEFAULT_PORT } from "../hub-unit.ts";
 import { HUB_PATH, writeHubFile } from "../hub.ts";
-import { type AliveFn, processState } from "../process-state.ts";
 import { shortNameForManifest } from "../service-spec.ts";
 import { type ServiceEntry, readManifest } from "../services-manifest.ts";
 import { type ServeEntry, bringupCommand, teardownCommand } from "../tailscale/commands.ts";
@@ -28,7 +20,6 @@ import { type Runner, defaultRunner } from "../tailscale/run.ts";
 import { clearVaultHubOrigin } from "../vault-hub-origin-env.ts";
 import type { VaultAuthStatus } from "../vault/auth-status.ts";
 import {
-  WELL_KNOWN_DIR,
   WELL_KNOWN_MOUNT,
   WELL_KNOWN_PATH,
   buildWellKnown,
@@ -42,7 +33,6 @@ import {
   resolveExposeSupervisor,
   restartHubDependentViaSupervisor,
 } from "./expose-supervisor.ts";
-import { restart } from "./lifecycle.ts";
 
 /**
  * Two exposure layers share a single tailscale serve config on this node.
@@ -74,17 +64,12 @@ export interface ExposeOpts {
   statePath?: string;
   wellKnownPath?: string;
   hubPath?: string;
-  /** Directory holding hub.html (passed to the hub server). */
-  wellKnownDir?: string;
   configDir?: string;
   port?: number;
   log?: (line: string) => void;
   /** Override detected FQDN — primarily for tests. */
   fqdnOverride?: string;
-  /** Overrides for the hub lifecycle — primarily for tests. */
-  hubEnsureOpts?: Omit<EnsureHubOpts, "configDir" | "wellKnownDir" | "log">;
-  hubStopOpts?: Omit<StopHubOpts, "configDir" | "log">;
-  /** Skip spawning the hub server. Tests flip this off to verify it's called. */
+  /** Skip ensuring the hub unit. Tests seed a `hub.port` and flip this on. */
   skipHub?: boolean;
   /**
    * Probe a port to decide whether a service is responding. Returns true when
@@ -100,14 +85,6 @@ export interface ExposeOpts {
    * through to vault (and future services) via PARACHUTE_HUB_ORIGIN.
    */
   hubOrigin?: string;
-  /** Process-liveness check for auto-restart — test seam. */
-  alive?: AliveFn;
-  /**
-   * Restart a service by short name after exposure changes. Defaults to the
-   * lifecycle `restart`; tests inject a fake to assert the call without
-   * spawning real child processes.
-   */
-  restartService?: (short: string) => Promise<number>;
   /**
    * Override `~/.parachute/vault` for the 2FA-enrollment probe on the public
    * (Funnel) layer. Tests point at a tmp dir; production omits and the probe
@@ -121,18 +98,17 @@ export interface ExposeOpts {
    */
   vaultAuthStatus?: VaultAuthStatus;
   /**
-   * Phase 4 supervisor-path seams (design §4.3). When a hub UNIT is installed
-   * (launchd/systemd/container — detected via `isHubUnitInstalled`), `expose`
-   * "ensures the hub" by ensuring the UNIT is up (not a detached spawn), the
-   * post-expose hub-dependent restart drives the running Supervisor over the
+   * Supervisor-path seams (design §4.3) — the ONLY runtime as of Phase 5b.
+   * `expose` "ensures the hub" by ensuring the UNIT is up (not a detached spawn),
+   * the post-expose hub-dependent restart drives the running Supervisor over the
    * loopback module-ops API, and `expose off` leaves the hub RUNNING (a managed
    * hub with Restart=always/KeepAlive would just respawn a stopped one — D3).
-   * The detached arm (`hubEnsureOpts` / `stopHub` / `lifecycle.restart`) remains
-   * the no-unit fallback until Phase 5 retires it.
+   * A box with no hub unit gets `ensureHubUnit`'s actionable "run `parachute
+   * migrate`" message rather than a detached spawn.
    *
    * The production CLI dispatch passes `supervisor: {}` so the real
-   * `isHubUnitInstalled` probe decides the arm; omitting it entirely is the
-   * detached arm deterministically (the shape of every existing expose test).
+   * `isHubUnitInstalled` probe resolves the seams; tests inject the seams they
+   * want to assert.
    */
   supervisor?: ExposeSupervisorOpts;
 }
@@ -257,14 +233,13 @@ export async function exposeUp(layer: ExposeLayer, opts: ExposeOpts = {}): Promi
   const statePath = opts.statePath ?? EXPOSE_STATE_PATH;
   const wellKnownFilePath = opts.wellKnownPath ?? WELL_KNOWN_PATH;
   const hubFilePath = opts.hubPath ?? HUB_PATH;
-  const wellKnownDir = opts.wellKnownDir ?? WELL_KNOWN_DIR;
   const configDir = opts.configDir ?? CONFIG_DIR;
   const port = opts.port ?? 443;
   const log = opts.log ?? ((line) => console.log(line));
   const funnel = layer === "public";
-  // Phase 4 dual-dispatch (design §4.3). Unit-installed → ensure the hub UNIT is
-  // up (the unit guarantees loopback reachability, §4.3a) + restart hub-dependent
-  // services via the Supervisor. No unit → the unchanged detached arm below.
+  // §4.3: ensure the hub UNIT is up (it guarantees loopback reachability) +
+  // restart hub-dependent services via the Supervisor. The detached arm was
+  // retired in Phase 5b.
   const sup = resolveExposeSupervisor(opts.supervisor);
 
   if (!(await isTailscaleInstalled(runner))) {
@@ -345,27 +320,18 @@ export async function exposeUp(layer: ExposeLayer, opts: ExposeOpts = {}): Promi
       throw new Error("skipHub set but no hub.port on disk — tests must seed one");
     }
     hubPort = existing;
-  } else if (sup.unitInstalled) {
-    // Unit-managed (§4.3a): "ensure the hub" = ensure the hub UNIT is up. The
-    // unit guarantees the hub is reachable on loopback (all tailscale needs);
-    // it pins the canonical 1939 (no walking fallback), so that's the target.
+  } else {
+    // §4.3a: "ensure the hub" = ensure the hub UNIT is up. The unit guarantees
+    // the hub is reachable on loopback (all tailscale needs); it pins the
+    // canonical 1939 (no walking fallback), so that's the target. Phase 5b
+    // retired the detached `ensureHubRunning` bringup — a box with no hub unit
+    // gets `ensureHubUnit`'s actionable "run `parachute migrate`" message, never
+    // a detached spawn.
     const probePort = readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT;
     const ensured = await ensureHubUnitForExpose(sup, probePort, log);
     if (!ensured.ok) return 1;
     hubPort = ensured.port;
     log(`✓ hub unit up (port ${hubPort}).`);
-  } else {
-    const hub = await ensureHubRunning({
-      reservedPorts: manifest.services.map((s) => s.port),
-      ...(opts.hubEnsureOpts ?? {}),
-      configDir,
-      wellKnownDir,
-      issuer: hubOrigin,
-      log,
-    });
-    hubPort = hub.port;
-    if (hub.started) log(`✓ hub started (pid ${hub.pid}, port ${hub.port}).`);
-    else log(`✓ hub already running (pid ${hub.pid}, port ${hub.port}).`);
   }
 
   const entries = planEntries(hubPort);
@@ -427,37 +393,20 @@ export async function exposeUp(layer: ExposeLayer, opts: ExposeOpts = {}): Promi
   // claude.ai MCP failed with a cryptic "Couldn't reach the MCP server". The
   // old output told the user to restart manually; it got buried in the wall
   // of expose output. Do the restart ourselves.
-  // Phase 4 dual-dispatch (design §4.3c). Unit-managed → the hub-dependent
-  // restart goes through the running Supervisor (`driveModuleOp(short,
-  // "restart")`), which re-injects the hub's current origin; the origin
-  // self-heal (operator-token iss + vault `.env`) fires there. No-unit → the
-  // unchanged detached `lifecycle.restart` path, gated on pidfile liveness.
-  if (sup.unitInstalled) {
-    for (const short of HUB_DEPENDENT_SHORTS) {
-      log("");
-      log(`Restarting ${short} to pick up new hub origin…`);
-      const rcode = await restartHubDependentViaSupervisor({
-        short,
-        hubOrigin,
-        configDir,
-        sup,
-        log,
-      });
-      if (rcode !== 0) {
-        log(
-          `⚠ ${short} restart failed. Run manually once the issue is resolved: parachute restart ${short}`,
-        );
-      }
-    }
-    return 0;
-  }
-  const doRestart =
-    opts.restartService ?? ((short: string) => restart(short, { manifestPath, configDir, log }));
+  // §4.3c: the hub-dependent restart goes through the running Supervisor
+  // (`driveModuleOp(short, "restart")`), which re-injects the hub's current
+  // origin; the origin self-heal (operator-token iss + vault `.env`) fires there.
+  // Phase 5b retired the detached `lifecycle.restart` arm.
   for (const short of HUB_DEPENDENT_SHORTS) {
-    if (processState(short, configDir, opts.alive).status !== "running") continue;
     log("");
     log(`Restarting ${short} to pick up new hub origin…`);
-    const rcode = await doRestart(short);
+    const rcode = await restartHubDependentViaSupervisor({
+      short,
+      hubOrigin,
+      configDir,
+      sup,
+      log,
+    });
     if (rcode !== 0) {
       log(
         `⚠ ${short} restart failed. Run manually once the issue is resolved: parachute restart ${short}`,
@@ -474,11 +423,10 @@ export async function exposeOff(layer: ExposeLayer, opts: ExposeOpts = {}): Prom
   const hubFilePath = opts.hubPath ?? HUB_PATH;
   const configDir = opts.configDir ?? CONFIG_DIR;
   const log = opts.log ?? ((line) => console.log(line));
-  // Phase 4 dual-dispatch (design §4.3a / D3). Unit-managed → leave the hub
-  // RUNNING (a managed hub with Restart=always/KeepAlive would just respawn a
-  // stopped one — stopping it is futile + wrong). No unit → the unchanged
-  // detached behavior (stop the hub when the last layer is torn down).
-  const sup = resolveExposeSupervisor(opts.supervisor);
+  // D3 (§4.3a): `expose off` tears down ONLY the exposure layer and leaves the
+  // hub running — the hub is a persistent platform unit now, so stopping it
+  // would just be respawned by the manager. The detached `stopHub` arm was
+  // retired in Phase 5b, so there is no longer any hub-lifecycle dispatch here.
 
   const state = readExposeState(statePath);
   if (!state || state.entries.length === 0) {
@@ -519,19 +467,12 @@ export async function exposeOff(layer: ExposeLayer, opts: ExposeOpts = {}): Prom
     unlinkSync(hubFilePath);
   }
 
-  // Detached-arm only (no unit installed): the hub lived only as long as some
-  // layer was exposed. State was just cleared, so no layer is active — stop the
-  // hub. (Layer switch doesn't go through here; that path reuses the running
-  // hub.) Under a managed hub UNIT (the `sup.unitInstalled` arm), the hub is a
-  // persistent process the manager keeps alive whether or not a layer is
-  // exposed — the "hub exists only while exposed" invariant inverts (D3). We
-  // tear down ONLY the exposure layer above and leave the hub running; the CLI
-  // output drops the "hub stopped" line accordingly. Phase 5 deletes this whole
-  // detached branch.
-  if (!sup.unitInstalled && !opts.skipHub) {
-    const stopped = await stopHub({ ...(opts.hubStopOpts ?? {}), configDir, log });
-    if (stopped) log("✓ hub stopped.");
-  }
+  // D3 (§4.3a) — `expose off` no longer stops the hub. The hub is a persistent
+  // platform unit (Restart=always / KeepAlive) that runs whether or not a layer
+  // is exposed: the "hub exists only while exposed" invariant inverted under the
+  // supervised model, and the detached `stopHub` arm was retired in Phase 5b
+  // (stopping it would just be respawned by the manager). We tear down ONLY the
+  // exposure layer above and leave the hub running.
 
   log(`✓ ${layerLabel(layer)} exposure removed.`);
   return 0;

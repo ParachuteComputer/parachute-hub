@@ -1,27 +1,19 @@
 /**
- * Phase 4 expose-path dual-dispatch seams (design
+ * Expose-path supervisor seams (design
  * `parachute.computer/design/2026-06-01-hub-as-supervisor-unification.md` §4.3).
  *
- * Under the hub-as-supervisor unification, `expose` / `expose off` decouple
- * from the hub's lifecycle:
- *   - When a hub UNIT is installed (launchd/systemd/container), "ensure the hub"
- *     means "ensure the hub UNIT is up" (`ensureHubUnit`), and the post-expose
- *     hub-dependent service restart goes through the RUNNING hub's in-process
- *     Supervisor over the loopback module-ops API (`driveModuleOp(short,
- *     "restart")`), NOT `lifecycle.restart` / a detached spawn.
- *   - When NO unit is installed (a legacy detached box, until Phase 5 retires
- *     the detached spawners), the existing behavior is preserved UNCHANGED:
- *     `ensureHubRunning` (the detached spawn) + `lifecycle.restart`.
+ * Under the hub-as-supervisor unification, `expose` / `expose off` are decoupled
+ * from the hub's lifecycle. As of Phase 5b the supervised path is the ONLY
+ * runtime:
+ *   - "ensure the hub" means "ensure the hub UNIT is up" (`ensureHubUnit`); a box
+ *     with no unit gets `ensureHubUnit`'s actionable "run `parachute migrate`"
+ *     message rather than a detached spawn.
+ *   - the post-expose hub-dependent service restart goes through the RUNNING
+ *     hub's in-process Supervisor over the loopback module-ops API
+ *     (`driveModuleOp(short, "restart")`), NOT a detached `lifecycle.restart`.
  *
  * This module is the shared seam BOTH `expose.ts` (Tailscale) and
- * `expose-cloudflare.ts` (cloudflared) use so the two paths can't drift, and so
- * the unit-arm is a clean, separately-deletable branch when Phase 5 collapses
- * to the supervisor-only path.
- *
- * THE SAFETY PRINCIPLE (same dual-dispatch bridge as Phase 3b): unit installed →
- * drive the manager/supervisor (new path); no unit → keep the EXACT current
- * detached behavior. The discriminant is `isHubUnitInstalled`, structured as a
- * top-level branch in the callers.
+ * `expose-cloudflare.ts` (cloudflared) use so the two paths can't drift.
  */
 
 import { readHubPort } from "../hub-control.ts";
@@ -33,7 +25,6 @@ import {
   type HubUnitDeps,
   defaultHubUnitDeps,
   ensureHubUnit as ensureHubUnitImpl,
-  isHubUnitInstalled,
 } from "../hub-unit.ts";
 import {
   type DriveModuleOpDeps,
@@ -51,27 +42,15 @@ import {
 import { persistVaultHubOrigin, selfHealVaultHubOrigin } from "../vault-hub-origin-env.ts";
 
 /**
- * Injectable Phase 4 supervisor-path seams shared by the Tailscale + cloudflared
- * expose paths. Mirrors `LifecycleOpts.supervisor` (Phase 3b): everything is
- * injectable so tests can (a) force the unit-installed branch without a real
- * launchd/systemd, and (b) assert the `ensureHubUnit` / `driveModuleOp` /
- * operator-token-self-heal calls without a live hub. Production wires the real
- * impls against an opened hub.db + the resolved hub origin.
- *
- * When the caller OMITS this block entirely, the discriminant defaults to
- * `false` (detached arm) — deterministic regardless of whether the test host
- * happens to have a real hub unit installed. The production CLI dispatch passes
- * `supervisor: {}` so the real `isHubUnitInstalled` probe decides the arm.
+ * Injectable supervisor-path seams shared by the Tailscale + cloudflared expose
+ * paths. Mirrors `LifecycleOpts.supervisor`: everything is injectable so tests
+ * can assert the `ensureHubUnit` / `driveModuleOp` / operator-token-self-heal
+ * calls without a live hub or a real launchd/systemd. Production wires the real
+ * impls against an opened hub.db + the resolved hub origin; the CLI dispatch
+ * passes `supervisor: {}`.
  */
 export interface ExposeSupervisorOpts {
-  /**
-   * Is a hub unit installed (the dual-dispatch discriminant)? Production uses
-   * `isHubUnitInstalled(hubUnitDeps)`. Tests set this `true`/`false` directly to
-   * pick the branch deterministically. When set, it wins over the
-   * `hubUnitDeps`-derived detection.
-   */
-  unitInstalled?: boolean;
-  /** Deps for the real `isHubUnitInstalled` probe + the ensure-hub-unit call. */
+  /** Deps for the ensure-hub-unit call + the module-op self-heal. */
   hubUnitDeps?: HubUnitDeps;
   /** Ensure the hub unit is up before / during expose (§3.2 / §4.3a). */
   ensureHubUnit?: (opts: EnsureHubUnitOpts) => Promise<EnsureHubUnitResult>;
@@ -100,10 +79,8 @@ export interface ExposeSupervisorOpts {
   baseUrl?: string;
 }
 
-/** Resolved Phase 4 expose supervisor-path seams (see {@link ExposeSupervisorOpts}). */
+/** Resolved expose supervisor-path seams (see {@link ExposeSupervisorOpts}). */
 export interface ResolvedExposeSupervisor {
-  /** Whether a hub unit is installed — the dual-dispatch discriminant. */
-  unitInstalled: boolean;
   hubUnitDeps: HubUnitDeps;
   ensureHubUnit: (opts: EnsureHubUnitOpts) => Promise<EnsureHubUnitResult>;
   driveModuleOp: (short: string, op: ModuleOp, deps: DriveModuleOpDeps) => Promise<ModuleOpResult>;
@@ -116,19 +93,16 @@ export interface ResolvedExposeSupervisor {
 }
 
 /**
- * Resolve the Phase 4 expose supervisor seams. Same discriminant shape as
- * lifecycle's `resolveSupervisor`: a `supervisor` block (even `{}`) opts into
- * the real `isHubUnitInstalled` probe; omitting it entirely is the detached arm
- * deterministically.
+ * Resolve the expose supervisor seams. Production passes `supervisor: {}` (or
+ * omits it) and gets the real impls; tests inject the seams they want to assert.
+ * Phase 5b retired the dual-dispatch discriminant — the supervised path is the
+ * only runtime, so there is no longer an `isHubUnitInstalled` probe here.
  */
 export function resolveExposeSupervisor(
   opts: ExposeSupervisorOpts | undefined,
 ): ResolvedExposeSupervisor {
   const hubUnitDeps = opts?.hubUnitDeps ?? defaultHubUnitDeps;
-  const unitInstalled =
-    opts === undefined ? false : (opts.unitInstalled ?? isHubUnitInstalled(hubUnitDeps));
   return {
-    unitInstalled,
     hubUnitDeps,
     ensureHubUnit: opts?.ensureHubUnit ?? ensureHubUnitImpl,
     driveModuleOp: opts?.driveModuleOp ?? driveModuleOpImpl,
