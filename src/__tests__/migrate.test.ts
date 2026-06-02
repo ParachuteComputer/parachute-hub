@@ -296,6 +296,7 @@ describe("migrate — interactive + flag behavior", () => {
           throw new Error("prompt must not be called");
         },
         isTty: true,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(0);
       expect(logs.join("\n")).toMatch(/nothing to archive/i);
@@ -325,6 +326,7 @@ describe("migrate — interactive + flag behavior", () => {
         },
         list: true,
         isTty: true,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(0);
       expect(logs.join("\n")).toMatch(/--list — no changes made/);
@@ -351,6 +353,7 @@ describe("migrate — interactive + flag behavior", () => {
         },
         dryRun: true,
         isTty: true,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(0);
       expect(logs.join("\n")).toMatch(/dry-run/);
@@ -383,6 +386,7 @@ describe("migrate — interactive + flag behavior", () => {
         },
         yes: true,
         isTty: false,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(0);
       const archive = join(h.configDir, ".archive-2026-04-19");
@@ -510,6 +514,7 @@ describe("migrate — interactive + flag behavior", () => {
           throw new Error("prompt must not be called");
         },
         isTty: false,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(1);
       expect(logs.join("\n")).toMatch(/refusing to sweep without a TTY/i);
@@ -533,6 +538,7 @@ describe("migrate — interactive + flag behavior", () => {
         log: () => {},
         prompt: async () => answers.shift() ?? "n",
         isTty: true,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(1);
       // Aborted before any rename — daily.db still there.
@@ -557,6 +563,7 @@ describe("migrate — interactive + flag behavior", () => {
         log: () => {},
         prompt: async () => answers.shift() ?? "y",
         isTty: true,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(0);
       const archive = join(h.configDir, ".archive-2026-04-19");
@@ -588,6 +595,7 @@ describe("migrate — interactive + flag behavior", () => {
         },
         yes: true,
         isTty: false,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(0);
       const archivedLink = join(h.configDir, ".archive-2026-04-19", "logs");
@@ -621,6 +629,7 @@ describe("migrate — interactive + flag behavior", () => {
         },
         yes: true,
         isTty: false,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(0);
       // The "nothing recognized" exit branch — no archive directory created.
@@ -647,6 +656,7 @@ describe("migrate — interactive + flag behavior", () => {
         log: (l) => logs.push(l),
         prompt: async () => "n",
         isTty: true,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(1);
       expect(logs.join("\n")).toMatch(/aborted/i);
@@ -668,6 +678,7 @@ describe("migrate — interactive + flag behavior", () => {
         log: () => {},
         prompt: async () => "y",
         isTty: true,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(code).toBe(0);
       expect(existsSync(join(h.configDir, ".archive-2026-04-19", "server.yaml"))).toBe(true);
@@ -687,6 +698,7 @@ describe("migrate — interactive + flag behavior", () => {
         log: () => {},
         yes: true,
         isTty: false,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       // Add more cruft and sweep again the same day
       touch(join(h.configDir, "channel.log"), "2");
@@ -696,6 +708,7 @@ describe("migrate — interactive + flag behavior", () => {
         log: () => {},
         yes: true,
         isTty: false,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       const archive = join(h.configDir, ".archive-2026-04-19");
       expect(existsSync(join(archive, "server.yaml"))).toBe(true);
@@ -719,6 +732,7 @@ describe("migrate — interactive + flag behavior", () => {
         log: () => {},
         yes: true,
         isTty: false,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       touch(join(h.configDir, "channel.log"), "2");
       await migrate({
@@ -727,6 +741,7 @@ describe("migrate — interactive + flag behavior", () => {
         log: () => {},
         yes: true,
         isTty: false,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       expect(existsSync(join(h.configDir, ".archive-2026-04-19", "server.yaml"))).toBe(true);
       expect(existsSync(join(h.configDir, ".archive-2026-04-20", "channel.log"))).toBe(true);
@@ -749,6 +764,7 @@ describe("migrate — interactive + flag behavior", () => {
         log: () => {},
         yes: true,
         isTty: false,
+        hubUnitState: () => ({ state: "inactive" }),
       });
       const archive = join(h.configDir, ".archive-2026-04-19");
       const contents = readdirSync(archive);
