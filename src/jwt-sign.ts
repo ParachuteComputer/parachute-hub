@@ -37,8 +37,15 @@ export interface SignAccessTokenOpts {
   /** Subject — the user id. */
   sub: string;
   scopes: string[];
-  /** Module short name (vault, notes, …) or "hub" — sets `aud`. */
-  audience: string;
+  /**
+   * Sets the `aud` claim. Either a single module short name (vault, notes, …)
+   * or "hub" — the scope-derived audience — OR an array (RFC 7519 §4.1.3) when
+   * an RFC 8707 `resource` was bound at the token step (#511): the array is
+   * `[scopeAudience, resourceUrl]`, e.g. `["vault.default", "https://…/mcp"]`.
+   * jose's `.setAudience()` accepts both shapes. All non-OAuth callers (CLI
+   * mint-token, operator-token, the manual picker) keep passing a bare string.
+   */
+  audience: string | string[];
   clientId: string;
   /**
    * Hub origin — sets the `iss` claim. Required: every consumer (vault,

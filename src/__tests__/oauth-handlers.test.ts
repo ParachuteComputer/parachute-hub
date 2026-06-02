@@ -2494,6 +2494,203 @@ describe("handleToken — full OAuth dance", () => {
   });
 });
 
+// closes #511 — RFC 8707 resource binding at the token step. Claude's MCP
+// connector (Claude Desktop / claude.ai / mobile) sends
+// `resource=<origin>/vault/<name>/mcp` on the token request and validates the
+// returned access token's `aud` against that exact URL. Pre-#511 the hub minted
+// `aud` purely from scopes ("vault.default") and dropped `resource` at the
+// token step, so the connector rejected the credential client-side and never
+// called /mcp. The fix widens `aud` to the array `[scopeAud, resource]` when
+// the resource resolves to the SAME vault the scope-derived aud names — which
+// still satisfies the vault's `aud.includes("vault.<name>")` check (no vault
+// change) AND matches the connector's resource check.
+describe("handleToken — RFC 8707 resource → aud binding (#511)", () => {
+  // Drive a full authorize→token dance with `resource` set on the token form,
+  // returning the validated JWT payload. `tokenResource` is what we send on the
+  // token (and refresh) request; `consentResource` narrows consent so the auth
+  // code carries the named `vault:<name>:read` scope.
+  async function dance(opts: {
+    db: import("bun:sqlite").Database;
+    scope?: string;
+    consentResource?: string;
+    tokenResource?: string;
+  }) {
+    const { db } = opts;
+    const user = await createUser(db, "owner", "pw");
+    const session = createSession(db, { userId: user.id });
+    const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+    const { verifier, challenge } = makePkce();
+    const consentForm = new URLSearchParams({
+      __action: "consent",
+      __csrf: TEST_CSRF,
+      approve: "yes",
+      client_id: reg.client.clientId,
+      redirect_uri: "https://app.example/cb",
+      response_type: "code",
+      scope: opts.scope ?? "vault:default:read",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    if (opts.consentResource) consentForm.set("resource", opts.consentResource);
+    const consentRes = await handleAuthorizePost(
+      db,
+      new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: consentForm,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      }),
+      { issuer: ISSUER, hubBoundOrigins: () => [ISSUER] },
+    );
+    const code = new URL(consentRes.headers.get("location") ?? "").searchParams.get("code");
+    expect(code).toBeTruthy();
+
+    const tokenForm = new URLSearchParams({
+      grant_type: "authorization_code",
+      code: code ?? "",
+      client_id: reg.client.clientId,
+      redirect_uri: "https://app.example/cb",
+      code_verifier: verifier,
+    });
+    if (opts.tokenResource) tokenForm.set("resource", opts.tokenResource);
+    const tokenRes = await handleToken(
+      db,
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: tokenForm,
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      { issuer: ISSUER, hubBoundOrigins: () => [ISSUER] },
+    );
+    return { tokenRes, reg, userId: user.id };
+  }
+
+  test("authorization_code + resolving resource → aud is an array of [vault.<name>, resourceUrl]", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const resource = `${ISSUER}/vault/default/mcp`;
+      const { tokenRes } = await dance({
+        db,
+        consentResource: resource,
+        tokenResource: resource,
+      });
+      expect(tokenRes.status).toBe(200);
+      const body = (await tokenRes.json()) as { access_token: string; scope: string };
+      // scope unchanged by the resource binding (narrowed to the named vault scope).
+      expect(body.scope).toBe("vault:default:read");
+      const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+      // aud is the array [vault.default, <resource-url>] — both present.
+      expect(Array.isArray(payload.aud)).toBe(true);
+      const auds = payload.aud as string[];
+      expect(auds).toContain("vault.default");
+      expect(auds).toContain(resource);
+      expect(auds).toHaveLength(2);
+      // iss unchanged.
+      expect(payload.iss).toBe(ISSUER);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("refresh_token + resource → SAME array aud (the load-bearing refresh case)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const resource = `${ISSUER}/vault/default/mcp`;
+      const { tokenRes, reg } = await dance({
+        db,
+        consentResource: resource,
+        tokenResource: resource,
+      });
+      const initial = (await tokenRes.json()) as { refresh_token: string };
+
+      // Claude re-sends `resource` on refresh (RFC 8707 SHOULD). The refreshed
+      // access token MUST re-bind the array aud — otherwise the connector
+      // breaks ~15min after it started working.
+      const refreshForm = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: initial.refresh_token,
+        client_id: reg.client.clientId,
+        resource,
+      });
+      const refreshRes = await handleToken(
+        db,
+        new Request(`${ISSUER}/oauth/token`, {
+          method: "POST",
+          body: refreshForm,
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+        }),
+        { issuer: ISSUER, hubBoundOrigins: () => [ISSUER] },
+      );
+      expect(refreshRes.status).toBe(200);
+      const rotated = (await refreshRes.json()) as { access_token: string };
+      const { payload } = await validateAccessToken(db, rotated.access_token, ISSUER);
+      expect(Array.isArray(payload.aud)).toBe(true);
+      const auds = payload.aud as string[];
+      expect(auds).toContain("vault.default");
+      expect(auds).toContain(resource);
+      expect(auds).toHaveLength(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("no resource on the token request → bare scope-derived string aud preserved (no regression)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      // No tokenResource → the pre-#511 path: aud is the bare string.
+      const { tokenRes } = await dance({ db });
+      expect(tokenRes.status).toBe(200);
+      const body = (await tokenRes.json()) as { access_token: string };
+      const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+      expect(payload.aud).toBe("vault.default");
+      expect(Array.isArray(payload.aud)).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("resource that does NOT resolve to the scope's vault → ignored, bare scope aud (the guard)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      // Scope/consent bind vault.default, but the token request supplies a
+      // resource naming a DIFFERENT vault. The guard ignores it: bare scope aud.
+      const { tokenRes } = await dance({
+        db,
+        consentResource: `${ISSUER}/vault/default/mcp`,
+        tokenResource: `${ISSUER}/vault/other/mcp`,
+      });
+      expect(tokenRes.status).toBe(200);
+      const body = (await tokenRes.json()) as { access_token: string };
+      const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+      // No junk aud, no foreign URL: bare scope string.
+      expect(payload.aud).toBe("vault.default");
+      expect(Array.isArray(payload.aud)).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("off-origin / garbage resource → ignored, bare scope aud (the guard)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const { tokenRes } = await dance({
+        db,
+        consentResource: `${ISSUER}/vault/default/mcp`,
+        tokenResource: "https://evil.example/vault/default/mcp",
+      });
+      expect(tokenRes.status).toBe(200);
+      const body = (await tokenRes.json()) as { access_token: string };
+      const { payload } = await validateAccessToken(db, body.access_token, ISSUER);
+      expect(payload.aud).toBe("vault.default");
+      expect(Array.isArray(payload.aud)).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 // closes #72 — RFC 6749 §3.2.1 + §2.3.1: confidential clients must
 // authenticate at /oauth/token via Authorization: Basic header (preferred)
 // or form-body client_secret. Public clients (PKCE-only) are unaffected

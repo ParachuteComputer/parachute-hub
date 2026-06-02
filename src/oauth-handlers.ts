@@ -47,7 +47,7 @@ import {
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import { isCoveredByGrant, isCoveredByGrantForClientName, recordGrant } from "./grants.ts";
 import { consumeFirstClientAutoApproveWindow } from "./hub-settings.ts";
-import { VAULT_VERBS, inferAudience } from "./jwt-audience.ts";
+import { VAULT_VERBS, bindResourceAudience, inferAudience } from "./jwt-audience.ts";
 import {
   ACCESS_TOKEN_TTL_SECONDS,
   RefreshTokenInsertError,
@@ -2057,7 +2057,19 @@ async function handleTokenAuthorizationCode(
       400,
     );
   }
-  const audience = inferAudience(redeemed.scopes);
+  // RFC 8707 resource → aud binding (#511). Claude's MCP connector sends
+  // `resource=<origin>/vault/<name>/mcp` on the token request and validates
+  // the returned token's `aud` against that exact URL. When the resource
+  // resolves (hub-fronted per-vault MCP resource) to the SAME vault the
+  // scope-derived aud names, widen `aud` to the array `[scopeAud, resource]`
+  // so the connector's check passes AND the vault's `aud.includes(vault.<name>)`
+  // check still passes. A foreign/non-resolving resource is ignored (bare
+  // scope aud minted, as pre-#511) — the guard lives in `bindResourceAudience`.
+  const audience = bindResourceAudience(
+    inferAudience(redeemed.scopes),
+    (form.get("resource") as string | null) ?? null,
+    (resource) => resolveResourceVault(resource, resolveBoundOrigins(deps)),
+  );
   const access = await signAccessToken(db, {
     sub: redeemed.userId,
     scopes: redeemed.scopes,
@@ -2183,7 +2195,18 @@ async function handleTokenRefresh(
   // (revoke old) + INSERT (mint new refresh row) commit or roll back as
   // a unit, so a mid-rotation crash can't dead-old-without-replacement
   // (#107).
-  const audience = inferAudience(row.scopes);
+  // RFC 8707 resource → aud binding on refresh (#511) — LOAD-BEARING. Claude's
+  // access token is short-lived (~15min); the connector refreshes with
+  // `resource` re-sent (RFC 8707 SHOULD; Claude does). If the refreshed token
+  // reverted to the bare scope aud, the connector would break ~15min after it
+  // started working. So re-apply the SAME binding the authcode path uses: when
+  // `resource` resolves to the scope's vault, widen `aud` to `[scopeAud,
+  // resource]`; otherwise (no/foreign resource) keep the bare scope aud.
+  const audience = bindResourceAudience(
+    inferAudience(row.scopes),
+    (form.get("resource") as string | null) ?? null,
+    (resource) => resolveResourceVault(resource, resolveBoundOrigins(deps)),
+  );
   const access = await signAccessToken(db, {
     sub: refreshUserId,
     scopes: row.scopes,
