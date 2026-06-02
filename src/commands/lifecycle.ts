@@ -585,7 +585,7 @@ async function maybeOfferAndMigrate(r: Resolved): Promise<boolean> {
  * The fallback differs cosmetically — here `readHubPort(configDir) ??
  * HUB_UNIT_DEFAULT_PORT`, in auth.ts `127.0.0.1:${HUB_DEFAULT_PORT}` — but both
  * resolve to 1939 under canonical-ports today, so they agree in practice.
- * TODO: consolidate with auth.ts:resolveHubIssuer to prevent drift.
+ * See #508: consolidate with auth.ts:resolveHubIssuer to prevent drift.
  */
 function resolveOperatorTokenIssuer(hubOrigin: string | undefined, configDir: string): string {
   if (hubOrigin) return hubOrigin;
@@ -1084,7 +1084,14 @@ export async function restart(svc: string | undefined, opts: LifecycleOpts = {})
   // re-probing `isHubUnitInstalled` (two redundant `stat`s per call) — we
   // already resolved no-unit above, so both inner calls would re-take this
   // same detached arm regardless. Behavior-preserving; just drops the probes.
-  const detachedOpts = { ...opts, supervisor: undefined };
+  //
+  // Also DISABLE the auto-migrate offer on the inner stop+start: the OUTER
+  // `restart` already ran `maybeOfferAndMigrate` above (one offer). Without this,
+  // the offer block (`migrateOffer: { enabled: true }`) flows through `...opts`
+  // into both inner calls → an operator who declines is prompted 3× (TTY) / the
+  // command is printed 3× (non-TTY). `restart` owns the single offer; the inner
+  // verbs must not re-offer.
+  const detachedOpts = { ...opts, supervisor: undefined, migrateOffer: { enabled: false } };
   const stopCode = await stop(svc, detachedOpts);
   if (stopCode !== 0) return stopCode;
   return await start(svc, detachedOpts);

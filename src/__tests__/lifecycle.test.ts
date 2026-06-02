@@ -2460,4 +2460,36 @@ describe("§7.5 auto-detect-and-offer hook in start/stop/restart", () => {
       h.cleanup();
     }
   });
+
+  test("restart: declined → offer fires EXACTLY ONCE, not three times (MUST-FIX 3)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writePid("vault", 4242, h.configDir);
+      // The operator DECLINES the offer. The outer `restart` makes the single
+      // offer, then falls to the detached stop+start. WITHOUT the fix, the offer
+      // block flowed through `...opts` into both inner verbs → 3 offers/prints.
+      const offerStub = makeOfferStub("declined");
+      const spawner = makeSpawner([7777]);
+      const code = await restart("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        spawner,
+        // Stale 4242 dead (stop's stale-pid path skips the kill); spawned 7777
+        // alive past the post-spawn settle.
+        alive: (pid) => pid === 7777,
+        sleep: async () => {},
+        log: () => {},
+        migrateOffer: { enabled: true, offer: offerStub.offer },
+      });
+      expect(code).toBe(0);
+      // EXACTLY ONE offer — the outer restart's, not re-offered by inner stop+start.
+      expect(offerStub.calls).toBe(1);
+      // The detached restart still happened (declined → detached arm).
+      expect(spawner.calls).toHaveLength(1);
+      expect(readPid("vault", h.configDir)).toBe(7777);
+    } finally {
+      h.cleanup();
+    }
+  });
 });
