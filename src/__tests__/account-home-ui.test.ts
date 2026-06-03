@@ -201,9 +201,11 @@ describe("renderAccountHome", () => {
     );
   });
 
-  test("get-started card — present on every branch (admin + no-vault too)", () => {
-    // The on-ramp is useful regardless of vault-assignment state, so it
-    // renders on all three vault-card branches.
+  test("get-started card — present on the admin branch, hidden on the no-vault branch", () => {
+    // The on-ramp belongs on branches that have a vault to act against (admin +
+    // assigned-vault). It's suppressed on the no-vault branch, where the page
+    // says "You don't have a vault yet" — a do-the-thing card there would
+    // contradict the you-lack-the-prerequisite message.
     const admin = renderAccountHome({
       username: "admin",
       assignedVaults: [],
@@ -224,7 +226,9 @@ describe("renderAccountHome", () => {
       csrfToken: CSRF,
       twoFactorEnabled: false,
     });
-    expect(noVault).toContain('data-testid="get-started-card"');
+    // No-vault branch: card suppressed, and the no-vault message stands alone.
+    expect(noVault).not.toContain('data-testid="get-started-card"');
+    expect(noVault).toContain('data-testid="no-vault-card"');
   });
 
   test("connect-any-client hint bridges MCP ↔ ChatGPT 'connector' terminology", () => {
@@ -239,8 +243,11 @@ describe("renderAccountHome", () => {
     });
     // The "any other client" hint now names the ChatGPT "connector" term so
     // a friend who only knows that word can find the right place to paste.
+    // Assert the NEW hint string specifically — a bare toContain("connector")
+    // was already satisfied pre-PR by the Claude.ai "Connectors" block, so it
+    // wouldn't catch a regression that drops this bridging copy.
     expect(html).toContain('data-testid="connect-any-client-hint"');
-    expect(html).toContain("connector");
+    expect(html).toContain('call these "connectors."');
   });
 
   test("account card — security actions collapse into a secondary <details>", () => {

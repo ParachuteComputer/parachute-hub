@@ -174,7 +174,14 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
       )}</div>`
     : "";
 
-  const startedCard = renderGetStartedCard();
+  // Suppress the "Get started with your AI" card on the no-vault branch:
+  // that branch tells the user "You don't have a vault yet" + "ask the operator
+  // to assign you one," so a do-the-thing card alongside reads as contradictory
+  // (do-this vs you-lack-the-prerequisite). The admin (isFirstAdmin) and
+  // assigned-vault branches both have a vault to act against, so the card
+  // belongs there.
+  const hasNoVault = !isFirstAdmin && assignedVaults.length === 0;
+  const startedCard = hasNoVault ? "" : renderGetStartedCard();
 
   const vaultCard = renderVaultCard({
     assignedVaults,
