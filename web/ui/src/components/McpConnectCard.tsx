@@ -159,10 +159,11 @@ export function McpConnectCard({ vaultName, vaultUrl, embedded = false }: McpCon
 
   const inner = (
     <>
-      <h3>Connect an MCP client</h3>
+      <h3>Connect an MCP client (or connector)</h3>
       <p className="muted">
-        Connect an MCP client — Claude Code, Claude.ai, etc. — to the <code>{vaultName}</code>{" "}
-        vault. The client signs in to this hub and reads/writes vault data over MCP.
+        Connect an MCP client — Claude Code, Claude.ai, etc. (sometimes called a connector in
+        ChatGPT and other web UIs) — to the <code>{vaultName}</code> vault. The client signs in to
+        this hub and reads/writes vault data over MCP.
       </p>
 
       <div className="mcp-field">
