@@ -595,21 +595,32 @@ export class Supervisor {
   }
 
   /**
-   * Restart a supervised module: stop, wait for exit, start with the
-   * same SpawnRequest. Used by the `/api/modules/:name/restart`
-   * handler. The on-box `parachute restart <svc>` path stays on
-   * `commands/lifecycle.ts` — different surface, different ownership.
+   * Restart a supervised module: stop, wait for exit, start again. Used by
+   * the `/api/modules/:name/restart` handler. The on-box
+   * `parachute restart <svc>` path stays on `commands/lifecycle.ts` —
+   * different surface, different ownership.
+   *
+   * `nextReq` (hub#532): when the caller supplies a freshly-rebuilt
+   * SpawnRequest (current `PARACHUTE_HUB_ORIGIN` / enriched PATH /
+   * re-resolved cwd), the re-spawn uses it AND it becomes the entry's new
+   * `req` — so subsequent CRASH-restarts (`handleExit` → `spawnAndWatch`,
+   * which reuse `entry.req`) also carry the refreshed env, not the original
+   * first-start snapshot. When omitted, the prior `entry.req` is replayed
+   * (legacy behavior, e.g. an internal restart with no state change). The
+   * short on `nextReq` must match `short` — a mismatch is a caller bug.
    */
-  async restart(short: string): Promise<ModuleState | undefined> {
+  async restart(short: string, nextReq?: SpawnRequest): Promise<ModuleState | undefined> {
     const entry = this.modules.get(short);
     if (!entry) return undefined;
-    const req = entry.req;
+    const req = nextReq ?? entry.req;
     entry.state = { ...entry.state, status: "restarting" };
     // stop() now awaits the prior process's exit (with SIGKILL
     // escalation) before returning, so the fresh spawn below doesn't
     // race on EADDRINUSE — no separate await needed here.
     await this.stop(short);
-    // Drop the entry so `start` treats this as a clean spawn.
+    // Drop the entry so `start` treats this as a clean spawn. `start` stores
+    // `req` as the new entry's `req`, so a refreshed `nextReq` propagates to
+    // the crash-restart path too.
     this.modules.delete(short);
     return this.start(req);
   }
