@@ -116,6 +116,9 @@ export function buildModuleSpawnRequest(
   // PATH (operator intent) still wins via the spread below. See `spawn-path.ts`.
   // The API-start path builds its own env — see `api-modules-ops.ts`
   // `spawnSupervised`, which calls `enrichedPath()` too (keep the two in sync).
+  // `process.env.PATH` may ALREADY be enriched by serve startup (serve.ts);
+  // re-enriching here is a harmless no-op — `enrichedPath` is idempotent
+  // (dedupe + append-only), so double-enrichment can't duplicate or reorder.
   const env: Record<string, string> = {
     PATH: enrichedPath(),
     PORT: String(entry.port),

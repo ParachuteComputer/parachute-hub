@@ -389,6 +389,11 @@ function defaultRun(cmd: readonly string[]): Promise<number> {
   // etc. set by the Dockerfile / Render env. Bun.spawn defaults to empty
   // env — without this, bun-add fails with cross-mount rename errors on
   // Render (where TMPDIR points at the persistent disk). See hub#349.
+  // PATH: intentionally the raw `process.env` (no per-call `enrichedPath()`).
+  // This is `bun add`, not a module spawn — it doesn't need the operator-tool
+  // dirs (parakeet-mlx / ffmpeg). It still benefits from the serve-startup PATH
+  // enrichment: `serve.ts` applies `enrichedPath()` to `process.env.PATH` at
+  // boot, so the PATH inherited here is already enriched under a managed hub.
   const proc = Bun.spawn([...cmd], {
     stdio: ["ignore", "inherit", "inherit"],
     env: process.env,
@@ -496,6 +501,9 @@ async function spawnSupervised(
   // `parakeet-mlx` / `ffmpeg`. This is the SECOND, independently-built spawn
   // env; keep it in sync with serve-boot.ts:buildModuleSpawnRequest. `spawnEnv`
   // (test seam) still wins via the spread below. See `spawn-path.ts`.
+  // `process.env.PATH` may ALREADY be enriched by serve startup (serve.ts);
+  // re-enriching here is a harmless no-op — `enrichedPath` is idempotent
+  // (dedupe + append-only), so double-enrichment can't duplicate or reorder.
   const childEnv: Record<string, string> = {
     PATH: enrichedPath(),
     PORT: String(entry.port),
