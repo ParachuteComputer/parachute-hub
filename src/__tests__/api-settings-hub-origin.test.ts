@@ -83,6 +83,11 @@ function putReq(body: unknown, headers: Record<string, string> = {}): Request {
   });
 }
 
+// Stub "no exposure recorded" so resolveIssuer / resolveIssuerSource don't
+// pick up the host's real ~/.parachute/expose-state.json (the hub#532 expose
+// tier would otherwise shadow the request-origin source these tests assert).
+const noExpose = (): string | undefined => undefined;
+
 function deps(
   h: Harness,
   overrides: Partial<Parameters<typeof handleApiSettingsHubOrigin>[1]> = {},
@@ -90,8 +95,8 @@ function deps(
   return {
     db: h.db,
     issuer: ISSUER,
-    resolvedIssuer: resolveIssuer(getReq(), h.db, undefined),
-    resolvedSource: resolveIssuerSource(h.db, undefined),
+    resolvedIssuer: resolveIssuer(getReq(), h.db, undefined, noExpose),
+    resolvedSource: resolveIssuerSource(h.db, undefined, noExpose),
     ...overrides,
   };
 }
@@ -414,8 +419,8 @@ describe("change takes effect on the next request (no restart needed)", () => {
     const g1 = await handleApiSettingsHubOrigin(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
       issuer: ISSUER,
-      resolvedIssuer: resolveIssuer(getReq(), h.db, undefined),
-      resolvedSource: resolveIssuerSource(h.db, undefined),
+      resolvedIssuer: resolveIssuer(getReq(), h.db, undefined, noExpose),
+      resolvedSource: resolveIssuerSource(h.db, undefined, noExpose),
     });
     const b1 = (await g1.json()) as { source: string; resolved_issuer: string };
     expect(b1.source).toBe("request");
@@ -426,8 +431,8 @@ describe("change takes effect on the next request (no restart needed)", () => {
       {
         db: h.db,
         issuer: ISSUER,
-        resolvedIssuer: resolveIssuer(putReq({}), h.db, undefined),
-        resolvedSource: resolveIssuerSource(h.db, undefined),
+        resolvedIssuer: resolveIssuer(putReq({}), h.db, undefined, noExpose),
+        resolvedSource: resolveIssuerSource(h.db, undefined, noExpose),
       },
     );
     expect(p.status).toBe(200);
@@ -437,8 +442,8 @@ describe("change takes effect on the next request (no restart needed)", () => {
     const g2 = await handleApiSettingsHubOrigin(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
       issuer: ISSUER,
-      resolvedIssuer: resolveIssuer(getReq(), h.db, undefined),
-      resolvedSource: resolveIssuerSource(h.db, undefined),
+      resolvedIssuer: resolveIssuer(getReq(), h.db, undefined, noExpose),
+      resolvedSource: resolveIssuerSource(h.db, undefined, noExpose),
     });
     const b2 = (await g2.json()) as {
       hub_origin: string | null;

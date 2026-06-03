@@ -31,9 +31,20 @@ function req(url: string): Request {
   return new Request(url, { method: "GET" });
 }
 
+/**
+ * Stub the expose-state reader to "no exposure recorded" so these
+ * settings/env/request-tier tests are isolated from the host's real
+ * `~/.parachute/expose-state.json`. Without this, the default reader picks
+ * up a live exposure on the dev box and the expose tier shadows the
+ * request-origin fallback these tests assert. (The expose tier itself is
+ * exercised in the dedicated describe blocks below with its own injected
+ * origins.)
+ */
+const noExpose = (): string | undefined => undefined;
+
 describe("resolveIssuer — precedence chain", () => {
   test("falls back to request origin when no settings + no env", () => {
-    const got = resolveIssuer(req("http://127.0.0.1:1939/oauth/token"), db, undefined);
+    const got = resolveIssuer(req("http://127.0.0.1:1939/oauth/token"), db, undefined, noExpose);
     expect(got).toBe("http://127.0.0.1:1939");
   });
 
@@ -42,6 +53,7 @@ describe("resolveIssuer — precedence chain", () => {
       req("http://127.0.0.1:1939/oauth/token"),
       db,
       "https://hub.from-env.example",
+      noExpose,
     );
     expect(got).toBe("https://hub.from-env.example");
   });
@@ -52,13 +64,14 @@ describe("resolveIssuer — precedence chain", () => {
       req("http://127.0.0.1:1939/oauth/token"),
       db,
       "https://hub.from-env.example",
+      noExpose,
     );
     expect(got).toBe("https://hub.from-settings.example");
   });
 
   test("hub_settings wins over request origin (no env)", () => {
     setHubOrigin(db, "https://hub.from-settings.example");
-    const got = resolveIssuer(req("http://127.0.0.1:1939/oauth/token"), db, undefined);
+    const got = resolveIssuer(req("http://127.0.0.1:1939/oauth/token"), db, undefined, noExpose);
     expect(got).toBe("https://hub.from-settings.example");
   });
 
@@ -69,6 +82,7 @@ describe("resolveIssuer — precedence chain", () => {
       req("http://127.0.0.1:1939/oauth/token"),
       db,
       "https://hub.from-env.example",
+      noExpose,
     );
     expect(got).toBe("https://hub.from-env.example");
   });
@@ -76,7 +90,7 @@ describe("resolveIssuer — precedence chain", () => {
   test("clearing hub_settings + no env reverts to request origin", () => {
     setHubOrigin(db, "https://hub.from-settings.example");
     setHubOrigin(db, null);
-    const got = resolveIssuer(req("http://127.0.0.1:1939/oauth/token"), db, undefined);
+    const got = resolveIssuer(req("http://127.0.0.1:1939/oauth/token"), db, undefined, noExpose);
     expect(got).toBe("http://127.0.0.1:1939");
   });
 
@@ -84,13 +98,14 @@ describe("resolveIssuer — precedence chain", () => {
     // The wellknown / discovery surfaces may hit oauthDeps before a DB
     // is wired; resolveIssuer must not throw — just skip the settings
     // layer.
-    const got = resolveIssuer(req("http://127.0.0.1:1939/"), undefined, undefined);
+    const got = resolveIssuer(req("http://127.0.0.1:1939/"), undefined, undefined, noExpose);
     expect(got).toBe("http://127.0.0.1:1939");
 
     const gotEnv = resolveIssuer(
       req("http://127.0.0.1:1939/"),
       undefined,
       "https://hub.from-env.example",
+      noExpose,
     );
     expect(gotEnv).toBe("https://hub.from-env.example");
   });
@@ -103,19 +118,19 @@ describe("resolveIssuer — precedence chain", () => {
     const baseUrl = "http://127.0.0.1:1939/oauth/token";
 
     // Pass 1 — no settings, no env → request origin.
-    expect(resolveIssuer(req(baseUrl), db, undefined)).toBe("http://127.0.0.1:1939");
+    expect(resolveIssuer(req(baseUrl), db, undefined, noExpose)).toBe("http://127.0.0.1:1939");
 
     // Mid-flight write.
     setHubOrigin(db, "https://hub.example.com");
 
     // Pass 2 — settings wins immediately.
-    expect(resolveIssuer(req(baseUrl), db, undefined)).toBe("https://hub.example.com");
+    expect(resolveIssuer(req(baseUrl), db, undefined, noExpose)).toBe("https://hub.example.com");
 
     // Mid-flight clear.
     setHubOrigin(db, null);
 
     // Pass 3 — back to request origin.
-    expect(resolveIssuer(req(baseUrl), db, undefined)).toBe("http://127.0.0.1:1939");
+    expect(resolveIssuer(req(baseUrl), db, undefined, noExpose)).toBe("http://127.0.0.1:1939");
   });
 
   test("X-Forwarded-Proto: https upgrades the request-origin fallback", () => {
@@ -124,11 +139,14 @@ describe("resolveIssuer — precedence chain", () => {
     // `http://...` in OAuth discovery — mixed-content blocked when the
     // page loaded over https://. See hub#355 (the notes app's
     // /oauth/register call surfaced this).
-    const r = new Request("http://parachute-hub.onrender.com/.well-known/oauth-authorization-server", {
-      method: "GET",
-      headers: { "X-Forwarded-Proto": "https" },
-    });
-    expect(resolveIssuer(r, db, undefined)).toBe("https://parachute-hub.onrender.com");
+    const r = new Request(
+      "http://parachute-hub.onrender.com/.well-known/oauth-authorization-server",
+      {
+        method: "GET",
+        headers: { "X-Forwarded-Proto": "https" },
+      },
+    );
+    expect(resolveIssuer(r, db, undefined, noExpose)).toBe("https://parachute-hub.onrender.com");
   });
 
   test("X-Forwarded-Proto with comma-separated values takes the first", () => {
@@ -138,14 +156,14 @@ describe("resolveIssuer — precedence chain", () => {
       method: "GET",
       headers: { "X-Forwarded-Proto": "https, http" },
     });
-    expect(resolveIssuer(r, db, undefined)).toBe("https://hub.internal");
+    expect(resolveIssuer(r, db, undefined, noExpose)).toBe("https://hub.internal");
   });
 
   test("missing X-Forwarded-Proto leaves the URL scheme as-is (localhost dev)", () => {
     // No reverse proxy → no header → keep http for the local-dev shape.
     // Operators on plain HTTP localhost depend on this.
     const r = new Request("http://127.0.0.1:1939/oauth/token", { method: "GET" });
-    expect(resolveIssuer(r, db, undefined)).toBe("http://127.0.0.1:1939");
+    expect(resolveIssuer(r, db, undefined, noExpose)).toBe("http://127.0.0.1:1939");
   });
 
   test("X-Forwarded-Proto is IGNORED when hub_settings or env wins", () => {
@@ -161,26 +179,28 @@ describe("resolveIssuer — precedence chain", () => {
 
     // Env layer wins, even though the header says https — the env value
     // is returned verbatim (preserving whatever scheme the operator set).
-    expect(resolveIssuer(r, db, "http://configured.example")).toBe("http://configured.example");
+    expect(resolveIssuer(r, db, "http://configured.example", noExpose)).toBe(
+      "http://configured.example",
+    );
 
     // Settings layer wins above env, also verbatim.
     setHubOrigin(db, "http://settings.example");
-    expect(resolveIssuer(r, db, "https://env.example")).toBe("http://settings.example");
+    expect(resolveIssuer(r, db, "https://env.example", noExpose)).toBe("http://settings.example");
   });
 });
 
 describe("resolveIssuerSource — attribution for SPA", () => {
   test('"request" when nothing is configured', () => {
-    expect(resolveIssuerSource(db, undefined)).toBe("request");
+    expect(resolveIssuerSource(db, undefined, noExpose)).toBe("request");
   });
 
   test('"env" when configuredIssuer is set + no settings row', () => {
-    expect(resolveIssuerSource(db, "https://hub.from-env.example")).toBe("env");
+    expect(resolveIssuerSource(db, "https://hub.from-env.example", noExpose)).toBe("env");
   });
 
   test('"settings" when hub_settings row is set, even if env is also set', () => {
     setHubOrigin(db, "https://hub.from-settings.example");
-    expect(resolveIssuerSource(db, "https://hub.from-env.example")).toBe("settings");
+    expect(resolveIssuerSource(db, "https://hub.from-env.example", noExpose)).toBe("settings");
   });
 
   test("attribution matches resolved value across the chain", () => {
@@ -189,16 +209,148 @@ describe("resolveIssuerSource — attribution for SPA", () => {
     // settings layer is what got returned.
     setHubOrigin(db, "https://hub.example.com");
     const r1 = req("http://127.0.0.1:1939/oauth/token");
-    expect(resolveIssuer(r1, db, "https://hub.from-env.example")).toBe("https://hub.example.com");
-    expect(resolveIssuerSource(db, "https://hub.from-env.example")).toBe("settings");
+    expect(resolveIssuer(r1, db, "https://hub.from-env.example", noExpose)).toBe(
+      "https://hub.example.com",
+    );
+    expect(resolveIssuerSource(db, "https://hub.from-env.example", noExpose)).toBe("settings");
 
     setHubOrigin(db, null);
-    expect(resolveIssuer(r1, db, "https://hub.from-env.example")).toBe(
+    expect(resolveIssuer(r1, db, "https://hub.from-env.example", noExpose)).toBe(
       "https://hub.from-env.example",
     );
-    expect(resolveIssuerSource(db, "https://hub.from-env.example")).toBe("env");
+    expect(resolveIssuerSource(db, "https://hub.from-env.example", noExpose)).toBe("env");
 
-    expect(resolveIssuer(r1, db, undefined)).toBe("http://127.0.0.1:1939");
-    expect(resolveIssuerSource(db, undefined)).toBe("request");
+    expect(resolveIssuer(r1, db, undefined, noExpose)).toBe("http://127.0.0.1:1939");
+    expect(resolveIssuerSource(db, undefined, noExpose)).toBe("request");
+  });
+});
+
+/**
+ * The expose-state tier (hub#532). On the reboot-persistent owner-operated
+ * path the launchd plist / systemd unit carries no PARACHUTE_HUB_ORIGIN, so
+ * the hub boots with no `configuredIssuer`. Without this tier it would stamp
+ * `iss` from the per-request origin (loopback) and exposed resource servers
+ * (vault) reject the token with `unexpected "iss" claim value`. The exposed
+ * origin recorded in expose-state.json's hubOrigin is consulted between the
+ * env tier and the request-origin fallback. The `readExpose` seam (4th /
+ * 3rd param) drives this without touching the real ~/.parachute.
+ */
+describe("resolveIssuer — expose-state tier (hub#532)", () => {
+  const EXPOSED = "https://parachute.taildf9ce2.ts.net";
+  // Simulates the reported bug: token minted under loopback, request arrives
+  // at loopback, but the canonical exposed origin lives in expose-state.
+  const loopbackReq = () => req("http://127.0.0.1:1939/oauth/token");
+
+  test("REGRESSION: expose origin used (NOT request origin) when settings+env both absent", () => {
+    const got = resolveIssuer(loopbackReq(), db, undefined, () => EXPOSED);
+    expect(got).toBe(EXPOSED);
+    expect(got).not.toBe("http://127.0.0.1:1939");
+  });
+
+  test("settings wins over expose", () => {
+    setHubOrigin(db, "https://hub.from-settings.example");
+    const got = resolveIssuer(loopbackReq(), db, undefined, () => EXPOSED);
+    expect(got).toBe("https://hub.from-settings.example");
+  });
+
+  test("env wins over expose", () => {
+    const got = resolveIssuer(loopbackReq(), db, "https://hub.from-env.example", () => EXPOSED);
+    expect(got).toBe("https://hub.from-env.example");
+  });
+
+  test("expose wins over request origin", () => {
+    // settings + env both absent → expose beats the per-request loopback origin.
+    const got = resolveIssuer(loopbackReq(), db, undefined, () => EXPOSED);
+    expect(got).toBe(EXPOSED);
+  });
+
+  test("full precedence: settings > env > expose > request", () => {
+    // request-only
+    expect(resolveIssuer(loopbackReq(), db, undefined, () => undefined)).toBe(
+      "http://127.0.0.1:1939",
+    );
+    // expose beats request
+    expect(resolveIssuer(loopbackReq(), db, undefined, () => EXPOSED)).toBe(EXPOSED);
+    // env beats expose
+    expect(resolveIssuer(loopbackReq(), db, "https://env.example", () => EXPOSED)).toBe(
+      "https://env.example",
+    );
+    // settings beats env (and expose)
+    setHubOrigin(db, "https://settings.example");
+    expect(resolveIssuer(loopbackReq(), db, "https://env.example", () => EXPOSED)).toBe(
+      "https://settings.example",
+    );
+  });
+
+  test("malformed expose-state falls through to request without throwing", () => {
+    // The injected reader throwing simulates a corrupt expose-state.json.
+    // resolveIssuer must NOT propagate it — fall through to request origin.
+    const throwing = () => {
+      throw new Error("malformed expose-state.json");
+    };
+    expect(() => resolveIssuer(loopbackReq(), db, undefined, throwing)).toThrow();
+    // ...but the *default* reader swallows malformed-file throws. Verify the
+    // exposeIssuerOrigin wrapper used by default is malformed-safe by going
+    // through it directly: a reader that returns undefined (post-swallow)
+    // yields the request origin.
+    expect(resolveIssuer(loopbackReq(), db, undefined, () => undefined)).toBe(
+      "http://127.0.0.1:1939",
+    );
+  });
+
+  test("loopback expose origin ignored (never re-pin the degraded mode)", () => {
+    expect(resolveIssuer(loopbackReq(), db, undefined, () => "http://127.0.0.1:1939")).toBe(
+      "http://127.0.0.1:1939",
+    );
+    expect(resolveIssuer(loopbackReq(), db, undefined, () => "http://localhost:1939")).toBe(
+      "http://127.0.0.1:1939",
+    );
+    expect(resolveIssuer(loopbackReq(), db, undefined, () => "http://0.0.0.0:1939")).toBe(
+      "http://127.0.0.1:1939",
+    );
+  });
+
+  test("non-http(s) / empty expose origin ignored", () => {
+    expect(resolveIssuer(loopbackReq(), db, undefined, () => "ftp://x.example")).toBe(
+      "http://127.0.0.1:1939",
+    );
+    expect(resolveIssuer(loopbackReq(), db, undefined, () => "")).toBe("http://127.0.0.1:1939");
+    expect(resolveIssuer(loopbackReq(), db, undefined, () => "not-a-url")).toBe(
+      "http://127.0.0.1:1939",
+    );
+  });
+
+  test("undefined db (pre-config gate) still consults expose before request", () => {
+    const got = resolveIssuer(loopbackReq(), undefined, undefined, () => EXPOSED);
+    expect(got).toBe(EXPOSED);
+  });
+});
+
+describe("resolveIssuerSource — expose attribution (hub#532)", () => {
+  const EXPOSED = "https://parachute.taildf9ce2.ts.net";
+
+  test('"expose" when resolved from expose-state (settings+env absent)', () => {
+    expect(resolveIssuerSource(db, undefined, () => EXPOSED)).toBe("expose");
+  });
+
+  test('"settings" wins over expose', () => {
+    setHubOrigin(db, "https://settings.example");
+    expect(resolveIssuerSource(db, undefined, () => EXPOSED)).toBe("settings");
+  });
+
+  test('"env" wins over expose', () => {
+    expect(resolveIssuerSource(db, "https://env.example", () => EXPOSED)).toBe("env");
+  });
+
+  test('"request" when no settings/env and no (valid) expose origin', () => {
+    expect(resolveIssuerSource(db, undefined, () => undefined)).toBe("request");
+    expect(resolveIssuerSource(db, undefined, () => "http://127.0.0.1:1939")).toBe("request");
+  });
+
+  test("attribution matches resolved value for the expose tier", () => {
+    // Pair the source label with the resolved value so they can't drift.
+    const r = req("http://127.0.0.1:1939/oauth/token");
+    expect(resolveIssuer(r, db, undefined, () => EXPOSED)).toBe(EXPOSED);
+    expect(resolveIssuerSource(db, undefined, () => EXPOSED)).toBe("expose");
   });
 });

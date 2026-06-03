@@ -530,9 +530,13 @@ describe("hubFetch routing", () => {
     const h = makeHarness();
     try {
       writeManifest({ services: [vaultEntry("default")] }, h.manifestPath);
-      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(
-        new Request("http://127.0.0.1:1939/.well-known/parachute.json"),
-      );
+      const res = await hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        // No exposure recorded — isolate from the host's real expose-state.json
+        // so the request-origin fallback (not the hub#532 expose tier) is what
+        // this test exercises.
+        loadExposeHubOrigin: () => undefined,
+      })(new Request("http://127.0.0.1:1939/.well-known/parachute.json"));
       const body = (await res.json()) as { vaults: Array<{ url: string }> };
       expect(body.vaults[0]?.url).toBe("http://127.0.0.1:1939/vault/default");
     } finally {

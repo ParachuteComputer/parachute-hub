@@ -248,6 +248,13 @@ describe("bootstrap-token wiring under needs-setup", () => {
 });
 
 describe("resolveStartupIssuer — precedence chain (hub#365)", () => {
+  // Stub "no exposure recorded" so the undefined-asserting tests are
+  // isolated from the host's real ~/.parachute/expose-state.json — the
+  // default reader picks up a live exposure on the dev box and the expose
+  // tier (hub#532) would otherwise shadow the "no source → undefined" cases.
+  // The expose tier itself is exercised in its own describe block below.
+  const noExpose = (): string | undefined => undefined;
+
   test("explicit opts.issuer wins over everything", () => {
     const got = resolveStartupIssuer(
       { issuer: "https://override.example" },
@@ -296,9 +303,9 @@ describe("resolveStartupIssuer — precedence chain (hub#365)", () => {
   });
 
   test("returns undefined when no source has a value", () => {
-    expect(resolveStartupIssuer({}, {})).toBeUndefined();
-    expect(resolveStartupIssuer({}, { RENDER_EXTERNAL_URL: "" })).toBeUndefined();
-    expect(resolveStartupIssuer({}, { PARACHUTE_HUB_ORIGIN: "" })).toBeUndefined();
+    expect(resolveStartupIssuer({}, {}, noExpose)).toBeUndefined();
+    expect(resolveStartupIssuer({}, { RENDER_EXTERNAL_URL: "" }, noExpose)).toBeUndefined();
+    expect(resolveStartupIssuer({}, { PARACHUTE_HUB_ORIGIN: "" }, noExpose)).toBeUndefined();
   });
 
   test("empty string after slash-strip collapses to undefined (defensive)", () => {
@@ -306,7 +313,7 @@ describe("resolveStartupIssuer — precedence chain (hub#365)", () => {
     // Guards against a misconfigured env where someone sets the var to "/"
     // expecting it to mean "root" (it doesn't — leaves hub without a usable
     // origin, which is the same as not setting it at all).
-    expect(resolveStartupIssuer({}, { PARACHUTE_HUB_ORIGIN: "/" })).toBeUndefined();
+    expect(resolveStartupIssuer({}, { PARACHUTE_HUB_ORIGIN: "/" }, noExpose)).toBeUndefined();
   });
 
   // Fly.io self-host path (patterns#100). resolveStartupIssuer is the
@@ -341,11 +348,84 @@ describe("resolveStartupIssuer — precedence chain (hub#365)", () => {
   });
 
   test("FLY_APP_NAME with slash rejected (defensive — Fly slugs don't contain /)", () => {
-    expect(resolveStartupIssuer({}, { FLY_APP_NAME: "a/b" })).toBeUndefined();
-    expect(resolveStartupIssuer({}, { FLY_APP_NAME: "../etc/passwd" })).toBeUndefined();
+    expect(resolveStartupIssuer({}, { FLY_APP_NAME: "a/b" }, noExpose)).toBeUndefined();
+    expect(resolveStartupIssuer({}, { FLY_APP_NAME: "../etc/passwd" }, noExpose)).toBeUndefined();
   });
 
   test("FLY_APP_NAME empty string → no fallback", () => {
-    expect(resolveStartupIssuer({}, { FLY_APP_NAME: "" })).toBeUndefined();
+    expect(resolveStartupIssuer({}, { FLY_APP_NAME: "" }, noExpose)).toBeUndefined();
+  });
+});
+
+describe("resolveStartupIssuer — expose-state fallback (hub#532)", () => {
+  // The reboot-persistent bug: the launchd plist / systemd unit that keeps
+  // `parachute serve` alive carries no PARACHUTE_HUB_ORIGIN, so on every
+  // reboot the hub boots with no flag/env/platform origin and would stamp
+  // iss from the per-request origin — which exposed resource servers (vault)
+  // reject until they restart. Reading expose-state.json's hubOrigin makes
+  // iss deterministic across reboots. The readExpose seam lets us drive this
+  // without touching the real ~/.parachute.
+  const EXPOSED = "https://parachute.taildf9ce2.ts.net";
+
+  test("returns expose-state.hubOrigin when no flag/env/platform set", () => {
+    const got = resolveStartupIssuer({}, {}, () => EXPOSED);
+    expect(got).toBe(EXPOSED);
+  });
+
+  test("explicit opts.issuer wins over expose-state", () => {
+    const got = resolveStartupIssuer({ issuer: "https://override.example" }, {}, () => EXPOSED);
+    expect(got).toBe("https://override.example");
+  });
+
+  test("PARACHUTE_HUB_ORIGIN wins over expose-state", () => {
+    const got = resolveStartupIssuer(
+      {},
+      { PARACHUTE_HUB_ORIGIN: "https://env.example" },
+      () => EXPOSED,
+    );
+    expect(got).toBe("https://env.example");
+  });
+
+  test("RENDER_EXTERNAL_URL wins over expose-state", () => {
+    const got = resolveStartupIssuer(
+      {},
+      { RENDER_EXTERNAL_URL: "https://app.onrender.com" },
+      () => EXPOSED,
+    );
+    expect(got).toBe("https://app.onrender.com");
+  });
+
+  test("FLY_APP_NAME wins over expose-state", () => {
+    const got = resolveStartupIssuer({}, { FLY_APP_NAME: "my-parachute" }, () => EXPOSED);
+    expect(got).toBe("https://my-parachute.fly.dev");
+  });
+
+  test("returns undefined when expose-state is absent (no hubOrigin recorded)", () => {
+    expect(resolveStartupIssuer({}, {}, () => undefined)).toBeUndefined();
+  });
+
+  test("strips trailing slashes from the expose origin", () => {
+    expect(resolveStartupIssuer({}, {}, () => `${EXPOSED}/`)).toBe(EXPOSED);
+    expect(resolveStartupIssuer({}, {}, () => `${EXPOSED}//`)).toBe(EXPOSED);
+  });
+
+  test("ignores a loopback expose hubOrigin (never re-pin the degraded mode)", () => {
+    expect(resolveStartupIssuer({}, {}, () => "http://127.0.0.1:1939")).toBeUndefined();
+    expect(resolveStartupIssuer({}, {}, () => "http://localhost:1939")).toBeUndefined();
+    expect(resolveStartupIssuer({}, {}, () => "http://[::1]:1939")).toBeUndefined();
+    expect(resolveStartupIssuer({}, {}, () => "http://0.0.0.0:1939")).toBeUndefined();
+  });
+
+  test("ignores a non-http(s) or malformed expose origin", () => {
+    expect(resolveStartupIssuer({}, {}, () => "ftp://parachute.example")).toBeUndefined();
+    expect(resolveStartupIssuer({}, {}, () => "not-a-url")).toBeUndefined();
+    expect(resolveStartupIssuer({}, {}, () => "")).toBeUndefined();
+  });
+
+  test("default reader is swallowed-safe (no real ~/.parachute) — does not throw", () => {
+    // The default readExpose swallows a malformed-file throw; with no
+    // exposure recorded under the test PARACHUTE_HOME it just yields
+    // undefined → undefined issuer. The key assertion is "doesn't throw."
+    expect(() => resolveStartupIssuer({}, {})).not.toThrow();
   });
 });
