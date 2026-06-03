@@ -6,11 +6,33 @@ import { _resetBootstrapTokenForTests, getBootstrapToken } from "../bootstrap-to
 import {
   formatBootstrapTokenBanner,
   formatListeningBanner,
+  hubPortConflictMessage,
   resolveStartupIssuer,
   seedInitialAdminIfNeeded,
 } from "../commands/serve.ts";
 import { openHubDb } from "../hub-db.ts";
 import { getUserByUsername, userCount } from "../users.ts";
+
+describe("hubPortConflictMessage (hub#536)", () => {
+  test("maps a port-in-use error to a clear duplicate-supervisor message", () => {
+    // Bun surfaces a port conflict as "...Is port 1939 in use?"; node-style is
+    // "EADDRINUSE: address already in use". Both must map to the clear message.
+    for (const m of [
+      "EADDRINUSE: address already in use 127.0.0.1:1939",
+      "Failed to start server. Is port 1939 in use?",
+    ]) {
+      const out = hubPortConflictMessage(new Error(m), 1939);
+      expect(out).toContain("already in use");
+      expect(out).toContain("duplicate supervisor");
+      expect(out).toContain("1939");
+    }
+  });
+
+  test("returns null for an unrelated error (caller re-throws the original)", () => {
+    expect(hubPortConflictMessage(new Error("permission denied"), 1939)).toBeNull();
+    expect(hubPortConflictMessage("not even an Error", 1939)).toBeNull();
+  });
+});
 
 describe("seedInitialAdminIfNeeded", () => {
   let dir: string;
