@@ -251,7 +251,7 @@ describe("resolveStartupIssuer — precedence chain (hub#365)", () => {
   // Stub "no exposure recorded" so the undefined-asserting tests are
   // isolated from the host's real ~/.parachute/expose-state.json — the
   // default reader picks up a live exposure on the dev box and the expose
-  // tier (hub#532) would otherwise shadow the "no source → undefined" cases.
+  // tier (#531) would otherwise shadow the "no source → undefined" cases.
   // The expose tier itself is exercised in its own describe block below.
   const noExpose = (): string | undefined => undefined;
 
@@ -357,7 +357,7 @@ describe("resolveStartupIssuer — precedence chain (hub#365)", () => {
   });
 });
 
-describe("resolveStartupIssuer — expose-state fallback (hub#532)", () => {
+describe("resolveStartupIssuer — expose-state fallback (#531)", () => {
   // The reboot-persistent bug: the launchd plist / systemd unit that keeps
   // `parachute serve` alive carries no PARACHUTE_HUB_ORIGIN, so on every
   // reboot the hub boots with no flag/env/platform origin and would stamp
@@ -427,5 +427,17 @@ describe("resolveStartupIssuer — expose-state fallback (hub#532)", () => {
     // exposure recorded under the test PARACHUTE_HOME it just yields
     // undefined → undefined issuer. The key assertion is "doesn't throw."
     expect(() => resolveStartupIssuer({}, {})).not.toThrow();
+  });
+
+  test("a throwing injected reader can't crash startup (returns undefined)", () => {
+    // The readExpose() call is try/catch-wrapped so even a non-swallowing
+    // reader can't propagate into boot. With no flag/env/platform origin set
+    // and a throwing reader, the issuer resolves to undefined (the degraded
+    // request-origin mode) rather than crashing `parachute serve`.
+    const throwing = () => {
+      throw new Error("malformed expose-state.json");
+    };
+    expect(() => resolveStartupIssuer({}, {}, throwing)).not.toThrow();
+    expect(resolveStartupIssuer({}, {}, throwing)).toBeUndefined();
   });
 });

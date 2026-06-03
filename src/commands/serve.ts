@@ -38,7 +38,7 @@ import { hubFetch } from "../hub-server.ts";
 import { writeHubFile } from "../hub.ts";
 import { Supervisor } from "../supervisor.ts";
 import { createUser, userCount } from "../users.ts";
-import { isLoopbackOrigin } from "../vault-hub-origin-env.ts";
+import { sanitizePublicOrigin } from "../vault-hub-origin-env.ts";
 import { WELL_KNOWN_DIR } from "../well-known.ts";
 import { bootSupervisedModules } from "./serve-boot.ts";
 
@@ -156,7 +156,18 @@ function parsePort(raw: string | undefined): number | undefined {
  * `readExpose` is injectable so tests exercise the expose-state tier
  * without touching the real `~/.parachute`. The default reads
  * `expose-state.json` and swallows a malformed-file throw (a corrupt state
- * file must never crash startup — fall through to the request-origin mode).
+ * file must never crash startup — fall through to the request-origin mode);
+ * the `readExpose()` call is additionally try/catch-wrapped here so even an
+ * injected non-swallowing reader can't crash startup.
+ *
+ * KNOWN ASTERISK (tracked in #532): this resolves the issuer at boot, so a
+ * child module spawned during a *pre-expose* boot — hub started before the
+ * first-ever `parachute expose` — gets no `PARACHUTE_HUB_ORIGIN` injected
+ * until it's restarted after the exposure exists. Once an exposure is
+ * recorded, every subsequent reboot picks it up here automatically. The
+ * remaining gap (rebuild the live spawn-env on `supervisor.restart` so the
+ * first exposure propagates to already-running children without a manual
+ * restart) is the deferred #532 follow-up; not implemented in this PR.
  */
 export function resolveStartupIssuer(
   opts: { issuer?: string },
@@ -172,13 +183,16 @@ export function resolveStartupIssuer(
   )?.replace(/\/+$/, "");
   if (explicit) return explicit;
   // No flag / env / platform origin set — fall back to the exposed origin
-  // recorded on disk. Guard it to a non-loopback http(s) origin so a stray
-  // loopback value never pins the degraded request-origin mode.
-  const exposed = readExpose()?.replace(/\/+$/, "");
-  if (exposed && isHttpOrigin(exposed) && !isLoopbackOrigin(exposed)) {
-    return exposed;
+  // recorded on disk. `sanitizePublicOrigin` applies the same non-loopback
+  // http(s) guard as the hub-server chokepoint (#531) so a stray loopback
+  // value never pins the degraded request-origin mode.
+  let raw: string | undefined;
+  try {
+    raw = readExpose();
+  } catch {
+    return undefined;
   }
-  return undefined;
+  return sanitizePublicOrigin(raw);
 }
 
 /**
@@ -191,20 +205,6 @@ function defaultReadExposeHubOrigin(): string | undefined {
     return readExposeState()?.hubOrigin;
   } catch {
     return undefined;
-  }
-}
-
-/**
- * True iff `origin` parses as an absolute http(s) URL. Defends the
- * expose-state fallback against a non-URL or wrong-scheme value sneaking in
- * as the issuer.
- */
-function isHttpOrigin(origin: string): boolean {
-  try {
-    const proto = new URL(origin).protocol;
-    return proto === "http:" || proto === "https:";
-  } catch {
-    return false;
   }
 }
 

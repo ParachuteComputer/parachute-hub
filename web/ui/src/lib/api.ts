@@ -886,7 +886,7 @@ export async function setModuleChannel(
  * Where the resolved hub issuer came from — drives the source label
  * on /admin/settings. Mirrors `IssuerSource` in src/hub-server.ts.
  */
-export type IssuerSource = "settings" | "env" | "request";
+export type IssuerSource = "settings" | "env" | "expose" | "request";
 
 /**
  * Response shape from `GET /api/settings/hub-origin` (hub#298). Carries

@@ -81,6 +81,29 @@ describe("Settings — initial render across source states", () => {
     expect(input.value).toBe("");
   });
 
+  it("renders source=expose with the exposed origin + expose attribution label", async () => {
+    // An exposed box with no stored row and no env var derives the issuer
+    // from expose-state.json (#531). The label must say it came from the
+    // expose config — NOT fall through to the "from request origin" default.
+    vi.mocked(api.getHubOriginSetting).mockResolvedValue({
+      hub_origin: null,
+      resolved_issuer: "https://parachute.taildf9ce2.ts.net",
+      source: "expose",
+    });
+    renderRoute();
+    await waitFor(() =>
+      expect(screen.getByTestId("hub-origin-source")).toHaveTextContent(
+        /from your parachute expose config/i,
+      ),
+    );
+    expect(screen.getByTestId("hub-origin-current")).toHaveTextContent(
+      "https://parachute.taildf9ce2.ts.net",
+    );
+    // Input is still empty — the stored row is empty even though expose wins.
+    const input = screen.getByLabelText(/canonical url/i) as HTMLInputElement;
+    expect(input.value).toBe("");
+  });
+
   it("renders source=settings + pre-fills the input from the stored value", async () => {
     vi.mocked(api.getHubOriginSetting).mockResolvedValue({
       hub_origin: "https://hub.example.com",

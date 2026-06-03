@@ -226,7 +226,7 @@ describe("resolveIssuerSource — attribution for SPA", () => {
 });
 
 /**
- * The expose-state tier (hub#532). On the reboot-persistent owner-operated
+ * The expose-state tier (#531). On the reboot-persistent owner-operated
  * path the launchd plist / systemd unit carries no PARACHUTE_HUB_ORIGIN, so
  * the hub boots with no `configuredIssuer`. Without this tier it would stamp
  * `iss` from the per-request origin (loopback) and exposed resource servers
@@ -235,7 +235,7 @@ describe("resolveIssuerSource — attribution for SPA", () => {
  * env tier and the request-origin fallback. The `readExpose` seam (4th /
  * 3rd param) drives this without touching the real ~/.parachute.
  */
-describe("resolveIssuer — expose-state tier (hub#532)", () => {
+describe("resolveIssuer — expose-state tier (#531)", () => {
   const EXPOSED = "https://parachute.taildf9ce2.ts.net";
   // Simulates the reported bug: token minted under loopback, request arrives
   // at loopback, but the canonical exposed origin lives in expose-state.
@@ -283,15 +283,17 @@ describe("resolveIssuer — expose-state tier (hub#532)", () => {
   });
 
   test("malformed expose-state falls through to request without throwing", () => {
-    // The injected reader throwing simulates a corrupt expose-state.json.
-    // resolveIssuer must NOT propagate it — fall through to request origin.
+    // A reader that throws simulates a corrupt expose-state.json. The
+    // `exposeIssuerOrigin` wrapper guards the `readExpose()` call itself in
+    // try/catch, so even an injected non-swallowing reader can NEVER
+    // propagate into the request path — resolveIssuer falls through to the
+    // request origin instead of 500ing the hub.
     const throwing = () => {
       throw new Error("malformed expose-state.json");
     };
-    expect(() => resolveIssuer(loopbackReq(), db, undefined, throwing)).toThrow();
-    // ...but the *default* reader swallows malformed-file throws. Verify the
-    // exposeIssuerOrigin wrapper used by default is malformed-safe by going
-    // through it directly: a reader that returns undefined (post-swallow)
+    expect(() => resolveIssuer(loopbackReq(), db, undefined, throwing)).not.toThrow();
+    expect(resolveIssuer(loopbackReq(), db, undefined, throwing)).toBe("http://127.0.0.1:1939");
+    // A reader that returns undefined (the default's post-swallow shape) also
     // yields the request origin.
     expect(resolveIssuer(loopbackReq(), db, undefined, () => undefined)).toBe(
       "http://127.0.0.1:1939",
@@ -326,7 +328,7 @@ describe("resolveIssuer — expose-state tier (hub#532)", () => {
   });
 });
 
-describe("resolveIssuerSource — expose attribution (hub#532)", () => {
+describe("resolveIssuerSource — expose attribution (#531)", () => {
   const EXPOSED = "https://parachute.taildf9ce2.ts.net";
 
   test('"expose" when resolved from expose-state (settings+env absent)', () => {

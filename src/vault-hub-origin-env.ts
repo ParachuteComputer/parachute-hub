@@ -59,6 +59,34 @@ export function isLoopbackOrigin(origin: string): boolean {
   }
 }
 
+/**
+ * Canonicalize a candidate public origin for use as the hub's OAuth issuer:
+ * strip trailing slashes, then accept it only when it parses as an absolute
+ * `http(s)` URL that is NOT loopback. Returns the canonical origin or
+ * undefined when it fails any check.
+ *
+ * Shared by the two expose-state issuer fallbacks (`resolveStartupIssuer` in
+ * commands/serve.ts and `exposeIssuerOrigin` in hub-server.ts) so the guard
+ * — never let a non-http(s) or loopback value pin the issuer — stays
+ * identical on both origin-resolution chokepoints (#531). The loopback
+ * rejection is defensive: expose-state.hubOrigin should always be the public
+ * origin, but a stray loopback value would re-pin the degraded
+ * request-origin mode the fix exists to escape.
+ */
+export function sanitizePublicOrigin(raw: string | undefined): string | undefined {
+  const trimmed = raw?.replace(/\/+$/, "");
+  if (!trimmed) return undefined;
+  let proto: string;
+  try {
+    proto = new URL(trimmed).protocol;
+  } catch {
+    return undefined;
+  }
+  if (proto !== "http:" && proto !== "https:") return undefined;
+  if (isLoopbackOrigin(trimmed)) return undefined;
+  return trimmed;
+}
+
 function vaultEnvPath(configDir: string): string {
   return join(configDir, "vault", ".env");
 }

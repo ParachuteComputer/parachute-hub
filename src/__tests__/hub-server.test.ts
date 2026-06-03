@@ -533,7 +533,7 @@ describe("hubFetch routing", () => {
       const res = await hubFetch(h.dir, {
         manifestPath: h.manifestPath,
         // No exposure recorded — isolate from the host's real expose-state.json
-        // so the request-origin fallback (not the hub#532 expose tier) is what
+        // so the request-origin fallback (not the #531 expose tier) is what
         // this test exercises.
         loadExposeHubOrigin: () => undefined,
       })(new Request("http://127.0.0.1:1939/.well-known/parachute.json"));

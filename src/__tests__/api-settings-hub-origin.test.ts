@@ -84,7 +84,7 @@ function putReq(body: unknown, headers: Record<string, string> = {}): Request {
 }
 
 // Stub "no exposure recorded" so resolveIssuer / resolveIssuerSource don't
-// pick up the host's real ~/.parachute/expose-state.json (the hub#532 expose
+// pick up the host's real ~/.parachute/expose-state.json (the #531 expose
 // tier would otherwise shadow the request-origin source these tests assert).
 const noExpose = (): string | undefined => undefined;
 

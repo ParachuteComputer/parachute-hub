@@ -220,7 +220,7 @@ import { getAllPublicKeys } from "./signing-keys.ts";
 import type { Supervisor } from "./supervisor.ts";
 import { handleTwoFactorGet, handleTwoFactorPost } from "./two-factor-handlers.ts";
 import { getUserById, userCount } from "./users.ts";
-import { isLoopbackOrigin } from "./vault-hub-origin-env.ts";
+import { sanitizePublicOrigin } from "./vault-hub-origin-env.ts";
 import {
   WELL_KNOWN_DIR,
   buildWellKnown,
@@ -798,7 +798,7 @@ export interface HubFetchDeps {
    *
    * This single seam now feeds BOTH (a) the same-origin bound set via
    * `buildHubBoundOrigins`, and (b) the issuer resolution via `resolveIssuer`
-   * (hub#532): on the reboot-persistent owner-operated path the launchd /
+   * (#531): on the reboot-persistent owner-operated path the launchd /
    * systemd unit carries no `PARACHUTE_HUB_ORIGIN`, so the hub boots with no
    * `configuredIssuer` and falls back to this exposed origin rather than
    * stamping `iss` from the per-request (loopback) origin — which exposed
@@ -1088,22 +1088,24 @@ function dbNotConfigured(): Response {
  * so without it the hub boots issuer-less and stamps `iss` from the
  * per-request origin, which exposed resource servers (vault) reject.
  *
- * Trailing slashes stripped for canonical form, mirroring resolveStartupIssuer.
+ * The `readExpose()` call is itself wrapped in try/catch so ANY reader —
+ * the default OR an injected one — that throws yields undefined rather than
+ * propagating into the request path. The default reader self-wraps too, but
+ * the seam must not depend on that: a future caller passing a non-swallowing
+ * reader still can't 500 the hub. Origin sanitization is delegated to the
+ * shared `sanitizePublicOrigin` helper (strips trailing slashes, validates
+ * http(s), rejects loopback), kept identical with resolveStartupIssuer (#531).
  */
 export function exposeIssuerOrigin(
   readExpose: () => string | undefined = defaultExposeHubOriginRead,
 ): string | undefined {
-  const raw = readExpose()?.replace(/\/+$/, "");
-  if (!raw) return undefined;
-  let proto: string;
+  let raw: string | undefined;
   try {
-    proto = new URL(raw).protocol;
+    raw = readExpose();
   } catch {
     return undefined;
   }
-  if (proto !== "http:" && proto !== "https:") return undefined;
-  if (isLoopbackOrigin(raw)) return undefined;
-  return raw;
+  return sanitizePublicOrigin(raw);
 }
 
 function defaultExposeHubOriginRead(): string | undefined {
@@ -1116,7 +1118,7 @@ function defaultExposeHubOriginRead(): string | undefined {
 
 /**
  * Resolve the OAuth issuer URL for this request. Precedence, highest
- * first (hub#298, expose tier added hub#532):
+ * first (hub#298, expose tier added #531):
  *
  *   1. `hub_settings.hub_origin` — operator-set canonical URL from the
  *      admin SPA. Wins when present.
