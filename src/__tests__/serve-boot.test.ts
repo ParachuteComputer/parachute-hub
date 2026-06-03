@@ -171,10 +171,7 @@ describe("bootSupervisedModules", () => {
     // injects + probes the wrong port and records a false `started_but_unbound`.
     writeManifest({ services: [VAULT_ENTRY] }, h.manifestPath);
     mkdirSync(join(h.dir, "vault"), { recursive: true });
-    writeFileSync(
-      join(h.dir, "vault", ".env"),
-      "PORT=1944\nSCRIBE_AUTH_TOKEN=secret-token\n",
-    );
+    writeFileSync(join(h.dir, "vault", ".env"), "PORT=1944\nSCRIBE_AUTH_TOKEN=secret-token\n");
 
     const recorder = makeRecorder();
     const sup = new Supervisor({ spawnFn: recorder.spawn });
@@ -199,6 +196,45 @@ describe("bootSupervisedModules", () => {
       extraEnv: { PORT: "9999" },
     });
     expect(req.env?.PORT).toBe("9999");
+  });
+
+  test("injects an enriched PATH carrying the inherited process PATH (hub launchd-PATH fix)", () => {
+    // The hub unit bakes a minimal PATH and Bun.spawn defaults to empty env, so
+    // without this injection the child can't find operator tools (scribe's
+    // parakeet-mlx / ffmpeg). The req must carry a PATH, and it must preserve
+    // whatever the hub process inherited.
+    const req = buildModuleSpawnRequest("vault", VAULT_ENTRY, ["parachute-vault", "serve"], {
+      configDir: h.dir,
+    });
+    expect(req.env?.PATH).toBeDefined();
+    expect(req.env?.PATH?.length).toBeGreaterThan(0);
+    // Every entry the hub inherited is still present (enrichment appends, never
+    // drops). process.env.PATH is always set in the test runner.
+    for (const entry of (process.env.PATH ?? "").split(":").filter((e) => e.length > 0)) {
+      expect(req.env?.PATH?.split(":")).toContain(entry);
+    }
+  });
+
+  test("a per-service .env PATH wins over the injected enrichment (operator intent)", () => {
+    mkdirSync(join(h.dir, "vault"), { recursive: true });
+    writeFileSync(join(h.dir, "vault", ".env"), "PATH=/operator/pinned/bin\n");
+    const req = buildModuleSpawnRequest("vault", VAULT_ENTRY, ["parachute-vault", "serve"], {
+      configDir: h.dir,
+    });
+    expect(req.env?.PATH).toBe("/operator/pinned/bin");
+  });
+
+  test("the API-start path (buildModuleSpawnRequest reuse) also carries the enriched PATH", () => {
+    // handleStart() in api-modules-ops.ts routes through buildModuleSpawnRequest,
+    // so the /api/modules/:short/start path inherits the same PATH fix. Assert
+    // the shared builder is the single source — extraEnv (the start handler's
+    // spawnEnv seam) does NOT clobber PATH unless it explicitly sets one.
+    const req = buildModuleSpawnRequest("vault", VAULT_ENTRY, ["parachute-vault", "serve"], {
+      configDir: h.dir,
+      extraEnv: { SOME_FLAG: "1" },
+    });
+    expect(req.env?.PATH).toBeDefined();
+    expect(req.env?.SOME_FLAG).toBe("1");
   });
 
   test("hubOrigin wins over a stale .env entry on collision", async () => {

@@ -53,6 +53,7 @@ import {
   systemdUnitPathForName,
 } from "./managed-unit.ts";
 import { type PortListeningFn, defaultPortListening } from "./port-probe.ts";
+import { enrichedUnitPath } from "./spawn-path.ts";
 
 /** Default canonical hub port (the 1939 pin). */
 export const HUB_UNIT_DEFAULT_PORT = 1939;
@@ -623,14 +624,8 @@ export function hubUnitMessages(): ManagedUnitMessages {
   };
 }
 
-/**
- * Sane default PATH for the hub unit when the caller doesn't supply one: bun's
- * global bin first (so supervised children resolve a bun-linked binary on cold
- * boot, R20), then the usual system dirs.
- */
-function defaultUnitPath(bunInstall: string): string {
-  return `${bunInstall}/bin:/usr/local/bin:/usr/bin:/bin`;
-}
+// The hub-unit PATH is built by `enrichedUnitPath` (src/spawn-path.ts) so this
+// init-bringup path and the `migrate --to-supervised` cutover path can't drift.
 
 /**
  * Build + install + start the hub unit, then wait for hub readiness (design
@@ -652,7 +647,7 @@ export async function installAndStartHubUnit(
   const deps = opts.deps ?? defaultHubUnitDeps;
   const port = opts.port ?? HUB_UNIT_DEFAULT_PORT;
   const bunInstall = opts.bunInstall ?? `${deps.homeDir()}/.bun`;
-  const path = opts.path ?? defaultUnitPath(bunInstall);
+  const path = opts.path ?? enrichedUnitPath(bunInstall, deps.homeDir(), deps.platform);
   const logPath = opts.logPath ?? `${opts.parachuteHome}/hub/logs/hub.log`;
   const log = opts.log ?? (() => {});
 

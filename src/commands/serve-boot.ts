@@ -27,6 +27,7 @@ import {
   shortNameForManifest,
 } from "../service-spec.ts";
 import { type ServiceEntry, readManifestLenient } from "../services-manifest.ts";
+import { enrichedPath } from "../spawn-path.ts";
 import type { Supervisor } from "../supervisor.ts";
 
 export interface BootOpts {
@@ -106,7 +107,23 @@ export function buildModuleSpawnRequest(
   // own resolvePort ladder already prefers services.json, so this keeps the
   // injected PORT + probe in agreement with what the child actually binds.
   const { PORT: _staleEnvPort, ...fileEnvSansPort } = fileEnv;
-  const env: Record<string, string> = { PORT: String(entry.port), ...fileEnvSansPort };
+  // PATH enrichment (hub launchd-PATH regression): the hub unit bakes a minimal
+  // PATH and `Bun.spawn` defaults to empty env, so without this the child only
+  // ever sees the unit's PATH — which omits `$HOME/.local/bin` (scribe's
+  // `parakeet-mlx`) + the Homebrew bin (`ffmpeg`), killing transcription on
+  // canonical installs. `enrichedPath` appends those dirs (when they exist) to
+  // the inherited PATH; inherited entries keep their order. A per-service `.env`
+  // PATH (operator intent) still wins via the spread below. See `spawn-path.ts`.
+  // The API-start path builds its own env — see `api-modules-ops.ts`
+  // `spawnSupervised`, which calls `enrichedPath()` too (keep the two in sync).
+  // `process.env.PATH` may ALREADY be enriched by serve startup (serve.ts);
+  // re-enriching here is a harmless no-op — `enrichedPath` is idempotent
+  // (dedupe + append-only), so double-enrichment can't duplicate or reorder.
+  const env: Record<string, string> = {
+    PATH: enrichedPath(),
+    PORT: String(entry.port),
+    ...fileEnvSansPort,
+  };
   if (opts.hubOrigin) env[HUB_ORIGIN_ENV] = opts.hubOrigin;
   if (opts.extraEnv) Object.assign(env, opts.extraEnv);
 

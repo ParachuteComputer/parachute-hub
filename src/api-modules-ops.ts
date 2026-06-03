@@ -52,6 +52,7 @@ import {
   synthesizeManifestForKnownModule,
 } from "./service-spec.ts";
 import { findService, readManifestLenient, removeService } from "./services-manifest.ts";
+import { enrichedPath } from "./spawn-path.ts";
 import type { ModuleState, SpawnRequest, Supervisor } from "./supervisor.ts";
 import { WELL_KNOWN_PATH, type regenerateWellKnown } from "./well-known.ts";
 
@@ -388,6 +389,11 @@ function defaultRun(cmd: readonly string[]): Promise<number> {
   // etc. set by the Dockerfile / Render env. Bun.spawn defaults to empty
   // env — without this, bun-add fails with cross-mount rename errors on
   // Render (where TMPDIR points at the persistent disk). See hub#349.
+  // PATH: intentionally the raw `process.env` (no per-call `enrichedPath()`).
+  // This is `bun add`, not a module spawn — it doesn't need the operator-tool
+  // dirs (parakeet-mlx / ffmpeg). It still benefits from the serve-startup PATH
+  // enrichment: `serve.ts` applies `enrichedPath()` to `process.env.PATH` at
+  // boot, so the PATH inherited here is already enriched under a managed hub.
   const proc = Bun.spawn([...cmd], {
     stdio: ["ignore", "inherit", "inherit"],
     env: process.env,
@@ -488,7 +494,18 @@ async function spawnSupervised(
   // operator has had a chance to write `configDir/<short>/.env`, so install
   // spawns with install-env only. The per-service `.env` is layered in by
   // `buildModuleSpawnRequest` (serve-boot.ts) on the next `boot` or `start`.
+  // PATH enrichment (hub launchd-PATH regression): mirror the serve-boot path's
+  // `buildModuleSpawnRequest` so a module STARTED from the admin SPA gets the
+  // same operator-tool dirs (`$HOME/.local/bin`, brew bin) as one booted from
+  // services.json — otherwise scribe started via /admin/modules can't find
+  // `parakeet-mlx` / `ffmpeg`. This is the SECOND, independently-built spawn
+  // env; keep it in sync with serve-boot.ts:buildModuleSpawnRequest. `spawnEnv`
+  // (test seam) still wins via the spread below. See `spawn-path.ts`.
+  // `process.env.PATH` may ALREADY be enriched by serve startup (serve.ts);
+  // re-enriching here is a harmless no-op — `enrichedPath` is idempotent
+  // (dedupe + append-only), so double-enrichment can't duplicate or reorder.
   const childEnv: Record<string, string> = {
+    PATH: enrichedPath(),
     PORT: String(entry.port),
     ...(deps.issuer ? { PARACHUTE_HUB_ORIGIN: deps.issuer } : {}),
     ...(deps.spawnEnv ?? {}),

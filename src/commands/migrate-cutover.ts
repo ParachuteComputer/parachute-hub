@@ -86,6 +86,7 @@ import { type PortListeningFn, defaultPortListening } from "../port-probe.ts";
 import { type AliveFn, clearPid, readPid } from "../process-state.ts";
 import { shortNameForManifest } from "../service-spec.ts";
 import { type ServiceEntry, readManifestLenient } from "../services-manifest.ts";
+import { enrichedUnitPath } from "../spawn-path.ts";
 import {
   type DisableStaleModuleUnitsOpts,
   type DisableStaleModuleUnitsResult,
@@ -232,14 +233,14 @@ export interface WriteUnitResult {
  * and `installManagedUnit(start:false)` — daemon-reload / write-the-plist but
  * NEVER enable --now / bootstrap. The §7.1 step-2 race-avoider.
  */
-function defaultUnitPath(bunInstall: string): string {
-  return `${bunInstall}/bin:/usr/local/bin:/usr/bin:/bin`;
-}
-
 export function defaultWriteUnitWithoutStarting(opts: WriteUnitOpts): WriteUnitResult {
   const { deps } = opts;
   const bunInstall = `${deps.homeDir()}/.bun`;
-  const path = defaultUnitPath(bunInstall);
+  // Shared with the init-bringup path (hub-unit.ts) so the two unit-generation
+  // sites can't drift — enriches the unit PATH with operator-tool dirs
+  // (`$HOME/.local/bin`, brew bin) so a migrated launchd/systemd hub can find
+  // scribe's `parakeet-mlx` + `ffmpeg`. See `spawn-path.ts`.
+  const path = enrichedUnitPath(bunInstall, deps.homeDir(), deps.platform);
   const logPath = `${opts.parachuteHome}/hub/logs/hub.log`;
   let unit: ManagedUnit;
   try {

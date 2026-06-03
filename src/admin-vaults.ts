@@ -59,6 +59,7 @@ import type { Database } from "bun:sqlite";
 import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { findService, type readManifest, readManifestLenient } from "./services-manifest.ts";
+import { enrichedPath } from "./spawn-path.ts";
 import { type WellKnownVaultEntry, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 /** Scope required to call POST /vaults. */
@@ -230,9 +231,13 @@ function buildEntry(
 async function defaultRunCommand(cmd: readonly string[]): Promise<RunResult> {
   // Inherit env so the child sees PATH, HOME, BUN_INSTALL, etc. Bun.spawn
   // defaults to empty env — see api-modules-ops.ts:defaultRun for the rationale.
+  // PATH enrichment (hub launchd-PATH regression): a launchd-managed hub bakes
+  // a minimal PATH, so this shell-out (vault ops) inherits that thin PATH too;
+  // enrich it with operator-tool dirs (`$HOME/.local/bin`, brew bin). See
+  // `spawn-path.ts`.
   const proc = Bun.spawn([...cmd], {
     stdio: ["ignore", "pipe", "pipe"],
-    env: process.env,
+    env: { ...process.env, PATH: enrichedPath() },
   });
   // Drain both pipes in parallel — leaving stderr unread can deadlock long
   // installs once the OS pipe buffer fills (#97). Captured stderr is folded
