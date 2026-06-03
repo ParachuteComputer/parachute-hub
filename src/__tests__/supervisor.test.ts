@@ -833,6 +833,76 @@ describe("Supervisor port-readiness + structured start-error (§6.5)", () => {
     proc.resolveExit(0);
   });
 
+  test("(b2) late bind AFTER the window → the background watch clears the started-but-unbound note", async () => {
+    // Heavy modules (vault — SQLite + git mirror + well-known init) routinely
+    // bind a moment after the readiness window. Pre-fix, the note recorded at
+    // window-elapse stuck for the module's whole lifetime and `parachute
+    // status` showed a perpetual "failed to start" on a healthy module.
+    const proc = makeFakeProc(103);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    let bound = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      portListening: async () => bound,
+      startReadyMs: 30,
+      startReadyPollMs: 5,
+      lateBindWatchMs: 2_000,
+      lateBindPollMs: 5,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+    // Window elapsed unbound → note recorded (status stays running)…
+    expect(state.startError?.error_type).toBe("started_but_unbound");
+
+    // …then the port binds late. The watch must clear the note.
+    bound = true;
+    let cleared = false;
+    const deadline = Date.now() + 1_500;
+    while (Date.now() < deadline) {
+      if (sup.list()[0]?.startError === undefined) {
+        cleared = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(cleared).toBe(true);
+    expect(sup.list()[0]?.status).toBe("running");
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("(b3) never binds → the watch gives up at its deadline and the note persists", async () => {
+    // A genuinely-unbound module must KEEP its diagnostic — the watch is a
+    // bounded grace window, not an eraser.
+    const proc = makeFakeProc(104);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      portListening: async () => false,
+      startReadyMs: 20,
+      startReadyPollMs: 5,
+      lateBindWatchMs: 40,
+      lateBindPollMs: 5,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+    expect(state.startError?.error_type).toBe("started_but_unbound");
+
+    // Let the 40ms watch budget expire; the note must remain.
+    await new Promise((r) => setTimeout(r, 120));
+    expect(sup.list()[0]?.startError?.error_type).toBe("started_but_unbound");
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
   test("(c) preflight MissingDependencyError → structured start-error, NO spawn", async () => {
     const spawner = makeQueueSpawner();
     // No proc enqueued — if start() tried to spawn, the queue spawner throws.

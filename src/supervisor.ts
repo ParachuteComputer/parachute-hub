@@ -197,6 +197,19 @@ export interface SupervisorOpts {
   /** Poll interval while waiting for the port to bind, in ms. Default 200. */
   readonly startReadyPollMs?: number;
   /**
+   * How long the background late-bind watch keeps re-probing AFTER the
+   * readiness window elapsed with the port unbound, in ms. Heavy modules
+   * (vault — SQLite + git mirror + well-known init) can legitimately take
+   * longer than `startReadyMs` to bind; without a re-probe the recorded
+   * `started_but_unbound` note sticks for the module's whole lifetime and
+   * `parachute status` shows a perpetual "failed to start" on a healthy
+   * module. The watch clears the note once the port binds. Default 60s;
+   * `0` disables the watch (the note then behaves as before).
+   */
+  readonly lateBindWatchMs?: number;
+  /** Poll interval for the late-bind watch, in ms. Default 1000. */
+  readonly lateBindPollMs?: number;
+  /**
    * PATH-resolution seam for the pre-spawn `ensureExecutable` preflight
    * (`@openparachute/depcheck`). Production uses the real `Bun.which`; a
    * missing startCmd binary then aborts the spawn with a structured
@@ -242,6 +255,8 @@ const DEFAULT_KILL_TIMEOUT_MS = 5_000;
 const DEFAULT_LOG_BUFFER_BYTES = 64 * 1024;
 const DEFAULT_START_READY_MS = 4_000;
 const DEFAULT_START_READY_POLL_MS = 200;
+const DEFAULT_LATE_BIND_WATCH_MS = 60_000;
+const DEFAULT_LATE_BIND_POLL_MS = 1_000;
 
 /**
  * Bounded, line-oriented ring buffer (§6.5). Holds the most-recent lines of a
@@ -318,6 +333,8 @@ export class Supervisor {
       startReadyMs:
         opts.startReadyMs ?? (isProductionPath || readinessOptedIn ? DEFAULT_START_READY_MS : 0),
       startReadyPollMs: opts.startReadyPollMs ?? DEFAULT_START_READY_POLL_MS,
+      lateBindWatchMs: opts.lateBindWatchMs ?? DEFAULT_LATE_BIND_WATCH_MS,
+      lateBindPollMs: opts.lateBindPollMs ?? DEFAULT_LATE_BIND_POLL_MS,
       which: opts.which ?? (isProductionPath ? Bun.which : () => "/stub/bin/preflight-skipped"),
     };
   }
@@ -453,6 +470,36 @@ export class Supervisor {
           at: new Date(this.opts.now()).toISOString(),
         },
       };
+      // Keep watching in the background: heavy modules (vault) routinely bind
+      // a moment after the window. Without the re-probe the note above would
+      // stick for the module's whole lifetime — `parachute status` then shows
+      // a perpetual "failed to start" on a healthy module. Fire-and-forget so
+      // `start()`'s latency stays bounded by `startReadyMs`.
+      if (this.opts.lateBindWatchMs > 0) {
+        void this.lateBindWatch(entry, port).catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * Background re-probe after `awaitPortReadiness` recorded a
+   * `started_but_unbound` note: poll (slower cadence, bounded window) and
+   * clear the note once the port binds. Exits early when the module stops,
+   * crashes, or the note is replaced by a different startError (a later
+   * crash-restart's missing-dependency note must not be wiped).
+   */
+  private async lateBindWatch(entry: ModuleEntry, port: number): Promise<void> {
+    const deadline = this.opts.now() + this.opts.lateBindWatchMs;
+    while (this.opts.now() < deadline) {
+      await this.opts.sleep(this.opts.lateBindPollMs);
+      if (entry.stopRequested || entry.state.status !== "running") return;
+      // Only OUR note is clearable — anything else was recorded after us.
+      if (entry.state.startError?.error_type !== "started_but_unbound") return;
+      if (await this.opts.portListening(port)) {
+        const { startError: _drop, ...rest } = entry.state;
+        entry.state = rest;
+        return;
+      }
     }
   }
 
