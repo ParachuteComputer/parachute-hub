@@ -4,6 +4,34 @@ All notable changes to `@openparachute/scope-guard` are documented here. The for
 
 The library's RC cadence is independent of `@openparachute/hub`'s — they ship from the same repo but aren't coupled in version.
 
+## Unreleased
+
+JWKS force-reload-and-retry on rotation-class verification failures (hub#543). Closes the latent gap where `validateHubJwt` could hard-401 until `cacheMaxAge` expiry or a process restart after certain key rotations.
+
+### Why
+
+jose's `createRemoteJWKSet` only self-heals ONE rotation case: an **unknown kid** (a key it's never seen) triggers a reactive re-fetch inside the getter, rate-limited by `cooldownDuration`. It does NOT recover from:
+
+- **same-kid rotation** — the kid is unchanged but the key bytes rotated → `JWSSignatureVerificationFailed`, thrown OUTSIDE the getter, so jose never re-enters the JWKS path;
+- **no-kid tokens against a multi-key set** → `JWKSMultipleMatchingKeys`;
+- **staleness inside the `cacheMaxAge` window** where the old kid vanished.
+
+Those produced hard 401s until `cacheMaxAge` (default 5 min) expired or the resource server restarted. Latent in practice (the hub's kid is content-addressed — `SHA-256(public_key_pem)` → unique per key — and the JWKS carries a 24h old+new overlap, so a *normal* rotation is recoverable via the unknown-kid path), but real for manual key swaps that reuse a kid, DB-snapshot restores, and rotation drills.
+
+### Changed
+
+- **`validateHubJwt` force-reloads the JWKS and retries exactly once** on a verification failure classified as `signature` / `kid` / `jwks` (the rotation-recoverable classes). `expired` / `issuer` are token-level facts a fresh key set can never fix, so they never trigger a reload. The retry's outcome — success or error — is final and flows through the existing classify-and-wrap. The reload uses jose's `.reload()` escape hatch (present on the `createRemoteJWKSet` return), which bypasses `cooldownDuration`; a failed reload (endpoint down) is swallowed and the original error surfaces unchanged.
+- **Comment corrections** in `jwks.ts` and `validate.ts` that previously claimed rotation "is handled inside jose by re-fetching after `cacheMaxAge`" — true only for the unknown-kid case, and `cacheMaxAge` is the periodic refresh ceiling, not a reaction to a verification failure.
+
+### Added
+
+- **`CreateScopeGuardOptions.jwksReloadMinIntervalMs?: number`** (default 10s) — throttle between *forced* reloads. Because `.reload()` bypasses jose's cooldown, an unthrottled retry would let a flood of genuinely-bad-signature tokens drive a refetch storm against the hub. Within the window the forced reload is skipped and the original failure surfaces as before.
+- **`CreateScopeGuardOptions.jwksReloadNow?: () => number`** — injectable clock for the throttle (mirrors `revocationNow`); tests drive the window deterministically.
+
+### Compatibility
+
+- **Additive at the construction site** — both new options are optional; no behavior change for existing callers beyond the recovery itself, which only fires on a path that previously hard-failed. An injected `jwksGetter` without a `.reload` method (a bare function) degrades gracefully: no forced reload, behavior identical to before.
+
 ## 0.4.0-rc.2 — 2026-05-28
 
 Surfaces the raw `permissions` claim on `HubJwtClaims` (additive) so resource servers (e.g. vault reading `permissions.scoped_tags` for tag-scoping) can read it without re-decoding the token. scope-guard passes the object through verbatim — a non-null plain object surfaces; absent / null / non-object (string, number, array) leaves `permissions` `undefined`, distinct from an empty `{}`. Auth-unification arc C0.

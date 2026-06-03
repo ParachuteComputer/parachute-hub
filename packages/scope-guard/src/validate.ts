@@ -1,5 +1,11 @@
 import { type JWTPayload, jwtVerify } from "jose";
-import { type JwksGetter, type JwksOptions, getOrCreateJwksGetter, resetCache } from "./jwks.js";
+import {
+  type JwksGetter,
+  type JwksOptions,
+  forceReloadJwks,
+  getOrCreateJwksGetter,
+  resetCache,
+} from "./jwks.js";
 import { parseScopes } from "./parse.js";
 import {
   type RevocationCache,
@@ -23,6 +29,15 @@ import {
  * enforced one layer up by the consumer — this function stays focused on
  * JWT-level concerns and is generic across all Parachute resource servers.
  */
+
+/**
+ * Default min-interval between *forced* JWKS reloads on rotation-class
+ * verification failures. 10s — long enough that a flood of bad-signature
+ * tokens can't drive a refetch storm against the hub, short enough that a
+ * genuine same-kid rotation / DB restore recovers near-immediately rather
+ * than waiting out the 5-min `cacheMaxAge`.
+ */
+const DEFAULT_JWKS_RELOAD_MIN_INTERVAL_MS = 10_000;
 
 /** Surface of claims returned to callers. Everything else is dropped. */
 export interface HubJwtClaims {
@@ -157,6 +172,31 @@ export interface CreateScopeGuardOptions {
   jwks?: JwksOptions;
 
   /**
+   * Minimum interval (ms) between *forced* JWKS reloads on rotation-class
+   * verification failures. Defaults to 10s.
+   *
+   * On a verification failure classified as `signature` / `kid` / `jwks`
+   * (the rotation-recoverable classes), `validateHubJwt` force-reloads the
+   * JWKS once and retries — this recovers from same-kid rotation,
+   * no-kid-multi-key, and within-`cacheMaxAge` staleness, which jose's own
+   * reactive reload can't reach. Because the forced reload bypasses jose's
+   * `cooldownDuration`, an unthrottled retry would let a flood of
+   * genuinely-bad-signature tokens drive a refetch storm against the hub.
+   * This min-interval gates the forced reload per guard: within the window,
+   * the retry is skipped and the original failure is surfaced as-is (the same
+   * behavior as before this hardening landed). Tests use a small value plus
+   * `jwksReloadNow` to exercise the window deterministically.
+   */
+  jwksReloadMinIntervalMs?: number;
+
+  /**
+   * Test seam for time used by the forced-reload throttle. Defaults to
+   * `Date.now`. Mirrors `revocationNow` — override to drive the throttle
+   * window deterministically without sleeping.
+   */
+  jwksReloadNow?: () => number;
+
+  /**
    * Inject a JWKS getter directly. When provided, the lib uses it verbatim
    * and does NOT consult the cache or `jwks` options. Tests use this to
    * point at a fake JWKS endpoint without needing to register the origin
@@ -211,8 +251,12 @@ export interface ScopeGuard {
   /**
    * Drop the cached JWKS getter for this guard's origin. Tests use this to
    * switch fake JWKS endpoints between cases; production callers shouldn't
-   * need it (origin is process-stable, key rotation is handled inside the
-   * jose getter by re-fetching after `cacheMaxAge`).
+   * need it. Key rotation is handled at validate time: jose's getter reacts
+   * to an *unknown kid* on its own (rate-limited by `cooldownDuration`), and
+   * `validateHubJwt` covers the remaining cases (same-kid rotation,
+   * no-kid-multi-key, within-`cacheMaxAge` staleness) by force-reloading the
+   * JWKS and retrying once on a rotation-class failure. `cacheMaxAge` is only
+   * the periodic refresh ceiling, not a reaction to verification failures.
    */
   resetJwksCache(): void;
 
@@ -243,6 +287,15 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
     missingJtiLogger,
   } = opts;
 
+  const reloadMinIntervalMs = opts.jwksReloadMinIntervalMs ?? DEFAULT_JWKS_RELOAD_MIN_INTERVAL_MS;
+  const reloadNow = opts.jwksReloadNow ?? (() => Date.now());
+  // Timestamp of the last *forced* JWKS reload for this guard. Drives the
+  // throttle: a forced reload is only issued when at least
+  // `reloadMinIntervalMs` has elapsed since the previous one. Persists across
+  // requests (the guard is one-per-process), so a flood of bad-signature
+  // tokens can drive at most one refetch per window.
+  let lastForcedReloadAt: number | undefined;
+
   function pickGetter(origin: string): JwksGetter {
     if (injected) return injected;
     return getOrCreateJwksGetter(origin, jwksOpts);
@@ -266,20 +319,84 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
     return cache;
   }
 
+  /** Wrap a jose error in our taxonomy. `never`-typed so callers can use it
+   * as the throwing tail of a try/catch without TS losing definite-assignment
+   * narrowing on the value they were trying to compute. */
+  function throwWrapped(err: unknown): never {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new HubJwtError(classifyJoseError(err), `hub JWT verification failed: ${msg}`);
+  }
+
+  /**
+   * Throttle gate for forced reloads. Returns true (and records the time)
+   * only when at least `reloadMinIntervalMs` has elapsed since the previous
+   * forced reload. A non-positive interval disables throttling (always allow)
+   * — convenient for tests that want every failure to trigger a reload.
+   */
+  function shouldForceReload(): boolean {
+    const t = reloadNow();
+    if (
+      reloadMinIntervalMs > 0 &&
+      lastForcedReloadAt !== undefined &&
+      t - lastForcedReloadAt < reloadMinIntervalMs
+    ) {
+      return false;
+    }
+    lastForcedReloadAt = t;
+    return true;
+  }
+
+  /**
+   * Verify the JWT signature + issuer, with a force-reload-and-retry-once on
+   * rotation-class failures. Returns the verified payload or throws a wrapped
+   * `HubJwtError`. See the inline comment for the recovery rationale.
+   */
+  async function verifyWithRotationRetry(
+    token: string,
+    origin: string,
+    getter: JwksGetter,
+  ): Promise<JWTPayload> {
+    try {
+      const verified = await jwtVerify(token, getter, { issuer: origin });
+      return verified.payload;
+    } catch (err) {
+      const code = classifyJoseError(err);
+
+      // Rotation-class recovery: a `signature` / `kid` / `jwks` failure can
+      // mean our cached JWKS is stale relative to the hub's current signing
+      // key (same-kid rotation, no-kid-multi-key, or within-`cacheMaxAge`
+      // staleness — cases jose's reactive reload can't reach). Force a
+      // re-fetch and retry exactly once. `expired` / `issuer` are token-level
+      // facts a fresh JWKS can never fix, so they never trigger a reload. The
+      // throttle bounds forced reloads to one per `reloadMinIntervalMs` so a
+      // flood of genuinely-bad-signature tokens can't drive a refetch storm;
+      // within the window (or with an injected getter that has no `.reload`)
+      // we surface the original failure unchanged.
+      if (code === "signature" || code === "kid" || code === "jwks") {
+        if (shouldForceReload()) {
+          const reloaded = await forceReloadJwks(getter);
+          if (reloaded) {
+            // The retry's outcome — success OR error — is final and flows
+            // through the same classify-and-wrap. No second reload.
+            try {
+              const verified = await jwtVerify(token, getter, { issuer: origin });
+              return verified.payload;
+            } catch (retryErr) {
+              throwWrapped(retryErr);
+            }
+          }
+        }
+      }
+      throwWrapped(err);
+    }
+  }
+
   return {
     async validateHubJwt(token, validateOpts = {}) {
       const origin = resolveOrigin(hubOrigin);
       const getter = pickGetter(origin);
 
-      let payload: JWTPayload;
-      try {
-        const verified = await jwtVerify(token, getter, { issuer: origin });
-        payload = verified.payload;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        const code = classifyJoseError(err);
-        throw new HubJwtError(code, `hub JWT verification failed: ${msg}`);
-      }
+      const payload: JWTPayload = await verifyWithRotationRetry(token, origin, getter);
 
       if (typeof payload.sub !== "string" || payload.sub.length === 0) {
         throw new HubJwtError("shape", "hub JWT missing required `sub` claim");

@@ -41,6 +41,10 @@ interface JwksFixture {
   setUnreachable: (down: boolean) => void;
   setRevokedJtis: (jtis: string[]) => void;
   setRevocationUnreachable: (down: boolean) => void;
+  /** Count of `/.well-known/jwks.json` GETs served — observes forced reloads. */
+  jwksFetchCount: () => number;
+  /** Reset the JWKS fetch counter to zero (call before a case's assertions). */
+  resetJwksFetchCount: () => void;
 }
 
 function startJwksFixture(): JwksFixture {
@@ -48,11 +52,13 @@ function startJwksFixture(): JwksFixture {
   let down = false;
   let revokedJtis: string[] = [];
   let revocationDown = false;
+  let jwksFetches = 0;
   const server = Bun.serve({
     port: 0,
     fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === "/.well-known/jwks.json") {
+        jwksFetches += 1;
         if (down) return new Response("upstream down", { status: 503 });
         return Response.json({ keys: keys.map((k) => k.publicJwk) });
       }
@@ -77,6 +83,10 @@ function startJwksFixture(): JwksFixture {
     },
     setRevocationUnreachable: (v) => {
       revocationDown = v;
+    },
+    jwksFetchCount: () => jwksFetches,
+    resetJwksFetchCount: () => {
+      jwksFetches = 0;
     },
   };
 }
@@ -150,6 +160,25 @@ async function signJwt(kp: Keypair, opts: SignOpts): Promise<string> {
     .setExpirationTime(exp)
     .setJti(opts.jti ?? "jti-1");
   return await builder.sign(kp.privateKey);
+}
+
+/** Assert a promise rejects with a HubJwtError of `code` (module-scoped so
+ * the rotation-retry describe block can reuse it). */
+async function expectError(
+  promise: Promise<unknown>,
+  code: HubJwtError["code"],
+  msgPattern?: RegExp,
+): Promise<HubJwtError> {
+  let caught: HubJwtError | undefined;
+  try {
+    await promise;
+  } catch (e) {
+    caught = e as HubJwtError;
+  }
+  expect(caught).toBeInstanceOf(HubJwtError);
+  expect(caught?.code).toBe(code);
+  if (msgPattern) expect(caught?.message).toMatch(msgPattern);
+  return caught!;
 }
 
 let fixture: JwksFixture;
@@ -287,22 +316,8 @@ describe("createScopeGuard — audience strict-check", () => {
 });
 
 describe("createScopeGuard — failure modes (HubJwtError.code)", () => {
-  async function expectError(
-    promise: Promise<unknown>,
-    code: HubJwtError["code"],
-    msgPattern?: RegExp,
-  ): Promise<HubJwtError> {
-    let caught: HubJwtError | undefined;
-    try {
-      await promise;
-    } catch (e) {
-      caught = e as HubJwtError;
-    }
-    expect(caught).toBeInstanceOf(HubJwtError);
-    expect(caught?.code).toBe(code);
-    if (msgPattern) expect(caught?.message).toMatch(msgPattern);
-    return caught!;
-  }
+  // `expectError` is module-scoped (defined near the top helpers) so the
+  // rotation-retry block can share it.
 
   test("wrong issuer → code: issuer", async () => {
     const guard = makeGuard();
@@ -320,6 +335,13 @@ describe("createScopeGuard — failure modes (HubJwtError.code)", () => {
   });
 
   test("bad signature (token signed by an unpublished key) → code: signature", async () => {
+    // Genuinely-invalid token: signed by a key never in the JWKS. Under the
+    // rotation-retry hardening this now force-reloads the JWKS once and
+    // retries — but the fixture still serves only the published key, so the
+    // retry fails the same way and we surface `signature`. The dedicated
+    // throttle + recovery tests below pin the reload behavior; this case
+    // pins that an unrecoverable token still fails (no infinite loop, code
+    // unchanged) after the single retry.
     const guard = makeGuard();
     const otherKp = await makeKeypair("k1"); // same kid, different key
     const token = await signJwt(otherKp, { iss: fixture.origin });
@@ -403,6 +425,204 @@ describe("createScopeGuard — injected JWKS getter", () => {
     });
     // Should not throw; should not affect the injected getter's state.
     expect(() => guard.resetJwksCache()).not.toThrow();
+  });
+});
+
+describe("createScopeGuard — JWKS force-reload-and-retry on rotation (hub#543)", () => {
+  // The gap these tests pin: jose's `createRemoteJWKSet` only self-heals an
+  // *unknown kid* (reactive reload inside the getter, rate-limited by
+  // `cooldownDuration`). It does NOT recover a *same-kid* rotation (key bytes
+  // change under an unchanged kid → JWSSignatureVerificationFailed, thrown
+  // OUTSIDE the getter), a no-kid token against a multi-key set
+  // (JWKSMultipleMatchingKeys), or staleness inside `cacheMaxAge`. Those would
+  // produce hard 401s until cacheMaxAge expiry or a restart. validateHubJwt
+  // now force-reloads the JWKS and retries once on a rotation-class failure
+  // (signature/kid/jwks), throttled so a flood of bad tokens can't storm the
+  // hub. Observability seam: the fixture counts `/.well-known/jwks.json` GETs.
+
+  test("same-kid rotation recovers: reload fires, retry succeeds", async () => {
+    // The terminal-today case. Fixture serves key A under kid K; we then sign
+    // a token with key B under the SAME kid K and flip the fixture to B. The
+    // first verify fails `signature` (cached key A can't verify a B-signed
+    // token) → forced reload picks up B → retry succeeds.
+    const keyA = await makeKeypair("rotk");
+    const keyB = await makeKeypair("rotk"); // same kid, different bytes
+    fixture.setKeys([keyA]);
+
+    const guard = makeGuard();
+    guard.resetJwksCache(); // cold getter
+    // Warm the getter on key A so the stale-cache scenario is real (the
+    // signature failure must come from a *cached* key, not a cold fetch that
+    // would already see B).
+    const warmToken = await signJwt(keyA, { iss: fixture.origin, jti: "warm" });
+    expect((await guard.validateHubJwt(warmToken)).jti).toBe("warm");
+
+    // Rotate: same kid, key B is now authoritative on the wire.
+    fixture.setKeys([keyB]);
+    fixture.resetJwksFetchCount();
+
+    const rotatedToken = await signJwt(keyB, { iss: fixture.origin, jti: "rotated" });
+    const claims = await guard.validateHubJwt(rotatedToken);
+    expect(claims.jti).toBe("rotated");
+    // Exactly one forced reload fetched the new key set.
+    expect(fixture.jwksFetchCount()).toBe(1);
+
+    fixture.setKeys([kp]);
+    guard.resetJwksCache();
+  });
+
+  test("new-kid path still works (jose's own reload — no regression)", async () => {
+    // jose reactively reloads on an unknown kid all on its own. Adding our
+    // retry layer must not break that path. Fixture has only key A (kid kA);
+    // sign with key B under a NEW kid kB and publish B. jose's getter sees an
+    // unknown kid, reloads internally, finds kB, verifies.
+    const keyA = await makeKeypair("kA");
+    const keyB = await makeKeypair("kB");
+    fixture.setKeys([keyA]);
+
+    const guard = makeGuard();
+    guard.resetJwksCache();
+    const warmToken = await signJwt(keyA, { iss: fixture.origin, jti: "warmkid" });
+    expect((await guard.validateHubJwt(warmToken)).jti).toBe("warmkid");
+
+    fixture.setKeys([keyA, keyB]); // 24h-overlap shape: both keys live
+    const newKidToken = await signJwt(keyB, { iss: fixture.origin, jti: "newkid" });
+    const claims = await guard.validateHubJwt(newKidToken);
+    expect(claims.jti).toBe("newkid");
+
+    fixture.setKeys([kp]);
+    guard.resetJwksCache();
+  });
+
+  test("throttle: two bad-signature tokens in quick succession → exactly ONE reload", async () => {
+    // The refetch-storm guard. Two genuinely-bad tokens arrive back-to-back
+    // within the throttle window; only the first is allowed to force a reload.
+    // An injected clock holds time fixed inside the window.
+    //
+    // Crucially these are SAME-KID signature failures (wrong key bytes under
+    // the published kid), NOT unknown-kid: jose only reactively reloads on an
+    // unknown kid, so with same-kid every `/.well-known/jwks.json` fetch in
+    // the count is unambiguously OUR forced reload — no jose-cooldown
+    // confound.
+    let clock = 1_000_000;
+    const evil = await makeKeypair("k1"); // same published kid, wrong bytes
+    fixture.setKeys([kp]); // only the good key is on the wire
+
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      jwksReloadMinIntervalMs: 10_000,
+      jwksReloadNow: () => clock,
+    });
+    guard.resetJwksCache();
+    // Warm the getter so the bad tokens hit a populated cache and the
+    // signature failure is genuinely "cached key can't verify," not a cold
+    // fetch.
+    const warm = await signJwt(kp, { iss: fixture.origin, jti: "warm-throttle" });
+    expect((await guard.validateHubJwt(warm)).jti).toBe("warm-throttle");
+    fixture.resetJwksFetchCount();
+
+    const bad1 = await signJwt(evil, { iss: fixture.origin, jti: "b1" });
+    const bad2 = await signJwt(evil, { iss: fixture.origin, jti: "b2" });
+
+    // First bad token: signature fails → forced reload (1 fetch).
+    await expectError(guard.validateHubJwt(bad1), "signature");
+    expect(fixture.jwksFetchCount()).toBe(1);
+    // Second bad token, same window: throttle skips the forced reload → still 1.
+    await expectError(guard.validateHubJwt(bad2), "signature");
+    expect(fixture.jwksFetchCount()).toBe(1);
+
+    // After the window elapses, a forced reload is allowed again (→ 2 total).
+    clock += 10_001;
+    await expectError(guard.validateHubJwt(bad1), "signature");
+    expect(fixture.jwksFetchCount()).toBe(2);
+
+    fixture.setKeys([kp]);
+    guard.resetJwksCache();
+  });
+
+  test("genuinely-invalid token still fails after the one retry (no infinite loop)", async () => {
+    // A token signed by a key that's never in the JWKS: reload fetches the
+    // (unchanged) key set, retry fails the same way, classify unchanged. One
+    // retry only — no loop.
+    const evil = await makeKeypair("k1"); // same published kid, wrong bytes
+    fixture.setKeys([kp]);
+    const guard = makeGuard();
+    guard.resetJwksCache();
+    const warm = await signJwt(kp, { iss: fixture.origin, jti: "warm-evil" });
+    await guard.validateHubJwt(warm);
+    fixture.resetJwksFetchCount();
+
+    const token = await signJwt(evil, { iss: fixture.origin, jti: "evil" });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(token);
+    } catch (e) {
+      caught = e as HubJwtError;
+    }
+    expect(caught).toBeInstanceOf(HubJwtError);
+    expect(caught?.code).toBe("signature");
+    // Exactly one forced reload (the retry), not a storm.
+    expect(fixture.jwksFetchCount()).toBe(1);
+    guard.resetJwksCache();
+  });
+
+  test("expired token does NOT trigger a reload", async () => {
+    const guard = makeGuard();
+    guard.resetJwksCache();
+    const warm = await signJwt(kp, { iss: fixture.origin, jti: "warm-exp" });
+    await guard.validateHubJwt(warm);
+    fixture.resetJwksFetchCount();
+
+    const past = Math.floor(Date.now() / 1000) - 10;
+    const token = await signJwt(kp, { iss: fixture.origin, expiresAtSeconds: past });
+    await expectError(guard.validateHubJwt(token), "expired");
+    // Expiry is a token-level fact a fresh JWKS can't fix → no forced reload.
+    expect(fixture.jwksFetchCount()).toBe(0);
+    guard.resetJwksCache();
+  });
+
+  test("wrong-issuer token does NOT trigger a reload", async () => {
+    const guard = makeGuard();
+    guard.resetJwksCache();
+    const warm = await signJwt(kp, { iss: fixture.origin, jti: "warm-iss" });
+    await guard.validateHubJwt(warm);
+    fixture.resetJwksFetchCount();
+
+    const token = await signJwt(kp, { iss: "http://attacker.example", jti: "wrong-iss" });
+    await expectError(guard.validateHubJwt(token), "issuer");
+    expect(fixture.jwksFetchCount()).toBe(0);
+    guard.resetJwksCache();
+  });
+
+  test("injected bare-function getter (no .reload): no crash, behaves as today", async () => {
+    // The test-injected getter seam may be a bare function with no `.reload`.
+    // forceReloadJwks returns false → no retry, original error surfaces. A
+    // same-kid-rotated token is therefore terminal (the pre-hardening
+    // behavior), proving the retry is genuinely gated on a reload seam.
+    const keyA = await makeKeypair("bk");
+    const keyB = await makeKeypair("bk"); // same kid, different bytes
+
+    // A bare-function getter that only ever resolves key A — no `.reload`.
+    const { importJWK } = await import("jose");
+    const cryptoKeyA = await importJWK(
+      { kty: "RSA", n: keyA.publicJwk.n, e: keyA.publicJwk.e, alg: "RS256" },
+      "RS256",
+    );
+    const bareGetter = (async () => cryptoKeyA) as unknown as import("../jwks").JwksGetter;
+    expect("reload" in bareGetter).toBe(false);
+
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      jwksGetter: bareGetter,
+    });
+    // Key-A-signed token verifies fine through the bare getter.
+    const good = await signJwt(keyA, { iss: fixture.origin, jti: "bare-good" });
+    expect((await guard.validateHubJwt(good)).jti).toBe("bare-good");
+
+    // Key-B-signed token under the same kid: the bare getter still hands back
+    // key A, verify fails, no `.reload` to call → terminal `signature`.
+    const rotated = await signJwt(keyB, { iss: fixture.origin, jti: "bare-rot" });
+    await expectError(guard.validateHubJwt(rotated), "signature");
   });
 });
 
