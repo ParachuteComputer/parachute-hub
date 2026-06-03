@@ -36,6 +36,7 @@ import { readExposeState } from "../expose-state.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
 import { writeHubFile } from "../hub.ts";
+import { enrichedPath } from "../spawn-path.ts";
 import { Supervisor } from "../supervisor.ts";
 import { createUser, userCount } from "../users.ts";
 import { sanitizePublicOrigin } from "../vault-hub-origin-env.ts";
@@ -315,6 +316,16 @@ export async function serve(opts: ServeOpts = {}): Promise<{
 }> {
   const env = opts.env ?? process.env;
   const log = opts.log ?? ((line) => console.log(line));
+
+  // PATH enrichment (hub launchd-PATH regression): the launchd/systemd hub unit
+  // bakes a minimal PATH. Enrich the hub's OWN process PATH so its `Bun.which`
+  // probes (cloudflared / tailscale detection, etc.) see operator-tool dirs
+  // (`$HOME/.local/bin`, brew bin) too — and so any child that inherits raw
+  // `process.env` (not the explicit per-child env) starts from the enriched
+  // PATH. The per-child spawn env is enriched independently in
+  // `buildModuleSpawnRequest` / `spawnSupervised`. See `spawn-path.ts`. Only
+  // mutate the live process env, never a test-injected `opts.env`.
+  if (!opts.env) process.env.PATH = enrichedPath(process.env);
 
   const envPort = parsePort(env.PORT);
   const port = opts.port ?? envPort ?? DEFAULT_PORT;

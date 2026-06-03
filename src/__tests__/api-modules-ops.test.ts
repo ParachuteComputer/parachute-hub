@@ -323,6 +323,13 @@ describe("POST /api/modules/:short/install", () => {
     expect(manifest.services.some((s) => s.name === "parachute-vault")).toBe(true);
     // Supervisor was handed the spawn.
     expect(spawns.find((s) => s.short === "vault")?.cmd).toEqual(["parachute-vault", "serve"]);
+    // The install-time spawn path (spawnSupervised) injects the enriched PATH
+    // so a module installed via /admin/modules can find operator tools (scribe's
+    // parakeet-mlx / ffmpeg) — same fix as the serve-boot path, second spawn
+    // site (hub launchd-PATH regression). It must carry the inherited PATH.
+    const vaultEnv = spawns.find((s) => s.short === "vault")?.env;
+    expect(vaultEnv?.PATH).toBeDefined();
+    expect(vaultEnv?.PATH?.length).toBeGreaterThan(0);
   });
 
   test("idempotent: already-installed + running returns succeeded immediately", async () => {

@@ -260,6 +260,10 @@ describe("installAndStartHubUnit — init bringup (§3.3 / §4.2)", () => {
     expect(written).toBeDefined();
     expect(written).toContain("Environment=PARACHUTE_HOME=/home/op/.parachute");
     expect(written).toContain("src/cli.ts serve");
+    // The default unit PATH is enriched with operator-tool dirs so the managed
+    // hub + its supervised children can find scribe's parakeet-mlx / ffmpeg
+    // (hub launchd-PATH regression). $HOME/.local/bin is the Linux operator dir.
+    expect(written).toContain("/home/op/.bun/bin:/usr/local/bin:/usr/bin:/bin:/home/op/.local/bin");
     // enable --now drove the start.
     expect(f.calls).toContainEqual([
       "systemctl",

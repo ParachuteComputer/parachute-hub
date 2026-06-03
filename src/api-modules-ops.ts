@@ -52,6 +52,7 @@ import {
   synthesizeManifestForKnownModule,
 } from "./service-spec.ts";
 import { findService, readManifestLenient, removeService } from "./services-manifest.ts";
+import { enrichedPath } from "./spawn-path.ts";
 import type { ModuleState, SpawnRequest, Supervisor } from "./supervisor.ts";
 import { WELL_KNOWN_PATH, type regenerateWellKnown } from "./well-known.ts";
 
@@ -488,7 +489,15 @@ async function spawnSupervised(
   // operator has had a chance to write `configDir/<short>/.env`, so install
   // spawns with install-env only. The per-service `.env` is layered in by
   // `buildModuleSpawnRequest` (serve-boot.ts) on the next `boot` or `start`.
+  // PATH enrichment (hub launchd-PATH regression): mirror the serve-boot path's
+  // `buildModuleSpawnRequest` so a module STARTED from the admin SPA gets the
+  // same operator-tool dirs (`$HOME/.local/bin`, brew bin) as one booted from
+  // services.json — otherwise scribe started via /admin/modules can't find
+  // `parakeet-mlx` / `ffmpeg`. This is the SECOND, independently-built spawn
+  // env; keep it in sync with serve-boot.ts:buildModuleSpawnRequest. `spawnEnv`
+  // (test seam) still wins via the spread below. See `spawn-path.ts`.
   const childEnv: Record<string, string> = {
+    PATH: enrichedPath(),
     PORT: String(entry.port),
     ...(deps.issuer ? { PARACHUTE_HUB_ORIGIN: deps.issuer } : {}),
     ...(deps.spawnEnv ?? {}),
