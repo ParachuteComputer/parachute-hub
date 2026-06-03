@@ -821,8 +821,27 @@ export async function handleStart(
     ...(deps.spawnEnv ? { extraEnv: deps.spawnEnv } : {}),
   });
 
-  const state = await deps.supervisor.start(spawnReq);
+  let state: Awaited<ReturnType<typeof deps.supervisor.start>>;
+  try {
+    state = await deps.supervisor.start(spawnReq);
+  } catch (err) {
+    // A spawn-level throw (e.g. Bun.spawn ENOENT because the module's
+    // installDir/cwd no longer exists — the hub#536 wedge) used to escape the
+    // handler as a naked 500 with no JSON body; the CLI then surfaced an
+    // opaque "✗ <short>: request failed" with no actionable next step.
+    // Return the real reason instead.
+    return moduleOpFailure(short, "start", err);
+  }
   return jsonOk({ short, state });
+}
+
+/**
+ * Map a thrown supervisor-op failure to a structured 500 so the CLI/SPA can
+ * surface the real reason instead of an opaque "request failed" (hub#536).
+ */
+function moduleOpFailure(short: string, op: string, err: unknown): Response {
+  const msg = err instanceof Error ? err.message : String(err);
+  return jsonError(500, "module_op_failed", `${short} ${op} failed: ${msg}`);
 }
 
 /**
@@ -847,7 +866,12 @@ export async function handleStop(
   const authFail = await authorize(req, deps);
   if (authFail) return authFail;
 
-  const state = await deps.supervisor.stop(short);
+  let state: Awaited<ReturnType<typeof deps.supervisor.stop>>;
+  try {
+    state = await deps.supervisor.stop(short);
+  } catch (err) {
+    return moduleOpFailure(short, "stop", err);
+  }
   if (!state) {
     return jsonOk({ short, stopped: false });
   }
@@ -871,7 +895,12 @@ export async function handleRestart(
   const authFail = await authorize(req, deps);
   if (authFail) return authFail;
 
-  const state = await deps.supervisor.restart(short);
+  let state: Awaited<ReturnType<typeof deps.supervisor.restart>>;
+  try {
+    state = await deps.supervisor.restart(short);
+  } catch (err) {
+    return moduleOpFailure(short, "restart", err);
+  }
   if (!state) {
     return jsonError(
       404,

@@ -842,6 +842,31 @@ describe("POST /api/modules/:short/start", () => {
     expect(res.status).toBe(403);
   });
 
+  test("supervisor.start throw → structured 500 module_op_failed, not a naked 500 (hub#536)", async () => {
+    seedVault();
+    // Models the hub#536 wedge: Bun.spawn throwing because the module's
+    // installDir/cwd no longer exists (NOT a missing binary — the preflight
+    // + rethrowIfMissing nets don't catch it, so it propagates out of
+    // supervisor.start). Pre-fix this escaped the handler as a bodyless 500
+    // and the CLI showed an opaque "request failed".
+    const supervisor = new Supervisor({
+      spawnFn: () => {
+        throw new Error("simulated spawn failure: cwd /gone/parachute-app does not exist");
+      },
+    });
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleStart(
+      postReq("/api/modules/vault/start", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, configDir: h.dir, supervisor },
+    );
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("module_op_failed");
+    expect(body.error_description).toContain("vault start failed");
+    expect(body.error_description).toContain("cwd /gone/parachute-app does not exist");
+  });
+
   test("pure supervisor.start of an installed module — NOT install (no bun add)", async () => {
     seedVault();
     const { supervisor, spawns } = makeIdleSupervisor();
