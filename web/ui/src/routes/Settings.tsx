@@ -15,6 +15,11 @@
  *     The stored row is empty; the input field is empty. Helper text
  *     calls out that env wins until cleared, and that saving a value
  *     here overrides env.
+ *   - source: "expose" — no stored row, no env var, but the box has a
+ *     live `parachute expose` exposure recorded in expose-state.json.
+ *     The hub derives the issuer from that exposed origin (#531) so an
+ *     exposed box mints deterministic `iss` across reboots without the
+ *     operator setting anything. Saving a value here overrides it.
  *   - source: "settings" — operator has saved a value via this page.
  *     Input shows the stored value; the source label confirms it's
  *     the active layer.
@@ -214,6 +219,13 @@ function SourceLabel({ source, hasStored: _hasStored }: SourceLabelProps) {
     return (
       <span className="badge badge-info" data-testid="hub-origin-source">
         from env var <code>PARACHUTE_HUB_ORIGIN</code>
+      </span>
+    );
+  }
+  if (source === "expose") {
+    return (
+      <span className="badge badge-info" data-testid="hub-origin-source">
+        from your <code>parachute expose</code> config
       </span>
     );
   }

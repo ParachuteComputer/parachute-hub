@@ -32,11 +32,13 @@ import { generateBootstrapToken } from "../bootstrap-token.ts";
 // `serve()` cannot reroute them — set PARACHUTE_HOME before importing for
 // path isolation.
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
+import { readExposeState } from "../expose-state.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
 import { writeHubFile } from "../hub.ts";
 import { Supervisor } from "../supervisor.ts";
 import { createUser, userCount } from "../users.ts";
+import { sanitizePublicOrigin } from "../vault-hub-origin-env.ts";
 import { WELL_KNOWN_DIR } from "../well-known.ts";
 import { bootSupervisedModules } from "./serve-boot.ts";
 
@@ -124,7 +126,21 @@ function parsePort(raw: string | undefined): number | undefined {
  *      operator can't know the URL at deploy time. Without this, supervised
  *      modules' iss-validation breaks on hub-minted tokens (iss-mismatch
  *      every time).
- *   4. None (returns undefined). Hub falls back to per-request derivation
+ *   4. `expose-state.json`'s `hubOrigin` — the canonical public origin a
+ *      live tailscale/cloudflare exposure recorded (e.g.
+ *      `https://parachute.taildf9ce2.ts.net`). This is the load-bearing
+ *      tier for the **owner-operated reboot-persistent path**: the launchd
+ *      plist / systemd unit that keeps `parachute serve` alive carries no
+ *      `PARACHUTE_HUB_ORIGIN` env, so on every reboot the hub would
+ *      otherwise boot issuer-less (tier 5), stamp `iss` from the per-request
+ *      origin, and inject nothing into children — vault then defaults to
+ *      loopback and rejects hub-minted tokens with `unexpected "iss" claim
+ *      value` until it restarts. Reading the exposed origin off disk makes
+ *      `iss` deterministic across reboots with zero operator action. Guarded
+ *      to a non-loopback `http(s)` origin (a loopback value here would
+ *      re-pin the degraded mode; expose-state should never carry one, but we
+ *      defend anyway).
+ *   5. None (returns undefined). Hub falls back to per-request derivation
  *      via `resolveIssuer` in hub-server.ts — works for `/.well-known`
  *      discovery but supervised modules with cached iss expectations
  *      won't have a static value to validate against, so OAuth flows
@@ -136,18 +152,60 @@ function parsePort(raw: string | undefined): number | undefined {
  *
  * Trailing slashes are stripped for canonical-form comparison; empty
  * strings collapse to undefined.
+ *
+ * `readExpose` is injectable so tests exercise the expose-state tier
+ * without touching the real `~/.parachute`. The default reads
+ * `expose-state.json` and swallows a malformed-file throw (a corrupt state
+ * file must never crash startup — fall through to the request-origin mode);
+ * the `readExpose()` call is additionally try/catch-wrapped here so even an
+ * injected non-swallowing reader can't crash startup.
+ *
+ * KNOWN ASTERISK (tracked in #532): this resolves the issuer at boot, so a
+ * child module spawned during a *pre-expose* boot — hub started before the
+ * first-ever `parachute expose` — gets no `PARACHUTE_HUB_ORIGIN` injected
+ * until it's restarted after the exposure exists. Once an exposure is
+ * recorded, every subsequent reboot picks it up here automatically. The
+ * remaining gap (rebuild the live spawn-env on `supervisor.restart` so the
+ * first exposure propagates to already-running children without a manual
+ * restart) is the deferred #532 follow-up; not implemented in this PR.
  */
 export function resolveStartupIssuer(
   opts: { issuer?: string },
   env: NodeJS.ProcessEnv,
+  readExpose: () => string | undefined = defaultReadExposeHubOrigin,
 ): string | undefined {
   const flyOrigin = flyDefaultOriginFromEnv(env);
-  return (
-    (opts.issuer ?? env.PARACHUTE_HUB_ORIGIN ?? env.RENDER_EXTERNAL_URL ?? flyOrigin)?.replace(
-      /\/+$/,
-      "",
-    ) || undefined
-  );
+  const explicit = (
+    opts.issuer ??
+    env.PARACHUTE_HUB_ORIGIN ??
+    env.RENDER_EXTERNAL_URL ??
+    flyOrigin
+  )?.replace(/\/+$/, "");
+  if (explicit) return explicit;
+  // No flag / env / platform origin set — fall back to the exposed origin
+  // recorded on disk. `sanitizePublicOrigin` applies the same non-loopback
+  // http(s) guard as the hub-server chokepoint (#531) so a stray loopback
+  // value never pins the degraded request-origin mode.
+  let raw: string | undefined;
+  try {
+    raw = readExpose();
+  } catch {
+    return undefined;
+  }
+  return sanitizePublicOrigin(raw);
+}
+
+/**
+ * Read `expose-state.json`'s `hubOrigin` for the startup-issuer fallback,
+ * swallowing a malformed-file throw. Kept separate so it can be passed as
+ * the default `readExpose` arg and stubbed in tests.
+ */
+function defaultReadExposeHubOrigin(): string | undefined {
+  try {
+    return readExposeState()?.hubOrigin;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

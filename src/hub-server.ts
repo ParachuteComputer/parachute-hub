@@ -220,6 +220,7 @@ import { getAllPublicKeys } from "./signing-keys.ts";
 import type { Supervisor } from "./supervisor.ts";
 import { handleTwoFactorGet, handleTwoFactorPost } from "./two-factor-handlers.ts";
 import { getUserById, userCount } from "./users.ts";
+import { sanitizePublicOrigin } from "./vault-hub-origin-env.ts";
 import {
   WELL_KNOWN_DIR,
   buildWellKnown,
@@ -788,12 +789,20 @@ export interface HubFetchDeps {
    */
   loopbackPort?: number;
   /**
-   * Test seam for reading `expose-state.json`. Production reads the operator's
-   * `~/.parachute/expose-state.json` via `readExposeState`; tests inject a
-   * fake to drive tailnet/funnel origins into the bound set without standing
-   * up real exposes. Returns `undefined` when no state file is present
-   * (pre-`parachute expose` state — fine, the issuer + loopback still cover
-   * legitimate access).
+   * Test seam for reading `expose-state.json`'s `hubOrigin`. Production reads
+   * the operator's `~/.parachute/expose-state.json` via `readExposeState`;
+   * tests inject a fake to drive tailnet/funnel origins into the bound set
+   * without standing up real exposes. Returns `undefined` when no state file
+   * is present (pre-`parachute expose` state — fine, the issuer + loopback
+   * still cover legitimate access).
+   *
+   * This single seam now feeds BOTH (a) the same-origin bound set via
+   * `buildHubBoundOrigins`, and (b) the issuer resolution via `resolveIssuer`
+   * (#531): on the reboot-persistent owner-operated path the launchd /
+   * systemd unit carries no `PARACHUTE_HUB_ORIGIN`, so the hub boots with no
+   * `configuredIssuer` and falls back to this exposed origin rather than
+   * stamping `iss` from the per-request (loopback) origin — which exposed
+   * resource servers (vault) reject until they restart.
    */
   loadExposeHubOrigin?: () => string | undefined;
   /**
@@ -1069,37 +1078,94 @@ function dbNotConfigured(): Response {
 }
 
 /**
+ * Read the exposed public origin off `expose-state.json` for the issuer
+ * fallback, guarded to a non-loopback http(s) origin and malformed-safe.
+ * Returns undefined when no exposure is recorded, the file is corrupt, or
+ * the recorded origin is loopback / not an http(s) URL (a loopback value
+ * here would re-pin the degraded request-origin mode — expose-state should
+ * never carry one, but we defend anyway). This is the seam the launchd /
+ * systemd reboot path leans on: those units carry no `PARACHUTE_HUB_ORIGIN`,
+ * so without it the hub boots issuer-less and stamps `iss` from the
+ * per-request origin, which exposed resource servers (vault) reject.
+ *
+ * The `readExpose()` call is itself wrapped in try/catch so ANY reader —
+ * the default OR an injected one — that throws yields undefined rather than
+ * propagating into the request path. The default reader self-wraps too, but
+ * the seam must not depend on that: a future caller passing a non-swallowing
+ * reader still can't 500 the hub. Origin sanitization is delegated to the
+ * shared `sanitizePublicOrigin` helper (strips trailing slashes, validates
+ * http(s), rejects loopback), kept identical with resolveStartupIssuer (#531).
+ */
+export function exposeIssuerOrigin(
+  readExpose: () => string | undefined = defaultExposeHubOriginRead,
+): string | undefined {
+  let raw: string | undefined;
+  try {
+    raw = readExpose();
+  } catch {
+    return undefined;
+  }
+  return sanitizePublicOrigin(raw);
+}
+
+function defaultExposeHubOriginRead(): string | undefined {
+  try {
+    return readExposeState()?.hubOrigin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Resolve the OAuth issuer URL for this request. Precedence, highest
- * first (hub#298):
+ * first (hub#298, expose tier added #531):
  *
  *   1. `hub_settings.hub_origin` — operator-set canonical URL from the
  *      admin SPA. Wins when present.
  *   2. `configuredIssuer` — `--issuer` flag or `PARACHUTE_HUB_ORIGIN`
  *      env var captured at hub start. The deploy-time setting.
- *   3. `new URL(req.url).origin` — the request's own origin. Local dev
+ *   3. `expose-state.json`'s `hubOrigin` — the canonical public origin a
+ *      live tailscale/cloudflare exposure recorded. Load-bearing for the
+ *      reboot-persistent owner-operated path: the launchd plist / systemd
+ *      unit carries no `PARACHUTE_HUB_ORIGIN`, so a hub booted off it has
+ *      no `configuredIssuer` and would otherwise stamp `iss` from the
+ *      per-request origin — which exposed resource servers (vault) reject
+ *      with `unexpected "iss" claim value` until they restart. Reading the
+ *      exposed origin off disk closes that. Guarded non-loopback http(s)
+ *      (see `exposeIssuerOrigin`).
+ *   4. `new URL(req.url).origin` — the request's own origin. Local dev
  *      + Render-assigned subdomains land here when nothing's been
  *      configured.
  *
  * Per-request (not cached at hub start) so a PUT to
  * `/api/settings/hub-origin` takes effect on the next request without a
- * restart. The hub_settings read is a single small SQLite query — cheap
- * relative to JWT signing on the same request path.
+ * restart. Both the hub_settings read and the expose-state read are cheap
+ * (a small SQLite query / a small JSON parse) relative to JWT signing on
+ * the same request path — and the expose read is per-request so an operator
+ * who runs `parachute expose` while the hub is up gets the new origin on the
+ * next request without a restart.
  *
  * `db` is optional because the wellknown / discovery surfaces are
  * reachable on a hub with no DB configured (the dbNotConfigured 503
  * gate sits behind these in the dispatcher). In that case we skip the
- * settings layer and fall through to env/request precedence.
+ * settings layer and fall through to env/expose/request precedence.
+ *
+ * `readExpose` is injectable so tests exercise the expose tier without
+ * touching the real `~/.parachute`.
  */
 export function resolveIssuer(
   req: Request,
   db: Database | undefined,
   configuredIssuer: string | undefined,
+  readExpose: () => string | undefined = defaultExposeHubOriginRead,
 ): string {
   if (db !== undefined) {
     const stored = getHubOrigin(db);
     if (stored) return stored;
   }
   if (configuredIssuer) return configuredIssuer;
+  const exposed = exposeIssuerOrigin(readExpose);
+  if (exposed) return exposed;
   // Reverse-proxy aware: Render / Tailscale Funnel / cloudflared terminate
   // TLS at the edge and forward plain HTTP to hub. Without X-Forwarded-Proto
   // honoring, `req.url.origin` is `http://...` and hub publishes mixed-content
@@ -1128,16 +1194,20 @@ export function resolveIssuer(
 /**
  * Where did the resolved issuer come from? Drives the source-label
  * surfaced in the admin SPA so operators can tell which precedence
- * layer they're on without inspecting the DB or env.
+ * layer they're on without inspecting the DB or env. Mirrors the
+ * precedence in `resolveIssuer` exactly — settings > env > expose >
+ * request — so the attribution can't drift from the resolved value.
  */
-export type IssuerSource = "settings" | "env" | "request";
+export type IssuerSource = "settings" | "env" | "expose" | "request";
 
 export function resolveIssuerSource(
   db: Database | undefined,
   configuredIssuer: string | undefined,
+  readExpose: () => string | undefined = defaultExposeHubOriginRead,
 ): IssuerSource {
   if (db !== undefined && getHubOrigin(db)) return "settings";
   if (configuredIssuer) return "env";
+  if (exposeIssuerOrigin(readExpose)) return "expose";
   return "request";
 }
 
@@ -1164,7 +1234,7 @@ export function hubFetch(
     });
 
   const oauthDeps = (req: Request) => {
-    const issuer = resolveIssuer(req, getDb?.(), configuredIssuer);
+    const issuer = resolveIssuer(req, getDb?.(), configuredIssuer, loadExposeHubOrigin);
     return {
       issuer,
       // Per-request resolution (closes #245): expose-state.json can change
@@ -1525,7 +1595,12 @@ export function hubFetch(
         // `/.well-known/parachute.json` while their JWTs carry the
         // canonical URL, and discovery clients would split-brain on
         // which one to trust.
-        const canonicalOrigin = resolveIssuer(req, getDb?.(), configuredIssuer);
+        const canonicalOrigin = resolveIssuer(
+          req,
+          getDb?.(),
+          configuredIssuer,
+          loadExposeHubOrigin,
+        );
         const readManifestFn = deps?.readModuleManifest ?? defaultReadModuleManifest;
         const [managementUrlByName, serviceUiMeta] = await Promise.all([
           loadManagementUrls(manifest.services, readManifestFn),
@@ -1826,8 +1901,8 @@ export function hubFetch(
       return handleApiSettingsHubOrigin(req, {
         db,
         issuer: oauthDeps(req).issuer,
-        resolvedIssuer: resolveIssuer(req, db, configuredIssuer),
-        resolvedSource: resolveIssuerSource(db, configuredIssuer),
+        resolvedIssuer: resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin),
+        resolvedSource: resolveIssuerSource(db, configuredIssuer, loadExposeHubOrigin),
       });
     }
 
@@ -2159,7 +2234,7 @@ export function hubFetch(
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
       const vaultName = decodeURIComponent(pathname.slice("/account/vault-token/".length));
       const db = getDb();
-      const hubOrigin = resolveIssuer(req, db, configuredIssuer);
+      const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
       return handleAccountVaultTokenPost(req, vaultName, { db, hubOrigin });
     }
 
@@ -2177,7 +2252,7 @@ export function hubFetch(
       }
       if (!getDb) return dbNotConfigured();
       const db = getDb();
-      const hubOrigin = resolveIssuer(req, db, configuredIssuer);
+      const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
       return handleAccountHomeGet(req, { db, hubOrigin });
     }
 
