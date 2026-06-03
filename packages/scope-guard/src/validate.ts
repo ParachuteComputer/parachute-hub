@@ -332,6 +332,14 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
    * only when at least `reloadMinIntervalMs` has elapsed since the previous
    * forced reload. A non-positive interval disables throttling (always allow)
    * — convenient for tests that want every failure to trigger a reload.
+   *
+   * The slot is consumed per *attempt*, before `forceReloadJwks` reports
+   * whether the getter actually had a `.reload` to call. For a bare
+   * test-injected getter (no `.reload`) that means a slot is burned without a
+   * reload firing — harmless, because every production getter comes from
+   * `createRemoteJWKSet`, which always exposes `.reload`. Keeping the
+   * `hasReload` check inside `jwks.ts` (rather than pre-gating here) is the
+   * deliberate seam: validate.ts stays ignorant of getter internals.
    */
   function shouldForceReload(): boolean {
     const t = reloadNow();

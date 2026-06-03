@@ -30,6 +30,14 @@ export type JwksGetter = ReturnType<typeof createRemoteJWKSet>;
  * getter generally does NOT. We narrow at the call site rather than assume,
  * so injected getters without a reload seam degrade to "no forced refresh"
  * instead of crashing.
+ *
+ * jose types `.reload()` with a `/** @ignore *​/` tag — it's a public runtime
+ * member but intentionally undocumented, so it's an API jose could drop in a
+ * future major without it being a documented break. The runtime `hasReload`
+ * guard is the insurance: if a jose major removes `.reload`, `forceReloadJwks`
+ * returns `false` and we degrade to no-retry (the pre-hardening behavior)
+ * rather than crashing. Whoever bumps jose past v6 should re-verify `.reload`
+ * is still present and re-run the rotation-recovery tests.
  */
 type ReloadableGetter = JwksGetter & { reload: () => Promise<void> };
 
