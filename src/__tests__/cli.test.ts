@@ -296,6 +296,16 @@ describe("cli lazy-import isolation (feedback #9)", () => {
   let sandboxCli: string;
 
   beforeAll(() => {
+    // The sandbox lives INSIDE the repo (`<repo>/.tmp-cli-iso-*`) on purpose: it
+    // copies `src/` + `package.json` but NOT `node_modules`. The sandboxed CLI
+    // still resolves workspace packages (`@openparachute/depcheck`, etc.) by Bun
+    // walking up the directory tree to the **repo-root** `node_modules` — the same
+    // walk a nested file uses. So this suite REQUIRES `node_modules` installed at
+    // the repo root. CI must `bun install` before running it; a fresh worktree
+    // without an install will see `Cannot find module '@openparachute/...'`
+    // failures that are worktree-resolution artifacts, NOT a regression in the
+    // code under test. (A temp dir under `os.tmpdir()` would break this walk and
+    // also break `cli.ts`'s `../package.json` import, hence the in-repo sandbox.)
     sandbox = mkdtempSync(join(REPO_ROOT, ".tmp-cli-iso-"));
     cpSync(join(REPO_ROOT, "src"), join(sandbox, "src"), { recursive: true });
     cpSync(join(REPO_ROOT, "package.json"), join(sandbox, "package.json"));
