@@ -678,6 +678,30 @@ describe("Supervisor.restart", () => {
     sup.stop("vault");
     third.resolveExit(0);
   });
+
+  test("throws when nextReq.short mismatches the restarted short (state-corruption guard)", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    // A nextReq for a DIFFERENT short would re-register under the wrong map key.
+    await expect(
+      sup.restart("vault", { short: "scribe", cmd: ["bun", "scribe.ts"] }),
+    ).rejects.toThrow(/nextReq\.short is "scribe"/);
+    // The original entry is untouched — no spurious stop/respawn happened.
+    expect(spawner.calls).toHaveLength(1);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
 });
 
 describe("Supervisor output multiplexing", () => {

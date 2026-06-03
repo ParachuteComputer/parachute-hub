@@ -606,10 +606,21 @@ export class Supervisor {
    * `req` — so subsequent CRASH-restarts (`handleExit` → `spawnAndWatch`,
    * which reuse `entry.req`) also carry the refreshed env, not the original
    * first-start snapshot. When omitted, the prior `entry.req` is replayed
-   * (legacy behavior, e.g. an internal restart with no state change). The
-   * short on `nextReq` must match `short` — a mismatch is a caller bug.
+   * (legacy behavior, e.g. an internal restart with no state change).
+   *
+   * `nextReq.short` MUST match `short`: `start(req)` keys the supervisor map
+   * on `req.short`, so a mismatch would silently register the restarted
+   * module under the WRONG key (orphaning the original entry + breaking every
+   * subsequent `get`/`stop`/`restart` lookup). Throws on mismatch rather than
+   * trusting the caller — a one-line invariant that turns a silent
+   * state-corruption bug into a loud one.
    */
   async restart(short: string, nextReq?: SpawnRequest): Promise<ModuleState | undefined> {
+    if (nextReq && nextReq.short !== short) {
+      throw new Error(
+        `restart(${short}): nextReq.short is "${nextReq.short}" — it must match the restarted short or the module re-registers under the wrong key`,
+      );
+    }
     const entry = this.modules.get(short);
     if (!entry) return undefined;
     const req = nextReq ?? entry.req;

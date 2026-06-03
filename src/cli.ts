@@ -843,6 +843,14 @@ async function main(argv: string[]): Promise<number> {
         // `messages` empty) or a real failure (the removal carried a reason in
         // `messages` the internal log didn't surface). The no-op is informational
         // (exit 0); a failure with detail is an error (print it, exit 1).
+        //
+        // DELIBERATE double-print on the failure path (not a bug): the function's
+        // own log() already wrote a human-readable summary ("Hub-unit teardown did
+        // not complete: …") to STDOUT; here we re-emit the raw reason(s) to STDERR.
+        // The split is intentional — a person reading the terminal sees the framed
+        // summary, while a script that captures `2>` gets the machine-parseable
+        // reason alongside the non-zero exit. Mirrors the streams convention the
+        // rest of the CLI uses (human guidance on stdout, error detail on stderr).
         if (result.messages.length > 0) {
           for (const line of result.messages) console.error(line);
           return 1;
