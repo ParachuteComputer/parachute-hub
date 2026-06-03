@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bootSupervisedModules } from "../commands/serve-boot.ts";
+import { bootSupervisedModules, buildModuleSpawnRequest } from "../commands/serve-boot.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
 import { type SpawnRequest, type SupervisedProc, Supervisor } from "../supervisor.ts";
 
@@ -188,6 +188,17 @@ describe("bootSupervisedModules", () => {
     // values still merge.
     expect(recorder.calls[0]?.env?.PORT).toBe("1940");
     expect(recorder.calls[0]?.env?.SCRIBE_AUTH_TOKEN).toBe("secret-token");
+  });
+
+  test("extraEnv PORT still wins over entry.port (layer 4 — test seam / first-boot)", () => {
+    // Dropping a stale .env PORT must not affect the documented layer-4 override:
+    // an explicit `opts.extraEnv.PORT` (programmatic, not a stale on-disk file)
+    // still wins last.
+    const req = buildModuleSpawnRequest("vault", VAULT_ENTRY, ["parachute-vault", "serve"], {
+      configDir: h.dir,
+      extraEnv: { PORT: "9999" },
+    });
+    expect(req.env?.PORT).toBe("9999");
   });
 
   test("hubOrigin wins over a stale .env entry on collision", async () => {
