@@ -1128,7 +1128,44 @@ describe("POST /api/modules/:short/restart", () => {
   });
   afterEach(() => h.cleanup());
 
-  test("404 not_supervised when module isn't running", async () => {
+  /** Seed a minimal installed vault row (in services.json). */
+  function seedVault(port = 1940): void {
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.0.0-linked",
+      },
+    ]);
+  }
+
+  test("400 not_installed when the module isn't in services.json", async () => {
+    // restart rebuilds the spawn req from services.json (hub#532), so a
+    // missing row is a `not_installed` 400 (mirrors `start`) — before the
+    // supervisor is even consulted.
+    const { supervisor } = makeIdleSupervisor();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleRestart(
+      postReq("/api/modules/vault/restart", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run: async () => 0,
+      },
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("not_installed");
+  });
+
+  test("404 not_supervised when installed but not currently running", async () => {
+    seedVault();
     const { supervisor } = makeIdleSupervisor();
     const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
     const res = await handleRestart(
@@ -1149,6 +1186,7 @@ describe("POST /api/modules/:short/restart", () => {
   });
 
   test("returns new state on success", async () => {
+    seedVault();
     const { supervisor } = makeIdleSupervisor();
     await supervisor.start({ short: "vault", cmd: ["parachute-vault", "serve"] });
 
@@ -1171,6 +1209,122 @@ describe("POST /api/modules/:short/restart", () => {
     // restart sets the state to either restarting or running depending
     // on timing — either is acceptable here as long as it's not crashed/stopped.
     expect(["restarting", "running", "starting"]).toContain(body.state.status);
+  });
+
+  test("re-injects the CURRENT hub origin on restart (hub#532)", async () => {
+    // The core hub#532 fix: a module first started under one issuer, then
+    // restarted after the canonical origin changed (e.g. post-expose), must
+    // re-spawn with the NEW PARACHUTE_HUB_ORIGIN — not replay the stale
+    // first-start snapshot. We drive the supervisor directly to control the
+    // first-start env, then restart through the handler with a different
+    // `deps.issuer` and assert the recorded spawn carries the new origin.
+    seedVault(1940);
+    const { supervisor, spawns } = makeIdleSupervisor();
+    // First start with the OLD origin baked in (as boot would have).
+    await supervisor.start({
+      short: "vault",
+      cmd: ["parachute-vault", "serve"],
+      env: { PORT: "1940", PARACHUTE_HUB_ORIGIN: "https://old.example" },
+    });
+    const spawnsBefore = spawns.length;
+
+    const NEW_ORIGIN = "https://new.example";
+    // The bearer was minted at the prior (loopback) ISSUER; the canonical
+    // origin has since moved to NEW_ORIGIN. `knownIssuers` accepts the older
+    // bearer iss while `deps.issuer` is the current canonical origin — exactly
+    // the post-expose scenario hub#532 describes.
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleRestart(
+      postReq("/api/modules/vault/restart", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: NEW_ORIGIN,
+        knownIssuers: [ISSUER, NEW_ORIGIN],
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run: async () => 0,
+      },
+    );
+    expect(res.status).toBe(200);
+    // A fresh spawn happened, and it carries the NEW origin (rebuilt from the
+    // live deps.issuer), not the stale one from first start.
+    const reSpawn = spawns[spawnsBefore];
+    expect(reSpawn?.env?.PARACHUTE_HUB_ORIGIN).toBe(NEW_ORIGIN);
+    expect(reSpawn?.env?.PORT).toBe("1940");
+  });
+
+  test("crash-restart after a restart reuses the REFRESHED req (hub#532)", async () => {
+    // The refreshed SpawnRequest must become the supervisor entry's `req` so
+    // a SUBSEQUENT crash-restart (handleExit → spawnAndWatch, which replays
+    // `entry.req`) also carries the current env — not the original snapshot.
+    seedVault(1940);
+    // Controllable supervisor: spawns record env; each fake exposes a `crash()`
+    // resolving `exited` with code 1 (a crash, not an operator stop). `kill()`
+    // (driven by the injected group-aware `killFn`) resolves with 0 so the
+    // handler's restart-stop completes promptly. Distinct codes let us crash a
+    // specific child without tripping the stop path.
+    const spawns: SpawnRequest[] = [];
+    const procs: Array<{ pid: number; crash: () => void; kill: () => void }> = [];
+    let nextPid = 8000;
+    const spawnFn = (req: SpawnRequest): SupervisedProc => {
+      spawns.push(req);
+      const pid = nextPid++;
+      let resolveExit!: (c: number | null) => void;
+      const exited = new Promise<number | null>((r) => {
+        resolveExit = r;
+      });
+      const proc = {
+        pid,
+        exited,
+        stdout: null,
+        stderr: null,
+        kill: () => resolveExit(0),
+      };
+      procs.push({ pid, crash: () => resolveExit(1), kill: proc.kill });
+      return proc;
+    };
+    const killFn = (pid: number): void => {
+      procs.find((p) => p.pid === Math.abs(pid))?.kill();
+    };
+    const supervisor = new Supervisor({ spawnFn, killFn, restartDelayMs: 1, startReadyMs: 0 });
+
+    // First start with the OLD origin.
+    await supervisor.start({
+      short: "vault",
+      cmd: ["parachute-vault", "serve"],
+      env: { PORT: "1940", PARACHUTE_HUB_ORIGIN: "https://old.example" },
+    });
+
+    const NEW_ORIGIN = "https://new.example";
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    await handleRestart(
+      postReq("/api/modules/vault/restart", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: NEW_ORIGIN,
+        knownIssuers: [ISSUER, NEW_ORIGIN],
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run: async () => 0,
+      },
+    );
+    // The restart re-spawn is the most recent — confirm the NEW origin landed.
+    const restartSpawnIdx = spawns.length - 1;
+    expect(spawns[restartSpawnIdx]?.env?.PARACHUTE_HUB_ORIGIN).toBe(NEW_ORIGIN);
+
+    // Crash the restart-spawned child → the supervisor's crash-restart replays
+    // entry.req (which `start` stored from the refreshed req).
+    procs[restartSpawnIdx]?.crash();
+    // Wait for the crash watcher's restartDelay + respawn.
+    await new Promise((r) => setTimeout(r, 40));
+    expect(spawns.length).toBeGreaterThan(restartSpawnIdx + 1);
+    const crashRespawn = spawns[spawns.length - 1];
+    // The crash-restart inherited the REFRESHED req → still the new origin.
+    expect(crashRespawn?.env?.PARACHUTE_HUB_ORIGIN).toBe(NEW_ORIGIN);
   });
 });
 

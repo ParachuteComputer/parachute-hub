@@ -879,6 +879,12 @@ export function teardownHubUnit(opts: TeardownOpts = {}): { removed: boolean; me
     log("The supervised hub unit is gone. To run the hub now, either:");
     log("  - `parachute serve` (foreground), or");
     log("  - `parachute migrate --to-supervised` to reinstall the unit.");
+  } else if (res.messages.length > 0) {
+    // removed === false WITH detail: a real removal failure, not a clean
+    // no-op. Surface the reason rather than the misleading "nothing was
+    // installed" line (hub#534 — the CLI also maps this to a non-zero exit).
+    log("Hub-unit teardown did not complete:");
+    for (const m of res.messages) log(`  ${m}`);
   } else {
     log("No hub unit was installed — nothing to tear down.");
   }

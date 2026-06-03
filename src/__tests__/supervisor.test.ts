@@ -595,6 +595,113 @@ describe("Supervisor.restart", () => {
     sup.stop("vault");
     second.resolveExit(0);
   });
+
+  test("replays entry.req when no nextReq is supplied", async () => {
+    const first = makeFakeProc(101);
+    const second = makeFakeProc(102);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PARACHUTE_HUB_ORIGIN: "https://origin.example" },
+    });
+
+    const restartPromise = sup.restart("vault");
+    first.closeStreams();
+    first.resolveExit(0);
+    await restartPromise;
+
+    // No nextReq → the re-spawn replays the original env (legacy behavior).
+    expect(spawner.calls[1]?.env?.PARACHUTE_HUB_ORIGIN).toBe("https://origin.example");
+    expect(spawner.calls[1]?.cmd).toEqual(["bun", "vault.ts"]);
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test("nextReq re-spawns with the refreshed req AND propagates to crash-restart (hub#532)", async () => {
+    const first = makeFakeProc(101);
+    const second = makeFakeProc(102); // restart re-spawn
+    const third = makeFakeProc(103); // crash-restart respawn
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    spawner.enqueue(third);
+
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    // First start with the OLD origin.
+    await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PARACHUTE_HUB_ORIGIN: "https://old.example" },
+    });
+
+    // Restart WITH a refreshed req carrying the NEW origin.
+    const restartPromise = sup.restart("vault", {
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PARACHUTE_HUB_ORIGIN: "https://new.example" },
+    });
+    first.closeStreams();
+    first.resolveExit(0);
+    await restartPromise;
+
+    // The restart re-spawn carries the NEW origin.
+    expect(spawner.calls[1]?.env?.PARACHUTE_HUB_ORIGIN).toBe("https://new.example");
+
+    // Now crash the restart-spawned child (resolveExit with a non-stop code).
+    // handleExit → spawnAndWatch replays entry.req, which `start` stored from
+    // the refreshed nextReq — so the crash-restart ALSO carries the new origin.
+    second.closeStreams();
+    second.resolveExit(1);
+    await tick(20);
+
+    expect(spawner.calls).toHaveLength(3);
+    expect(spawner.calls[2]?.env?.PARACHUTE_HUB_ORIGIN).toBe("https://new.example");
+
+    third.closeStreams();
+    sup.stop("vault");
+    third.resolveExit(0);
+  });
+
+  test("throws when nextReq.short mismatches the restarted short (state-corruption guard)", async () => {
+    const proc = makeFakeProc(101);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+    });
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+
+    // A nextReq for a DIFFERENT short would re-register under the wrong map key.
+    await expect(
+      sup.restart("vault", { short: "scribe", cmd: ["bun", "scribe.ts"] }),
+    ).rejects.toThrow(/nextReq\.short is "scribe"/);
+    // The original entry is untouched — no spurious stop/respawn happened.
+    expect(spawner.calls).toHaveLength(1);
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
 });
 
 describe("Supervisor output multiplexing", () => {

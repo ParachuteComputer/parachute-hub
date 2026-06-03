@@ -384,6 +384,85 @@ async function resolveSpawnSpec(
   return composeKnownModuleSpec(km, manifest);
 }
 
+/**
+ * Outcome of `resolveSpawnRequest`: either a freshly-built `SpawnRequest`
+ * (carrying CURRENT env — live `deps.issuer` → `PARACHUTE_HUB_ORIGIN`,
+ * enriched PATH, re-resolved `cwd`) or a structured error the HTTP handler
+ * can return verbatim. A discriminated union so `handleStart` /
+ * `handleRestart` / `runUpgrade` share the resolve-and-rebuild path
+ * without duplicating the not-installed / no-start-cmd error shapes.
+ */
+type ResolveSpawnResult =
+  | { ok: true; req: SpawnRequest }
+  | { ok: false; status: number; code: string; message: string };
+
+/**
+ * Build a `SpawnRequest` for an already-installed module from CURRENT state,
+ * identically to the serve-boot path (PORT / per-service `.env` / live
+ * `PARACHUTE_HUB_ORIGIN` / enriched PATH via the shared
+ * `buildModuleSpawnRequest`). This is the single source of truth the start,
+ * restart, and post-upgrade-restart paths share so each re-injects the
+ * current hub origin + PATH rather than replaying a stale first-start
+ * snapshot (hub#532). `cwd` is re-resolved from the row's `installDir` too,
+ * so a post-upgrade relocation is picked up.
+ *
+ * Returns a structured `{ ok: false }` for the two operator-facing
+ * preconditions the start endpoint already surfaced: 400 `not_installed`
+ * (no services.json row) and 422 `no_start_cmd` (CLI-only / unreadable
+ * module.json). Callers map these to the response shape their surface wants.
+ */
+async function resolveSpawnRequest(
+  short: CuratedModuleShort,
+  deps: ApiModulesOpsDeps,
+): Promise<ResolveSpawnResult> {
+  const spec = specFor(short);
+
+  // The module must already be installed (present in services.json).
+  const entry = findService(spec.manifestName, deps.manifestPath);
+  if (!entry) {
+    return {
+      ok: false,
+      status: 400,
+      code: "not_installed",
+      message: `${short} is not installed (no services.json entry) — install it first via POST /api/modules/${short}/install`,
+    };
+  }
+
+  // KNOWN_MODULES shorts (vault / scribe / runner): module.json is the
+  // canonical source for startCmd. Re-resolve from
+  // `<installDir>/.parachute/module.json` when installDir is stamped so the
+  // module is authoritative for its own spawn cmd — mirroring runInstall's
+  // post-bun-add re-resolve. Falls back to the imperative `extras.startCmd`
+  // carried by `spec` when installDir is absent or module.json is unreadable.
+  let spawnSpec: ServiceSpec = spec;
+  if (entry.installDir && KNOWN_MODULES[short]) {
+    const resolved = await resolveSpawnSpec(short, entry.installDir);
+    if (resolved) spawnSpec = resolved;
+  }
+
+  const cmd = spawnSpec.startCmd?.(entry);
+  if (!cmd || cmd.length === 0) {
+    return {
+      ok: false,
+      status: 422,
+      code: "no_start_cmd",
+      message: `${short} has no resolvable startCmd (CLI-only module, or <installDir>/.parachute/module.json missing a startCmd)`,
+    };
+  }
+
+  // Build the SpawnRequest identically to the serve-boot path so start,
+  // restart, and post-upgrade-restart produce the same child env (PORT / .env
+  // / live HUB_ORIGIN / enriched PATH). The test-seam / first-boot `spawnEnv`
+  // rides the shared helper's `extraEnv` and wins last, matching
+  // `spawnSupervised`'s precedence.
+  const req = buildModuleSpawnRequest(short, entry, cmd, {
+    configDir: deps.configDir,
+    ...(deps.issuer ? { hubOrigin: deps.issuer } : {}),
+    ...(deps.spawnEnv ? { extraEnv: deps.spawnEnv } : {}),
+  });
+  return { ok: true, req };
+}
+
 function defaultRun(cmd: readonly string[]): Promise<number> {
   // Inherit env so child `bun add` sees TMPDIR, BUN_INSTALL, PARACHUTE_*,
   // etc. set by the Dockerfile / Render env. Bun.spawn defaults to empty
@@ -792,51 +871,16 @@ export async function handleStart(
   const authFail = await authorize(req, deps);
   if (authFail) return authFail;
 
-  const spec = specFor(short);
-
-  // Pure-spawn precondition: the module must already be installed
-  // (present in services.json). `start` never installs — that's the
-  // install endpoint's job, which is far heavier (bun add -g / seed /
-  // stamp). A missing row is an operator error worth a clear message.
-  const entry = findService(spec.manifestName, deps.manifestPath);
-  if (!entry) {
-    return jsonError(
-      400,
-      "not_installed",
-      `${short} is not installed (no services.json entry) — install it first via POST /api/modules/${short}/install`,
-    );
-  }
-
-  // KNOWN_MODULES shorts (vault / scribe / runner): module.json is the
-  // canonical source for startCmd. Re-resolve from
-  // `<installDir>/.parachute/module.json` when installDir is stamped so the
-  // module is authoritative for its own spawn cmd — mirroring runInstall's
-  // post-bun-add re-resolve. Falls back to the imperative `extras.startCmd`
-  // carried by `spec` when installDir is absent or module.json is unreadable.
-  let spawnSpec: ServiceSpec = spec;
-  if (entry.installDir && KNOWN_MODULES[short]) {
-    const resolved = await resolveSpawnSpec(short, entry.installDir);
-    if (resolved) spawnSpec = resolved;
-  }
-
-  const cmd = spawnSpec.startCmd?.(entry);
-  if (!cmd || cmd.length === 0) {
-    return jsonError(
-      422,
-      "no_start_cmd",
-      `${short} has no resolvable startCmd (CLI-only module, or <installDir>/.parachute/module.json missing a startCmd)`,
-    );
-  }
-
-  // Build the SpawnRequest identically to the serve-boot path so `start`
-  // and boot produce the same child env (PORT / .env / HUB_ORIGIN). The
-  // test-seam / first-boot `spawnEnv` rides the shared helper's `extraEnv`
-  // and wins last, matching `spawnSupervised`'s precedence.
-  const spawnReq = buildModuleSpawnRequest(short, entry, cmd, {
-    configDir: deps.configDir,
-    ...(deps.issuer ? { hubOrigin: deps.issuer } : {}),
-    ...(deps.spawnEnv ? { extraEnv: deps.spawnEnv } : {}),
-  });
+  // Build the SpawnRequest from CURRENT state (live issuer / PATH / .env /
+  // re-resolved startCmd), shared with the restart + post-upgrade-restart
+  // paths so each spawn carries the same fresh env (hub#532). The two
+  // operator-facing preconditions — 400 `not_installed` (no services.json
+  // row; `start` never installs, that's the heavier install endpoint's job)
+  // and 422 `no_start_cmd` (CLI-only / unreadable module.json) — surface as
+  // structured errors here.
+  const resolved = await resolveSpawnRequest(short, deps);
+  if (!resolved.ok) return jsonError(resolved.status, resolved.code, resolved.message);
+  const spawnReq = resolved.req;
 
   let state: Awaited<ReturnType<typeof deps.supervisor.start>>;
   try {
@@ -898,10 +942,19 @@ export async function handleStop(
 /**
  * POST /api/modules/:short/restart — synchronous.
  *
- * Routes through `supervisor.restart(short)` which does stop → await
- * exit → start with the same SpawnRequest. Returns the new state in
- * the body — the UI's spinner can clear as soon as the response
- * arrives, no operation poll needed.
+ * Rebuilds the SpawnRequest from CURRENT state (live `deps.issuer` →
+ * `PARACHUTE_HUB_ORIGIN`, enriched PATH, re-resolved cwd) — identically to
+ * `handleStart` via the shared `resolveSpawnRequest` — and hands it to
+ * `supervisor.restart(short, req)` so the re-spawn re-injects the current
+ * hub origin (hub#532). Before this, restart replayed the env captured at
+ * FIRST start, so an admin-UI restart / `parachute restart <svc>` never
+ * picked up a corrected hub origin (or, since #546, the enriched PATH) —
+ * only `start` and the `expose up` self-heal rebuilt env. The refreshed req
+ * also becomes the supervisor entry's `req`, so subsequent crash-restarts
+ * carry the current env too.
+ *
+ * Returns the new state in the body — the UI's spinner can clear as soon as
+ * the response arrives, no operation poll needed.
  */
 export async function handleRestart(
   req: Request,
@@ -912,9 +965,16 @@ export async function handleRestart(
   const authFail = await authorize(req, deps);
   if (authFail) return authFail;
 
+  // Rebuild the spawn env from current state. A `not_installed` row is a 400
+  // (same as `start`); `no_start_cmd` a 422. A module that's installed but
+  // not currently supervised falls through to the 404 `not_supervised` below
+  // (the supervisor returns `undefined`).
+  const resolved = await resolveSpawnRequest(short, deps);
+  if (!resolved.ok) return jsonError(resolved.status, resolved.code, resolved.message);
+
   let state: Awaited<ReturnType<typeof deps.supervisor.restart>>;
   try {
-    state = await deps.supervisor.restart(short);
+    state = await deps.supervisor.restart(short, resolved.req);
   } catch (err) {
     return moduleOpFailure(short, "restart", err);
   }
@@ -1103,7 +1163,16 @@ async function runUpgrade(
     });
   }
 
-  const state = await deps.supervisor.restart(short);
+  // Rebuild the spawn req from post-upgrade state before restarting: a major
+  // bump may have relocated installDir (re-stamped above), so the re-spawn's
+  // cwd must track it, and the restart should carry the live hub origin /
+  // enriched PATH like start does (hub#532). Fall back to a plain replay
+  // restart if the row can't be resolved into a fresh req (shouldn't happen
+  // mid-upgrade, but a missing startCmd shouldn't wedge the upgrade op).
+  const resolved = await resolveSpawnRequest(short, deps);
+  const state = resolved.ok
+    ? await deps.supervisor.restart(short, resolved.req)
+    : await deps.supervisor.restart(short);
   if (!state) {
     registry.update(
       opId,
