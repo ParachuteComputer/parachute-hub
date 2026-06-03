@@ -1,9 +1,10 @@
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { appendFileSync, cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const CLI = join(import.meta.dir, "..", "cli.ts");
+const REPO_ROOT = join(import.meta.dir, "..", "..");
 
 async function runCli(
   args: string[],
@@ -274,6 +275,92 @@ describe("cli per-subcommand help", () => {
     const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     expect(code).toBe(127);
     expect(stderr).toMatch(/parachute-vault not found on PATH/);
+  });
+});
+
+describe("cli lazy-import isolation (feedback #9)", () => {
+  // Regression for the eager-import fragility: `cli.ts` used to import every
+  // command module at top-level, so a module that THREW at eval-time (the 0.6.2
+  // `migrate-cutover.ts` ReferenceError) aborted the entire CLI load — even
+  // `parachute --help` — because top-level import evaluation runs before
+  // `run()`'s try/catch is reached. Per-arm lazy `await import()` isolates a
+  // broken module to its own command.
+  //
+  // We exercise the REAL dispatcher: copy the live `src/` tree (plus the repo
+  // `package.json`, which `cli.ts` imports as `../package.json`) into a sandbox
+  // *inside the repo* so workspace `node_modules` resolution still works, then
+  // corrupt one command module so it throws at module-eval. `node_modules` is
+  // NOT copied — Bun walks up to the repo's. The corruption never touches the
+  // real source tree, so concurrent suites are unaffected.
+  let sandbox: string;
+  let sandboxCli: string;
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(join(REPO_ROOT, ".tmp-cli-iso-"));
+    cpSync(join(REPO_ROOT, "src"), join(sandbox, "src"), { recursive: true });
+    cpSync(join(REPO_ROOT, "package.json"), join(sandbox, "package.json"));
+    sandboxCli = join(sandbox, "src", "cli.ts");
+    // Append an unconditional throw so the module fails at eval. `migrate-cutover`
+    // is the canonical real-world case (the 0.6.2 bug) AND it's reachable by both
+    // eager paths the fix addresses: the direct `cli.ts` import and the transitive
+    // `cli.ts → lifecycle.ts → migrate-offer.ts → migrate-cutover.ts` chain.
+    appendFileSync(
+      join(sandbox, "src", "commands", "migrate-cutover.ts"),
+      '\nthrow new ReferenceError("boom: migrate-cutover failed at module eval");\n',
+    );
+  });
+
+  afterAll(() => {
+    if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  async function runSandbox(
+    args: string[],
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    const proc = Bun.spawn([process.execPath, sandboxCli, ...args], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        HOME: "/tmp/parachute-hub-nonexistent-home",
+        PARACHUTE_HOME: "/tmp/parachute-hub-nonexistent-home",
+      },
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { code, stdout, stderr };
+  }
+
+  test("a command module that throws at eval does NOT abort --help", async () => {
+    const { code, stdout } = await runSandbox(["--help"]);
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/parachute install/);
+  });
+
+  test("an unrelated command still dispatches when one module is broken", async () => {
+    // `status` doesn't touch migrate-cutover at all — it must still run to
+    // completion (exit 0) rather than dying at top-level import.
+    const { code } = await runSandbox(["status"]);
+    expect(code).toBe(0);
+  });
+
+  test("lifecycle commands survive the broken transitive path", async () => {
+    // `stop` pulls in `migrate-offer.ts` (for the §7.5 detect-and-offer), which
+    // used to EAGERLY import the broken `migrate-cutover.ts`. With the import now
+    // `import type` + lazy, `stop --help` must not crash.
+    const { code, stdout } = await runSandbox(["stop", "--help"]);
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/parachute stop/);
+  });
+
+  test("the broken command itself exits 1 with a 'failed to load' message", async () => {
+    const { code, stderr } = await runSandbox(["migrate", "--to-supervised"]);
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/parachute migrate: failed to load/);
+    expect(stderr).toMatch(/boom: migrate-cutover failed at module eval/);
   });
 });
 

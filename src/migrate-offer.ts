@@ -22,11 +22,15 @@
  */
 
 import { existsSync } from "node:fs";
-import {
-  type CutoverOpts,
-  type CutoverResult,
-  cutoverToSupervised,
-} from "./commands/migrate-cutover.ts";
+// `migrate-cutover.ts` is imported as a TYPE only (erased at compile time, no
+// module evaluation) and loaded LAZILY at the call site below. This breaks the
+// transitive eager-load chain `cli.ts` → `lifecycle.ts` → `migrate-offer.ts` →
+// `migrate-cutover.ts`: a broken `migrate-cutover` (e.g. the 0.6.2 eval-time
+// ReferenceError) must not crash the start/stop/restart/logs lifecycle commands
+// that pull in this module purely for the §7.5 detect-and-offer machinery. The
+// cutover is only ever evaluated when an operator interactively accepts the
+// offer, so deferring its import to that moment keeps the whole chain robust.
+import type { CutoverOpts, CutoverResult } from "./commands/migrate-cutover.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
 import { HUB_SVC } from "./hub-control.ts";
 import { type HubUnitDeps, defaultHubUnitDeps, isHubUnitInstalled } from "./hub-unit.ts";
@@ -149,7 +153,6 @@ export async function offerMigrateToSupervised(
   const unitInstalledFn = opts.isHubUnitInstalled ?? isHubUnitInstalled;
   const hubUnitDeps = opts.hubUnitDeps ?? defaultHubUnitDeps;
   const hasPriorDetached = opts.hasPriorDetached ?? hasPriorDetachedInstall;
-  const cutover = opts.cutover ?? cutoverToSupervised;
   const prompt = opts.prompt ?? defaultOfferPrompt;
   const isTty = opts.isTty ?? Boolean(process.stdin.isTTY);
 
@@ -179,6 +182,12 @@ export async function offerMigrateToSupervised(
     return { outcome: "declined" };
   }
 
+  // Resolve the cutover lazily: only import `migrate-cutover.ts` now that the
+  // operator has accepted, so the offer's mere availability never drags the
+  // cutover module into the lifecycle-command load graph (see the `import type`
+  // note at the top). Tests inject `opts.cutover` and never hit the import.
+  const cutover =
+    opts.cutover ?? (await import("./commands/migrate-cutover.ts")).cutoverToSupervised;
   const result = await cutover({ configDir, manifestPath, log });
   for (const line of result.messages) log(line);
   const ok = result.outcome === "migrated" || result.outcome === "already-migrated";
