@@ -374,6 +374,95 @@ describe("cli lazy-import isolation (feedback #9)", () => {
   });
 });
 
+// hub#534: `migrate --teardown` must surface teardownHubUnit's outcome — pre-fix
+// it ignored `removed` + `messages` and always exited 0, so a non-removal looked
+// like success. We exercise the REAL CLI arm via the in-repo sandbox (same shape
+// as the lazy-import suite above) so the arm's exit-code mapping runs end-to-end
+// without shelling out to real launchctl/systemctl: the sandboxed
+// `teardownHubUnit` is replaced with a stub keyed off an env var.
+describe("cli migrate --teardown exit-code policy (hub#534)", () => {
+  let sandbox: string;
+  let sandboxCli: string;
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(join(REPO_ROOT, ".tmp-cli-teardown-"));
+    cpSync(join(REPO_ROOT, "src"), join(sandbox, "src"), { recursive: true });
+    cpSync(join(REPO_ROOT, "package.json"), join(sandbox, "package.json"));
+    sandboxCli = join(sandbox, "src", "cli.ts");
+    // Replace migrate-cutover.ts entirely with a minimal stub exporting only the
+    // `teardownHubUnit` the CLI arm calls. Its result is driven by
+    // `TEARDOWN_FAKE` so one rewrite covers all three outcomes. It logs the same
+    // human-facing lines the real function would (so the stdout assertions match
+    // real behavior), and the CLI owns the exit code.
+    writeFileSync(
+      join(sandbox, "src", "commands", "migrate-cutover.ts"),
+      [
+        "export function teardownHubUnit() {",
+        '  const mode = process.env.TEARDOWN_FAKE ?? "removed";',
+        '  if (mode === "removed") {',
+        '    console.log("Removed systemd unit parachute-hub.service — the hub no longer starts on boot.");',
+        "    return { removed: true, messages: [] };",
+        "  }",
+        '  if (mode === "failure") {',
+        '    console.log("Hub-unit teardown did not complete:");',
+        '    console.log("  systemctl disable failed: permission denied");',
+        '    return { removed: false, messages: ["systemctl disable failed: permission denied"] };',
+        "  }",
+        '  console.log("No hub unit was installed — nothing to tear down.");',
+        "  return { removed: false, messages: [] };",
+        "}",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  afterAll(() => {
+    if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  async function runTeardown(
+    fake: string,
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    const proc = Bun.spawn([process.execPath, sandboxCli, "migrate", "--teardown"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        HOME: "/tmp/parachute-hub-nonexistent-home",
+        PARACHUTE_HOME: "/tmp/parachute-hub-nonexistent-home",
+        TEARDOWN_FAKE: fake,
+      },
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { code, stdout, stderr };
+  }
+
+  test("removed → exit 0 with the removal message", async () => {
+    const { code, stdout } = await runTeardown("removed");
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/Removed systemd unit/);
+  });
+
+  test("nothing installed → informational exit 0", async () => {
+    const { code, stdout } = await runTeardown("nothing");
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/nothing to tear down/);
+  });
+
+  test("removal failure (messages present) → exit 1, reason on stderr", async () => {
+    const { code, stdout, stderr } = await runTeardown("failure");
+    expect(code).toBe(1);
+    // The function logged the failure header to stdout; the CLI re-surfaces the
+    // detail on stderr so a script's `2>` capture sees the reason.
+    expect(stdout).toMatch(/did not complete/);
+    expect(stderr).toMatch(/permission denied/);
+  });
+});
+
 describe("cli friendly errors", () => {
   test("malformed services.json prints friendly error not stack trace", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pcli-bad-"));

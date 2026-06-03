@@ -535,6 +535,29 @@ describe("teardownHubUnit (§7.4)", () => {
     expect(staleCalled).toBe(true);
     expect(log.join("\n")).toContain("nothing to tear down");
   });
+
+  test("removal failure (removed:false WITH messages) → surfaces the reason, not 'nothing installed' (hub#534)", () => {
+    // A future / defensive `removeManagedUnit` that returns removed:false WITH a
+    // failure reason must NOT be reported as the benign "nothing was installed"
+    // line — the operator (and the CLI's non-zero exit) need the real detail.
+    const log: string[] = [];
+    const res = teardownHubUnit({
+      log: (l) => log.push(l),
+      deps: fakeHubUnitDeps(),
+      remove: (): ManagedUnitRemoveResult => ({
+        removed: false,
+        messages: ["systemctl disable failed: permission denied"],
+      }),
+      disableStaleModuleUnits: () => ({ actions: [] }),
+    });
+    expect(res.removed).toBe(false);
+    expect(res.messages).toEqual(["systemctl disable failed: permission denied"]);
+    const out = log.join("\n");
+    expect(out).toContain("did not complete");
+    expect(out).toContain("permission denied");
+    // Must NOT claim nothing was installed when there was a real failure.
+    expect(out).not.toContain("nothing to tear down");
+  });
 });
 
 // ===========================================================================
