@@ -164,6 +164,32 @@ describe("bootSupervisedModules", () => {
     expect(recorder.calls[0]?.env?.SCRIBE_URL).toBe("http://127.0.0.1:3200");
   });
 
+  test("services.json entry.port wins over a stale .env PORT (hub#537)", async () => {
+    // Pre-hub#206 installs wrote `PORT=` into the per-service .env. A leftover
+    // PORT there that disagrees with services.json (e.g. scribe's stale 1944 vs
+    // canonical 1943) must NOT shadow entry.port — otherwise the supervisor
+    // injects + probes the wrong port and records a false `started_but_unbound`.
+    writeManifest({ services: [VAULT_ENTRY] }, h.manifestPath);
+    mkdirSync(join(h.dir, "vault"), { recursive: true });
+    writeFileSync(
+      join(h.dir, "vault", ".env"),
+      "PORT=1944\nSCRIBE_AUTH_TOKEN=secret-token\n",
+    );
+
+    const recorder = makeRecorder();
+    const sup = new Supervisor({ spawnFn: recorder.spawn });
+
+    await bootSupervisedModules(sup, {
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+    });
+
+    // entry.port (1940) wins; the stale .env PORT is dropped. Other .env
+    // values still merge.
+    expect(recorder.calls[0]?.env?.PORT).toBe("1940");
+    expect(recorder.calls[0]?.env?.SCRIBE_AUTH_TOKEN).toBe("secret-token");
+  });
+
   test("hubOrigin wins over a stale .env entry on collision", async () => {
     writeManifest({ services: [VAULT_ENTRY] }, h.manifestPath);
     mkdirSync(join(h.dir, "vault"), { recursive: true });

@@ -75,9 +75,14 @@ export interface BuildSpawnRequestOpts {
  * Env layering (later wins):
  *   1. `PORT` from the services.json `entry.port` — overrides hub's own PORT
  *      so supervised children honor their canonical port assignment
- *      (hub#356/#357).
+ *      (hub#356/#357). This is authoritative and is NOT overridable by a
+ *      `.env` `PORT` (see below) — services.json is the single source of truth
+ *      for the port (scribe#41 4-tier ladder; hub#206).
  *   2. per-service `.env` at `<configDir>/<short>/.env` — operator-configured
- *      values (e.g. scribe provider keys) override the bare PORT.
+ *      values (e.g. scribe provider keys) merge on top. A `PORT` key here is
+ *      dropped: a stale pre-#206 `.env` `PORT` must not shadow `entry.port`
+ *      (hub#537 — a leftover scribe `PORT=1944` ≠ services.json `1943` leaked
+ *      into the injected PORT and broke the supervisor's readiness probe).
  *   3. `PARACHUTE_HUB_ORIGIN` = `opts.hubOrigin` — anchors the child's `iss`
  *      expectation to the value hub mints with (hub#365).
  *   4. `opts.extraEnv` — test seam / first-boot pass-through; wins last.
@@ -93,7 +98,15 @@ export function buildModuleSpawnRequest(
   opts: BuildSpawnRequestOpts,
 ): SpawnReqShape {
   const fileEnv = readEnvFileValues(join(opts.configDir, short, ".env"));
-  const env: Record<string, string> = { PORT: String(entry.port), ...fileEnv };
+  // Drop a `PORT` from the per-service .env: services.json `entry.port` is the
+  // canonical port and must win (scribe#41 ladder; hub#206). A stale pre-#206
+  // `.env` PORT (e.g. scribe's `1944` vs services.json `1943`) would otherwise
+  // leak into the injected PORT and the supervisor's readiness probe would
+  // check the wrong port → false `started_but_unbound` (hub#537). The module's
+  // own resolvePort ladder already prefers services.json, so this keeps the
+  // injected PORT + probe in agreement with what the child actually binds.
+  const { PORT: _staleEnvPort, ...fileEnvSansPort } = fileEnv;
+  const env: Record<string, string> = { PORT: String(entry.port), ...fileEnvSansPort };
   if (opts.hubOrigin) env[HUB_ORIGIN_ENV] = opts.hubOrigin;
   if (opts.extraEnv) Object.assign(env, opts.extraEnv);
 
