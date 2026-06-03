@@ -20,6 +20,7 @@ import {
 import {
   type DriveModuleOpDeps,
   type ModuleStatesResult,
+  type ModuleStateSnapshot,
   NoOperatorTokenError,
   OperatorTokenExpiredError,
   fetchModuleStates as fetchModuleStatesImpl,
@@ -487,7 +488,7 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
     }
   }
 
-  const stateByShort = new Map<string, ModuleStatesResult["modules"][number]>();
+  const stateByShort = new Map<string, ModuleStateSnapshot>();
   for (const m of states?.modules ?? []) {
     if (m.short) stateByShort.set(m.short, m);
   }
