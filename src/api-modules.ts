@@ -243,8 +243,32 @@ interface ModuleWireShape {
   management_url: string | null;
 }
 
+/**
+ * Per-module supervisor snapshot for the `supervised` array (hub#539). The
+ * supervisor-derived subset of `ModuleWireShape` — enough for `status` to
+ * render a run-state row for a module that isn't in the curated catalog.
+ */
+interface SupervisedSnapshotWire {
+  short: string;
+  installed: boolean;
+  installed_version: string | null;
+  supervisor_status: ModuleState["status"] | null;
+  pid: number | null;
+  supervisor_start_error: ModuleStartError | null;
+}
+
 interface ModulesResponse {
   modules: ModuleWireShape[];
+  /**
+   * Run-state for EVERY module the supervisor is currently tracking — not just
+   * the curated `modules` (vault/scribe). Non-curated supervised modules (e.g.
+   * the `surface` UI host) appear here so `parachute status` / the SPA can
+   * reflect their real run-state instead of mislabelling them `inactive`
+   * because they're absent from the curated catalog (hub#539). Curated modules
+   * also appear here (harmless — consumers dedupe by `short`, preferring the
+   * richer `modules` entry). Same supervisor-field shape as a `modules` entry.
+   */
+  supervised: SupervisedSnapshotWire[];
   /**
    * Whether the supervisor is wired into this hub. `false` under
    * `parachute expose` / on-box CLI; the UI greys out install/start
@@ -522,8 +546,20 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
     });
   }
 
+  // Every supervised module's run-state — curated AND non-curated (hub#539).
+  // Built from the same supervisor.list() snapshot already in `stateByShort`.
+  const supervised: SupervisedSnapshotWire[] = Array.from(stateByShort.values()).map((s) => ({
+    short: s.short,
+    installed: installedByShort.has(s.short),
+    installed_version: installedByShort.get(s.short)?.version ?? null,
+    supervisor_status: s.status,
+    pid: s.pid ?? null,
+    supervisor_start_error: s.startError ?? null,
+  }));
+
   const body: ModulesResponse = {
     modules,
+    supervised,
     supervisor_available: supervisor !== undefined,
     module_install_channel: getModuleInstallChannel(deps.db),
   };

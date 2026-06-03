@@ -491,6 +491,13 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
   for (const m of states?.modules ?? []) {
     if (m.short) stateByShort.set(m.short, m);
   }
+  // Fall back to the full `supervised` snapshot for modules the curated
+  // `modules` catalog omits — e.g. the `surface` UI host, which the supervisor
+  // runs but isn't a curated installable. Without this it'd map to `inactive`
+  // despite running (hub#539). Curated entries already in the map win (richer).
+  for (const m of states?.supervised ?? []) {
+    if (m.short && !stateByShort.has(m.short)) stateByShort.set(m.short, m);
+  }
 
   const rows: StatusRow[] = manifest.services.map((entry) => {
     const base = manifestRowBase(entry, installSourceDeps);
