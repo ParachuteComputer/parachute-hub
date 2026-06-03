@@ -183,6 +183,27 @@ describe("driveModuleOp — auth + transport", () => {
     expect(calls).toHaveLength(0);
   });
 
+  test("non-2xx with NO error body → fallback names the HTTP status, not bare 'request failed' (hub#536)", async () => {
+    h = await makeHarnessWithToken();
+    // An empty `{}` body models a handler crash that produced a bodyless 500
+    // (pre-fix this collapsed to an unactionable "request failed").
+    const { fetch: f } = fakeFetch([{ status: 500, body: {} }]);
+    let err: unknown;
+    try {
+      await driveModuleOp("vault", "start", {
+        db: h.db,
+        issuer: ISSUER,
+        configDir: h.dir,
+        fetch: f,
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ModuleOpHttpError);
+    expect((err as ModuleOpHttpError).status).toBe(500);
+    expect((err as Error).message).toContain("hub returned HTTP 500 with no error detail");
+  });
+
   test("non-2xx hub response → ModuleOpHttpError carrying status + code", async () => {
     h = await makeHarnessWithToken();
     const { fetch: f } = fakeFetch([

@@ -183,7 +183,7 @@ export async function driveModuleOp(
   const body = await parseJsonSafe(res);
 
   if (res.status < 200 || res.status >= 300) {
-    const { error, error_description } = asErrorBody(body);
+    const { error, error_description } = asErrorBody(body, res.status);
     throw new ModuleOpHttpError(res.status, error, error_description);
   }
 
@@ -231,7 +231,7 @@ async function pollOperation(
     });
     const body = await parseJsonSafe(res);
     if (res.status < 200 || res.status >= 300) {
-      const { error, error_description } = asErrorBody(body);
+      const { error, error_description } = asErrorBody(body, res.status);
       throw new ModuleOpHttpError(res.status, error, error_description);
     }
     const status = extractOpStatus(body);
@@ -288,7 +288,7 @@ export async function fetchModuleLogs(
   });
   const body = await parseJsonSafe(res);
   if (res.status < 200 || res.status >= 300) {
-    const { error, error_description } = asErrorBody(body);
+    const { error, error_description } = asErrorBody(body, res.status);
     throw new ModuleOpHttpError(res.status, error, error_description);
   }
   const b = (body ?? {}) as { lines?: unknown; text?: unknown };
@@ -396,7 +396,7 @@ export async function fetchModuleStates(deps: DriveModuleOpDeps): Promise<Module
   }
   const body = await parseJsonSafe(res);
   if (res.status < 200 || res.status >= 300) {
-    const { error, error_description } = asErrorBody(body);
+    const { error, error_description } = asErrorBody(body, res.status);
     throw new ModuleOpHttpError(res.status, error, error_description);
   }
   const b = (body ?? {}) as {
@@ -437,15 +437,20 @@ async function parseJsonSafe(res: Response): Promise<unknown> {
   }
 }
 
-function asErrorBody(body: unknown): { error: string; error_description: string } {
+function asErrorBody(body: unknown, status: number): { error: string; error_description: string } {
+  // A bare/unparseable error response used to collapse to "request failed",
+  // which gave the operator nothing to act on (hub#536 — a spawn-throw
+  // escaping a handler produced exactly this). Carry the HTTP status so even
+  // the worst case names the failure class.
+  const fallback = `hub returned HTTP ${status} with no error detail`;
   if (body && typeof body === "object") {
     const b = body as Record<string, unknown>;
     const error = typeof b.error === "string" ? b.error : "error";
     const error_description =
-      typeof b.error_description === "string" ? b.error_description : "request failed";
+      typeof b.error_description === "string" ? b.error_description : fallback;
     return { error, error_description };
   }
-  return { error: "error", error_description: "request failed" };
+  return { error: "error", error_description: fallback };
 }
 
 function extractOperationId(body: unknown): string | undefined {
