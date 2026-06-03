@@ -9,19 +9,16 @@
 import { MissingDependencyError } from "@openparachute/depcheck";
 import pkg from "../package.json" with { type: "json" };
 import { CloudflaredStateError } from "./cloudflare/state.ts";
-import { auth } from "./commands/auth.ts";
-import { exposePublic, exposeTailnet } from "./commands/expose.ts";
-import { init } from "./commands/init.ts";
-import { install } from "./commands/install.ts";
-import { logs, restart, start, stop } from "./commands/lifecycle.ts";
-import { cutoverToSupervised, teardownHubUnit } from "./commands/migrate-cutover.ts";
-import { migrate } from "./commands/migrate.ts";
-import { serve } from "./commands/serve.ts";
-import { setup } from "./commands/setup.ts";
-import { status } from "./commands/status.ts";
-import { upgrade } from "./commands/upgrade.ts";
-import { dispatchVault } from "./commands/vault.ts";
-import { runSetupWizardCommand } from "./commands/wizard.ts";
+// Command-implementation modules are loaded LAZILY inside their switch arms (see
+// `loadCommand` + each `case`), so a module that throws at eval-time is isolated
+// to its own command instead of aborting the whole CLI at top-level import. The
+// `import type`s below are erased at compile time (they trigger no module
+// evaluation) and exist only so the arms can reference each command's options
+// type for `Parameters<typeof …>`.
+import type { init } from "./commands/init.ts";
+import type { install } from "./commands/install.ts";
+import type { setup } from "./commands/setup.ts";
+import type { upgrade } from "./commands/upgrade.ts";
 import { ExposeStateError } from "./expose-state.ts";
 import {
   exposeHelp,
@@ -273,6 +270,34 @@ function extractExposeProviderFlags(args: string[]): {
   return out;
 }
 
+/**
+ * Lazy-load a command-implementation module, isolating an eval-time throw to the
+ * command that asked for it.
+ *
+ * `cli.ts` used to eagerly `import` every command module at top-level. That made
+ * a single broken module (e.g. a half-built `migrate-cutover.ts` with a
+ * ReferenceError at eval) abort the *entire* CLI load — even `parachute --help`
+ * — because top-level import evaluation runs before `run()`'s try/catch is ever
+ * reached. Loading each module lazily inside its switch arm (the same pattern
+ * the expose subcommands already use, e.g. `await import("./commands/expose-
+ * cloudflare.ts")`) means an import rejection touches only its own command.
+ *
+ * On rejection we print `parachute <cmd>: failed to load (<err>)` and return
+ * `undefined`; the arm turns that into exit code 1. This keeps a broken module
+ * from surfacing as an unhandled promise rejection (which the top-level
+ * `run()` boundary doesn't shape — it wraps execution, not import).
+ */
+async function loadCommand<T>(cmd: string, importer: () => Promise<T>): Promise<T | undefined> {
+  try {
+    return await importer();
+  } catch (err) {
+    console.error(
+      `parachute ${cmd}: failed to load (${err instanceof Error ? err.message : String(err)})`,
+    );
+    return undefined;
+  }
+}
+
 async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
 
@@ -309,7 +334,9 @@ async function main(argv: string[]): Promise<number> {
       const setupOpts: Parameters<typeof setup>[0] = {};
       if (tagExtract.tag) setupOpts.tag = tagExtract.tag;
       if (noStart) setupOpts.noStart = true;
-      return await setup(setupOpts);
+      const mod = await loadCommand("setup", () => import("./commands/setup.ts"));
+      if (!mod) return 1;
+      return await mod.setup(setupOpts);
     }
 
     case "setup-wizard": {
@@ -323,7 +350,9 @@ async function main(argv: string[]): Promise<number> {
         console.log(setupWizardHelp());
         return 0;
       }
-      return await runSetupWizardCommand(rest);
+      const mod = await loadCommand("setup-wizard", () => import("./commands/wizard.ts"));
+      if (!mod) return 1;
+      return await mod.runSetupWizardCommand(rest);
     }
 
     case "init": {
@@ -379,7 +408,9 @@ async function main(argv: string[]): Promise<number> {
       }
       if (cliWizard) initOpts.wizardChoice = "cli";
       else if (browserWizard) initOpts.wizardChoice = "browser";
-      return await init(initOpts);
+      const mod = await loadCommand("init", () => import("./commands/init.ts"));
+      if (!mod) return 1;
+      return await mod.init(initOpts);
     }
 
     case "install": {
@@ -438,16 +469,18 @@ async function main(argv: string[]): Promise<number> {
       if (noStart) installOpts.noStart = true;
       if (providerExtract.value) installOpts.scribeProvider = providerExtract.value;
       if (keyExtract.value) installOpts.scribeKey = keyExtract.value;
+      const mod = await loadCommand("install", () => import("./commands/install.ts"));
+      if (!mod) return 1;
       if (service === "all") {
         // Bootstrap the whole ecosystem to one dist-tag — the RC-testing payload.
         // Bail on first failure so a broken channel doesn't mask a working tag.
         for (const svc of knownServices()) {
-          const code = await install(svc, installOpts);
+          const code = await mod.install(svc, installOpts);
           if (code !== 0) return code;
         }
         return 0;
       }
-      return await install(service, installOpts);
+      return await mod.install(service, installOpts);
     }
 
     case "status":
@@ -459,7 +492,11 @@ async function main(argv: string[]): Promise<number> {
       // dual-dispatch: on a box with a hub unit installed it reads the platform
       // manager + the running supervisor; on a legacy detached box it falls back
       // to the pidfile readout (design §6.4). Tests drive the seams directly.
-      return await status({ supervisor: {} });
+      {
+        const mod = await loadCommand("status", () => import("./commands/status.ts"));
+        if (!mod) return 1;
+        return await mod.status({ supervisor: {} });
+      }
 
     case "expose": {
       const hubExtract = extractHubOrigin(rest);
@@ -585,6 +622,14 @@ async function main(argv: string[]): Promise<number> {
         ...(hubExtract.hubOrigin ? { hubOrigin: hubExtract.hubOrigin } : {}),
       };
 
+      // Lazy-load the Tailscale-Funnel entry points the same way the Cloudflare /
+      // interactive / auto-pick paths above load theirs. Reaching here means we're
+      // past the early Cloudflare returns, so `exposePublic` / `exposeTailnet` are
+      // about to be needed by one of the branches below.
+      const exposeMod = await loadCommand("expose", () => import("./commands/expose.ts"));
+      if (!exposeMod) return 1;
+      const { exposePublic, exposeTailnet } = exposeMod;
+
       // `--tailnet` is the explicit Tailscale Funnel pin — bypass both the
       // interactive picker and the non-TTY auto-pick. Goes straight to
       // exposePublic so today's Funnel flow keeps working unchanged.
@@ -677,7 +722,9 @@ async function main(argv: string[]): Promise<number> {
         migrateOffer: { enabled: true },
         ...(hubExtract.hubOrigin ? { hubOrigin: hubExtract.hubOrigin } : {}),
       };
-      return await start(hubExtract.rest[0], startOpts);
+      const mod = await loadCommand("start", () => import("./commands/lifecycle.ts"));
+      if (!mod) return 1;
+      return await mod.start(hubExtract.rest[0], startOpts);
     }
 
     case "stop": {
@@ -685,7 +732,9 @@ async function main(argv: string[]): Promise<number> {
         console.log(stopHelp());
         return 0;
       }
-      return await stop(rest[0], { supervisor: {}, migrateOffer: { enabled: true } });
+      const mod = await loadCommand("stop", () => import("./commands/lifecycle.ts"));
+      if (!mod) return 1;
+      return await mod.stop(rest[0], { supervisor: {}, migrateOffer: { enabled: true } });
     }
 
     case "restart": {
@@ -693,7 +742,9 @@ async function main(argv: string[]): Promise<number> {
         console.log(restartHelp());
         return 0;
       }
-      return await restart(rest[0], { supervisor: {}, migrateOffer: { enabled: true } });
+      const mod = await loadCommand("restart", () => import("./commands/lifecycle.ts"));
+      if (!mod) return 1;
+      return await mod.restart(rest[0], { supervisor: {}, migrateOffer: { enabled: true } });
     }
 
     case "upgrade": {
@@ -744,7 +795,9 @@ async function main(argv: string[]): Promise<number> {
         upgradeOpts.channel = channelExtract.value;
       }
       if (allowDowngrade) upgradeOpts.allowDowngrade = true;
-      return await upgrade(remaining[0], upgradeOpts);
+      const mod = await loadCommand("upgrade", () => import("./commands/upgrade.ts"));
+      if (!mod) return 1;
+      return await mod.upgrade(remaining[0], upgradeOpts);
     }
 
     case "logs": {
@@ -759,7 +812,9 @@ async function main(argv: string[]): Promise<number> {
         return 1;
       }
       const follow = rest.includes("-f") || rest.includes("--follow");
-      return await logs(svc, { follow });
+      const mod = await loadCommand("logs", () => import("./commands/lifecycle.ts"));
+      if (!mod) return 1;
+      return await mod.logs(svc, { follow });
     }
 
     case "migrate": {
@@ -775,7 +830,9 @@ async function main(argv: string[]): Promise<number> {
           console.error("usage: parachute migrate --teardown");
           return 1;
         }
-        teardownHubUnit();
+        const mod = await loadCommand("migrate", () => import("./commands/migrate-cutover.ts"));
+        if (!mod) return 1;
+        mod.teardownHubUnit();
         return 0;
       }
       // §7.1 detached→supervised cutover. Opt-in surface (the archive sweep
@@ -788,7 +845,9 @@ async function main(argv: string[]): Promise<number> {
           console.error("usage: parachute migrate --to-supervised");
           return 1;
         }
-        const result = await cutoverToSupervised();
+        const mod = await loadCommand("migrate", () => import("./commands/migrate-cutover.ts"));
+        if (!mod) return 1;
+        const result = await mod.cutoverToSupervised();
         for (const line of result.messages) console.log(line);
         // "already-migrated" / "migrated" are success; every other outcome is a
         // recoverable failure that should exit non-zero so scripts can retry.
@@ -807,7 +866,9 @@ async function main(argv: string[]): Promise<number> {
         );
         return 1;
       }
-      return await migrate({ dryRun, list, yes });
+      const mod = await loadCommand("migrate", () => import("./commands/migrate.ts"));
+      if (!mod) return 1;
+      return await mod.migrate({ dryRun, list, yes });
     }
 
     case "serve": {
@@ -824,7 +885,9 @@ async function main(argv: string[]): Promise<number> {
       // event loop alive until SIGINT/SIGTERM, at which point we stop the
       // server cleanly and exit. Container supervisor (tini, Render, Docker)
       // reaps us once the event loop drains.
-      const { stop: stopServer } = await serve();
+      const mod = await loadCommand("serve", () => import("./commands/serve.ts"));
+      if (!mod) return 1;
+      const { stop: stopServer } = await mod.serve();
       await new Promise<void>((resolve) => {
         const handler = async () => {
           await stopServer();
@@ -836,14 +899,19 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
 
-    case "auth":
-      return await auth(rest);
+    case "auth": {
+      const mod = await loadCommand("auth", () => import("./commands/auth.ts"));
+      if (!mod) return 1;
+      return await mod.auth(rest);
+    }
 
     case "vault": {
+      const mod = await loadCommand("vault", () => import("./commands/vault.ts"));
+      if (!mod) return 1;
       // `parachute vault` with no args forwards --help to parachute-vault so
       // users see the actual vault surface, not a CLI-side stub. Anything
       // after `vault` (including --help) is passed through verbatim.
-      if (rest.length === 0) return await dispatchVault(["--help"]);
+      if (rest.length === 0) return await mod.dispatchVault(["--help"]);
 
       // Everything under `vault` forwards transparently to `parachute-vault`.
       // `vault tokens create` used to route through a guided interactive
@@ -852,7 +920,7 @@ async function main(argv: string[]): Promise<number> {
       // hub-issued JWTs; mint them with `parachute auth mint-token` or the
       // admin SPA Connect card. We forward verbatim so the operator sees
       // vault's own migration error rather than a hub-side stub.
-      return await dispatchVault(rest);
+      return await mod.dispatchVault(rest);
     }
 
     default:

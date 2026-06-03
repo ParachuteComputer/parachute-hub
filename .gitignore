@@ -7,3 +7,4 @@ dist/
 *.tsbuildinfo
 bun.lock.backup
 package/
+.tmp-cli-iso-*/
