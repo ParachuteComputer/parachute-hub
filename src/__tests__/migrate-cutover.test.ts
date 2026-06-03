@@ -490,6 +490,12 @@ describe("teardownHubUnit (§7.4)", () => {
     const log: string[] = [];
     const res = teardownHubUnit({
       log: (l) => log.push(l),
+      // hub#535: inject fake deps so teardown NEVER falls back to the production
+      // default Runner (which would shell out to the real launchctl/systemctl).
+      // The injected fakes below mean no service-manager call is even attempted,
+      // but pinning `deps` removes the latent "forgot to inject → real bootout"
+      // hazard at the source.
+      deps: fakeHubUnitDeps(),
       remove: (opts): ManagedUnitRemoveResult => {
         removeArgs = { launchdLabel: opts.launchdLabel, systemdUnitName: opts.systemdUnitName };
         return { removed: true, messages: [opts.removedSystemdMessage(opts.systemdUnitName)] };
@@ -514,6 +520,9 @@ describe("teardownHubUnit (§7.4)", () => {
     const log: string[] = [];
     const res = teardownHubUnit({
       log: (l) => log.push(l),
+      // hub#535: inject fake deps (see the success-path test above) so this never
+      // reaches the production default Runner / real service manager.
+      deps: fakeHubUnitDeps(),
       remove: (): ManagedUnitRemoveResult => ({ removed: false, messages: [] }),
       disableStaleModuleUnits: () => {
         staleCalled = true;

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { guardServiceManagerCommand } from "./launchctl-guard.ts";
 
 /**
  * Platform-agnostic "managed unit" machinery — the reusable launchd/systemd
@@ -86,6 +87,12 @@ export const defaultManagedUnitDeps: ManagedUnitDeps = {
   userName: () => process.env.USER ?? process.env.LOGNAME ?? process.env.USERNAME ?? "",
   which: (binary) => Bun.which(binary),
   run: (cmd) => {
+    // hub#535 boundary guard: under a test runner, REFUSE destructive
+    // launchctl/systemctl verbs (bootout/bootstrap/load/kickstart, etc.) instead
+    // of spawning the REAL service manager — a test that forgot to inject a fake
+    // `run` must not be able to tear down the operator's live daemon by omission.
+    // No-op in production (NODE_ENV !== "test"); see src/launchctl-guard.ts.
+    guardServiceManagerCommand(cmd);
     const proc = Bun.spawnSync([...cmd], { env: process.env });
     return {
       code: proc.exitCode ?? 1,
