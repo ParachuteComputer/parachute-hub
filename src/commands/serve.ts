@@ -103,6 +103,22 @@ export function formatListeningBanner(args: {
   return `parachute serve: listening on http://${displayHost}:${port}${boundNote} (PARACHUTE_HOME=${configDir}, db=${dbPath}, issuer=${issuer ?? "<request-origin>"}, admin=${adminBootstrap})`;
 }
 
+/**
+ * Map a `Bun.serve` bind failure to a clear "another supervisor is running"
+ * message when it's a port-in-use error, or `null` for any other error (so the
+ * caller re-throws the original). Keeps a duplicate-supervisor start from
+ * surfacing as a raw `EADDRINUSE` stack — the operator's actionable next step
+ * is "stop the other instance," not a backtrace. See hub#536. Exported for
+ * testing (the bind itself isn't seam-injectable).
+ */
+export function hubPortConflictMessage(err: unknown, port: number): string | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/EADDRINUSE|address already in use|in use/i.test(msg)) {
+    return `parachute serve: hub port ${port} is already in use — another hub/supervisor is running. Refusing to start a duplicate supervisor (it would fight the live one over module ports). Stop the other instance first, then retry.`;
+  }
+  return null;
+}
+
 function parsePort(raw: string | undefined): number | undefined {
   if (raw === undefined || raw === "") return undefined;
   const n = Number.parseInt(raw, 10);
@@ -334,8 +350,51 @@ export async function serve(opts: ServeOpts = {}): Promise<{
 
   const supervisor = opts.supervisor ?? new Supervisor();
 
-  // Boot already-installed modules from services.json. In a container,
-  // this is the path that re-spawns vault / notes / scribe after a
+  // Claim the hub port FIRST — before booting a single supervised module. If
+  // another hub/supervisor already owns it, `Bun.serve` throws here and we
+  // exit immediately. The prior order (boot modules, *then* bind) let a
+  // duplicate `serve` spawn + port-race the live hub's children over their
+  // module ports before it ever hit the hub-port conflict — the
+  // dual-supervisor crash loop in hub#536. Binding first makes a duplicate
+  // fail fast and cleanly, leaving the live hub's children untouched.
+  let server: ReturnType<typeof Bun.serve>;
+  try {
+    server = Bun.serve({
+      port,
+      hostname,
+      // Hold idle keep-alive connections for Bun's maximum 255s so reverse-
+      // proxy edges (Render, Cloudflare, fly.io) don't race us when reusing
+      // pooled connections. See `src/hub-server.ts` for the full rationale —
+      // this is the active code path for `bun src/cli.ts serve` (the Docker
+      // CMD), so the fix has to land here too. Closes hub#399.
+      idleTimeout: 255,
+      fetch: hubFetch(WELL_KNOWN_DIR, {
+        getDb: () => db,
+        issuer,
+        loopbackPort: port,
+        supervisor,
+      }),
+    });
+  } catch (err) {
+    const conflict = hubPortConflictMessage(err, port);
+    if (conflict) throw new Error(conflict);
+    throw err;
+  }
+
+  log(
+    formatListeningBanner({
+      hostname,
+      port,
+      configDir: CONFIG_DIR,
+      dbPath,
+      issuer,
+      adminBootstrap,
+    }),
+  );
+
+  // Boot already-installed modules from services.json — now that we own the
+  // hub port (above), we're guaranteed to be the sole supervisor. In a
+  // container, this is the path that re-spawns vault / notes / scribe after a
   // restart — the persistent disk preserved both the install (in
   // `$BUN_INSTALL/install/global/node_modules`) and the row that says
   // "this module is registered + active." Idempotent: the supervisor
@@ -361,34 +420,6 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       );
     }
   }
-
-  const server = Bun.serve({
-    port,
-    hostname,
-    // Hold idle keep-alive connections for Bun's maximum 255s so reverse-
-    // proxy edges (Render, Cloudflare, fly.io) don't race us when reusing
-    // pooled connections. See `src/hub-server.ts` for the full rationale —
-    // this is the active code path for `bun src/cli.ts serve` (the Docker
-    // CMD), so the fix has to land here too. Closes hub#399.
-    idleTimeout: 255,
-    fetch: hubFetch(WELL_KNOWN_DIR, {
-      getDb: () => db,
-      issuer,
-      loopbackPort: port,
-      supervisor,
-    }),
-  });
-
-  log(
-    formatListeningBanner({
-      hostname,
-      port,
-      configDir: CONFIG_DIR,
-      dbPath,
-      issuer,
-      adminBootstrap,
-    }),
-  );
 
   return {
     result: {
