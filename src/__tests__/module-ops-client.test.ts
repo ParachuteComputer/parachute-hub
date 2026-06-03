@@ -471,6 +471,53 @@ describe("fetchModuleStates", () => {
     expect((scribe?.supervisor_start_error as { binary?: string } | null)?.binary).toBe("scribe");
   });
 
+  test("parses the `supervised` array — non-curated modules' run-state (hub#539)", async () => {
+    h = await makeHarnessWithToken();
+    const { fetch: f } = fakeFetch([
+      {
+        status: 200,
+        body: {
+          supervisor_available: true,
+          modules: [], // curated catalog can omit a running module (e.g. surface)…
+          supervised: [
+            {
+              short: "surface",
+              installed: true,
+              installed_version: null,
+              supervisor_status: "running",
+              pid: 8739,
+              supervisor_start_error: null,
+            },
+          ],
+        },
+      },
+    ]);
+    const result = await fetchModuleStates({
+      db: h.db,
+      issuer: ISSUER,
+      configDir: h.dir,
+      fetch: f,
+    });
+    expect(result.supervised).toHaveLength(1);
+    const surf = result.supervised?.find((m) => m.short === "surface");
+    expect(surf?.supervisor_status).toBe("running");
+    expect(surf?.pid).toBe(8739);
+  });
+
+  test("omitted `supervised` (older hub) parses to [] — hub#539 forward-compat", async () => {
+    h = await makeHarnessWithToken();
+    const { fetch: f } = fakeFetch([
+      { status: 200, body: { supervisor_available: true, modules: [] } },
+    ]);
+    const result = await fetchModuleStates({
+      db: h.db,
+      issuer: ISSUER,
+      configDir: h.dir,
+      fetch: f,
+    });
+    expect(result.supervised).toEqual([]);
+  });
+
   test("no operator token → NoOperatorTokenError before any fetch", async () => {
     h = await makeHarnessNoToken();
     const { fetch: f, calls } = fakeFetch([{ status: 200, body: { modules: [] } }]);

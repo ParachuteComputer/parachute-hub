@@ -330,6 +330,14 @@ export interface ModuleStatesResult {
   readonly supervisorAvailable: boolean;
   /** Per-module supervisor snapshots, keyed by short name in array order. */
   readonly modules: ModuleStateSnapshot[];
+  /**
+   * Run-state for ALL supervised modules — including non-curated ones the
+   * `modules` catalog omits (e.g. the `surface` UI host). `status` falls back
+   * to this so a running-but-non-curated module reads `active`, not `inactive`
+   * (hub#539). The live `fetchModuleStates` always populates it (`[]` against an
+   * older hub that predates the field); optional so test stubs may omit it.
+   */
+  readonly supervised?: ModuleStateSnapshot[];
 }
 
 /**
@@ -391,22 +399,34 @@ export async function fetchModuleStates(deps: DriveModuleOpDeps): Promise<Module
     const { error, error_description } = asErrorBody(body);
     throw new ModuleOpHttpError(res.status, error, error_description);
   }
-  const b = (body ?? {}) as { modules?: unknown; supervisor_available?: unknown };
+  const b = (body ?? {}) as {
+    modules?: unknown;
+    supervised?: unknown;
+    supervisor_available?: unknown;
+  };
   const supervisorAvailable = b.supervisor_available === true;
-  const modules: ModuleStateSnapshot[] = Array.isArray(b.modules)
-    ? b.modules
-        .filter((m): m is Record<string, unknown> => !!m && typeof m === "object")
-        .map((m) => ({
-          short: typeof m.short === "string" ? m.short : "",
-          installed: m.installed === true,
-          installed_version: typeof m.installed_version === "string" ? m.installed_version : null,
-          supervisor_status: typeof m.supervisor_status === "string" ? m.supervisor_status : null,
-          pid: typeof m.pid === "number" ? m.pid : null,
-          supervisor_start_error:
-            m.supervisor_start_error !== undefined ? (m.supervisor_start_error ?? null) : null,
-        }))
-    : [];
-  return { supervisorAvailable, modules };
+  const modules = parseSnapshots(b.modules);
+  // `supervised` (hub#539) carries run-state for ALL supervised modules,
+  // including non-curated ones absent from `modules` (e.g. the surface host).
+  // Older hubs without the field yield []; consumers tolerate that.
+  const supervised = parseSnapshots(b.supervised);
+  return { supervisorAvailable, modules, supervised };
+}
+
+/** Parse a `modules`/`supervised` array into validated snapshots (hub#539). */
+function parseSnapshots(raw: unknown): ModuleStateSnapshot[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((m): m is Record<string, unknown> => !!m && typeof m === "object")
+    .map((m) => ({
+      short: typeof m.short === "string" ? m.short : "",
+      installed: m.installed === true,
+      installed_version: typeof m.installed_version === "string" ? m.installed_version : null,
+      supervisor_status: typeof m.supervisor_status === "string" ? m.supervisor_status : null,
+      pid: typeof m.pid === "number" ? m.pid : null,
+      supervisor_start_error:
+        m.supervisor_start_error !== undefined ? (m.supervisor_start_error ?? null) : null,
+    }));
 }
 
 async function parseJsonSafe(res: Response): Promise<unknown> {

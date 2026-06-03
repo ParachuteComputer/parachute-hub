@@ -256,4 +256,68 @@ describe("status — per-module URL deep-links (manifestRowBase / urlForEntry)",
       cleanup();
     }
   });
+
+  test("non-curated supervised module reads `active` via the `supervised` fallback — hub#539", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      // surface is supervised but absent from the curated `modules` catalog
+      // (which only carries vault/scribe). Before hub#539 it mapped to
+      // `inactive` despite running; now `status` falls back to `supervised`.
+      upsertService(
+        {
+          name: "parachute-surface",
+          port: 1946,
+          paths: ["/surface"],
+          health: "/surface/healthz",
+          version: "0.2.2",
+        },
+        path,
+      );
+      const lines: string[] = [];
+      await status({
+        ...supervisorOpts(configDir, path, {
+          // `modules` empty (curated catalog omits surface); run-state ONLY in
+          // `supervised` — exactly the wire shape the live hub now returns.
+          moduleStates: {
+            supervisorAvailable: true,
+            modules: [],
+            supervised: [runningModule("surface")],
+          },
+        }),
+        print: (l) => lines.push(l),
+      });
+      const surfaceLine = lines.find((l) => l.includes("parachute-surface")) ?? "";
+      expect(surfaceLine).toMatch(/\bactive\b/);
+      expect(surfaceLine).not.toMatch(/\binactive\b/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("module absent from BOTH modules and supervised stays `inactive` — hub#539 boundary", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      upsertService(
+        {
+          name: "parachute-surface",
+          port: 1946,
+          paths: ["/surface"],
+          health: "/surface/healthz",
+          version: "0.2.2",
+        },
+        path,
+      );
+      const lines: string[] = [];
+      await status({
+        ...supervisorOpts(configDir, path, {
+          moduleStates: { supervisorAvailable: true, modules: [], supervised: [] },
+        }),
+        print: (l) => lines.push(l),
+      });
+      const surfaceLine = lines.find((l) => l.includes("parachute-surface")) ?? "";
+      expect(surfaceLine).toMatch(/\binactive\b/);
+    } finally {
+      cleanup();
+    }
+  });
 });

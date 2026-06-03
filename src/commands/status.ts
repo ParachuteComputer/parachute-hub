@@ -20,6 +20,7 @@ import {
 import {
   type DriveModuleOpDeps,
   type ModuleStatesResult,
+  type ModuleStateSnapshot,
   NoOperatorTokenError,
   OperatorTokenExpiredError,
   fetchModuleStates as fetchModuleStatesImpl,
@@ -487,9 +488,16 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
     }
   }
 
-  const stateByShort = new Map<string, ModuleStatesResult["modules"][number]>();
+  const stateByShort = new Map<string, ModuleStateSnapshot>();
   for (const m of states?.modules ?? []) {
     if (m.short) stateByShort.set(m.short, m);
+  }
+  // Fall back to the full `supervised` snapshot for modules the curated
+  // `modules` catalog omits — e.g. the `surface` UI host, which the supervisor
+  // runs but isn't a curated installable. Without this it'd map to `inactive`
+  // despite running (hub#539). Curated entries already in the map win (richer).
+  for (const m of states?.supervised ?? []) {
+    if (m.short && !stateByShort.has(m.short)) stateByShort.set(m.short, m);
   }
 
   const rows: StatusRow[] = manifest.services.map((entry) => {

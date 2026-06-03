@@ -317,6 +317,45 @@ describe("GET /api/modules", () => {
     expect(shorts).not.toContain("surface");
   });
 
+  test("non-curated supervised modules appear in `supervised` (not `modules`) — hub#539", async () => {
+    // surface (the UI host) is supervised but not curated. Its run-state must
+    // surface in `supervised` so `parachute status` reads it `active`, while it
+    // stays OUT of the curated `modules` catalog (which drives the install UI).
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.4.5",
+      },
+    ]);
+    const { supervisor } = makeIdleSupervisor();
+    await supervisor.start({ short: "vault", cmd: ["parachute-vault", "serve"] });
+    await supervisor.start({ short: "surface", cmd: ["parachute-surface", "serve"] });
+
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      supervisor,
+      fetchLatestVersion: async () => null,
+    });
+    const body = (await res.json()) as {
+      modules: Array<{ short: string }>;
+      supervised: Array<{ short: string; supervisor_status: string | null; pid: number | null }>;
+    };
+    // surface stays out of the curated catalog…
+    expect(body.modules.map((m) => m.short)).not.toContain("surface");
+    // …but its run-state is in `supervised`, marked running with a pid.
+    const surf = body.supervised.find((m) => m.short === "surface");
+    expect(surf?.supervisor_status).toBe("running");
+    expect(typeof surf?.pid).toBe("number");
+    // Curated modules appear in `supervised` too (consumers dedupe by short).
+    expect(body.supervised.find((m) => m.short === "vault")?.supervisor_status).toBe("running");
+  });
+
   test("surfaces installed_version from services.json", async () => {
     writeManifest(h.manifestPath, [
       {
@@ -716,10 +755,7 @@ describe("GET /api/modules", () => {
     // Second back-to-back request must not re-hit the registry. The
     // UI may poll this endpoint; we don't want it to slam npm.
     let calls = 0;
-    const probe = async (
-      _pkg: string,
-      _channel: "latest" | "rc",
-    ): Promise<string | null> => {
+    const probe = async (_pkg: string, _channel: "latest" | "rc"): Promise<string | null> => {
       calls++;
       return "0.5.0";
     };
