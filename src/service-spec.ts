@@ -39,9 +39,14 @@ import type { ServiceEntry } from "./services-manifest.ts";
  *
  * Operator override is now "edit services.json" (or `parachute config`
  * once that lands), not "edit `.env`". Pre-#206 stale `.env` PORT lines on
- * existing operator machines stay where they are — harmless, since the
- * boot-time ladder reads services.json before falling through to the bare
- * PORT env tier — and future installs no longer touch them.
+ * existing operator machines stay where they are — harmless to the module's
+ * own resolvePort ladder, which reads services.json before falling through to
+ * the bare PORT env tier — and future installs no longer touch them. (Caveat,
+ * hub#537: the supervisor's spawn-env builder used to echo a stale `.env` PORT
+ * into the injected `PORT`, and its readiness probe trusted that — so a `.env`
+ * PORT disagreeing with services.json yielded a false `started_but_unbound`.
+ * Fixed by making `entry.port` authoritative: `buildModuleSpawnRequest` drops a
+ * `.env` PORT.)
  *
  * **No speculative reservations.** Future first-party modules claim a slot
  * the moment they ship, not before — pre-reservation for unbuilt things has
