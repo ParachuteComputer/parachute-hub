@@ -487,6 +487,14 @@ export class Supervisor {
    * clear the note once the port binds. Exits early when the module stops,
    * crashes, or the note is replaced by a different startError (a later
    * crash-restart's missing-dependency note must not be wiped).
+   *
+   * Restart safety: a crash-auto-restart reuses the same `entry` object and
+   * clears `startError` on respawn — this watch's `error_type` guard then sees
+   * `undefined` and exits, so a stale watch from spawn-1 never clobbers
+   * spawn-2's state. If spawn-2 also misses its window, its own gate records a
+   * fresh note and launches its own watch; two live watches clearing the same
+   * note is idempotent. `stop()`/teardown set `stopRequested` before any entry
+   * removal, so a watch holding a stale entry ref exits cleanly.
    */
   private async lateBindWatch(entry: ModuleEntry, port: number): Promise<void> {
     const deadline = this.opts.now() + this.opts.lateBindWatchMs;
