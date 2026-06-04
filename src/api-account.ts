@@ -49,6 +49,7 @@ import type { Database } from "bun:sqlite";
 import { hash as argonHash } from "@node-rs/argon2";
 import { type ChangePasswordMode, renderChangePassword } from "./account-change-password-ui.ts";
 import { renderAccountHome } from "./account-home-ui.ts";
+import { fetchVaultUsage, formatUsageStat } from "./account-usage.ts";
 import { POST_LOGIN_DEFAULT } from "./admin-handlers.ts";
 import { renderAdminError } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
@@ -486,9 +487,24 @@ export async function handleAccountChangePasswordPost(
 export interface AccountHomeDeps extends ApiAccountDeps {
   /** Canonical hub origin for this request (e.g. `https://my-hub.example`). */
   hubOrigin: string;
+  /**
+   * Resolve a vault's loopback port from services.json, or `null` when no vault
+   * is mounted under that name. Threaded in by the route handler (which reads
+   * the manifest) so this module stays free of services.json plumbing. Absent
+   * in tests / older callers → usage surfacing is skipped (tiles render without
+   * the stat, same as a failed fetch).
+   */
+  resolveVaultPort?: (vaultName: string) => number | null;
+  /**
+   * Fetch one vault's usage stat, or `null` on any failure. Defaults to the
+   * real `fetchVaultUsage` (mints a read token + hits the vault's loopback
+   * usage endpoint). Injectable so tests assert the render without a live
+   * vault.
+   */
+  fetchUsage?: typeof fetchVaultUsage;
 }
 
-export function handleAccountHomeGet(req: Request, deps: AccountHomeDeps): Response {
+export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps): Promise<Response> {
   const session = findActiveSession(deps.db, req);
   if (!session) {
     return redirect(`/login?next=${encodeURIComponent("/account/")}`);
@@ -511,6 +527,32 @@ export function handleAccountHomeGet(req: Request, deps: AccountHomeDeps): Respo
     const verbs = vaultVerbsForUserVault(deps.db, user.id, v);
     if (verbs && verbs.length > 0) mintableVerbs[v] = verbs;
   }
+
+  // Per-vault usage stat ("X notes · Y MB"). Fetched concurrently across the
+  // user's assigned vaults via the read-scoped vault endpoint; each fetch is
+  // independently fault-tolerant (returns null → that tile renders without a
+  // stat). Skipped entirely when the route didn't wire a port resolver (tests /
+  // older callers). The READ scope means the user's own authority suffices.
+  const usageStats: Record<string, string> = {};
+  if (deps.resolveVaultPort && user.assignedVaults.length > 0) {
+    const fetchUsage = deps.fetchUsage ?? fetchVaultUsage;
+    const resolvePort = deps.resolveVaultPort;
+    await Promise.all(
+      user.assignedVaults.map(async (vaultName) => {
+        const port = resolvePort(vaultName);
+        if (port === null) return;
+        const stat = await fetchUsage(vaultName, {
+          db: deps.db,
+          hubOrigin: deps.hubOrigin,
+          vaultPort: port,
+          userId: user.id,
+          ...(deps.now !== undefined ? { now: deps.now } : {}),
+        });
+        if (stat) usageStats[vaultName] = formatUsageStat(stat);
+      }),
+    );
+  }
+
   return htmlResponse(
     renderAccountHome({
       username: user.username,
@@ -521,6 +563,7 @@ export function handleAccountHomeGet(req: Request, deps: AccountHomeDeps): Respo
       csrfToken: csrf.token,
       twoFactorEnabled: isTotpEnrolled(deps.db, user.id),
       mintableVerbs,
+      usageStats,
     }),
     200,
     extra,

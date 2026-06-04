@@ -121,6 +121,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pkg from "../package.json" with { type: "json" };
+import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
 import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
 import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
 import { handleListGrants, handleRevokeGrant } from "./admin-grants.ts";
@@ -2290,6 +2291,50 @@ export function hubFetch(
       return new Response("method not allowed", { status: 405 });
     }
 
+    // /account/vault-admin-token/<name> — friend-facing vault ADMIN deep-link.
+    // POST-only, session-gated, assignment-capped to the `admin` verb: an
+    // assigned non-admin user mints a `vault:<name>:admin` bootstrap token and
+    // 303-redirects into the vault's own admin SPA (`#token=<jwt>`), where they
+    // can rotate vault tokens AND configure Git backup / mirror. The non-admin
+    // sibling of `/admin/vault-admin-token/<name>` (which is first-admin-gated
+    // and returns JSON for the hub SPA). The handler enforces session →
+    // assignment-grants-admin → CSRF → force-change-password (item F / #469)
+    // before minting. Must precede `/account/vault-token/` (it isn't a prefix
+    // of it, but keep the more-specific admin path first for clarity) and the
+    // `/account/` match below. See `account-vault-admin-token.ts`.
+    if (pathname.startsWith("/account/vault-admin-token/")) {
+      if (!getDb) return dbNotConfigured();
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+      const vaultName = decodeURIComponent(pathname.slice("/account/vault-admin-token/".length));
+      const db = getDb();
+      const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
+      // Resolve the vault's declared `managementUrl` at request time (same
+      // source the well-known doc reads — `installDir/.parachute/module.json`)
+      // so the deep-link lands on the vault admin SPA's real entry point. Quiet
+      // on a malformed/absent manifest: the handler defaults to `/admin/`
+      // (vault's canonical value), the same target the admin sibling uses.
+      const readManifestFn = deps?.readModuleManifest ?? defaultReadModuleManifest;
+      const manifest = readManifestLenient(manifestPath);
+      let managementUrl: string | undefined;
+      for (const s of manifest.services) {
+        if (!isVaultEntry(s) || !s.installDir) continue;
+        const instanceNames = new Set(s.paths.map((p) => vaultInstanceNameFor(s.name, p)));
+        if (!instanceNames.has(vaultName)) continue;
+        try {
+          const m = await readManifestFn(s.installDir);
+          if (m?.managementUrl) managementUrl = m.managementUrl;
+        } catch {
+          // Leave undefined → handler defaults to /admin/.
+        }
+        break;
+      }
+      return handleAccountVaultAdminTokenPost(req, vaultName, {
+        db,
+        hubOrigin,
+        ...(managementUrl !== undefined ? { managementUrl } : {}),
+      });
+    }
+
     // /account/vault-token/<name> — friend-facing scoped vault token mint.
     // POST-only, session-gated, assignment-capped: a non-admin friend mints a
     // `vault:<name>:read|write` bearer for a vault they're ASSIGNED to, for
@@ -2322,7 +2367,16 @@ export function hubFetch(
       if (!getDb) return dbNotConfigured();
       const db = getDb();
       const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
-      return handleAccountHomeGet(req, { db, hubOrigin });
+      // Resolve each assigned vault's loopback port from services.json so the
+      // home can fetch per-vault usage. Read at request time (same dynamism as
+      // proxyToVault) — a vault created seconds ago surfaces a stat without a
+      // restart. Returns null for an unknown name → that tile skips the stat.
+      const resolveVaultPort = (vaultName: string): number | null => {
+        const services = readManifestLenient(manifestPath).services;
+        const match = findVaultUpstream(services, `/vault/${vaultName}`);
+        return match ? match.port : null;
+      };
+      return handleAccountHomeGet(req, { db, hubOrigin, resolveVaultPort });
     }
 
     // Legacy `/admin/config` (server-rendered module-config portal, #46)

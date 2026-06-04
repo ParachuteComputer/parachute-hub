@@ -254,6 +254,62 @@ export async function mintVaultAdminToken(name: string): Promise<MintedVaultAdmi
 }
 
 /**
+ * Per-vault usage stat surfaced in the VaultsList row. Subset of the vault's
+ * `GET /vault/<name>/.parachute/usage` report (vault#437) — the full report
+ * carries more (links, tags, db/assets/mirror byte breakdown), but the row only
+ * needs note count + physical footprint.
+ */
+export interface VaultUsage {
+  notes: number;
+  /** Physical footprint bytes (`bytes.total` from the vault report). */
+  totalBytes: number;
+}
+
+/**
+ * Fetch one vault's usage report through the hub's `/vault/<name>/*` proxy.
+ *
+ * The endpoint is read-scoped; `parachute:host:admin` is NOT a vault scope and
+ * vault would 403 it, so we mint a `vault:<name>:admin` bearer (admin ⊇ read)
+ * via the existing session-cookie path — the same token the "Manage" button
+ * uses. The VaultsList fans this out per row (N small requests) and tolerates
+ * per-vault failure by rendering "—", so this throws on failure and the caller
+ * swallows it; it deliberately does NOT redirect-on-401 (that's the Manage
+ * button's job — a usage cell shouldn't hijack the page).
+ */
+export async function getVaultUsage(name: string): Promise<VaultUsage> {
+  const minted = await mintVaultAdminToken(name);
+  const res = await fetch(`/vault/${encodeURIComponent(name)}/.parachute/usage`, {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${minted.token}` },
+  });
+  if (!res.ok) {
+    throw new HttpError(res.status, await readError(res));
+  }
+  const body = (await res.json()) as {
+    counts?: { notes?: unknown };
+    bytes?: { total?: unknown };
+  };
+  const notes = body.counts?.notes;
+  const totalBytes = body.bytes?.total;
+  if (typeof notes !== "number" || typeof totalBytes !== "number") {
+    throw new HttpError(500, "/.parachute/usage returned malformed body");
+  }
+  return { notes, totalBytes };
+}
+
+/** Human-readable byte size — B / KB / MB / GB, one decimal for MB+. */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  const gb = mb / 1024;
+  return `${gb.toFixed(1)} GB`;
+}
+
+/**
  * Operator-visible OAuth grant from `GET /api/grants`. The hub returns a
  * snake_case row to keep the wire format aligned with the underlying
  * sqlite schema; the SPA reads it directly.

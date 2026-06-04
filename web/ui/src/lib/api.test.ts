@@ -377,6 +377,73 @@ describe("mintVaultAdminToken", () => {
   });
 });
 
+describe("getVaultUsage", () => {
+  // getVaultUsage mints a vault-admin token (admin ⊇ read) then GETs the vault's
+  // proxied /.parachute/usage. The mock routes by URL: the mint endpoint returns
+  // a token, the usage endpoint returns the footprint report.
+  function routedFetch(usage: { status: number; body: unknown }) {
+    return vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.startsWith("/admin/vault-admin-token/")) {
+        return jsonResponse(200, {
+          token: "vadmin-jwt",
+          expires_at: "2026-01-01T00:00:00.000Z",
+          scopes: ["vault:work:admin"],
+        });
+      }
+      // Usage request — assert it carried the minted Bearer.
+      expect((init?.headers as Record<string, string>)?.authorization).toBe("Bearer vadmin-jwt");
+      return jsonResponse(usage.status, usage.body);
+    });
+  }
+
+  it("mints an admin token then parses {counts, bytes} from the proxied endpoint", async () => {
+    const fetchMock = routedFetch({
+      status: 200,
+      body: {
+        counts: { notes: 12, attachments: 0, links: 3, tags: 1 },
+        bytes: { content: 100, db: 2048, assets: 0, total: 2048 },
+        computedAt: "2026-01-01T00:00:00.000Z",
+        cached: false,
+      },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = await import("./api.ts");
+    const usage = await api.getVaultUsage("work");
+    expect(usage).toEqual({ notes: 12, totalBytes: 2048 });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/vault/work/.parachute/usage",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("throws HttpError when the usage endpoint 403s (caller swallows → '—')", async () => {
+    vi.stubGlobal("fetch", routedFetch({ status: 403, body: { error: "forbidden" } }));
+    const api = await import("./api.ts");
+    await expect(api.getVaultUsage("work")).rejects.toMatchObject({
+      name: "HttpError",
+      status: 403,
+    });
+  });
+
+  it("throws HttpError on a malformed usage body", async () => {
+    vi.stubGlobal("fetch", routedFetch({ status: 200, body: { counts: {}, bytes: {} } }));
+    const api = await import("./api.ts");
+    await expect(api.getVaultUsage("work")).rejects.toMatchObject({ name: "HttpError" });
+  });
+});
+
+describe("formatBytes", () => {
+  it("picks the largest sensible unit", async () => {
+    const api = await import("./api.ts");
+    expect(api.formatBytes(0)).toBe("0 B");
+    expect(api.formatBytes(512)).toBe("512 B");
+    expect(api.formatBytes(2048)).toBe("2 KB");
+    expect(api.formatBytes(5 * 1024 * 1024)).toBe("5.0 MB");
+    expect(api.formatBytes(3 * 1024 * 1024 * 1024)).toBe("3.0 GB");
+    expect(api.formatBytes(-1)).toBe("0 B");
+  });
+});
+
 describe("listGrants", () => {
   it("sends Bearer + parses {grants: [...]} body", async () => {
     const fetchMock = vi.fn(async () =>

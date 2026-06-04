@@ -129,6 +129,15 @@ export interface RenderAccountHomeOpts {
    */
   mintableVerbs?: Record<string, VaultVerb[]>;
   /**
+   * Per-vault usage stat (`"X notes · Y MB"`) for each assigned vault tile.
+   * Maps `vaultName` → the pre-formatted stat string. A vault absent from this
+   * map renders no stat — the page tolerates a vault whose usage endpoint
+   * failed / is unreachable / predates the feature (the `/account/` GET handler
+   * builds this map by fetching `/.parachute/usage` per vault and omitting any
+   * that don't resolve). Omitted entirely on the admin / no-vault branches.
+   */
+  usageStats?: Record<string, string>;
+  /**
    * Set after a successful `POST /account/vault-token/<name>` to show the
    * freshly-minted token ONCE (the only time it's ever shown — the hub keeps
    * no plaintext copy). Drives the show-once banner at the top of the page.
@@ -189,6 +198,7 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
     isFirstAdmin,
     csrfToken,
     mintableVerbs: opts.mintableVerbs ?? {},
+    usageStats: opts.usageStats ?? {},
   });
 
   const accountCard = renderAccountCard({
@@ -257,6 +267,8 @@ interface VaultCardOpts {
   isFirstAdmin: boolean;
   csrfToken: string;
   mintableVerbs: Record<string, VaultVerb[]>;
+  /** `vaultName` → pre-formatted usage stat ("X notes · Y MB"). */
+  usageStats: Record<string, string>;
 }
 
 /**
@@ -286,7 +298,8 @@ export function accountClaudeMcpAddCommand(trimmedOrigin: string, vaultName: str
 }
 
 function renderVaultCard(opts: VaultCardOpts): string {
-  const { assignedVaults, trimmedOrigin, isFirstAdmin, csrfToken, mintableVerbs } = opts;
+  const { assignedVaults, trimmedOrigin, isFirstAdmin, csrfToken, mintableVerbs, usageStats } =
+    opts;
 
   if (assignedVaults.length > 0) {
     // One vault tile per assignment (multi-user Phase 2 PR 2). Each tile
@@ -313,15 +326,25 @@ function renderVaultCard(opts: VaultCardOpts): string {
         const addCmd = accountClaudeMcpAddCommand(trimmedOrigin, vaultName);
         const safeEndpoint = escapeHtml(endpoint);
         const safeAddCmd = escapeHtml(addCmd);
-        const tokenMintBlock = renderTokenMintBlock(
-          vaultName,
-          safeVault,
-          mintableVerbs[vaultName] ?? [],
-          csrfToken,
-        );
+        const verbsForVault = mintableVerbs[vaultName] ?? [];
+        const tokenMintBlock = renderTokenMintBlock(vaultName, safeVault, verbsForVault, csrfToken);
+        // "Configure / back up this vault ↗" — only for users whose assignment
+        // grants `admin` (the verb the deep-link mints). Today every assigned
+        // user holds admin, but gate on the verb so the button never offers
+        // authority the POST handler would 403.
+        const manageBlock = verbsForVault.includes("admin")
+          ? renderVaultAdminLink(vaultName, csrfToken)
+          : "";
+        // Compact usage stat ("X notes · Y MB"), when the vault's usage endpoint
+        // resolved. Omitted gracefully otherwise.
+        const usageStat = usageStats[vaultName];
+        const usageLine = usageStat
+          ? `<p class="vault-usage" data-testid="vault-usage">${escapeHtml(usageStat)}</p>`
+          : "";
         return `
         <div class="vault-tile" data-testid="vault-tile" data-vault-name="${safeVault}">
           <p class="vault-name"><strong>${safeVault}</strong></p>
+          ${usageLine}
           <div class="mcp-connect" data-testid="mcp-connect">
             <p class="mcp-connect-label" data-testid="connect-ai-heading">Connect your AI
                assistant to this vault</p>
@@ -364,6 +387,7 @@ function renderVaultCard(opts: VaultCardOpts): string {
                capture in this vault — or jump straight to bulk-importing Markdown/Obsidian
                notes into it.</span>
           </p>
+          ${manageBlock}
           ${tokenMintBlock}
         </div>`;
       })
@@ -471,6 +495,34 @@ function renderTokenMintBlock(
               </form>
             </div>
           </details>`;
+}
+
+/**
+ * The "Configure / back up this vault ↗" affordance on a vault tile. A small
+ * POST form to `/account/vault-admin-token/<name>` that mints a
+ * `vault:<name>:admin` deep-link token and redirects into the vault's own admin
+ * SPA — where the assigned user can rotate vault tokens AND set up Git backup /
+ * mirror config. Shown only when the user's assignment grants `admin` (gated by
+ * the caller). A plain form button (no `<details>`) — this is a primary admin
+ * action for an individual user, more prominent than the headless-token mint
+ * below it.
+ *
+ * No-JS posture: a same-origin form POST that 303-redirects on success, same
+ * shape as the other `/account/*` forms. CSRF-gated via the hidden field.
+ */
+function renderVaultAdminLink(vaultName: string, csrfToken: string): string {
+  // Path segment is URL-encoded; the action attribute is HTML-escaped on top.
+  const action = escapeHtml(`/account/vault-admin-token/${encodeURIComponent(vaultName)}`);
+  return `
+          <form method="POST" action="${action}" class="vault-admin-link"
+                data-testid="vault-admin-form">
+            ${renderCsrfHiddenInput(csrfToken)}
+            <button type="submit" class="btn btn-secondary" data-testid="vault-admin-button">
+              Configure / back up this vault ↗
+            </button>
+            <span class="vault-admin-sub">Open this vault's admin tools — rotate access tokens,
+               and set up Git backup (mirror to a repository).</span>
+          </form>`;
 }
 
 /**
@@ -717,6 +769,11 @@ const STYLES = `
     margin: 0 0 0.6rem;
   }
   .vault-name strong { color: ${PALETTE.fg}; font-weight: 600; }
+  .vault-usage {
+    font-size: 0.8rem;
+    color: ${PALETTE.fgMuted};
+    margin: 0 0 0.5rem;
+  }
   .vault-tiles {
     display: flex;
     flex-direction: column;
@@ -822,6 +879,21 @@ const STYLES = `
     font-size: 0.82rem;
     color: ${PALETTE.fgMuted};
     margin: 0.4rem 0 0;
+  }
+
+  .vault-admin-link {
+    margin: 0.9rem 0 0;
+    padding-top: 0.6rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.75rem;
+  }
+  .vault-admin-sub {
+    font-size: 0.82rem;
+    color: ${PALETTE.fgMuted};
+    flex: 1 1 12rem;
   }
 
   .token-mint {
@@ -981,13 +1053,14 @@ const STYLES = `
     h1, h2 { color: #f0ece4; }
     .subtitle, .kv dt, .mcp-field-label, .mcp-connect-hint,
     .mcp-connect-intro, .mcp-method-sub, .mcp-method-note,
-    .vault-notes-cta-sub { color: #a8a29a; }
+    .vault-notes-cta-sub, .vault-usage { color: #a8a29a; }
     .vault-name strong, .mcp-connect-label, .mcp-method-title { color: #f0ece4; }
     code { background: #1f1c18; color: #e8e4dc; }
     .copy-row code { background: transparent; }
     .section { border-top-color: #3a362f; }
     .mcp-method, .vault-notes-cta, .token-mint,
-    .account-security { border-top-color: #3a362f; }
+    .vault-admin-link, .account-security { border-top-color: #3a362f; }
+    .vault-admin-sub { color: #a8a29a; }
     .get-started h3 { color: #f0ece4; }
     .starter-tile { border-color: #3a362f; background: #1f1c18; }
     .starter-tile:hover { border-color: ${PALETTE.accent}; }
