@@ -15,6 +15,7 @@ import {
 } from "../hub-server.ts";
 import { setNotesRedirectDisabled } from "../hub-settings.ts";
 import { clearNotesRedirectLogState } from "../notes-redirect.ts";
+import { mintOperatorToken } from "../operator-token.ts";
 import { pidPath } from "../process-state.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
 import { buildSessionCookie, createSession } from "../sessions.ts";
@@ -4412,6 +4413,73 @@ describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to
         manifestPath: h.manifestPath,
       })(req("/account/vault-token/work"));
       expect(res.status).toBe(405);
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+});
+
+// Item D (#450) routed e2e — exercise the knownVaultNames threading from
+// services.json → hubFetch → handleApiMintToken (hub-server.ts dispatch),
+// which the unit-level handler tests can't cover. A `vault:<typo>:admin` mint
+// for an unregistered vault → 400 through the full stack; a known vault → 200.
+describe("POST /api/auth/mint-token — vault-existence threading (routed end-to-end, item D)", () => {
+  const ISSUER = "https://hub.test";
+
+  async function seedMint(
+    h: Harness,
+    vaultNames: string[],
+  ): Promise<{ db: ReturnType<typeof openHubDb>; bearer: string }> {
+    const db = openHubDb(hubDbPath(h.dir));
+    rotateSigningKey(db); // mint needs an active signing key
+    const owner = await createUser(db, "owner", "owner-password-123");
+    // The default operator scope-set carries parachute:host:admin, which mints
+    // vault:<name>:admin (canGrant rule 2).
+    const op = await mintOperatorToken(db, owner.id, { issuer: ISSUER });
+    writeManifest({ services: vaultNames.map((n) => vaultEntry(n)) }, h.manifestPath);
+    return { db, bearer: op.token };
+  }
+
+  function mintReq(scope: string, bearer: string): Request {
+    return req("/api/auth/mint-token", {
+      method: "POST",
+      headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" },
+      body: JSON.stringify({ scope }),
+    });
+  }
+
+  test("vault:<typo>:admin for an unregistered vault → 400 (knownVaultNames from services.json)", async () => {
+    const h = makeHarness();
+    const { db, bearer } = await seedMint(h, ["work", "default"]);
+    try {
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        issuer: ISSUER,
+      })(mintReq("vault:typo:admin", bearer));
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string; error_description: string };
+      expect(body.error).toBe("invalid_scope");
+      expect(body.error_description).toContain("typo");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("vault:<name>:admin for a REGISTERED vault → 200 (proves the gate isn't over-blocking)", async () => {
+    const h = makeHarness();
+    const { db, bearer } = await seedMint(h, ["work", "default"]);
+    try {
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        issuer: ISSUER,
+      })(mintReq("vault:work:admin", bearer));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { scope: string };
+      expect(body.scope).toBe("vault:work:admin");
     } finally {
       db.close();
       h.cleanup();

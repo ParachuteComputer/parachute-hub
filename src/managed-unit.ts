@@ -666,9 +666,12 @@ export interface BuildHubManagedUnitOpts {
  * the bind host to `0.0.0.0` (serve.ts), which is correct for the container
  * shape (the platform's HTTP forwarder must reach the hub) but WRONG for a
  * self-hosted box — bare `serve` would expose the admin/OAuth surfaces on every
- * interface, contradicting the pre-supervisor detached behavior and the trust
- * model `layerOf` (hub-server.ts) assumes (header-absent ⇒ "loopback"). The
- * container path never calls this builder (the Dockerfile pins
+ * interface, contradicting the pre-supervisor detached behavior. Forcing a
+ * loopback bind also keeps `layerOf` (hub-server.ts) precise: post-#526 it
+ * derives trust from the peer address (`server.requestIP`), failing closed to
+ * "public" for any non-loopback peer — so a 127.0.0.1-only listener is what
+ * lets a header-absent on-box CLI caller classify as "loopback". The container
+ * path never calls this builder (the Dockerfile pins
  * `ENV PARACHUTE_BIND_HOST=0.0.0.0` + runs `serve` directly), so it stays
  * 0.0.0.0. The canonical expose path is unaffected: cloudflared/tailscale dial
  * `127.0.0.1:<port>` from the same host, and the hub's own proxy targets
