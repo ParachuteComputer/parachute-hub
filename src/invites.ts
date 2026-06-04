@@ -253,14 +253,14 @@ export function assertInviteRedeemable(
 
 /**
  * Mark an invite consumed — stamp `used_at` + `redeemed_user_id`. Called
- * ONLY after the redeemed user row has committed (so a createUser exception
- * leaves the invite re-usable). Single-use is enforced by the
- * `used_at IS NULL` guard in the UPDATE: a racing second redeem updates zero
- * rows and the caller treats that as already-consumed.
+ * Called within the account-creation transaction (or after a committed user
+ * row). Single-use + not-revoked is enforced by the
+ * `used_at IS NULL AND revoked_at IS NULL` guard in the UPDATE: a racing
+ * second redeem — or a concurrent revoke — updates zero rows and the caller
+ * treats that as already-consumed/revoked. Race-safe because sqlite
+ * serializes writes.
  *
- * Returns `true` if THIS call consumed the invite, `false` if it was already
- * consumed (used_at already set) — race-safe because sqlite serializes
- * writes.
+ * Returns `true` if THIS call consumed the invite, `false` otherwise.
  */
 export function consumeInvite(
   db: Database,
@@ -270,7 +270,7 @@ export function consumeInvite(
 ): boolean {
   const res = db
     .prepare(
-      "UPDATE invites SET used_at = ?, redeemed_user_id = ? WHERE token = ? AND used_at IS NULL",
+      "UPDATE invites SET used_at = ?, redeemed_user_id = ? WHERE token = ? AND used_at IS NULL AND revoked_at IS NULL",
     )
     .run(now.toISOString(), redeemedUserId, tokenHash);
   return res.changes > 0;

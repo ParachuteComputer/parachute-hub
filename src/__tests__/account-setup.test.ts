@@ -28,7 +28,7 @@ import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { consumeInvite, findInviteByRawToken, issueInvite, revokeInvite } from "../invites.ts";
 import { __resetForTests } from "../rate-limit.ts";
 import { findActiveSession } from "../sessions.ts";
-import { createUser, getUserByUsernameCI, vaultVerbsForUserVault } from "../users.ts";
+import { createUser, getUserByUsernameCI, userCount, vaultVerbsForUserVault } from "../users.ts";
 
 const ISSUER = "https://hub.test";
 
@@ -492,5 +492,118 @@ describe("POST /account/setup/<token> — re-usability on createUser failure (or
     expect(res2.status).toBe(302);
     expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).not.toBeNull();
     void invite;
+  });
+});
+
+describe("POST /account/setup/<token> — vault-name validation (N1)", () => {
+  test("a 33-char invitee-chosen vault name → clear validation error, NOT a generic provision failure", async () => {
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    // vault_name null → the redeemer names their own vault.
+    const { rawToken } = issueInvite(harness.db, { createdBy: admin.id });
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const tooLong = "a".repeat(33); // passes the bare charset regex, exceeds the 32 cap
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username: "sam",
+          password: "sam-strong-password-12",
+          password_confirm: "sam-strong-password-12",
+          vault_name: tooLong,
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+    // 400 with the validator's specific message — the vault CLI is never reached.
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain("2–32 characters");
+    expect(html).not.toContain("Could not provision your vault");
+    expect(stub.calls.length).toBe(0);
+    // No account created.
+    expect(getUserByUsernameCI(harness.db, "sam")).toBeNull();
+  });
+});
+
+describe("POST /account/setup/<token> — concurrent redeem (N2)", () => {
+  test("two concurrent redeems of one invite create EXACTLY one account (no orphan)", async () => {
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    const { rawToken } = issueInvite(harness.db, { createdBy: admin.id, vaultName: "maya" });
+    const before = userCount(harness.db); // 1 (the admin)
+
+    // Two POSTs with DIFFERENT usernames, fired together. Each has its own
+    // CSRF pair. createUser awaits argon2 before its (synchronous) commit
+    // transaction; the consume-inside-tx guard is what serializes them.
+    const a = csrfPair();
+    const b = csrfPair();
+    const mk = (uname: string, csrf: { token: string; cookieFragment: string }) =>
+      handleAccountSetupPost(
+        postReq(
+          rawToken,
+          {
+            [CSRF_FIELD_NAME]: csrf.token,
+            username: uname,
+            password: `${uname}-strong-password-1`,
+            password_confirm: `${uname}-strong-password-1`,
+          },
+          csrf.cookieFragment,
+        ),
+        rawToken,
+        deps(makeStubRunCommand().run),
+      );
+    const [r1, r2] = await Promise.all([mk("alice", a), mk("bob", b)]);
+
+    const statuses = [r1.status, r2.status].sort();
+    // Exactly one 302 (success) and one 410 (the loser's used-path).
+    expect(statuses).toEqual([302, 410]);
+    // EXACTLY one account was created from the invite — no orphan row.
+    expect(userCount(harness.db) - before).toBe(1);
+    const aliceExists = getUserByUsernameCI(harness.db, "alice") !== null;
+    const bobExists = getUserByUsernameCI(harness.db, "bob") !== null;
+    // Exactly one of the two usernames landed.
+    expect(aliceExists !== bobExists).toBe(true);
+    // The invite is consumed, pinned to whichever user won.
+    const after = findInviteByRawToken(harness.db, rawToken);
+    expect(after?.usedAt).not.toBeNull();
+    const winner = getUserByUsernameCI(harness.db, aliceExists ? "alice" : "bob");
+    expect(after?.redeemedUserId).toBe(winner?.id ?? "");
+  });
+});
+
+describe("POST /account/setup/<token> — account-only invite (N3)", () => {
+  test("provision_vault=false, no vault_name → user with empty assignedVaults, no vault shell-out", async () => {
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    const { rawToken } = issueInvite(harness.db, {
+      createdBy: admin.id,
+      provisionVault: false,
+    });
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username: "accountonly",
+          password: "accountonly-password-1",
+          password_confirm: "accountonly-password-1",
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+    expect(res.status).toBe(302);
+    const user = getUserByUsernameCI(harness.db, "accountonly");
+    expect(user).not.toBeNull();
+    expect(user?.assignedVaults).toEqual([]);
+    // No vault provisioning shell-out for an account-only invite.
+    expect(stub.calls.length).toBe(0);
+    // Invite consumed.
+    expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).not.toBeNull();
   });
 });

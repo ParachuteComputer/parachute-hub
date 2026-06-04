@@ -200,10 +200,10 @@ export function renderInviteSetup(props: InviteSetupProps): string {
         <label class="field">
           <span class="field-label">Name your vault</span>
           <input type="text" name="vault_name" autocomplete="off"
-            required minlength="2" maxlength="64"
-            pattern="[a-z0-9_-]+" title="lowercase letters, digits, _ - (2–64 chars)"
+            required minlength="2" maxlength="32"
+            pattern="[a-z0-9_-]+" title="lowercase letters, digits, _ - (2–32 chars)"
             spellcheck="false" autocapitalize="off"${vaultAttr} />
-          <span class="field-hint">lowercase letters, digits, <code>_</code>, <code>-</code></span>
+          <span class="field-hint">lowercase letters, digits, <code>_</code>, <code>-</code> (2–32 chars)</span>
         </label>`;
     }
   }

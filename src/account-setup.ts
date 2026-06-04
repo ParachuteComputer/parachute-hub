@@ -33,7 +33,6 @@
 import type { Database } from "bun:sqlite";
 import { renderAdminError, renderInviteSetup } from "./admin-login-ui.ts";
 import { type RunResult, provisionVault } from "./admin-vaults.ts";
-import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import {
   InviteExpiredError,
@@ -54,7 +53,7 @@ import {
   validatePassword,
   validateUsername,
 } from "./users.ts";
-import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
+import { validateVaultName } from "./vault-name.ts";
 
 export interface AccountSetupDeps {
   db: Database;
@@ -242,16 +241,21 @@ export async function handleAccountSetupPost(
   }
 
   // Resolve the vault name: pinned by the invite, or chosen by the invitee.
+  // The invitee-chosen name goes through the FULL `validateVaultName` (the
+  // same 2–32 + charset + reserved contract vault's init enforces), not just
+  // the charset regex — otherwise a 33–64 char name slips past here and fails
+  // at the vault CLI with a generic provision error.
   let vaultName: string | null = null;
   if (invite.provisionVault) {
     if (invite.vaultName !== null) {
       vaultName = invite.vaultName;
     } else {
       const chosen = String(form.get("vault_name") ?? "").trim();
-      if (!VAULT_NAME_CHARSET_RE.test(chosen)) {
-        return rerender(400, "Vault name must be 2–64 lowercase letters, digits, _ or -.", chosen);
+      const v = validateVaultName(chosen);
+      if (!v.ok) {
+        return rerender(400, v.error, chosen);
       }
-      vaultName = chosen;
+      vaultName = v.name;
     }
   } else if (invite.vaultName !== null) {
     // Account-only invite that assigns an existing vault.
@@ -281,11 +285,23 @@ export async function handleAccountSetupPost(
     }
   }
 
-  // (4) Create the user — the COMMIT POINT. passwordChanged: TRUE because the
-  // invitee chose their own password (no force-change). assignedVaults pins
-  // them to exactly their one vault at the invite's role. allowMulti because
-  // the first admin already exists. The invite is NOT yet consumed — if this
-  // throws, the invite stays re-usable.
+  // (4) Create the user + consume the invite ATOMICALLY — the COMMIT POINT.
+  // The invite is consumed INSIDE createUser's transaction (the `withinTx`
+  // hook), so the two single-use guarantees compose:
+  //
+  //   - Single-use under concurrency: two redeems of one invite both pass
+  //     `assertInviteRedeemable` above, but only one's `consumeInvite` UPDATE
+  //     (`used_at IS NULL AND revoked_at IS NULL`) changes a row. The loser's
+  //     hook throws `InviteUsedError`, which rolls back ITS user insert — no
+  //     orphan account. Exactly one account results.
+  //   - Re-usable on failure: if createUser throws (UNIQUE collision, etc.)
+  //     before the hook, the invite was never touched; if the hook itself
+  //     throws (lost race), the consume + the user insert roll back together.
+  //     Either way nothing commits, so the invite stays re-usable.
+  //
+  // passwordChanged: TRUE (the invitee chose their own password → no force-
+  // change). assignedVaults pins them to exactly their one vault at the
+  // invite's role. allowMulti because the first admin already exists.
   let userId: string;
   try {
     const created = await createUser(deps.db, username, password, {
@@ -293,25 +309,25 @@ export async function handleAccountSetupPost(
       passwordChanged: true,
       assignedVaults: vaultName !== null ? [vaultName] : [],
       role: invite.role,
+      withinTx: (newUserId) => {
+        if (!consumeInvite(deps.db, invite.tokenHash, newUserId, now)) {
+          // Lost the redeem race (or a concurrent revoke landed). Throw to
+          // roll back this user insert; surfaced as the used/410 path below.
+          throw new InviteUsedError();
+        }
+      },
     });
     userId = created.id;
   } catch (err) {
+    if (err instanceof InviteUsedError) {
+      return rejectInvite(err);
+    }
     if (err instanceof UsernameTakenError) {
       return rerender(409, `The username "${username}" is already taken. Pick another.`);
     }
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[account-setup] createUser failed for "${username}": ${msg}`);
     return rerender(500, "Could not create your account. Please try again.");
-  }
-
-  // (5) Consume the invite — AFTER the user row committed. used_at IS NULL
-  // guard makes this single-use even under a redeem race; a false return means
-  // another redeem won, so reject this one (the account we just created is
-  // harmless — it has no session yet and the invitee can sign in with it, but
-  // we don't hand THIS request a session for a doubly-redeemed invite).
-  const consumed = consumeInvite(deps.db, invite.tokenHash, userId, now);
-  if (!consumed) {
-    return rejectInvite(new InviteUsedError());
   }
 
   // (6) Sign the invitee in + land them on /account/.
