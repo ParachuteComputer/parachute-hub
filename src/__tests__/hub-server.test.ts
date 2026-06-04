@@ -4802,4 +4802,148 @@ describe("force-change-password per-request gate (#469)", () => {
       h.cleanup();
     }
   });
+
+  test("(b) pre-rotation user CAN POST /account/change-password (the rotation action itself)", async () => {
+    // The exempt POST: a pre-rotation user submitting their new password must
+    // NOT be intercepted by the gate — it's the only way out of force-change.
+    // `/account/change-password` is dispatched ABOVE the gate, so it never
+    // reaches the choke point. We assert the POST reaches its own handler (it
+    // fails CSRF here → its OWN 400/403, NOT the gate's 302→change-password).
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const csrf = generateCsrfToken();
+        const form = new URLSearchParams();
+        form.set("__csrf", csrf);
+        form.set("current_password", "temp-pw");
+        form.set("new_password", "rotated-password-123");
+        form.set("new_password_confirm", "rotated-password-123");
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/account/change-password", {
+            method: "POST",
+            headers: {
+              cookie: `${cookie}; ${buildCsrfCookie(csrf)}`,
+              "content-type": "application/x-www-form-urlencoded",
+              accept: "text/html",
+            },
+            body: form.toString(),
+          }),
+        );
+        // Reaches its own handler (303 back to /account/ on success, or its own
+        // form re-render). The point: it is NOT the gate's 302 to
+        // change-password and NOT the gate's 403 force_change_password.
+        expect(res.status).not.toBe(403);
+        if (res.status === 302 || res.status === 303) {
+          expect(res.headers.get("location")).not.toBe("/account/change-password");
+        }
+        // And the rotation actually took: the user's flag flipped to true.
+        const { getUserById } = await import("../users.ts");
+        const friend = getUserById(
+          db,
+          db.query<{ id: string }, []>("SELECT id FROM users WHERE username = 'friend'").get()
+            ?.id ?? "",
+        );
+        expect(friend?.passwordChanged).toBe(true);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(a) bare /account (no trailing slash) is gated on the FIRST hop for a pre-rotation user", async () => {
+    // The bare `/account` 301s to `/account/`; without an explicit match it
+    // would slip past `startsWith("/account/")` and only be gated on the second
+    // hop. The gate must intercept the first request.
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/account", { headers: { cookie, accept: "text/html" } }),
+        );
+        // Gated → 302 to change-password, NOT the 301 → /account/.
+        expect(res.status).toBe(302);
+        expect(res.headers.get("location")).toBe("/account/change-password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(a) pre-rotation session at /oauth/authorize is 302'd to change-password (no auth code issued)", async () => {
+    // The important one: a signed-in pre-rotation user must not ride the
+    // consent flow to an auth code → /oauth/token exchange for a vault token
+    // WITHOUT rotating. The gate intercepts /oauth/authorize before any client
+    // validation or code issuance, so no `code=` redirect can be produced.
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req(
+            "/oauth/authorize?client_id=x&response_type=code&redirect_uri=https://app.example/cb&scope=vault:work:read",
+            { headers: { cookie, accept: "text/html" } },
+          ),
+        );
+        expect(res.status).toBe(302);
+        const location = res.headers.get("location") ?? "";
+        expect(location).toBe("/account/change-password");
+        // No auth code was issued — the redirect is to the rotation rail, not a
+        // client callback carrying a `code=`.
+        expect(location).not.toContain("code=");
+        expect(location).not.toContain("app.example");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(c) after rotation, /oauth/authorize is NOT gated (reaches the oauth handler)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: true,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req(
+            "/oauth/authorize?client_id=x&response_type=code&redirect_uri=https://app.example/cb&scope=vault:work:read",
+            { headers: { cookie, accept: "text/html" } },
+          ),
+        );
+        // Reaches the real authorize handler (login/consent/error) — NOT bounced
+        // to the change-password rail by the gate.
+        expect(res.headers.get("location")).not.toBe("/account/change-password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
 });

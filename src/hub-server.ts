@@ -1287,9 +1287,11 @@ interface PeerIpResolver {
  *
  * EXEMPT (NOT gated — the rotation/exit path; callers must route these BEFORE
  * invoking this gate): `/account/change-password` (GET+POST) and `/logout`.
- * Everything else under `/account/*` and the per-vault `/vault/<name>/*` proxy
- * is gated. The decision is deliberate: a pre-rotation user can ONLY rotate or
- * sign out — no vault reads, no token mints, no account home.
+ * Everything else under `/account/*`, the per-vault `/vault/<name>/*` proxy,
+ * and the session-backed `/oauth/authorize` consent path is gated. The decision
+ * is deliberate: a pre-rotation user can ONLY rotate or sign out — no vault
+ * reads, no token mints, no account home, and no OAuth authorize → auth code →
+ * `/oauth/token` exchange for a vault-scoped access token.
  *
  * Browser GETs (Accept: text/html) get a 302 to `/account/change-password`;
  * non-GET and API-style requests get a 403 with the same JSON error shape the
@@ -1845,6 +1847,17 @@ export function hubFetch(
     // See `src/cors.ts` for the wildcard-origin rationale.
     if (pathname === "/oauth/authorize") {
       if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
+      // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 3:
+      // a signed-in pre-rotation user must NOT be able to ride the consent flow
+      // to an auth code → `/oauth/token` exchange → vault-scoped access token
+      // without rotating the temp password. Gating `/oauth/authorize` (the
+      // session-backed consent path) is sufficient — no code is issued without
+      // it, so `/oauth/token` (back-channel code exchange, no session cookie)
+      // is intentionally NOT gated (gating it would break the legitimate
+      // exchange). An UNAUTHENTICATED authorize request returns null from the
+      // gate and falls through to render the login form, unchanged.
+      const oauthGate = forceChangePasswordGate(getDb(), req);
+      if (oauthGate) return applyCorsHeaders(req, oauthGate);
       if (req.method === "GET") {
         // handleAuthorizeGet is sync (returns Response, not Promise<Response>).
         // handleAuthorizePost is async — keep the await on POST only.
@@ -2350,7 +2363,13 @@ export function hubFetch(
     // gate for the whole `/account/*` family rather than per-route. The
     // per-route mints in `account-vault-{token,admin-token}.ts` keep their own
     // gate as defence-in-depth (they're also reachable in tests directly).
-    if (getDb && pathname.startsWith("/account/")) {
+    //
+    // The bare `/account` (no trailing slash) is matched explicitly too —
+    // otherwise it would slip past `startsWith("/account/")` to its 301 →
+    // `/account/` below, and a pre-rotation user wouldn't be gated until the
+    // second hop. Exact-match `/account` (not `startsWith("/account")`) so
+    // unrelated paths like `/accounts-something` aren't caught.
+    if (getDb && (pathname === "/account" || pathname.startsWith("/account/"))) {
       const gate = forceChangePasswordGate(getDb(), req);
       if (gate) return gate;
     }
