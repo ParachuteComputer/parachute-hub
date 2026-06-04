@@ -6,12 +6,15 @@
  * is the second wall.
  *
  * 2FA at the hub login layer is real as of hub#473: "password +
- * something-you-have." This warning recommends `parachute auth 2fa enroll`
- * (which now gates hub `/login` for real) when the operator hasn't enrolled.
+ * something-you-have." This prints a STRONG RECOMMENDATION to enroll — via the
+ * browser at `/account/2fa` or `parachute auth 2fa enroll` (which now gates hub
+ * `/login` for real) — when the operator hasn't enrolled.
  *
- * Why this is a warning, not a hard gate: hard-gating would surprise operators
- * mid-flow — they ran `parachute expose public` to expose, not to be told
- * "set up 2FA first." A loud, contextual warning + a clear remediation is the
+ * Why this is a recommendation, not a hard gate (Aaron's explicit call, 2026-06:
+ * "I don't think we need to require 2FA for public expose but we should strongly
+ * recommend it"): hard-gating would surprise operators mid-flow — they ran
+ * `parachute expose public` to expose, not to be told "set up 2FA first." A
+ * clear, friendly, contextual recommendation + an obvious remediation is the
  * right shape; the operator decides whether to act now or later. The tunnel is
  * up regardless.
  *
@@ -68,16 +71,17 @@ export function printPublic2FAWarning(opts: Public2FAWarningOpts): boolean {
     return false;
   }
   log("");
-  log("⚠ /login is now reachable on the public internet");
-  log(`  (${opts.publicUrl}/login). Anyone who guesses your password is in.`);
+  log("→ Strongly recommended: turn on two-factor authentication.");
+  log("  Your login page is now reachable from the public internet");
+  log(`  (${opts.publicUrl}/login) — anyone online can reach it, so your`);
+  log("  password is the only wall. A second factor (a one-time code from");
+  log("  your authenticator app) materially raises the bar:");
   log("");
-  log("  Turn on two-factor authentication — it adds a second wall (a one-time");
-  log("  code from your authenticator app) on top of your password:");
+  log(`    ${opts.publicUrl}/account/2fa     # scan a QR code in your browser`);
+  log("    parachute auth 2fa enroll         # or enroll from the terminal");
   log("");
-  log("    parachute auth 2fa enroll");
-  log("");
-  log("  (Or set it up in the browser at /account/2fa for a scannable QR code.)");
-  log("  Either way, also make sure your owner password is a strong one:");
+  log("  It's a recommendation, not a requirement — your hub is up either way.");
+  log("  While you're at it, make sure your owner password is a strong one:");
   log("");
   log("    parachute auth set-password");
   return true;

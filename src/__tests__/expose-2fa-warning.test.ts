@@ -87,13 +87,16 @@ describe("printPublic2FAWarning", () => {
     });
     expect(fired).toBe(true);
     const joined = logs.join("\n");
-    // hub#473: real hub-login 2FA. The warning now recommends the real
-    // `parachute auth 2fa enroll` path (+ the /account/2fa browser path) and
-    // still nudges a strong owner password.
-    expect(joined).toContain("/login is now reachable on the public internet");
+    // hub#473: real hub-login 2FA. The recommendation now leads with the
+    // friendly "strongly recommended" framing, points at both the /account/2fa
+    // browser path and the `parachute auth 2fa enroll` CLI path, makes clear
+    // it's not a requirement, and still nudges a strong owner password.
+    expect(joined).toContain("Strongly recommended: turn on two-factor authentication");
+    expect(joined).toContain("reachable from the public internet");
     expect(joined).toContain("https://vault.example.com/login");
+    expect(joined).toContain("https://vault.example.com/account/2fa");
     expect(joined).toContain("parachute auth 2fa enroll");
-    expect(joined).toContain("/account/2fa");
+    expect(joined).toContain("It's a recommendation, not a requirement");
     expect(joined).toContain("parachute auth set-password");
   });
 
@@ -120,9 +123,9 @@ describe("printPublic2FAWarning", () => {
       publicUrl: "https://vault.example.com",
     });
     expect(fired).toBe(true);
-    expect(logs.some((l) => l.includes("/login is now reachable on the public internet"))).toBe(
-      true,
-    );
+    expect(
+      logs.some((l) => l.includes("Strongly recommended: turn on two-factor authentication")),
+    ).toBe(true);
   });
 
   test("embeds the supplied publicUrl into the /login pointer", () => {
