@@ -1230,9 +1230,10 @@ describe("exposeCloudflareUp", () => {
 
         expect(code).toBe(0);
         const joined = logs.join("\n");
-        // hub#473: real hub-login 2FA — the warning now recommends the real
-        // `parachute auth 2fa enroll` path.
-        expect(joined).toContain("/login is now reachable on the public internet");
+        // hub#473: real hub-login 2FA — the recommendation now leads with the
+        // friendly "strongly recommended" framing and the real `parachute auth
+        // 2fa enroll` / `/account/2fa` paths.
+        expect(joined).toContain("Strongly recommended: turn on two-factor authentication");
         expect(joined).toContain("https://vault.example.com/login");
         expect(joined).toContain("parachute auth 2fa enroll");
       } finally {
@@ -1281,7 +1282,7 @@ describe("exposeCloudflareUp", () => {
 
         expect(code).toBe(0);
         const joined = logs.join("\n");
-        expect(joined).not.toContain("/login is now reachable on the public internet");
+        expect(joined).not.toContain("Strongly recommended: turn on two-factor authentication");
         // The contextual 2FA warning is suppressed (2FA already enrolled); the
         // always-shown owner-password guidance from `printAuthGuidance` still
         // appears, and it now (hub#473) also surfaces the real `2fa enroll`

@@ -558,7 +558,9 @@ describe("expose tailnet up", () => {
         },
       });
       expect(code).toBe(0);
-      expect(logs.join("\n")).not.toContain("2FA is not enrolled");
+      expect(logs.join("\n")).not.toContain(
+        "Strongly recommended: turn on two-factor authentication",
+      );
     } finally {
       h.cleanup();
     }
@@ -931,9 +933,10 @@ describe("expose public up", () => {
       });
       expect(code).toBe(0);
       const joined = logs.join("\n");
-      // hub#473: real hub-login 2FA. The warning now recommends the real
-      // `parachute auth 2fa enroll` path.
-      expect(joined).toContain("/login is now reachable on the public internet");
+      // hub#473: real hub-login 2FA. The recommendation now leads with the
+      // friendly "strongly recommended" framing and the real `parachute auth
+      // 2fa enroll` path.
+      expect(joined).toContain("Strongly recommended: turn on two-factor authentication");
       expect(joined).toContain("parachute auth 2fa enroll");
       // /login pointer uses the canonical https://<fqdn> origin.
       expect(joined).toContain("https://parachute.taildf9ce2.ts.net/login");
@@ -966,7 +969,9 @@ describe("expose public up", () => {
         },
       });
       expect(code).toBe(0);
-      expect(logs.join("\n")).not.toContain("2FA is not enrolled");
+      expect(logs.join("\n")).not.toContain(
+        "Strongly recommended: turn on two-factor authentication",
+      );
     } finally {
       h.cleanup();
     }
