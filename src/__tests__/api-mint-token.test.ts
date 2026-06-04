@@ -1215,6 +1215,91 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     });
   });
 
+  // Item D / hub#450 — vault-existence check on vault:<name>:admin mints.
+  describe("vault-existence check on vault:<name>:admin (item D / #450)", () => {
+    test("vault:typo:admin for an unknown vault → 400 when knownVaultNames is wired", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:typo:admin" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER, knownVaultNames: new Set(["work", "default"]) },
+          );
+          expect(resp.status).toBe(400);
+          const body = (await resp.json()) as { error: string; error_description: string };
+          expect(body.error).toBe("invalid_scope");
+          expect(body.error_description).toContain("typo");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("vault:work:admin for a KNOWN vault → 200", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:work:admin" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER, knownVaultNames: new Set(["work", "default"]) },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { scope: string };
+          expect(body.scope).toBe("vault:work:admin");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("read/write for an unknown vault are NOT existence-checked (admin-only gate)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:typo:read" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER, knownVaultNames: new Set(["work"]) },
+          );
+          expect(resp.status).toBe(200);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("knownVaultNames omitted → existence check skipped (back-compat)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "vault:typo:admin" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          // No knownVaultNames → the documented "caller responsible" fallback.
+          expect(resp.status).toBe(200);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
   test("405 on non-POST", async () => {
     const h = makeHarness();
     try {

@@ -2008,9 +2008,20 @@ export function hubFetch(
 
     if (pathname === "/api/auth/mint-token") {
       if (!getDb) return dbNotConfigured();
+      // Derive the set of registered vault names so the handler can reject a
+      // `vault:<typo>:admin` mint (item D / hub#450) — same source + shape the
+      // session-cookie `/admin/vault-admin-token/<name>` path uses. Lenient
+      // read so a malformed manifest doesn't 500 the mint endpoint.
+      const mintManifest = readManifestLenient(manifestPath);
+      const mintKnownVaultNames = new Set<string>();
+      for (const s of mintManifest.services) {
+        if (!isVaultEntry(s)) continue;
+        for (const path of s.paths) mintKnownVaultNames.add(vaultInstanceNameFor(s.name, path));
+      }
       return handleApiMintToken(req, {
         db: getDb(),
         issuer: oauthDeps(req).issuer,
+        knownVaultNames: mintKnownVaultNames,
       });
     }
 

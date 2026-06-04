@@ -87,6 +87,21 @@ export interface ApiMintTokenDeps {
   db: Database;
   /** Hub origin — written into the JWT `iss` of minted tokens AND used to validate the bearer. */
   issuer: string;
+  /**
+   * Names of vault instances currently registered in services.json (item D /
+   * hub#450). When provided, a `vault:<name>:admin` mint whose `<name>` is not
+   * in this set is rejected with 400 — a typo'd name can no longer mint
+   * `vault:typo:admin` (an unusable token that authenticates against no real
+   * vault, only confusing automation that's debugging a typo). Mirrors the
+   * session-cookie path (`/admin/vault-admin-token/<name>`), which already
+   * 404s unknown vault names via `knownVaultNames.has`.
+   *
+   * Optional: when undefined the existence check is skipped (the documented
+   * "caller is responsible for a real vault name" fallback, and the shape used
+   * by unit tests that don't wire a manifest). Production wires it from
+   * services.json in hub-server.ts.
+   */
+  knownVaultNames?: ReadonlySet<string>;
   /** Test seam for time. */
   now?: () => Date;
 }
@@ -212,6 +227,31 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
       "invalid_scope",
       "bare vault:admin is not mintable headlessly; request a resource-narrowed vault:<name>:admin instead",
     );
+  }
+
+  // Item D / hub#450 — vault-existence check for `vault:<name>:admin` mints.
+  // The session-cookie path (`/admin/vault-admin-token/<name>`) already 404s an
+  // unknown vault name; this mirrors it for the bearer path so a typo can't mint
+  // `vault:typo:admin` — an unusable token (it authenticates against no real
+  // vault) that only confuses automation debugging a typo. Gated on `<name>:admin`
+  // (the one form #450 calls out); read/write are left alone (even more harmless,
+  // and the broad-requestable path). Skipped entirely when `knownVaultNames` is
+  // absent (the documented "caller responsible" fallback + unit-test shape).
+  if (deps.knownVaultNames !== undefined) {
+    const unknownAdminVaults = scopes.filter((s) => {
+      if (!isVaultAdminScope(s)) return false;
+      const name = vaultScopeName(s);
+      return name !== null && !deps.knownVaultNames!.has(name);
+    });
+    if (unknownAdminVaults.length > 0) {
+      return jsonError(
+        400,
+        "invalid_scope",
+        `no vault named ${unknownAdminVaults
+          .map((s) => `"${vaultScopeName(s)}"`)
+          .join(", ")} in this hub; create the vault before minting an admin token for it`,
+      );
+    }
   }
 
   // Capability-attenuation guard: every requested scope must be a subset of
