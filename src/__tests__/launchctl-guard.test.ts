@@ -166,13 +166,20 @@ describe("default Runner refuses real launchctl under test (regression — hub#5
   });
 
   test("default deps still RUN a read-only `launchctl print` (guard is verb-scoped, not a blanket block)", () => {
-    // This proves the guard doesn't break the legitimate default-deps read paths
-    // (`queryHubUnitState`, the stale-unit `print` probe). Under the dev test-run
-    // PATH shim this hits the fake launchctl (exit 0); without it the real
-    // `launchctl print` of a non-loaded label returns nonzero — either way it does
-    // NOT throw, which is the property under test.
-    expect(() =>
-      defaultManagedUnitDeps.run(["launchctl", "print", "gui/501/computer.parachute.NONEXISTENT"]),
-    ).not.toThrow();
+    // The property under test: the GUARD does not block a read-only `print`
+    // (verb-scoped, not a blanket launchctl block) — so it never throws the
+    // `/launchctl-guard/` error for it. What happens AFTER the guard allows it
+    // through is environment-dependent and NOT under test:
+    //   - dev Mac under the test PATH shim → fake launchctl, exit 0, no throw
+    //   - real Mac → `launchctl print` of a non-loaded label returns nonzero, no throw
+    //   - Linux CI (no launchctl on PATH) → the spawn throws ENOENT
+    //     ("Executable not found in $PATH") — which is NOT the guard, and still
+    //     proves the guard let the command reach the spawn.
+    // So: assert only that no error thrown here is a GUARD throw.
+    try {
+      defaultManagedUnitDeps.run(["launchctl", "print", "gui/501/computer.parachute.NONEXISTENT"]);
+    } catch (err) {
+      expect(String((err as { message?: unknown })?.message ?? err)).not.toMatch(/launchctl-guard/);
+    }
   });
 });
