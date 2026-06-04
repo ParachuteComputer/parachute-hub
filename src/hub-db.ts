@@ -2,8 +2,9 @@
  * Hub-local SQLite database. Opens `~/.parachute/hub.db` (overridable via
  * `$PARACHUTE_HOME`). Holds everything the hub owns as the ecosystem's OAuth
  * issuer — signing keys (v1), users + opaque refresh tokens (v2), OAuth
- * clients + auth-codes + grants + browser sessions (v3), and TOTP 2FA
- * enrollment on the users row (v11, hub#473).
+ * clients + auth-codes + grants + browser sessions (v3), TOTP 2FA
+ * enrollment on the users row (v11, hub#473), and one-time invite links
+ * (v12, the `invites` table).
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -356,6 +357,73 @@ const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE users ADD COLUMN totp_secret TEXT;
       ALTER TABLE users ADD COLUMN totp_backup_codes TEXT;
       ALTER TABLE users ADD COLUMN totp_enrolled_at TEXT;
+    `,
+  },
+  {
+    version: 12,
+    sql: `
+      -- One-time, expiring invite links (design
+      -- 2026-06-04-individual-users-and-vault-operations.md §7). An admin
+      -- generates a link; the recipient opens it, picks a username +
+      -- password, and gets their OWN freshly-provisioned vault as owner.
+      --
+      -- The row stores sha256(token), NOT the raw token. Invites are
+      -- longer-lived than the 60s OAuth auth-codes (default 7-day expiry),
+      -- so a DB read must not be enough to replay the link — the raw token
+      -- is emitted exactly once at creation and never persisted, exactly
+      -- like the bootstrap token. Lookup hashes the URL token and selects
+      -- by the hash; the hash is the primary key.
+      --
+      -- Columns:
+      --   * token (TEXT PK)        — sha256(raw token), hex. Never the raw value.
+      --   * created_by (TEXT)      — admin user id that issued the invite
+      --                              (FK users.id; ON DELETE SET NULL so
+      --                              deleting the issuer doesn't orphan-block
+      --                              the audit row).
+      --   * vault_name (TEXT)      — nullable. When set, the invite pins the
+      --                              vault name (redeemer can't squat names).
+      --                              When NULL + provision_vault=1 the redeemer
+      --                              names their own vault at redeem time.
+      --   * role (TEXT DEFAULT 'write') — the user_vaults role the redeemed
+      --                              user gets on their vault. 'write' = owner
+      --                              (full vault admin per vaultVerbsForRole).
+      --                              Carried so the shared-into-existing-vault
+      --                              case is a later policy change, not a
+      --                              migration.
+      --   * provision_vault (INTEGER) — 1 = provision a NEW vault for the
+      --                              redeemer (the primary flow); 0 = account
+      --                              only / assign an existing vault.
+      --   * default_mirror (TEXT)  — nullable; wires the §3 default-mirror knob
+      --                              ('internal' | 'off') through to the
+      --                              provisioned vault. NULL = vault's own
+      --                              default.
+      --   * expires_at (TEXT)      — ISO-8601; redeem rejects past this.
+      --   * used_at (TEXT)         — ISO-8601 stamp set at redeem. Single-use:
+      --                              a second redeem sees this set and is
+      --                              rejected. Stamped only AFTER the user row
+      --                              commits, so a createUser failure leaves
+      --                              the invite re-usable.
+      --   * redeemed_user_id (TEXT) — the user id the invite created (FK
+      --                              users.id; ON DELETE SET NULL).
+      --   * revoked_at (TEXT)      — ISO-8601 stamp when the admin revokes the
+      --                              invite before redemption.
+      --   * created_at (TEXT)      — ISO-8601.
+      --
+      -- No backfill — no invites pre-date this migration.
+      CREATE TABLE invites (
+        token TEXT PRIMARY KEY,
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        vault_name TEXT,
+        role TEXT NOT NULL DEFAULT 'write',
+        provision_vault INTEGER NOT NULL DEFAULT 1,
+        default_mirror TEXT,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        redeemed_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX invites_created_at ON invites (created_at);
     `,
   },
 ];

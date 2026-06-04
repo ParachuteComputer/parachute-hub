@@ -127,6 +127,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pkg from "../package.json" with { type: "json" };
+import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.ts";
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
 import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
 import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
@@ -147,6 +148,7 @@ import {
 } from "./api-account.ts";
 import { handleHubUpgrade, handleHubUpgradeStatus } from "./api-hub-upgrade.ts";
 import { handleApiHub } from "./api-hub.ts";
+import { handleCreateInvite, handleListInvites, handleRevokeInvite } from "./api-invites.ts";
 import { handleApiMe } from "./api-me.ts";
 import { handleApiMintToken } from "./api-mint-token.ts";
 import { handleApiModulesConfig, parseModulesConfigPath } from "./api-modules-config.ts";
@@ -1091,6 +1093,13 @@ async function serveSpa(spaDistDir: string, pathname: string, mount: SpaMount): 
  * regular dispatch continues.
  */
 function shouldGateForSetup(pathname: string): boolean {
+  // Invite redemption (`/account/setup/<token>`) is an un-authed onboarding
+  // surface like the wizard — it must pass through the pre-admin lockout so a
+  // recipient can claim an invite. (In practice invites can only be issued
+  // after an admin exists, so the no-admin lockout rarely coincides; the
+  // explicit pass-through keeps the surface's posture clear + matches the
+  // wizard's `/admin/setup/*` exemption.)
+  if (pathname === "/account/setup" || pathname.startsWith("/account/setup/")) return false;
   if (pathname === "/login" || pathname === "/logout") return true;
   // The wizard itself + its POST endpoints are the *only* way to exit
   // the pre-admin lockout from a browser — they must pass through. Any
@@ -2301,6 +2310,29 @@ export function hubFetch(
       });
     }
 
+    // One-time invite links (design §7). host:admin-gated, same gate flavor
+    // as /api/users. POST creates (returns the single-emit token + URL), GET
+    // lists (status-annotated), DELETE /:id revokes by sha256 hash.
+    if (pathname === "/api/invites") {
+      if (!getDb) return dbNotConfigured();
+      const invitesDeps = { db: getDb(), issuer: oauthDeps(req).issuer, manifestPath };
+      if (req.method === "GET") return handleListInvites(req, invitesDeps);
+      if (req.method === "POST") return handleCreateInvite(req, invitesDeps);
+      return new Response("method not allowed", { status: 405 });
+    }
+    if (pathname.startsWith("/api/invites/")) {
+      if (!getDb) return dbNotConfigured();
+      const id = decodeURIComponent(pathname.slice("/api/invites/".length));
+      if (!id || id.includes("/")) {
+        return new Response("not found", { status: 404 });
+      }
+      return handleRevokeInvite(req, id, {
+        db: getDb(),
+        issuer: oauthDeps(req).issuer,
+        manifestPath,
+      });
+    }
+
     // Canonical login/logout. The handlers themselves are unchanged from
     // when they lived at /admin/login + /admin/logout; the rename surfaced
     // via #231-followup so the URL reflects the surface's actual scope
@@ -2329,6 +2361,27 @@ export function hubFetch(
       if (!getDb) return dbNotConfigured();
       if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
       return handleAdminLogoutPost(getDb(), req);
+    }
+
+    // Invite redemption — `/account/setup/<token>` (design §7). Un-authed
+    // onboarding surface (the invitee has no session yet); routed BEFORE the
+    // per-request force-change choke point and the `/account/` matches below.
+    // GET renders the claim form; POST redeems → creates account + own vault,
+    // mints a session, 302 → /account/. The handler validates the invite
+    // (sha256 lookup, expiry/used/revoked), CSRF, and rate-limits on the
+    // /login IP bucket. The invite alone is the authorization — no host:admin.
+    if (pathname.startsWith("/account/setup/")) {
+      if (!getDb) return dbNotConfigured();
+      const rawToken = decodeURIComponent(pathname.slice("/account/setup/".length));
+      if (!rawToken || rawToken.includes("/")) {
+        return new Response("not found", { status: 404 });
+      }
+      const db = getDb();
+      const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
+      const setupDeps = { db, hubOrigin, manifestPath };
+      if (req.method === "GET") return handleAccountSetupGet(req, rawToken, setupDeps);
+      if (req.method === "POST") return handleAccountSetupPost(req, rawToken, setupDeps);
+      return new Response("method not allowed", { status: 405 });
     }
 
     // Multi-user Phase 1 PR 3 — user self-service change-password surface

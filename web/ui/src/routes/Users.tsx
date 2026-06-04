@@ -57,6 +57,7 @@ import {
   resetUserPassword,
   updateUserVaults,
 } from "../lib/api.ts";
+import { InvitesSection } from "./InvitesSection";
 
 /**
  * Server's password-floor. Mirrors `PASSWORD_MIN_LEN` in `users.ts`
@@ -400,6 +401,8 @@ export function Users() {
           onSubmit={onSubmitCreate}
         />
       )}
+
+      {state.kind === "ok" && <InvitesSection hubOrigin={state.data.hubOrigin} />}
     </div>
   );
 }

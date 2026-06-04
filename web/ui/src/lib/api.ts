@@ -1369,6 +1369,97 @@ export async function listUserVaults(): Promise<string[]> {
   return body.vaults ?? [];
 }
 
+// ---------------------------------------------------------------------------
+// Invite links (design §7). host:admin-gated; same Bearer pattern as users.
+// ---------------------------------------------------------------------------
+
+export type InviteStatus = "pending" | "redeemed" | "expired" | "revoked";
+
+/** Wire shape from `GET /api/invites`. `id` is the sha256 hash, NOT the raw token. */
+export interface InviteListing {
+  id: string;
+  status: InviteStatus;
+  vault_name: string | null;
+  role: string;
+  provision_vault: boolean;
+  default_mirror: string | null;
+  expires_at: string;
+  used_at: string | null;
+  redeemed_user_id: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+/** Body for `POST /api/invites`. Every field is optional (server defaults apply). */
+export interface CreateInviteInput {
+  vault_name?: string | null;
+  role?: string;
+  provision_vault?: boolean;
+  default_mirror?: "internal" | "off" | null;
+  expires_in?: number;
+}
+
+/** `POST /api/invites` response — the raw token + URL are emitted ONCE here. */
+export interface CreatedInvite {
+  invite: InviteListing;
+  token: string;
+  url: string;
+}
+
+/** GET /api/invites — list invites, newest first, status-annotated. */
+export async function listInvites(): Promise<InviteListing[]> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/invites", {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { invites: InviteListing[] };
+  return body.invites ?? [];
+}
+
+/**
+ * POST /api/invites — create an invite. The response carries the raw token +
+ * full redemption URL, which the hub never stores and never returns again —
+ * the caller must surface them once.
+ */
+export async function createInvite(input: CreateInviteInput): Promise<CreatedInvite> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/invites", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify(input),
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as CreatedInvite;
+}
+
+/** DELETE /api/invites/:id — revoke a pending invite by its sha256 id. */
+export async function revokeInvite(id: string): Promise<void> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/invites/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
 /**
  * Wire shape returned by `GET /api/hub`. Mirrors the snake_case payload
  * defined in `src/api-hub.ts:HubStatusResponse`. Drives the admin SPA's
