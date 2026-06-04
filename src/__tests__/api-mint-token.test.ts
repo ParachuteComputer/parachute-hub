@@ -317,6 +317,32 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     }
   });
 
+  // Item C — case-insensitive non-requestable guard. An uppercase casing of a
+  // host-level scope must NOT bypass the non-requestable membership check (which
+  // was exact-string before). `PARACHUTE:HOST:AUTH` is now correctly rejected.
+  test("400 invalid_scope when minting an uppercase host scope (item C)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        for (const variant of ["PARACHUTE:HOST:AUTH", "Parachute:Host:Admin"]) {
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: variant }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(400);
+          const body = (await resp.json()) as { error: string };
+          expect(body.error).toBe("invalid_scope");
+        }
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("400 invalid_scope when multi-scope includes a non-requestable", async () => {
     const h = makeHarness();
     try {
