@@ -232,6 +232,15 @@ export interface CreateUserOpts {
    * each name against `services.json` before passing through.
    */
   assignedVaults?: string[];
+  /**
+   * The `user_vaults.role` to write for every entry in `assignedVaults`.
+   * Default `'write'` (= owner; `vaultVerbsForRole('write')` grants the
+   * full read/write/admin triple). The invite-redeem path passes the
+   * invite's baked-in role so a future shared-into-existing-vault invite
+   * can land a narrower `'read'` role without a second migration. All
+   * existing call sites omit it and keep the historical `'write'` default.
+   */
+  role?: string;
 }
 
 export async function createUser(
@@ -268,12 +277,13 @@ export async function createUser(
          VALUES (?, ?, ?, ?, ?, ?)`,
       ).run(id, username, passwordHash, stamp, stamp, passwordChanged);
       if (assignedVaults.length > 0) {
+        const role = opts.role ?? "write";
         const insertVault = db.prepare(
           `INSERT INTO user_vaults (user_id, vault_name, role, created_at)
-           VALUES (?, ?, 'write', ?)`,
+           VALUES (?, ?, ?, ?)`,
         );
         for (const vaultName of assignedVaults) {
-          insertVault.run(id, vaultName, stamp);
+          insertVault.run(id, vaultName, role, stamp);
         }
       }
     })();

@@ -279,10 +279,17 @@ async function orchestrate(
   manifestPath: string,
   name: string,
   runCommand: (cmd: readonly string[]) => Promise<RunResult>,
+  opts: { noMirror?: boolean } = {},
 ): Promise<OrchestrateOk | OrchestrateError> {
   const vaultRegistered = findService("parachute-vault", manifestPath) !== undefined;
+  // `--no-mirror` opts this create out of the default internal live mirror
+  // (§3 default_mirror knob). Only meaningful on the `create` branch — the
+  // bootstrap `install` path provisions the default vault and follows the
+  // server-wide knob.
   const cmd = vaultRegistered
-    ? ["parachute-vault", "create", name, "--json"]
+    ? opts.noMirror
+      ? ["parachute-vault", "create", name, "--json", "--no-mirror"]
+      : ["parachute-vault", "create", name, "--json"]
     : ["parachute", "install", "vault"];
   let result: RunResult;
   try {
@@ -331,6 +338,102 @@ async function orchestrate(
   return { ok: true, createJson };
 }
 
+/**
+ * Result of {@link provisionVault} — the programmatic vault-provisioning
+ * core shared by the authed HTTP handler and the invite-redeem path.
+ *
+ *   - `created: true`  — a fresh vault was provisioned this call. `entry`
+ *     describes it; `createJson` (when present) carries the single-emit
+ *     bootstrap creds.
+ *   - `created: false` — the vault already existed (idempotent). `entry`
+ *     describes the existing vault; no `createJson`.
+ */
+export type ProvisionVaultResult =
+  | {
+      ok: true;
+      created: boolean;
+      entry: WellKnownVaultEntry;
+      createJson: VaultCreateJson | null;
+    }
+  | { ok: false; status: number; message: string };
+
+/**
+ * Provision (or no-op if it exists) a vault by name — the auth-free core
+ * lifted out of {@link handleCreateVault} so the invite-redeem flow can
+ * provision a vault for a freshly-created account WITHOUT a host:admin
+ * bearer (the redeemer holds no admin authority; the invite IS the
+ * authorization). The HTTP handler keeps the host:admin gate in front of
+ * this; the invite path calls it directly after validating the invite.
+ *
+ * Idempotent-safe: if the vault already exists this returns
+ * `created:false` with the existing entry rather than re-running the CLI —
+ * a redeem retry (or a name collision) lands the user on the existing
+ * vault instead of erroring.
+ *
+ * Name validation matches `parachute-vault create`'s rules. Callers that
+ * accept an untrusted name (the invite redeemer naming their own vault)
+ * MUST pass it through here so the same regex + reserved-name gate the
+ * `/vaults` API edge enforces applies.
+ */
+export async function provisionVault(
+  name: string,
+  deps: {
+    issuer: string;
+    manifestPath?: string;
+    runCommand?: CreateVaultDeps["runCommand"];
+    /** `'off'` appends `--no-mirror`; anything else follows the server knob. */
+    defaultMirror?: string;
+  },
+): Promise<ProvisionVaultResult> {
+  const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
+  const runCommand = deps.runCommand ?? defaultRunCommand;
+
+  if (!VAULT_NAME_PATTERN.test(name)) {
+    return {
+      ok: false,
+      status: 400,
+      message: "vault name must contain only lowercase letters, numbers, hyphens, and underscores",
+    };
+  }
+  if (RESERVED_VAULT_NAMES.has(name)) {
+    return { ok: false, status: 400, message: `"${name}" is a reserved vault name` };
+  }
+
+  // Idempotency: if the vault already exists, return the existing entry.
+  const existing = findExistingVault(manifestPath, name);
+  if (existing) {
+    return {
+      ok: true,
+      created: false,
+      entry: buildEntry(name, existing.path, existing.version, deps.issuer),
+      createJson: null,
+    };
+  }
+
+  const result = await orchestrate(manifestPath, name, runCommand, {
+    noMirror: deps.defaultMirror === "off",
+  });
+  if (!result.ok) {
+    return { ok: false, status: result.status, message: result.message };
+  }
+
+  // Re-read services.json: the CLI just wrote it.
+  const created = findExistingVault(manifestPath, name);
+  if (!created) {
+    return {
+      ok: false,
+      status: 500,
+      message: `vault "${name}" was provisioned but is not in services.json — manual recovery required`,
+    };
+  }
+  return {
+    ok: true,
+    created: true,
+    entry: buildEntry(name, created.path, created.version, deps.issuer),
+    createJson: result.createJson,
+  };
+}
+
 export async function handleCreateVault(req: Request, deps: CreateVaultDeps): Promise<Response> {
   if (req.method !== "POST") {
     return new Response("method not allowed", { status: 405 });
@@ -352,35 +455,29 @@ export async function handleCreateVault(req: Request, deps: CreateVaultDeps): Pr
   }
   const { name } = parsed.body;
 
-  // Idempotency: if the vault already exists, return 200 + existing entry.
-  // Skip the CLI shell-out — re-POST is usually a UI retry.
-  const existing = findExistingVault(manifestPath, name);
-  if (existing) {
-    return new Response(
-      JSON.stringify(buildEntry(name, existing.path, existing.version, deps.issuer)),
-      {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      },
-    );
+  const provisioned = await provisionVault(name, {
+    issuer: deps.issuer,
+    manifestPath,
+    runCommand,
+  });
+  if (!provisioned.ok) {
+    // parseBody already enforced the name regex/reserved gate, so a
+    // provisionVault 400 here would be a redundant re-check; map any
+    // non-ok to its status. invalid_request for 400, server_error otherwise.
+    const error = provisioned.status === 400 ? "invalid_request" : "server_error";
+    return jsonError(provisioned.status, error, provisioned.message);
   }
 
-  const result = await orchestrate(manifestPath, name, runCommand);
-  if (!result.ok) {
-    return jsonError(result.status, "server_error", result.message);
+  // Idempotent re-POST: existing vault → 200, no single-emit creds.
+  if (!provisioned.created) {
+    return new Response(JSON.stringify(provisioned.entry), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   }
 
-  // Re-read services.json: the CLI just wrote it.
-  const created = findExistingVault(manifestPath, name);
-  if (!created) {
-    return jsonError(
-      500,
-      "server_error",
-      `vault "${name}" was provisioned but is not in services.json — manual recovery required`,
-    );
-  }
-
-  const entry = buildEntry(name, created.path, created.version, deps.issuer);
+  const entry = provisioned.entry;
+  const result = { createJson: provisioned.createJson };
   // Access token (a `vault:<name>:admin` JWT, possibly empty post-DROP) +
   // filesystem paths are single-emit at create time. We surface them here so
   // the caller can immediately bootstrap a connection to the new vault.

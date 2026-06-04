@@ -1108,6 +1108,23 @@ a.btn:hover {
   background: var(--bg-soft);
   color: var(--fg-dim);
 }
+/*
+ * Invite-link statuses (design §7). `pending` reuses `.status-pending`
+ * above. `redeemed` is a successful terminal state (success palette);
+ * `expired` + `revoked` are muted terminal states.
+ */
+.status-redeemed {
+  background: var(--success-soft);
+  color: var(--success);
+}
+.status-expired {
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+}
+.status-revoked {
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+}
 
 /*
  * Back-compat aliases for the pre-F vocabulary. Modules / SDKs that

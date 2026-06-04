@@ -152,6 +152,100 @@ export function renderTotpChallenge(props: TotpChallengeProps): string {
   return baseDocument("Two-factor authentication — Parachute", body);
 }
 
+// --- invite redemption ( /account/setup/<token> ) --------------------------
+
+export interface InviteSetupProps {
+  /** The raw token from the URL — POSTs back to the same path. */
+  token: string;
+  csrfToken: string;
+  /**
+   * When the invite pins a vault name the redeemer can't choose one — we show
+   * it read-only. When null the redeemer names their own vault (a text field).
+   */
+  pinnedVaultName: string | null;
+  /** Whether redemption provisions a vault at all (shows the vault row iff true). */
+  provisionVault: boolean;
+  username?: string;
+  vaultName?: string;
+  errorMessage?: string;
+}
+
+/**
+ * Server-rendered "claim your invite" form for `/account/setup/<token>`.
+ * Stands alone without the SPA (same posture as `/login` + the setup wizard):
+ * a brand-new invitee hits this with no session and no JS. Posts back to the
+ * same `/account/setup/<token>` path. Reuses the shared login chrome.
+ */
+export function renderInviteSetup(props: InviteSetupProps): string {
+  const { token, csrfToken, pinnedVaultName, provisionVault, username, vaultName, errorMessage } =
+    props;
+  const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
+  const usernameAttr = username ? ` value="${escapeAttr(username)}"` : "";
+
+  // Vault row: shown only when the invite provisions a vault. Pinned → a
+  // read-only display of the name the admin chose (redeemer can't squat names).
+  // Unpinned → a text field the redeemer fills.
+  let vaultRow = "";
+  if (provisionVault) {
+    if (pinnedVaultName !== null) {
+      vaultRow = `
+        <label class="field">
+          <span class="field-label">Your vault</span>
+          <input type="text" value="${escapeAttr(pinnedVaultName)}" readonly disabled />
+          <span class="field-hint">Your hub operator named this vault for you.</span>
+        </label>`;
+    } else {
+      const vaultAttr = vaultName ? ` value="${escapeAttr(vaultName)}"` : "";
+      vaultRow = `
+        <label class="field">
+          <span class="field-label">Name your vault</span>
+          <input type="text" name="vault_name" autocomplete="off"
+            required minlength="2" maxlength="64"
+            pattern="[a-z0-9_-]+" title="lowercase letters, digits, _ - (2–64 chars)"
+            spellcheck="false" autocapitalize="off"${vaultAttr} />
+          <span class="field-hint">lowercase letters, digits, <code>_</code>, <code>-</code></span>
+        </label>`;
+    }
+  }
+
+  const body = `
+    <div class="card">
+      <div class="card-header">
+        ${header()}
+        <h1>Claim your invite</h1>
+        <p class="subtitle">Pick a username and password to create your Parachute account${
+          provisionVault ? " and your own vault" : ""
+        }.</p>
+      </div>
+      ${error}
+      <form method="POST" action="/account/setup/${escapeAttr(token)}" class="auth-form">
+        ${renderCsrfHiddenInput(csrfToken)}
+        <label class="field">
+          <span class="field-label">Username</span>
+          <input type="text" name="username" autocomplete="username" autofocus
+            required minlength="2" maxlength="32"
+            pattern="[a-z0-9_-]+" title="lowercase letters, digits, _ - (2–32 chars)"
+            spellcheck="false" autocapitalize="off"${usernameAttr} />
+          <span class="field-hint">lowercase letters, digits, <code>_</code>, <code>-</code></span>
+        </label>
+        <label class="field">
+          <span class="field-label">Password</span>
+          <input type="password" name="password" autocomplete="new-password"
+            required minlength="12" />
+          <span class="field-hint">at least 12 characters</span>
+        </label>
+        <label class="field">
+          <span class="field-label">Confirm password</span>
+          <input type="password" name="password_confirm" autocomplete="new-password"
+            required minlength="12" />
+        </label>
+        ${vaultRow}
+        <button type="submit" class="btn btn-primary">Create my account</button>
+      </form>
+    </div>`;
+  return baseDocument("Claim your invite — Parachute", body);
+}
+
 // --- error page ------------------------------------------------------------
 
 export function renderAdminError(props: { title: string; message: string }): string {
