@@ -151,6 +151,17 @@ export interface RenderAccountHomeOpts {
    * on the normal GET render.
    */
   mintError?: string;
+  /**
+   * Whether this user has already connected an AI to (any of) their assigned
+   * vault(s) — true when a `grants` row touches one of their vaults (see
+   * `userHasVaultGrant`). Drives the first-run onboarding checklist: when
+   * `false`, the checklist leads with the hero "Connect your AI" step (inline
+   * endpoint + both methods); when `true`, the checklist condenses to a quiet
+   * "you're connected" line so it stops nagging returning users. The full vault
+   * card below remains the working surface either way. Omitted (defaults to
+   * `false`) on the admin / no-vault branches, where no checklist is shown.
+   */
+  connectedVault?: boolean;
 }
 
 /**
@@ -192,6 +203,22 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
   const hasNoVault = !isFirstAdmin && assignedVaults.length === 0;
   const startedCard = hasNoVault ? "" : renderGetStartedCard();
 
+  // First-run onboarding checklist — the lead surface for a friend with at
+  // least one assigned vault. Walks them through the obvious path: account
+  // ready → connect your AI (the hero step, inline endpoint + both methods) →
+  // set up your vault. Once connected (a grant touches one of their vaults) it
+  // condenses to a quiet "you're connected" line so it stops nagging. Shown
+  // only on the assigned-vault branch — the admin + no-vault branches have no
+  // single "your vault" to connect, so the checklist would be misleading there.
+  const checklist =
+    assignedVaults.length > 0
+      ? renderOnboardingChecklist({
+          primaryVault: assignedVaults[0] as string,
+          trimmedOrigin,
+          connected: opts.connectedVault ?? false,
+        })
+      : "";
+
   const vaultCard = renderVaultCard({
     assignedVaults,
     trimmedOrigin,
@@ -216,11 +243,118 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
       </div>
       ${mintedBanner}
       ${mintErrorBanner}
-      ${startedCard}
+      ${checklist}
       ${vaultCard}
+      ${startedCard}
       ${accountCard}
     </div>${COPY_SCRIPT}`;
   return baseDocument(`${username} — Parachute`, body);
+}
+
+interface OnboardingChecklistOpts {
+  /**
+   * The vault the checklist's "Connect your AI" step shows the endpoint for.
+   * For the common single-vault case this is their only vault; for the rare
+   * multi-vault case it's the first/primary one (the per-vault tiles below
+   * still list every vault). Already validated/escaped at render time.
+   */
+  primaryVault: string;
+  trimmedOrigin: string;
+  /** Whether they've already connected an AI (a grant touches a vault). */
+  connected: boolean;
+}
+
+/**
+ * The first-run "Get set up" checklist — the lead surface on `/account/` for a
+ * friend with an assigned vault. Three numbered steps give a non-technical
+ * person an obvious path:
+ *
+ *   ① Your account is ready  — always done (they're signed in, password set).
+ *   ② Connect your AI        — the hero. Inline endpoint (`/vault/<name>/mcp`)
+ *                              with a copy button + the two short connect
+ *                              methods (Claude.ai connector, Claude Code
+ *                              `claude mcp add`). Marked done when `connected`.
+ *   ③ Set up your vault      — links the vault-setup starter prompt.
+ *
+ * When `connected` is true the whole thing condenses to a quiet "✓ You're
+ * connected" line so it doesn't nag returning users — the full vault card below
+ * stays the working surface either way.
+ *
+ * Server-rendered, no-JS-required: the copy button is progressive enhancement
+ * (the endpoint stays selectable text without it), matching the rest of the page.
+ */
+function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
+  const { primaryVault, trimmedOrigin, connected } = opts;
+  const safeVault = escapeHtml(primaryVault);
+  const endpoint = accountMcpEndpoint(trimmedOrigin, primaryVault);
+  const addCmd = accountClaudeMcpAddCommand(trimmedOrigin, primaryVault);
+  const safeEndpoint = escapeHtml(endpoint);
+  const safeAddCmd = escapeHtml(addCmd);
+
+  // Condensed state — they've connected, so the checklist shrinks to a single
+  // reassuring line. The vault card below remains the place to actually work.
+  if (connected) {
+    return `
+    <section class="section onboarding onboarding-done" data-testid="onboarding-checklist"
+             data-connected="true">
+      <p class="onboarding-done-line" data-testid="onboarding-done-line">
+        <span class="onboarding-check" aria-hidden="true">✓</span>
+        You're connected — here's your vault.</p>
+    </section>`;
+  }
+
+  return `
+    <section class="section onboarding" data-testid="onboarding-checklist"
+             data-connected="false">
+      <h2>Get set up</h2>
+      <p class="onboarding-intro">Three quick steps to start using your vault with your AI.</p>
+      <ol class="onboarding-steps">
+        <li class="onboarding-step onboarding-step-done" data-testid="onboarding-step-1">
+          <span class="onboarding-num onboarding-num-done" aria-hidden="true">✓</span>
+          <div class="onboarding-step-body">
+            <p class="onboarding-step-title">Your account is ready</p>
+            <p class="onboarding-step-sub">You're signed in and your password is set. Nothing to
+               do here.</p>
+          </div>
+        </li>
+
+        <li class="onboarding-step onboarding-step-hero" data-testid="onboarding-step-2">
+          <span class="onboarding-num" aria-hidden="true">2</span>
+          <div class="onboarding-step-body">
+            <p class="onboarding-step-title">Connect your AI</p>
+            <p class="onboarding-step-sub">Point Claude (or another AI) at your vault using this
+               address — no token to copy, you'll sign in and approve the first time:</p>
+            <div class="copy-row">
+              <code data-testid="onboarding-mcp-endpoint">${safeEndpoint}</code>
+              <button type="button" class="btn btn-copy" data-copy="${safeEndpoint}"
+                      data-testid="copy-onboarding-endpoint">Copy</button>
+            </div>
+            <p class="onboarding-method"><strong>Claude.ai (web):</strong> open
+               Settings → Connectors → Add custom connector, and paste the address above.</p>
+            <p class="onboarding-method"><strong>Claude Code (terminal):</strong> run this command:</p>
+            <div class="copy-row">
+              <code data-testid="onboarding-mcp-add-command">${safeAddCmd}</code>
+              <button type="button" class="btn btn-copy" data-copy="${safeAddCmd}"
+                      data-testid="copy-onboarding-add-command">Copy</button>
+            </div>
+          </div>
+        </li>
+
+        <li class="onboarding-step" data-testid="onboarding-step-3">
+          <span class="onboarding-num" aria-hidden="true">3</span>
+          <div class="onboarding-step-body">
+            <p class="onboarding-step-title">Set up your vault</p>
+            <p class="onboarding-step-sub">Open a new Claude chat and paste the
+               <a href="https://parachute.computer/onboarding/vault-setup/" target="_blank"
+                  rel="noopener" data-testid="onboarding-vault-setup-link">vault-setup prompt</a> —
+               your AI interviews you and structures your vault around how you think.</p>
+          </div>
+        </li>
+      </ol>
+      <p class="onboarding-foot" data-testid="onboarding-foot">Your vault is
+         <code>${safeVault}</code>. Full connect details, Notes, backup, and access tokens are
+         just below.</p>
+    </section>`;
 }
 
 /**
@@ -231,9 +365,9 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
  * live on parachute.computer rather than embedded here so they iterate
  * without a hub release; this card just links.
  *
- * Placed near the top of the page (after any banners, before the vault card)
- * because "what do I actually do with this?" is the friend's first question —
- * the connect details below answer "how", this answers "what next".
+ * Placed AFTER the connect/vault card (connect-before-prompts): the prompts are
+ * only useful once the vault is connected, so the page leads with the connect
+ * checklist + vault details, and these "what next" prompts sit below them.
  */
 function renderGetStartedCard(): string {
   return `
@@ -748,6 +882,87 @@ const STYLES = `
     .starter-grid { grid-template-columns: 1fr; }
   }
 
+  .onboarding-intro { color: ${PALETTE.fgMuted}; font-size: 0.95rem; margin: 0 0 0.4rem; }
+  .onboarding-steps {
+    list-style: none;
+    margin: 0.75rem 0 0.4rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+  }
+  .onboarding-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.7rem;
+  }
+  .onboarding-num {
+    flex: 0 0 auto;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 999px;
+    background: ${PALETTE.accent};
+    color: ${PALETTE.cardBg};
+    font-size: 0.85rem;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 0.1rem;
+  }
+  .onboarding-num-done {
+    background: ${PALETTE.successSoft};
+    color: ${PALETTE.success};
+    border: 1px solid ${PALETTE.success};
+  }
+  .onboarding-step-body { flex: 1 1 auto; min-width: 0; }
+  .onboarding-step-title {
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: ${PALETTE.fg};
+    margin: 0 0 0.15rem;
+  }
+  .onboarding-step-sub {
+    font-size: 0.85rem;
+    color: ${PALETTE.fgMuted};
+    margin: 0 0 0.4rem;
+  }
+  .onboarding-step-done .onboarding-step-title { color: ${PALETTE.fgMuted}; font-weight: 500; }
+  .onboarding-method {
+    font-size: 0.85rem;
+    color: ${PALETTE.fgMuted};
+    margin: 0.5rem 0 0.3rem;
+  }
+  .onboarding-method strong { color: ${PALETTE.fg}; }
+  .onboarding-step .copy-row { margin: 0.35rem 0; }
+  .onboarding-foot {
+    font-size: 0.82rem;
+    color: ${PALETTE.fgMuted};
+    margin: 0.6rem 0 0;
+  }
+  .onboarding-done-line {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1rem;
+    font-weight: 500;
+    color: ${PALETTE.fg};
+    margin: 0;
+  }
+  .onboarding-check {
+    flex: 0 0 auto;
+    width: 1.4rem;
+    height: 1.4rem;
+    border-radius: 999px;
+    background: ${PALETTE.successSoft};
+    color: ${PALETTE.success};
+    border: 1px solid ${PALETTE.success};
+    font-size: 0.85rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
   .account-security {
     margin: 0.9rem 0 0;
     padding-top: 0.6rem;
@@ -1053,8 +1268,13 @@ const STYLES = `
     h1, h2 { color: #f0ece4; }
     .subtitle, .kv dt, .mcp-field-label, .mcp-connect-hint,
     .mcp-connect-intro, .mcp-method-sub, .mcp-method-note,
-    .vault-notes-cta-sub, .vault-usage { color: #a8a29a; }
-    .vault-name strong, .mcp-connect-label, .mcp-method-title { color: #f0ece4; }
+    .vault-notes-cta-sub, .vault-usage,
+    .onboarding-intro, .onboarding-step-sub, .onboarding-method,
+    .onboarding-foot { color: #a8a29a; }
+    .vault-name strong, .mcp-connect-label, .mcp-method-title,
+    .onboarding-step-title, .onboarding-method strong,
+    .onboarding-done-line { color: #f0ece4; }
+    .onboarding-step-done .onboarding-step-title { color: #a8a29a; }
     code { background: #1f1c18; color: #e8e4dc; }
     .copy-row code { background: transparent; }
     .section { border-top-color: #3a362f; }
