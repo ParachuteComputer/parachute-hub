@@ -175,7 +175,7 @@ describe("renderAccountHome", () => {
     expect(html).not.toContain('data-testid="mcp-connect"');
   });
 
-  test("get-started card — links to the two onboarding prompts, placed before the vault card", () => {
+  test("get-started card — links to the two onboarding prompts, placed AFTER the vault card", () => {
     const html = renderAccountHome({
       username: "alice",
       assignedVaults: ["alice"],
@@ -195,8 +195,10 @@ describe("renderAccountHome", () => {
     expect(html).toContain('data-testid="starter-surface-build"');
     // External links open safely.
     expect(html).toContain('rel="noopener"');
-    // Placed prominently — before the vault card in document order.
-    expect(html.indexOf('data-testid="get-started-card"')).toBeLessThan(
+    // Connect-before-prompts: the prompts are only useful once connected, so
+    // they now sit AFTER the vault card in document order (and after the
+    // onboarding checklist, which leads the page).
+    expect(html.indexOf('data-testid="get-started-card"')).toBeGreaterThan(
       html.indexOf('data-testid="vault-card"'),
     );
   });
@@ -528,5 +530,123 @@ describe("renderAccountHome", () => {
     expect(html).toContain("not assigned");
     // Error render must NOT also show a token.
     expect(html).not.toContain('data-testid="minted-token-banner"');
+  });
+
+  // --- first-run onboarding checklist --------------------------------------
+
+  test("onboarding checklist — renders 3 steps with the correct /mcp endpoint (not connected)", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      connectedVault: false,
+    });
+    expect(html).toContain('data-testid="onboarding-checklist"');
+    expect(html).toContain('data-connected="false"');
+    // All three numbered steps render.
+    expect(html).toContain('data-testid="onboarding-step-1"');
+    expect(html).toContain('data-testid="onboarding-step-2"');
+    expect(html).toContain('data-testid="onboarding-step-3"');
+    expect(html).toContain("Your account is ready");
+    expect(html).toContain("Connect your AI");
+    expect(html).toContain("Set up your vault");
+    // Step ② shows the canonical /vault/<name>/mcp endpoint inline — the /mcp
+    // suffix is load-bearing (only it returns the WWW-Authenticate header).
+    expect(html).toContain(`${HUB_ORIGIN}/vault/alice/mcp`);
+    expect(html).toMatch(/data-testid="onboarding-mcp-endpoint">[^<]*\/vault\/alice\/mcp</);
+    // Both connect methods are inline in step ②.
+    expect(html).toContain('data-testid="onboarding-mcp-add-command"');
+    expect(html).toContain("Add custom connector");
+    expect(html).toContain("claude mcp add");
+    // Step ③ links the vault-setup starter prompt.
+    expect(html).toContain('data-testid="onboarding-vault-setup-link"');
+    expect(html).toContain("https://parachute.computer/onboarding/vault-setup/");
+  });
+
+  test("onboarding checklist — condenses to 'you're connected' when a grant exists", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      connectedVault: true,
+    });
+    // Still the same section, but in its condensed done-state.
+    expect(html).toContain('data-testid="onboarding-checklist"');
+    expect(html).toContain('data-connected="true"');
+    expect(html).toContain('data-testid="onboarding-done-line"');
+    expect(html).toContain("You're connected");
+    // The full 3-step list is gone (no nagging) — but the vault card below
+    // remains the working surface.
+    expect(html).not.toContain('data-testid="onboarding-step-2"');
+    expect(html).toContain('data-testid="vault-card"');
+  });
+
+  test("onboarding checklist — leads the page: BEFORE the vault card and the starter prompts", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      connectedVault: false,
+    });
+    const checklistIdx = html.indexOf('data-testid="onboarding-checklist"');
+    const vaultIdx = html.indexOf('data-testid="vault-card"');
+    const promptsIdx = html.indexOf('data-testid="get-started-card"');
+    // Net first-run order: checklist (connect) → vault details → prompts.
+    expect(checklistIdx).toBeGreaterThanOrEqual(0);
+    expect(checklistIdx).toBeLessThan(vaultIdx);
+    expect(vaultIdx).toBeLessThan(promptsIdx);
+  });
+
+  test("onboarding checklist — absent on the admin and no-vault branches", () => {
+    const admin = renderAccountHome({
+      username: "admin",
+      assignedVaults: [],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: true,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    expect(admin).not.toContain('data-testid="onboarding-checklist"');
+
+    const noVault = renderAccountHome({
+      username: "ghost",
+      assignedVaults: [],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    expect(noVault).not.toContain('data-testid="onboarding-checklist"');
+  });
+
+  test("onboarding checklist — multi-vault uses the first vault for the connect step", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["personal", "family"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      connectedVault: false,
+    });
+    // The checklist's connect step references the first/primary vault; the
+    // per-vault tiles below still list every vault.
+    expect(html).toMatch(/data-testid="onboarding-mcp-endpoint">[^<]*\/vault\/personal\/mcp</);
+    expect(html).toContain(`${HUB_ORIGIN}/vault/family/mcp`); // still present in the vault tiles
   });
 });

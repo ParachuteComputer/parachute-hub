@@ -188,6 +188,31 @@ export function isCoveredByGrantForClientName(
   return true;
 }
 
+const VAULT_SCOPE_PREFIX_RE = /^vault:([^:]+):/;
+
+/**
+ * True when the user has approved at least one OAuth client whose granted
+ * scopes touch `vaultName` (any `vault:<name>:<verb>` scope). This is the
+ * "has this person actually connected an AI to this vault yet?" signal — the
+ * `/account/` onboarding checklist uses it to mark the "Connect your AI" step
+ * done (a grant row only lands once the user has clicked through the consent
+ * screen for a client wired to this vault).
+ *
+ * Mirrors the per-grant vault filter in `admin-grants.ts`; kept here so the
+ * detection lives next to the rest of the grants helpers and can be unit-tested
+ * without the admin route harness.
+ */
+export function userHasVaultGrant(db: Database, userId: string, vaultName: string): boolean {
+  const grants = listGrantsForUser(db, userId);
+  for (const g of grants) {
+    for (const s of g.scopes) {
+      const m = s.match(VAULT_SCOPE_PREFIX_RE);
+      if (m && m[1] === vaultName) return true;
+    }
+  }
+  return false;
+}
+
 /** All grants for a user, ordered most-recent first. Used by `parachute auth list-grants`. */
 export function listGrantsForUser(db: Database, userId: string): Grant[] {
   const rows = db

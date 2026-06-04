@@ -11,6 +11,7 @@ import {
   listGrantsForUser,
   recordGrant,
   revokeGrant,
+  userHasVaultGrant,
 } from "../grants.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { createUser } from "../users.ts";
@@ -177,7 +178,13 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
         redirectUris: ["https://app.example/cb"],
         clientName: "claude-code",
       });
-      recordGrant(h.db, h.userId, reg1.client.clientId, ["a", "b"], new Date("2026-04-10T00:00:00Z"));
+      recordGrant(
+        h.db,
+        h.userId,
+        reg1.client.clientId,
+        ["a", "b"],
+        new Date("2026-04-10T00:00:00Z"),
+      );
       // Second DCR: same client_name="claude-code", fresh client_id, no grant yet
       const reg2 = registerClient(h.db, {
         redirectUris: ["https://app.example/cb"],
@@ -249,8 +256,20 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
         clientName: "claude-code",
       });
       recordGrant(h.db, h.userId, reg1.client.clientId, ["a"], new Date("2026-04-01T00:00:00Z"));
-      recordGrant(h.db, h.userId, reg3.client.clientId, ["a", "c"], new Date("2026-04-15T00:00:00Z"));
-      recordGrant(h.db, h.userId, reg2.client.clientId, ["a", "b"], new Date("2026-04-10T00:00:00Z"));
+      recordGrant(
+        h.db,
+        h.userId,
+        reg3.client.clientId,
+        ["a", "c"],
+        new Date("2026-04-15T00:00:00Z"),
+      );
+      recordGrant(
+        h.db,
+        h.userId,
+        reg2.client.clientId,
+        ["a", "b"],
+        new Date("2026-04-10T00:00:00Z"),
+      );
       const grant = findGrantByClientName(h.db, h.userId, "claude-code");
       // Most recent = reg3's grant (2026-04-15)
       expect(grant?.clientId).toBe(reg3.client.clientId);
@@ -267,9 +286,19 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
         redirectUris: ["https://app.example/cb"],
         clientName: "claude-code",
       });
-      recordGrant(h.db, h.userId, reg.client.clientId, ["vault:default:read", "vault:default:write"]);
-      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:read"])).toBe(true);
-      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:read", "vault:default:write"])).toBe(true);
+      recordGrant(h.db, h.userId, reg.client.clientId, [
+        "vault:default:read",
+        "vault:default:write",
+      ]);
+      expect(
+        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:read"]),
+      ).toBe(true);
+      expect(
+        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [
+          "vault:default:read",
+          "vault:default:write",
+        ]),
+      ).toBe(true);
     } finally {
       h.cleanup();
     }
@@ -284,8 +313,15 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
       });
       recordGrant(h.db, h.userId, reg.client.clientId, ["vault:default:read"]);
       // Asking for write — not previously granted
-      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:write"])).toBe(false);
-      expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:read", "vault:default:write"])).toBe(false);
+      expect(
+        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", ["vault:default:write"]),
+      ).toBe(false);
+      expect(
+        isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [
+          "vault:default:read",
+          "vault:default:write",
+        ]),
+      ).toBe(false);
     } finally {
       h.cleanup();
     }
@@ -300,6 +336,60 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
       });
       recordGrant(h.db, h.userId, reg.client.clientId, ["a"]);
       expect(isCoveredByGrantForClientName(h.db, h.userId, "claude-code", [])).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // --- userHasVaultGrant (onboarding "has connected an AI?" signal) --------
+
+  test("userHasVaultGrant: false when the user has no grants at all", async () => {
+    const h = await harness();
+    try {
+      expect(userHasVaultGrant(h.db, h.userId, "default")).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("userHasVaultGrant: true when a grant's scopes touch the vault", async () => {
+    const h = await harness();
+    try {
+      recordGrant(h.db, h.userId, h.clientId, ["vault:default:read", "vault:default:write"]);
+      expect(userHasVaultGrant(h.db, h.userId, "default")).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("userHasVaultGrant: false when the grant touches a DIFFERENT vault", async () => {
+    const h = await harness();
+    try {
+      recordGrant(h.db, h.userId, h.clientId, ["vault:work:read"]);
+      expect(userHasVaultGrant(h.db, h.userId, "default")).toBe(false);
+      expect(userHasVaultGrant(h.db, h.userId, "work")).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("userHasVaultGrant: non-vault scopes don't count as a connection", async () => {
+    const h = await harness();
+    try {
+      recordGrant(h.db, h.userId, h.clientId, ["parachute:host:auth", "vault:read"]);
+      // `vault:read` (no name segment) is a generic scope, not vault:<name>:.
+      expect(userHasVaultGrant(h.db, h.userId, "default")).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("userHasVaultGrant: prefix isn't substring-fooled (vault:default-2 ≠ default)", async () => {
+    const h = await harness();
+    try {
+      recordGrant(h.db, h.userId, h.clientId, ["vault:default-2:read"]);
+      expect(userHasVaultGrant(h.db, h.userId, "default")).toBe(false);
+      expect(userHasVaultGrant(h.db, h.userId, "default-2")).toBe(true);
     } finally {
       h.cleanup();
     }
