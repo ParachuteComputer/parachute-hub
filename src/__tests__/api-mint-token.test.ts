@@ -416,13 +416,13 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     }
   });
 
-  // A bare `vault:admin` (no vault name) is NOT a per-vault admin scope —
-  // the de-escalation exception only covers `vault:<name>:admin`. It isn't
-  // in the non-requestable set either, so it's treated as an ordinary
-  // (unnamed) scope and mints — but with the `vault` fallback audience, not
-  // a per-vault one. Pinned so a future regex loosening can't silently let
-  // an unnamed admin through the named-vault exemption.
-  test("bare vault:admin (no name) is not caught by the de-escalation exemption", async () => {
+  // Item B / hub#451 — bare `vault:admin` (no vault name) is NOT mintable on
+  // the headless path. The unnamed broad-admin form has no resource pin; the
+  // mint endpoint refuses it with 400 `invalid_scope` (even for a full host:admin
+  // operator). The legitimate path for a vault admin token is a resource-narrowed
+  // `vault:<name>:admin`. The OAuth flow still accepts bare `vault:admin` and
+  // narrows it via the picker — that path is unaffected (see oauth-handlers).
+  test("bare vault:admin (no name) → 400 (non-requestable headlessly, item B / #451)", async () => {
     const h = makeHarness();
     try {
       const { db, userId } = await bootstrap(h.dir);
@@ -432,9 +432,31 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
           jsonRequest({ scope: "vault:admin" }, { authorization: `Bearer ${op.token}` }),
           { db, issuer: ISSUER },
         );
-        // `vault:admin` isn't a per-vault admin scope and isn't in the
-        // non-requestable set, so it mints as an ordinary scope. The point
-        // of this test is that it does NOT get a per-vault audience/pin.
+        expect(resp.status).toBe(400);
+        const body = (await resp.json()) as { error: string; error_description: string };
+        expect(body.error).toBe("invalid_scope");
+        expect(body.error_description).toContain("vault:admin");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // Item B does NOT touch unnamed vault:read / vault:write — those carry no
+  // admin authority and remain mintable (regression guard for the narrow scope
+  // of the bare-admin block).
+  test("bare vault:read still mints headlessly (item B is admin-only)", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const resp = await handleApiMintToken(
+          jsonRequest({ scope: "vault:read" }, { authorization: `Bearer ${op.token}` }),
+          { db, issuer: ISSUER },
+        );
         expect(resp.status).toBe(200);
         const body = (await resp.json()) as { token: string };
         const validated = await validateAccessToken(db, body.token, ISSUER);

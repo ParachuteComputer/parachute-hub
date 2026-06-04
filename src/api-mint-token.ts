@@ -189,6 +189,31 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     );
   }
 
+  // Item B / hub#451 — bare (unnamed) `vault:admin` is non-requestable on the
+  // HEADLESS mint path. The unnamed `vault:admin` form is a broad full-vault
+  // admin grant with no resource pin (`aud=vault`, `vault_scope=[]`); minting
+  // it via a host:auth bearer here would issue a surprising un-narrowed admin
+  // credential. Vault rejects broad `vault:admin` on hub-JWTs anyway (it forces
+  // resource-narrowing — `parachute-vault/src/auth.ts:428`), so the practical
+  // blast radius is low, but a headless caller should never be handed it.
+  //
+  // This is mint-side, NOT in the OAuth-shared `NON_REQUESTABLE_SCOPES`, on
+  // purpose: the public `/oauth/authorize` flow legitimately accepts an unnamed
+  // `vault:admin` and NARROWS it to `vault:<picked>:admin` via the vault picker
+  // (oauth-handlers.ts `narrowVaultScopes`) before any token is minted. Adding
+  // it to `NON_REQUESTABLE_SCOPES` would reject that narrowing flow (the
+  // requestability gate fires on the raw, pre-narrow scopes). Named
+  // `vault:<name>:admin` — the post-narrow form — stays mintable. `vault:read`
+  // / `vault:write` unnamed are unaffected (they carry no admin authority).
+  const bareVaultAdmin = scopes.filter((s) => s === "vault:admin");
+  if (bareVaultAdmin.length > 0) {
+    return jsonError(
+      400,
+      "invalid_scope",
+      "bare vault:admin is not mintable headlessly; request a resource-narrowed vault:<name>:admin instead",
+    );
+  }
+
   // Capability-attenuation guard: every requested scope must be a subset of
   // the bearer's own authority under `canGrant` (rules in the file docstring).
   // A `parachute:host:auth` bearer mints any requestable scope; a
