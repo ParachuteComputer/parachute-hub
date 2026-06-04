@@ -801,7 +801,7 @@ describe("handleAccountHomeGet", () => {
 
   test("302 → /login when no session cookie is present", async () => {
     const req = new Request(`${HUB_ORIGIN}/account/`);
-    const res = handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    const res = await handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
     expect(res.status).toBe(302);
     const location = res.headers.get("location") ?? "";
     // Round-trip /account/ as the `next` param so post-login lands back.
@@ -820,7 +820,7 @@ describe("handleAccountHomeGet", () => {
     const session = createSession(harness.db, { userId: friend.id });
     const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
     const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
-    const res = handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    const res = await handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
     const html = await res.text();
@@ -840,7 +840,7 @@ describe("handleAccountHomeGet", () => {
     const session = createSession(harness.db, { userId: admin.id });
     const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
     const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
-    const res = handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    const res = await handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("Welcome, admin");
@@ -871,8 +871,71 @@ describe("handleAccountHomeGet", () => {
       harness.db.exec("PRAGMA foreign_keys = ON");
     }
     const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
-    const res = handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    const res = await handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/login");
+  });
+
+  test("renders the per-vault usage stat when usage resolves", async () => {
+    await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
+    const friend = await createUser(harness.db, "alice", "alice-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVaults: ["alice"],
+    });
+    const session = createSession(harness.db, { userId: friend.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = await handleAccountHomeGet(req, {
+      db: harness.db,
+      hubOrigin: HUB_ORIGIN,
+      resolveVaultPort: () => 1940,
+      // Stub the fetch: resolves to a known stat.
+      fetchUsage: async () => ({ notes: 7, totalBytes: 2 * 1024 * 1024 }),
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-testid="vault-usage"');
+    expect(html).toContain("7 notes · 2.0 MB");
+  });
+
+  test("omits the usage stat gracefully when the fetch fails (null)", async () => {
+    await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
+    const friend = await createUser(harness.db, "alice", "alice-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVaults: ["alice"],
+    });
+    const session = createSession(harness.db, { userId: friend.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = await handleAccountHomeGet(req, {
+      db: harness.db,
+      hubOrigin: HUB_ORIGIN,
+      resolveVaultPort: () => 1940,
+      fetchUsage: async () => null,
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Tile still renders; just no usage stat.
+    expect(html).toContain("<strong>alice</strong>");
+    expect(html).not.toContain('data-testid="vault-usage"');
+  });
+
+  test("renders the 'Configure / back up this vault ↗' deep-link button for an assigned vault", async () => {
+    await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
+    const friend = await createUser(harness.db, "alice", "alice-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVaults: ["alice"],
+    });
+    const session = createSession(harness.db, { userId: friend.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = await handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-testid="vault-admin-button"');
+    expect(html).toContain('action="/account/vault-admin-token/alice"');
   });
 });

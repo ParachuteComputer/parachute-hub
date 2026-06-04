@@ -14,6 +14,9 @@ import { McpConnectCard } from "../components/McpConnectCard.tsx";
 import {
   HttpError,
   type VaultListing,
+  type VaultUsage,
+  formatBytes,
+  getVaultUsage,
   listVaults,
   mintVaultAdminToken,
   resolveManagementUrl,
@@ -34,6 +37,15 @@ type ManageState =
   | { kind: "minting"; name: string }
   | { kind: "error"; name: string; message: string };
 
+/**
+ * Per-vault usage cell state. Client-side fan-out: one small request per row,
+ * each independently fault-tolerant — a vault whose usage endpoint fails (down,
+ * older vault without the endpoint, mint failure) shows "—" rather than
+ * breaking the list. `loading` while in flight, `ok` with the stat, `error`
+ * collapses to the "—" placeholder.
+ */
+type UsageCell = { kind: "loading" } | { kind: "ok"; usage: VaultUsage } | { kind: "error" };
+
 export function VaultsList() {
   const [state, setState] = useState<State>({ kind: "loading" });
   const [reload, setReload] = useState(0);
@@ -41,6 +53,9 @@ export function VaultsList() {
   // Which row's MCP-connect card is expanded. Single-open: clicking
   // Connect on another row swaps the open card rather than stacking them.
   const [connectFor, setConnectFor] = useState<string | null>(null);
+  // Per-vault usage cells, keyed by vault name. Populated by the fan-out effect
+  // below once the vault list resolves.
+  const [usage, setUsage] = useState<Record<string, UsageCell>>({});
 
   async function onManage(vault: VaultListing): Promise<void> {
     if (!vault.managementUrl) return;
@@ -89,6 +104,36 @@ export function VaultsList() {
       cancelled = true;
     };
   }, [reload]);
+
+  // Fan out per-vault usage once the list resolves. Each row's fetch is
+  // independent + fault-tolerant: success → its cell shows the stat, any failure
+  // → "—". Re-runs when the vault set changes (create / reload). The cell is
+  // seeded "loading" so the row shows a placeholder until its request settles.
+  useEffect(() => {
+    if (state.kind !== "ok") return;
+    const names = state.vaults.map((v) => v.name);
+    if (names.length === 0) return;
+    let cancelled = false;
+    setUsage((prev) => {
+      const next = { ...prev };
+      for (const name of names) if (!next[name]) next[name] = { kind: "loading" };
+      return next;
+    });
+    for (const name of names) {
+      getVaultUsage(name)
+        .then((u) => {
+          if (cancelled) return;
+          setUsage((prev) => ({ ...prev, [name]: { kind: "ok", usage: u } }));
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setUsage((prev) => ({ ...prev, [name]: { kind: "error" } }));
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [state]);
 
   if (state.kind === "loading") {
     return (
@@ -179,6 +224,13 @@ export function VaultsList() {
             const isMinting = manage.kind === "minting" && manage.name === v.name;
             const rowError = manage.kind === "error" && manage.name === v.name ? manage : null;
             const isConnectOpen = connectFor === v.name;
+            const usageCell = usage[v.name];
+            const usageText =
+              usageCell?.kind === "ok"
+                ? `${usageCell.usage.notes} ${usageCell.usage.notes === 1 ? "note" : "notes"} · ${formatBytes(usageCell.usage.totalBytes)}`
+                : usageCell?.kind === "loading"
+                  ? "…"
+                  : "—";
             return (
               <div key={v.name} className="vault-row-group">
                 <div className="vault-row">
@@ -191,6 +243,9 @@ export function VaultsList() {
                     </div>
                     <div className="dim url">
                       <code>{v.url}</code>
+                    </div>
+                    <div className="dim vault-usage" data-testid={`vault-usage-${v.name}`}>
+                      {usageText}
                     </div>
                     {rowError ? (
                       <div className="error-banner" style={{ marginTop: "0.5rem" }}>
