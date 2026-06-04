@@ -745,6 +745,122 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
         h.cleanup();
       }
     });
+
+    // Item A (subject-pin) — audit-attribution forgery. A non-operator
+    // (vault-admin-only) bearer may NOT override the minted token's `sub`:
+    // forging a foreign subject would mis-attribute the registry + revocation
+    // rows. It may still mint under its OWN sub (subject omitted / equal).
+    test("subject override by non-operator bearer → 403 (forgery blocked)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read", subject: "someone-else" },
+              { authorization: `Bearer ${bearer}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(403);
+          const body = (await resp.json()) as { error: string; error_description: string };
+          expect(body.error).toBe("insufficient_scope");
+          expect(body.error_description).toContain("non-operator");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("subject equal to own sub by non-operator bearer → 200 (no forgery)", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const bearer = await mintVaultAdminBearer(db, userId, "work");
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read", subject: userId },
+              { authorization: `Bearer ${bearer}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { jti: string };
+          const row = db
+            .query<{ subject: string }, [string]>("SELECT subject FROM tokens WHERE jti = ?")
+            .get(body.jti);
+          expect(row?.subject).toBe(userId);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
+  // Item A (subject-pin) — the operator carve-out: a host operator
+  // (parachute:host:auth / parachute:host:admin) MAY override `sub` to stamp a
+  // service-account subject. This is the documented service-account override
+  // that the non-operator pin above must NOT break.
+  describe("subject override — operator carve-out (item A)", () => {
+    test("host:auth operator overrides subject → 200, registry row carries override", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER, scopeSet: "auth" });
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:read", subject: "svc-account" },
+              { authorization: `Bearer ${op.token}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { jti: string; token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.sub).toBe("svc-account");
+          const row = db
+            .query<{ subject: string }, [string]>("SELECT subject FROM tokens WHERE jti = ?")
+            .get(body.jti);
+          expect(row?.subject).toBe("svc-account");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("host:admin operator overrides subject → 200", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "vault:work:admin", subject: "svc-account" },
+              { authorization: `Bearer ${op.token}` },
+            ),
+            { db, issuer: ISSUER },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { token: string };
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.sub).toBe("svc-account");
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
   });
 
   describe("capability attenuation — entry gate + regression", () => {

@@ -52,6 +52,7 @@ import {
   MINT_HOST_AUTH_SCOPE,
   canGrant,
   hasMintingAuthority,
+  isOperatorBearer,
 } from "./scope-attenuation.ts";
 import {
   isVaultAdminScope,
@@ -235,6 +236,21 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   if (body.subject === undefined) {
     subject = bearerSub;
   } else if (typeof body.subject === "string" && body.subject.length > 0) {
+    // Subject override is an OPERATOR-only capability (audit-attribution
+    // forgery otherwise). A host operator (`parachute:host:auth` /
+    // `parachute:host:admin`) may stamp a service-account `sub` other than its
+    // own — the documented service-account override. A merely vault-scoped
+    // bearer (`vault:<N>:admin` only, no host authority) has no business
+    // forging the minted token's subject: it would let a vault admin mint a
+    // token the registry + revocation list attribute to a foreign subject. So
+    // a non-operator bearer may only mint tokens carrying its OWN `sub`.
+    if (!isOperatorBearer(bearerScopes) && body.subject !== bearerSub) {
+      return jsonError(
+        403,
+        "insufficient_scope",
+        "non-operator bearers may not override subject; omit `subject` to mint under your own identity",
+      );
+    }
     subject = body.subject;
   } else {
     return jsonError(400, "invalid_request", "subject must be a non-empty string when present");
