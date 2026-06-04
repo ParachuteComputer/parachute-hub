@@ -601,8 +601,10 @@ export async function resetUserPassword(
  *     parent users row. The audit trail survives via the `subject`
  *     column we backfill from the username plus the existing
  *     `created_at`, `scopes`, `client_id`, `revoked_at` fields.
- *   - `sessions.user_id` and `grants.user_id` are NOT NULL with a
- *     non-cascading FK. Both are deleted before the users row drops.
+ *   - `sessions.user_id`, `grants.user_id`, and `auth_codes.user_id` are
+ *     NOT NULL with a non-cascading (RESTRICT) FK. All three are deleted
+ *     before the users row drops — auth_codes are ephemeral OAuth codes
+ *     (60s TTL, no audit value), so a hard-delete is correct (hub#559).
  *   - `user_vaults.user_id` has `ON DELETE CASCADE` (migration v10), so
  *     vault assignments are dropped automatically when the parent row
  *     goes. No explicit cleanup needed.
@@ -630,10 +632,16 @@ export function deleteUser(db: Database, userId: string): boolean {
     db.prepare(
       "UPDATE tokens SET subject = COALESCE(subject, ?), user_id = NULL WHERE user_id = ?",
     ).run(row.username, userId);
-    // 2. Drop sessions + grants. Both have non-cascading FKs on user_id;
-    //    leaving rows behind would RESTRICT the users delete below.
+    // 2. Drop sessions + grants + auth_codes. All have NOT-NULL, non-cascading
+    //    (RESTRICT) FKs on user_id; leaving rows behind blocks the users delete
+    //    below with SQLITE_CONSTRAINT_FOREIGNKEY. auth_codes are short-lived
+    //    (60s TTL) OAuth authorization codes with no audit value — hard-delete,
+    //    same as sessions. (Omitting this 500'd a real delete of a user who had
+    //    completed an OAuth authorize: the code row outlived its TTL but still
+    //    pinned the FK. hub#559.)
     db.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
     db.prepare("DELETE FROM grants WHERE user_id = ?").run(userId);
+    db.prepare("DELETE FROM auth_codes WHERE user_id = ?").run(userId);
     // 3. Drop the user row itself.
     db.prepare("DELETE FROM users WHERE id = ?").run(userId);
   })();
