@@ -231,14 +231,38 @@ function timingSafeEqualHex(a: string, b: string): boolean {
 }
 
 /**
- * Light validation — refuses obviously-wrong shapes (relative paths, javascript:
- * URIs). Doesn't try to match a registered URI; that's `requireRegisteredRedirectUri`.
+ * Light validation — refuses obviously-wrong shapes (relative paths,
+ * `javascript:`/`data:` URIs). Doesn't try to match a registered URI; that's
+ * `requireRegisteredRedirectUri`.
+ *
+ * Accepts `http:`/`https:` AND private-use custom schemes (RFC 8252 §7.1) so
+ * native apps can register a redirect URI like `pebblejs://close` or
+ * `myapp://callback` and complete the auth-code flow with no hosted web page.
+ * RFC 8252 §7.1 recommends native apps use a private-use URI scheme they
+ * control (typically a reverse-DNS name) as the redirect target. We allow any
+ * parseable URL whose scheme is NOT in a denylist of schemes that are either
+ * script-execution / data-embedding vectors (`javascript:`, `data:`,
+ * `vbscript:`, `blob:`, `about:`) or local-resource references (`file:`).
+ * Anything unparseable (relative paths, scheme-less strings) is still refused.
+ *
+ * NOTE: this is a registration-time sanity filter only. The far stronger
+ * defense is exact-match at redirect time (`requireRegisteredRedirectUri`,
+ * unchanged + still strict per RFC 8252/6749) — a custom-scheme URI is only
+ * ever a redirect target if the client registered that exact string.
  */
+const REDIRECT_URI_SCHEME_DENYLIST: ReadonlySet<string> = new Set([
+  "javascript:",
+  "data:",
+  "file:",
+  "vbscript:",
+  "blob:",
+  "about:",
+]);
+
 export function isValidRedirectUri(uri: string): boolean {
   try {
     const u = new URL(uri);
-    if (u.protocol === "javascript:" || u.protocol === "data:") return false;
-    return u.protocol === "http:" || u.protocol === "https:";
+    return !REDIRECT_URI_SCHEME_DENYLIST.has(u.protocol);
   } catch {
     return false;
   }

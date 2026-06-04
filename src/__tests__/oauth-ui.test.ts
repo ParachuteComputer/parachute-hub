@@ -21,6 +21,7 @@ const PARAMS: AuthorizeFormParams = {
   codeChallengeMethod: "S256",
   state: "xyz",
   resource: null,
+  responseMode: null,
 };
 
 const CSRF = "csrf-token-fixture";
@@ -48,6 +49,18 @@ describe("renderHiddenInputs", () => {
   test("omits state input when state is null", () => {
     const html = renderHiddenInputs({ ...PARAMS, state: null });
     expect(html).not.toContain('name="state"');
+  });
+
+  test("omits response_mode input by default (query mode), emits it for fragment", () => {
+    // Null = query mode (the default): no hidden input, so the success redirect
+    // falls back to query encoding.
+    expect(renderHiddenInputs({ ...PARAMS, responseMode: null })).not.toContain(
+      'name="response_mode"',
+    );
+    // fragment mode round-trips so the consent POST's success redirect honors it.
+    expect(renderHiddenInputs({ ...PARAMS, responseMode: "fragment" })).toContain(
+      'name="response_mode" value="fragment"',
+    );
   });
 
   test("escapes hostile values into hidden inputs", () => {

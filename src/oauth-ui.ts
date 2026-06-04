@@ -20,7 +20,7 @@
  *     module scopes that the hub doesn't know about) render verbatim.
  *   - **No JavaScript.** Entirely form-based. Submit is the only interaction.
  */
-import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
+import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import { type ScopeExplanation, explainScope } from "./scope-explanations.ts";
 
@@ -68,6 +68,17 @@ export interface AuthorizeFormParams {
    * sign-in redirect. Null when the client sent no `resource` param.
    */
   resource: string | null;
+  /**
+   * OAuth 2.0 Multiple Response Type Encoding Practices `response_mode`.
+   * `"query"` (the default, and what we emit when null) appends `code`/`state`
+   * to the redirect_uri query string; `"fragment"` appends them to the URL
+   * fragment instead. Native apps (e.g. the Pebble watchapp) that only receive
+   * the fragment of a custom-scheme deep link request `response_mode=fragment`.
+   * Carried through the login → consent → form-post round-trip exactly like
+   * `resource`/`state` so the chosen mode survives a sign-in redirect. Null
+   * when the client sent no `response_mode` param (defaults to query).
+   */
+  responseMode: "query" | "fragment" | null;
 }
 
 export interface LoginViewProps {
@@ -248,12 +259,17 @@ export interface ApprovePendingViewProps {
    * calling client (`<redirect_uri>?error=access_denied&state=<state>`).
    * `redirectUri` is required because deny must signal back to the client;
    * `state` may be undefined (OAuth clients sometimes omit it).
+   *
+   * `responseMode` (OAuth 2.0 Multiple Response Type Encoding Practices) is
+   * plumbed through too so the Deny error redirect honors the native-app
+   * fragment encoding the client requested. Undefined → query mode (default).
    */
   approveForm?: {
     csrfToken: string;
     returnTo: string;
     redirectUri: string;
     state?: string;
+    responseMode?: "query" | "fragment";
   };
   /**
    * Same-origin hub-relative URL (path + search) to send the operator to
@@ -539,6 +555,7 @@ export function renderApprovePending(props: ApprovePendingViewProps): string {
         <input type="hidden" name="return_to" value="${escapeHtml(approveForm.returnTo)}" />
         <input type="hidden" name="redirect_uri" value="${escapeHtml(approveForm.redirectUri)}" />
         ${approveForm.state !== undefined ? `<input type="hidden" name="state" value="${escapeHtml(approveForm.state)}" />` : ""}
+        ${approveForm.responseMode !== undefined ? `<input type="hidden" name="response_mode" value="${escapeHtml(approveForm.responseMode)}" />` : ""}
         <div class="approve-actions">
           <button type="submit" name="decision" value="approve" class="btn btn-primary">Approve</button>
           <button type="submit" name="decision" value="deny" class="btn btn-secondary">Deny</button>
@@ -942,6 +959,11 @@ export function renderHiddenInputs(p: AuthorizeFormParams): string {
   // the resource-bound vault narrowing survives the POST (the consent submit
   // path re-derives the bound vault from it).
   if (p.resource) fields.push(["resource", p.resource]);
+  // response_mode (OAuth 2.0 Multiple Response Type Encoding Practices) —
+  // round-tripped through the consent form so the success redirect after the
+  // consent POST honors the native-app fragment encoding. Null = query mode,
+  // which we omit (the default).
+  if (p.responseMode) fields.push(["response_mode", p.responseMode]);
   return fields
     .map(([k, v]) => `<input type="hidden" name="${k}" value="${escapeHtml(v)}" />`)
     .join("\n        ");
