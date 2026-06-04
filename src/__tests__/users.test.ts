@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
+import { createSession, findSession } from "../sessions.ts";
 import {
   PASSWORD_MIN_LEN,
   SingleUserModeError,
@@ -494,6 +495,32 @@ describe("resetUserPassword", () => {
         .get(minted.jti);
       expect(after?.revoked_at).not.toBeNull();
       expect(after?.user_id).toBe(user.id);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Item G — a reset also kills active sessions (not just tokens), so the
+  // attacker/holder of a live session cookie must re-authenticate.
+  test("deletes the user's active sessions (item G)", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const alice = await createUser(db, "alice", "alice-strong-passphrase", {
+        passwordChanged: true,
+      });
+      const bob = await createUser(db, "bob", "bob-strong-passphrase", {
+        passwordChanged: true,
+        allowMulti: true,
+      });
+      const aliceSession = createSession(db, { userId: alice.id });
+      const bobSession = createSession(db, { userId: bob.id });
+      expect(findSession(db, aliceSession.id)).not.toBeNull();
+
+      expect(await resetUserPassword(db, alice.id, "new-temp-passphrase")).toBe(true);
+
+      // Alice's session is gone; Bob's (a different user) is untouched.
+      expect(findSession(db, aliceSession.id)).toBeNull();
+      expect(findSession(db, bobSession.id)).not.toBeNull();
     } finally {
       cleanup();
     }
