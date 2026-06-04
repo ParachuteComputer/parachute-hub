@@ -35,6 +35,7 @@ import {
   CHANGE_PASSWORD_WINDOW_MS,
   changePasswordRateLimiter,
 } from "../rate-limit.ts";
+import { recordTokenMint } from "../jwt-sign.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
 import { createUser, getUserById, verifyPassword } from "../users.ts";
 
@@ -255,6 +256,67 @@ describe("POST /account/change-password", () => {
       expect(await verifyPassword(after, "user-chosen-strong-passphrase")).toBe(true);
       expect(await verifyPassword(after, "old-default-pw")).toBe(false);
     }
+  });
+
+  // Item F / hub#469 — a successful self-service password change revokes the
+  // user's still-active tokens (so a token minted under the admin's temp
+  // password dies with the rotation). Mirrors `resetUserPassword`'s admin-reset
+  // revoke. Tokens belonging to OTHER users are untouched.
+  test("self-change revokes the user's active tokens, leaves other users' tokens (item F)", async () => {
+    const { userId, cookie } = await sessionCookieFor(harness.db, "newbie", "old-default-pw", {
+      passwordChanged: false,
+    });
+    const other = await createUser(harness.db, "other", "other-strong-passphrase", {
+      passwordChanged: true,
+      allowMulti: true,
+    });
+    // Seed one active token for the changing user + one for another user.
+    recordTokenMint(harness.db, {
+      jti: "tok-self-1",
+      createdVia: "cli_mint",
+      subject: userId,
+      userId,
+      clientId: "parachute-account",
+      scopes: ["vault:work:read"],
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    });
+    recordTokenMint(harness.db, {
+      jti: "tok-other-1",
+      createdVia: "cli_mint",
+      subject: other.id,
+      userId: other.id,
+      clientId: "parachute-account",
+      scopes: ["vault:work:read"],
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    });
+
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      current_password: "old-default-pw",
+      new_password: "user-chosen-strong-passphrase",
+      new_password_confirm: "user-chosen-strong-passphrase",
+      next: "/account/",
+    });
+    const req = new Request("http://hub.test/account/change-password", {
+      method: "POST",
+      headers: { ...headers, cookie },
+      body,
+    });
+    const res = await handleAccountChangePasswordPost(req, { db: harness.db });
+    expect(res.status).toBe(302);
+
+    const selfTok = harness.db
+      .query<{ revoked_at: string | null }, [string]>(
+        "SELECT revoked_at FROM tokens WHERE jti = ?",
+      )
+      .get("tok-self-1");
+    const otherTok = harness.db
+      .query<{ revoked_at: string | null }, [string]>(
+        "SELECT revoked_at FROM tokens WHERE jti = ?",
+      )
+      .get("tok-other-1");
+    expect(selfTok?.revoked_at).not.toBeNull(); // changing user's token revoked
+    expect(otherTok?.revoked_at).toBeNull(); // other user's token untouched
   });
 
   test("non-admin user with no next defaults to /account/ (no admin-shell flash)", async () => {

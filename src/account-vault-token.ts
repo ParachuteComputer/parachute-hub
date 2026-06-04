@@ -233,6 +233,25 @@ export async function handleAccountVaultTokenPost(
     });
   }
 
+  // Force-change-password gate (item F / hub#469, NARROW). A user the admin
+  // created/reset lands with `password_changed: false` and an admin-known temp
+  // password. Without this gate an authorized friend could mint a LONG-LIVED
+  // vault token here and then keep using (or never rotate) the temp password —
+  // the token outlives any later rotation, defeating the "temp password is a
+  // one-time handoff" model. So an authorized-but-unrotated friend is sent to
+  // the change-password rail BEFORE minting anything. Placed AFTER the
+  // authority gates (so an unassigned/garbage request still gets its 403/400,
+  // preserving those semantics) and BEFORE the rate-limit + mint. 303 (See
+  // Other) so the browser re-issues as GET. Narrow #469 fix — gates
+  // token-minting specifically; the broad per-request /account/* wall is
+  // deferred to Aaron's design call.
+  if (!user.passwordChanged) {
+    return new Response(null, {
+      status: 303,
+      headers: { location: "/account/change-password", "cache-control": "no-store" },
+    });
+  }
+
   // Rate limit — after CSRF + authority shape, before the mint. Per-user.
   const rlNow = (deps.now ?? (() => new Date()))();
   const gate = vaultTokenMintRateLimiter.checkAndRecord(user.id, rlNow);
