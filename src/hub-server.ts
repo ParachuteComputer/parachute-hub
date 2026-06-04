@@ -478,10 +478,7 @@ function isLoopbackPeer(peerAddr: string | null | undefined): boolean {
   if (!peerAddr) return false;
   const addr = peerAddr.trim().toLowerCase();
   return (
-    addr === "127.0.0.1" ||
-    addr === "::1" ||
-    addr === "::ffff:127.0.0.1" ||
-    addr.startsWith("127.")
+    addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1" || addr.startsWith("127.")
   );
 }
 
@@ -631,7 +628,10 @@ async function proxyToVault(
   // pass through; the service does its own auth. `peerAddr` (item E / #526)
   // is the loopback discriminator: a header-absent NON-loopback peer is NOT
   // loopback, so the cloak fires on a 0.0.0.0 bind.
-  if (effectivePublicExposure(match.entry) === "loopback" && layerOf(req, peerAddr) !== "loopback") {
+  if (
+    effectivePublicExposure(match.entry) === "loopback" &&
+    layerOf(req, peerAddr) !== "loopback"
+  ) {
     return new Response("not found", { status: 404 });
   }
   // Symmetry with proxyToService (#196): honor `stripPrefix` with FIRST_-
@@ -728,7 +728,10 @@ async function proxyToService(
   // from "not installed" — 404, not 403, so we don't leak the existence of
   // the route. "allowed" / "auth-required" pass through; the service does
   // its own auth. `peerAddr` (item E / #526) is the loopback discriminator.
-  if (effectivePublicExposure(match.entry) === "loopback" && layerOf(req, peerAddr) !== "loopback") {
+  if (
+    effectivePublicExposure(match.entry) === "loopback" &&
+    layerOf(req, peerAddr) !== "loopback"
+  ) {
     return new Response("not found", { status: 404 });
   }
   // Consult FIRST_PARTY_FALLBACKS as a fallback for `stripPrefix` (#196).

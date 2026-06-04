@@ -321,9 +321,7 @@ describe("handleAccountVaultTokenPost — authorization gates (adversarial)", ()
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/account/change-password");
     // No token row was written for the friend.
-    const rows = harness.db
-      .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM tokens")
-      .get();
+    const rows = harness.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM tokens").get();
     expect(rows?.n).toBe(0);
   });
 

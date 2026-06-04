@@ -171,8 +171,7 @@ async function parseBody(req: Request): Promise<ParseResult | ParseError> {
     return {
       ok: false,
       status: 400,
-      message:
-        "vault name must contain only lowercase letters, numbers, hyphens, and underscores",
+      message: "vault name must contain only lowercase letters, numbers, hyphens, and underscores",
     };
   }
   if (RESERVED_VAULT_NAMES.has(name)) {

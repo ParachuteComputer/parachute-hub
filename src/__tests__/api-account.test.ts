@@ -30,12 +30,12 @@ import {
 } from "../api-account.ts";
 import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { recordTokenMint } from "../jwt-sign.ts";
 import {
   CHANGE_PASSWORD_MAX_ATTEMPTS,
   CHANGE_PASSWORD_WINDOW_MS,
   changePasswordRateLimiter,
 } from "../rate-limit.ts";
-import { recordTokenMint } from "../jwt-sign.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
 import { createUser, getUserById, verifyPassword } from "../users.ts";
 
@@ -306,14 +306,10 @@ describe("POST /account/change-password", () => {
     expect(res.status).toBe(302);
 
     const selfTok = harness.db
-      .query<{ revoked_at: string | null }, [string]>(
-        "SELECT revoked_at FROM tokens WHERE jti = ?",
-      )
+      .query<{ revoked_at: string | null }, [string]>("SELECT revoked_at FROM tokens WHERE jti = ?")
       .get("tok-self-1");
     const otherTok = harness.db
-      .query<{ revoked_at: string | null }, [string]>(
-        "SELECT revoked_at FROM tokens WHERE jti = ?",
-      )
+      .query<{ revoked_at: string | null }, [string]>("SELECT revoked_at FROM tokens WHERE jti = ?")
       .get("tok-other-1");
     expect(selfTok?.revoked_at).not.toBeNull(); // changing user's token revoked
     expect(otherTok?.revoked_at).toBeNull(); // other user's token untouched
