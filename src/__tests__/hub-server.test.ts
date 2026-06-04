@@ -4342,7 +4342,12 @@ describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to
   // Item F (#469) routed e2e — an assigned but unrotated friend is force-
   // redirected to the change-password rail before any mint, through the real
   // dispatch.
-  test("unrotated friend → 303 to change-password, routed through hubFetch (item F)", async () => {
+  test("unrotated friend is force-change-gated, routed through hubFetch (item F / #469)", async () => {
+    // As of hub#469 the broad per-request gate (forceChangePasswordGate) is the
+    // choke point and intercepts BEFORE the per-route mint handler. A browser
+    // request (Accept: text/html) is 302'd to the change-password rail; an
+    // API-style POST without that header is 403 force_change_password. Both
+    // prove the unrotated friend can't parlay the temp password into a mint.
     const h = makeHarness();
     writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
     const db = openHubDb(hubDbPath(h.dir));
@@ -4358,20 +4363,33 @@ describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to
     const cookie = `${buildSessionCookie(session.id, 3600, { secure: false })}; ${
       buildCsrfCookie(csrf, { secure: false }).split(";")[0]
     }`;
+    const fetcher = hubFetch(h.dir, {
+      getDb: () => db,
+      manifestPath: h.manifestPath,
+      issuer: "https://hub.test",
+    });
     try {
-      const res = await hubFetch(h.dir, {
-        getDb: () => db,
-        manifestPath: h.manifestPath,
-        issuer: "https://hub.test",
-      })(
+      // The mint is a POST (non-GET) → the gate rejects with 403
+      // force_change_password regardless of Accept, per the spec ("redirect
+      // browser GETs, reject non-GET / API-style requests with 403"). A 302 on
+      // a POST wouldn't usefully re-issue the mint anyway.
+      const apiRes = await fetcher(
         req("/account/vault-token/work", {
           method: "POST",
           headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
           body: postBody(csrf, "read"),
         }),
       );
-      expect(res.status).toBe(303);
-      expect(res.headers.get("location")).toBe("/account/change-password");
+      expect(apiRes.status).toBe(403);
+      expect(((await apiRes.json()) as { error: string }).error).toBe("force_change_password");
+
+      // The friend's browser GET of the account home IS bounced to the
+      // change-password rail — the surface they'd navigate to is gated.
+      const browserRes = await fetcher(
+        req("/account/", { headers: { cookie, accept: "text/html" } }),
+      );
+      expect(browserRes.status).toBe(302);
+      expect(browserRes.headers.get("location")).toBe("/account/change-password");
     } finally {
       db.close();
       h.cleanup();
@@ -4542,6 +4560,385 @@ describe("hubFetch routing — /api/hub/upgrade (D4 SPA hub-upgrade)", () => {
           req("/api/hub/upgrade", { method: "GET" }),
         );
         expect(res.status).not.toBe(404);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// Per-request force-change-password enforcement (P0-1 / hub#469). The redirect
+// at /login was never enough: a signed-in user holding an admin-set temp
+// password (`password_changed=false`) could navigate DIRECTLY to /account/* or
+// a per-vault proxy URL and operate indefinitely on the un-rotated secret.
+// These tests pin the broad per-request gate: pre-rotation users are bounced
+// off every /account/* surface AND the per-vault proxy, EXCEPT the rotation/exit
+// path (/account/change-password + /logout); after rotation all surfaces open.
+describe("force-change-password per-request gate (#469)", () => {
+  // Seed a signed-in user with a chosen password_changed flag and return a
+  // ready-to-use session cookie. Mirrors the seedFriend helpers in the
+  // account-vault-{token,admin-token} suites.
+  async function seedUser(
+    h: Harness,
+    db: ReturnType<typeof openHubDb>,
+    opts: { passwordChanged: boolean; assignedVaults?: string[] },
+  ): Promise<{ cookie: string }> {
+    const { SESSION_TTL_MS } = await import("../sessions.ts");
+    const user = await createUser(db, "friend", "temp-pw", {
+      allowMulti: true,
+      passwordChanged: opts.passwordChanged,
+      assignedVaults: opts.assignedVaults ?? [],
+    });
+    const session = createSession(db, { userId: user.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    return { cookie };
+  }
+
+  test("(a) pre-rotation browser GET /account/ is 302'd to change-password", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/account/", { headers: { cookie, accept: "text/html" } }),
+        );
+        expect(res.status).toBe(302);
+        expect(res.headers.get("location")).toBe("/account/change-password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(a) pre-rotation API POST /account/vault-token/<name> is 403 force_change_password", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        // No Accept: text/html → treated as an API client → 403 JSON, not a 302.
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/account/vault-token/work", { method: "POST", headers: { cookie } }),
+        );
+        expect(res.status).toBe(403);
+        const body = (await res.json()) as { error: string };
+        expect(body.error).toBe("force_change_password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(a) pre-rotation browser GET of a per-vault proxy URL is 302'd to change-password", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/vault/work/notes/abc", { headers: { cookie, accept: "text/html" } }),
+        );
+        // Gated BEFORE the proxy ever runs — so this is the gate's 302, not a
+        // proxy 404/502.
+        expect(res.status).toBe(302);
+        expect(res.headers.get("location")).toBe("/account/change-password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(b) pre-rotation user CAN still reach /account/change-password (GET)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/account/change-password", { headers: { cookie, accept: "text/html" } }),
+        );
+        // Reaches the real handler (200 form render) — NOT bounced to itself.
+        expect(res.status).toBe(200);
+        const body = await res.text();
+        expect(body.toLowerCase()).toContain("password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(b) pre-rotation user CAN still reach /logout (POST)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        // CSRF cookie + matching field so the logout POST passes its own gate;
+        // the point is the force-change gate does NOT intercept /logout.
+        const csrf = generateCsrfToken();
+        const form = new URLSearchParams();
+        form.set("__csrf", csrf);
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/logout", {
+            method: "POST",
+            headers: {
+              cookie: `${cookie}; ${buildCsrfCookie(csrf)}`,
+              "content-type": "application/x-www-form-urlencoded",
+            },
+            body: form.toString(),
+          }),
+        );
+        // Logout succeeds (302 to /) — it is NOT the force-change 302 to
+        // /account/change-password and NOT a 403.
+        expect(res.status).toBe(302);
+        expect(res.headers.get("location")).not.toBe("/account/change-password");
+        expect(res.status).not.toBe(403);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(c) after rotation, /account/ is reachable (not gated)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: true,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/account/", { headers: { cookie, accept: "text/html" } }),
+        );
+        // Account home renders — not bounced.
+        expect(res.status).toBe(200);
+        expect(res.headers.get("location")).not.toBe("/account/change-password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(c) after rotation, a per-vault proxy URL is NOT gated (reaches the proxy)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: true,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/vault/work/notes/abc", { headers: { cookie, accept: "text/html" } }),
+        );
+        // No upstream listening → the proxy returns a 404/502, NOT the gate's
+        // 302→change-password / 403. The point is the gate let it through.
+        expect(res.headers.get("location")).not.toBe("/account/change-password");
+        const body = res.status === 403 ? ((await res.json()) as { error?: string }) : null;
+        expect(body?.error).not.toBe("force_change_password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("an UNAUTHENTICATED per-vault proxy request is NOT gated (no hub session)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        // No cookie at all — the common Notes/MCP case carrying its own bearer.
+        // forceChangePasswordGate returns null (no session) → proxy handles it.
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/vault/work/notes/abc", { headers: { accept: "text/html" } }),
+        );
+        expect(res.headers.get("location")).not.toBe("/account/change-password");
+        expect(res.status).not.toBe(403);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(b) pre-rotation user CAN POST /account/change-password (the rotation action itself)", async () => {
+    // The exempt POST: a pre-rotation user submitting their new password must
+    // NOT be intercepted by the gate — it's the only way out of force-change.
+    // `/account/change-password` is dispatched ABOVE the gate, so it never
+    // reaches the choke point. We assert the POST reaches its own handler (it
+    // fails CSRF here → its OWN 400/403, NOT the gate's 302→change-password).
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const csrf = generateCsrfToken();
+        const form = new URLSearchParams();
+        form.set("__csrf", csrf);
+        form.set("current_password", "temp-pw");
+        form.set("new_password", "rotated-password-123");
+        form.set("new_password_confirm", "rotated-password-123");
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/account/change-password", {
+            method: "POST",
+            headers: {
+              cookie: `${cookie}; ${buildCsrfCookie(csrf)}`,
+              "content-type": "application/x-www-form-urlencoded",
+              accept: "text/html",
+            },
+            body: form.toString(),
+          }),
+        );
+        // Reaches its own handler (303 back to /account/ on success, or its own
+        // form re-render). The point: it is NOT the gate's 302 to
+        // change-password and NOT the gate's 403 force_change_password.
+        expect(res.status).not.toBe(403);
+        if (res.status === 302 || res.status === 303) {
+          expect(res.headers.get("location")).not.toBe("/account/change-password");
+        }
+        // And the rotation actually took: the user's flag flipped to true.
+        const { getUserById } = await import("../users.ts");
+        const friend = getUserById(
+          db,
+          db.query<{ id: string }, []>("SELECT id FROM users WHERE username = 'friend'").get()
+            ?.id ?? "",
+        );
+        expect(friend?.passwordChanged).toBe(true);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(a) bare /account (no trailing slash) is gated on the FIRST hop for a pre-rotation user", async () => {
+    // The bare `/account` 301s to `/account/`; without an explicit match it
+    // would slip past `startsWith("/account/")` and only be gated on the second
+    // hop. The gate must intercept the first request.
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/account", { headers: { cookie, accept: "text/html" } }),
+        );
+        // Gated → 302 to change-password, NOT the 301 → /account/.
+        expect(res.status).toBe(302);
+        expect(res.headers.get("location")).toBe("/account/change-password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(a) pre-rotation session at /oauth/authorize is 302'd to change-password (no auth code issued)", async () => {
+    // The important one: a signed-in pre-rotation user must not ride the
+    // consent flow to an auth code → /oauth/token exchange for a vault token
+    // WITHOUT rotating. The gate intercepts /oauth/authorize before any client
+    // validation or code issuance, so no `code=` redirect can be produced.
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req(
+            "/oauth/authorize?client_id=x&response_type=code&redirect_uri=https://app.example/cb&scope=vault:work:read",
+            { headers: { cookie, accept: "text/html" } },
+          ),
+        );
+        expect(res.status).toBe(302);
+        const location = res.headers.get("location") ?? "";
+        expect(location).toBe("/account/change-password");
+        // No auth code was issued — the redirect is to the rotation rail, not a
+        // client callback carrying a `code=`.
+        expect(location).not.toContain("code=");
+        expect(location).not.toContain("app.example");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(c) after rotation, /oauth/authorize is NOT gated (reaches the oauth handler)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: true,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req(
+            "/oauth/authorize?client_id=x&response_type=code&redirect_uri=https://app.example/cb&scope=vault:work:read",
+            { headers: { cookie, accept: "text/html" } },
+          ),
+        );
+        // Reaches the real authorize handler (login/consent/error) — NOT bounced
+        // to the change-password rail by the gate.
+        expect(res.headers.get("location")).not.toBe("/account/change-password");
       } finally {
         db.close();
       }

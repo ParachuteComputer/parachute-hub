@@ -78,7 +78,13 @@
  *   /account/change-password      (GET + POST) → user self-service change-password
  *                                                 (force-redirect target for users
  *                                                 with password_changed=false; also
- *                                                 reachable directly to rotate)
+ *                                                 reachable directly to rotate). With
+ *                                                 hub#469, EVERY other /account/* route
+ *                                                 + the per-vault proxy is hard-gated
+ *                                                 per-request on password_changed===true
+ *                                                 (forceChangePasswordGate); only this
+ *                                                 route and /logout stay reachable
+ *                                                 pre-rotation.
  *   /account/2fa                  (GET + POST) → user self-service 2FA enroll/disenroll
  *                                                 (hub#473; QR + backup codes)
  *   /account/vault-token/<name>   (POST)       → friend mints a scoped
@@ -1262,6 +1268,62 @@ interface PeerIpResolver {
   requestIP(req: Request): { address: string } | null;
 }
 
+/**
+ * Per-request force-change-password gate (P0-1 / hub#469).
+ *
+ * Before #469, `password_changed === false` only triggered a redirect at the
+ * `/login` step. A signed-in user handed an admin-set temp password could then
+ * navigate DIRECTLY to `/account/`, `/account/vault-token/<name>`, a vault-admin
+ * deep-link, or any per-vault proxy URL and operate INDEFINITELY on the
+ * un-rotated secret. Invites = temp-credential handoff at scale, so that gap
+ * scales with every invited user. This makes the gate per-request.
+ *
+ * Returns a 302/403 Response when the request must be bounced; `null` when the
+ * request may proceed (no session, password already rotated, or — for callers
+ * that pre-check — an exempt path). Resolution is a single session→user lookup,
+ * mirroring the per-route gates in `account-vault-{token,admin-token}.ts` so we
+ * don't add a second DB read on those paths (they keep their own gate; this is
+ * the broad net for everything else under `/account/*` + the vault proxy).
+ *
+ * EXEMPT (NOT gated — the rotation/exit path; callers must route these BEFORE
+ * invoking this gate): `/account/change-password` (GET+POST) and `/logout`.
+ * Everything else under `/account/*`, the per-vault `/vault/<name>/*` proxy,
+ * and the session-backed `/oauth/authorize` consent path is gated. The decision
+ * is deliberate: a pre-rotation user can ONLY rotate or sign out — no vault
+ * reads, no token mints, no account home, and no OAuth authorize → auth code →
+ * `/oauth/token` exchange for a vault-scoped access token.
+ *
+ * Browser GETs (Accept: text/html) get a 302 to `/account/change-password`;
+ * non-GET and API-style requests get a 403 with the same JSON error shape the
+ * per-route mints use, so a scripted client gets a clear machine-readable
+ * refusal rather than an HTML redirect it can't follow.
+ */
+export function forceChangePasswordGate(db: Database, req: Request): Response | null {
+  const session = findActiveSession(db, req);
+  if (!session) return null; // unauthenticated → downstream handler decides (401/login)
+  const user = getUserById(db, session.userId);
+  if (!user || user.passwordChanged) return null; // rotated (or vanished) → proceed
+
+  const wantsHtml = req.method === "GET" && (req.headers.get("accept") ?? "").includes("text/html");
+  if (wantsHtml) {
+    return new Response(null, {
+      status: 302,
+      headers: { location: "/account/change-password", "cache-control": "no-store" },
+    });
+  }
+  return new Response(
+    JSON.stringify({
+      error: "force_change_password",
+      error_description:
+        "You must change your temporary password before using this surface. Visit /account/change-password.",
+    }),
+    {
+      status: 403,
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    },
+  );
+}
+
 export function hubFetch(
   wellKnownDir: string,
   deps?: HubFetchDeps,
@@ -1785,6 +1847,17 @@ export function hubFetch(
     // See `src/cors.ts` for the wildcard-origin rationale.
     if (pathname === "/oauth/authorize") {
       if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
+      // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 3:
+      // a signed-in pre-rotation user must NOT be able to ride the consent flow
+      // to an auth code → `/oauth/token` exchange → vault-scoped access token
+      // without rotating the temp password. Gating `/oauth/authorize` (the
+      // session-backed consent path) is sufficient — no code is issued without
+      // it, so `/oauth/token` (back-channel code exchange, no session cookie)
+      // is intentionally NOT gated (gating it would break the legitimate
+      // exchange). An UNAUTHENTICATED authorize request returns null from the
+      // gate and falls through to render the login form, unchanged.
+      const oauthGate = forceChangePasswordGate(getDb(), req);
+      if (oauthGate) return applyCorsHeaders(req, oauthGate);
       if (req.method === "GET") {
         // handleAuthorizeGet is sync (returns Response, not Promise<Response>).
         // handleAuthorizePost is async — keep the await on POST only.
@@ -2279,6 +2352,28 @@ export function hubFetch(
       return new Response("method not allowed", { status: 405 });
     }
 
+    // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 1:
+    // every `/account/*` route BELOW this line is gated. `/logout` and
+    // `/account/change-password` (the rotation/exit path) ran above and already
+    // returned, so they're never reached here — they stay reachable
+    // pre-rotation by construction. A signed-in user with
+    // `password_changed === false` is bounced (302 → change-password for
+    // browsers, 403 JSON for API clients) before any account surface
+    // (2fa, vault-token, vault-admin-token, account home) resolves. DRY: one
+    // gate for the whole `/account/*` family rather than per-route. The
+    // per-route mints in `account-vault-{token,admin-token}.ts` keep their own
+    // gate as defence-in-depth (they're also reachable in tests directly).
+    //
+    // The bare `/account` (no trailing slash) is matched explicitly too —
+    // otherwise it would slip past `startsWith("/account/")` to its 301 →
+    // `/account/` below, and a pre-rotation user wouldn't be gated until the
+    // second hop. Exact-match `/account` (not `startsWith("/account")`) so
+    // unrelated paths like `/accounts-something` aren't caught.
+    if (getDb && (pathname === "/account" || pathname.startsWith("/account/"))) {
+      const gate = forceChangePasswordGate(getDb(), req);
+      if (gate) return gate;
+    }
+
     // /account/2fa — user self-service TOTP 2FA enroll / disenroll (hub#473).
     // Both GET (render state) and POST (start/confirm/disable) require an
     // active session; the handler does the session check + 302 to /login when
@@ -2400,6 +2495,18 @@ export function hubFetch(
     // here anymore (the SPA moved to /admin), so we can't accidentally
     // mask a backend 404 with HTML.
     if (pathname.startsWith("/vault/")) {
+      // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 2:
+      // a pre-rotation signed-in user can't reach a per-vault user surface
+      // (Notes PWA, MCP, vault API) on the un-rotated temp password — they're
+      // bounced to change-password (browser) / 403 (API). Same posture as the
+      // `/account/*` gate above. An UNAUTHENTICATED proxy request (no hub
+      // session — the common Notes/MCP case carrying its own bearer) passes the
+      // gate untouched (`forceChangePasswordGate` returns null with no session)
+      // and is handled by the vault's own auth downstream.
+      if (getDb) {
+        const gate = forceChangePasswordGate(getDb(), req);
+        if (gate) return gate;
+      }
       const proxied = await proxyToVault(req, manifestPath, deps?.supervisor, peerAddr);
       if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
       return new Response("not found", { status: 404 });
