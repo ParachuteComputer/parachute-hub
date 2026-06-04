@@ -26,6 +26,7 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { selfHealScribeAuth } from "../auto-wire.ts";
 import { generateBootstrapToken } from "../bootstrap-token.ts";
 // NOTE: CONFIG_DIR/WELL_KNOWN_DIR/SERVICES_MANIFEST_PATH are evaluated at
 // import time from process.env.PARACHUTE_HOME. The `env` parameter on
@@ -402,6 +403,26 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       adminBootstrap,
     }),
   );
+
+  // Self-heal scribe's auth token from vault's .env (item H) BEFORE booting
+  // modules, so scribe's first boot below reads the synced config. Closes the
+  // "scribe installed pre-auto-wire boots auth-OPEN over loopback" gap: every
+  // `serve` start re-syncs scribe's `auth.required_token` to vault's
+  // SCRIBE_AUTH_TOKEN. Fully idempotent — no-op when there's nothing to sync or
+  // the two already match; logs only when it heals. Mirrors the issuer
+  // self-heal pattern in vault-hub-origin-env.ts. Skipped in tests via
+  // `opts.skipModuleBoot` (which also gates the boot it feeds).
+  if (!opts.skipModuleBoot) {
+    try {
+      selfHealScribeAuth({ configDir: CONFIG_DIR, log });
+    } catch (err) {
+      // A self-heal failure must never block the hub from starting — scribe
+      // just keeps whatever auth state it had. Log and move on.
+      log(
+        `parachute serve: scribe auth self-heal failed (${err instanceof Error ? err.message : String(err)}); continuing.`,
+      );
+    }
+  }
 
   // Boot already-installed modules from services.json — now that we own the
   // hub port (above), we're guaranteed to be the sole supervisor. In a

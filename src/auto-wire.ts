@@ -100,6 +100,26 @@ function writeScribeConfig(path: string, token: string): void {
 }
 
 /**
+ * Read scribe's current `auth.required_token` from `config.json`, or undefined
+ * when the file is absent / malformed / has no auth token. Used by the
+ * serve-boot self-heal to decide whether scribe's config is already in sync
+ * with vault's `.env`.
+ */
+function readScribeAuthToken(path: string): string | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const auth = (parsed as Record<string, unknown>).auth;
+    if (!auth || typeof auth !== "object" || Array.isArray(auth)) return undefined;
+    const token = (auth as Record<string, unknown>).required_token;
+    return typeof token === "string" && token.length > 0 ? token : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Mint (or preserve) a shared secret and persist it to vault and scribe, plus
  * pin SCRIBE_URL on vault's side. Caller has already confirmed both services
  * are installed. Restarts vault if it's running so the worker re-reads .env.
@@ -181,4 +201,71 @@ export async function autoWireScribeAuth(opts: AutoWireOpts): Promise<AutoWireRe
     scribeConfigPath,
     restartedVault,
   };
+}
+
+export interface SelfHealScribeAuthResult {
+  /** True when scribe's config.json was written this call (was missing/out-of-sync). */
+  healed: boolean;
+  /**
+   * Why no heal happened (when `healed` is false): "no-token" (vault .env has
+   * no SCRIBE_AUTH_TOKEN — nothing to sync) or "already-synced" (scribe already
+   * carries the same token). Undefined when `healed` is true.
+   */
+  reason?: "no-token" | "already-synced";
+}
+
+/**
+ * Idempotent self-heal of scribe's `auth.required_token`, run on hub `serve`
+ * startup (item H — the loopback-open finding).
+ *
+ * The gap: `autoWireScribeAuth` only fires from `parachute install scribe` (and
+ * the vault↔scribe install pairing). An install that PREDATES auto-wire — or
+ * any path where scribe booted with no `auth.required_token` — leaves scribe
+ * accepting UNAUTHENTICATED transcription requests over loopback forever; the
+ * shared secret never lands in scribe's config even though vault's `.env`
+ * already carries `SCRIBE_AUTH_TOKEN`. Install-time wiring can't fix an
+ * already-installed box.
+ *
+ * The fix mirrors the issuer self-heal in `vault-hub-origin-env.ts`: run on
+ * every `serve` boot, fully idempotent. When vault's `.env` carries a
+ * `SCRIBE_AUTH_TOKEN` AND scribe's `config.json` either lacks
+ * `auth.required_token` or carries a DIFFERENT value, write/sync the vault
+ * value into scribe's config (via `writeScribeConfig`'s merge-don't-clobber
+ * logic — only the auth token is touched, every other config key is preserved).
+ * Vault's `.env` is treated as the source of truth (it's where the operator's
+ * worker reads the secret from). No-op when vault has no token (nothing to
+ * sync) or the two already match. Does NOT restart scribe — `serve` boots the
+ * supervised modules AFTER this runs, so the synced config is read on that
+ * first boot; an already-running scribe (manual start) is the operator's to
+ * restart, same posture as the issuer self-heal.
+ *
+ * Logs only when it actually heals.
+ */
+export function selfHealScribeAuth(opts: {
+  configDir: string;
+  log?: (line: string) => void;
+}): SelfHealScribeAuthResult {
+  const log = opts.log ?? (() => {});
+  const vaultEnvPath = join(opts.configDir, "vault", ".env");
+  const scribeConfigPath = join(opts.configDir, "scribe", "config.json");
+
+  const vaultToken = parseEnvFile(vaultEnvPath).values[SCRIBE_AUTH_ENV_KEY];
+  if (vaultToken === undefined || vaultToken.length === 0) {
+    // Nothing to sync — vault hasn't been wired with a scribe secret. (Either
+    // scribe isn't in use, or auto-wire never ran on either side.)
+    return { healed: false, reason: "no-token" };
+  }
+
+  const scribeToken = readScribeAuthToken(scribeConfigPath);
+  if (scribeToken === vaultToken) {
+    return { healed: false, reason: "already-synced" };
+  }
+
+  writeScribeConfig(scribeConfigPath, vaultToken);
+  log(
+    scribeToken === undefined
+      ? `Self-healed scribe auth: wrote required_token to ${scribeConfigPath} (scribe was running auth-OPEN; synced from vault ${SCRIBE_AUTH_ENV_KEY}).`
+      : `Self-healed scribe auth: re-synced required_token in ${scribeConfigPath} to match vault ${SCRIBE_AUTH_ENV_KEY}.`,
+  );
+  return { healed: true };
 }
