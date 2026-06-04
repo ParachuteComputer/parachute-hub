@@ -304,6 +304,45 @@ describe("deleteUser", () => {
       cleanup();
     }
   });
+
+  test("deletes a user holding an auth_codes row (hub#559 — OAuth-authorize FK regression)", async () => {
+    // A user who completed an OAuth authorize has an `auth_codes` row whose
+    // NOT-NULL, non-cascading FK to users(id) outlives its 60s TTL. Before the
+    // fix, that pinned the FK and `DELETE FROM users` threw
+    // SQLITE_CONSTRAINT_FOREIGNKEY → a 500 on the admin "delete user" action.
+    const { db, cleanup } = makeDb();
+    try {
+      const u = await createUser(db, "ag", "ag-strong-passphrase");
+      // auth_codes.client_id FKs to clients — seed a minimal client first.
+      db.prepare(
+        "INSERT INTO clients (client_id, redirect_uris, scopes, registered_at) VALUES (?, ?, ?, ?)",
+      ).run("client-x", "https://app.example/cb", "vault:default:read", "2026-06-04T00:00:00.000Z");
+      db.prepare(
+        `INSERT INTO auth_codes
+           (code, client_id, user_id, redirect_uri, scopes, code_challenge, code_challenge_method, expires_at, used_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "dead-code",
+        "client-x",
+        u.id,
+        "https://app.example/cb",
+        "vault:default:read",
+        "challenge",
+        "S256",
+        "2026-06-04T00:00:00.000Z", // long-expired
+        "2026-06-04T00:00:00.000Z", // already used
+        "2026-06-04T00:00:00.000Z",
+      );
+      expect(deleteUser(db, u.id)).toBe(true);
+      expect(getUserById(db, u.id)).toBeNull();
+      // The dead auth_code is gone too (hard-deleted with the user).
+      expect(db.query("SELECT COUNT(*) c FROM auth_codes WHERE user_id = ?").get(u.id)).toEqual({
+        c: 0,
+      });
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("validateUsername", () => {
