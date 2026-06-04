@@ -225,6 +225,26 @@ describe("POST /vaults — body validation", () => {
     }
   });
 
+  // Item I — uppercase is rejected at the hub edge (vault's init is
+  // lowercase-only `[a-z0-9_-]`; a hub `[a-zA-Z0-9_-]` superset drifted from it).
+  test("400 when name contains uppercase letters (item I — lowercase-only)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        for (const name of ["Work", "MyVault", "FOO", "camelCase"]) {
+          const res = await call({ db, manifestPath: h.manifestPath, body: { name } });
+          expect(res.status).toBe(400);
+        }
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test('400 when name is the reserved "list"', async () => {
     const h = makeHarness();
     try {

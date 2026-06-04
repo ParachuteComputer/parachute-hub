@@ -52,6 +52,7 @@ import {
   MINT_HOST_AUTH_SCOPE,
   canGrant,
   hasMintingAuthority,
+  isOperatorBearer,
 } from "./scope-attenuation.ts";
 import {
   isVaultAdminScope,
@@ -86,6 +87,21 @@ export interface ApiMintTokenDeps {
   db: Database;
   /** Hub origin — written into the JWT `iss` of minted tokens AND used to validate the bearer. */
   issuer: string;
+  /**
+   * Names of vault instances currently registered in services.json (item D /
+   * hub#450). When provided, a `vault:<name>:admin` mint whose `<name>` is not
+   * in this set is rejected with 400 — a typo'd name can no longer mint
+   * `vault:typo:admin` (an unusable token that authenticates against no real
+   * vault, only confusing automation that's debugging a typo). Mirrors the
+   * session-cookie path (`/admin/vault-admin-token/<name>`), which already
+   * 404s unknown vault names via `knownVaultNames.has`.
+   *
+   * Optional: when undefined the existence check is skipped (the documented
+   * "caller is responsible for a real vault name" fallback, and the shape used
+   * by unit tests that don't wire a manifest). Production wires it from
+   * services.json in hub-server.ts.
+   */
+  knownVaultNames?: ReadonlySet<string>;
   /** Test seam for time. */
   now?: () => Date;
 }
@@ -188,6 +204,56 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
     );
   }
 
+  // Item B / hub#451 — bare (unnamed) `vault:admin` is non-requestable on the
+  // HEADLESS mint path. The unnamed `vault:admin` form is a broad full-vault
+  // admin grant with no resource pin (`aud=vault`, `vault_scope=[]`); minting
+  // it via a host:auth bearer here would issue a surprising un-narrowed admin
+  // credential. Vault rejects broad `vault:admin` on hub-JWTs anyway (it forces
+  // resource-narrowing — `parachute-vault/src/auth.ts:428`), so the practical
+  // blast radius is low, but a headless caller should never be handed it.
+  //
+  // This is mint-side, NOT in the OAuth-shared `NON_REQUESTABLE_SCOPES`, on
+  // purpose: the public `/oauth/authorize` flow legitimately accepts an unnamed
+  // `vault:admin` and NARROWS it to `vault:<picked>:admin` via the vault picker
+  // (oauth-handlers.ts `narrowVaultScopes`) before any token is minted. Adding
+  // it to `NON_REQUESTABLE_SCOPES` would reject that narrowing flow (the
+  // requestability gate fires on the raw, pre-narrow scopes). Named
+  // `vault:<name>:admin` — the post-narrow form — stays mintable. `vault:read`
+  // / `vault:write` unnamed are unaffected (they carry no admin authority).
+  const bareVaultAdmin = scopes.filter((s) => s === "vault:admin");
+  if (bareVaultAdmin.length > 0) {
+    return jsonError(
+      400,
+      "invalid_scope",
+      "bare vault:admin is not mintable headlessly; request a resource-narrowed vault:<name>:admin instead",
+    );
+  }
+
+  // Item D / hub#450 — vault-existence check for `vault:<name>:admin` mints.
+  // The session-cookie path (`/admin/vault-admin-token/<name>`) already 404s an
+  // unknown vault name; this mirrors it for the bearer path so a typo can't mint
+  // `vault:typo:admin` — an unusable token (it authenticates against no real
+  // vault) that only confuses automation debugging a typo. Gated on `<name>:admin`
+  // (the one form #450 calls out); read/write are left alone (even more harmless,
+  // and the broad-requestable path). Skipped entirely when `knownVaultNames` is
+  // absent (the documented "caller responsible" fallback + unit-test shape).
+  if (deps.knownVaultNames !== undefined) {
+    const unknownAdminVaults = scopes.filter((s) => {
+      if (!isVaultAdminScope(s)) return false;
+      const name = vaultScopeName(s);
+      return name !== null && !deps.knownVaultNames!.has(name);
+    });
+    if (unknownAdminVaults.length > 0) {
+      return jsonError(
+        400,
+        "invalid_scope",
+        `no vault named ${unknownAdminVaults
+          .map((s) => `"${vaultScopeName(s)}"`)
+          .join(", ")} in this hub; create the vault before minting an admin token for it`,
+      );
+    }
+  }
+
   // Capability-attenuation guard: every requested scope must be a subset of
   // the bearer's own authority under `canGrant` (rules in the file docstring).
   // A `parachute:host:auth` bearer mints any requestable scope; a
@@ -235,6 +301,21 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   if (body.subject === undefined) {
     subject = bearerSub;
   } else if (typeof body.subject === "string" && body.subject.length > 0) {
+    // Subject override is an OPERATOR-only capability (audit-attribution
+    // forgery otherwise). A host operator (`parachute:host:auth` /
+    // `parachute:host:admin`) may stamp a service-account `sub` other than its
+    // own — the documented service-account override. A merely vault-scoped
+    // bearer (`vault:<N>:admin` only, no host authority) has no business
+    // forging the minted token's subject: it would let a vault admin mint a
+    // token the registry + revocation list attribute to a foreign subject. So
+    // a non-operator bearer may only mint tokens carrying its OWN `sub`.
+    if (!isOperatorBearer(bearerScopes) && body.subject !== bearerSub) {
+      return jsonError(
+        403,
+        "insufficient_scope",
+        "non-operator bearers may not override subject; omit `subject` to mint under your own identity",
+      );
+    }
     subject = body.subject;
   } else {
     return jsonError(400, "invalid_request", "subject must be a non-empty string when present");

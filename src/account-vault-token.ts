@@ -75,9 +75,15 @@ import { vaultTokenMintRateLimiter } from "./rate-limit.ts";
 import { findActiveSession } from "./sessions.ts";
 import { isTotpEnrolled } from "./two-factor-store.ts";
 import { type VaultVerb, getUserById, isFirstAdmin, vaultVerbsForUserVault } from "./users.ts";
+import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 
-/** Matches the manifest vault-name validator + `/admin/vault-admin-token`. */
-const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+/**
+ * Lowercase-only vault-name charset (item I) — single source of truth in
+ * vault-name.ts, matching what vault's init enforces. Was `[a-zA-Z0-9_-]`; the
+ * uppercase superset let a mint name drift from vault's lowercase URL-derived
+ * name, so the minted token's `vault.<Name>` audience wouldn't validate.
+ */
+const VAULT_NAME_RE = VAULT_NAME_CHARSET_RE;
 /** Verbs this surface will ever mint. `admin` is deliberately absent. */
 const ALLOWED_VERBS: readonly VaultVerb[] = ["read", "write", "admin"];
 /** client_id stamped on the minted JWT + registry row. */
@@ -230,6 +236,25 @@ export async function handleAccountVaultTokenPost(
   if (!allowedForUser.includes(requestedVerb)) {
     return renderHome(403, {
       mintError: `Your access to "${vaultName}" doesn't allow minting a ${requestedVerb} token.`,
+    });
+  }
+
+  // Force-change-password gate (item F / hub#469, NARROW). A user the admin
+  // created/reset lands with `password_changed: false` and an admin-known temp
+  // password. Without this gate an authorized friend could mint a LONG-LIVED
+  // vault token here and then keep using (or never rotate) the temp password —
+  // the token outlives any later rotation, defeating the "temp password is a
+  // one-time handoff" model. So an authorized-but-unrotated friend is sent to
+  // the change-password rail BEFORE minting anything. Placed AFTER the
+  // authority gates (so an unassigned/garbage request still gets its 403/400,
+  // preserving those semantics) and BEFORE the rate-limit + mint. 303 (See
+  // Other) so the browser re-issues as GET. Narrow #469 fix — gates
+  // token-minting specifically; the broad per-request /account/* wall is
+  // deferred to Aaron's design call.
+  if (!user.passwordChanged) {
+    return new Response(null, {
+      status: 303,
+      headers: { location: "/account/change-password", "cache-control": "no-store" },
     });
   }
 

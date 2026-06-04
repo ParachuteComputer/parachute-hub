@@ -83,3 +83,22 @@ export function hasMintingAuthority(bearerScopes: string[]): boolean {
     bearerScopes.some((s) => isVaultAdminScope(s))
   );
 }
+
+/**
+ * Is this an *operator* bearer — i.e. does it hold host-level minting authority
+ * (`parachute:host:auth` or `parachute:host:admin`)?
+ *
+ * The distinction matters for the `subject` override on the mint endpoint: an
+ * operator bearer is the on-box host administrator (or a service account it
+ * delegated to), so it may legitimately mint a token whose `sub` names a
+ * service account other than its own — the documented service-account override.
+ * A merely vault-scoped bearer (`vault:<N>:admin` only) has NO host authority,
+ * so letting it set an arbitrary `sub` is audit-attribution forgery: it could
+ * mint a token that the registry + revocation list attribute to a foreign
+ * subject. Non-operator bearers are therefore pinned to their own `sub`.
+ */
+export function isOperatorBearer(bearerScopes: string[]): boolean {
+  return (
+    bearerScopes.includes(MINT_HOST_AUTH_SCOPE) || bearerScopes.includes(MINT_HOST_ADMIN_SCOPE)
+  );
+}

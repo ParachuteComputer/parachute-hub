@@ -270,7 +270,15 @@ export function isNonRequestableScope(scope: string): boolean {
   // consent path and through `canGrant` rule 1, capped to the consenting
   // user's held authority at the `issueAuthCodeRedirect` choke-point. Only
   // the host-level operator scopes stay non-requestable here.
-  return NON_REQUESTABLE_SCOPES.has(scope);
+  //
+  // Item C — case-insensitive guard. The membership check is exact-string,
+  // but Parachute scope tokens are canonically lowercase. A casing variant
+  // like `PARACHUTE:HOST:AUTH` would slip past a raw `Set.has` and be treated
+  // as requestable — minting a junk-but-harmless token today (consumers are
+  // case-sensitive + anchored, so it grants nothing), but a backstop against
+  // a future consumer that case-folds. Normalize to lowercase before the
+  // membership check so every casing of a host-level scope is refused.
+  return NON_REQUESTABLE_SCOPES.has(scope.toLowerCase());
 }
 
 /** True when the scope can appear in a public `/oauth/authorize` request. */

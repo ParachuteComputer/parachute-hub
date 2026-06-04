@@ -468,7 +468,7 @@ export async function setPassword(
  * only Phase-1 recovery was delete+recreate, which is destructive-feeling
  * even though it's safe (vaults are independent of accounts).
  *
- * Three writes inside one transaction:
+ * Four writes inside one transaction:
  *
  *   1. Rotate `password_hash` to the new argon2id hash and flip
  *      `password_changed` back to 0 so the user is force-redirected
@@ -482,7 +482,15 @@ export async function setPassword(
  *      would defeat the purpose. We keep the rows (don't NULL `user_id`
  *      like `deleteUser` does) because the audit trail naturally re-
  *      anchors to the still-existing user row.
- *   3. Bump `updated_at` so the SPA's row reflects the rotation.
+ *   3. Delete every active SESSION for the user (item G). Revoking tokens
+ *      alone left a live session cookie valid — an attacker who already had
+ *      a session (the very "old password / stolen device" shape this reset
+ *      recovers from) kept browsing post-reset until the session aged out.
+ *      Killing sessions in the same transaction makes the reset a true cut:
+ *      the user (and any attacker) must re-authenticate with the new
+ *      password. Sessions carry no audit value (unlike tokens), so we hard-
+ *      delete — same shape as `deleteUser`'s `DELETE FROM sessions`.
+ *   4. Bump `updated_at` so the SPA's row reflects the rotation.
  *
  * Hash OUTSIDE the transaction — argon2id is async and `db.transaction()`
  * on bun:sqlite is sync; doing it inside silently breaks atomicity (same
@@ -547,6 +555,12 @@ export async function resetUserPassword(
       stamp,
       userId,
     );
+    // Item G — also kill active sessions in the same transaction. A token
+    // revoke alone left a live session cookie valid; an admin reset must
+    // force re-auth with the new password (the "old password leaked / stolen
+    // device" recovery shape). Sessions carry no audit value, so hard-delete
+    // (same shape as deleteUser).
+    db.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
   })();
   return updated;
 }

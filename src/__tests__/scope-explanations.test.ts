@@ -4,6 +4,7 @@ import {
   NON_REQUESTABLE_SCOPES,
   SCOPE_EXPLANATIONS,
   explainScope,
+  isNonRequestableScope,
   isRequestableScope,
   isWellFormedOrNonVaultScope,
   scopeIsAdmin,
@@ -161,6 +162,21 @@ describe("isRequestableScope", () => {
   test("vault:<name>:read|write stays requestable", () => {
     expect(isRequestableScope("vault:default:read")).toBe(true);
     expect(isRequestableScope("vault:work:write")).toBe(true);
+  });
+
+  // Item C — case-insensitive guard. A casing variant of a host-level scope
+  // must NOT slip past the exact-string membership check as "requestable."
+  test("uppercase / mixed-case host scopes are non-requestable (item C)", () => {
+    expect(isRequestableScope("PARACHUTE:HOST:AUTH")).toBe(false);
+    expect(isRequestableScope("Parachute:Host:Admin")).toBe(false);
+    expect(isRequestableScope("parachute:HOST:vault")).toBe(false);
+    // And the direct predicate agrees.
+    expect(isNonRequestableScope("PARACHUTE:HOST:AUTH")).toBe(true);
+    expect(isNonRequestableScope("parachute:Host:Install")).toBe(true);
+    // Canonical lowercase still works unchanged.
+    expect(isNonRequestableScope("parachute:host:auth")).toBe(true);
+    // A non-host scope (even uppercased) stays requestable.
+    expect(isNonRequestableScope("HUB:ADMIN")).toBe(false);
   });
 });
 

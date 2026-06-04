@@ -15,6 +15,7 @@ import {
 } from "../hub-server.ts";
 import { setNotesRedirectDisabled } from "../hub-settings.ts";
 import { clearNotesRedirectLogState } from "../notes-redirect.ts";
+import { mintOperatorToken } from "../operator-token.ts";
 import { pidPath } from "../process-state.ts";
 import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
 import { buildSessionCookie, createSession } from "../sessions.ts";
@@ -3199,13 +3200,46 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
   });
 });
 
-describe("layerOf — classify trust layer from proxy headers", () => {
-  // Hub binds 127.0.0.1:1939; only trusted forwarders (cloudflared,
-  // tailscaled-serve, tailscaled-funnel) reach the listener. Spoofing isn't
-  // a concern. layerOf inspects the headers each forwarder injects.
+describe("layerOf — classify trust layer from proxy headers + peer (item E / #526)", () => {
+  // Proxy headers (cloudflared, tailscale serve/funnel) take precedence. When
+  // absent, the PEER ADDRESS is the loopback discriminator — header-absence is
+  // no longer a loopback signal (#526). The peer-address is the 2nd arg.
 
-  test("no proxy headers → loopback (direct localhost call)", () => {
-    expect(layerOf(req("/"))).toBe("loopback");
+  test("no proxy headers + loopback peer (127.0.0.1) → loopback (on-box CLI)", () => {
+    expect(layerOf(req("/"), "127.0.0.1")).toBe("loopback");
+  });
+
+  test("no proxy headers + IPv6 loopback peer (::1) → loopback", () => {
+    expect(layerOf(req("/"), "::1")).toBe("loopback");
+  });
+
+  test("no proxy headers + IPv4-mapped IPv6 loopback (::ffff:127.0.0.1) → loopback", () => {
+    expect(layerOf(req("/"), "::ffff:127.0.0.1")).toBe("loopback");
+  });
+
+  // THE FIX: a header-absent NON-loopback peer (the 0.0.0.0-bind direct-network
+  // case) must NOT be classified loopback — it would bypass the
+  // publicExposure:loopback 404-cloak. Fail to public (least-trusted).
+  test("no proxy headers + non-loopback peer → public (NOT loopback) [#526]", () => {
+    expect(layerOf(req("/"), "203.0.113.7")).toBe("public");
+    expect(layerOf(req("/"), "10.0.0.5")).toBe("public");
+    expect(layerOf(req("/"), "fd00::1234")).toBe("public");
+  });
+
+  // Fail-closed: an unknown peer (no Server threaded — null/undefined) is NOT
+  // loopback. A direct unit call to the fetch fn with no server lands here.
+  test("no proxy headers + unknown peer (null/undefined) → public (fail closed)", () => {
+    expect(layerOf(req("/"), null)).toBe("public");
+    expect(layerOf(req("/"), undefined)).toBe("public");
+    expect(layerOf(req("/"))).toBe("public");
+  });
+
+  // Headers still win over peer address — a tailnet/public forwarder sets the
+  // header and the peer (the local tailscaled/cloudflared) is loopback, but the
+  // header is authoritative.
+  test("Tailscale-User-Login → tailnet even from a loopback peer", () => {
+    const r = req("/", { headers: { "Tailscale-User-Login": "alice@example.com" } });
+    expect(layerOf(r, "127.0.0.1")).toBe("tailnet");
   });
 
   test("Tailscale-User-Login → tailnet (authed via tailscale serve)", () => {
@@ -3270,6 +3304,11 @@ describe("hubFetch publicExposure layer-gate (proxyToService)", () => {
     return { port: server.port as number, stop: () => server.stop(true) };
   }
 
+  // Fake Bun Server handle exposing only `requestIP` (item E / #526) so the
+  // fetch fn can resolve the peer address. The on-box CLI caller connects from
+  // 127.0.0.1; a network peer on a 0.0.0.0 bind connects from its real IP.
+  const fakeServer = (address: string) => ({ requestIP: () => ({ address }) });
+
   test("publicExposure: loopback + tailnet header → 404 (gate hides the route)", async () => {
     const h = makeHarness();
     const upstream = startUpstream("loopback-only");
@@ -3330,7 +3369,7 @@ describe("hubFetch publicExposure layer-gate (proxyToService)", () => {
     }
   });
 
-  test("publicExposure: loopback + no headers → reaches upstream (loopback layer)", async () => {
+  test("publicExposure: loopback + no headers + loopback peer → reaches upstream (loopback layer)", async () => {
     const h = makeHarness();
     const upstream = startUpstream("loopback-only");
     try {
@@ -3350,10 +3389,42 @@ describe("hubFetch publicExposure layer-gate (proxyToService)", () => {
         h.manifestPath,
       );
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/loopback-only/health"));
+      // On-box CLI caller: 127.0.0.1 peer, no proxy headers → loopback layer.
+      const res = await fetcher(req("/loopback-only/health"), fakeServer("127.0.0.1"));
       expect(res.status).toBe(200);
       const body = (await res.json()) as { tag: string };
       expect(body.tag).toBe("loopback-only");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  // Item E / #526 — the core fix. On a 0.0.0.0 bind a network peer reaches the
+  // listener with NO proxy headers; it must NOT be treated as loopback, so the
+  // loopback-exposure cloak still fires (404) rather than leaking the route.
+  test("publicExposure: loopback + no headers + NON-loopback peer → 404 (cloak fires) [#526]", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("loopback-only");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "loopback-only",
+              port: upstream.port,
+              paths: ["/loopback-only"],
+              health: "/loopback-only/health",
+              version: "0.1.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/loopback-only/health"), fakeServer("203.0.113.9"));
+      expect(res.status).toBe(404);
     } finally {
       upstream.stop();
       h.cleanup();
@@ -3518,6 +3589,10 @@ describe("hubFetch publicExposure layer-gate (proxyToVault)", () => {
     return { port: server.port as number, stop: () => server.stop(true) };
   }
 
+  // Item E / #526 — fake Bun Server handle exposing `requestIP` for the peer-
+  // address discriminator (see the proxyToService block for the rationale).
+  const fakeServer = (address: string) => ({ requestIP: () => ({ address }) });
+
   test("vault publicExposure: loopback + tailnet header → 404", async () => {
     const h = makeHarness();
     const upstream = startVaultUpstream("vault-private");
@@ -3549,7 +3624,7 @@ describe("hubFetch publicExposure layer-gate (proxyToVault)", () => {
     }
   });
 
-  test("vault publicExposure: loopback + no headers → reaches vault backend", async () => {
+  test("vault publicExposure: loopback + no headers + loopback peer → reaches vault backend", async () => {
     const h = makeHarness();
     const upstream = startVaultUpstream("vault-private");
     try {
@@ -3569,10 +3644,40 @@ describe("hubFetch publicExposure layer-gate (proxyToVault)", () => {
         h.manifestPath,
       );
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
-      const res = await fetcher(req("/vault/private/health"));
+      const res = await fetcher(req("/vault/private/health"), fakeServer("127.0.0.1"));
       expect(res.status).toBe(200);
       const body = (await res.json()) as { tag: string };
       expect(body.tag).toBe("vault-private");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  // Item E / #526 — vault-path symmetry: a header-absent NON-loopback peer on a
+  // 0.0.0.0 bind must NOT reach a loopback-exposed vault (cloak fires).
+  test("vault publicExposure: loopback + no headers + NON-loopback peer → 404 [#526]", async () => {
+    const h = makeHarness();
+    const upstream = startVaultUpstream("vault-private");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-private",
+              port: upstream.port,
+              paths: ["/vault/private"],
+              health: "/vault/private/health",
+              version: "0.4.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/vault/private/health"), fakeServer("198.51.100.4"));
+      expect(res.status).toBe(404);
     } finally {
       upstream.stop();
       h.cleanup();
@@ -4189,6 +4294,9 @@ describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to
     const friend = await createUser(db, "friend", "friend-password-123", {
       assignedVaults,
       allowMulti: true,
+      // Item F (#469): the friend mints a token only after rotating the temp
+      // password; an unrotated friend is force-redirected before any mint.
+      passwordChanged: true,
     });
     const session = createSession(db, { userId: friend.id });
     const csrf = generateCsrfToken();
@@ -4231,6 +4339,45 @@ describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to
     }
   });
 
+  // Item F (#469) routed e2e — an assigned but unrotated friend is force-
+  // redirected to the change-password rail before any mint, through the real
+  // dispatch.
+  test("unrotated friend → 303 to change-password, routed through hubFetch (item F)", async () => {
+    const h = makeHarness();
+    writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+    const db = openHubDb(hubDbPath(h.dir));
+    rotateSigningKey(db);
+    await createUser(db, "operator", "operator-password-123");
+    const friend = await createUser(db, "friend", "friend-password-123", {
+      assignedVaults: ["work"],
+      allowMulti: true,
+      passwordChanged: false, // not yet rotated
+    });
+    const session = createSession(db, { userId: friend.id });
+    const csrf = generateCsrfToken();
+    const cookie = `${buildSessionCookie(session.id, 3600, { secure: false })}; ${
+      buildCsrfCookie(csrf, { secure: false }).split(";")[0]
+    }`;
+    try {
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        issuer: "https://hub.test",
+      })(
+        req("/account/vault-token/work", {
+          method: "POST",
+          headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+          body: postBody(csrf, "read"),
+        }),
+      );
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe("/account/change-password");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
   test("unassigned vault → 403, no token, routed through hubFetch", async () => {
     const h = makeHarness();
     writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
@@ -4266,6 +4413,73 @@ describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to
         manifestPath: h.manifestPath,
       })(req("/account/vault-token/work"));
       expect(res.status).toBe(405);
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+});
+
+// Item D (#450) routed e2e — exercise the knownVaultNames threading from
+// services.json → hubFetch → handleApiMintToken (hub-server.ts dispatch),
+// which the unit-level handler tests can't cover. A `vault:<typo>:admin` mint
+// for an unregistered vault → 400 through the full stack; a known vault → 200.
+describe("POST /api/auth/mint-token — vault-existence threading (routed end-to-end, item D)", () => {
+  const ISSUER = "https://hub.test";
+
+  async function seedMint(
+    h: Harness,
+    vaultNames: string[],
+  ): Promise<{ db: ReturnType<typeof openHubDb>; bearer: string }> {
+    const db = openHubDb(hubDbPath(h.dir));
+    rotateSigningKey(db); // mint needs an active signing key
+    const owner = await createUser(db, "owner", "owner-password-123");
+    // The default operator scope-set carries parachute:host:admin, which mints
+    // vault:<name>:admin (canGrant rule 2).
+    const op = await mintOperatorToken(db, owner.id, { issuer: ISSUER });
+    writeManifest({ services: vaultNames.map((n) => vaultEntry(n)) }, h.manifestPath);
+    return { db, bearer: op.token };
+  }
+
+  function mintReq(scope: string, bearer: string): Request {
+    return req("/api/auth/mint-token", {
+      method: "POST",
+      headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" },
+      body: JSON.stringify({ scope }),
+    });
+  }
+
+  test("vault:<typo>:admin for an unregistered vault → 400 (knownVaultNames from services.json)", async () => {
+    const h = makeHarness();
+    const { db, bearer } = await seedMint(h, ["work", "default"]);
+    try {
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        issuer: ISSUER,
+      })(mintReq("vault:typo:admin", bearer));
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string; error_description: string };
+      expect(body.error).toBe("invalid_scope");
+      expect(body.error_description).toContain("typo");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("vault:<name>:admin for a REGISTERED vault → 200 (proves the gate isn't over-blocking)", async () => {
+    const h = makeHarness();
+    const { db, bearer } = await seedMint(h, ["work", "default"]);
+    try {
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        issuer: ISSUER,
+      })(mintReq("vault:work:admin", bearer));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { scope: string };
+      expect(body.scope).toBe("vault:work:admin");
     } finally {
       db.close();
       h.cleanup();

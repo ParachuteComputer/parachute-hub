@@ -73,14 +73,23 @@ function csrfPair(): { token: string; cookieFragment: string } {
   return { token, cookieFragment: cookie };
 }
 
-/** Build the first-admin operator + a friend assigned to `vaults`. */
+/**
+ * Build the first-admin operator + a friend assigned to `vaults`.
+ *
+ * `passwordChanged` defaults to true: the friend has already rotated the admin-
+ * set temp password, which is the precondition for minting a token now (item F
+ * / hub#469 — an unrotated friend is force-redirected before any mint). Pass
+ * `passwordChanged: false` to exercise the force-change gate.
+ */
 async function seedFriend(
   vaults: string[],
+  opts: { passwordChanged?: boolean } = {},
 ): Promise<{ friendId: string; cookie: string; csrfToken: string }> {
   await createUser(harness.db, "operator", "operator-password-123");
   const friend = await createUser(harness.db, "friend", "friend-password-123", {
     assignedVaults: vaults,
     allowMulti: true,
+    passwordChanged: opts.passwordChanged ?? true,
   });
   const session = createSession(harness.db, { userId: friend.id });
   const { token, cookieFragment } = csrfPair();
@@ -281,6 +290,49 @@ describe("handleAccountVaultTokenPost — authorization gates (adversarial)", ()
       deps(),
     );
     expect(res.status).toBe(400);
+  });
+
+  // Item I — uppercase vault names are rejected at the hub edge (lowercase-only,
+  // matching vault's init; the old `[a-zA-Z0-9_-]` superset drifted from it).
+  test("an uppercase vault name is rejected (item I — lowercase-only)", async () => {
+    const { cookie, csrfToken } = await seedFriend(["work"]);
+    for (const name of ["Work", "WORK", "myVault"]) {
+      const res = await handleAccountVaultTokenPost(
+        mintReq(name, { cookie, csrfToken, verb: "read" }),
+        name,
+        deps(),
+      );
+      expect(res.status).toBe(400);
+    }
+  });
+
+  // Item F / hub#469 — force-change gate. An assigned friend who has NOT yet
+  // rotated the admin-set temp password is redirected to the change-password
+  // rail instead of minting a long-lived token (which would outlive the
+  // rotation). The gate fires AFTER the authority checks (so an unassigned
+  // request still 403s) and BEFORE the mint.
+  test("authorized but unrotated friend → 303 to /account/change-password, no mint (item F)", async () => {
+    const { cookie, csrfToken } = await seedFriend(["work"], { passwordChanged: false });
+    const res = await handleAccountVaultTokenPost(
+      mintReq("work", { cookie, csrfToken, verb: "read" }),
+      "work",
+      deps(),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/account/change-password");
+    // No token row was written for the friend.
+    const rows = harness.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM tokens").get();
+    expect(rows?.n).toBe(0);
+  });
+
+  test("an UNASSIGNED unrotated friend still 403s (authority precedes the force-change gate)", async () => {
+    const { cookie, csrfToken } = await seedFriend(["work"], { passwordChanged: false });
+    const res = await handleAccountVaultTokenPost(
+      mintReq("other", { cookie, csrfToken, verb: "read" }),
+      "other",
+      deps(),
+    );
+    expect(res.status).toBe(403);
   });
 });
 

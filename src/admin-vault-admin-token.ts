@@ -28,13 +28,19 @@ import type { Database } from "bun:sqlite";
 import { signAccessToken } from "./jwt-sign.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
+import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 
 /** Short TTL — matches host-admin-token. SPA re-fetches on near-expiry. */
 export const VAULT_ADMIN_TOKEN_TTL_SECONDS = 10 * 60;
 const VAULT_ADMIN_CLIENT_ID = "parachute-hub-spa";
 
-/** Same shape as the manifest name validator — keeps URL-injection out. */
-const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+/**
+ * Lowercase-only vault-name charset (item I) — single source of truth in
+ * vault-name.ts, matching vault's init. Keeps URL-injection out AND closes the
+ * case-drift class (an uppercased name minting `vault.<Name>` audience that
+ * vault's lowercase URL-derived name would never validate).
+ */
+const VAULT_NAME_RE = VAULT_NAME_CHARSET_RE;
 
 export interface MintVaultAdminTokenDeps {
   db: Database;

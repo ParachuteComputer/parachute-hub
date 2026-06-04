@@ -419,6 +419,16 @@ export async function handleAccountChangePasswordPost(
         )
         .run(passwordHash, stamp, user.id);
       if (result.changes === 0) throw new UserNotFoundError(user.id);
+      // Revoke the user's still-active tokens on a self-service password change
+      // (item F / hub#469). The admin-reset path already revokes
+      // (`resetUserPassword`, users.ts); applying the same on self-change closes
+      // the "mint a token under the admin's temp password, then rotate but keep
+      // the token" gap — any token minted before the rotation dies with it. The
+      // user re-mints under their own (now-rotated) password if they need one.
+      // Same transaction as the hash write so the two are atomic.
+      deps.db
+        .prepare("UPDATE tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
+        .run(stamp, user.id);
     })();
   } catch (err) {
     // The user row vanished between the session-resolve check above and

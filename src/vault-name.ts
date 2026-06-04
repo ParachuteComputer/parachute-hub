@@ -25,7 +25,19 @@
  * `/vault/list` endpoint.
  */
 
-const VAULT_NAME_RE = /^[a-z0-9_-]+$/;
+/**
+ * Canonical vault-name charset: lowercase alphanumerics + hyphen/underscore.
+ * Exported as the single source of truth for the hub edge sites that mint /
+ * create vaults (item I) — `admin-vaults.ts`, `account-vault-token.ts`,
+ * `admin-vault-admin-token.ts` historically accepted `[a-zA-Z0-9_-]`, a
+ * superset of what vault's init enforces. The case drift was a real bug class:
+ * a hub-side `Work` would never match vault's URL-derived `work`, so the minted
+ * token's audience (`vault.Work`) wouldn't validate, and a created vault name
+ * could diverge from what vault persisted. Pinning every hub edge to THIS
+ * lowercase-only regex closes the drift.
+ */
+export const VAULT_NAME_CHARSET_RE = /^[a-z0-9_-]+$/;
+const VAULT_NAME_RE = VAULT_NAME_CHARSET_RE;
 const VAULT_NAME_MIN_LEN = 2;
 const VAULT_NAME_MAX_LEN = 32;
 
