@@ -14,7 +14,8 @@
  * Redeem ORDERING (the re-usability guarantee, mirroring the wizard):
  *   1. lookup + validate the invite (not-found/expired/used/revoked)
  *   2. validate username/password (+ vault name)
- *   3. provision the vault (idempotent-safe)
+ *   3. provision the vault (must FRESHLY CREATE — reject a pre-existing name;
+ *      attaching the new user to someone else's vault is a cross-tenant breach)
  *   4. createUser (the commit point)
  *   5. consumeInvite — stamp used_at + redeemed_user_id ONLY AFTER (4) commits
  *   6. createSession + cookie + 302
@@ -250,20 +251,38 @@ export async function handleAccountSetupPost(
     if (invite.vaultName !== null) {
       vaultName = invite.vaultName;
     } else {
-      const chosen = String(form.get("vault_name") ?? "").trim();
+      // Unpinned name: the invitee names their own vault. The field is
+      // OPTIONAL (no-JS server-side default) — a blank submission defaults
+      // the vault name to the chosen username. Either way the resolved name
+      // runs through the full validator; a username that isn't a valid vault
+      // name (e.g. too long, disallowed chars) re-renders asking for an
+      // explicit vault name with the validator's error.
+      const submitted = String(form.get("vault_name") ?? "").trim();
+      const chosen = submitted === "" ? username : submitted;
       const v = validateVaultName(chosen);
       if (!v.ok) {
-        return rerender(400, v.error, chosen);
+        // Echo the resolved name only if the invitee typed one; a blank
+        // (username-derived) failure shouldn't pre-fill the vault box.
+        return rerender(400, v.error, submitted === "" ? undefined : submitted);
       }
       vaultName = v.name;
     }
   } else if (invite.vaultName !== null) {
-    // Account-only invite that assigns an existing vault.
-    vaultName = invite.vaultName;
+    // UNSUPPORTED shared-vault case: an account-only invite (provision_vault
+    // =false) that pins an EXISTING vault would assign the new user owner-
+    // admin on a pre-existing vault — a cross-tenant breach, and the owner-
+    // vs-shared role split isn't built. The admin API rejects creating such
+    // an invite (defense in depth); reject here too in case one slipped
+    // through. The legit account-only invite (vaultName === null) is unaffected.
+    return rerender(
+      400,
+      "This invite is not supported (shared-vault invites aren't available yet). Ask your hub operator for a new one.",
+    );
   }
 
-  // (3) Provision the vault (idempotent-safe). Routed through the SAME
-  // createVault path the wizard/SPA use, so the new vault gets the §3
+  // (3) Provision the vault — must FRESHLY CREATE it (see the security
+  // invariant on the `!provisioned.created` check below). Routed through the
+  // SAME createVault path the wizard/SPA use, so the new vault gets the §3
   // internal-live-mirror default for free. Done BEFORE createUser so a
   // provisioning failure doesn't leave a vault-less account; the invite is
   // still unconsumed at this point, so the invitee can retry.
@@ -281,6 +300,26 @@ export async function handleAccountSetupPost(
           ? provisioned.message
           : "Could not provision your vault. Please try again, or ask your hub operator.",
         invite.vaultName === null ? (vaultName ?? undefined) : undefined,
+      );
+    }
+    // SECURITY INVARIANT: an invite redeem may grant access ONLY to a vault
+    // that was FRESHLY CREATED during this redeem. `provisionVault` returns
+    // `created:true` (HTTP 201) for a new vault, `created:false` (HTTP 200)
+    // when the name ALREADY EXISTS — in which case it hands back SOMEONE
+    // ELSE'S vault. Attaching the new user there as owner would be a cross-
+    // tenant breach. Reject any non-created (already-existing) result; the
+    // invitee must choose a different, unused name. This also closes the
+    // concurrent-redeem race on a new name: first redeem 201, second 200 →
+    // second rejected.
+    if (!provisioned.created) {
+      return rerender(
+        409,
+        `A vault named "${vaultName}" already exists. Choose a different name.`,
+        // Echo the typed name only if the invitee chose it explicitly; a
+        // username-derived collision shouldn't pre-fill the vault box.
+        invite.vaultName === null && String(form.get("vault_name") ?? "").trim() !== ""
+          ? vaultName
+          : undefined,
       );
     }
   }

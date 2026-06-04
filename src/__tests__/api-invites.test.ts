@@ -120,6 +120,43 @@ describe("POST /api/invites", () => {
     );
     expect(res.status).toBe(400);
   });
+
+  test("400 rejects a shared-vault invite (provision_vault=false + vault_name)", async () => {
+    // Defense in depth (FIX-1): assigning a redeemer to a PRE-EXISTING vault
+    // as owner-admin is a cross-tenant breach; shared-vault invites aren't
+    // supported yet, so the create handler refuses this combination outright.
+    const bearer = await makeAdminBearer();
+    const res = await handleCreateInvite(
+      withBearer("/api/invites", bearer, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provision_vault: false, vault_name: "someoneelse" }),
+      }),
+      deps(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("invalid_request");
+    expect(body.error_description).toContain("shared-vault");
+  });
+
+  test("account-only invite (provision_vault=false, NO vault_name) is still allowed", async () => {
+    const bearer = await makeAdminBearer();
+    const res = await handleCreateInvite(
+      withBearer("/api/invites", bearer, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provision_vault: false }),
+      }),
+      deps(),
+    );
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as {
+      invite: { provision_vault: boolean; vault_name: string | null };
+    };
+    expect(body.invite.provision_vault).toBe(false);
+    expect(body.invite.vault_name).toBeNull();
+  });
 });
 
 describe("GET /api/invites", () => {

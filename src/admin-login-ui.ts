@@ -196,17 +196,44 @@ export function renderInviteSetup(props: InviteSetupProps): string {
         </label>`;
     } else {
       const vaultAttr = vaultName ? ` value="${escapeAttr(vaultName)}"` : "";
+      // OPTIONAL (not `required`): a blank submission defaults the vault name
+      // to the chosen username, resolved server-side (this form is no-JS, so
+      // the server is the source of truth). The inline script below is a
+      // progressive-enhancement pre-fill only.
       vaultRow = `
         <label class="field">
           <span class="field-label">Name your vault</span>
-          <input type="text" name="vault_name" autocomplete="off"
-            required minlength="2" maxlength="32"
+          <input type="text" name="vault_name" id="vault_name" autocomplete="off"
+            minlength="2" maxlength="32"
             pattern="[a-z0-9_-]+" title="lowercase letters, digits, _ - (2–32 chars)"
-            spellcheck="false" autocapitalize="off"${vaultAttr} />
-          <span class="field-hint">lowercase letters, digits, <code>_</code>, <code>-</code> (2–32 chars)</span>
+            spellcheck="false" autocapitalize="off"
+            placeholder="defaults to your username"${vaultAttr} />
+          <span class="field-hint">lowercase letters, digits, <code>_</code>, <code>-</code> (2–32 chars). Leave blank to use your username.</span>
         </label>`;
     }
   }
+
+  // Progressive enhancement ONLY: mirror the username into the (empty) vault
+  // field as the user types, so they see the default before submitting. The
+  // server applies the same default with no JS (the field is optional), so
+  // this is purely cosmetic — it stops mirroring the moment the user edits the
+  // vault field directly. Shown only for the unpinned-provision case.
+  const vaultPrefillScript =
+    provisionVault && pinnedVaultName === null
+      ? `
+    <script>
+      (function () {
+        var u = document.getElementById("username");
+        var v = document.getElementById("vault_name");
+        if (!u || !v) return;
+        var dirty = v.value !== "";
+        v.addEventListener("input", function () { dirty = true; });
+        u.addEventListener("input", function () {
+          if (!dirty) v.value = u.value;
+        });
+      })();
+    </script>`
+      : "";
 
   const body = `
     <div class="card">
@@ -222,7 +249,7 @@ export function renderInviteSetup(props: InviteSetupProps): string {
         ${renderCsrfHiddenInput(csrfToken)}
         <label class="field">
           <span class="field-label">Username</span>
-          <input type="text" name="username" autocomplete="username" autofocus
+          <input type="text" name="username" id="username" autocomplete="username" autofocus
             required minlength="2" maxlength="32"
             pattern="[a-z0-9_-]+" title="lowercase letters, digits, _ - (2–32 chars)"
             spellcheck="false" autocapitalize="off"${usernameAttr} />
@@ -242,7 +269,7 @@ export function renderInviteSetup(props: InviteSetupProps): string {
         ${vaultRow}
         <button type="submit" class="btn btn-primary">Create my account</button>
       </form>
-    </div>`;
+    </div>${vaultPrefillScript}`;
   return baseDocument("Claim your invite — Parachute", body);
 }
 
