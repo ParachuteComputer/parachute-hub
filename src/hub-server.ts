@@ -429,19 +429,31 @@ export type RequestLayer = "loopback" | "tailnet" | "public";
  *   - `CF-Ray` and `CF-Connecting-IP` are set by Cloudflare's edge for
  *     anything proxied through a cloudflared tunnel.
  *
- * Spoofing isn't a concern: hub binds `127.0.0.1:1939`, so external requests
- * can't reach the listener except via these trusted forwarders. Tailscale
- * specifically strips the same headers from incoming requests before
- * re-injecting them, so even a malicious tailnet peer can't impersonate a
- * different user. We could mirror that strip-on-arrival defense, but it's
- * belt-and-braces given the bind shape.
+ * Spoofing isn't a concern for the proxy-injected layers: the trusted
+ * forwarders (tailscale serve/funnel, cloudflared) set these headers and a
+ * peer can't forge them past the forwarder. Tailscale specifically strips the
+ * same headers from incoming requests before re-injecting them, so even a
+ * malicious tailnet peer can't impersonate a different user.
  *
- * Default to "loopback" when no proxy headers are present — that's the
- * direct-localhost case. Funnel without `Tailscale-Funnel-Request` would
- * also fall here, but Tailscale always sets the header on funneled
- * requests, so this branch only fires for true loopback callers.
+ * Header-absence is NOT a loopback signal (item E / hub#526). The old default
+ * returned "loopback" — the most-trusted layer — for any request with no proxy
+ * headers, on the premise (true only on a loopback bind) that "external
+ * requests can't reach the listener." Containers / Render legitimately bind
+ * `0.0.0.0`, where a network peer can reach the listener directly with no proxy
+ * headers and would be misclassified `loopback`, bypassing the
+ * `publicExposure:"loopback"` 404-cloak on `proxyToService` / `proxyToVault`.
+ *
+ * Fix: derive loopback from the actual PEER ADDRESS (`peerAddr`, resolved by
+ * the caller from `server.requestIP(req)` — `requestIP` lives on the Bun
+ * Server, not the Request; see rate-limit.ts:282-285). A header-absent request
+ * is `loopback` ONLY when its peer is `127.0.0.1` / `::1` (the on-box CLI
+ * caller, which must stay loopback). A header-absent NON-loopback peer is the
+ * untrusted direct-network case and is classified `public` (least-trusted) so
+ * the cloak fires. When `peerAddr` is unknown (null/undefined — no Server
+ * threaded, e.g. a unit test calling `layerOf(req)` directly), we fail CLOSED
+ * to `public` rather than open to `loopback`.
  */
-export function layerOf(req: Request): RequestLayer {
+export function layerOf(req: Request, peerAddr?: string | null): RequestLayer {
   const h = req.headers;
   if (h.get("cf-ray") !== null || h.get("cf-connecting-ip") !== null) return "public";
   // Match the structured-header value (`?1`) rather than mere presence:
@@ -452,7 +464,25 @@ export function layerOf(req: Request): RequestLayer {
   // value to compare against, hence the presence-check above.
   if (h.get("tailscale-funnel-request") === "?1") return "public";
   if (h.get("tailscale-user-login") !== null) return "tailnet";
-  return "loopback";
+  // No proxy headers — classify by peer address, failing closed when unknown.
+  return isLoopbackPeer(peerAddr) ? "loopback" : "public";
+}
+
+/**
+ * True when `peerAddr` (a `server.requestIP(req)?.address`) is a loopback
+ * address. Handles the IPv4-mapped IPv6 form (`::ffff:127.0.0.1`) Bun can emit
+ * on a dual-stack listener. A null/undefined/unparseable address is NOT
+ * loopback — `layerOf` fails closed to `public` in that case.
+ */
+function isLoopbackPeer(peerAddr: string | null | undefined): boolean {
+  if (!peerAddr) return false;
+  const addr = peerAddr.trim().toLowerCase();
+  return (
+    addr === "127.0.0.1" ||
+    addr === "::1" ||
+    addr === "::ffff:127.0.0.1" ||
+    addr.startsWith("127.")
+  );
 }
 
 /**
@@ -587,6 +617,7 @@ async function proxyToVault(
   req: Request,
   manifestPath: string,
   supervisor: Supervisor | undefined,
+  peerAddr: string | null,
 ): Promise<Response | undefined> {
   // Lenient — see hub#406. One bad services.json row no longer takes
   // down vault routing the way it used to take down /admin/setup and
@@ -597,8 +628,10 @@ async function proxyToVault(
   if (!match) return undefined;
   // Layer-gate on `publicExposure: "loopback"` — hide the entry from non-
   // loopback callers as if it doesn't exist. "allowed" / "auth-required"
-  // pass through; the service does its own auth.
-  if (effectivePublicExposure(match.entry) === "loopback" && layerOf(req) !== "loopback") {
+  // pass through; the service does its own auth. `peerAddr` (item E / #526)
+  // is the loopback discriminator: a header-absent NON-loopback peer is NOT
+  // loopback, so the cloak fires on a 0.0.0.0 bind.
+  if (effectivePublicExposure(match.entry) === "loopback" && layerOf(req, peerAddr) !== "loopback") {
     return new Response("not found", { status: 404 });
   }
   // Symmetry with proxyToService (#196): honor `stripPrefix` with FIRST_-
@@ -672,6 +705,7 @@ async function proxyToService(
   req: Request,
   manifestPath: string,
   supervisor: Supervisor | undefined,
+  peerAddr: string | null,
 ): Promise<Response | undefined> {
   // Lenient read on the hot-path — a single malformed services.json
   // entry (e.g. a module installed at a buggy version that wrote
@@ -693,8 +727,8 @@ async function proxyToService(
   // tailnet/public caller, a loopback-only service must be indistinguishable
   // from "not installed" — 404, not 403, so we don't leak the existence of
   // the route. "allowed" / "auth-required" pass through; the service does
-  // its own auth.
-  if (effectivePublicExposure(match.entry) === "loopback" && layerOf(req) !== "loopback") {
+  // its own auth. `peerAddr` (item E / #526) is the loopback discriminator.
+  if (effectivePublicExposure(match.entry) === "loopback" && layerOf(req, peerAddr) !== "loopback") {
     return new Response("not found", { status: 404 });
   }
   // Consult FIRST_PARTY_FALLBACKS as a fallback for `stripPrefix` (#196).
@@ -1211,10 +1245,23 @@ export function resolveIssuerSource(
   return "request";
 }
 
+/**
+ * Minimal structural type for the Bun `Server` handle the fetch callback
+ * receives as its 2nd argument. We only need `requestIP` (item E / #526) to
+ * resolve the peer address for `layerOf`. Typed structurally (rather than
+ * importing Bun's full `Server`) so tests can pass a tiny fake and so the
+ * signature stays robust to Bun type-shape churn. Optional in the callback
+ * because a direct unit call to the returned fetch fn may omit it — in which
+ * case `peerAddr` is null and `layerOf` fails closed to `public`.
+ */
+interface PeerIpResolver {
+  requestIP(req: Request): { address: string } | null;
+}
+
 export function hubFetch(
   wellKnownDir: string,
   deps?: HubFetchDeps,
-): (req: Request) => Response | Promise<Response> {
+): (req: Request, server?: PeerIpResolver) => Response | Promise<Response> {
   const hubHtmlPath = join(wellKnownDir, "hub.html");
   const getDb = deps?.getDb;
   const configuredIssuer = deps?.issuer;
@@ -1261,9 +1308,17 @@ export function hubFetch(
     };
   };
 
-  return async (req) => {
+  return async (req, server) => {
     const url = new URL(req.url);
     const pathname = url.pathname;
+
+    // Resolve the peer address ONCE per request (item E / #526). Bun's
+    // `requestIP` lives on the Server handle, not the Request. It's the
+    // loopback discriminator for `layerOf` on the loopback-exposure cloak —
+    // a header-absent non-loopback peer must NOT be treated as loopback.
+    // `server` is absent when a unit test calls this fn directly; `peerAddr`
+    // is then null and `layerOf` fails closed to `public`.
+    const peerAddr = server?.requestIP(req)?.address ?? null;
 
     // 301 back-compat for the pre-hub#231 admin-SPA mounts:
     //
@@ -2288,7 +2343,7 @@ export function hubFetch(
     // here anymore (the SPA moved to /admin), so we can't accidentally
     // mask a backend 404 with HTML.
     if (pathname.startsWith("/vault/")) {
-      const proxied = await proxyToVault(req, manifestPath, deps?.supervisor);
+      const proxied = await proxyToVault(req, manifestPath, deps?.supervisor, peerAddr);
       if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
       return new Response("not found", { status: 404 });
     }
@@ -2315,7 +2370,7 @@ export function hubFetch(
     // here only after every hub-owned prefix above has had its turn — so
     // `/`, `/admin/*`, `/oauth/*`, `/.well-known/*`, `/hub/*`, `/vault/*`,
     // `/api/*` are excluded by ordering, not by an explicit denylist (#182).
-    const proxied = await proxyToService(req, manifestPath, deps?.supervisor);
+    const proxied = await proxyToService(req, manifestPath, deps?.supervisor, peerAddr);
     if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
 
     // Branded fall-through 404 (closes hub#392) — the operator who mistyped
