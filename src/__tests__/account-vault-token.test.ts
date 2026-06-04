@@ -292,6 +292,20 @@ describe("handleAccountVaultTokenPost — authorization gates (adversarial)", ()
     expect(res.status).toBe(400);
   });
 
+  // Item I — uppercase vault names are rejected at the hub edge (lowercase-only,
+  // matching vault's init; the old `[a-zA-Z0-9_-]` superset drifted from it).
+  test("an uppercase vault name is rejected (item I — lowercase-only)", async () => {
+    const { cookie, csrfToken } = await seedFriend(["work"]);
+    for (const name of ["Work", "WORK", "myVault"]) {
+      const res = await handleAccountVaultTokenPost(
+        mintReq(name, { cookie, csrfToken, verb: "read" }),
+        name,
+        deps(),
+      );
+      expect(res.status).toBe(400);
+    }
+  });
+
   // Item F / hub#469 — force-change gate. An assigned friend who has NOT yet
   // rotated the admin-set temp password is redirected to the change-password
   // rail instead of minting a long-lived token (which would outlive the

@@ -121,6 +121,23 @@ describe("handleVaultAdminToken", () => {
     expect(res.status).toBe(400);
   });
 
+  // Item I — uppercase names are rejected at the hub edge (lowercase-only,
+  // matching vault's init). Rejected on shape (400) before the known-vault check.
+  test("400 when the vault name contains uppercase letters (item I)", async () => {
+    const { cookie } = await withSession();
+    for (const name of ["Work", "WORK", "myVault"]) {
+      const req = new Request(`${ISSUER}/admin/vault-admin-token/${name}`, {
+        headers: { cookie },
+      });
+      const res = await handleVaultAdminToken(req, name, {
+        db: harness.db,
+        issuer: ISSUER,
+        knownVaultNames: known(name, "work"),
+      });
+      expect(res.status).toBe(400);
+    }
+  });
+
   test("200 mints a JWT carrying vault:<name>:admin", async () => {
     const { cookie, userId } = await withSession();
     const req = new Request(`${ISSUER}/admin/vault-admin-token/work`, { headers: { cookie } });

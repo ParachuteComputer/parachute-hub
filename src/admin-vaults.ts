@@ -60,6 +60,7 @@ import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./adm
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { findService, type readManifest, readManifestLenient } from "./services-manifest.ts";
 import { enrichedPath } from "./spawn-path.ts";
+import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 import { type WellKnownVaultEntry, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 /** Scope required to call POST /vaults. */
@@ -73,7 +74,12 @@ export const HOST_ADMIN_SCOPE = "parachute:host:admin";
  * the hub rejects them at the API edge before a vault under those names
  * can register and capture the proxy path.
  */
-const VAULT_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+// Lowercase-only (item I) — single source of truth in vault-name.ts. Vault's
+// init enforces `[a-z0-9_-]`; a hub-side `[a-zA-Z0-9_-]` superset let an
+// uppercased name through that vault would then lowercase or reject, drifting
+// the hub's idea of the vault from vault's. The hub-only reservations (`new`,
+// `assets`) shadow SPA routes and stay on top of vault's `list`.
+const VAULT_NAME_PATTERN = VAULT_NAME_CHARSET_RE;
 const RESERVED_VAULT_NAMES = new Set(["list", "new", "assets"]);
 
 export interface CreateVaultRequest {
@@ -165,7 +171,8 @@ async function parseBody(req: Request): Promise<ParseResult | ParseError> {
     return {
       ok: false,
       status: 400,
-      message: "vault name must contain only letters, numbers, hyphens, and underscores",
+      message:
+        "vault name must contain only lowercase letters, numbers, hyphens, and underscores",
     };
   }
   if (RESERVED_VAULT_NAMES.has(name)) {

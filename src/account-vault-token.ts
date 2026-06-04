@@ -75,9 +75,15 @@ import { vaultTokenMintRateLimiter } from "./rate-limit.ts";
 import { findActiveSession } from "./sessions.ts";
 import { isTotpEnrolled } from "./two-factor-store.ts";
 import { type VaultVerb, getUserById, isFirstAdmin, vaultVerbsForUserVault } from "./users.ts";
+import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 
-/** Matches the manifest vault-name validator + `/admin/vault-admin-token`. */
-const VAULT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+/**
+ * Lowercase-only vault-name charset (item I) — single source of truth in
+ * vault-name.ts, matching what vault's init enforces. Was `[a-zA-Z0-9_-]`; the
+ * uppercase superset let a mint name drift from vault's lowercase URL-derived
+ * name, so the minted token's `vault.<Name>` audience wouldn't validate.
+ */
+const VAULT_NAME_RE = VAULT_NAME_CHARSET_RE;
 /** Verbs this surface will ever mint. `admin` is deliberately absent. */
 const ALLOWED_VERBS: readonly VaultVerb[] = ["read", "write", "admin"];
 /** client_id stamped on the minted JWT + registry row. */
