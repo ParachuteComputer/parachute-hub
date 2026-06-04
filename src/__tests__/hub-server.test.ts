@@ -4293,6 +4293,9 @@ describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to
     const friend = await createUser(db, "friend", "friend-password-123", {
       assignedVaults,
       allowMulti: true,
+      // Item F (#469): the friend mints a token only after rotating the temp
+      // password; an unrotated friend is force-redirected before any mint.
+      passwordChanged: true,
     });
     const session = createSession(db, { userId: friend.id });
     const csrf = generateCsrfToken();
@@ -4329,6 +4332,45 @@ describe("POST /account/vault-token/<name> — friend scoped mint (routed end-to
       const html = await res.text();
       expect(html).toContain('data-testid="minted-token-banner"');
       expect(html).toContain("vault:work:read");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  // Item F (#469) routed e2e — an assigned but unrotated friend is force-
+  // redirected to the change-password rail before any mint, through the real
+  // dispatch.
+  test("unrotated friend → 303 to change-password, routed through hubFetch (item F)", async () => {
+    const h = makeHarness();
+    writeManifest({ services: [vaultEntry("work")] }, h.manifestPath);
+    const db = openHubDb(hubDbPath(h.dir));
+    rotateSigningKey(db);
+    await createUser(db, "operator", "operator-password-123");
+    const friend = await createUser(db, "friend", "friend-password-123", {
+      assignedVaults: ["work"],
+      allowMulti: true,
+      passwordChanged: false, // not yet rotated
+    });
+    const session = createSession(db, { userId: friend.id });
+    const csrf = generateCsrfToken();
+    const cookie = `${buildSessionCookie(session.id, 3600, { secure: false })}; ${
+      buildCsrfCookie(csrf, { secure: false }).split(";")[0]
+    }`;
+    try {
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        issuer: "https://hub.test",
+      })(
+        req("/account/vault-token/work", {
+          method: "POST",
+          headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+          body: postBody(csrf, "read"),
+        }),
+      );
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe("/account/change-password");
     } finally {
       db.close();
       h.cleanup();
