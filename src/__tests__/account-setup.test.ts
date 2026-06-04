@@ -558,8 +558,13 @@ describe("POST /account/setup/<token> — concurrent redeem (N2)", () => {
     const [r1, r2] = await Promise.all([mk("alice", a), mk("bob", b)]);
 
     const statuses = [r1.status, r2.status].sort();
-    // Exactly one 302 (success) and one 410 (the loser's used-path).
-    expect(statuses).toEqual([302, 410]);
+    // Exactly one 302 (success). The loser is rejected — either at the
+    // FIX-1 existing-vault gate (409, it saw the name already created) or at
+    // the consume-inside-tx race (410, both raced past the existence check
+    // then one lost the invite-consume). Both are correct single-account
+    // outcomes; the only invariant is "exactly one success, one rejection".
+    expect(statuses[0]).toBe(302);
+    expect(statuses[1] === 409 || statuses[1] === 410).toBe(true);
     // EXACTLY one account was created from the invite — no orphan row.
     expect(userCount(harness.db) - before).toBe(1);
     const aliceExists = getUserByUsernameCI(harness.db, "alice") !== null;
@@ -605,5 +610,271 @@ describe("POST /account/setup/<token> — account-only invite (N3)", () => {
     expect(stub.calls.length).toBe(0);
     // Invite consumed.
     expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).not.toBeNull();
+  });
+});
+
+/**
+ * Add a pre-existing vault (someone else's) directly to services.json so
+ * `provisionVault`'s existence check finds it WITHOUT a shell-out. Mirrors the
+ * shape the stub writes.
+ */
+function seedExistingVault(name: string): void {
+  const manifest = JSON.parse(readFileSync(harness.manifestPath, "utf8")) as {
+    services: { name: string; paths: string[] }[];
+  };
+  const vaultSvc = manifest.services.find((s) => s.name === "parachute-vault");
+  if (vaultSvc && !vaultSvc.paths.includes(`/vault/${name}`)) {
+    vaultSvc.paths.push(`/vault/${name}`);
+    writeFileSync(harness.manifestPath, JSON.stringify(manifest));
+  }
+}
+
+describe("POST /account/setup/<token> — cross-tenant: existing-vault rejection (FIX-1)", () => {
+  test("HEADLINE: invitee picks an EXISTING vault name → rejected, no account, owner unchanged", async () => {
+    // An owner already holds "shared-vault".
+    const owner = await createUser(harness.db, "owner", "owner-strong-password-1", {
+      assignedVaults: ["shared-vault"],
+      role: "write",
+    });
+    seedExistingVault("shared-vault");
+
+    // Unpinned invite: the invitee gets to type a vault name.
+    const admin = await createUser(harness.db, "operator", "operator-password-1", {
+      allowMulti: true,
+    });
+    const { rawToken } = issueInvite(harness.db, { createdBy: admin.id }); // vault_name null
+    const before = userCount(harness.db);
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username: "intruder",
+          password: "intruder-strong-password-1",
+          password_confirm: "intruder-strong-password-1",
+          vault_name: "shared-vault", // collides with the owner's vault
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+
+    // Rejected with a re-rendered form carrying the "already exists" error.
+    expect(res.status).toBe(409);
+    const html = await res.text();
+    expect(html).toContain("already exists");
+    expect(html).toContain("Choose a different name");
+
+    // NO account created.
+    expect(getUserByUsernameCI(harness.db, "intruder")).toBeNull();
+    expect(userCount(harness.db) - before).toBe(0);
+    // The invite is NOT consumed — the invitee can retry with a new name.
+    expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).toBeNull();
+    // The pre-existing vault's owner/assignment is UNCHANGED.
+    expect(vaultVerbsForUserVault(harness.db, owner.id, "shared-vault")).toEqual([
+      "read",
+      "write",
+      "admin",
+    ]);
+    // No NEW user got authority over it.
+    const intruder = getUserByUsernameCI(harness.db, "intruder");
+    expect(intruder).toBeNull();
+  });
+
+  test("pinned EXISTING vault name (provision_vault=true) → rejected, no account", async () => {
+    await createUser(harness.db, "owner", "owner-strong-password-1", {
+      assignedVaults: ["taken"],
+      role: "write",
+    });
+    seedExistingVault("taken");
+    const admin = await createUser(harness.db, "operator", "operator-password-1", {
+      allowMulti: true,
+    });
+    // Admin pins an existing name with provision_vault=true (the redeem must
+    // still freshly CREATE — a pre-existing pinned name is rejected too).
+    const { rawToken } = issueInvite(harness.db, { createdBy: admin.id, vaultName: "taken" });
+    const before = userCount(harness.db);
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username: "newbie",
+          password: "newbie-strong-password-1",
+          password_confirm: "newbie-strong-password-1",
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(makeStubRunCommand().run),
+    );
+    expect(res.status).toBe(409);
+    expect(getUserByUsernameCI(harness.db, "newbie")).toBeNull();
+    expect(userCount(harness.db) - before).toBe(0);
+    expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).toBeNull();
+  });
+
+  test("concurrent redeem on a FRESH name → exactly one account, the other rejected", async () => {
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    // Pinned to a fresh name so both redeems target the SAME new vault.
+    const { rawToken } = issueInvite(harness.db, { createdBy: admin.id, vaultName: "freshvault" });
+    const before = userCount(harness.db);
+    const a = csrfPair();
+    const b = csrfPair();
+    const mk = (uname: string, csrf: { token: string; cookieFragment: string }) =>
+      handleAccountSetupPost(
+        postReq(
+          rawToken,
+          {
+            [CSRF_FIELD_NAME]: csrf.token,
+            username: uname,
+            password: `${uname}-strong-password-1`,
+            password_confirm: `${uname}-strong-password-1`,
+          },
+          csrf.cookieFragment,
+        ),
+        rawToken,
+        deps(makeStubRunCommand().run),
+      );
+    const [r1, r2] = await Promise.all([mk("ann", a), mk("ben", b)]);
+    const statuses = [r1.status, r2.status].sort();
+    // Exactly one success; the other rejected (409 existing-vault gate or 410
+    // consume race — see the N2 test for why both are correct).
+    expect(statuses[0]).toBe(302);
+    expect(statuses[1] === 409 || statuses[1] === 410).toBe(true);
+    expect(userCount(harness.db) - before).toBe(1);
+  });
+
+  test("shared-vault invite that slipped through (provision_vault=false + pinned name) → rejected at redeem", async () => {
+    // Defense in depth: the admin API rejects creating this shape, but if one
+    // exists in the DB the redeem must still refuse to assign the existing vault.
+    await createUser(harness.db, "owner", "owner-strong-password-1", {
+      assignedVaults: ["legacy"],
+      role: "write",
+    });
+    seedExistingVault("legacy");
+    const admin = await createUser(harness.db, "operator", "operator-password-1", {
+      allowMulti: true,
+    });
+    const { rawToken } = issueInvite(harness.db, {
+      createdBy: admin.id,
+      vaultName: "legacy",
+      provisionVault: false,
+    });
+    const before = userCount(harness.db);
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username: "wouldbe",
+          password: "wouldbe-strong-password-1",
+          password_confirm: "wouldbe-strong-password-1",
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+    expect(res.status).toBe(400);
+    expect(getUserByUsernameCI(harness.db, "wouldbe")).toBeNull();
+    expect(userCount(harness.db) - before).toBe(0);
+    // No vault shell-out — rejected before provisioning.
+    expect(stub.calls.length).toBe(0);
+    // Invite NOT consumed.
+    expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).toBeNull();
+  });
+});
+
+describe("POST /account/setup/<token> — vault name defaults to username (FIX-2)", () => {
+  test("blank vault_name → vault created NAMED AFTER the username", async () => {
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    const { rawToken } = issueInvite(harness.db, { createdBy: admin.id }); // unpinned
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username: "dana",
+          password: "dana-strong-password-12",
+          password_confirm: "dana-strong-password-12",
+          vault_name: "", // blank → defaults to username
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+    expect(res.status).toBe(302);
+    const user = getUserByUsernameCI(harness.db, "dana");
+    expect(user?.assignedVaults).toEqual(["dana"]);
+    // The shell-out created a vault named "dana".
+    expect(stub.calls.some((c) => c[1] === "create" && c[2] === "dana")).toBe(true);
+  });
+
+  test("vault_name field OMITTED entirely → still defaults to username", async () => {
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    const { rawToken } = issueInvite(harness.db, { createdBy: admin.id });
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username: "ezra",
+          password: "ezra-strong-password-12",
+          password_confirm: "ezra-strong-password-12",
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+    expect(res.status).toBe(302);
+    expect(getUserByUsernameCI(harness.db, "ezra")?.assignedVaults).toEqual(["ezra"]);
+  });
+
+  test("blank vault_name but the username collides with an EXISTING vault → rejected (FIX-1 still applies)", async () => {
+    await createUser(harness.db, "owner", "owner-strong-password-1", {
+      assignedVaults: ["fiona"],
+      role: "write",
+    });
+    seedExistingVault("fiona");
+    const admin = await createUser(harness.db, "operator", "operator-password-1", {
+      allowMulti: true,
+    });
+    const { rawToken } = issueInvite(harness.db, { createdBy: admin.id });
+    const before = userCount(harness.db);
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username: "fiona", // username derives a vault that already exists
+          password: "fiona-strong-password-1",
+          password_confirm: "fiona-strong-password-1",
+          vault_name: "",
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(makeStubRunCommand().run),
+    );
+    expect(res.status).toBe(409);
+    const html = await res.text();
+    expect(html).toContain("already exists");
+    expect(getUserByUsernameCI(harness.db, "fiona")).toBeNull();
+    expect(userCount(harness.db) - before).toBe(0);
+    expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).toBeNull();
   });
 });

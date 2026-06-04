@@ -19,7 +19,6 @@
 import type { Database } from "bun:sqlite";
 import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
-import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import {
   DEFAULT_INVITE_TTL_SECONDS,
   type Invite,
@@ -31,7 +30,6 @@ import {
   revokeInvite,
 } from "./invites.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
-import { listVaultNamesFromPath } from "./vault-names.ts";
 
 export interface ApiInvitesDeps {
   db: Database;
@@ -266,19 +264,19 @@ export async function handleCreateInvite(req: Request, deps: ApiInvitesDeps): Pr
   if (!parsed.ok) return jsonError(parsed.status, parsed.error, parsed.description);
   const { vaultName, role, provisionVault, defaultMirror, expiresInSeconds } = parsed.body;
 
-  // A pinned vault_name with provision_vault=false means "assign an existing
-  // vault" — validate it exists. (provision_vault=true with a pinned name
-  // provisions THAT name; provision_vault=false without a name is account-only.)
+  // SECURITY: a pinned vault_name with provision_vault=false would assign the
+  // redeeming user to a PRE-EXISTING vault as owner-admin — a cross-tenant
+  // breach, since the owner-vs-shared role split isn't built. Shared-vault
+  // invites aren't supported yet, so reject this combination outright (defense
+  // in depth — the redeem path rejects it too). The supported shapes are:
+  // provision_vault=true (+ optional pinned name → provisions THAT name), or
+  // provision_vault=false with NO name (account-only, assignedVaults=[]).
   if (vaultName !== null && !provisionVault) {
-    const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
-    const known = new Set(listVaultNamesFromPath(manifestPath));
-    if (!known.has(vaultName)) {
-      return jsonError(
-        400,
-        "vault_not_found",
-        `vault "${vaultName}" is not registered in services.json`,
-      );
-    }
+    return jsonError(
+      400,
+      "invalid_request",
+      "shared-vault invites (provision_vault=false with a vault_name) aren't supported yet — omit vault_name for an account-only invite, or set provision_vault=true to provision a new vault",
+    );
   }
 
   const issued = issueInvite(deps.db, {
