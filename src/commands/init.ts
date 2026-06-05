@@ -619,7 +619,12 @@ export async function init(opts: InitOpts = {}): Promise<number> {
       exposeTailnetImpl,
       exposeCloudflareImpl,
     });
-    if (code !== 0) return code;
+    // hub#565: exposure is an ENHANCEMENT, not a prerequisite. A failed
+    // expose chain must NOT abort init — warn + print the exact retry
+    // command, then fall through to vault install + the admin-URL/wizard
+    // handoff on the loopback URL. Init's contract is hub up → vault module
+    // installed → admin URL → wizard, ALWAYS.
+    if (code !== 0) warnExposeFailedContinue(opts.exposeChoice, log);
     // Refresh state — the chain may have brought up an FQDN.
     exposeState = readExposeStateFn();
   } else if (opts.noExposePrompt) {
@@ -642,7 +647,9 @@ export async function init(opts: InitOpts = {}): Promise<number> {
         exposeTailnetImpl,
         exposeCloudflareImpl,
       });
-      if (code !== 0) return code;
+      // hub#565: warn + continue on a failed expose chain rather than
+      // aborting init (same contract as the non-interactive branch above).
+      if (code !== 0) warnExposeFailedContinue(picked, log);
       exposeState = readExposeStateFn();
     }
   }
@@ -713,6 +720,13 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   log("");
   log(`  ${adminUrl}`);
   log("");
+  // hub#565: when we're on the loopback URL (no public exposure active),
+  // remind the operator they can expose later. Skipped once an FQDN is up.
+  if (!exposeState?.canonicalFqdn) {
+    log("(Reachable on this machine. To expose it publicly later, run");
+    log(" `parachute expose public --cloudflare` or `parachute expose public --tailnet`.)");
+    log("");
+  }
 
   // Step 4.5: offer the operator the CLI wizard vs. the browser wizard
   // (hub#168 Cut 4). Aaron's 2026-05-28 directive: "we should be able to
@@ -782,6 +796,32 @@ export async function init(opts: InitOpts = {}): Promise<number> {
     log("(Couldn't launch a browser — open the URL above manually.)");
   }
   return 0;
+}
+
+/** The exact retry command for a given exposure choice (hub#565 / #566). */
+export function exposeRetryCommand(choice: ExposeChoice): string {
+  if (choice === "tailnet") return "parachute expose public --tailnet";
+  // `none` never reaches here in practice — `runExposureChoice("none")` always
+  // returns 0, so `warnExposeFailedContinue` (the only caller) is never invoked
+  // for it. It falls through to the `--cloudflare` branch below; harmless, and
+  // spelled out so the fallthrough isn't read as a bug.
+  // Cloudflare (and the unreachable `none`): default the bare command to
+  // `--cloudflare` so the operator who picked Cloudflare lands in the right
+  // provider on retry (bare `parachute expose public` defaults to Tailscale
+  // Funnel — hub#566).
+  return "parachute expose public --cloudflare";
+}
+
+/**
+ * hub#565: warn that the exposure chain failed but init is continuing anyway,
+ * and print the exact retry command. Exposure is an enhancement, not a
+ * prerequisite — init still installs the vault module and hands off to the
+ * wizard on the loopback URL.
+ */
+function warnExposeFailedContinue(choice: ExposeChoice, log: (line: string) => void): void {
+  log("");
+  log("⚠ Couldn't finish setting up public access — continuing without it.");
+  log(`  To expose publicly later, run: ${exposeRetryCommand(choice)}`);
 }
 
 /**

@@ -14,9 +14,16 @@ import { createInterface } from "node:readline/promises";
 import {
   DEFAULT_CLOUDFLARED_HOME,
   cloudflaredInstallHint,
+  cloudflaredLinuxDownloadUrl,
   isCloudflaredInstalled,
   isCloudflaredLoggedIn,
 } from "../cloudflare/detect.ts";
+import {
+  CLOUDFLARED_STATE_PATH,
+  clearPendingHostname,
+  readPendingHostname,
+  writePendingHostname,
+} from "../cloudflare/state.ts";
 import {
   EXPOSE_LAST_PROVIDER_PATH,
   type ExposeProvider,
@@ -73,6 +80,19 @@ export interface ExposeInteractiveOpts {
   prompt?: (question: string) => Promise<string>;
   cloudflaredHome?: string;
   platform?: NodeJS.Platform;
+  /** Test seam: `process.arch` — drives the Linux cloudflared download URL. */
+  arch?: NodeJS.Architecture;
+  /**
+   * Test seam: `process.getuid` — root (uid 0) can write
+   * /usr/local/bin/cloudflared directly; non-root needs `sudo`. Defaults to
+   * `process.getuid` (undefined on platforms without it → treated non-root).
+   */
+  getuid?: () => number;
+  /**
+   * Path to cloudflared-state.json (hub#567 pending-hostname persistence).
+   * Defaults to the canonical `CLOUDFLARED_STATE_PATH`.
+   */
+  statePath?: string;
   lastProviderPath?: string;
   now?: () => Date;
   log?: (line: string) => void;
@@ -110,6 +130,9 @@ interface Resolved {
   prompt: (question: string) => Promise<string>;
   cloudflaredHome: string;
   platform: NodeJS.Platform;
+  arch: NodeJS.Architecture;
+  getuid: () => number;
+  statePath: string;
   lastProviderPath: string;
   now: () => Date;
   log: (line: string) => void;
@@ -129,6 +152,10 @@ function resolve(opts: ExposeInteractiveOpts): Resolved {
     prompt: opts.prompt ?? defaultPrompt,
     cloudflaredHome: opts.cloudflaredHome ?? DEFAULT_CLOUDFLARED_HOME,
     platform: opts.platform ?? process.platform,
+    arch: opts.arch ?? process.arch,
+    // `process.getuid` is absent on Windows; treat missing as non-root (uid 1).
+    getuid: opts.getuid ?? (() => process.getuid?.() ?? 1),
+    statePath: opts.statePath ?? CLOUDFLARED_STATE_PATH,
     lastProviderPath: opts.lastProviderPath ?? EXPOSE_LAST_PROVIDER_PATH,
     now: opts.now ?? (() => new Date()),
     log: opts.log ?? ((line) => console.log(line)),
@@ -185,10 +212,25 @@ async function promptHostname(r: Resolved): Promise<string | undefined> {
   r.log("");
   r.log("Cloudflare needs a hostname under a domain you've added to your Cloudflare account.");
   r.log('Example: vault.example.com   (apex "example.com" must be a Cloudflare zone)');
+  // hub#567: pre-fill with a hostname the operator typed on a prior (failed)
+  // run so a retry is "press Enter", not "redo the whole interview".
+  const pending = readPendingHostname(r.statePath);
+  const promptText = pending
+    ? `Hostname [${pending}] (or blank to quit): `
+    : "Hostname (or blank to quit): ";
   for (let attempt = 0; attempt < 5; attempt++) {
-    const raw = (await r.prompt("Hostname (or blank to quit): ")).trim();
+    const raw = (await r.prompt(promptText)).trim();
+    // Enter on a pre-filled prompt accepts the stashed hostname.
+    if (raw === "" && pending) {
+      return pending;
+    }
     if (raw === "") return undefined;
-    if (isValidHostname(raw)) return raw;
+    if (isValidHostname(raw)) {
+      // Stash it the moment it validates so a downstream failure (cloudflared
+      // login, tunnel/DNS error) doesn't discard it. Cleared on success.
+      writePendingHostname(raw, r.statePath);
+      return raw;
+    }
     r.log(`"${raw}" doesn't look like a hostname. Expected something like vault.example.com.`);
   }
   r.log("Too many invalid entries; aborting.");
@@ -239,10 +281,98 @@ function printTailscaleSetupGuidance(r: Resolved, readiness: ProviderAvailabilit
 }
 
 /**
+ * hub#566: offer to install cloudflared on Linux in place (instead of printing
+ * the command and bailing). The install is a single static-binary download
+ * (curl + chmod) we already know how to do.
+ *
+ *   - Confirm with `Install cloudflared now? [Y/n]` (Enter accepts).
+ *   - Run the curl into /usr/local/bin/cloudflared + chmod +x. Root writes
+ *     directly; non-root wraps each step in `sudo -n` (non-interactive — only
+ *     succeeds when sudo creds are already cached / passwordless). We use `-n`
+ *     deliberately: init often runs detached/unattended on a fresh server (SSH
+ *     + tmux, a cloud-init script), where a blocking interactive sudo password
+ *     prompt would hang the whole flow. `-n` fails fast instead, and we fall
+ *     back to printing the manual command.
+ *   - Verify with `cloudflared --version`.
+ *
+ * Returns true only when cloudflared is on PATH afterward. On decline, missing
+ * download URL (unknown arch), or any install/verify failure, prints the
+ * canonical manual instructions + the `--cloudflare` re-run hint and returns
+ * false. Per hub#565 the caller's `false` does NOT abort init.
+ */
+async function offerLinuxCloudflaredInstall(r: Resolved): Promise<boolean> {
+  r.log("");
+  r.log("Cloudflare Tunnel uses the `cloudflared` binary, which isn't installed yet.");
+  const downloadUrl = cloudflaredLinuxDownloadUrl(r.arch);
+
+  const printManualAndBail = () => {
+    r.log("");
+    for (const line of cloudflaredInstallHint("linux", r.arch).split("\n")) r.log(line);
+    r.log("");
+    r.log("After install, re-run: parachute expose public --cloudflare");
+  };
+
+  // No published artifact for this arch → can't auto-install; print + bail.
+  if (!downloadUrl) {
+    printManualAndBail();
+    return false;
+  }
+
+  const answer = (await r.prompt("Install cloudflared now? [Y/n] ")).trim().toLowerCase();
+  if (answer === "n" || answer === "no") {
+    r.log("Skipped auto-install.");
+    printManualAndBail();
+    return false;
+  }
+
+  const isRoot = r.getuid() === 0;
+  const dest = "/usr/local/bin/cloudflared";
+  // Root writes directly; non-root prefixes each privileged step with `sudo -n`
+  // (non-interactive). `-n` never prompts for a password: it exits non-zero
+  // when creds aren't cached, so a detached/unattended init (SSH + tmux, a
+  // cloud-init script) fails fast and falls back to the printed instructions
+  // rather than hanging on a password prompt nobody's there to answer.
+  const sudo = isRoot ? [] : ["sudo", "-n"];
+  const curlCmd = [...sudo, "curl", "-L", "-o", dest, downloadUrl];
+  const chmodCmd = [...sudo, "chmod", "+x", dest];
+
+  r.log("");
+  r.log(`Downloading cloudflared → ${dest} …`);
+  const curlCode = await r.interactiveRunner(curlCmd);
+  if (curlCode !== 0) {
+    r.log(`Download failed (exit ${curlCode}).`);
+    if (!isRoot) {
+      r.log(
+        "(`sudo -n` needs cached credentials; run `sudo -v` first, or use the commands below.)",
+      );
+    }
+    printManualAndBail();
+    return false;
+  }
+  const chmodCode = await r.interactiveRunner(chmodCmd);
+  if (chmodCode !== 0) {
+    r.log(`chmod failed (exit ${chmodCode}).`);
+    printManualAndBail();
+    return false;
+  }
+
+  if (!(await isCloudflaredInstalled(r.runner))) {
+    r.log("Install ran but `cloudflared` still isn't on PATH.");
+    r.log(
+      "Open a fresh shell (so PATH picks up the new binary), then re-run: parachute expose public --cloudflare",
+    );
+    return false;
+  }
+  r.log("✓ cloudflared installed.");
+  return true;
+}
+
+/**
  * Walks the user through installing and logging in cloudflared. On macOS we
- * auto-install via brew (with confirmation); on Linux we print manual-install
- * pointers and bail so the user can pick apt/dnf/tarball. Returns true only
- * when cloudflared is both present and logged in afterwards.
+ * auto-install via brew (with confirmation); on Linux we auto-install the
+ * static binary (hub#566) with confirmation; everywhere else we print
+ * manual-install pointers and bail. Returns true only when cloudflared is
+ * both present and logged in afterwards.
  */
 async function guideCloudflareSetup(
   r: Resolved,
@@ -259,7 +389,11 @@ async function guideCloudflareSetup(
         .trim()
         .toLowerCase();
       if (answer === "n" || answer === "no") {
-        r.log("Skipped auto-install. Install manually, then re-run: parachute expose public");
+        // hub#566: re-run with `--cloudflare` (bare `expose public` defaults
+        // to Tailscale Funnel, the wrong provider for someone who chose CF).
+        r.log(
+          "Skipped auto-install. Install manually, then re-run: parachute expose public --cloudflare",
+        );
         return false;
       }
       const code = await r.interactiveRunner(["brew", "install", "cloudflared"]);
@@ -273,20 +407,26 @@ async function guideCloudflareSetup(
         r.log("Open a fresh shell (so PATH picks up the new binary) and re-run.");
         return false;
       }
+    } else if (r.platform === "linux") {
+      // hub#566: on Linux the install is a single static-binary download we
+      // already know how to do — offer to run it in place instead of dumping
+      // the operator back to a shell. Auto-install requires root (write to
+      // /usr/local/bin) or a working passwordless `sudo -n`. If we can't, or
+      // the operator declines, fall back to printing the instructions (and
+      // per hub#565 init continues regardless of the `false` return here).
+      installed = await offerLinuxCloudflaredInstall(r);
+      if (!installed) return false;
     } else {
-      // 2026-05-27 refresh: distro-package paths (`apt-get`, `dnf`) are
-      // unreliable across versions — Aaron hit `No match for argument:
-      // cloudflared` on Amazon Linux 2023 — and the
-      // pkg.cloudflare.com / developers.cloudflare.com paths the old hint
-      // pointed at now serve HTML/404. Defer to `cloudflaredInstallHint`,
-      // which writes the canonical GitHub-release static-binary path
-      // matching the host's architecture.
+      // Non-darwin/linux (e.g. Windows / misc): no auto-install path. Print
+      // the canonical pointer and bail (init continues per hub#565).
       r.log("");
       r.log("Cloudflare Tunnel uses the `cloudflared` binary, which isn't installed yet.");
       r.log("");
-      for (const line of cloudflaredInstallHint(r.platform).split("\n")) r.log(line);
+      for (const line of cloudflaredInstallHint(r.platform, r.arch).split("\n")) r.log(line);
       r.log("");
-      r.log("After install, re-run: parachute expose public");
+      // hub#566: the bare `parachute expose public` defaults to Tailscale
+      // Funnel — an operator who chose Cloudflare must re-run with the flag.
+      r.log("After install, re-run: parachute expose public --cloudflare");
       return false;
     }
   }
@@ -310,7 +450,7 @@ async function guideCloudflareSetup(
     loggedIn = isCloudflaredLoggedIn(r.cloudflaredHome);
     if (!loggedIn) {
       r.log("Login ran but cert.pem didn't appear in ~/.cloudflared.");
-      r.log("Check the browser flow completed, then re-run: parachute expose public");
+      r.log("Check the browser flow completed, then re-run: parachute expose public --cloudflare");
       return false;
     }
   }
@@ -391,7 +531,13 @@ export async function exposePublicInteractive(opts: ExposeInteractiveOpts = {}):
   }
   writeLastProvider("cloudflare", { path: r.lastProviderPath, now: r.now });
   const code = await r.exposeCloudflareUpImpl(hostname, r.cloudflareOpts);
-  if (code === 0) await runPreflightSafely(r);
+  if (code === 0) {
+    // hub#567: routing succeeded — the tunnel record now carries the live
+    // hostname, so drop the pending one (a retry shouldn't pre-fill a
+    // hostname that's already exposed).
+    clearPendingHostname(r.statePath);
+    await runPreflightSafely(r);
+  }
   return code;
 }
 

@@ -509,16 +509,31 @@ describe("exposeCloudflareUp", () => {
     }
   });
 
-  test("errors out when vault isn't installed", async () => {
+  test("hub#564: continues (no vault gate) when vault isn't installed — routes the hub anyway", async () => {
     const env = makeEnv({ includeVault: false });
     try {
-      const { runner } = queueRunner([{ code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" }]);
-      const { spawner } = fakeSpawner(0);
+      const uuid = "3d2b8d8f-2345-6789-abcd-ef0123456789";
+      const derived = "parachute-vault-example-com";
+      // The full chain must run now that the vault gate is gone: version,
+      // tunnel list, tunnel create, route dns.
+      const { runner } = queueRunner([
+        { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" }, // --version
+        { code: 0, stdout: "[]", stderr: "" }, // tunnel list
+        {
+          code: 0,
+          stdout: `Created tunnel ${derived} with id ${uuid}\n`,
+          stderr: "",
+        }, // create
+        { code: 0, stdout: "", stderr: "" }, // route dns
+      ]);
+      const { spawner } = fakeSpawner(42000);
       const logs: string[] = [];
 
       const code = await exposeCloudflareUp("vault.example.com", {
         runner,
         spawner,
+        alive: () => false,
+        kill: () => {},
         log: (l) => logs.push(l),
         manifestPath: env.manifestPath,
         statePath: env.statePath,
@@ -528,10 +543,17 @@ describe("exposeCloudflareUp", () => {
         cloudflaredHome: env.cloudflaredHome,
         configDir: env.configDir,
         skipHub: true,
+        now: () => new Date("2026-04-22T12:00:00Z"),
       });
 
-      expect(code).toBe(1);
-      expect(logs.join("\n")).toContain("parachute install vault");
+      // The expose succeeds (the hub is what gets routed), with a courtesy
+      // note instead of a dead-end. No "install vault" gate, no Vault-URL
+      // footer (vault isn't there to point at).
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toContain("vault not installed yet");
+      expect(joined).not.toContain("nothing to route");
+      expect(joined).not.toMatch(/^\s*Vault:/m);
     } finally {
       env.cleanup();
     }

@@ -27,7 +27,7 @@ import {
 } from "../service-spec.ts";
 import { findService, readManifest, upsertService } from "../services-manifest.ts";
 import { WELL_KNOWN_PATH } from "../well-known.ts";
-import { start as lifecycleStart } from "./lifecycle.ts";
+import { type LifecycleOpts, start as lifecycleStart } from "./lifecycle.ts";
 import { migrateNotice } from "./migrate.ts";
 import {
   type InteractiveAvailability,
@@ -553,6 +553,39 @@ function resolveInstallTarget(
   return { kind: "npm", packageName: input };
 }
 
+/**
+ * Build the LifecycleOpts the install auto-start uses (hub#573).
+ *
+ * The auto-start MUST thread the SAME supervisor + migrate-offer opts the
+ * production CLI dispatch passes for `parachute start <svc>` (cli.ts:
+ * `supervisor: {}` + `migrateOffer: { enabled: true }`). Without them, `start`
+ * resolved `unitInstalled` to its omitted-supervisor default of `false` and
+ * `migrateOffer.enabled` to `false` — so the auto-start ALWAYS took the no-unit
+ * path, printed "No supervised hub unit is installed. Run `parachute migrate
+ * --to-supervised`…", and returned non-zero → the "⚠ didn't start cleanly"
+ * warning. Meanwhile `parachute migrate` (which DOES run the real
+ * `isHubUnitInstalled` probe + /health) reported the unit already installed +
+ * healthy: the two paths disagreed because only `migrate` opted into real
+ * detection. `supervisor: {}` makes the auto-start run the same probe;
+ * `migrateOffer: { enabled: true }` makes it offer the cutover on a genuinely-
+ * unmigrated box instead of dumping a bare error mid-install.
+ *
+ * Exported so the convergence is unit-testable without driving a real start.
+ */
+export function defaultStartLifecycleOpts(ctx: {
+  manifestPath: string;
+  configDir: string;
+  log: (line: string) => void;
+}): LifecycleOpts {
+  return {
+    manifestPath: ctx.manifestPath,
+    configDir: ctx.configDir,
+    log: ctx.log,
+    supervisor: {},
+    migrateOffer: { enabled: true },
+  };
+}
+
 export async function install(input: string, opts: InstallOpts = {}): Promise<number> {
   const runner = opts.runner ?? defaultRunner;
   const manifestPath = opts.manifestPath ?? SERVICES_MANIFEST_PATH;
@@ -883,7 +916,8 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   if (!opts.noStart && !opts.noCreate) {
     const startService =
       opts.startService ??
-      ((short: string) => lifecycleStart(short, { manifestPath, configDir, log }));
+      ((short: string) =>
+        lifecycleStart(short, defaultStartLifecycleOpts({ manifestPath, configDir, log })));
     const startCode = await startService(short);
     if (startCode !== 0) {
       log(`⚠ ${short} didn't start cleanly. Run manually: parachute start ${short}`);

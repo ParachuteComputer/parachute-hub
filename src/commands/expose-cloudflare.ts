@@ -51,7 +51,7 @@ import { HUB_DEFAULT_PORT, readHubPort } from "../hub-control.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
 import { HUB_UNIT_DEFAULT_PORT } from "../hub-unit.ts";
 import { type AliveFn, defaultAlive } from "../process-state.ts";
-import { readManifest } from "../services-manifest.ts";
+import { readManifestLenient } from "../services-manifest.ts";
 import { type Runner, defaultRunner } from "../tailscale/run.ts";
 import type { VaultAuthStatus } from "../vault/auth-status.ts";
 import { printPublic2FAWarning } from "./expose-2fa-warning.ts";
@@ -89,6 +89,22 @@ export function isValidHostname(h: string): boolean {
   if (!h.includes(".")) return false;
   const labelRe = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i;
   return h.split(".").every((label) => labelRe.test(label));
+}
+
+/**
+ * Best-effort "is this module registered in services.json?" check, used only
+ * for the courtesy note in the Cloudflare expose path (hub#564). Uses the
+ * LENIENT manifest reader on purpose: the strict `readManifest` can reject an
+ * older manifest shape (the #564 diagnostic — a manifest written by 0.6.3-era
+ * registration that the strict reader bounced), and a courtesy note must never
+ * throw. Any read error is swallowed and treated as "not installed".
+ */
+function serviceInstalled(manifestPath: string, name: string): boolean {
+  try {
+    return readManifestLenient(manifestPath).services.some((s) => s.name === name);
+  } catch {
+    return false;
+  }
 }
 
 export interface CloudflaredSpawner {
@@ -606,12 +622,18 @@ export async function exposeCloudflareUp(
     return 1;
   }
 
-  const manifest = readManifest(r.manifestPath);
-  const vaultEntry = manifest.services.find((s) => s.name === "parachute-vault");
-  if (!vaultEntry) {
-    r.log("parachute-vault is not installed; nothing to route.");
-    r.log("Run: parachute install vault");
-    return 1;
+  // No vault gate here (hub#564). cloudflared's ingress targets the HUB port
+  // (see `servicePort: hubPort` in `writeConfig` below + the long comment
+  // there) — the hub does ALL routing (discovery, admin, OAuth, well-known,
+  // per-vault proxy, generic /<svc>/* dispatch). Vault doesn't have to be
+  // installed for the tunnel to route anything. The old gate
+  // (`parachute-vault is not installed; nothing to route` → return 1) was a
+  // vestige of the pre-2026-05-27 vault-centric ingress, and it dead-ended
+  // fresh-server init: post-#168 init exposes (Step 2) BEFORE it installs the
+  // vault module (Step 2.5), so the gate always tripped on a fresh box and
+  // aborted the whole init. Courtesy note only — never block.
+  if (!serviceInstalled(r.manifestPath, "parachute-vault")) {
+    r.log("vault not installed yet — the admin wizard will set it up. Routing the hub anyway.");
   }
 
   // Resolve the public hub origin before spawning the hub server — it gets
@@ -897,45 +919,58 @@ export async function exposeCloudflareUp(
   // and makes the running vault re-read it immediately rather than waiting for
   // the next reboot.
   //
+  // hub#564: vault may not be installed yet (init exposes BEFORE installing the
+  // vault module). Resolve the entry once, here, and gate the vault-restart +
+  // the Vault-URL footer on it — restarting a not-installed vault would just
+  // fail and print a spurious warning. When present, a well-formed manifest
+  // always lists at least one mount path.
+  const vaultEntry = (() => {
+    try {
+      return readManifestLenient(r.manifestPath).services.find((s) => s.name === "parachute-vault");
+    } catch {
+      return undefined;
+    }
+  })();
+
   // §4.3c: drive the restart through the running Supervisor
   // (`driveModuleOp("vault", "restart")`), which re-injects the hub's current
   // origin; `restartHubDependentViaSupervisor` also persists the durable `.env`
   // + self-heals the operator-token issuer. Phase 5b retired the detached
-  // `lifecycle.restart` arm.
-  r.log("");
-  r.log("Restarting vault to pick up new hub origin…");
-  const rcode = await restartHubDependentViaSupervisor({
-    short: "vault",
-    hubOrigin,
-    configDir: r.configDir,
-    sup: r.sup,
-    log: r.log,
-  });
-  if (rcode !== 0) {
-    r.log(
-      "⚠ vault restart failed. Run manually once the issue is resolved: parachute restart vault",
-    );
+  // `lifecycle.restart` arm. Skipped entirely when vault isn't installed.
+  if (vaultEntry) {
+    r.log("");
+    r.log("Restarting vault to pick up new hub origin…");
+    const rcode = await restartHubDependentViaSupervisor({
+      short: "vault",
+      hubOrigin,
+      configDir: r.configDir,
+      sup: r.sup,
+      log: r.log,
+    });
+    if (rcode !== 0) {
+      r.log(
+        "⚠ vault restart failed. Run manually once the issue is resolved: parachute restart vault",
+      );
+    }
   }
 
   const baseUrl = `https://${hostname}`;
-  // A well-formed vault manifest always lists at least one mount path. If
-  // it's empty, something went sideways in `parachute install vault` — warn
-  // so the user can fix services.json rather than chasing a phantom 404 on
-  // /vault/default that may or may not exist.
-  if (!vaultEntry.paths[0]) {
-    r.log(
-      `⚠ vault entry in services.json has no paths[]; defaulting to "/vault/default". Check the manifest.`,
-    );
+  let vaultUrl: string | undefined;
+  if (vaultEntry) {
+    if (!vaultEntry.paths[0]) {
+      r.log(
+        `⚠ vault entry in services.json has no paths[]; defaulting to "/vault/default". Check the manifest.`,
+      );
+    }
+    vaultUrl = `${baseUrl}${vaultEntry.paths[0] ?? "/vault/default"}`;
   }
-  const vaultMount = vaultEntry.paths[0] ?? "/vault/default";
-  const vaultUrl = `${baseUrl}${vaultMount}`;
 
   r.log("");
   r.log(`✓ Cloudflare tunnel up (pid ${pid}).`);
   r.log(`  Tunnel:  ${r.tunnelName} (dedicated to this machine)`);
   r.log(`  Open:    ${baseUrl}/`);
   r.log(`  Admin:   ${baseUrl}/admin/`);
-  r.log(`  Vault:   ${vaultUrl}`);
+  if (vaultUrl) r.log(`  Vault:   ${vaultUrl}`);
   r.log(`  OAuth:   ${hubOrigin}`);
   r.log(`  Logs:    ${r.logPath}`);
   r.log("");
@@ -954,10 +989,14 @@ export async function exposeCloudflareUp(
     r.log("background but does NOT survive a reboot. After a reboot, re-run:");
     r.log(`  parachute expose public --cloudflare --domain ${hostname}`);
   }
-  r.log("");
-  r.log("Point a claude.ai / ChatGPT connector at:");
-  r.log(`  ${vaultUrl}`);
-  printAuthGuidance(r.log, vaultUrl);
+  // The connector guidance points at a vault MCP URL — only meaningful once a
+  // vault is installed (hub#564: it may not be yet, when init exposes first).
+  if (vaultUrl) {
+    r.log("");
+    r.log("Point a claude.ai / ChatGPT connector at:");
+    r.log(`  ${vaultUrl}`);
+    printAuthGuidance(r.log, vaultUrl);
+  }
   // 2FA-enrollment warning when /admin/login is now reachable on the public
   // internet but the operator hasn't enrolled TOTP. Cloudflare exposure is
   // always public; tailnet/funnel mirrors this in `expose.ts`. See #186.

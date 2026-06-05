@@ -100,19 +100,21 @@ bun run test         # vitest run
 ```
 
 `web/ui/dist/` is gitignored — the hub serves it from a co-located bundle
-that Vite produces. The root `package.json` wires this for you: a
-`postinstall` hook runs `bun run build:spa` after every `bun install` in
-the repo root, and `prepack` rebuilds before `bun pack` / `bun publish`
+that Vite produces. The root `package.json` wires the publish side: a
+`prepack` hook runs `bun run build:spa` before `bun pack` / `bun publish`
 so the npm tarball always ships a fresh `web/ui/dist/`. The `files`
 array in the root `package.json` includes `web/ui/dist`, so consumers
 of the published `@openparachute/hub` package get the bundle even
 though they don't get the SPA source.
 
-If you ever need to manually rebuild, `cd web/ui && bun run build` still
-works. `src/hub-server.ts` handles a missing `dist/` by 503ing the
-`/vault/*` and `/hub/*` SPA routes with a hint to run the build —
-usually means the postinstall hasn't run yet, or fired with
-`--ignore-scripts` (which suppresses lifecycle hooks).
+In a dev checkout, build the bundle yourself with `bun run build:spa`
+from the repo root (or `cd web/ui && bun run build`). There is **no**
+`postinstall` hook anymore — it was removed (hub#568) because `prepack`
+already covers publishes, and a consumer-side `postinstall` was just dead
+weight bun blocked on every fresh `bun add -g @openparachute/hub`
+("Blocked 1 postinstall"). `src/hub-server.ts` handles a missing `dist/`
+by 503ing the `/vault/*` and `/hub/*` SPA routes with a hint to run the
+build — in a dev checkout that just means you haven't run `build:spa` yet.
 
 ## Pagination convention
 

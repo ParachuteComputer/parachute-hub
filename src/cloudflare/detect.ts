@@ -109,7 +109,7 @@ export function cloudflaredInstallHint(
  * artifact (registry recipe is undefined) — the caller then uses the generic
  * pointer. Keeps the arch→suffix mapping in exactly one place (the registry).
  */
-function cloudflaredLinuxDownloadUrl(arch: NodeJS.Architecture): string | undefined {
+export function cloudflaredLinuxDownloadUrl(arch: NodeJS.Architecture): string | undefined {
   const recipe = lookupDep("cloudflared")?.install.linuxBinaryUrl?.(arch);
   if (!recipe) return undefined;
   const urlLine = recipe

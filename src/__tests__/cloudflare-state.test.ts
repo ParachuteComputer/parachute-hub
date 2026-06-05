@@ -7,12 +7,15 @@ import {
   CloudflaredStateError,
   type CloudflaredTunnelRecord,
   clearCloudflaredState,
+  clearPendingHostname,
   findTunnelRecord,
   listTunnelRecords,
   readCloudflaredState,
+  readPendingHostname,
   withTunnelRecord,
   withoutTunnelRecord,
   writeCloudflaredState,
+  writePendingHostname,
 } from "../cloudflare/state.ts";
 
 function makeTempPath(): { path: string; cleanup: () => void } {
@@ -248,5 +251,106 @@ describe("cloudflared state — record helpers", () => {
     const both = withTunnelRecord(withTunnelRecord(undefined, recordB), recordA);
     expect(listTunnelRecords(both).map((r) => r.tunnelName)).toEqual(["alpha", "beta"]);
     expect(listTunnelRecords(undefined)).toEqual([]);
+  });
+});
+
+describe("hub#567 pending hostname", () => {
+  test("read returns undefined when no state file / no pending hostname", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      expect(readPendingHostname(path)).toBeUndefined();
+      writeCloudflaredState(sample, path);
+      expect(readPendingHostname(path)).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("write then read round-trips the pending hostname (seeds empty state)", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writePendingHostname("techne.parachute.computer", path);
+      expect(readPendingHostname(path)).toBe("techne.parachute.computer");
+      const state = readCloudflaredState(path);
+      expect(state?.pendingHostname).toBe("techne.parachute.computer");
+      expect(state?.tunnels).toEqual({});
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("write preserves existing tunnel records", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeCloudflaredState(sample, path);
+      writePendingHostname("techne.parachute.computer", path);
+      const state = readCloudflaredState(path);
+      expect(state?.pendingHostname).toBe("techne.parachute.computer");
+      expect(state?.tunnels.parachute).toEqual(sampleRecord);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("clear drops the pending hostname but keeps tunnel records", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeCloudflaredState({ ...sample, pendingHostname: "techne.parachute.computer" }, path);
+      clearPendingHostname(path);
+      const state = readCloudflaredState(path);
+      expect(state?.pendingHostname).toBeUndefined();
+      expect(state?.tunnels.parachute).toEqual(sampleRecord);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("clear removes the state file entirely when no tunnels remain", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writePendingHostname("techne.parachute.computer", path);
+      expect(existsSync(path)).toBe(true);
+      clearPendingHostname(path);
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("validate preserves a pending hostname round-tripped through the bytes", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const withPending: CloudflaredState = { ...sample, pendingHostname: "a.example.com" };
+      writeCloudflaredState(withPending, path);
+      expect(readCloudflaredState(path)).toEqual(withPending);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("withTunnelRecord preserves an existing pending hostname", () => {
+    const seed: CloudflaredState = { version: 2, tunnels: {}, pendingHostname: "a.example.com" };
+    const next = withTunnelRecord(seed, sampleRecord);
+    expect(next.pendingHostname).toBe("a.example.com");
+    expect(next.tunnels.parachute).toEqual(sampleRecord);
+  });
+
+  test("withoutTunnelRecord carries the pending hostname when it's the only thing left", () => {
+    const seed: CloudflaredState = {
+      version: 2,
+      tunnels: { parachute: sampleRecord },
+      pendingHostname: "a.example.com",
+    };
+    // Removing the last tunnel must NOT discard a typed-but-not-routed hostname.
+    expect(withoutTunnelRecord(seed, "parachute")).toEqual({
+      version: 2,
+      tunnels: {},
+      pendingHostname: "a.example.com",
+    });
+  });
+
+  test("withoutTunnelRecord returns undefined when no tunnels AND no pending hostname remain", () => {
+    const seed: CloudflaredState = { version: 2, tunnels: { parachute: sampleRecord } };
+    expect(withoutTunnelRecord(seed, "parachute")).toBeUndefined();
   });
 });
