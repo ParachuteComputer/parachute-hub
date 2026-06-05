@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { install } from "../commands/install.ts";
+import { defaultStartLifecycleOpts, install } from "../commands/install.ts";
 import { findService, upsertService } from "../services-manifest.ts";
 
 function makeTempPath(): { path: string; configDir: string; cleanup: () => void } {
@@ -1719,5 +1719,28 @@ describe("install", () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+describe("hub#573 — install auto-start converges on supervised detection", () => {
+  test("the default start opts opt into real supervisor detection + the migrate offer", () => {
+    const log = () => {};
+    const opts = defaultStartLifecycleOpts({
+      manifestPath: "/tmp/services.json",
+      configDir: "/tmp/cfg",
+      log,
+    });
+    // `supervisor: {}` (present, even if empty) → lifecycle resolves
+    // `unitInstalled` via the real `isHubUnitInstalled` probe instead of the
+    // omitted-supervisor default of `false`. Pre-fix this block was absent, so
+    // the auto-start ALWAYS concluded "no unit" and printed the spurious
+    // "No supervised hub unit is installed" + "didn't start cleanly".
+    expect(opts.supervisor).toEqual({});
+    // The cutover offer is armed, matching `parachute start <svc>` (cli.ts).
+    expect(opts.migrateOffer).toEqual({ enabled: true });
+    // Plumbing preserved.
+    expect(opts.manifestPath).toBe("/tmp/services.json");
+    expect(opts.configDir).toBe("/tmp/cfg");
+    expect(opts.log).toBe(log);
   });
 });
