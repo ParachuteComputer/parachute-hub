@@ -898,14 +898,15 @@ describe("init exposure chain", () => {
     }
   });
 
-  test("exposure chain non-zero exit propagates", async () => {
+  test("hub#565: a failed exposure chain does NOT abort init — warns, continues, exits 0", async () => {
     const h = makeHarness();
     try {
       writeHubPort(1939, h.configDir);
+      const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
         manifestPath: h.manifestPath,
-        log: () => {},
+        log: (l) => logs.push(l),
         alive: () => false,
         ensureHub: async () => ({ pid: 7, port: 1939, started: true }),
         readExposeStateFn: () => undefined,
@@ -915,8 +916,46 @@ describe("init exposure chain", () => {
         exposeTailnetImpl: async () => 0,
         exposeCloudflareImpl: async () => 2,
         exposeChoice: "cloudflare",
+        installVaultModuleImpl: noopVaultInstall,
       });
-      expect(code).toBe(2);
+      // Init reaches the admin-URL/wizard handoff regardless of the expose
+      // failure (exposure is an enhancement, not a prerequisite).
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      // Warned about the failure + printed the exact retry command (the
+      // `--cloudflare` flag matters — bare `expose public` defaults to
+      // Tailscale, hub#566).
+      expect(joined).toContain("Couldn't finish setting up public access");
+      expect(joined).toContain("parachute expose public --cloudflare");
+      // Fell through to the loopback admin URL.
+      expect(joined).toContain("http://127.0.0.1:1939/admin/");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub#565: tailnet expose failure prints the --tailnet retry command", async () => {
+    const h = makeHarness();
+    try {
+      writeHubPort(1939, h.configDir);
+      const logs: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => false,
+        ensureHub: async () => ({ pid: 7, port: 1939, started: true }),
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        env: {},
+        exposeTailnetImpl: async () => 3,
+        exposeCloudflareImpl: async () => 0,
+        exposeChoice: "tailnet",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      expect(logs.join("\n")).toContain("parachute expose public --tailnet");
     } finally {
       h.cleanup();
     }
