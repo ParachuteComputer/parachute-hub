@@ -1139,6 +1139,72 @@ describe("response_mode (OAuth 2.0 Multiple Response Type Encoding Practices)", 
     }
   });
 
+  test("explicit response_mode=query behaves identically to absent", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const form = consentForm(reg, { state: "st-explicit-query", response_mode: "query" });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(302);
+      const target = new URL(res.headers.get("location") ?? "");
+      expect(target.searchParams.get("code")).toBeTruthy();
+      expect(target.searchParams.get("state")).toBe("st-explicit-query");
+      expect(target.hash).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("response_mode=fragment merges into a pre-existing fragment on the registered URI", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["pebblejs://close#session=abc"] });
+      const form = consentForm(reg, {
+        state: "st-merge",
+        response_mode: "fragment",
+        redirect_uri: "pebblejs://close#session=abc",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(302);
+      const loc = res.headers.get("location") ?? "";
+      const frag = loc.split("#")[1] ?? "";
+      const fragParams = new URLSearchParams(frag);
+      // Pre-existing fragment data survives alongside code + state.
+      expect(fragParams.get("session")).toBe("abc");
+      expect(fragParams.get("code")).toBeTruthy();
+      expect(fragParams.get("state")).toBe("st-merge");
+      expect(loc.split("#")[0]?.includes("code=")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("response_mode=fragment: success redirect puts code+state in the fragment", async () => {
     const { db, cleanup } = await makeDb();
     try {

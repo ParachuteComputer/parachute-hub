@@ -257,6 +257,16 @@ const REDIRECT_URI_SCHEME_DENYLIST: ReadonlySet<string> = new Set([
   "vbscript:",
   "blob:",
   "about:",
+  // OS deep-link / system schemes with known hijack or side-effect potential —
+  // not legitimate OAuth redirect targets (RFC 8252 private-use schemes are
+  // reverse-domain app schemes, not these).
+  "intent:",
+  "ms-appx:",
+  "ms-appx-web:",
+  "market:",
+  "tel:",
+  "sms:",
+  "mailto:",
 ]);
 
 export function isValidRedirectUri(uri: string): boolean {

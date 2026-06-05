@@ -1884,6 +1884,7 @@ export async function handleApproveClientPost(
       );
     }
     const stateRaw = form.get("state");
+    // null (not undefined) on purpose: buildAuthorizeRedirectLocation filters nulls.
     const denyState = typeof stateRaw === "string" && stateRaw.length > 0 ? stateRaw : null;
     // `response_mode` round-trips through the approve-pending form just like
     // redirect_uri/state (hidden input) so the Deny error redirect honors the

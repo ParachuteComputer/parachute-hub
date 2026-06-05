@@ -281,6 +281,12 @@ describe("isValidRedirectUri", () => {
     expect(isValidRedirectUri("file:///etc/passwd")).toBe(false);
     expect(isValidRedirectUri("vbscript:msgbox(1)")).toBe(false);
     expect(isValidRedirectUri("blob:https://example.com/uuid")).toBe(false);
+    expect(isValidRedirectUri("intent:android.intent.action.VIEW")).toBe(false);
+    expect(isValidRedirectUri("ms-appx://app/page")).toBe(false);
+    expect(isValidRedirectUri("market://details?id=x")).toBe(false);
+    expect(isValidRedirectUri("tel:+15551234567")).toBe(false);
+    expect(isValidRedirectUri("sms:+15551234567")).toBe(false);
+    expect(isValidRedirectUri("mailto:a@b.c")).toBe(false);
     expect(isValidRedirectUri("about:blank")).toBe(false);
   });
   test("rejects relative paths and garbage (unparseable)", () => {
