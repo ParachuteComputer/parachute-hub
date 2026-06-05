@@ -45,6 +45,15 @@ export interface CloudflaredTunnelRecord {
 export interface CloudflaredState {
   version: 2;
   tunnels: Record<string, CloudflaredTunnelRecord>;
+  /**
+   * A hostname the operator typed in the interactive Cloudflare flow that
+   * hasn't been routed yet (hub#567). Persisted as soon as it validates so a
+   * mid-chain failure (cloudflared missing, login, tunnel/DNS error) doesn't
+   * discard it — the next interactive run pre-fills the hostname prompt with
+   * it. Cleared once routing succeeds (the tunnel record then carries the live
+   * hostname). Optional + free-floating from the per-tunnel records.
+   */
+  pendingHostname?: string;
 }
 
 export class CloudflaredStateError extends Error {
@@ -91,11 +100,21 @@ function validate(raw: unknown, path: string): CloudflaredState {
     throw new CloudflaredStateError(`${path}: root must be an object`);
   }
   const r = raw as Record<string, unknown>;
+  // hub#567: an optional top-level `pendingHostname` (a typed-but-not-yet-routed
+  // hostname). Non-string / empty values read as absent so older state files
+  // keep validating.
+  const pendingHostname =
+    typeof r.pendingHostname === "string" && r.pendingHostname.length > 0
+      ? r.pendingHostname
+      : undefined;
+  const withPending = (state: CloudflaredState): CloudflaredState =>
+    pendingHostname ? { ...state, pendingHostname } : state;
+
   if (r.version === 1) {
     // v1 — single record at top level. Migrate by wrapping it under its
     // tunnelName. Disk isn't rewritten until the next write.
     const record = validateRecord(r, path);
-    return { version: 2, tunnels: { [record.tunnelName]: record } };
+    return withPending({ version: 2, tunnels: { [record.tunnelName]: record } });
   }
   if (r.version !== 2) {
     throw new CloudflaredStateError(`${path}: unsupported version ${String(r.version)}`);
@@ -113,7 +132,7 @@ function validate(raw: unknown, path: string): CloudflaredState {
     }
     tunnels[key] = record;
   }
-  return { version: 2, tunnels };
+  return withPending({ version: 2, tunnels });
 }
 
 export function readCloudflaredState(
@@ -161,7 +180,80 @@ export function withTunnelRecord(
   record: CloudflaredTunnelRecord,
 ): CloudflaredState {
   const tunnels = { ...(state?.tunnels ?? {}), [record.tunnelName]: record };
-  return { version: 2, tunnels };
+  // Preserve any pending hostname (hub#567); the caller clears it explicitly
+  // via `clearPendingHostname` once routing fully succeeds.
+  return state?.pendingHostname
+    ? { version: 2, tunnels, pendingHostname: state.pendingHostname }
+    : { version: 2, tunnels };
+}
+
+/**
+ * Pure: set the pending (typed-but-not-routed) hostname on the state (hub#567).
+ * Seeds an empty v2 state when none exists yet.
+ */
+export function withPendingHostname(
+  state: CloudflaredState | undefined,
+  hostname: string,
+): CloudflaredState {
+  return { version: 2, tunnels: state?.tunnels ?? {}, pendingHostname: hostname };
+}
+
+/**
+ * Pure: drop the pending hostname (hub#567). Returns undefined when the result
+ * would carry no tunnels either, so the caller can `clearCloudflaredState`
+ * rather than write an empty file.
+ */
+export function withoutPendingHostname(
+  state: CloudflaredState | undefined,
+): CloudflaredState | undefined {
+  if (!state) return undefined;
+  if (Object.keys(state.tunnels).length === 0) return undefined;
+  return { version: 2, tunnels: state.tunnels };
+}
+
+/**
+ * Read the pending hostname from the on-disk state (hub#567). Returns undefined
+ * when there's no state file or no pending hostname. Swallows read/parse errors
+ * (a corrupt state file must not abort the prompt — we just don't pre-fill).
+ */
+export function readPendingHostname(path: string = CLOUDFLARED_STATE_PATH): string | undefined {
+  try {
+    return readCloudflaredState(path)?.pendingHostname;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Persist a typed-but-not-yet-routed hostname (hub#567), preserving existing
+ * tunnel records. Best-effort: a write failure must not abort the expose flow.
+ */
+export function writePendingHostname(
+  hostname: string,
+  path: string = CLOUDFLARED_STATE_PATH,
+): void {
+  try {
+    const state = readCloudflaredState(path);
+    writeCloudflaredState(withPendingHostname(state, hostname), path);
+  } catch {
+    // Non-fatal — persistence is a convenience, not a correctness requirement.
+  }
+}
+
+/**
+ * Clear the pending hostname once routing succeeds (hub#567). If no tunnel
+ * records remain, removes the state file entirely. Best-effort.
+ */
+export function clearPendingHostname(path: string = CLOUDFLARED_STATE_PATH): void {
+  try {
+    const state = readCloudflaredState(path);
+    if (!state?.pendingHostname) return;
+    const next = withoutPendingHostname(state);
+    if (next) writeCloudflaredState(next, path);
+    else clearCloudflaredState(path);
+  } catch {
+    // Non-fatal.
+  }
 }
 
 /**

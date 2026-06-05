@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readPendingHostname, writePendingHostname } from "../cloudflare/state.ts";
 import { exposePublicInteractive } from "../commands/expose-interactive.ts";
 import { readLastProvider, writeLastProvider } from "../expose-last-provider.ts";
 import type { CommandResult, Runner } from "../tailscale/run.ts";
@@ -15,6 +16,7 @@ const noopPreflight = async () => {};
 interface TestEnv {
   cloudflaredHome: string;
   lastProviderPath: string;
+  statePath: string;
   cleanup: () => void;
 }
 
@@ -28,6 +30,7 @@ function makeEnv(opts: { cloudflaredLoggedIn?: boolean } = {}): TestEnv {
   return {
     cloudflaredHome,
     lastProviderPath: join(dir, "expose-last-provider.json"),
+    statePath: join(dir, "cloudflared-state.json"),
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
 }
@@ -189,6 +192,75 @@ describe("exposePublicInteractive — both ready", () => {
       expect(code).toBe(0);
       expect(cloudflareHostname).toBe("vault.example.com");
       expect(readLastProvider(env.lastProviderPath)?.provider).toBe("cloudflare");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub#567: persists the typed hostname as soon as it validates", async () => {
+    const env = makeEnv({ cloudflaredLoggedIn: true });
+    try {
+      const { runner } = fixedRunner({
+        tailscaleInstalled: true,
+        tailscaleLoggedIn: true,
+        tailscaleFunnelCap: true,
+        cloudflaredInstalled: true,
+      });
+      const { prompt } = queuePrompt(["2", "vault.example.com"]);
+      // exposeCloudflareUpImpl FAILS — so the hostname must survive for a retry.
+      const code = await exposePublicInteractive({
+        runner,
+        prompt,
+        cloudflaredHome: env.cloudflaredHome,
+        lastProviderPath: env.lastProviderPath,
+        statePath: env.statePath,
+        log: () => {},
+        exposePublicImpl: async () => 0,
+        exposeCloudflareUpImpl: async () => 1,
+        runAuthPreflightImpl: noopPreflight,
+      });
+      expect(code).toBe(1);
+      // Stashed despite the downstream failure.
+      expect(readPendingHostname(env.statePath)).toBe("vault.example.com");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub#567: pre-fills the hostname prompt from a stashed value; Enter accepts it", async () => {
+    const env = makeEnv({ cloudflaredLoggedIn: true });
+    try {
+      writePendingHostname("techne.parachute.computer", env.statePath);
+      const { runner } = fixedRunner({
+        tailscaleInstalled: true,
+        tailscaleLoggedIn: true,
+        tailscaleFunnelCap: true,
+        cloudflaredInstalled: true,
+      });
+      // Pick cloudflare, then press Enter (blank) at the hostname prompt.
+      const { prompt, asked } = queuePrompt(["2", ""]);
+      let cloudflareHostname: string | undefined;
+      const code = await exposePublicInteractive({
+        runner,
+        prompt,
+        cloudflaredHome: env.cloudflaredHome,
+        lastProviderPath: env.lastProviderPath,
+        statePath: env.statePath,
+        log: () => {},
+        exposePublicImpl: async () => 0,
+        exposeCloudflareUpImpl: async (h) => {
+          cloudflareHostname = h;
+          return 0;
+        },
+        runAuthPreflightImpl: noopPreflight,
+      });
+      expect(code).toBe(0);
+      // Enter accepted the stashed hostname.
+      expect(cloudflareHostname).toBe("techne.parachute.computer");
+      // The prompt surfaced the default in brackets.
+      expect(asked.some((q) => q.includes("[techne.parachute.computer]"))).toBe(true);
+      // Cleared once routing succeeded.
+      expect(readPendingHostname(env.statePath)).toBeUndefined();
     } finally {
       env.cleanup();
     }
@@ -440,11 +512,12 @@ describe("exposePublicInteractive — neither ready", () => {
     }
   });
 
-  test("user picks cloudflare on linux: prints manual install pointers and exits 1", async () => {
+  test("hub#566: cloudflare on linux, user DECLINES auto-install: prints manual + --cloudflare hint, exits 1", async () => {
     const env = makeEnv();
     try {
       const { runner } = fixedRunner({});
-      const { prompt } = queuePrompt(["2"]);
+      // "2" → cloudflare; "n" → decline the auto-install offer.
+      const { prompt } = queuePrompt(["2", "n"]);
       const logs: string[] = [];
       let interactiveCalled = false;
       let cloudflareCalled = false;
@@ -456,8 +529,10 @@ describe("exposePublicInteractive — neither ready", () => {
         },
         prompt,
         platform: "linux",
+        arch: "x64",
         cloudflaredHome: env.cloudflaredHome,
         lastProviderPath: env.lastProviderPath,
+        statePath: env.statePath,
         log: (l) => logs.push(l),
         exposePublicImpl: async () => 0,
         exposeCloudflareUpImpl: async () => {
@@ -466,19 +541,169 @@ describe("exposePublicInteractive — neither ready", () => {
         },
       });
       expect(code).toBe(1);
+      // Declining means no curl/chmod ran and we never reached the expose.
       expect(interactiveCalled).toBe(false);
       expect(cloudflareCalled).toBe(false);
       const joined = logs.join("\n");
-      // Post 2026-05-27 cloudflared-URL refresh: the install hint moved
-      // off apt-get / dnf / developers.cloudflare.com (all unreliable —
-      // Aaron hit `No match for argument: cloudflared` on AL2023 and
-      // 404s from the docs URL on the same box) onto the static binary
-      // from GitHub releases.
+      expect(joined).toContain("Skipped auto-install");
       expect(joined).toContain("github.com/cloudflare/cloudflared/releases/latest");
       expect(joined).toContain("curl -L -o /usr/local/bin/cloudflared");
+      // hub#566: re-run hint carries the --cloudflare flag (bare `expose
+      // public` defaults to Tailscale).
+      expect(joined).toContain("parachute expose public --cloudflare");
       expect(joined).not.toContain("developers.cloudflare.com");
       expect(joined).not.toContain("pkg.cloudflare.com");
       expect(joined).not.toContain("sudo dnf install cloudflared");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub#566: cloudflare on linux as ROOT, accepts auto-install: runs bare curl+chmod (no sudo), then exposes", async () => {
+    const env = makeEnv();
+    try {
+      // cloudflared starts absent (so the install offer fires), then present
+      // after the install runs (so the verify probe + flow continue).
+      let cloudflaredPresent = false;
+      const runner: Runner = async (cmd) => {
+        if (cmd.slice(0, 2).join(" ") === "cloudflared --version") {
+          return cloudflaredPresent
+            ? { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" }
+            : { code: 127, stdout: "", stderr: "not found" };
+        }
+        if (cmd[0] === "tailscale") {
+          // Detection: tailscale absent (forces the cloudflare-only path).
+          return { code: 127, stdout: "", stderr: "not found" };
+        }
+        throw new Error(`unexpected runner call: ${cmd.join(" ")}`);
+      };
+      // "2" cloudflare → "Y" install → "Y" login → hostname. The login prompt
+      // fires because detection reported cloudflared absent (so loggedIn=false)
+      // even though cert.pem appears once login "runs".
+      const { prompt } = queuePrompt(["2", "y", "y", "vault.example.com"]);
+      const interactiveCmds: string[][] = [];
+      const logs: string[] = [];
+      let cloudflareHostname = "";
+      const code = await exposePublicInteractive({
+        runner,
+        interactiveRunner: async (cmd) => {
+          interactiveCmds.push([...cmd]);
+          // Install "succeeds": flip cloudflared to present. Login "succeeds":
+          // drop the cert so `isCloudflaredLoggedIn` reads true afterward.
+          if (cmd.includes("login")) writeFileSync(join(env.cloudflaredHome, "cert.pem"), "---");
+          else cloudflaredPresent = true;
+          return 0;
+        },
+        prompt,
+        platform: "linux",
+        arch: "x64",
+        getuid: () => 0, // root
+        cloudflaredHome: env.cloudflaredHome,
+        lastProviderPath: env.lastProviderPath,
+        statePath: env.statePath,
+        log: (l) => logs.push(l),
+        exposePublicImpl: async () => 0,
+        exposeCloudflareUpImpl: async (hostname) => {
+          cloudflareHostname = hostname;
+          return 0;
+        },
+        runAuthPreflightImpl: noopPreflight,
+      });
+      expect(code).toBe(0);
+      expect(cloudflareHostname).toBe("vault.example.com");
+      // Root runs curl + chmod WITHOUT a sudo prefix.
+      expect(interactiveCmds[0]?.[0]).toBe("curl");
+      expect(interactiveCmds[0]).toContain("/usr/local/bin/cloudflared");
+      expect(interactiveCmds[1]?.[0]).toBe("chmod");
+      expect(interactiveCmds.some((c) => c[0] === "sudo")).toBe(false);
+      expect(logs.join("\n")).toContain("✓ cloudflared installed.");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub#566: cloudflare on linux NON-root, accepts auto-install: wraps curl+chmod in sudo", async () => {
+    const env = makeEnv();
+    try {
+      let cloudflaredPresent = false;
+      const runner: Runner = async (cmd) => {
+        if (cmd.slice(0, 2).join(" ") === "cloudflared --version") {
+          return cloudflaredPresent
+            ? { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" }
+            : { code: 127, stdout: "", stderr: "not found" };
+        }
+        if (cmd[0] === "tailscale") return { code: 127, stdout: "", stderr: "not found" };
+        throw new Error(`unexpected runner call: ${cmd.join(" ")}`);
+      };
+      const { prompt } = queuePrompt(["2", "y", "y", "vault.example.com"]);
+      const interactiveCmds: string[][] = [];
+      const code = await exposePublicInteractive({
+        runner,
+        interactiveRunner: async (cmd) => {
+          interactiveCmds.push([...cmd]);
+          if (cmd.includes("login")) writeFileSync(join(env.cloudflaredHome, "cert.pem"), "---");
+          else cloudflaredPresent = true;
+          return 0;
+        },
+        prompt,
+        platform: "linux",
+        arch: "arm64",
+        getuid: () => 1000, // non-root
+        cloudflaredHome: env.cloudflaredHome,
+        lastProviderPath: env.lastProviderPath,
+        statePath: env.statePath,
+        log: () => {},
+        exposePublicImpl: async () => 0,
+        exposeCloudflareUpImpl: async () => 0,
+        runAuthPreflightImpl: noopPreflight,
+      });
+      expect(code).toBe(0);
+      // Non-root prefixes both privileged steps with sudo.
+      expect(interactiveCmds[0]?.[0]).toBe("sudo");
+      expect(interactiveCmds[0]).toContain("curl");
+      expect(interactiveCmds[1]?.[0]).toBe("sudo");
+      expect(interactiveCmds[1]).toContain("chmod");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("hub#566: cloudflare on linux, sudo curl FAILS: prints manual + --cloudflare hint, exits 1", async () => {
+    const env = makeEnv();
+    try {
+      const runner: Runner = async (cmd) => {
+        if (cmd.slice(0, 2).join(" ") === "cloudflared --version") {
+          return { code: 127, stdout: "", stderr: "not found" };
+        }
+        if (cmd[0] === "tailscale") return { code: 127, stdout: "", stderr: "not found" };
+        throw new Error(`unexpected runner call: ${cmd.join(" ")}`);
+      };
+      const { prompt } = queuePrompt(["2", "y"]);
+      const logs: string[] = [];
+      let cloudflareCalled = false;
+      const code = await exposePublicInteractive({
+        runner,
+        // Simulate sudo failing (no cached creds, no tty).
+        interactiveRunner: async () => 1,
+        prompt,
+        platform: "linux",
+        arch: "x64",
+        getuid: () => 1000,
+        cloudflaredHome: env.cloudflaredHome,
+        lastProviderPath: env.lastProviderPath,
+        statePath: env.statePath,
+        log: (l) => logs.push(l),
+        exposePublicImpl: async () => 0,
+        exposeCloudflareUpImpl: async () => {
+          cloudflareCalled = true;
+          return 0;
+        },
+      });
+      expect(code).toBe(1);
+      expect(cloudflareCalled).toBe(false);
+      const joined = logs.join("\n");
+      expect(joined).toContain("Download failed");
+      expect(joined).toContain("parachute expose public --cloudflare");
     } finally {
       env.cleanup();
     }
