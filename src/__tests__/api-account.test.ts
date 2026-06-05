@@ -955,11 +955,14 @@ describe("handleAccountHomeGet", () => {
       hubOrigin: HUB_ORIGIN,
       resolveVaultPort: () => 1940,
       // Stub the mirror fetch: resolves to a backed-up, GitHub-pushing config.
-      fetchMirror: async () => ({ enabled: true, pushing: true }),
+      fetchMirror: async () => ({ enabled: true, backedUpToRemote: true }),
     });
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('data-testid="backup-state-line"');
+    // Already pushing → the handler threads mirrorPushing=true, so the
+    // "Back up to GitHub ↗" action is suppressed.
+    expect(html).not.toContain('data-testid="backup-github-button"');
     expect(html).toContain("version history + GitHub");
   });
 

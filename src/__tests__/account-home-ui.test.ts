@@ -303,6 +303,7 @@ describe("renderAccountHome", () => {
     expect(backedUp).toContain("/account/vault-admin-token/alice");
 
     // GitHub variant: when pushing, the line says so and the action is dropped.
+    // Suppression is gated on the `mirrorPushing` boolean (NOT the line string).
     const pushing = renderAccountHome({
       username: "alice",
       assignedVaults: ["alice"],
@@ -313,6 +314,7 @@ describe("renderAccountHome", () => {
       twoFactorEnabled: false,
       mintableVerbs: { alice: ["read", "write", "admin"] },
       mirrorLines: { alice: "Backed up — version history + GitHub" },
+      mirrorPushing: { alice: true },
     });
     expect(pushing).toContain("version history + GitHub");
     expect(pushing).not.toContain('data-testid="backup-github-button"');
@@ -330,6 +332,39 @@ describe("renderAccountHome", () => {
     });
     expect(noMirror).not.toContain('data-testid="backup-state-line"');
     expect(noMirror).not.toContain('data-testid="vault-backup"');
+  });
+
+  test("backup action — gated on the mirrorPushing boolean, not the line string", () => {
+    // Regression guard: the "Back up to GitHub ↗" suppression must follow the
+    // proper `mirrorPushing` boolean, NOT substring-match the display line.
+    // (a) line mentions "GitHub" but mirrorPushing is false → action STILL shows.
+    const lineLies = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { alice: ["read", "write", "admin"] },
+      mirrorLines: { alice: "Backed up — full version history (GitHub disabled)" },
+      mirrorPushing: { alice: false },
+    });
+    expect(lineLies).toContain('data-testid="backup-github-button"');
+    // (b) mirrorPushing true but the line lacks "GitHub" → action suppressed.
+    const boolWins = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { alice: ["read", "write", "admin"] },
+      mirrorLines: { alice: "Backed up — full version history" },
+      mirrorPushing: { alice: true },
+    });
+    expect(boolWins).not.toContain('data-testid="backup-github-button"');
   });
 
   test("account card — security actions collapse into a secondary <details>", () => {

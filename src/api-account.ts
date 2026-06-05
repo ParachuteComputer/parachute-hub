@@ -571,6 +571,10 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
   // Skipped entirely when the route didn't wire a port resolver (tests / older
   // callers).
   const mirrorLines: Record<string, string> = {};
+  // Whether each vault's backup is already pushing to a remote (`auto_push`).
+  // Threaded to the renderer as a proper boolean so it gates the "Back up to
+  // GitHub ↗" action without re-deriving "are we pushing?" from the line string.
+  const mirrorPushing: Record<string, boolean> = {};
   if (deps.resolveVaultPort && user.assignedVaults.length > 0) {
     const fetchMirror = deps.fetchMirror ?? fetchVaultMirrorStatus;
     const resolvePort = deps.resolveVaultPort;
@@ -588,7 +592,10 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
         });
         if (stat) {
           const line = formatMirrorLine(stat);
-          if (line) mirrorLines[vaultName] = line;
+          if (line) {
+            mirrorLines[vaultName] = line;
+            mirrorPushing[vaultName] = stat.backedUpToRemote;
+          }
         }
       }),
     );
@@ -612,6 +619,7 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
       mintableVerbs,
       usageStats,
       mirrorLines,
+      mirrorPushing,
       connectedVault,
     }),
     200,

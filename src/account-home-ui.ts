@@ -150,17 +150,34 @@ export interface RenderAccountHomeOpts {
    */
   mirrorLines?: Record<string, string>;
   /**
+   * Per-vault "is backup already pushing to a remote?" flag (the vault's
+   * `config.auto_push`, threaded from `VaultMirrorStat.backedUpToRemote`). Maps
+   * `vaultName` → `true` when an auto-push remote is configured. Drives whether
+   * the tile suppresses the "Back up to GitHub ↗" action — gated on this proper
+   * boolean, NOT re-derived from the `mirrorLines` display string. A vault absent
+   * defaults to `false` (offer the action). Built alongside `mirrorLines` by the
+   * GET handler; omitted on the admin / no-vault branches.
+   */
+  mirrorPushing?: Record<string, boolean>;
+  /**
    * Set after a successful `POST /account/vault-token/<name>` to show the
    * freshly-minted token ONCE (the only time it's ever shown — the hub keeps
    * no plaintext copy). Drives the show-once banner at the top of the page.
    * Absent on the normal GET render.
+   *
+   * NOT vestigial after the 2026-06-04 token-mint-UI removal: the page no
+   * longer renders the mint *form*, but the `POST /account/vault-token/<name>`
+   * route still exists (a script/advanced path) and on success re-renders THIS
+   * page with `mintedToken` set, so the show-once banner still fires for that
+   * flow. The renderer keeps the prop + banner for it.
    */
   mintedToken?: MintedTokenView;
   /**
    * Set after a `POST /account/vault-token/<name>` that failed authorization
    * or validation, to surface an inline error banner on the re-rendered page
    * (e.g. unassigned vault, capped verb, rate-limited). Absent on success and
-   * on the normal GET render.
+   * on the normal GET render. Same non-vestigial note as `mintedToken`: the
+   * mint route still re-renders this page, so the error banner stays live.
    */
   mintError?: string;
   /**
@@ -222,6 +239,11 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
   // condenses to a quiet "you're connected" line so it stops nagging. Shown
   // only on the assigned-vault branch — the admin + no-vault branches have no
   // single "your vault" to connect, so the checklist would be misleading there.
+  // TODO(multi-vault): `connectedVault` is true if ANY of the user's vaults has
+  // a grant (handler uses `.some(...)`), but the checklist shows the connect step
+  // for the FIRST vault only. With multiple vaults, connecting vault B condenses
+  // the checklist even though the displayed primary vault A isn't connected. Fine
+  // today — single-vault is the live case; revisit if multi-vault ships.
   const checklist =
     assignedVaults.length > 0
       ? renderOnboardingChecklist({
@@ -239,6 +261,7 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
     mintableVerbs: opts.mintableVerbs ?? {},
     usageStats: opts.usageStats ?? {},
     mirrorLines: opts.mirrorLines ?? {},
+    mirrorPushing: opts.mirrorPushing ?? {},
   });
 
   const accountCard = renderAccountCard({
@@ -418,6 +441,8 @@ interface VaultCardOpts {
   usageStats: Record<string, string>;
   /** `vaultName` → pre-formatted backup line ("Backed up — full version history"). */
   mirrorLines: Record<string, string>;
+  /** `vaultName` → is backup already pushing to a remote (gates the GitHub action). */
+  mirrorPushing: Record<string, boolean>;
 }
 
 /**
@@ -449,7 +474,7 @@ export function accountClaudeMcpAddCommand(trimmedOrigin: string, vaultName: str
 function renderVaultCard(opts: VaultCardOpts): string {
   const { assignedVaults, trimmedOrigin, isFirstAdmin, csrfToken, mintableVerbs, usageStats } =
     opts;
-  const { mirrorLines } = opts;
+  const { mirrorLines, mirrorPushing } = opts;
 
   if (assignedVaults.length > 0) {
     // One vault tile per assignment (multi-user Phase 2 PR 2). The tile is the
@@ -487,7 +512,13 @@ function renderVaultCard(opts: VaultCardOpts): string {
         // deep-link that opens the vault config SPA. Omitted silently when the
         // mirror fetch failed / backup is off (the renderer just gets no entry).
         const mirrorLine = mirrorLines[vaultName];
-        const backupBlock = renderBackupBlock(vaultName, mirrorLine, holdsAdmin, csrfToken);
+        const backupBlock = renderBackupBlock(
+          vaultName,
+          mirrorLine,
+          mirrorPushing[vaultName] ?? false,
+          holdsAdmin,
+          csrfToken,
+        );
         return `
         <div class="vault-tile" data-testid="vault-tile" data-vault-name="${safeVault}">
           <p class="vault-name"><strong>${safeVault}</strong></p>
@@ -560,17 +591,19 @@ function renderVaultCard(opts: VaultCardOpts): string {
  * `/account/vault-admin-token/<name>` deep-link (the same POST `renderVaultAdminLink`
  * uses) — it mints a `vault:<name>:admin` token and opens the vault config SPA,
  * where the GitHub push is configured. We do NOT invent a new auth path. It's
- * shown only when the user holds admin AND the backup line says they're not
- * already pushing (no "+ GitHub").
+ * shown only when the user holds admin AND `pushing` is false (not already
+ * pushing to a remote) — `pushing` is a proper boolean threaded from the mirror
+ * status (`VaultMirrorStat.backedUpToRemote`), never re-derived from the
+ * display string.
  */
 function renderBackupBlock(
   vaultName: string,
   mirrorLine: string | undefined,
+  pushing: boolean,
   holdsAdmin: boolean,
   csrfToken: string,
 ): string {
   if (!mirrorLine) return "";
-  const pushing = mirrorLine.includes("GitHub");
   // "Back up to GitHub ↗" — only when admin (the deep-link mints admin) and not
   // already pushing. Reuses the vault-admin-token deep-link to open the SPA's
   // backup page; no new auth path.

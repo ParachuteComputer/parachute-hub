@@ -33,8 +33,14 @@ import { signAccessToken } from "./jwt-sign.ts";
 export interface VaultMirrorStat {
   /** Backup is on — a version-history mirror is configured + bootstrapped. */
   enabled: boolean;
-  /** A GitHub (or any git remote) push is configured — backup leaves the box. */
-  pushing: boolean;
+  /**
+   * Backup leaves the box — an auto-push remote (GitHub or any git remote) is
+   * configured (`config.auto_push`). Drives the "+ GitHub" line variant AND
+   * gates the "Back up to GitHub ↗" action (suppressed once already pushing).
+   * Threaded through as a proper boolean so the renderer never has to re-derive
+   * "are we pushing?" from display-string content.
+   */
+  backedUpToRemote: boolean;
 }
 
 /** Short TTL for the admin token — used immediately for one loopback call. */
@@ -67,8 +73,8 @@ export interface FetchVaultMirrorStatusDeps {
  * "Backed up" is true when the persisted config says `enabled` (a version-
  * history mirror) — we read the persisted config, not just the runtime
  * `status.enabled`, so a freshly-configured-but-not-yet-bootstrapped vault still
- * reads as backed up. "Pushing" is true when an auto-push remote is configured
- * (the GitHub variant of backup).
+ * reads as backed up. `backedUpToRemote` is true when an auto-push remote is
+ * configured (the GitHub variant of backup).
  */
 export async function fetchVaultMirrorStatus(
   vaultName: string,
@@ -98,8 +104,8 @@ export async function fetchVaultMirrorStatus(
     };
     const enabled = body.config?.enabled;
     if (typeof enabled !== "boolean") return null;
-    const pushing = body.config?.auto_push === true;
-    return { enabled, pushing };
+    const backedUpToRemote = body.config?.auto_push === true;
+    return { enabled, backedUpToRemote };
   } catch {
     return null;
   }
@@ -114,5 +120,7 @@ export async function fetchVaultMirrorStatus(
  */
 export function formatMirrorLine(stat: VaultMirrorStat): string | null {
   if (!stat.enabled) return null;
-  return stat.pushing ? "Backed up — version history + GitHub" : "Backed up — full version history";
+  return stat.backedUpToRemote
+    ? "Backed up — version history + GitHub"
+    : "Backed up — full version history";
 }

@@ -71,7 +71,7 @@ describe("fetchVaultMirrorStatus", () => {
         { status: 200, headers: { "content-type": "application/json" } },
       )) as unknown as typeof fetch;
     const stat = await fetchVaultMirrorStatus("work", baseDeps(fetchImpl));
-    expect(stat).toEqual({ enabled: true, pushing: false });
+    expect(stat).toEqual({ enabled: true, backedUpToRemote: false });
   });
 
   test("flags pushing when auto_push is configured", async () => {
@@ -81,7 +81,7 @@ describe("fetchVaultMirrorStatus", () => {
         { status: 200 },
       )) as unknown as typeof fetch;
     const stat = await fetchVaultMirrorStatus("work", baseDeps(fetchImpl));
-    expect(stat).toEqual({ enabled: true, pushing: true });
+    expect(stat).toEqual({ enabled: true, backedUpToRemote: true });
   });
 
   test("returns enabled:false when backup is off", async () => {
@@ -90,7 +90,7 @@ describe("fetchVaultMirrorStatus", () => {
         status: 200,
       })) as unknown as typeof fetch;
     const stat = await fetchVaultMirrorStatus("work", baseDeps(fetchImpl));
-    expect(stat).toEqual({ enabled: false, pushing: false });
+    expect(stat).toEqual({ enabled: false, backedUpToRemote: false });
   });
 
   test("mints an ADMIN-scoped Bearer + hits the vault's loopback mirror endpoint", async () => {
@@ -140,15 +140,17 @@ describe("fetchVaultMirrorStatus", () => {
 
 describe("formatMirrorLine", () => {
   test("warm plain-language line; GitHub variant when pushing", () => {
-    expect(formatMirrorLine({ enabled: true, pushing: false } as VaultMirrorStat)).toBe(
+    expect(formatMirrorLine({ enabled: true, backedUpToRemote: false } as VaultMirrorStat)).toBe(
       "Backed up — full version history",
     );
-    expect(formatMirrorLine({ enabled: true, pushing: true } as VaultMirrorStat)).toBe(
+    expect(formatMirrorLine({ enabled: true, backedUpToRemote: true } as VaultMirrorStat)).toBe(
       "Backed up — version history + GitHub",
     );
   });
 
   test("returns null when backup is off (the tile omits the line, never nags)", () => {
-    expect(formatMirrorLine({ enabled: false, pushing: false } as VaultMirrorStat)).toBeNull();
+    expect(
+      formatMirrorLine({ enabled: false, backedUpToRemote: false } as VaultMirrorStat),
+    ).toBeNull();
   });
 });
