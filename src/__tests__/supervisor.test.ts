@@ -289,6 +289,47 @@ describe("Supervisor port-squatter detection (#580 item 4)", () => {
     scribeProc.resolveExit(0);
   });
 
+  test("a CRASHED child's stale pid does NOT vouch for a port holder (N1 liveness)", async () => {
+    // vault spawns (pid 800), then crashes for good (maxRestarts: 1). Its entry
+    // keeps `proc.pid === 800` (never cleared on exit) but status is `crashed`.
+    // A fresh `start` where pid 800 now holds :1940 must be flagged as a
+    // SQUATTER — the stale pid of a dead child must not excuse the holder.
+    const first = makeFakeProc(800);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    let portHeld = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      maxRestarts: 1,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      // Free before the crash; pid 800 "holds" :1940 after we flip portHeld.
+      pidOnPort: (port) => (portHeld && port === 1940 ? 800 : undefined),
+      ownerOfPid: () => "bun /x/vault/src/server.ts",
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    // Crash past the budget → status `crashed`, entry.proc.pid still 800.
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+    expect(sup.get("vault")?.status).toBe("crashed");
+
+    // Now pid 800 holds the port. A re-start must NOT treat 800 as "ours".
+    portHeld = true;
+    const restarted = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+    expect(restarted.status).toBe("crashed");
+    expect(restarted.startError?.error_type).toBe("port_squatter");
+    expect(restarted.startError?.error_description).toContain("port 1940 is held by pid 800");
+    // No second spawn — the squatter check aborted before re-spawning.
+    expect(spawner.calls).toHaveLength(1);
+  });
+
   test("no declared PORT → squatter check skipped (request without env.PORT)", async () => {
     const proc = makeFakeProc(900);
     const spawner = makeQueueSpawner();

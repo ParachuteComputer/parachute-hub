@@ -80,8 +80,11 @@ Flags:
                             the light default. For vault: the vault-name /
                             "install MCP in Claude Code?" / "mint a token?"
                             interview + its own standalone daemon registration.
-                            Use the light default + manage from the admin UI
-                            unless you specifically want the old interview.
+                            On a supervised hub that standalone daemon can RACE
+                            the supervisor for the module's port (EADDRINUSE
+                            crash-loop, #580) — prefer the light default + manage
+                            from the admin UI unless you specifically want the
+                            old interview.
   --scribe-provider <name>  set scribe's transcription provider non-interactively.
                             Known: parakeet-mlx (default), onnx-asr, whisper, groq, openai.
                             Skips the interactive picker.

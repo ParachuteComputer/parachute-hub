@@ -2005,6 +2005,35 @@ describe("#580 item 3 — install-time stale-unit sweep", () => {
     }
   });
 
+  test("does NOT sweep under --no-create (wizard defers the start; N2)", async () => {
+    // Parallel to the --no-start guard above. `noCreate` (the wizard's
+    // install path) also suppresses the start — and the sweep touches real
+    // launchctl/systemctl on a live box, so it must NOT fire when we're not
+    // about to start the module. A silent regression here would have the
+    // wizard disabling operator units mid-init.
+    const { path, cleanup } = makeTempPath();
+    try {
+      let sweepCalls = 0;
+      await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        noCreate: true,
+        log: () => {},
+        guidanceCtx: { hubUnitInstalled: true, exposeState: undefined, hubPort: 1939 },
+        disableStaleModuleUnits: () => {
+          sweepCalls += 1;
+          return { actions: [] };
+        },
+      });
+      expect(sweepCalls).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("a clean no-op sweep (nothing stale) logs nothing extra", async () => {
     const { path, cleanup } = makeTempPath();
     try {

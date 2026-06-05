@@ -691,6 +691,16 @@ function resolveGuidanceAdminUrl(
  *
  * Returns an empty array for modules that don't carry the interactive-init
  * footprint (so the generic `postInstallFooter` stays the surface for those).
+ *
+ * VAULT-ONLY for now, intentionally (N4). Vault is the only SERVICE_SPECS module
+ * that ships an interactive `spec.init` today, so it's the only one whose light
+ * path drops an interview that needs replacing with guidance. When a FUTURE
+ * module ships its own `spec.init` (and thus takes the light-path skip), add its
+ * guidance arm HERE — or, if the per-module copy starts to diverge meaningfully,
+ * lift the guidance text onto the ServiceSpec shape (e.g. a
+ * `lightInstallGuidance?: (adminUrl) => string[]` extra) so each module owns its
+ * own next-steps block instead of this central switch. The empty-array fallback
+ * keeps every other module silent here regardless.
  */
 export function buildLightInstallGuidance(short: string, adminUrl: string): string[] {
   if (short === "vault") {
@@ -902,6 +912,23 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   // unaffected — there's no interview to suppress.
   const runInteractiveInit = spec.init !== undefined && opts.interactive === true && !opts.noCreate;
   if (runInteractiveInit && spec.init) {
+    // Reviewer surprise 2 / #580: the interactive path runs the module's OWN
+    // init, which (for vault today) registers a standalone platform daemon
+    // (launchd KeepAlive / systemd Restart=always). On a SUPERVISED hub that
+    // daemon races the supervisor for the module's port — the exact #580
+    // EADDRINUSE-crash-loop condition the light path avoids by not running init.
+    // Warn so an operator who reaches for --interactive on a supervised box
+    // knows to pass the daemon-off flag (or prefer the light default).
+    const supervisedForWarn =
+      opts.guidanceCtx?.hubUnitInstalled ??
+      (opts.guidanceCtx !== undefined || manifestPath === SERVICES_MANIFEST_PATH
+        ? isHubUnitInstalled(opts.guidanceCtx?.hubUnitDeps ?? defaultHubUnitDeps)
+        : false);
+    if (supervisedForWarn) {
+      log(
+        `⚠ --interactive runs ${short}'s own setup, which may register a standalone daemon. On a supervised hub that daemon races the supervisor for ${short}'s port (#580). Prefer the light default, or pass --no-autostart through to ${short}'s init.`,
+      );
+    }
     // Forward --vault-name from the InstallOpts when set so `parachute setup`
     // (and any future programmatic caller) can pre-answer the name prompt.
     const initCmd =
@@ -1116,6 +1143,13 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   // replace the absent interview with a short pointer to the admin UI + the
   // optional extras. Skipped for --interactive (the service's own footer
   // covers it) and for noCreate (the wizard prints its own admin URL).
+  //
+  // INFORMATIONAL, independent of the start path (N3): this block is *guidance*,
+  // not an action, so it deliberately does NOT gate on `willStart` /
+  // `!opts.noStart` the way the stale-unit sweep above does. Even under
+  // `--no-start` (CI / piped installs) the operator still benefits from "here's
+  // where to manage it once it's up" — the admin URL + extras are equally true
+  // whether or not THIS invocation started the daemon.
   //
   // The supervised-hub probe + admin-URL resolution touch real on-disk state
   // (the hub plist / expose-state / hub-port file). Gate the production probe

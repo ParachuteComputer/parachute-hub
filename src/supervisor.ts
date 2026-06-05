@@ -518,15 +518,24 @@ export class Supervisor {
   }
 
   /**
-   * The set of pids the supervisor currently owns — its live children's pids.
-   * Used by the squatter check to decide whether a process holding a module's
-   * port is "ours" (a re-probe of our own just-spawned child, or a sibling) vs
-   * a foreign rogue. A child whose entry has no `proc` (never spawned / already
-   * exited) contributes no pid.
+   * The set of pids the supervisor currently owns AND that are still alive — its
+   * live children's pids. Used by the squatter check to decide whether a process
+   * holding a module's port is "ours" (a re-probe of our own just-spawned child,
+   * or a sibling) vs a foreign rogue.
+   *
+   * Liveness guard (N1): `entry.proc` is NEVER cleared on exit (`handleExit`
+   * only updates `entry.state`), so a recycled OS pid could otherwise be
+   * misclassified as "our own child" and wrongly excused from the squatter
+   * check. We therefore only count an entry whose child is actually running —
+   * `state.status` is `running` or `starting`. A `crashed` / `restarting` /
+   * `stopped` module's recorded pid is stale (the process is gone or being
+   * replaced) and must not vouch for whoever now holds the port. An entry with
+   * no `proc` (never spawned) contributes no pid either.
    */
   private supervisedPids(): Set<number> {
     const pids = new Set<number>();
     for (const entry of this.modules.values()) {
+      if (entry.state.status !== "running" && entry.state.status !== "starting") continue;
       const pid = entry.proc?.pid;
       if (typeof pid === "number" && pid > 0) pids.add(pid);
     }
