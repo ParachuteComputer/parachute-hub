@@ -922,7 +922,7 @@ describe("handleAccountHomeGet", () => {
     expect(html).not.toContain('data-testid="vault-usage"');
   });
 
-  test("renders the 'Configure / back up this vault ↗' deep-link button for an assigned vault", async () => {
+  test("renders the 'Advanced vault settings ↗' deep-link button for an assigned vault", async () => {
     await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
     const friend = await createUser(harness.db, "alice", "alice-passphrase", {
       allowMulti: true,
@@ -936,6 +936,53 @@ describe("handleAccountHomeGet", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('data-testid="vault-admin-button"');
+    expect(html).toContain("Advanced vault settings");
     expect(html).toContain('action="/account/vault-admin-token/alice"');
+  });
+
+  test("renders the backup-state line when the mirror status resolves enabled", async () => {
+    await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
+    const friend = await createUser(harness.db, "alice", "alice-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVaults: ["alice"],
+    });
+    const session = createSession(harness.db, { userId: friend.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = await handleAccountHomeGet(req, {
+      db: harness.db,
+      hubOrigin: HUB_ORIGIN,
+      resolveVaultPort: () => 1940,
+      // Stub the mirror fetch: resolves to a backed-up, GitHub-pushing config.
+      fetchMirror: async () => ({ enabled: true, pushing: true }),
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-testid="backup-state-line"');
+    expect(html).toContain("version history + GitHub");
+  });
+
+  test("omits the backup line gracefully when the mirror fetch fails (null)", async () => {
+    await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
+    const friend = await createUser(harness.db, "alice", "alice-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVaults: ["alice"],
+    });
+    const session = createSession(harness.db, { userId: friend.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = await handleAccountHomeGet(req, {
+      db: harness.db,
+      hubOrigin: HUB_ORIGIN,
+      resolveVaultPort: () => 1940,
+      fetchMirror: async () => null,
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Tile still renders; just no backup line.
+    expect(html).toContain("<strong>alice</strong>");
+    expect(html).not.toContain('data-testid="backup-state-line"');
   });
 });
