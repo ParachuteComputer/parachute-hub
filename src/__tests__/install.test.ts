@@ -1828,6 +1828,9 @@ describe("#579 / #580 item 1 — light manual install + guidance", () => {
             layer: "public",
             mode: "path",
             canonicalFqdn: "friends.parachute.computer",
+            port: 1939,
+            funnel: false,
+            entries: [],
           },
           hubPort: 1939,
         },
@@ -1908,6 +1911,115 @@ describe("#579 / #580 item 1 — light manual install + guidance", () => {
       const joined = logs.join("\n");
       expect(joined).not.toMatch(/skipping/);
       expect(joined).not.toMatch(/Manage \+ create vaults in the admin UI/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("#580 item 3 — install-time stale-unit sweep", () => {
+  test("sweeps stale per-module units before starting on a supervised box", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      let sweepCalls = 0;
+      const code = await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+        guidanceCtx: { hubUnitInstalled: true, exposeState: undefined, hubPort: 1939 },
+        disableStaleModuleUnits: () => {
+          sweepCalls += 1;
+          return {
+            actions: [
+              {
+                short: "vault",
+                kind: "launchd",
+                unit: "computer.parachute.vault",
+                result: "disabled",
+                messages: ["  ✓ Disabled stale computer.parachute.vault"],
+              },
+            ],
+          };
+        },
+      });
+      expect(code).toBe(0);
+      expect(sweepCalls).toBe(1);
+      expect(logs.join("\n")).toMatch(
+        /Swept 1 stale per-module autostart unit\(s\).*computer\.parachute\.vault/,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("does NOT sweep on a non-supervised box (no hub unit)", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      let sweepCalls = 0;
+      await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: () => {},
+        guidanceCtx: { hubUnitInstalled: false, exposeState: undefined, hubPort: 1939 },
+        disableStaleModuleUnits: () => {
+          sweepCalls += 1;
+          return { actions: [] };
+        },
+      });
+      // No supervised hub → the per-module unit is the legitimate lifecycle;
+      // the sweep must not run.
+      expect(sweepCalls).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("does NOT sweep under --no-start (caller owns the process model)", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      let sweepCalls = 0;
+      await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        noStart: true,
+        log: () => {},
+        guidanceCtx: { hubUnitInstalled: true, exposeState: undefined, hubPort: 1939 },
+        disableStaleModuleUnits: () => {
+          sweepCalls += 1;
+          return { actions: [] };
+        },
+      });
+      expect(sweepCalls).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a clean no-op sweep (nothing stale) logs nothing extra", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+        guidanceCtx: { hubUnitInstalled: true, exposeState: undefined, hubPort: 1939 },
+        disableStaleModuleUnits: () => ({ actions: [] }),
+      });
+      expect(logs.join("\n")).not.toMatch(/Swept .* stale per-module/);
     } finally {
       cleanup();
     }

@@ -29,6 +29,11 @@ import {
   synthesizeManifestForKnownModule,
 } from "../service-spec.ts";
 import { findService, readManifest, upsertService } from "../services-manifest.ts";
+import {
+  type DisableStaleModuleUnitsOpts,
+  type DisableStaleModuleUnitsResult,
+  disableStaleModuleUnits as defaultDisableStaleModuleUnits,
+} from "../stale-module-units.ts";
 import { WELL_KNOWN_PATH } from "../well-known.ts";
 import { type LifecycleOpts, start as lifecycleStart } from "./lifecycle.ts";
 import { migrateNotice } from "./migrate.ts";
@@ -258,6 +263,20 @@ export interface InstallOpts {
     /** Hub loopback port for the admin URL fallback. Defaults to `readHubPort()`. */
     hubPort?: number | undefined;
   };
+  /**
+   * Test seam for the install-time stale-unit sweep (#580 item 3). Production
+   * wires `disableStaleModuleUnits` (the #522 migrate/teardown sweep, reused
+   * verbatim — known-module shorts only, hub + cloudflared skipped, idempotent,
+   * non-fatal). Tests inject a fake so no real launchctl/systemctl runs and the
+   * sweep's invocation (and logged actions) can be asserted.
+   *
+   * The sweep fires only when a supervised hub is present (the same
+   * `guidanceCtx.hubUnitInstalled` discriminant) and the module is being
+   * started — a leftover standalone `parachute-<short>` unit (KeepAlive /
+   * RunAtLoad) would otherwise keep an unsupervised module bound to the port,
+   * crash-looping the supervisor's own child (the #580 field signature).
+   */
+  disableStaleModuleUnits?: (opts?: DisableStaleModuleUnitsOpts) => DisableStaleModuleUnitsResult;
   /**
    * `parachute install scribe` only: pre-pick the transcription provider so
    * the prompt doesn't fire. Validated against scribe's known providers — an
@@ -1027,6 +1046,40 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
 
   const notice = migrateNotice(configDir, now());
   if (notice) log(notice);
+
+  // Install-time stale-unit sweep (#580 item 3 / #522 part 2). Before we start
+  // the module under the supervisor, disable any leftover STANDALONE per-module
+  // autostart unit (a pre-supervisor `parachute-<short>.service` with
+  // Restart=always, or a `computer.parachute.<short>` LaunchAgent with
+  // KeepAlive). Such a unit keeps RESPAWNING an unsupervised module that binds
+  // the module's port; the supervised child then EADDRINUSE-crash-loops and
+  // lands `crashed` — the recurring field signature in #580 / #522. Reuses the
+  // exact #522 migrate/teardown sweep (`disableStaleModuleUnits`): known-module
+  // shorts only, hub + cloudflared explicitly skipped, idempotent (already-
+  // disabled/absent = silent no-op), non-fatal (a failed disable warns +
+  // continues). Gated on a supervised hub being present — on a non-supervised
+  // box the per-module unit IS the legitimate lifecycle and we must not touch
+  // it. Only runs on the start path (skipped under --no-start / --no-create).
+  const willStart = !opts.noStart && !opts.noCreate;
+  if (willStart) {
+    const gctx = opts.guidanceCtx;
+    const sweepAllowed =
+      opts.disableStaleModuleUnits !== undefined || manifestPath === SERVICES_MANIFEST_PATH;
+    const supervisedForSweep =
+      gctx?.hubUnitInstalled ?? isHubUnitInstalled(gctx?.hubUnitDeps ?? defaultHubUnitDeps);
+    if (sweepAllowed && supervisedForSweep) {
+      const sweep = opts.disableStaleModuleUnits ?? defaultDisableStaleModuleUnits;
+      const result = sweep({ log: (l) => log(l) });
+      const disabled = result.actions.filter((a) => a.result === "disabled");
+      if (disabled.length > 0) {
+        log(
+          `Swept ${disabled.length} stale per-module autostart unit(s) so the supervisor owns the port(s): ${disabled
+            .map((a) => a.unit)
+            .join(", ")}.`,
+        );
+      }
+    }
+  }
 
   // Auto-start: vault and notes' inits historically left a daemon running, but
   // scribe (and any service without a daemon-launching init) didn't — so
