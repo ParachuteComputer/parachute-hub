@@ -4,6 +4,9 @@ import { dirname, join } from "node:path";
 import { autoWireScribeAuth } from "../auto-wire.ts";
 import { bunGlobalPrefixes, isLinked as defaultIsLinkedShared } from "../bun-link.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
+import { type ExposeState, readExposeState } from "../expose-state.ts";
+import { HUB_DEFAULT_PORT, readHubPort } from "../hub-control.ts";
+import { type HubUnitDeps, defaultHubUnitDeps, isHubUnitInstalled } from "../hub-unit.ts";
 import {
   type ModuleManifest,
   ModuleManifestError,
@@ -215,6 +218,46 @@ export interface InstallOpts {
    * leave it false so today's behavior is unchanged.
    */
   noCreate?: boolean;
+  /**
+   * `parachute install vault --interactive` (#579 / #580 item 1): opt back into
+   * the FULL interactive module setup — the service's own `spec.init` (vault's
+   * vault-name prompt, "install as MCP in Claude Code?", "mint an API token?")
+   * and, for vault, its self-registered standalone daemon.
+   *
+   * Default: false. The manual `parachute install <svc>` path is now LIGHT
+   * (matching `parachute init`'s Step 2.5): install the package, seed/register
+   * services.json, start under the supervisor, and print a short guidance block
+   * pointing at the admin UI + the optional extras (`parachute-vault
+   * mcp-install`, token minting in the UI). No interactive interview, no
+   * vault-side daemon registration that would race the supervisor for :1940.
+   *
+   * The old "drag me through the full init" behavior is opt-in via this flag.
+   * When `true` AND the spec ships an `init` command, install runs `spec.init`
+   * as it did pre-#579. When `false` (the default) for a module whose `init`
+   * would otherwise run an interview, install SKIPS `spec.init` (the
+   * `noCreate`-equivalent quiet path) and emits the guidance block instead.
+   *
+   * Orthogonal to `noCreate` (which `parachute init` uses to ALSO skip the
+   * post-install start). The light manual path still starts the module under
+   * the supervisor; only the interactive interview is suppressed.
+   */
+  interactive?: boolean;
+  /**
+   * Test seam for the supervised-hub probe + admin-URL resolution that drive
+   * the light-install guidance block. Production reads the real expose-state /
+   * hub-port / hub-unit deps; tests inject deterministic values so the guidance
+   * assertions don't depend on the operator's live box.
+   */
+  guidanceCtx?: {
+    /** Is a hub unit installed (→ supervised box)? Defaults to the real probe. */
+    hubUnitInstalled?: boolean;
+    /** Hub-unit deps for the real `isHubUnitInstalled` probe. */
+    hubUnitDeps?: HubUnitDeps;
+    /** Live expose state (→ public admin URL). Defaults to `readExposeState()`. */
+    exposeState?: ExposeState | undefined;
+    /** Hub loopback port for the admin URL fallback. Defaults to `readHubPort()`. */
+    hubPort?: number | undefined;
+  };
   /**
    * `parachute install scribe` only: pre-pick the transcription provider so
    * the prompt doesn't fire. Validated against scribe's known providers — an
@@ -586,6 +629,68 @@ export function defaultStartLifecycleOpts(ctx: {
   };
 }
 
+/**
+ * Read the expose-state, swallowing a malformed-file error to undefined so the
+ * guidance block degrades to the loopback admin URL instead of throwing mid-
+ * install. Mirrors init's tolerant read of the same file.
+ */
+function safeReadExposeState(): ExposeState | undefined {
+  try {
+    return readExposeState();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve the canonical admin URL the light-install guidance points at — the
+ * SAME resolution `parachute init` uses (`init.ts:resolveAdminUrl`): the live
+ * expose-state public FQDN when the hub is exposed, otherwise the loopback
+ * `http://127.0.0.1:<port>/admin/`. Kept as a thin local copy (rather than
+ * importing init.ts) so the install command doesn't pull in the wizard module
+ * graph; the shape is asserted against init's in tests.
+ */
+function resolveGuidanceAdminUrl(
+  exposeState: ExposeState | undefined,
+  hubPort: number | undefined,
+): string {
+  if (exposeState?.canonicalFqdn) {
+    return `https://${exposeState.canonicalFqdn}/admin/`;
+  }
+  return `http://127.0.0.1:${hubPort ?? HUB_DEFAULT_PORT}/admin/`;
+}
+
+/**
+ * The post-install guidance block for the LIGHT manual install path (#579).
+ *
+ * Replaces the old interactive interview ("name your vault / install MCP / mint
+ * a token") with a short pointer to where the operator manages + creates vaults
+ * (the admin UI) plus one-liners for the optional extras they used to be dragged
+ * through up front. Aaron's framing: "I just wanna install vault and then I'm
+ * managing it through the UI" — the install confirms the module is up and tells
+ * them where to go next, no token minted, no MCP wired, until they ask.
+ *
+ * Returns an empty array for modules that don't carry the interactive-init
+ * footprint (so the generic `postInstallFooter` stays the surface for those).
+ */
+export function buildLightInstallGuidance(short: string, adminUrl: string): string[] {
+  if (short === "vault") {
+    return [
+      "",
+      "Vault is installed and running under the hub supervisor.",
+      "Manage + create vaults in the admin UI:",
+      `  ${adminUrl}`,
+      "",
+      "Optional, when you want them (not needed to start):",
+      "  • Connect a vault to Claude Code:  parachute-vault mcp-install",
+      "  • Mint an API token for other MCP clients: do it from the admin UI (Tokens).",
+      "",
+      "Run the full interactive setup instead with: parachute install vault --interactive",
+    ];
+  }
+  return [];
+}
+
 export async function install(input: string, opts: InstallOpts = {}): Promise<number> {
   const runner = opts.runner ?? defaultRunner;
   const manifestPath = opts.manifestPath ?? SERVICES_MANIFEST_PATH;
@@ -766,7 +871,18 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
       ? spec.manifestName
       : manifest.name;
 
-  if (spec.init && !opts.noCreate) {
+  // Whether to run the module's interactive `spec.init` (#579 / #580 item 1).
+  //
+  // The manual `parachute install <svc>` path is now LIGHT by default: we do
+  // NOT drag the operator through `spec.init`'s interview (for vault: vault-name
+  // prompt, "install as MCP?", "mint a token?", and a self-registered standalone
+  // daemon that would race the supervisor for :1940). The operator installs the
+  // module and manages it from the admin UI. `spec.init` runs ONLY when the
+  // caller explicitly opts back in with `--interactive` (and isn't in the
+  // `noCreate` quiet path the wizard uses). Modules without a `spec.init` are
+  // unaffected — there's no interview to suppress.
+  const runInteractiveInit = spec.init !== undefined && opts.interactive === true && !opts.noCreate;
+  if (runInteractiveInit && spec.init) {
     // Forward --vault-name from the InstallOpts when set so `parachute setup`
     // (and any future programmatic caller) can pre-answer the name prompt.
     const initCmd =
@@ -781,6 +897,15 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     }
   } else if (spec.init && opts.noCreate) {
     log(`(skipping ${spec.init.join(" ")} — --no-create: module installed, no instance created)`);
+  } else if (spec.init) {
+    // Light path: the module ships an interactive init but the operator didn't
+    // ask for it. Skip the interview; the guidance block at the end of install
+    // tells them where to manage + create instances. The supervisor (started
+    // below) owns the lifecycle, so vault's own daemon registration is
+    // deliberately NOT triggered here — that's the :1940 race #580 fixed.
+    log(
+      `(skipping ${spec.init.join(" ")} — manage ${short} from the admin UI; re-run with --interactive for the full setup)`,
+    );
   }
 
   // Hub-as-port-authority (#53): pick the service's port now and reflect it
@@ -930,6 +1055,37 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   const footer = spec.postInstallFooter?.();
   if (footer) {
     for (const line of footer) log(line);
+  }
+
+  // Light-install guidance block (#579 / #580 item 1). When we suppressed the
+  // module's interactive init (light path: it ships an init, the operator
+  // didn't pass --interactive, and this isn't the wizard's noCreate path),
+  // replace the absent interview with a short pointer to the admin UI + the
+  // optional extras. Skipped for --interactive (the service's own footer
+  // covers it) and for noCreate (the wizard prints its own admin URL).
+  //
+  // The supervised-hub probe + admin-URL resolution touch real on-disk state
+  // (the hub plist / expose-state / hub-port file). Gate the production probe
+  // on `manifestPath === SERVICES_MANIFEST_PATH` — the same isolation gate the
+  // well-known regen uses — so a test driving install against a tempdir
+  // manifestPath never reads the operator's real `~/.parachute`. Tests opt into
+  // the guidance assertions by passing `guidanceCtx` explicitly.
+  const guidanceProbeAllowed =
+    opts.guidanceCtx !== undefined || manifestPath === SERVICES_MANIFEST_PATH;
+  if (spec.init && !opts.interactive && !opts.noCreate && guidanceProbeAllowed) {
+    const gctx = opts.guidanceCtx;
+    const supervised =
+      gctx?.hubUnitInstalled ?? isHubUnitInstalled(gctx?.hubUnitDeps ?? defaultHubUnitDeps);
+    // Only emit the "managed under the supervisor" guidance when there's a
+    // supervised hub to manage it through. On a non-supervised box (no hub
+    // unit) the admin UI may not be reachable, so we stay quiet and let the
+    // generic install output stand — the operator can run --interactive.
+    if (supervised) {
+      const exposeState = gctx && "exposeState" in gctx ? gctx.exposeState : safeReadExposeState();
+      const hubPort = gctx && "hubPort" in gctx ? gctx.hubPort : readHubPort(configDir);
+      const adminUrl = resolveGuidanceAdminUrl(exposeState, hubPort);
+      for (const line of buildLightInstallGuidance(short, adminUrl)) log(line);
+    }
   }
 
   // Final registration check — the service may have written its own

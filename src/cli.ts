@@ -449,11 +449,14 @@ async function main(argv: string[]): Promise<number> {
         return 1;
       }
       const noStart = keyExtract.rest.includes("--no-start");
-      const installArgs = keyExtract.rest.filter((a) => a !== "--no-start");
+      const interactive = keyExtract.rest.includes("--interactive");
+      const installArgs = keyExtract.rest.filter(
+        (a) => a !== "--no-start" && a !== "--interactive",
+      );
       const service = installArgs[0];
       if (!service) {
         console.error(
-          "usage: parachute install <service|all> [--channel rc|latest] [--tag <name>] [--no-start]",
+          "usage: parachute install <service|all> [--channel rc|latest] [--tag <name>] [--no-start] [--interactive]",
         );
         console.error(
           "       parachute install scribe [--scribe-provider <name>] [--scribe-key <key>]",
@@ -467,6 +470,7 @@ async function main(argv: string[]): Promise<number> {
         installOpts.channel = channelExtract.value;
       }
       if (noStart) installOpts.noStart = true;
+      if (interactive) installOpts.interactive = true;
       if (providerExtract.value) installOpts.scribeProvider = providerExtract.value;
       if (keyExtract.value) installOpts.scribeKey = keyExtract.value;
       const mod = await loadCommand("install", () => import("./commands/install.ts"));

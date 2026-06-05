@@ -40,6 +40,9 @@ describe("install", () => {
       const calls: string[][] = [];
       const logs: string[] = [];
       const code = await install("vault", {
+        // --interactive: opt back into vault's full `init` (#579). The light
+        // default skips it; this test exercises the interactive path.
+        interactive: true,
         runner: async (cmd) => {
           calls.push([...cmd]);
           return 0;
@@ -67,6 +70,8 @@ describe("install", () => {
     try {
       const logs: string[] = [];
       const code = await install("vault", {
+        // --interactive: this test asserts init wrote the authoritative entry.
+        interactive: true,
         runner: async (cmd) => {
           if (cmd[0] === "parachute-vault") {
             upsertService(
@@ -133,6 +138,8 @@ describe("install", () => {
       const calls: string[][] = [];
       const logs: string[] = [];
       const code = await install("vault", {
+        // --interactive: this test asserts init still ran after the bun quirk.
+        interactive: true,
         runner: async (cmd) => {
           calls.push([...cmd]);
           // `bun add -g` exits 1; `parachute-vault init` succeeds.
@@ -796,12 +803,14 @@ describe("install", () => {
     }
   });
 
-  test("linked vault still runs init and defers to init's manifest write", async () => {
+  test("linked vault still runs init and defers to init's manifest write (--interactive)", async () => {
     const { path, cleanup } = makeTempPath();
     try {
       const calls: string[][] = [];
       const logs: string[] = [];
       const code = await install("vault", {
+        // --interactive: this test asserts vault's own init wrote the entry.
+        interactive: true,
         runner: async (cmd) => {
           calls.push([...cmd]);
           if (cmd[0] === "parachute-vault") {
@@ -1716,6 +1725,189 @@ describe("install", () => {
       });
       expect(code).toBe(1);
       expect(logs.join("\n")).toMatch(/path does not exist/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("#579 / #580 item 1 — light manual install + guidance", () => {
+  test("default vault install skips the interactive init (no parachute-vault init runs)", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const logs: string[] = [];
+      const code = await install("vault", {
+        // No `interactive` flag → the light default path.
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      // bun add ran; vault's interactive init did NOT.
+      expect(calls).toEqual([["bun", "add", "-g", "@openparachute/vault"]]);
+      expect(calls).not.toContainEqual(["parachute-vault", "init"]);
+      // The skip is announced + points at the admin UI / --interactive.
+      expect(logs.join("\n")).toMatch(/skipping parachute-vault init/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("default vault install still starts the module under the supervisor", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const startCalls: string[] = [];
+      const code = await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        startService: async (short) => {
+          startCalls.push(short);
+          return 0;
+        },
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      // Light ≠ no-start: the supervisor owns the lifecycle; vault is started.
+      expect(startCalls).toEqual(["vault"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("guidance block prints the admin URL + extras on a supervised box (loopback)", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      const code = await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+        // Deterministic supervised-box context: hub unit installed, not exposed.
+        guidanceCtx: { hubUnitInstalled: true, exposeState: undefined, hubPort: 1939 },
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/Manage \+ create vaults in the admin UI/);
+      expect(joined).toMatch(/http:\/\/127\.0\.0\.1:1939\/admin\//);
+      expect(joined).toMatch(/parachute-vault mcp-install/);
+      expect(joined).toMatch(/--interactive/);
+      // It does NOT mint a token or wire MCP — just points there.
+      expect(joined).toMatch(/Mint an API token.*admin UI/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("guidance uses the exposed public FQDN when the hub is exposed", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+        guidanceCtx: {
+          hubUnitInstalled: true,
+          exposeState: {
+            version: 1,
+            layer: "public",
+            mode: "path",
+            canonicalFqdn: "friends.parachute.computer",
+          },
+          hubPort: 1939,
+        },
+      });
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/https:\/\/friends\.parachute\.computer\/admin\//);
+      expect(joined).not.toMatch(/127\.0\.0\.1/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("no guidance block on a non-supervised box (no hub unit)", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+        guidanceCtx: { hubUnitInstalled: false, exposeState: undefined, hubPort: 1939 },
+      });
+      const joined = logs.join("\n");
+      expect(joined).not.toMatch(/Manage \+ create vaults in the admin UI/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("--interactive runs vault init and suppresses the guidance block", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const logs: string[] = [];
+      const code = await install("vault", {
+        interactive: true,
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+        // Even on a supervised box, --interactive means the service's own
+        // init owns the next-steps surface — no light guidance block.
+        guidanceCtx: { hubUnitInstalled: true, exposeState: undefined, hubPort: 1939 },
+      });
+      expect(code).toBe(0);
+      expect(calls).toContainEqual(["parachute-vault", "init"]);
+      expect(logs.join("\n")).not.toMatch(/Manage \+ create vaults in the admin UI/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("scribe (no interactive init) is unaffected — no skip log, no vault guidance", async () => {
+    const { path, cleanup } = makeTempPath();
+    const configDir = join(path, "..");
+    try {
+      const logs: string[] = [];
+      const code = await install("scribe", {
+        runner: async () => 0,
+        manifestPath: path,
+        configDir,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        scribeAvailability: { kind: "not-tty" },
+        log: (l) => logs.push(l),
+        guidanceCtx: { hubUnitInstalled: true, exposeState: undefined, hubPort: 1939 },
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).not.toMatch(/skipping/);
+      expect(joined).not.toMatch(/Manage \+ create vaults in the admin UI/);
     } finally {
       cleanup();
     }

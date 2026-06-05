@@ -42,7 +42,7 @@ export function installHelp(): string {
   return `parachute install — install and register a Parachute service
 
 Usage:
-  parachute install <service> [--channel rc|latest] [--tag <name>] [--no-start]
+  parachute install <service> [--channel rc|latest] [--tag <name>] [--no-start] [--interactive]
   parachute install all       [--channel rc|latest] [--tag <name>] [--no-start]
   parachute install scribe    [--scribe-provider <name>] [--scribe-key <key>]
 
@@ -52,7 +52,10 @@ Services:
 
 What it does:
   1. bun add -g @openparachute/<service>[@<tag>]
-  2. run any service-specific init (e.g. \`parachute-vault init\`)
+  2. register + start the module under the hub supervisor (LIGHT by default —
+     no interactive interview; for vault: no vault-name / MCP / token prompts
+     and no competing standalone daemon). Pass \`--interactive\` to run the
+     service's own full setup (e.g. \`parachute-vault init\`) instead.
   3. assign a canonical port (1939–1949) and reflect it in
      \`~/.parachute/services.json\` — the single source of truth at boot
      (services follow a 4-tier resolvePort ladder; services.json wins).
@@ -73,6 +76,12 @@ Flags:
                             Skipped if the package is already \`bun link\`-ed locally.
   --no-start                skip the post-install daemon start. For piped / CI
                             installs that own their own process model.
+  --interactive             run the module's full interactive setup instead of
+                            the light default. For vault: the vault-name /
+                            "install MCP in Claude Code?" / "mint a token?"
+                            interview + its own standalone daemon registration.
+                            Use the light default + manage from the admin UI
+                            unless you specifically want the old interview.
   --scribe-provider <name>  set scribe's transcription provider non-interactively.
                             Known: parakeet-mlx (default), onnx-asr, whisper, groq, openai.
                             Skips the interactive picker.
@@ -89,7 +98,8 @@ Environment:
                             and \`--tag\`. Defaults to \`latest\` when unset.
 
 Examples:
-  parachute install vault                                   # installs, runs init, starts vault
+  parachute install vault                                   # light: installs + starts vault, points you at the admin UI
+  parachute install vault --interactive                     # full interactive vault init (name / MCP / token prompts)
   parachute install surface                                 # installs surface (auto-bootstraps Notes)
   parachute install notes                                   # back-compat: legacy notes-daemon (Phase 2 deprecating)
   parachute install scribe                                  # installs, prompts for provider, starts scribe
