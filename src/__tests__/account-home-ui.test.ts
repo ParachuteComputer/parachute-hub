@@ -4,9 +4,11 @@
  * tests pin the load-bearing shape:
  *
  *   - Assigned-vault branch: Notes CTA href encodes the hub+vault URL,
- *     vault name shows in the body, AND a per-tile MCP connect block
- *     surfaces the endpoint + `claude mcp add` command (OAuth, no token)
- *     with copy buttons — the multi-user friend-connect surface.
+ *     vault name shows in the body, the backup-state line surfaces, and a
+ *     "build your own UI" hint links the surface-build starter. The connect
+ *     instructions live ONCE in the onboarding checklist (not duplicated in
+ *     the vault card); token-minting is gone from /account (OAuth-first);
+ *     a single "Advanced vault settings ↗" deep-link covers advanced needs.
  *   - Admin (no assigned vault) branch: link to /admin/ visible.
  *   - Defensive third branch (non-admin + no vault): "ask the operator"
  *     copy renders.
@@ -44,41 +46,87 @@ describe("renderAccountHome", () => {
     expect(html).toContain(`https://notes.parachute.computer/add?url=${encodedVaultUrl}`);
     expect(html).toContain('target="_blank"');
     expect(html).toContain('rel="noopener"');
-    // The friend-connect surface: MCP endpoint + `claude mcp add` command,
-    // each with a copy button. OAuth path (no token in the command).
-    expect(html).toContain(`${HUB_ORIGIN}/vault/alice/mcp`);
-    expect(html).toContain(
-      `claude mcp add --transport http parachute-alice ${HUB_ORIGIN}/vault/alice/mcp`,
-    );
-    expect(html).toContain('data-testid="copy-mcp-endpoint"');
-    expect(html).toContain('data-testid="copy-mcp-add-command"');
-    // The connect command must NOT embed a token — the OAuth path needs none.
-    expect(html).not.toContain("--header");
-    expect(html).not.toContain("Authorization: Bearer");
     // Copy-button progressive-enhancement script is present.
     expect(html).toContain("navigator.clipboard");
-    // Friendlier framing: the block leads with "connect your AI assistant"
-    // rather than MCP jargon up top.
-    expect(html).toContain('data-testid="connect-ai-heading"');
-    expect(html).toContain("Connect your AI");
-    // BOTH connect methods render as distinct, labelled blocks.
-    expect(html).toContain('data-testid="connect-method-claude-code"');
-    expect(html).toContain("Claude Code");
-    expect(html).toContain('data-testid="connect-method-claude-ai"');
-    expect(html).toContain("Claude.ai");
-    // The Claude.ai path mirrors the install.njk canonical phrasing
-    // (Settings → Connectors → Add custom connector, paste the endpoint).
-    expect(html).toContain("Connectors");
-    expect(html).toContain("Add custom connector");
-    // A brief "any other MCP client" line is present (no bloat — just one).
-    expect(html).toContain('data-testid="connect-any-client-hint"');
-    // Notes CTA still present, now framed as the browser-UI option.
+    // Notes CTA present, framed as the browser-UI option.
     expect(html).toContain('data-testid="open-notes-cta"');
     // Import-notes CTA deep-links to the Notes-UI /import route for the same
     // vault, mirroring the Open-Notes target-resolution (same hosted origin,
     // same `?url=${hubOrigin}/vault/<name>` vault-targeting param).
     expect(html).toContain(`https://notes.parachute.computer/import?url=${encodedVaultUrl}`);
     expect(html).toContain('data-testid="import-notes-cta"');
+  });
+
+  test("dedup — the full connect block lives ONCE (in the checklist), NOT in the vault card", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      connectedVault: false,
+    });
+    // The checklist owns "Connect your AI" — the endpoint + the `claude mcp add`
+    // command (OAuth, no token) appear there.
+    expect(html).toContain('data-testid="onboarding-mcp-endpoint"');
+    expect(html).toContain('data-testid="onboarding-mcp-add-command"');
+    expect(html).toContain(`${HUB_ORIGIN}/vault/alice/mcp`);
+    // The vault card must NOT repeat the connect instructions. None of the
+    // old mcp-connect block markers may appear — no duplicated connect surface.
+    expect(html).not.toContain('data-testid="mcp-connect"');
+    expect(html).not.toContain('data-testid="connect-ai-heading"');
+    expect(html).not.toContain('data-testid="connect-method-claude-code"');
+    expect(html).not.toContain('data-testid="connect-method-claude-ai"');
+    expect(html).not.toContain('data-testid="connect-any-client-hint"');
+    // The connect instructions live only in the checklist, never duplicated in
+    // the vault card: split the page at the vault card and assert the endpoint
+    // doesn't reappear in that slice.
+    const cardIdx = html.indexOf('data-testid="vault-card"');
+    expect(cardIdx).toBeGreaterThan(-1);
+    const vaultCardSlice = html.slice(cardIdx);
+    expect(vaultCardSlice).not.toContain(`${HUB_ORIGIN}/vault/alice/mcp`);
+    expect(vaultCardSlice).not.toContain("claude mcp add");
+  });
+
+  test("token-mint — the mint affordance is gone from /account (OAuth-first)", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { alice: ["read", "write", "admin"] },
+    });
+    // No token-mint <details> block, no mint form, no verb radios — minting a
+    // header-auth token is a script/advanced concern that lives in the SPA.
+    expect(html).not.toContain('data-testid="token-mint"');
+    expect(html).not.toContain('data-testid="mint-form"');
+    expect(html).not.toContain('data-testid="mint-verb-read"');
+    expect(html).not.toContain('data-testid="mint-verb-admin"');
+    expect(html).not.toContain("Mint an access token");
+    // The single advanced entry point covers the advanced needs.
+    expect(html).toContain('data-testid="vault-admin-button"');
+    expect(html).toContain("Advanced vault settings");
+  });
+
+  test("build-your-own-UI — Notes is one way; the hint links the surface-build starter", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+    });
+    expect(html).toContain('data-testid="build-your-own-ui"');
+    expect(html).toContain('data-testid="build-your-own-ui-link"');
+    expect(html).toContain("https://parachute.computer/onboarding/surface-build/");
+    expect(html).toContain("build you a custom UI");
   });
 
   test("assigned-vault branch — import-notes CTA gated alongside open-notes (no dead link)", () => {
@@ -233,8 +281,8 @@ describe("renderAccountHome", () => {
     expect(noVault).toContain('data-testid="no-vault-card"');
   });
 
-  test("connect-any-client hint bridges MCP ↔ ChatGPT 'connector' terminology", () => {
-    const html = renderAccountHome({
+  test("backup state — renders the backup line + omits when no mirror entry", () => {
+    const backedUp = renderAccountHome({
       username: "alice",
       assignedVaults: ["alice"],
       passwordChanged: true,
@@ -242,14 +290,81 @@ describe("renderAccountHome", () => {
       isFirstAdmin: false,
       csrfToken: CSRF,
       twoFactorEnabled: false,
+      mintableVerbs: { alice: ["read", "write", "admin"] },
+      mirrorLines: { alice: "Backed up — full version history" },
     });
-    // The "any other client" hint now names the ChatGPT "connector" term so
-    // a friend who only knows that word can find the right place to paste.
-    // Assert the NEW hint string specifically — a bare toContain("connector")
-    // was already satisfied pre-PR by the Claude.ai "Connectors" block, so it
-    // wouldn't catch a regression that drops this bridging copy.
-    expect(html).toContain('data-testid="connect-any-client-hint"');
-    expect(html).toContain('call these "connectors."');
+    // The warm, plain-language backup line surfaces on the tile.
+    expect(backedUp).toContain('data-testid="backup-state-line"');
+    expect(backedUp).toContain("Backed up — full version history");
+    // Not pushing yet → a "Back up to GitHub ↗" action (reuses the
+    // vault-admin-token deep-link, gated on admin).
+    expect(backedUp).toContain('data-testid="backup-github-button"');
+    expect(backedUp).toContain("Back up to GitHub");
+    expect(backedUp).toContain("/account/vault-admin-token/alice");
+
+    // GitHub variant: when pushing, the line says so and the action is dropped.
+    // Suppression is gated on the `mirrorPushing` boolean (NOT the line string).
+    const pushing = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { alice: ["read", "write", "admin"] },
+      mirrorLines: { alice: "Backed up — version history + GitHub" },
+      mirrorPushing: { alice: true },
+    });
+    expect(pushing).toContain("version history + GitHub");
+    expect(pushing).not.toContain('data-testid="backup-github-button"');
+
+    // Omitted silently when the mirror fetch returned nothing (no entry).
+    const noMirror = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { alice: ["read", "write", "admin"] },
+    });
+    expect(noMirror).not.toContain('data-testid="backup-state-line"');
+    expect(noMirror).not.toContain('data-testid="vault-backup"');
+  });
+
+  test("backup action — gated on the mirrorPushing boolean, not the line string", () => {
+    // Regression guard: the "Back up to GitHub ↗" suppression must follow the
+    // proper `mirrorPushing` boolean, NOT substring-match the display line.
+    // (a) line mentions "GitHub" but mirrorPushing is false → action STILL shows.
+    const lineLies = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { alice: ["read", "write", "admin"] },
+      mirrorLines: { alice: "Backed up — full version history (GitHub disabled)" },
+      mirrorPushing: { alice: false },
+    });
+    expect(lineLies).toContain('data-testid="backup-github-button"');
+    // (b) mirrorPushing true but the line lacks "GitHub" → action suppressed.
+    const boolWins = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { alice: ["read", "write", "admin"] },
+      mirrorLines: { alice: "Backed up — full version history" },
+      mirrorPushing: { alice: true },
+    });
+    expect(boolWins).not.toContain('data-testid="backup-github-button"');
   });
 
   test("account card — security actions collapse into a secondary <details>", () => {
@@ -347,18 +462,13 @@ describe("renderAccountHome", () => {
     const familyEncoded = encodeURIComponent(`${HUB_ORIGIN}/vault/family`);
     expect(html).toContain(`https://notes.parachute.computer/add?url=${personalEncoded}`);
     expect(html).toContain(`https://notes.parachute.computer/add?url=${familyEncoded}`);
-    // One per-vault MCP connect block per tile (endpoint + command).
-    expect(html).toContain(`${HUB_ORIGIN}/vault/personal/mcp`);
-    expect(html).toContain(`${HUB_ORIGIN}/vault/family/mcp`);
-    expect(html).toContain(
-      `claude mcp add --transport http parachute-personal ${HUB_ORIGIN}/vault/personal/mcp`,
-    );
-    expect(html).toContain(
-      `claude mcp add --transport http parachute-family ${HUB_ORIGIN}/vault/family/mcp`,
-    );
-    // Two tiles → two copy-endpoint buttons.
-    expect(html.split('data-testid="copy-mcp-endpoint"').length - 1).toBe(2);
-    // The copy script is emitted once at the section level, not per-tile.
+    // Two tiles → two Open-Notes CTAs.
+    expect(html.split('data-testid="open-notes-cta"').length - 1).toBe(2);
+    // The vault card does NOT repeat the connect block — that lives in the
+    // checklist (which uses the first/primary vault only).
+    expect(html).not.toContain('data-testid="mcp-connect"');
+    expect(html).not.toContain(`${HUB_ORIGIN}/vault/family/mcp`);
+    // The copy script is emitted once at the page level, not per-tile.
     expect(html.split("<script>").length - 1).toBe(1);
   });
 
@@ -396,56 +506,9 @@ describe("renderAccountHome", () => {
     expect(html).toContain("parachute-&lt;vault&gt;");
   });
 
-  // --- friend vault-token mint affordance (the new surface) ----------------
+  // --- single advanced entry point (gated on the admin verb) ---------------
 
-  test("mint affordance — read+write tile offers both verbs, POSTs to the right path", () => {
-    const html = renderAccountHome({
-      username: "alice",
-      assignedVaults: ["work"],
-      passwordChanged: true,
-      hubOrigin: HUB_ORIGIN,
-      isFirstAdmin: false,
-      csrfToken: CSRF,
-      twoFactorEnabled: false,
-      mintableVerbs: { work: ["read", "write"] },
-    });
-    // The collapsible mint block is present, framed as secondary (headless).
-    expect(html).toContain('data-testid="token-mint"');
-    expect(html).toContain("Mint an access token");
-    expect(html).toContain("for scripts / headless clients");
-    // Both verb radios render.
-    expect(html).toContain('data-testid="mint-verb-read"');
-    expect(html).toContain('data-testid="mint-verb-write"');
-    // Form POSTs to the per-vault endpoint with the CSRF token embedded.
-    expect(html).toContain('action="/account/vault-token/work"');
-    expect(html).toContain('method="POST"');
-    expect(html).toContain('data-testid="mint-form"');
-    expect(html).toContain(CSRF);
-    // Recommends the no-token path as default.
-    expect(html).toContain("no-token");
-  });
-
-  test("mint affordance — a read-only role offers ONLY the read verb", () => {
-    // Today every assignment is write-role, but the renderer is verb-blind to
-    // the role: it shows exactly the verbs it's handed. A read-only cap must
-    // never surface a write radio (the server would reject it anyway).
-    const html = renderAccountHome({
-      username: "alice",
-      assignedVaults: ["work"],
-      passwordChanged: true,
-      hubOrigin: HUB_ORIGIN,
-      isFirstAdmin: false,
-      csrfToken: CSRF,
-      twoFactorEnabled: false,
-      mintableVerbs: { work: ["read"] },
-    });
-    expect(html).toContain('data-testid="mint-verb-read"');
-    expect(html).not.toContain('data-testid="mint-verb-write"');
-  });
-
-  test("mint affordance — offers the admin verb when the user holds it", () => {
-    // 2026-05-30: assigned users hold read/write/admin on their vault, so the
-    // mint form offers admin (the live `vaultVerbsForUserVault` returns it).
+  test("advanced settings link — present + gated on the admin verb", () => {
     const html = renderAccountHome({
       username: "alice",
       assignedVaults: ["work"],
@@ -456,12 +519,32 @@ describe("renderAccountHome", () => {
       twoFactorEnabled: false,
       mintableVerbs: { work: ["read", "write", "admin"] },
     });
-    expect(html).toContain('value="admin"');
-    expect(html).toContain('data-testid="mint-verb-admin"');
+    // One clearly-labelled "Advanced vault settings ↗" link → the SPA deep-link.
+    expect(html).toContain('data-testid="vault-admin-form"');
+    expect(html).toContain('data-testid="vault-admin-button"');
+    expect(html).toContain("Advanced vault settings");
+    expect(html).toContain('action="/account/vault-admin-token/work"');
+    expect(html).toContain('method="POST"');
+    expect(html).toContain(CSRF);
+    // The old dual-purpose "Configure / back up this vault" label is gone.
+    expect(html).not.toContain("Configure / back up this vault");
   });
 
-  test("mint affordance — absent when no mintable verbs (admin / no-vault / unmapped role)", () => {
-    // Admin branch: no tiles at all, so no mint block.
+  test("advanced settings link — absent when the user lacks the admin verb", () => {
+    // A read/write-only assignment must not surface the admin deep-link (the
+    // POST handler would 403 the admin token mint).
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["work"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      mintableVerbs: { work: ["read", "write"] },
+    });
+    expect(html).not.toContain('data-testid="vault-admin-button"');
+    // Admin branch: no tiles at all, so no advanced link.
     const admin = renderAccountHome({
       username: "admin",
       assignedVaults: [],
@@ -471,19 +554,7 @@ describe("renderAccountHome", () => {
       csrfToken: CSRF,
       twoFactorEnabled: false,
     });
-    expect(admin).not.toContain('data-testid="token-mint"');
-    // Assigned vault but empty verb list (fail-closed unknown role) → no block.
-    const empty = renderAccountHome({
-      username: "alice",
-      assignedVaults: ["work"],
-      passwordChanged: true,
-      hubOrigin: HUB_ORIGIN,
-      isFirstAdmin: false,
-      csrfToken: CSRF,
-      twoFactorEnabled: false,
-      mintableVerbs: { work: [] },
-    });
-    expect(empty).not.toContain('data-testid="token-mint"');
+    expect(admin).not.toContain('data-testid="vault-admin-button"');
   });
 
   test("minted-token banner — shows the token once with a save-it warning, no revoke claim", () => {
@@ -645,8 +716,10 @@ describe("renderAccountHome", () => {
       connectedVault: false,
     });
     // The checklist's connect step references the first/primary vault; the
-    // per-vault tiles below still list every vault.
+    // per-vault tiles below still list every vault (by name + Notes CTA), but
+    // no longer repeat the connect endpoint (dedup — connect lives only here).
     expect(html).toMatch(/data-testid="onboarding-mcp-endpoint">[^<]*\/vault\/personal\/mcp</);
-    expect(html).toContain(`${HUB_ORIGIN}/vault/family/mcp`); // still present in the vault tiles
+    expect(html).toContain("<strong>family</strong>"); // second vault still has a tile
+    expect(html).not.toContain(`${HUB_ORIGIN}/vault/family/mcp`); // no duplicated connect
   });
 });

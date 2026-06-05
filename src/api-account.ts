@@ -49,6 +49,7 @@ import type { Database } from "bun:sqlite";
 import { hash as argonHash } from "@node-rs/argon2";
 import { type ChangePasswordMode, renderChangePassword } from "./account-change-password-ui.ts";
 import { renderAccountHome } from "./account-home-ui.ts";
+import { fetchVaultMirrorStatus, formatMirrorLine } from "./account-mirror.ts";
 import { fetchVaultUsage, formatUsageStat } from "./account-usage.ts";
 import { POST_LOGIN_DEFAULT } from "./admin-handlers.ts";
 import { renderAdminError } from "./admin-login-ui.ts";
@@ -503,6 +504,13 @@ export interface AccountHomeDeps extends ApiAccountDeps {
    * vault.
    */
   fetchUsage?: typeof fetchVaultUsage;
+  /**
+   * Fetch one vault's backup (mirror) status, or `null` on any failure.
+   * Defaults to the real `fetchVaultMirrorStatus` (mints an admin-scoped token +
+   * hits the vault's loopback `/.parachute/mirror` endpoint). Injectable so
+   * tests assert the render without a live vault.
+   */
+  fetchMirror?: typeof fetchVaultMirrorStatus;
 }
 
 export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps): Promise<Response> {
@@ -554,6 +562,45 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
     );
   }
 
+  // Per-vault backup (mirror) line ("Backed up — full version history" / "…
+  // + GitHub"). The vault's mirror endpoint is ADMIN-scoped, so we only fetch
+  // for vaults where this user holds the admin verb (the same gate the
+  // "Advanced vault settings ↗" deep-link uses). Each fetch is independently
+  // fault-tolerant (returns null → no backup line on that tile) and backup-off
+  // formats to null too (we never nag with a "not backed up" warning here).
+  // Skipped entirely when the route didn't wire a port resolver (tests / older
+  // callers).
+  const mirrorLines: Record<string, string> = {};
+  // Whether each vault's backup is already pushing to a remote (`auto_push`).
+  // Threaded to the renderer as a proper boolean so it gates the "Back up to
+  // GitHub ↗" action without re-deriving "are we pushing?" from the line string.
+  const mirrorPushing: Record<string, boolean> = {};
+  if (deps.resolveVaultPort && user.assignedVaults.length > 0) {
+    const fetchMirror = deps.fetchMirror ?? fetchVaultMirrorStatus;
+    const resolvePort = deps.resolveVaultPort;
+    await Promise.all(
+      user.assignedVaults.map(async (vaultName) => {
+        if (!(mintableVerbs[vaultName] ?? []).includes("admin")) return;
+        const port = resolvePort(vaultName);
+        if (port === null) return;
+        const stat = await fetchMirror(vaultName, {
+          db: deps.db,
+          hubOrigin: deps.hubOrigin,
+          vaultPort: port,
+          userId: user.id,
+          ...(deps.now !== undefined ? { now: deps.now } : {}),
+        });
+        if (stat) {
+          const line = formatMirrorLine(stat);
+          if (line) {
+            mirrorLines[vaultName] = line;
+            mirrorPushing[vaultName] = stat.backedUpToRemote;
+          }
+        }
+      }),
+    );
+  }
+
   // "Has this user connected an AI to any of their vaults yet?" — drives the
   // onboarding checklist's "Connect your AI" step (done/condensed when true).
   // A grant row only lands after the user clicks through an OAuth consent for a
@@ -571,6 +618,8 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
       twoFactorEnabled: isTotpEnrolled(deps.db, user.id),
       mintableVerbs,
       usageStats,
+      mirrorLines,
+      mirrorPushing,
       connectedVault,
     }),
     200,

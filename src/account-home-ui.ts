@@ -117,15 +117,16 @@ export interface RenderAccountHomeOpts {
    */
   twoFactorEnabled: boolean;
   /**
-   * Per-vault mintable verbs for the "mint an access token" affordance on
-   * each vault tile (friend headless-client path). Maps `vaultName` → the
-   * verbs the user's assignment role permits (today always
-   * `["read", "write"]` since every `user_vaults.role` is `'write'`). A
-   * vault absent from this map (or mapped to an empty list) renders no mint
-   * affordance — the UI never offers a verb the server would reject. The
-   * `/account/` GET handler builds this from `vaultVerbsForUserVault` for
-   * each assigned vault. Omitted (or empty) for the admin / no-vault
-   * branches, where no token-mint tile is shown.
+   * Per-vault verbs the user's assignment role permits. Maps `vaultName` → the
+   * verbs (today `["read", "write", "admin"]` since every `user_vaults.role` is
+   * `'write'`, which grants admin). Now used solely to GATE the per-tile
+   * "Advanced vault settings ↗" deep-link (and the "Back up to GitHub ↗" action)
+   * on the `admin` verb — the deep-link mints a `vault:<name>:admin` token, so
+   * the button never offers authority the POST handler would 403. (The old
+   * token-mint affordance this map also drove was dropped from `/account/`
+   * 2026-06-04 — OAuth-first; minting header-auth tokens is an advanced concern
+   * that lives in the vault config SPA.) Omitted (or empty) for the admin /
+   * no-vault branches, where no vault tile is shown.
    */
   mintableVerbs?: Record<string, VaultVerb[]>;
   /**
@@ -138,17 +139,45 @@ export interface RenderAccountHomeOpts {
    */
   usageStats?: Record<string, string>;
   /**
+   * Per-vault backup (mirror) line for each assigned vault tile. Maps
+   * `vaultName` → the warm, pre-formatted line ("Backed up — full version
+   * history", or "… + GitHub" when a push remote is configured). A vault absent
+   * from this map renders no backup line — the page tolerates a vault whose
+   * mirror endpoint failed / is unreachable / is backup-off (the `/account/` GET
+   * handler builds this map by fetching `/.parachute/mirror` per admin-held
+   * vault and omitting any that don't resolve or read backup-off). Omitted
+   * entirely on the admin / no-vault branches.
+   */
+  mirrorLines?: Record<string, string>;
+  /**
+   * Per-vault "is backup already pushing to a remote?" flag (the vault's
+   * `config.auto_push`, threaded from `VaultMirrorStat.backedUpToRemote`). Maps
+   * `vaultName` → `true` when an auto-push remote is configured. Drives whether
+   * the tile suppresses the "Back up to GitHub ↗" action — gated on this proper
+   * boolean, NOT re-derived from the `mirrorLines` display string. A vault absent
+   * defaults to `false` (offer the action). Built alongside `mirrorLines` by the
+   * GET handler; omitted on the admin / no-vault branches.
+   */
+  mirrorPushing?: Record<string, boolean>;
+  /**
    * Set after a successful `POST /account/vault-token/<name>` to show the
    * freshly-minted token ONCE (the only time it's ever shown — the hub keeps
    * no plaintext copy). Drives the show-once banner at the top of the page.
    * Absent on the normal GET render.
+   *
+   * NOT vestigial after the 2026-06-04 token-mint-UI removal: the page no
+   * longer renders the mint *form*, but the `POST /account/vault-token/<name>`
+   * route still exists (a script/advanced path) and on success re-renders THIS
+   * page with `mintedToken` set, so the show-once banner still fires for that
+   * flow. The renderer keeps the prop + banner for it.
    */
   mintedToken?: MintedTokenView;
   /**
    * Set after a `POST /account/vault-token/<name>` that failed authorization
    * or validation, to surface an inline error banner on the re-rendered page
    * (e.g. unassigned vault, capped verb, rate-limited). Absent on success and
-   * on the normal GET render.
+   * on the normal GET render. Same non-vestigial note as `mintedToken`: the
+   * mint route still re-renders this page, so the error banner stays live.
    */
   mintError?: string;
   /**
@@ -210,6 +239,11 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
   // condenses to a quiet "you're connected" line so it stops nagging. Shown
   // only on the assigned-vault branch — the admin + no-vault branches have no
   // single "your vault" to connect, so the checklist would be misleading there.
+  // TODO(multi-vault): `connectedVault` is true if ANY of the user's vaults has
+  // a grant (handler uses `.some(...)`), but the checklist shows the connect step
+  // for the FIRST vault only. With multiple vaults, connecting vault B condenses
+  // the checklist even though the displayed primary vault A isn't connected. Fine
+  // today — single-vault is the live case; revisit if multi-vault ships.
   const checklist =
     assignedVaults.length > 0
       ? renderOnboardingChecklist({
@@ -226,6 +260,8 @@ export function renderAccountHome(opts: RenderAccountHomeOpts): string {
     csrfToken,
     mintableVerbs: opts.mintableVerbs ?? {},
     usageStats: opts.usageStats ?? {},
+    mirrorLines: opts.mirrorLines ?? {},
+    mirrorPushing: opts.mirrorPushing ?? {},
   });
 
   const accountCard = renderAccountCard({
@@ -352,7 +388,7 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
         </li>
       </ol>
       <p class="onboarding-foot" data-testid="onboarding-foot">Your vault is
-         <code>${safeVault}</code>. Full connect details, Notes, backup, and access tokens are
+         <code>${safeVault}</code>. Its size, backup state, Notes, and advanced settings are
          just below.</p>
     </section>`;
 }
@@ -403,6 +439,10 @@ interface VaultCardOpts {
   mintableVerbs: Record<string, VaultVerb[]>;
   /** `vaultName` → pre-formatted usage stat ("X notes · Y MB"). */
   usageStats: Record<string, string>;
+  /** `vaultName` → pre-formatted backup line ("Backed up — full version history"). */
+  mirrorLines: Record<string, string>;
+  /** `vaultName` → is backup already pushing to a remote (gates the GitHub action). */
+  mirrorPushing: Record<string, boolean>;
 }
 
 /**
@@ -434,84 +474,56 @@ export function accountClaudeMcpAddCommand(trimmedOrigin: string, vaultName: str
 function renderVaultCard(opts: VaultCardOpts): string {
   const { assignedVaults, trimmedOrigin, isFirstAdmin, csrfToken, mintableVerbs, usageStats } =
     opts;
+  const { mirrorLines, mirrorPushing } = opts;
 
   if (assignedVaults.length > 0) {
-    // One vault tile per assignment (multi-user Phase 2 PR 2). Each tile
-    // leads with a friendly "connect your AI assistant to this vault" block
-    // that covers BOTH connect paths a non-technical friend is likely to
-    // use — Claude Code (the `claude mcp add` CLI command) and Claude.ai on
-    // the web (Settings → Connectors → Add custom connector, pointed at the
-    // endpoint). Both are the OAuth path — no token to paste, the first
-    // connection opens a browser to sign in + approve. The Notes "Open" CTA
-    // sits alongside as the browser-UI option. Phrasing mirrors
-    // parachute.computer/install.njk's #connect-mcp-clients section so the
-    // operator docs and the friend's account page stay consistent.
-    //
-    // This closes the multi-user gap where the friend tile read as MCP
-    // jargon ("Connect an MCP client") rather than "here's how to connect
-    // this to your AI" — and where the web (Claude.ai) path was entirely
-    // missing, only the Claude Code CLI command was offered.
+    // One vault tile per assignment (multi-user Phase 2 PR 2). The tile is the
+    // everyday "here's your vault" detail card — name, size, backup state, a
+    // browser-UI on-ramp (Notes + "build your own"), and a single deep-link
+    // into the advanced vault settings SPA. It deliberately does NOT repeat the
+    // "Connect your AI" instructions: the onboarding checklist above owns that
+    // step (collapsing to "✓ You're connected" once a grant lands), so the
+    // page never shows the connect endpoint + both methods twice. Token minting
+    // + raw mirror config are advanced concerns that live in the vault config
+    // SPA, reached via "Advanced vault settings ↗" — not duplicated here.
     const heading = assignedVaults.length === 1 ? "<h2>Your vault</h2>" : "<h2>Your vaults</h2>";
     const tiles = assignedVaults
       .map((vaultName) => {
         const safeVault = escapeHtml(vaultName);
         const vaultUrlForAdd = encodeURIComponent(`${trimmedOrigin}/vault/${vaultName}`);
-        const endpoint = accountMcpEndpoint(trimmedOrigin, vaultName);
-        const addCmd = accountClaudeMcpAddCommand(trimmedOrigin, vaultName);
-        const safeEndpoint = escapeHtml(endpoint);
-        const safeAddCmd = escapeHtml(addCmd);
         const verbsForVault = mintableVerbs[vaultName] ?? [];
-        const tokenMintBlock = renderTokenMintBlock(vaultName, safeVault, verbsForVault, csrfToken);
-        // "Configure / back up this vault ↗" — only for users whose assignment
-        // grants `admin` (the verb the deep-link mints). Today every assigned
-        // user holds admin, but gate on the verb so the button never offers
-        // authority the POST handler would 403.
-        const manageBlock = verbsForVault.includes("admin")
-          ? renderVaultAdminLink(vaultName, csrfToken)
-          : "";
+        const holdsAdmin = verbsForVault.includes("admin");
+        // "Advanced vault settings ↗" — only for users whose assignment grants
+        // `admin` (the verb the deep-link mints). Today every assigned user
+        // holds admin, but gate on the verb so the button never offers
+        // authority the POST handler would 403. The single advanced entry point:
+        // schema, tokens, retention, raw mirror config all live in the SPA.
+        const manageBlock = holdsAdmin ? renderVaultAdminLink(vaultName, csrfToken) : "";
         // Compact usage stat ("X notes · Y MB"), when the vault's usage endpoint
         // resolved. Omitted gracefully otherwise.
         const usageStat = usageStats[vaultName];
         const usageLine = usageStat
           ? `<p class="vault-usage" data-testid="vault-usage">${escapeHtml(usageStat)}</p>`
           : "";
+        // Backup state line + a "Back up to GitHub ↗" deep-link when not already
+        // pushing. Both gated on admin: the backup line is only fetched for
+        // admin-held vaults (the mirror endpoint is admin-scoped), and the
+        // GitHub action reuses the same `/account/vault-admin-token/<name>`
+        // deep-link that opens the vault config SPA. Omitted silently when the
+        // mirror fetch failed / backup is off (the renderer just gets no entry).
+        const mirrorLine = mirrorLines[vaultName];
+        const backupBlock = renderBackupBlock(
+          vaultName,
+          mirrorLine,
+          mirrorPushing[vaultName] ?? false,
+          holdsAdmin,
+          csrfToken,
+        );
         return `
         <div class="vault-tile" data-testid="vault-tile" data-vault-name="${safeVault}">
           <p class="vault-name"><strong>${safeVault}</strong></p>
           ${usageLine}
-          <div class="mcp-connect" data-testid="mcp-connect">
-            <p class="mcp-connect-label" data-testid="connect-ai-heading">Connect your AI
-               assistant to this vault</p>
-            <p class="mcp-connect-intro">Two common ways. Both sign you in to this hub over
-               HTTPS and ask you to approve access the first time — no token to copy.</p>
-
-            <div class="mcp-method" data-testid="connect-method-claude-code">
-              <p class="mcp-method-title">Claude Code (terminal)</p>
-              <p class="mcp-method-sub">Run this in your terminal:</p>
-              <div class="copy-row">
-                <code data-testid="mcp-add-command">${safeAddCmd}</code>
-                <button type="button" class="btn btn-copy" data-copy="${safeAddCmd}"
-                        data-testid="copy-mcp-add-command">Copy</button>
-              </div>
-            </div>
-
-            <div class="mcp-method" data-testid="connect-method-claude-ai">
-              <p class="mcp-method-title">Claude.ai (web)</p>
-              <p class="mcp-method-sub">In Claude.ai, open <strong>Settings → Connectors</strong>,
-                 choose <strong>Add custom connector</strong>, and paste this endpoint:</p>
-              <div class="copy-row">
-                <code data-testid="mcp-endpoint">${safeEndpoint}</code>
-                <button type="button" class="btn btn-copy" data-copy="${safeEndpoint}"
-                        data-testid="copy-mcp-endpoint">Copy</button>
-              </div>
-              <p class="mcp-method-note">Claude.ai then redirects you here to sign in and
-                 approve. (Your hub must be reachable from the web for this.)</p>
-            </div>
-
-            <p class="mcp-connect-hint" data-testid="connect-any-client-hint">Using something
-               else? Point any MCP client at the same endpoint above. (ChatGPT and some other
-               web UIs call these "connectors.")</p>
-          </div>
+          ${backupBlock}
           <p class="vault-notes-cta">
             <a class="btn btn-primary" href="https://notes.parachute.computer/add?url=${vaultUrlForAdd}"
                target="_blank" rel="noopener" data-testid="open-notes-cta">Open Notes ↗</a>
@@ -521,19 +533,21 @@ function renderVaultCard(opts: VaultCardOpts): string {
                capture in this vault — or jump straight to bulk-importing Markdown/Obsidian
                notes into it.</span>
           </p>
+          <p class="vault-build-ui" data-testid="build-your-own-ui">Notes is just one way to see
+             your vault — when you're ready, your AI can build you a custom UI for it in a few
+             minutes. <a href="https://parachute.computer/onboarding/surface-build/"
+             target="_blank" rel="noopener" data-testid="build-your-own-ui-link">Build your own ↗</a></p>
           ${manageBlock}
-          ${tokenMintBlock}
         </div>`;
       })
       .join("");
     return `
       <section class="section" data-testid="vault-card">
         ${heading}
-        <p>Connect Claude (or any AI assistant) to your vault${
+        <p>Your vault${
           assignedVaults.length === 1 ? "" : "s"
-        } — pick Claude Code or
-          Claude.ai below — or open Notes for a browser UI. The first connection signs you in
-          to your hub over HTTPS and asks you to approve access.</p>
+        } at a glance — size, backup, and a browser UI. You connect your AI from the
+          steps above; the deeper settings live one click away.</p>
         <div class="vault-tiles">${tiles}
         </div>
       </section>`;
@@ -563,83 +577,62 @@ function renderVaultCard(opts: VaultCardOpts): string {
 }
 
 /**
- * The "mint an access token (for scripts / headless clients)" affordance on a
- * vault tile. Sits BELOW the OAuth connect block + Notes CTA — the no-token
- * OAuth path stays the recommended default; this is the secondary, opt-in
- * path for clients that can't do an interactive browser sign-in (cron jobs,
- * headless agents, a `curl` script).
+ * The backup-state block on a vault tile: a warm, plain-language line telling
+ * the owner their vault is backed up (local version history, optionally pushed
+ * to GitHub), plus a "Back up to GitHub ↗" action when no push remote is set.
  *
- * Renders one radio per verb the user's assignment role permits (`verbs` —
- * today always `["read", "write"]`). The UI NEVER offers a verb the server
- * would reject: a read-only assignment shows only "Read". An empty `verbs`
- * list (unknown / unmappable role) renders nothing — fail-closed, matching
- * the server's `vaultVerbsForUserVault` returning `[]`.
+ * `mirrorLine` is the pre-formatted backup line ("Backed up — full version
+ * history" / "… + GitHub") the GET handler built from the vault's mirror status,
+ * or `undefined` when the mirror fetch failed / backup is off / the user doesn't
+ * hold admin. When absent, the whole block is omitted silently — the everyday
+ * home never nags with a "not backed up" warning.
  *
- * The form POSTs `application/x-www-form-urlencoded` to
- * `/account/vault-token/<name>` with the CSRF hidden field + a `verb` radio —
- * same no-JS-required posture as the change-password and sign-out forms. The
- * `<details>` keeps it collapsed by default so the tile leads with the
- * recommended OAuth path.
+ * The "Back up to GitHub ↗" action reuses the EXISTING
+ * `/account/vault-admin-token/<name>` deep-link (the same POST `renderVaultAdminLink`
+ * uses) — it mints a `vault:<name>:admin` token and opens the vault config SPA,
+ * where the GitHub push is configured. We do NOT invent a new auth path. It's
+ * shown only when the user holds admin AND `pushing` is false (not already
+ * pushing to a remote) — `pushing` is a proper boolean threaded from the mirror
+ * status (`VaultMirrorStat.backedUpToRemote`), never re-derived from the
+ * display string.
  */
-function renderTokenMintBlock(
+function renderBackupBlock(
   vaultName: string,
-  safeVault: string,
-  verbs: VaultVerb[],
+  mirrorLine: string | undefined,
+  pushing: boolean,
+  holdsAdmin: boolean,
   csrfToken: string,
 ): string {
-  if (verbs.length === 0) return "";
-  // Path segment is URL-encoded; the action attribute is HTML-escaped on top.
-  const action = escapeHtml(`/account/vault-token/${encodeURIComponent(vaultName)}`);
-  const radios = verbs
-    .map((verb, i) => {
-      const checked = i === 0 ? " checked" : "";
-      const label =
-        verb === "read"
-          ? "Read-only"
-          : verb === "admin"
-            ? "Full (read, write, rotate tokens + config)"
-            : "Read + write";
-      return `
-              <label class="mint-verb-option">
-                <input type="radio" name="verb" value="${verb}"${checked}
-                       data-testid="mint-verb-${verb}" />
-                <span><strong>${verb}</strong> — ${label} access to <code>${safeVault}</code></span>
-              </label>`;
-    })
-    .join("");
+  if (!mirrorLine) return "";
+  // "Back up to GitHub ↗" — only when admin (the deep-link mints admin) and not
+  // already pushing. Reuses the vault-admin-token deep-link to open the SPA's
+  // backup page; no new auth path.
+  const action = escapeHtml(`/account/vault-admin-token/${encodeURIComponent(vaultName)}`);
+  const githubAction =
+    holdsAdmin && !pushing
+      ? `
+            <form method="POST" action="${action}" class="vault-backup-github"
+                  data-testid="backup-github-form">
+              ${renderCsrfHiddenInput(csrfToken)}
+              <button type="submit" class="btn btn-secondary" data-testid="backup-github-button">
+                Back up to GitHub ↗
+              </button>
+            </form>`
+      : "";
   return `
-          <details class="token-mint" data-testid="token-mint">
-            <summary data-testid="token-mint-summary">Mint an access token
-              <span class="token-mint-sub">for scripts / headless clients</span></summary>
-            <div class="token-mint-body">
-              <p class="token-mint-intro">Most clients should use the no-token
-                connect options above — they sign you in over HTTPS and never
-                ask you to paste a secret. Mint a token only for a script or
-                headless client that can't open a browser to sign in. It's a
-                bearer for <code>vault:${safeVault}:&lt;verb&gt;</code>, scoped to
-                <strong>this vault only</strong>, and you'll see it once.</p>
-              <form method="POST" action="${action}" class="mint-form"
-                    data-testid="mint-form">
-                ${renderCsrfHiddenInput(csrfToken)}
-                <fieldset class="mint-verbs">
-                  <legend>Access level</legend>${radios}
-                </fieldset>
-                <button type="submit" class="btn btn-secondary"
-                        data-testid="mint-token-button">Mint token</button>
-              </form>
-            </div>
-          </details>`;
+          <div class="vault-backup" data-testid="vault-backup">
+            <p class="vault-backup-line" data-testid="backup-state-line">
+              <span class="vault-backup-check" aria-hidden="true">✓</span>${escapeHtml(mirrorLine)}</p>${githubAction}
+          </div>`;
 }
 
 /**
- * The "Configure / back up this vault ↗" affordance on a vault tile. A small
- * POST form to `/account/vault-admin-token/<name>` that mints a
- * `vault:<name>:admin` deep-link token and redirects into the vault's own admin
- * SPA — where the assigned user can rotate vault tokens AND set up Git backup /
- * mirror config. Shown only when the user's assignment grants `admin` (gated by
- * the caller). A plain form button (no `<details>`) — this is a primary admin
- * action for an individual user, more prominent than the headless-token mint
- * below it.
+ * The "Advanced vault settings ↗" affordance on a vault tile — the single
+ * advanced entry point. A small POST form to `/account/vault-admin-token/<name>`
+ * that mints a `vault:<name>:admin` deep-link token and redirects into the
+ * vault's own config SPA — where the assigned user can manage schema, rotate
+ * access tokens, set retention, and edit raw mirror/backup config. Shown only
+ * when the user's assignment grants `admin` (gated by the caller).
  *
  * No-JS posture: a same-origin form POST that 303-redirects on success, same
  * shape as the other `/account/*` forms. CSRF-gated via the hidden field.
@@ -652,10 +645,10 @@ function renderVaultAdminLink(vaultName: string, csrfToken: string): string {
                 data-testid="vault-admin-form">
             ${renderCsrfHiddenInput(csrfToken)}
             <button type="submit" class="btn btn-secondary" data-testid="vault-admin-button">
-              Configure / back up this vault ↗
+              Advanced vault settings ↗
             </button>
-            <span class="vault-admin-sub">Open this vault's admin tools — rotate access tokens,
-               and set up Git backup (mirror to a repository).</span>
+            <span class="vault-admin-sub">Open this vault's config — schema, access tokens,
+               retention, and raw backup settings.</span>
           </form>`;
 }
 
@@ -766,8 +759,8 @@ const COPY_SCRIPT = `
 //
 // Same brand palette + font stack as account-change-password-ui.ts so the
 // `/account/*` family is visually cohesive. Extra rules (.section, .kv,
-// .vault-name, .mcp-connect, .copy-row) describe the new card + MCP
-// connect-block shapes this page introduces.
+// .vault-name, .vault-backup, .vault-build-ui, .copy-row) describe the card +
+// backup-state + onboarding-checklist shapes this page introduces.
 
 const STYLES = `
   *, *::before, *::after { box-sizing: border-box; }
@@ -989,6 +982,36 @@ const STYLES = `
     color: ${PALETTE.fgMuted};
     margin: 0 0 0.5rem;
   }
+  .vault-backup { margin: 0 0 0.5rem; }
+  .vault-backup-line {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    color: ${PALETTE.success};
+    margin: 0;
+  }
+  .vault-backup-check {
+    flex: 0 0 auto;
+    width: 1.1rem;
+    height: 1.1rem;
+    border-radius: 999px;
+    background: ${PALETTE.successSoft};
+    color: ${PALETTE.success};
+    border: 1px solid ${PALETTE.success};
+    font-size: 0.7rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .vault-backup-github { margin: 0.4rem 0 0; }
+  .vault-build-ui {
+    font-size: 0.82rem;
+    color: ${PALETTE.fgMuted};
+    margin: 0.6rem 0 0;
+    padding-top: 0.6rem;
+    border-top: 1px solid ${PALETTE.borderLight};
+  }
   .vault-tiles {
     display: flex;
     flex-direction: column;
@@ -1004,52 +1027,6 @@ const STYLES = `
   .vault-tile p { margin: 0.2rem 0; }
   .vault-tile p:last-child { margin-top: 0.5rem; }
 
-  .mcp-connect {
-    margin-bottom: 0.75rem;
-  }
-  .mcp-connect-label {
-    font-family: ${FONT_SERIF};
-    font-size: 1.05rem;
-    font-weight: 400;
-    color: ${PALETTE.fg};
-    margin: 0 0 0.3rem;
-  }
-  .mcp-connect-intro {
-    font-size: 0.85rem;
-    color: ${PALETTE.fgMuted};
-    margin: 0 0 0.75rem;
-  }
-  .mcp-method {
-    margin: 0.75rem 0;
-    padding-top: 0.6rem;
-    border-top: 1px solid ${PALETTE.borderLight};
-  }
-  .mcp-method-title {
-    font-size: 0.9rem;
-    font-weight: 600;
-    color: ${PALETTE.fg};
-    margin: 0 0 0.15rem;
-  }
-  .mcp-method-sub {
-    font-size: 0.82rem;
-    color: ${PALETTE.fgMuted};
-    margin: 0 0 0.4rem;
-  }
-  .mcp-method-note {
-    font-size: 0.78rem;
-    color: ${PALETTE.fgMuted};
-    margin: 0.35rem 0 0;
-  }
-  .mcp-field { margin: 0.5rem 0; }
-  .mcp-field-label {
-    display: block;
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: ${PALETTE.fgMuted};
-    font-family: ${FONT_MONO};
-    margin-bottom: 0.2rem;
-  }
   .vault-notes-cta {
     margin: 0.9rem 0 0;
     padding-top: 0.6rem;
@@ -1090,11 +1067,6 @@ const STYLES = `
     border-color: ${PALETTE.border};
   }
   .btn-copy:hover { background: ${PALETTE.bgSoft}; border-color: ${PALETTE.accent}; }
-  .mcp-connect-hint {
-    font-size: 0.82rem;
-    color: ${PALETTE.fgMuted};
-    margin: 0.4rem 0 0;
-  }
 
   .vault-admin-link {
     margin: 0.9rem 0 0;
@@ -1110,53 +1082,6 @@ const STYLES = `
     color: ${PALETTE.fgMuted};
     flex: 1 1 12rem;
   }
-
-  .token-mint {
-    margin: 0.9rem 0 0;
-    padding-top: 0.6rem;
-    border-top: 1px solid ${PALETTE.borderLight};
-  }
-  .token-mint > summary {
-    cursor: pointer;
-    font-size: 0.88rem;
-    font-weight: 600;
-    color: ${PALETTE.fg};
-    list-style: revert;
-  }
-  .token-mint-sub {
-    font-weight: 400;
-    font-size: 0.8rem;
-    color: ${PALETTE.fgMuted};
-  }
-  .token-mint-body { margin-top: 0.6rem; }
-  .token-mint-intro {
-    font-size: 0.8rem;
-    color: ${PALETTE.fgMuted};
-    margin: 0 0 0.6rem;
-  }
-  .mint-verbs {
-    border: 1px solid ${PALETTE.borderLight};
-    border-radius: 6px;
-    padding: 0.5rem 0.7rem;
-    margin: 0 0 0.6rem;
-  }
-  .mint-verbs legend {
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: ${PALETTE.fgMuted};
-    font-family: ${FONT_MONO};
-    padding: 0 0.3rem;
-  }
-  .mint-verb-option {
-    display: flex;
-    align-items: baseline;
-    gap: 0.5rem;
-    font-size: 0.85rem;
-    margin: 0.3rem 0;
-  }
-  .mint-verb-option input { margin: 0; }
-  .mint-form .btn { margin-top: 0.2rem; }
 
   .minted-banner {
     border: 1px solid ${PALETTE.accent};
@@ -1266,19 +1191,18 @@ const STYLES = `
     body { background: #1a1815; color: #e8e4dc; }
     .card { background: #25221d; border-color: #3a362f; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3); }
     h1, h2 { color: #f0ece4; }
-    .subtitle, .kv dt, .mcp-field-label, .mcp-connect-hint,
-    .mcp-connect-intro, .mcp-method-sub, .mcp-method-note,
-    .vault-notes-cta-sub, .vault-usage,
+    .subtitle, .kv dt,
+    .vault-notes-cta-sub, .vault-usage, .vault-build-ui,
     .onboarding-intro, .onboarding-step-sub, .onboarding-method,
     .onboarding-foot { color: #a8a29a; }
-    .vault-name strong, .mcp-connect-label, .mcp-method-title,
+    .vault-name strong,
     .onboarding-step-title, .onboarding-method strong,
     .onboarding-done-line { color: #f0ece4; }
     .onboarding-step-done .onboarding-step-title { color: #a8a29a; }
     code { background: #1f1c18; color: #e8e4dc; }
     .copy-row code { background: transparent; }
     .section { border-top-color: #3a362f; }
-    .mcp-method, .vault-notes-cta, .token-mint,
+    .vault-notes-cta, .vault-build-ui,
     .vault-admin-link, .account-security { border-top-color: #3a362f; }
     .vault-admin-sub { color: #a8a29a; }
     .get-started h3 { color: #f0ece4; }
@@ -1291,9 +1215,7 @@ const STYLES = `
     .copy-row { background: #1f1c18; border-color: #3a362f; }
     .btn-secondary, .btn-copy { color: #e8e4dc; border-color: #3a362f; }
     .btn-secondary:hover, .btn-copy:hover { background: #1f1c18; border-color: ${PALETTE.accent}; }
-    .token-mint > summary { color: #f0ece4; }
-    .token-mint-sub, .token-mint-intro, .mint-verbs legend, .minted-hint { color: #a8a29a; }
-    .mint-verbs { border-color: #3a362f; }
+    .minted-hint { color: #a8a29a; }
     .minted-title, .minted-warn { color: #f0ece4; }
   }
 `;
