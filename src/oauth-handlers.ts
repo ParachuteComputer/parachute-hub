@@ -353,17 +353,61 @@ function htmlError(title: string, message: string, status: number): Response {
   return htmlResponse(renderError({ title, message, status }), status);
 }
 
+/**
+ * Build the authorize redirect location, encoding the response parameters per
+ * the OAuth 2.0 Multiple Response Type Encoding Practices `response_mode`:
+ *
+ *   - `"query"` (the default — null normalizes to it): append to the query
+ *     string (`<redirect_uri>?code=...&state=...`). Unchanged historical
+ *     behavior.
+ *   - `"fragment"`: append to the URL fragment (`<redirect_uri>#code=...&
+ *     state=...`), preserving any fragment the redirect_uri already carries.
+ *     The native-app path — the Pebble phone app delivers the fragment of a
+ *     `pebblejs://close#...` deep link to the watchapp JS but drops query-form
+ *     params, so query-mode `code` never arrives.
+ *
+ * `params` is an ordered list of [key, value] pairs (skipping null values) so
+ * the emitted ordering is stable (`code` before `state`, `error` before
+ * `error_description` before `state`) — easier to assert in tests and matches
+ * what clients expect.
+ */
+function buildAuthorizeRedirectLocation(
+  redirectUri: string,
+  params: ReadonlyArray<readonly [key: string, value: string | null]>,
+  responseMode: "query" | "fragment" | null,
+): string {
+  const u = new URL(redirectUri);
+  const present = params.filter((p): p is [string, string] => p[1] !== null);
+  if (responseMode === "fragment") {
+    // Build the fragment params on top of any fragment the redirect_uri
+    // already carries (rare, but RFC-permitted). `URLSearchParams` gives us
+    // correct percent-encoding for the fragment body.
+    const frag = new URLSearchParams(u.hash.startsWith("#") ? u.hash.slice(1) : u.hash);
+    for (const [k, v] of present) frag.set(k, v);
+    u.hash = frag.toString();
+  } else {
+    for (const [k, v] of present) u.searchParams.set(k, v);
+  }
+  return u.toString();
+}
+
 function oauthErrorRedirect(
   redirectUri: string,
   error: string,
   description: string,
   state: string | null,
+  responseMode: "query" | "fragment" | null = null,
 ): Response {
-  const u = new URL(redirectUri);
-  u.searchParams.set("error", error);
-  u.searchParams.set("error_description", description);
-  if (state) u.searchParams.set("state", state);
-  return redirectResponse(u.toString());
+  const location = buildAuthorizeRedirectLocation(
+    redirectUri,
+    [
+      ["error", error],
+      ["error_description", description],
+      ["state", state],
+    ],
+    responseMode,
+  );
+  return redirectResponse(location);
 }
 
 // --- /.well-known/oauth-protected-resource ---------------------------------
@@ -505,6 +549,22 @@ function parseAuthorizeFormParams(url: URL): AuthorizeFormParams | { error: stri
   if (!responseType) return { error: "missing response_type" };
   if (!codeChallenge) return { error: "missing code_challenge" };
   if (!codeChallengeMethod) return { error: "missing code_challenge_method" };
+  // OAuth 2.0 Multiple Response Type Encoding Practices `response_mode`.
+  // Optional; absent → null (defaults to query at redirect time). Only the two
+  // values meaningful for the authorization-code flow are accepted —
+  // `query` (explicit default) and `fragment` (native-app path). Any other
+  // value is rejected with the standard invalid_request error rather than
+  // silently ignored, so a client asking for an unsupported encoding
+  // (e.g. form_post, web_message) learns the request was malformed.
+  const responseModeRaw = url.searchParams.get("response_mode");
+  let responseMode: "query" | "fragment" | null;
+  if (responseModeRaw === null || responseModeRaw === "") {
+    responseMode = null;
+  } else if (responseModeRaw === "query" || responseModeRaw === "fragment") {
+    responseMode = responseModeRaw;
+  } else {
+    return { error: `unsupported response_mode "${responseModeRaw}"` };
+  }
   return {
     clientId,
     redirectUri,
@@ -516,6 +576,7 @@ function parseAuthorizeFormParams(url: URL): AuthorizeFormParams | { error: stri
     // RFC 8707 resource indicator (optional). When present and resolvable to
     // a per-vault MCP resource, drives the narrow-consent + named-scope path.
     resource: url.searchParams.get("resource"),
+    responseMode,
   };
 }
 
@@ -664,6 +725,10 @@ function pendingClientResponse(
     // state lives in the query string by design).
     const requestRedirectUri = authorizeUrl.searchParams.get("redirect_uri") ?? "";
     const requestState = authorizeUrl.searchParams.get("state") ?? undefined;
+    // Only `"fragment"` is plumbed; the default query mode is left undefined
+    // (the deny handler treats absent/anything-else as query).
+    const requestResponseMode =
+      authorizeUrl.searchParams.get("response_mode") === "fragment" ? "fragment" : undefined;
     return htmlResponse(
       renderApprovePending({
         clientName: client.clientName ?? client.clientId,
@@ -677,6 +742,7 @@ function pendingClientResponse(
           returnTo,
           redirectUri: requestRedirectUri,
           ...(requestState !== undefined && { state: requestState }),
+          ...(requestResponseMode !== undefined && { responseMode: requestResponseMode }),
         },
         loginNextUrl: returnTo,
       }),
@@ -867,6 +933,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       "unsupported_response_type",
       "only response_type=code is supported",
       parsed.state,
+      parsed.responseMode,
     );
   }
   if (parsed.codeChallengeMethod !== "S256") {
@@ -875,6 +942,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       "invalid_request",
       "PKCE S256 is required",
       parsed.state,
+      parsed.responseMode,
     );
   }
   let client = getClient(db, parsed.clientId);
@@ -1017,6 +1085,7 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       "invalid_scope",
       `requested scopes are not available via the public authorization endpoint: ${blocked.join(", ")}`,
       parsed.state,
+      parsed.responseMode,
     );
   }
 
@@ -1284,6 +1353,7 @@ function issueAuthCodeRedirect(
       "invalid_scope",
       "You can grant only the access you hold on this vault; an admin grant requires hub-owner authority.",
       params.state,
+      params.responseMode,
     );
   }
 
@@ -1300,10 +1370,15 @@ function issueAuthCodeRedirect(
     codeChallengeMethod: params.codeChallengeMethod,
     now: deps.now,
   });
-  const u = new URL(params.redirectUri);
-  u.searchParams.set("code", code.code);
-  if (params.state) u.searchParams.set("state", params.state);
-  return redirectResponse(u.toString());
+  const location = buildAuthorizeRedirectLocation(
+    params.redirectUri,
+    [
+      ["code", code.code],
+      ["state", params.state],
+    ],
+    params.responseMode,
+  );
+  return redirectResponse(location);
 }
 
 /**
@@ -1492,6 +1567,7 @@ async function handleConsentSubmit(
       "access_denied",
       "user denied the authorization request",
       params.state,
+      params.responseMode,
     );
   }
   let scopes = params.scope.split(" ").filter((s) => s.length > 0);
@@ -1505,6 +1581,7 @@ async function handleConsentSubmit(
       "invalid_scope",
       `requested scopes are not available via the public authorization endpoint: ${blockedHere.join(", ")}`,
       params.state,
+      params.responseMode,
     );
   }
   // Multi-user Phase 2 PR 2: non-admin users are pinned to a list of one
@@ -1807,14 +1884,20 @@ export async function handleApproveClientPost(
       );
     }
     const stateRaw = form.get("state");
-    const denyState = typeof stateRaw === "string" && stateRaw.length > 0 ? stateRaw : undefined;
+    // null (not undefined) on purpose: buildAuthorizeRedirectLocation filters nulls.
+    const denyState = typeof stateRaw === "string" && stateRaw.length > 0 ? stateRaw : null;
+    // `response_mode` round-trips through the approve-pending form just like
+    // redirect_uri/state (hidden input) so the Deny error redirect honors the
+    // native-app fragment encoding the client asked for. Anything other than
+    // the literal `"fragment"` falls back to query (the default + back-compat
+    // for forms that don't carry the field).
+    const denyResponseMode = form.get("response_mode") === "fragment" ? "fragment" : null;
     // `new URL()` could in principle throw if a legacy code path bypassed
-    // `isValidRedirectUri` at registration and wrote a non-http(s) URI.
+    // `isValidRedirectUri` at registration and wrote an unparseable URI.
     // Current DCR enforces validity at write time, so this catch is
     // belt-and-suspenders, but cost is near-zero.
-    let target: URL;
     try {
-      target = new URL(denyRedirectUri);
+      new URL(denyRedirectUri);
     } catch {
       return htmlError(
         "Invalid form submission",
@@ -1822,10 +1905,16 @@ export async function handleApproveClientPost(
         400,
       );
     }
-    target.searchParams.set("error", "access_denied");
-    target.searchParams.set("error_description", "The user denied the authorization request.");
-    if (denyState !== undefined) target.searchParams.set("state", denyState);
-    return redirectResponse(target.toString());
+    const location = buildAuthorizeRedirectLocation(
+      denyRedirectUri,
+      [
+        ["error", "access_denied"],
+        ["error_description", "The user denied the authorization request."],
+        ["state", denyState],
+      ],
+      denyResponseMode,
+    );
+    return redirectResponse(location);
   }
 
   // Approve branch (default — also the back-compat path for any form that
@@ -1869,6 +1958,10 @@ export function isSafeAuthorizeReturnTo(value: string): boolean {
 }
 
 function paramsFromForm(form: Awaited<ReturnType<Request["formData"]>>): AuthorizeFormParams {
+  // `response_mode` round-trips through the consent form's hidden inputs.
+  // Only the literal `"fragment"` flips the encoding; everything else (absent,
+  // empty, or the explicit `"query"`) normalizes to null = query mode.
+  const responseModeRaw = form.get("response_mode");
   return {
     clientId: String(form.get("client_id") ?? ""),
     redirectUri: String(form.get("redirect_uri") ?? ""),
@@ -1878,6 +1971,7 @@ function paramsFromForm(form: Awaited<ReturnType<Request["formData"]>>): Authori
     codeChallengeMethod: String(form.get("code_challenge_method") ?? "S256"),
     state: (form.get("state") as string | null) ?? null,
     resource: (form.get("resource") as string | null) ?? null,
+    responseMode: responseModeRaw === "fragment" ? "fragment" : null,
   };
 }
 
@@ -1895,6 +1989,11 @@ function authorizeParamsToQuery(p: AuthorizeFormParams): Record<string, string> 
   // the resource-bound narrowing survives a sign-in (it re-enters GET
   // /oauth/authorize with the original params).
   if (p.resource) q.resource = p.resource;
+  // Round-trip response_mode (OAuth 2.0 Multiple Response Type Encoding
+  // Practices) through the login redirect so a native app's fragment request
+  // survives sign-in (re-enters GET /oauth/authorize with the original
+  // params). Null = query mode, which we omit (it's the default).
+  if (p.responseMode) q.response_mode = p.responseMode;
   return q;
 }
 

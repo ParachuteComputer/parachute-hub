@@ -1091,6 +1091,261 @@ describe("handleAuthorizePost — vault picker", () => {
   });
 });
 
+describe("response_mode (OAuth 2.0 Multiple Response Type Encoding Practices)", () => {
+  // Helper: build a consent POST that mints a code, used by the success cases.
+  function consentForm(reg: ReturnType<typeof registerClient>, extra: Record<string, string>) {
+    const { challenge } = makePkce();
+    return new URLSearchParams({
+      __action: "consent",
+      __csrf: TEST_CSRF,
+      approve: "yes",
+      client_id: reg.client.clientId,
+      redirect_uri: reg.client.redirectUris[0] ?? "",
+      response_type: "code",
+      scope: "",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      ...extra,
+    });
+  }
+
+  test("default (no response_mode): success redirect puts code+state in the query", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const form = consentForm(reg, { state: "st-query" });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(302);
+      const target = new URL(res.headers.get("location") ?? "");
+      // Code + state live in the query; no fragment.
+      expect(target.searchParams.get("code")).toBeTruthy();
+      expect(target.searchParams.get("state")).toBe("st-query");
+      expect(target.hash).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("explicit response_mode=query behaves identically to absent", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const form = consentForm(reg, { state: "st-explicit-query", response_mode: "query" });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(302);
+      const target = new URL(res.headers.get("location") ?? "");
+      expect(target.searchParams.get("code")).toBeTruthy();
+      expect(target.searchParams.get("state")).toBe("st-explicit-query");
+      expect(target.hash).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("response_mode=fragment merges into a pre-existing fragment on the registered URI", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["pebblejs://close#session=abc"] });
+      const form = consentForm(reg, {
+        state: "st-merge",
+        response_mode: "fragment",
+        redirect_uri: "pebblejs://close#session=abc",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(302);
+      const loc = res.headers.get("location") ?? "";
+      const frag = loc.split("#")[1] ?? "";
+      const fragParams = new URLSearchParams(frag);
+      // Pre-existing fragment data survives alongside code + state.
+      expect(fragParams.get("session")).toBe("abc");
+      expect(fragParams.get("code")).toBeTruthy();
+      expect(fragParams.get("state")).toBe("st-merge");
+      expect(loc.split("#")[0]?.includes("code=")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("response_mode=fragment: success redirect puts code+state in the fragment", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      // Custom-scheme native-app client (the Pebble shape).
+      const reg = registerClient(db, { redirectUris: ["pebblejs://close"] });
+      const form = consentForm(reg, { state: "st-frag", response_mode: "fragment" });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(302);
+      const loc = res.headers.get("location") ?? "";
+      expect(loc.startsWith("pebblejs://close#")).toBe(true);
+      const target = new URL(loc);
+      // Nothing in the query — code + state are in the fragment.
+      expect(target.search).toBe("");
+      const frag = new URLSearchParams(target.hash.slice(1));
+      expect(frag.get("code")).toBeTruthy();
+      expect(frag.get("state")).toBe("st-frag");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("response_mode=fragment: consent-deny error redirect lands in the fragment", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["pebblejs://close"] });
+      const { challenge } = makePkce();
+      const form = new URLSearchParams({
+        __action: "consent",
+        __csrf: TEST_CSRF,
+        approve: "no",
+        client_id: reg.client.clientId,
+        redirect_uri: "pebblejs://close",
+        response_type: "code",
+        scope: "vault:read",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        state: "deny-frag",
+        response_mode: "fragment",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, 86400)}`,
+        },
+      });
+      const res = await handleAuthorizePost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      const target = new URL(res.headers.get("location") ?? "");
+      expect(target.search).toBe("");
+      const frag = new URLSearchParams(target.hash.slice(1));
+      expect(frag.get("error")).toBe("access_denied");
+      expect(frag.get("state")).toBe("deny-frag");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("GET /oauth/authorize with an unknown response_mode → invalid_request 400", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          response_mode: "form_post",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      // Malformed request param → HTML 400 (we can't trust the redirect_uri
+      // pairing enough to bounce a structured error, same as other parse
+      // failures in this handler).
+      expect(res.status).toBe(400);
+      const html = await res.text();
+      expect(html).toContain("response_mode");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("GET /oauth/authorize with response_mode=fragment is accepted (round-trips to consent)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, { redirectUris: ["pebblejs://close"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "pebblejs://close",
+          response_type: "code",
+          scope: "scribe:transcribe",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          response_mode: "fragment",
+          state: "rt-frag",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      // Consent screen renders (200 HTML) and round-trips response_mode through
+      // a hidden input so the eventual success redirect honors fragment mode.
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('name="response_mode" value="fragment"');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 describe("handleAuthorizePost — login submit", () => {
   test("sets session cookie and redirects to GET on valid credentials", async () => {
     const { db, cleanup } = await makeDb();
@@ -5202,6 +5457,53 @@ describe("inline approve button on pending /oauth/authorize (#208)", () => {
       expect(res.status).toBe(302);
       expect(res.headers.get("location")).toBe(returnTo);
       expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("deny POST with response_mode=fragment → error params in the URL fragment", async () => {
+    // Native-app path: a custom-scheme client that requested
+    // response_mode=fragment must get the access_denied error in the fragment
+    // (the Pebble watchapp only sees the fragment of a pebblejs://close deep
+    // link). The approve-pending form round-trips response_mode as a hidden
+    // input so the deny handler honors it.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["pebblejs://close"],
+        status: "pending",
+      });
+      const form = new URLSearchParams({
+        __csrf: TEST_CSRF,
+        client_id: reg.client.clientId,
+        return_to: `/oauth/authorize?client_id=${reg.client.clientId}`,
+        decision: "deny",
+        redirect_uri: "pebblejs://close",
+        state: "deny-frag-state",
+        response_mode: "fragment",
+      });
+      const req = new Request(`${ISSUER}/oauth/authorize/approve`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, SESSION_COOKIE_TTL_S)}`,
+          origin: ISSUER,
+        },
+      });
+      const res = await handleApproveClientPost(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      const loc = res.headers.get("location") ?? "";
+      // No query-form error params — they live in the fragment.
+      expect(loc).not.toContain("?error=");
+      const target = new URL(loc);
+      expect(target.search).toBe("");
+      const frag = new URLSearchParams(target.hash.slice(1));
+      expect(frag.get("error")).toBe("access_denied");
+      expect(frag.get("state")).toBe("deny-frag-state");
     } finally {
       cleanup();
     }

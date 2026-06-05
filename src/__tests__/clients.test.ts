@@ -74,7 +74,7 @@ describe("registerClient", () => {
     }
   });
 
-  test("rejects non-http(s) redirect_uri", () => {
+  test("rejects denylisted-scheme + relative redirect_uri", () => {
     const { db, cleanup } = makeDb();
     try {
       expect(() => registerClient(db, { redirectUris: ["javascript:alert(1)"] })).toThrow(
@@ -83,6 +83,18 @@ describe("registerClient", () => {
       expect(() => registerClient(db, { redirectUris: ["/relative/path"] })).toThrow(
         /invalid redirect_uri/,
       );
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("accepts a private-use custom-scheme redirect_uri (RFC 8252 §7.1)", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const r = registerClient(db, { redirectUris: ["pebblejs://close"] });
+      expect(r.client.redirectUris).toEqual(["pebblejs://close"]);
+      const r2 = registerClient(db, { redirectUris: ["com.example.myapp://callback"] });
+      expect(r2.client.redirectUris).toEqual(["com.example.myapp://callback"]);
     } finally {
       cleanup();
     }
@@ -255,9 +267,29 @@ describe("isValidRedirectUri", () => {
     expect(isValidRedirectUri("http://localhost:3000/cb")).toBe(true);
     expect(isValidRedirectUri("https://example.com/cb")).toBe(true);
   });
-  test("rejects javascript:, data:, relative paths, garbage", () => {
+  test("accepts private-use custom schemes (RFC 8252 §7.1)", () => {
+    // Native apps register a private-use URI scheme they control as the
+    // redirect target — the Pebble watchapp uses pebblejs://close.
+    expect(isValidRedirectUri("pebblejs://close")).toBe(true);
+    expect(isValidRedirectUri("myapp://callback")).toBe(true);
+    // Reverse-DNS scheme name (the RFC 8252 recommendation).
+    expect(isValidRedirectUri("com.example.app://oauth/redirect")).toBe(true);
+  });
+  test("rejects denylisted schemes", () => {
     expect(isValidRedirectUri("javascript:alert(1)")).toBe(false);
     expect(isValidRedirectUri("data:text/html,x")).toBe(false);
+    expect(isValidRedirectUri("file:///etc/passwd")).toBe(false);
+    expect(isValidRedirectUri("vbscript:msgbox(1)")).toBe(false);
+    expect(isValidRedirectUri("blob:https://example.com/uuid")).toBe(false);
+    expect(isValidRedirectUri("intent:android.intent.action.VIEW")).toBe(false);
+    expect(isValidRedirectUri("ms-appx://app/page")).toBe(false);
+    expect(isValidRedirectUri("market://details?id=x")).toBe(false);
+    expect(isValidRedirectUri("tel:+15551234567")).toBe(false);
+    expect(isValidRedirectUri("sms:+15551234567")).toBe(false);
+    expect(isValidRedirectUri("mailto:a@b.c")).toBe(false);
+    expect(isValidRedirectUri("about:blank")).toBe(false);
+  });
+  test("rejects relative paths and garbage (unparseable)", () => {
     expect(isValidRedirectUri("/relative")).toBe(false);
     expect(isValidRedirectUri("not a url")).toBe(false);
   });
