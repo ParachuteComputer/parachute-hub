@@ -287,9 +287,12 @@ function printTailscaleSetupGuidance(r: Resolved, readiness: ProviderAvailabilit
  *
  *   - Confirm with `Install cloudflared now? [Y/n]` (Enter accepts).
  *   - Run the curl into /usr/local/bin/cloudflared + chmod +x. Root writes
- *     directly; non-root wraps each step in `sudo` (passwordless `sudo -n`
- *     succeeds non-interactively; an interactive sudo will prompt for the
- *     password under the inherit-stdio runner).
+ *     directly; non-root wraps each step in `sudo -n` (non-interactive — only
+ *     succeeds when sudo creds are already cached / passwordless). We use `-n`
+ *     deliberately: init often runs detached/unattended on a fresh server (SSH
+ *     + tmux, a cloud-init script), where a blocking interactive sudo password
+ *     prompt would hang the whole flow. `-n` fails fast instead, and we fall
+ *     back to printing the manual command.
  *   - Verify with `cloudflared --version`.
  *
  * Returns true only when cloudflared is on PATH afterward. On decline, missing
@@ -324,10 +327,12 @@ async function offerLinuxCloudflaredInstall(r: Resolved): Promise<boolean> {
 
   const isRoot = r.getuid() === 0;
   const dest = "/usr/local/bin/cloudflared";
-  // Root writes directly; non-root prefixes each privileged step with `sudo`.
-  // `sudo` with no cached creds + no tty will fail cleanly (non-zero exit) and
-  // we fall back to the printed instructions — never hang init.
-  const sudo = isRoot ? [] : ["sudo"];
+  // Root writes directly; non-root prefixes each privileged step with `sudo -n`
+  // (non-interactive). `-n` never prompts for a password: it exits non-zero
+  // when creds aren't cached, so a detached/unattended init (SSH + tmux, a
+  // cloud-init script) fails fast and falls back to the printed instructions
+  // rather than hanging on a password prompt nobody's there to answer.
+  const sudo = isRoot ? [] : ["sudo", "-n"];
   const curlCmd = [...sudo, "curl", "-L", "-o", dest, downloadUrl];
   const chmodCmd = [...sudo, "chmod", "+x", dest];
 
@@ -336,7 +341,11 @@ async function offerLinuxCloudflaredInstall(r: Resolved): Promise<boolean> {
   const curlCode = await r.interactiveRunner(curlCmd);
   if (curlCode !== 0) {
     r.log(`Download failed (exit ${curlCode}).`);
-    if (!isRoot) r.log("(If sudo needs a password, run the commands below manually.)");
+    if (!isRoot) {
+      r.log(
+        "(`sudo -n` needs cached credentials; run `sudo -v` first, or use the commands below.)",
+      );
+    }
     printManualAndBail();
     return false;
   }

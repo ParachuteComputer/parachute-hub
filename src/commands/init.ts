@@ -801,9 +801,14 @@ export async function init(opts: InitOpts = {}): Promise<number> {
 /** The exact retry command for a given exposure choice (hub#565 / #566). */
 export function exposeRetryCommand(choice: ExposeChoice): string {
   if (choice === "tailnet") return "parachute expose public --tailnet";
-  // Default the bare command to `--cloudflare` so the operator who picked
-  // Cloudflare lands in the right provider on retry (the bare
-  // `parachute expose public` defaults to Tailscale Funnel — hub#566).
+  // `none` never reaches here in practice — `runExposureChoice("none")` always
+  // returns 0, so `warnExposeFailedContinue` (the only caller) is never invoked
+  // for it. It falls through to the `--cloudflare` branch below; harmless, and
+  // spelled out so the fallthrough isn't read as a bug.
+  // Cloudflare (and the unreachable `none`): default the bare command to
+  // `--cloudflare` so the operator who picked Cloudflare lands in the right
+  // provider on retry (bare `parachute expose public` defaults to Tailscale
+  // Funnel — hub#566).
   return "parachute expose public --cloudflare";
 }
 

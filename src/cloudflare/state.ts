@@ -257,9 +257,11 @@ export function clearPendingHostname(path: string = CLOUDFLARED_STATE_PATH): voi
 }
 
 /**
- * Pure: drop the named tunnel from state. Returns undefined when the result
- * would be empty so callers can `clearCloudflaredState` instead of writing
- * an empty file.
+ * Pure: drop the named tunnel from state. Returns undefined when NO tunnels AND
+ * no pending hostname remain, so callers can `clearCloudflaredState` instead of
+ * writing an empty file. A pending hostname (hub#567) is carried forward — both
+ * when other tunnels survive and when it's the only thing left — so removing a
+ * tunnel never discards a typed-but-not-routed hostname awaiting retry.
  */
 export function withoutTunnelRecord(
   state: CloudflaredState | undefined,
@@ -267,8 +269,10 @@ export function withoutTunnelRecord(
 ): CloudflaredState | undefined {
   if (!state) return undefined;
   const { [tunnelName]: _dropped, ...rest } = state.tunnels;
-  if (Object.keys(rest).length === 0) return undefined;
-  return { version: 2, tunnels: rest };
+  if (Object.keys(rest).length === 0 && !state.pendingHostname) return undefined;
+  return state.pendingHostname
+    ? { version: 2, tunnels: rest, pendingHostname: state.pendingHostname }
+    : { version: 2, tunnels: rest };
 }
 
 /** All tunnel records, in name-sorted order so output is deterministic. */

@@ -658,10 +658,12 @@ describe("exposePublicInteractive — neither ready", () => {
         runAuthPreflightImpl: noopPreflight,
       });
       expect(code).toBe(0);
-      // Non-root prefixes both privileged steps with sudo.
-      expect(interactiveCmds[0]?.[0]).toBe("sudo");
+      // Non-root prefixes both privileged steps with non-interactive `sudo -n`
+      // (fails fast instead of hanging on a password prompt under a detached
+      // init).
+      expect(interactiveCmds[0]?.slice(0, 2)).toEqual(["sudo", "-n"]);
       expect(interactiveCmds[0]).toContain("curl");
-      expect(interactiveCmds[1]?.[0]).toBe("sudo");
+      expect(interactiveCmds[1]?.slice(0, 2)).toEqual(["sudo", "-n"]);
       expect(interactiveCmds[1]).toContain("chmod");
     } finally {
       env.cleanup();

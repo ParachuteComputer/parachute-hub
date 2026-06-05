@@ -334,4 +334,23 @@ describe("hub#567 pending hostname", () => {
     expect(next.pendingHostname).toBe("a.example.com");
     expect(next.tunnels.parachute).toEqual(sampleRecord);
   });
+
+  test("withoutTunnelRecord carries the pending hostname when it's the only thing left", () => {
+    const seed: CloudflaredState = {
+      version: 2,
+      tunnels: { parachute: sampleRecord },
+      pendingHostname: "a.example.com",
+    };
+    // Removing the last tunnel must NOT discard a typed-but-not-routed hostname.
+    expect(withoutTunnelRecord(seed, "parachute")).toEqual({
+      version: 2,
+      tunnels: {},
+      pendingHostname: "a.example.com",
+    });
+  });
+
+  test("withoutTunnelRecord returns undefined when no tunnels AND no pending hostname remain", () => {
+    const seed: CloudflaredState = { version: 2, tunnels: { parachute: sampleRecord } };
+    expect(withoutTunnelRecord(seed, "parachute")).toBeUndefined();
+  });
 });
