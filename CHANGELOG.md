@@ -2,6 +2,112 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
+> **Backfill note (2026-06-06).** The entire 0.6.x line (0.6.0 → 0.6.4) shipped without changelog entries — the file stopped at `0.5.13-rc.48`. The block below backfills it retroactively at **stable granularity**: one entry per published stable, each summarizing its rc chain rather than logging every `rc.N` as the governance preamble prescribes. This mirrors the file's existing honesty about the 0.3.6 drift. Per-rc detail lives in the git history and tags (`git log v0.6.0..v0.6.1`, etc.); the [v0.6.4 GitHub Release](https://github.com/ParachuteComputer/parachute-hub/releases/tag/v0.6.4) is the only one with curated release notes. All five stables (0.6.0, 0.6.1, 0.6.2, 0.6.3, 0.6.4) published to npm; no intermediate stable was skipped.
+
+## [0.6.4] - 2026-06-06
+
+**Fresh-install onboarding overhaul + a multi-user/account security wave.** The 0.6.4-rc chain (rc.1–rc.10) promoted to stable. Driven by real field transcripts of operators hitting dead-ends on fresh boxes.
+
+### Security & multi-user
+
+- **Per-request force-change-password enforcement** (closes #469, PR #552). A signed-in user on an admin-set temporary password could navigate around the change gate and operate indefinitely — the gate was session-redirect-only, not enforced per request. Now every request re-checks; an OAuth gate complement landed alongside.
+- **First-claim bootstrap token** (#576, PR #585). On a public expose with no admin yet, `init` prints a one-time terminal token the wizard requires before creating the first admin (Render-style). Whoever finds your URL first can no longer claim your hub.
+- **One-time expiring invite links** that provision an account + its own vault (#553); cross-tenant invite assignment rejected, invite vault name defaults to the username (#557).
+- **2FA recommended when exposing publicly** — enrollment pointers shown on `expose` (#554).
+- **Pre-multi-user hardening** across mint-token, layer detection, and scribe auth (#550); scope-guard force-reloads JWKS and retries once on rotation-class verification failures (#549).
+- `deleteUser` no longer 500s on OAuth-authorized users (clears `auth_codes`) (#559).
+
+### Install & init
+
+- `parachute init` never dead-ends: expose failures warn and continue to the wizard URL instead of aborting; the Cloudflare flow no longer requires a vault to route; typed hostnames persist across retries (#564–#567, #574).
+- **`parachute install <svc>` is light** — install → register → start → "manage it in the admin UI." The interactive interview is opt-in via `--interactive` (#579). The "Blocked 1 postinstall" warning on `bun add -g` is gone (#568).
+
+### Lifecycle robustness
+
+- **Dual-lifecycle race closed**: install sweeps stale per-module units; the supervisor names port squatters with pid + command instead of crash-looping (#580, #581).
+- **`init`/`expose` version-check the running hub** and restart the unit when it's stale (#590, PR #591) — no more wiring a tunnel to a months-old zombie process.
+- Deterministic OAuth issuer via expose-state fallback on both origin chokepoints (#531); supervisor restarts rebuild spawn env (#532); canonical `services.json` port wins over a stale `.env` PORT (#537, #538); hub binds its port before booting modules + structured errors from module-ops (#536, #540, #545); launchd hubs find operator tools via enriched PATH (#546); status reports run-state for non-curated supervised modules (#539, #542); per-arm lazy imports so one broken command module can't take down the whole CLI (#533); test-isolation guards against real `launchctl` under test (#535, #541, #556).
+- `expose off --cloudflare` clears the propagated hub origin, ending the post-teardown iss-mismatch class (#503, PR #587).
+
+### Account & connect UX
+
+- `/account` is a **first-run onboarding checklist** (account → connect your AI → vault) (#561), with a consolidated owner home that dedups connect, surfaces backup state, drops the token-mint, and hints at building your own UI (#571).
+- Self-serve vault-admin-token unlock + per-vault usage on the account surface (#551).
+- "You're connected" no longer false-positives on a Notes browser sign-in, and a "Connect another AI" expander stays available once connected (#583).
+- POSTs to a bare `/vault/<name>` URL 308-redirect to `/vault/<name>/mcp` — pasting the URL without the suffix into an MCP client just works (#525, PR #587).
+- Phantom `default` vault row removed from discovery on fresh boxes (#577).
+
+## [0.6.3] - 2026-06-02
+
+**Supervisor unification completed (Phases 1–6) + the loopback trust-model restoration.** The 0.6.3-rc chain landed the long-running "hub-as-supervisor, modules = children" arc: there is now one runtime (`parachute serve` under a process manager), no detached-daemon model.
+
+### Changed
+
+- **Supervisor unification, Phases 1–6** (#495–#510, #514). Module-ops start/stop endpoints + a CLI module-ops client (Phase 1); supervisor hardening — process-group reaping, per-module log ring buffer, port-readiness + structured start-errors (Phase 2a); a generalized `ManagedUnit` with env block + install-without-start (Phase 2b); `ensureHubUnit` + `init` installs/starts the hub unit (Phase 3a); start/stop/restart cutover to drive the supervisor with a detached fallback + fresh-box operator-token closure (Phase 3b); `status` reads the platform manager + running supervisor (Phase 3c); expose decouple + `upgrade-hub` restarts the unit (Phase 4 CLI); `POST /api/hub/upgrade` + detached one-shot helper + admin-SPA hub-upgrade affordance (Phase 4 SPA); migrate detached→supervised cutover + archive-guard fix + auto-offer (Phase 5a); **retire the detached spawners + collapse the dual-dispatch bridge — supervised is the only runtime** (Phase 5b); doc rewrite across Service-lifecycle, CLAUDE.md, help, and route headers (Phase 6).
+
+### Fixed
+
+- **Supervised hub unit binds `127.0.0.1`, not `0.0.0.0`** — restores the loopback trust model (security, #524). The supervised unit had been binding all interfaces.
+- **`migrate`/`teardown` disables stale per-module autostart units** (`parachute-<short>` systemd/launchd) so they can't race the supervisor (#522, #523).
+- **Operator-token validation accepts the hub's known issuers** so loopback CLI + `status` work on exposed boxes (#516, #517, #518).
+
+### Added
+
+- `/account` starter-prompts card + connector-terminology cleanup (#529).
+
+## [0.6.2] - 2026-05-31
+
+**Reboot survival for the public connector + the import-notes deep-link.**
+
+### Added
+
+- **Reboot-persistent `cloudflared` connector** — the public-expose connector is installed as a managed unit so it survives a host reboot (#493). Headless non-root Linux boxes need `loginctl enable-linger` to cold-boot cleanly.
+- **`/account` "Import notes" deep-link** to the Notes import flow (#493).
+
+## [0.6.1] - 2026-05-31
+
+**Per-hostname Cloudflare tunnels + the scripting token + OAuth scope hygiene.**
+
+### Fixed
+
+- **Per-hostname Cloudflare tunnels** — a fixed shared tunnel name made two machines share one tunnel UUID; Cloudflare load-balances connectors across them, producing cross-host 404s. Each host now gets its own tunnel; CLI messaging clarified (#491).
+- **Vault-bound consent scope-drop + container-boot dist build** (#487) — the published container now builds its `web/ui` dist on boot.
+
+### Added
+
+- **`--ephemeral` short-TTL `mint-token`** for scripting — ideal for cron/CI credentials (#488).
+- **Assigned (non-admin) users can grant `vault:<name>:admin` to their own OAuth client** for vaults they're assigned to (#490).
+
+### Changed
+
+- **OAuth advertises optional-module scopes only when the module is installed** — scribe/channel scopes no longer appear in metadata on hubs that don't run them (#489).
+
+## [0.6.0] - 2026-05-29
+
+**Single OAuth consent + the pvt_* retirement endgame + first-vault import + real 2FA.** Closes out the capability-attenuation auth arc (started in the 0.5.14-rc chain) and ships the unified `parachute init` setup flow.
+
+### Added
+
+- **Single OAuth consent with grantable `vault:<name>:admin`** under a delegate-only-what-you-hold capability model (#484). One consent screen mints the named, vault-bound scope a client actually needs.
+- **`@openparachute/depcheck` library + hub adoption** — friendly missing-dependency UX (the systematic version of the cloudflared/git/tailscale guidance) (#483, follow-on to #481, #188).
+- **Friend-facing `/account` connect-your-vault UX** for Claude.ai + Claude Code, plus a slimmed signed-out discovery page (#478); friends can mint a scoped (read/write, assignment-gated) vault token from `/account` (#479).
+- **Real TOTP 2FA at hub login** with backup codes (#473, #475).
+- **Capability attenuation throughout mint/revoke** — host-admin bearers mint `vault:<name>:admin`; that token mints same-vault subtokens; revoke can revoke what it could mint; malformed vault-shaped scopes rejected at mint (#449, #452, #454, #455, #461; scope-guard surfaces the `permissions` claim, #453).
+- **Wizard parity + first-vault import-from-git** — the wizard always installs the vault module, has a CLI variant, and can seed the first vault from a git repo; `parachute init` extends to the optional exposure chain so a laptop ≈ a server in one command (#445, #447).
+- **Per-vault "MCP connection" card** in the admin SPA (#463); multi-vault membership per user + admin password reset (multi-user Phase 2, #427, #429); friend-facing `/account/` home with a first-admin gate on `/admin/host-admin-token` (#425, #426).
+
+### Fixed
+
+- **Self-heal stale credentials on Cloudflare deploys** — persist the public hub origin into the vault `.env` (vault was 401ing hub tokens, #480); self-heal the stale operator-token issuer on `start hub` (#481); inject the hub public origin into the supervised vault env to fix the OAuth iss-mismatch 401-on-reconnect (#460).
+- **`upgrade` no longer crashes when git is absent** (#472); `start` readiness / `EADDRINUSE` handling + cloudflared orphan cleanup + expose DNS self-diagnosis (#476).
+- **RFC 8707 resource honored** — narrow consent + named-scope mint for vault-bound MCP, fixing scary broad scopes + broad-scope rejection (#461); setup-flow 404 after vault-create + wizard honors live expose-state (#462).
+- **Honest first-admin/2FA/expose-state labeling** on Cloudflare (#474); init expose prompt no longer mislabels tailnet as "Tailscale Funnel" (#458).
+
+### Changed
+
+- **`app` → `surface` rename, hub side** (Phase 1.5 of patterns#102, #422); curated modules trimmed to `[vault, scribe]` for launch focus (#436); README leads with the unified `parachute init` setup flow (#456); Fly.io added as a peer self-host option (#420).
+- **Hotfix**: dropped the `bun`→src exports condition that broke published resolution under Bun (#485).
+
 ## [0.5.13-rc.48] - 2026-05-26
 
 **Hotfix.** /admin/setup + /api/modules + every other hot-path read site now uses readManifestLenient (#411). #406 only patched ONE call site; Aaron hit 500s when a stale services.json row from an old @openparachute/app@0.2.0-rc.4 install threw the strict validator on /admin/setup. Now: one bad row in services.json no longer 500s the entire admin SPA + wizard.
