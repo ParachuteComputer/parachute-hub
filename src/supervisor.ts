@@ -42,6 +42,7 @@ import {
   rethrowIfMissing,
 } from "@openparachute/depcheck";
 import { defaultPidOnPort } from "./hub-control.ts";
+import { orphanAttributable } from "./orphan-attribution.ts";
 import { type PortListeningFn, defaultPortListening } from "./port-probe.ts";
 
 /**
@@ -285,6 +286,28 @@ export interface SupervisorOpts {
    * stub-spawner test path defaults to "unknown" (returns undefined).
    */
   readonly ownerOfPid?: OwnerProbeFn;
+  /**
+   * Port-reclamation POLICY for the CRASH-RESTART path (#522 / #582). When a
+   * supervised child crashes and a foreign process now holds its declared port,
+   * `handleExit` must decide what to do with an ATTRIBUTABLE orphan (one whose
+   * command line carries the `parachute` marker or matches a recorded module
+   * pid — see `orphan-attribution.ts`):
+   *   - `"adopt"` (default): adopt-kill the attributable orphan (SIGTERM →
+   *     SIGKILL escalation, all idempotent) and proceed to re-spawn. This
+   *     extends the migrate orphan-sweep's field-tested auto-adopt behavior to
+   *     the crash-restart path — closing the recurring "port 1940 taken"
+   *     crash-loop (#522) for good.
+   *   - `"prompt"`: NEVER auto-kill; record the structured `port_squatter`
+   *     start-error (same surface a NON-attributable squatter gets) so the
+   *     operator resolves it manually.
+   *
+   * A NON-attributable holder is ALWAYS surfaced (never killed) regardless of
+   * policy — `"adopt"` only ever escalates to a kill on a holder we can
+   * attribute to this very module. Default `"adopt"`; the flag is the one-line
+   * lever to flip the whole crash-restart behavior to detect-and-prompt if the
+   * auto-kill default is later vetoed.
+   */
+  readonly reclaimPolicy?: "adopt" | "prompt";
 }
 
 /**
@@ -406,6 +429,12 @@ export class Supervisor {
       // opt in by injecting `pidOnPort` / `ownerOfPid`.
       pidOnPort: opts.pidOnPort ?? (isProductionPath ? defaultPidOnPort : () => undefined),
       ownerOfPid: opts.ownerOfPid ?? (isProductionPath ? defaultOwnerOfPid : () => undefined),
+      // Crash-restart port-reclamation policy (#522 / #582). Default "adopt"
+      // everywhere (production + tests) — the migrate precedent already
+      // auto-kills attributable orphans, and the attribution check is
+      // conservative. The flag exists so a future veto of auto-kill is a
+      // one-line "prompt" flip.
+      reclaimPolicy: opts.reclaimPolicy ?? "adopt",
     };
   }
 
@@ -467,13 +496,13 @@ export class Supervisor {
     // spawning — the operator sees the offending pid + cmdline + a copy-paste
     // recovery in `status` / the SPA. Detection only: we never kill someone
     // else's process (it may be the operator's unrelated dev server).
-    const squatter = this.detectPortSquatter(entry);
+    const squatter = this.checkPortSquatter(entry);
     if (squatter) {
       entry.state = {
         ...entry.state,
         status: "crashed",
         pid: undefined,
-        startError: squatter,
+        startError: this.portSquatterError(entry, squatter),
       };
       return entry.state;
     }
@@ -532,9 +561,14 @@ export class Supervisor {
    * replaced) and must not vouch for whoever now holds the port. An entry with
    * no `proc` (never spawned) contributes no pid either.
    */
-  private supervisedPids(): Set<number> {
+  private supervisedPids(exclude?: ModuleEntry): Set<number> {
     const pids = new Set<number>();
     for (const entry of this.modules.values()) {
+      // The just-crashed entry on the `handleExit` path is still `running`
+      // (status hasn't been updated yet) with `entry.proc.pid` pointing at the
+      // now-DEAD child — it must not vouch for whoever holds the port (the same
+      // N1 stale-pid hazard, here for an exiting-but-not-yet-restated child).
+      if (exclude !== undefined && entry === exclude) continue;
       if (entry.state.status !== "running" && entry.state.status !== "starting") continue;
       const pid = entry.proc?.pid;
       if (typeof pid === "number" && pid > 0) pids.add(pid);
@@ -543,28 +577,52 @@ export class Supervisor {
   }
 
   /**
-   * Pre-spawn port-squatter check (#580 item 4). Returns a structured
-   * `port_squatter` start-error when the module's declared port is held by a
+   * Pure pre-spawn port-squatter PROBE (#580 item 4, refactored for #522/#582).
+   * Returns the squatter detail when the module's declared port is held by a
    * process the supervisor does NOT own; undefined when the port is free, the
    * holder is one of our own children, or detection isn't available on this
    * platform (no `lsof` → `pidOnPort` returns undefined → we degrade to the
    * existing started-but-unbound path post-spawn).
    *
+   * This is DETECTION ONLY — it records nothing and kills nothing. The two
+   * callers decide what to do with the result:
+   *   - `start()` (#581) records the structured `port_squatter` start-error and
+   *     refuses to spawn (a foreign pid on a module port may be the operator's
+   *     unrelated process — never auto-killed on the operator-initiated path);
+   *   - `handleExit` (#522/#582) additionally runs attribution and, for an
+   *     ATTRIBUTABLE orphan under the "adopt" policy, adopt-kills + re-spawns.
+   *
    * Ownership precedent mirrors `migrate-cutover.ts:sweepOrphanOnPort`'s "is
    * this mine?" check — here the discriminant is "is the holder one of my live
-   * children's pids?". We deliberately do NOT kill the holder (detection only):
-   * a foreign pid on a module port may be the operator's unrelated process.
+   * children's pids?".
    */
-  private detectPortSquatter(entry: ModuleEntry): ModuleStartError | undefined {
+  private checkPortSquatter(
+    entry: ModuleEntry,
+    excludeSelf = false,
+  ): { port: number; holder: number; cmdline: string | undefined } | undefined {
     const portStr = entry.req.env?.PORT;
     const port = portStr ? Number(portStr) : Number.NaN;
     if (!Number.isFinite(port) || port <= 0) return undefined; // No declared port.
 
     const holder = this.opts.pidOnPort(port);
     if (holder === undefined) return undefined; // Port free, or detection unavailable.
-    if (this.supervisedPids().has(holder)) return undefined; // Our own child.
+    // On the crash-restart path the crashing entry is still `running` with a
+    // stale (dead) pid — exclude it so it can't vouch for the holder.
+    if (this.supervisedPids(excludeSelf ? entry : undefined).has(holder)) return undefined;
 
-    const cmdline = this.opts.ownerOfPid(holder);
+    return { port, holder, cmdline: this.opts.ownerOfPid(holder) };
+  }
+
+  /**
+   * Build the structured, actionable `port_squatter` start-error from a probe
+   * result (#581). Shared by `start()` and the NON-attributable / "prompt"
+   * branch of `handleExit` so the wire shape stays identical.
+   */
+  private portSquatterError(
+    entry: ModuleEntry,
+    squatter: { port: number; holder: number; cmdline: string | undefined },
+  ): ModuleStartError {
+    const { port, holder, cmdline } = squatter;
     const who = cmdline ? `pid ${holder} (${cmdline})` : `pid ${holder}`;
     const short = entry.req.short;
     return {
@@ -574,6 +632,117 @@ export class Supervisor {
         `kill it and retry: kill ${holder} && parachute start ${short}`,
       at: new Date(this.opts.now()).toISOString(),
     };
+  }
+
+  /**
+   * Adopt-kill an orphan holding a module's port on the crash-restart path
+   * (#522 / #582). Best-effort + idempotent: SIGTERM the group, brief wait, then
+   * a SIGKILL escalation if it's still bound — every signal is try-caught so an
+   * ESRCH (the orphan already exited between probe + signal) is a no-op, not a
+   * throw. Modeled on `migrate-cutover.ts:sweepOrphanOnPort`'s adopt arm, using
+   * the supervisor's group-aware `killFn`. If the kill doesn't free the port the
+   * subsequent re-spawn just EADDRINUSE-crashes again and the normal restart
+   * budget eventually halts the loop — so a failed kill degrades gracefully.
+   */
+  private async adoptKillOrphanOnPort(port: number, holder: number): Promise<void> {
+    try {
+      this.opts.killFn(holder, "SIGTERM");
+    } catch {
+      // ESRCH (already gone) or EPERM (can't signal) — best-effort: nothing
+      // more to do, the re-spawn surfaces a still-held port as a normal crash.
+      return;
+    }
+    // Give the orphan a moment to drop its listener before escalating. Reuse the
+    // restart delay (also the socket-release grace) so we don't add a new knob.
+    await this.opts.sleep(this.opts.restartDelayMs);
+    // Still holding the port? Escalate to SIGKILL (idempotent — if it already
+    // exited under the SIGTERM the port is free and we skip the escalation).
+    if (this.opts.pidOnPort(port) === holder) {
+      try {
+        this.opts.killFn(holder, "SIGKILL");
+      } catch {
+        // Already gone / can't signal — best-effort; fall through to re-spawn.
+      }
+    }
+  }
+
+  /**
+   * Crash-restart squatter resolution (#522 / #582). Called from `handleExit`
+   * when a foreign process holds the crashed module's port. Returns:
+   *   - `true`  → the loop should HALT: we recorded a structured `port_squatter`
+   *     start-error + set status `crashed` WITHOUT touching the crash budget
+   *     (the module didn't crash — a foreign process is blocking its port, so a
+   *     budget tick would wrongly bring us closer to "giving up"). Applies to a
+   *     NON-attributable holder always, and to an attributable holder under the
+   *     `"prompt"` policy.
+   *   - `false` → we ADOPT-KILLED an attributable orphan (under the default
+   *     `"adopt"` policy); the caller falls through to the normal restart, which
+   *     re-spawns onto the now-freed port (counting as a normal restart).
+   *
+   * Attribution is the safety crux: REUSE the shared `orphanAttributable`
+   * (`orphan-attribution.ts`) — the same field-tested heuristic the migrate
+   * orphan-sweep uses — so an operator's unrelated process squatting the port is
+   * NEVER killed (it lacks the `parachute` marker / a matching recorded pid →
+   * not attributable → surfaced, not adopted).
+   */
+  private async handleCrashRestartSquatter(
+    entry: ModuleEntry,
+    squatter: { port: number; holder: number; cmdline: string | undefined },
+    exitCode: number | null,
+  ): Promise<boolean> {
+    const { port, holder } = squatter;
+    const short = entry.req.short;
+
+    const recordSquatterError = (): true => {
+      entry.state = {
+        ...entry.state,
+        status: "crashed",
+        pid: undefined,
+        lastExitCode: exitCode,
+        // NB: restartsInWindow is left as-is — we deliberately do NOT push a
+        // crash stamp for a port-blocked module (it didn't crash).
+        startError: this.portSquatterError(entry, squatter),
+      };
+      return true;
+    };
+
+    // Policy gate: "prompt" never auto-kills — surface every squatter for the
+    // operator (the one-line lever to flip off auto-kill if it's vetoed).
+    if (this.opts.reclaimPolicy === "prompt") {
+      this.opts.output(
+        `[supervisor] ${short} crashed; port ${port} held by pid ${holder} (reclaim policy "prompt") — surfacing instead of adopting.\n`,
+      );
+      return recordSquatterError();
+    }
+
+    // "adopt": adopt-kill only an ATTRIBUTABLE orphan. The recorded pid arm uses
+    // the entry's last-known pid (the just-crashed child's) — if the SAME pid
+    // somehow still holds the port it's trivially ours to reclaim; otherwise the
+    // cmdline `parachute` marker decides.
+    const { attributable, cmdline } = orphanAttributable({
+      orphan: holder,
+      recordedPid: entry.proc?.pid,
+      short,
+      startCmdHint: undefined,
+      ownerOfPid: this.opts.ownerOfPid,
+    });
+    if (!attributable) {
+      const desc = cmdline ?? squatter.cmdline ?? "command line unavailable";
+      this.opts.output(
+        `[supervisor] ${short} crashed; port ${port} held by an unrelated process (pid ${holder}, ${desc}) — refusing to kill it; surfacing.\n`,
+      );
+      return recordSquatterError();
+    }
+
+    // Attributable orphan under "adopt": reclaim the port, then fall through to
+    // the normal restart (return false). Best-effort — if the kill doesn't free
+    // the port, the re-spawn EADDRINUSE-crashes as a normal crash and the budget
+    // eventually halts the loop.
+    this.opts.output(
+      `[supervisor] ${short} crashed; port ${port} held by an attributable orphan (pid ${holder}${cmdline ? `, ${cmdline}` : ""}) — adopting + killing it before restart.\n`,
+    );
+    await this.adoptKillOrphanOnPort(port, holder);
+    return false;
   }
 
   /**
@@ -811,6 +980,26 @@ export class Supervisor {
         lastExitCode: exitCode,
       };
       return;
+    }
+
+    // Crash-restart port reconciliation (#522 / #582). Before counting this
+    // crash and re-spawning, check whether the module's declared port is now
+    // held by a process the supervisor doesn't own. The `start()` squatter
+    // check (#581) only runs on the operator-initiated path; the crash-restart
+    // loop bypassed it, so a foreign process that grabbed the port between the
+    // crash and the auto-restart kept EADDRINUSE-crash-looping into a bare
+    // `crashed` with no clue why (#582), and a leftover-autostart orphan from a
+    // prior instance re-took the port forever (#522). `excludeSelf` drops the
+    // just-crashed child's stale pid from the "ours" set (N1).
+    const squatter = this.checkPortSquatter(entry, /* excludeSelf */ true);
+    if (squatter) {
+      const handled = await this.handleCrashRestartSquatter(entry, squatter, exitCode);
+      // `handled` true → we surfaced a structured error and halted the loop
+      // WITHOUT counting this against the crash budget (the module didn't crash
+      // — a foreign process is blocking its port). `false` → we adopt-killed an
+      // attributable orphan and fall through to the normal restart below, which
+      // re-spawns onto the now-freed port (counting as a normal restart).
+      if (handled) return;
     }
 
     const now = this.opts.now();

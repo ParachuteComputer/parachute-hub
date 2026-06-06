@@ -936,6 +936,42 @@ describe("POST /api/modules/:short/start", () => {
     expect(spawns[0]?.env?.MY_CUSTOM_VAR).toBe("sentinel123");
   });
 
+  test("#519 surface orphan: start surfaces the structured port_squatter error (not a bare failure)", async () => {
+    // The #519 field signature: after a hub restart, a module (surface on the
+    // box; vault here) is orphaned — listening on its port but NOT a supervised
+    // child. The restart-surface API path (`parachute restart <svc>` → 404
+    // fallthrough → start, and the boot reconcile) calls `supervisor.start()`,
+    // whose #581 squatter detection must surface the structured `port_squatter`
+    // error in the response body so the operator gets an actionable next step,
+    // not an opaque "request failed". This pins that propagation.
+    seedVault(1940);
+    // A real Supervisor with the squatter seams injected: pid 95870 (the #519
+    // orphan) holds :1940 and is NOT one of the supervisor's children.
+    const supervisor = new Supervisor({
+      spawnFn: () => {
+        throw new Error("should not spawn — the port is squatted");
+      },
+      pidOnPort: (port) => (port === 1940 ? 95870 : undefined),
+      ownerOfPid: (pid) => (pid === 95870 ? "bun /x/.parachute/surface/server.ts" : undefined),
+    });
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleStart(
+      postReq("/api/modules/vault/start", { authorization: `Bearer ${bearer}` }),
+      "vault",
+      { db: h.db, issuer: ISSUER, manifestPath: h.manifestPath, configDir: h.dir, supervisor },
+    );
+    // 200 with the structured error riding in state.startError — the SPA/CLI
+    // render the actionable squatter message instead of a 500 "request failed".
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      short: string;
+      state: { status: string; startError?: { error_type: string; error_description: string } };
+    };
+    expect(body.state.status).toBe("crashed");
+    expect(body.state.startError?.error_type).toBe("port_squatter");
+    expect(body.state.startError?.error_description).toContain("port 1940 is held by pid 95870");
+  });
+
   test("400 not_installed when the module isn't in services.json (no silent install)", async () => {
     // No seedVault — services.json has no vault row.
     const { supervisor, spawns } = makeIdleSupervisor();

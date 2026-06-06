@@ -478,6 +478,233 @@ describe("Supervisor restart-on-crash", () => {
   });
 });
 
+describe("Supervisor crash-restart port reclamation (#522 / #582)", () => {
+  // A killFn that records its (pid, signal) calls so a test can prove an
+  // adopt-kill happened (or didn't). Does NOT forward to a fake — these tests
+  // drive the orphan's "death" by flipping the injected pidOnPort.
+  function recordingKill(): { killFn: KillFn; calls: Array<{ pid: number; signal: unknown }> } {
+    const calls: Array<{ pid: number; signal: unknown }> = [];
+    return { calls, killFn: (pid, signal) => calls.push({ pid, signal }) };
+  }
+
+  test("attributable orphan + kill frees the port → adopt-kill then respawn", async () => {
+    const first = makeFakeProc(900);
+    const second = makeFakeProc(901);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    // The orphan (pid 5000) holds :1940 right after the crash; the SIGTERM
+    // adopt-kill frees it — model that by clearing the holder inside the kill
+    // stub (so the SIGKILL-escalation re-probe sees a freed port).
+    const calls: Array<{ pid: number; signal: unknown }> = [];
+    let holder: number | undefined = undefined;
+    const killFn: KillFn = (pid, signal) => {
+      calls.push({ pid, signal });
+      if (pid === 5000 && signal === "SIGTERM") holder = undefined; // the orphan died
+    };
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // Attributable: the cmdline carries the `parachute` marker.
+      ownerOfPid: (pid) => (pid === 5000 ? "bun /x/.parachute/vault/server.ts" : undefined),
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    // Orphan grabs the port, then the child crashes. `handleExit` detects the
+    // attributable orphan + adopt-kills it (the stub clears `holder`), then
+    // falls through to a normal restart that re-spawns onto the freed port.
+    holder = 5000;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    // The orphan got SIGTERM'd, and the module respawned onto the freed port.
+    expect(calls.some((c) => c.pid === 5000 && c.signal === "SIGTERM")).toBe(true);
+    expect(spawner.calls).toHaveLength(2);
+    const state = sup.get("vault");
+    expect(state?.status).toBe("running");
+    expect(state?.pid).toBe(901);
+    // It WAS counted as a normal restart (the module did crash + we reclaimed).
+    expect(state?.restartsInWindow).toBe(1);
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test("attributable orphan + kill fails (ESRCH) → respawn still attempted", async () => {
+    const first = makeFakeProc(910);
+    const second = makeFakeProc(911);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    // killFn throws ESRCH (the orphan vanished between probe + signal) — the
+    // adopt-kill swallows it and the respawn proceeds best-effort.
+    const killFn: KillFn = () => {
+      const err = new Error("no such process") as NodeJS.ErrnoException;
+      err.code = "ESRCH";
+      throw err;
+    };
+    // Port free at the initial start; the orphan appears only after the crash.
+    let holder: number | undefined = undefined;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      // Holder present at crash time; the (failed) kill doesn't change it here,
+      // but the respawn is still attempted — that's the invariant under test.
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      ownerOfPid: () => "node /x/.parachute/vault/server.js",
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    holder = 5001;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    // Respawn was attempted despite the kill throwing ESRCH (best-effort).
+    expect(spawner.calls).toHaveLength(2);
+    const state = sup.get("vault");
+    expect(state?.status).toBe("running");
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test("foreign holder with readable cmdline → port_squatter error, no kill, no budget tick", async () => {
+    const first = makeFakeProc(920);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first); // ONLY one proc — a respawn would throw "unexpected spawn".
+    const kill = recordingKill();
+    let holder: number | undefined = undefined; // free at start; orphan after crash.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // NOT attributable: an operator's unrelated dev server (no `parachute`).
+      ownerOfPid: (pid) => (pid === 6000 ? "node /home/op/my-app/server.js" : undefined),
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    holder = 6000;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    const state = sup.get("vault");
+    expect(state?.status).toBe("crashed");
+    expect(state?.startError?.error_type).toBe("port_squatter");
+    expect(state?.startError?.error_description).toContain("port 1940 is held by pid 6000");
+    // No kill (foreign process), no respawn, and the crash budget was NOT
+    // ticked (the module didn't crash — a foreign process is blocking its port).
+    expect(kill.calls).toHaveLength(0);
+    expect(spawner.calls).toHaveLength(1);
+    expect(state?.restartsInWindow).toBe(0);
+  });
+
+  test("foreign holder with UNREADABLE cmdline → port_squatter error, no kill, no budget tick", async () => {
+    const first = makeFakeProc(930);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first); // only one — no respawn expected.
+    const kill = recordingKill();
+    let holder: number | undefined = undefined; // free at start; orphan after crash.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // Unreadable cmdline + a non-matching pid → NOT attributable (never kill).
+      ownerOfPid: () => undefined,
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    holder = 7000;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    const state = sup.get("vault");
+    expect(state?.status).toBe("crashed");
+    expect(state?.startError?.error_type).toBe("port_squatter");
+    expect(kill.calls).toHaveLength(0);
+    expect(spawner.calls).toHaveLength(1);
+    expect(state?.restartsInWindow).toBe(0);
+  });
+
+  test("no squatter after a crash → normal restart (unchanged behavior)", async () => {
+    const first = makeFakeProc(940);
+    const second = makeFakeProc(941);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    const kill = recordingKill();
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      // Port free at crash time (no squatter).
+      pidOnPort: () => undefined,
+      ownerOfPid: () => undefined,
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    expect(kill.calls).toHaveLength(0);
+    expect(spawner.calls).toHaveLength(2);
+    const state = sup.get("vault");
+    expect(state?.status).toBe("running");
+    expect(state?.restartsInWindow).toBe(1);
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
+
+  test('reclaimPolicy "prompt" → never adopt-kills, surfaces even an attributable orphan', async () => {
+    const first = makeFakeProc(950);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first); // only one — prompt halts, no respawn.
+    const kill = recordingKill();
+    let holder: number | undefined = undefined; // free at start; orphan after crash.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      reclaimPolicy: "prompt",
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // Attributable (parachute marker) — but "prompt" still refuses to kill.
+      ownerOfPid: () => "bun /x/.parachute/vault/server.ts",
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    holder = 8000;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    const state = sup.get("vault");
+    expect(state?.status).toBe("crashed");
+    expect(state?.startError?.error_type).toBe("port_squatter");
+    expect(kill.calls).toHaveLength(0); // prompt never kills
+    expect(spawner.calls).toHaveLength(1);
+    expect(state?.restartsInWindow).toBe(0);
+  });
+});
+
 describe("Supervisor.stop", () => {
   test("operator stop is not a crash — does not restart", async () => {
     const proc = makeFakeProc(101);
