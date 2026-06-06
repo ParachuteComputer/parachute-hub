@@ -861,22 +861,14 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   if ("error" in parsed) {
     return htmlError("Invalid authorization request", parsed.error, 400);
   }
-  if (parsed.responseType !== "code") {
-    return oauthErrorRedirect(
-      parsed.redirectUri,
-      "unsupported_response_type",
-      "only response_type=code is supported",
-      parsed.state,
-    );
-  }
-  if (parsed.codeChallengeMethod !== "S256") {
-    return oauthErrorRedirect(
-      parsed.redirectUri,
-      "invalid_request",
-      "PKCE S256 is required",
-      parsed.state,
-    );
-  }
+  // NOTE: response_type / code_challenge_method validation is DELIBERATELY
+  // deferred until after the (client_id, redirect_uri) pair is confirmed
+  // registered (below, just past `requireRegisteredRedirectUri`). RFC 6749
+  // §4.1.2.1: when the redirect_uri can't be validated against the client,
+  // errors MUST be shown to the user — NOT redirected to the supplied URI.
+  // Redirecting here (pre-validation) on a crafted redirect_uri is an open
+  // redirect (hub#570). Once the pair is validated, redirecting these errors
+  // back to the now-trusted URI is spec-correct.
   let client = getClient(db, parsed.clientId);
   if (!client) {
     // Can't safely redirect — we don't trust the redirect_uri until we've
@@ -1002,6 +994,27 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       "Redirect mismatch",
       "The redirect_uri does not match any URI registered for this app.",
       400,
+    );
+  }
+
+  // The (client_id, redirect_uri) pair is now confirmed registered, so it is
+  // spec-correct (RFC 6749 §4.1.2.1) to deliver these protocol errors by
+  // redirect to that trusted URI. Validating BEFORE these checks closes the
+  // pre-validation open-redirect on a crafted redirect_uri (hub#570).
+  if (parsed.responseType !== "code") {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "unsupported_response_type",
+      "only response_type=code is supported",
+      parsed.state,
+    );
+  }
+  if (parsed.codeChallengeMethod !== "S256") {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "invalid_request",
+      "PKCE S256 is required",
+      parsed.state,
     );
   }
 

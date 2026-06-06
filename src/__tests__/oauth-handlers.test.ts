@@ -578,6 +578,176 @@ describe("handleAuthorizeGet", () => {
   });
 });
 
+// hub#570 — open-redirect: protocol errors (unsupported_response_type,
+// invalid_request for non-S256 PKCE) MUST NOT redirect to the supplied
+// redirect_uri until the (client_id, redirect_uri) pair is confirmed
+// registered. RFC 6749 §4.1.2.1: an unvalidated redirect_uri error is shown
+// to the user, never redirected. Pre-fix, an attacker with a valid client_id
+// + crafted redirect_uri + bad response_type got an error redirect to the
+// attacker-controlled URI.
+describe("handleAuthorizeGet — error redirects gated on redirect_uri validation (hub#570)", () => {
+  test("invalid response_type + UNREGISTERED redirect_uri → HTML error, no redirect", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          // Crafted attacker-controlled URI, NOT registered for this client.
+          redirect_uri: "https://evil.example/steal",
+          response_type: "token",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "abc",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      // Must be the HTML "Redirect mismatch" error page, NOT a 302 to evil.
+      expect(res.status).toBe(400);
+      expect(res.headers.get("location")).toBeNull();
+      const body = await res.text();
+      expect(body).toContain("Redirect mismatch");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("invalid code_challenge_method + UNREGISTERED redirect_uri → HTML error, no redirect", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://evil.example/steal",
+          response_type: "code",
+          code_challenge: "challenge",
+          code_challenge_method: "plain",
+          state: "abc",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(400);
+      expect(res.headers.get("location")).toBeNull();
+      const body = await res.text();
+      expect(body).toContain("Redirect mismatch");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("invalid response_type + VALID registered redirect_uri → error redirect (spec-correct)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "token",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "abc",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      // Pair is registered → redirecting the protocol error is RFC-correct.
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("error")).toBe("unsupported_response_type");
+      expect(loc.searchParams.get("state")).toBe("abc");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("invalid code_challenge_method + VALID registered redirect_uri → error redirect (spec-correct)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: "challenge",
+          code_challenge_method: "plain",
+          state: "abc",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("error")).toBe("invalid_request");
+      expect(loc.searchParams.get("state")).toBe("abc");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("unknown client_id + invalid response_type → HTML error, no redirect", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: "no-such-client",
+          redirect_uri: "https://evil.example/steal",
+          response_type: "token",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(400);
+      expect(res.headers.get("location")).toBeNull();
+      const body = await res.text();
+      expect(body).toContain("Unknown application");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("valid full flow still reaches consent (regression guard)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "MyApp",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("Approve");
+      expect(html).toContain('name="__action" value="consent"');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 // Q1 of 2026-04-28-vault-config-and-scopes.md: an unnamed `vault:<verb>` is
 // ambiguous, so the consent screen forces the operator to pick a vault before
 // the JWT is minted. Picked vault rewrites the scope to `vault:<picked>:<verb>`
