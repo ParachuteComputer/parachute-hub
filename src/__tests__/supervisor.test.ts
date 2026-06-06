@@ -747,6 +747,98 @@ describe("Supervisor crash-restart port reclamation (#522 / #582)", () => {
     // proving the per-module marker is what spared it.
     expect("parachute-scribe serve").toContain("parachute");
   });
+
+  test("generic-runtime startCmd (bun server.ts): a FOREIGN bun on the port is NOT over-attributed (#601 re-review)", async () => {
+    // A custom operator startCmd whose cmd[0] is a generic runtime (`bun`). The
+    // marker must NOT be "bun" (that would adopt-KILL any bun process on the
+    // port) — it falls through to the module-specific cwd (the installDir). A
+    // foreign bun process with a DIFFERENT cwd in its cmdline is then NOT
+    // attributable → surfaced, never killed.
+    const first = makeFakeProc(970);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first); // only one — no kill+respawn expected.
+    const kill = recordingKill();
+    let holder: number | undefined = undefined;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // A foreign bun process — its cmdline carries `bun` (which WOULD match a
+      // naive cmd[0] marker) but NOT vault's installDir.
+      ownerOfPid: (pid) => (pid === 9100 ? "bun /home/op/other-project/server.ts" : undefined),
+    });
+
+    await sup.start({
+      short: "vault",
+      cmd: ["bun", "server.ts"],
+      cwd: "/x/.parachute/vault",
+      env: { PORT: "1940" },
+    });
+    holder = 9100;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    const state = sup.get("vault");
+    // Not over-attributed: no kill, no respawn — surfaced as a squatter.
+    expect(kill.calls).toHaveLength(0);
+    expect(spawner.calls).toHaveLength(1);
+    expect(state?.status).toBe("crashed");
+    expect(state?.startError?.error_type).toBe("port_squatter");
+    // Sanity: the foreign cmdline WOULD have matched a naive "bun" marker —
+    // proving the generic-runtime fall-through to the cwd marker is what spared it.
+    expect("bun /home/op/other-project/server.ts").toContain("bun");
+  });
+
+  test("generic-runtime startCmd: a GENUINE prior instance (same installDir cwd) IS adopted (positive control)", async () => {
+    // The other side of the fall-through: with cmd[0]=`bun`, the marker is the
+    // module's cwd (`/x/.parachute/vault`). A genuine prior vault instance was
+    // launched from that installDir, so its cmdline carries the path → it IS
+    // attributable and gets adopt-killed.
+    const first = makeFakeProc(980);
+    const second = makeFakeProc(981);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    spawner.enqueue(second);
+    const calls: Array<{ pid: number; signal: unknown }> = [];
+    let holder: number | undefined = undefined;
+    const killFn: KillFn = (pid, signal) => {
+      calls.push({ pid, signal });
+      if (pid === 9200 && signal === "SIGTERM") holder = undefined; // orphan died
+    };
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // Genuine prior vault instance — launched from vault's installDir, so the
+      // cwd marker appears in its cmdline.
+      ownerOfPid: (pid) => (pid === 9200 ? "bun /x/.parachute/vault/server.ts" : undefined),
+    });
+
+    await sup.start({
+      short: "vault",
+      cmd: ["bun", "server.ts"],
+      cwd: "/x/.parachute/vault",
+      env: { PORT: "1940" },
+    });
+    holder = 9200;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    // Adopted: SIGTERM'd the genuine prior instance, then respawned.
+    expect(calls.some((c) => c.pid === 9200 && c.signal === "SIGTERM")).toBe(true);
+    expect(spawner.calls).toHaveLength(2);
+    expect(sup.get("vault")?.status).toBe("running");
+
+    second.closeStreams();
+    sup.stop("vault");
+    second.resolveExit(0);
+  });
 });
 
 describe("Supervisor.stop", () => {

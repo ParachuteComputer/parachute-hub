@@ -346,6 +346,42 @@ const DEFAULT_LATE_BIND_WATCH_MS = 60_000;
 const DEFAULT_LATE_BIND_POLL_MS = 1_000;
 
 /**
+ * Generic language runtimes that can front a custom operator startCmd (e.g.
+ * `bun server.ts`, `python3 -m app`). When one of these is `cmd[0]` it is NOT a
+ * module-specific marker — using it as the adopt-kill attribution needle would
+ * match ANY such process on the port (over-broad kill, #601 re-review). The
+ * per-module marker then falls through to the module's installDir/cwd instead.
+ * First-party modules (`parachute-vault`, `parachute-scribe`, …) are unaffected
+ * — their `cmd[0]` isn't in this set. Matched on the BASENAME, lowercased, with
+ * any `.exe` suffix stripped (Windows), so an absolute `/usr/bin/bun` is caught.
+ */
+const GENERIC_RUNTIMES = new Set([
+  "bun",
+  "node",
+  "nodejs",
+  "deno",
+  "python",
+  "python2",
+  "python3",
+  "ruby",
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "env",
+]);
+
+/**
+ * Is `cmd0` a generic language runtime rather than a module-specific binary?
+ * Strips the directory and a trailing `.exe`, lowercases, and checks the
+ * {@link GENERIC_RUNTIMES} set. See `moduleMarkerFor`.
+ */
+function isGenericRuntime(cmd0: string): boolean {
+  const base = (cmd0.split("/").pop() ?? cmd0).toLowerCase().replace(/\.exe$/, "");
+  return GENERIC_RUNTIMES.has(base);
+}
+
+/**
  * Bounded, line-oriented ring buffer (§6.5). Holds the most-recent lines of a
  * module's output up to `maxBytes`; pushing past the cap drops whole lines
  * from the front (oldest-first) until it fits. Bounding by bytes (not line
@@ -765,11 +801,20 @@ export class Supervisor {
    * (#601 review). A genuine prior instance of THIS module was launched with
    * this module's start binary (`req.cmd[0]`, e.g. `parachute-vault`) and from
    * its installDir (`req.cwd`, e.g. `~/.parachute/vault/`) — both appear in the
-   * orphan's `ps` cmdline. Prefer the start binary (it's always present in the
-   * argv and is the most module-distinctive token); fall back to the cwd path
-   * when the binary is absent. Returns undefined when neither is available, in
-   * which case attribution falls back to the recorded-pid arm only (the cmdline
-   * arm can't match an empty needle → never a false-positive kill).
+   * orphan's `ps` cmdline.
+   *
+   * Prefer the start binary (it's the most module-distinctive token) — BUT only
+   * when it's actually module-specific. A custom operator startCmd like
+   * `bun server.ts` has a GENERIC RUNTIME at `cmd[0]` (`bun`/`node`/`python`/…);
+   * using "bun" as the marker would attribute ANY bun process on the port — the
+   * exact over-broad adopt-kill per-module attribution exists to prevent
+   * (#601 re-review). So when `cmd[0]`'s basename is a known generic runtime,
+   * fall through to the cwd / installDir marker, which IS module-specific.
+   *
+   * Returns undefined only when neither a non-generic `cmd[0]` nor a usable cwd
+   * is available — attribution then falls back to the recorded-pid arm only (the
+   * cmdline arm can't match an empty needle → the safe, conservative degradation:
+   * never a false-positive kill).
    *
    * Note we pass the FULL `cmd[0]` (e.g. `parachute-vault`, or an absolute
    * `/path/to/parachute-vault`), not a bare short name — the short name
@@ -777,7 +822,7 @@ export class Supervisor {
    */
   private moduleMarkerFor(entry: ModuleEntry): string | undefined {
     const binary = entry.req.cmd[0];
-    if (binary && binary.length > 0) return binary;
+    if (binary && binary.length > 0 && !isGenericRuntime(binary)) return binary;
     if (entry.req.cwd && entry.req.cwd.length > 0) return entry.req.cwd;
     return undefined;
   }
