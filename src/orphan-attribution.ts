@@ -38,22 +38,37 @@ export type OwnerProbeFn = (pid: number) => string | undefined;
  * of:
  *   - the orphan pid equals the module's RECORDED pid (services.json/pidfile,
  *     or a supervisor entry's recorded pid);
- *   - its command line mentions `parachute` (any parachute-managed process —
- *     the `~/.parachute/...` install path and the `@openparachute/<mod>`
- *     package name both carry this marker, so it catches every genuine
- *     parachute-managed module);
- *   - its command line mentions the module's start command (when a hint is
- *     supplied — currently always unset at the call sites, the seam is kept for
- *     a future services.json-derived start command).
+ *   - (the cmdline arm) it matches the configured needle set — see `moduleMarker`.
  *
  * An unreadable command line (probe returned undefined) + a non-matching pid is
  * NOT attributable — we refuse to kill it.
  *
- * NOTE: the bare module short-name needle (`vault`/`runner`/`scribe`/`notes`)
- * is deliberately NOT used — on a process KILL a bare short-name is too loose
- * (a `runner` substring matches an unrelated CI runner squatting the port). The
- * `parachute` marker already attributes every genuine parachute-managed
- * process, so the short-name arm only widened the false-positive surface.
+ * TWO ATTRIBUTION MODES (the `moduleMarker` knob):
+ *
+ *   - **Broad ("parachute") — the migrate orphan-sweep.** `moduleMarker`
+ *     OMITTED: the cmdline needle is the bare `parachute` marker (the
+ *     `~/.parachute/...` install path + the `@openparachute/<mod>` package name
+ *     both carry it). The sweep runs ecosystem-wide during a cutover, so
+ *     "is it ANY parachute-managed process?" is the right, field-tested width.
+ *
+ *   - **Per-module — the supervisor's crash-restart adopt-kill.** `moduleMarker`
+ *     PROVIDED (the module's own start binary / installDir, e.g.
+ *     `parachute-vault` or `~/.parachute/vault/`): the cmdline must contain THAT
+ *     marker. The supervisor is always restarting ONE specific module and knows
+ *     its identity, so a bare `parachute` match is too loose — it would let
+ *     vault's restart adopt-KILL a sibling `scribe`/`runner` orphan that happens
+ *     to hold vault's port (a cross-module kill). Requiring the module-specific
+ *     marker means the supervisor can only ever reclaim a prior instance of the
+ *     SAME module; a sibling's process is "not attributable" → surfaced, never
+ *     killed.
+ *
+ * The bare module short-NAME (`vault`/`scribe`/…) is deliberately NOT a needle
+ * in either mode — on a process KILL a bare short-name is too loose (a `runner`
+ * substring matches an unrelated CI runner). The per-module marker is the
+ * fully-qualified binary/path, not the short name.
+ *
+ * `startCmdHint` is an additional optional cmdline needle (currently unset at
+ * both call sites; a seam for a future services.json-derived start command).
  */
 export function orphanAttributable(args: {
   orphan: number;
@@ -61,15 +76,25 @@ export function orphanAttributable(args: {
   short: string;
   startCmdHint: string | undefined;
   ownerOfPid: OwnerProbeFn;
+  /**
+   * When provided, the cmdline arm requires THIS module-specific marker (start
+   * binary / installDir) instead of the broad `parachute` marker — see the
+   * "two attribution modes" note above. Omitted → broad `parachute` (migrate).
+   */
+  moduleMarker?: string;
 }): { attributable: boolean; cmdline: string | undefined } {
-  const { orphan, recordedPid, startCmdHint, ownerOfPid } = args;
+  const { orphan, recordedPid, startCmdHint, ownerOfPid, moduleMarker } = args;
   if (recordedPid !== undefined && orphan === recordedPid) {
     return { attributable: true, cmdline: undefined };
   }
   const cmdline = ownerOfPid(orphan);
   if (cmdline === undefined) return { attributable: false, cmdline: undefined };
   const haystack = cmdline.toLowerCase();
-  const needles = ["parachute", ...(startCmdHint ? [startCmdHint.toLowerCase()] : [])].filter(
+  // Per-module mode (moduleMarker set) uses the module-specific marker as the
+  // base needle; broad mode (migrate sweep) uses "parachute". `startCmdHint` is
+  // an extra needle in either mode.
+  const baseNeedle = moduleMarker ? moduleMarker.toLowerCase() : "parachute";
+  const needles = [baseNeedle, ...(startCmdHint ? [startCmdHint.toLowerCase()] : [])].filter(
     (n) => n.length > 0,
   );
   const attributable = needles.some((n) => haystack.includes(n));

@@ -598,7 +598,7 @@ export class Supervisor {
    */
   private checkPortSquatter(
     entry: ModuleEntry,
-    excludeSelf = false,
+    excludeCrashingEntry = false,
   ): { port: number; holder: number; cmdline: string | undefined } | undefined {
     const portStr = entry.req.env?.PORT;
     const port = portStr ? Number(portStr) : Number.NaN;
@@ -608,7 +608,7 @@ export class Supervisor {
     if (holder === undefined) return undefined; // Port free, or detection unavailable.
     // On the crash-restart path the crashing entry is still `running` with a
     // stale (dead) pid — exclude it so it can't vouch for the holder.
-    if (this.supervisedPids(excludeSelf ? entry : undefined).has(holder)) return undefined;
+    if (this.supervisedPids(excludeCrashingEntry ? entry : undefined).has(holder)) return undefined;
 
     return { port, holder, cmdline: this.opts.ownerOfPid(holder) };
   }
@@ -657,6 +657,13 @@ export class Supervisor {
     await this.opts.sleep(this.opts.restartDelayMs);
     // Still holding the port? Escalate to SIGKILL (idempotent — if it already
     // exited under the SIGTERM the port is free and we skip the escalation).
+    // N1: this re-check is deliberately NOT re-attributed — we already
+    // attributed `holder` to this module before the SIGTERM, and only escalate
+    // if the SAME pid still holds the SAME port. The TOCTOU window (the
+    // originally-attributed pid exits and the OS recycles its number onto a new,
+    // foreign holder of this port between the SIGTERM and this re-probe) is the
+    // same accepted, vanishingly-small risk the migrate sweep's SIGKILL
+    // follow-up carries (`sweepOrphanOnPort`); not worth a second `ps` round-trip.
     if (this.opts.pidOnPort(port) === holder) {
       try {
         this.opts.killFn(holder, "SIGKILL");
@@ -680,10 +687,15 @@ export class Supervisor {
    *     re-spawns onto the now-freed port (counting as a normal restart).
    *
    * Attribution is the safety crux: REUSE the shared `orphanAttributable`
-   * (`orphan-attribution.ts`) — the same field-tested heuristic the migrate
-   * orphan-sweep uses — so an operator's unrelated process squatting the port is
-   * NEVER killed (it lacks the `parachute` marker / a matching recorded pid →
-   * not attributable → surfaced, not adopted).
+   * (`orphan-attribution.ts`) — but in its PER-MODULE mode (`moduleMarker` set),
+   * NOT the migrate sweep's broad `parachute` mode. The supervisor is always
+   * restarting ONE specific module and knows its identity, so it requires the
+   * orphan's cmdline to carry THIS module's own start binary / installDir before
+   * killing — a bare `parachute` match would let vault's restart adopt-kill a
+   * sibling `scribe`/`runner` orphan on vault's port (a cross-module kill). So a
+   * sibling module's process (or an operator's unrelated process) is "not
+   * attributable" → surfaced, never killed. Only a genuine prior instance of the
+   * SAME module is reclaimable.
    */
   private async handleCrashRestartSquatter(
     entry: ModuleEntry,
@@ -718,13 +730,16 @@ export class Supervisor {
     // "adopt": adopt-kill only an ATTRIBUTABLE orphan. The recorded pid arm uses
     // the entry's last-known pid (the just-crashed child's) — if the SAME pid
     // somehow still holds the port it's trivially ours to reclaim; otherwise the
-    // cmdline `parachute` marker decides.
+    // PER-MODULE cmdline marker (this module's own start binary / installDir)
+    // decides — NOT the broad `parachute` marker, so a sibling module's orphan
+    // on this port is not attributable.
     const { attributable, cmdline } = orphanAttributable({
       orphan: holder,
       recordedPid: entry.proc?.pid,
       short,
       startCmdHint: undefined,
       ownerOfPid: this.opts.ownerOfPid,
+      moduleMarker: this.moduleMarkerFor(entry),
     });
     if (!attributable) {
       const desc = cmdline ?? squatter.cmdline ?? "command line unavailable";
@@ -743,6 +758,28 @@ export class Supervisor {
     );
     await this.adoptKillOrphanOnPort(port, holder);
     return false;
+  }
+
+  /**
+   * The module-specific cmdline marker for the per-module adopt-kill attribution
+   * (#601 review). A genuine prior instance of THIS module was launched with
+   * this module's start binary (`req.cmd[0]`, e.g. `parachute-vault`) and from
+   * its installDir (`req.cwd`, e.g. `~/.parachute/vault/`) — both appear in the
+   * orphan's `ps` cmdline. Prefer the start binary (it's always present in the
+   * argv and is the most module-distinctive token); fall back to the cwd path
+   * when the binary is absent. Returns undefined when neither is available, in
+   * which case attribution falls back to the recorded-pid arm only (the cmdline
+   * arm can't match an empty needle → never a false-positive kill).
+   *
+   * Note we pass the FULL `cmd[0]` (e.g. `parachute-vault`, or an absolute
+   * `/path/to/parachute-vault`), not a bare short name — the short name
+   * (`vault`) is deliberately too loose for a kill decision.
+   */
+  private moduleMarkerFor(entry: ModuleEntry): string | undefined {
+    const binary = entry.req.cmd[0];
+    if (binary && binary.length > 0) return binary;
+    if (entry.req.cwd && entry.req.cwd.length > 0) return entry.req.cwd;
+    return undefined;
   }
 
   /**
@@ -989,9 +1026,9 @@ export class Supervisor {
     // loop bypassed it, so a foreign process that grabbed the port between the
     // crash and the auto-restart kept EADDRINUSE-crash-looping into a bare
     // `crashed` with no clue why (#582), and a leftover-autostart orphan from a
-    // prior instance re-took the port forever (#522). `excludeSelf` drops the
-    // just-crashed child's stale pid from the "ours" set (N1).
-    const squatter = this.checkPortSquatter(entry, /* excludeSelf */ true);
+    // prior instance re-took the port forever (#522). `excludeCrashingEntry`
+    // drops the just-crashed child's stale pid from the "ours" set (N1).
+    const squatter = this.checkPortSquatter(entry, /* excludeCrashingEntry */ true);
     if (squatter) {
       const handled = await this.handleCrashRestartSquatter(entry, squatter, exitCode);
       // `handled` true → we surfaced a structured error and halted the loop

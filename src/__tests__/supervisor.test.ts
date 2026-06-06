@@ -508,11 +508,12 @@ describe("Supervisor crash-restart port reclamation (#522 / #582)", () => {
       restartDelayMs: 0,
       sleep: () => Promise.resolve(),
       pidOnPort: (port) => (port === 1940 ? holder : undefined),
-      // Attributable: the cmdline carries the `parachute` marker.
-      ownerOfPid: (pid) => (pid === 5000 ? "bun /x/.parachute/vault/server.ts" : undefined),
+      // Attributable PER-MODULE: the cmdline carries THIS module's start binary
+      // (`parachute-vault`), not just a bare `parachute` marker.
+      ownerOfPid: (pid) => (pid === 5000 ? "parachute-vault serve" : undefined),
     });
 
-    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
     // Orphan grabs the port, then the child crashes. `handleExit` detects the
     // attributable orphan + adopt-kills it (the stub clears `holder`), then
     // falls through to a normal restart that re-spawns onto the freed port.
@@ -558,10 +559,11 @@ describe("Supervisor crash-restart port reclamation (#522 / #582)", () => {
       // Holder present at crash time; the (failed) kill doesn't change it here,
       // but the respawn is still attempted — that's the invariant under test.
       pidOnPort: (port) => (port === 1940 ? holder : undefined),
-      ownerOfPid: () => "node /x/.parachute/vault/server.js",
+      // Attributable per-module: cmdline carries this module's start binary.
+      ownerOfPid: () => "parachute-vault serve",
     });
 
-    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
     holder = 5001;
     first.closeStreams();
     first.resolveExit(1);
@@ -589,11 +591,12 @@ describe("Supervisor crash-restart port reclamation (#522 / #582)", () => {
       restartDelayMs: 0,
       sleep: () => Promise.resolve(),
       pidOnPort: (port) => (port === 1940 ? holder : undefined),
-      // NOT attributable: an operator's unrelated dev server (no `parachute`).
+      // NOT attributable: an operator's unrelated dev server (no `parachute-vault`
+      // marker in its cmdline).
       ownerOfPid: (pid) => (pid === 6000 ? "node /home/op/my-app/server.js" : undefined),
     });
 
-    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
     holder = 6000;
     first.closeStreams();
     first.resolveExit(1);
@@ -626,7 +629,7 @@ describe("Supervisor crash-restart port reclamation (#522 / #582)", () => {
       ownerOfPid: () => undefined,
     });
 
-    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
     holder = 7000;
     first.closeStreams();
     first.resolveExit(1);
@@ -686,11 +689,11 @@ describe("Supervisor crash-restart port reclamation (#522 / #582)", () => {
       sleep: () => Promise.resolve(),
       reclaimPolicy: "prompt",
       pidOnPort: (port) => (port === 1940 ? holder : undefined),
-      // Attributable (parachute marker) — but "prompt" still refuses to kill.
-      ownerOfPid: () => "bun /x/.parachute/vault/server.ts",
+      // Attributable per-module (parachute-vault marker) — but "prompt" still refuses to kill.
+      ownerOfPid: () => "parachute-vault serve",
     });
 
-    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
     holder = 8000;
     first.closeStreams();
     first.resolveExit(1);
@@ -702,6 +705,47 @@ describe("Supervisor crash-restart port reclamation (#522 / #582)", () => {
     expect(kill.calls).toHaveLength(0); // prompt never kills
     expect(spawner.calls).toHaveLength(1);
     expect(state?.restartsInWindow).toBe(0);
+  });
+
+  test("foreign SIBLING parachute module on the port → NOT adopt-killed, port_squatter error (per-module attribution, #601 review)", async () => {
+    // The cross-module-kill hazard the per-module attribution closes: vault's
+    // crash-restart finds its port held by a SCRIBE orphan (a genuine parachute
+    // process — its cmdline carries `parachute` AND scribe's own binary — but
+    // NOT vault's). The broad `parachute` marker would have adopt-KILLED scribe;
+    // the per-module marker (`parachute-vault`) does not match scribe's cmdline,
+    // so scribe is "not attributable" → surfaced, never killed.
+    const first = makeFakeProc(960);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first); // only one — a kill+respawn would consume a second.
+    const kill = recordingKill();
+    let holder: number | undefined = undefined; // free at start; sibling after crash.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: kill.killFn,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      pidOnPort: (port) => (port === 1940 ? holder : undefined),
+      // A real parachute process — but it's SCRIBE, not vault. Carries the broad
+      // `parachute` marker (and `parachute-scribe`) yet NOT `parachute-vault`.
+      ownerOfPid: (pid) => (pid === 9000 ? "parachute-scribe serve" : undefined),
+    });
+
+    await sup.start({ short: "vault", cmd: ["parachute-vault", "serve"], env: { PORT: "1940" } });
+    holder = 9000;
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+
+    const state = sup.get("vault");
+    // The sibling was NOT killed (per-module marker mismatch), surfaced instead.
+    expect(kill.calls).toHaveLength(0);
+    expect(spawner.calls).toHaveLength(1); // no respawn — halted, no port reclaim
+    expect(state?.status).toBe("crashed");
+    expect(state?.startError?.error_type).toBe("port_squatter");
+    expect(state?.startError?.error_description).toContain("port 1940 is held by pid 9000");
+    // Sanity: the sibling WOULD have matched the broad `parachute` marker —
+    // proving the per-module marker is what spared it.
+    expect("parachute-scribe serve").toContain("parachute");
   });
 });
 
