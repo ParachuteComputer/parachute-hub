@@ -8127,6 +8127,171 @@ describe("zero-vault non-admin privesc gate (hub#429 reviewer)", () => {
   });
 });
 
+// hub#431 — consent UX: a non-admin with zero assigned vaults requesting a
+// NAMED vault scope (`vault:<name>:read`) renders an enabled Approve button
+// pre-fix, even though the POST is correctly 400'd. (Unnamed `vault:read` was
+// already covered by the empty-picker disable; the gap was named scopes,
+// which carry no picker.) The fix disables Approve + shows explanatory copy.
+describe("handleAuthorizeGet — zero-vault non-admin named vault scope disables Approve (hub#431)", () => {
+  test("non-admin / zero vaults / named vault scope → Approve disabled + copy", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", { allowMulti: true });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          // NAMED vault scope — no picker, so pre-fix Approve stayed enabled.
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("You have no assigned vaults");
+      expect(html).toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("admin / named vault scope → Approve enabled", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin-aaron", "pw");
+      const session = createSession(db, { userId: admin.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("You have no assigned vaults");
+      expect(html).not.toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin WITH an assigned vault / named vault scope → Approve enabled", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", { allowMulti: true });
+      setUserVaults(db, bob.id, ["default"]);
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("You have no assigned vaults");
+      expect(html).not.toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin / zero vaults / NON-vault scope → Approve enabled", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", { allowMulti: true });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          // Non-vault scope — the user can still consent without a vault.
+          scope: "scribe:transcribe",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("You have no assigned vaults");
+      expect(html).not.toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 // RFC 8707 resource binding (fix #461). A friend connecting an MCP client to
 // ONE vault (`<origin>/vault/<name>/mcp`) must see ONLY that vault's scopes on
 // consent, and the minted token must carry the narrow, NAMED scope +

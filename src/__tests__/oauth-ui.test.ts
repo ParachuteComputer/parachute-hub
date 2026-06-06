@@ -225,6 +225,33 @@ describe("renderConsent", () => {
     expect(html).toContain("no vaults exist");
     expect(html).toContain('value="yes" class="btn btn-primary" disabled');
   });
+
+  test("disables Approve + shows copy when user can't authorize (hub#431)", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:work:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:work:read"],
+      userCanAuthorizeRequest: false,
+    });
+    expect(html).toContain("You have no assigned vaults");
+    expect(html).toContain("ask the hub admin".replace("ask", "Ask"));
+    expect(html).toContain('value="yes" class="btn btn-primary" disabled');
+  });
+
+  test("leaves Approve enabled when userCanAuthorizeRequest is true (hub#431)", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:work:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:work:read"],
+      userCanAuthorizeRequest: true,
+    });
+    expect(html).not.toContain("You have no assigned vaults");
+    expect(html).not.toContain('value="yes" class="btn btn-primary" disabled');
+  });
 });
 
 describe("renderError", () => {

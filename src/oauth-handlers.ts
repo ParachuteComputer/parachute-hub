@@ -2584,6 +2584,23 @@ function consentProps(
 ) {
   const scopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(scopes);
+  // Zero-vault non-admin can't authorize a vault-scoped request (hub#431).
+  // The POST handler already 400s this case ("No vaults assigned"); this
+  // flag lets the consent screen render Approve disabled + explain why,
+  // instead of showing an enabled button that lands the user on an error.
+  // Mirrors the vault-scope detection in `handleConsentSubmit`'s zero-vault
+  // gate. Non-vault scopes (`scribe:transcribe`, etc.) stay authorizable.
+  const requestsVaultScope = scopes.some((s) => {
+    if (s === "vault:read" || s === "vault:write" || s === "vault:admin") return true;
+    const parts = s.split(":");
+    return (
+      parts.length === 3 &&
+      parts[0] === "vault" &&
+      parts[2] !== undefined &&
+      VAULT_VERBS.has(parts[2])
+    );
+  });
+  const userCanAuthorizeRequest = userIsAdmin || assignedVaults.length > 0 || !requestsVaultScope;
   // Multi-user Phase 2 PR 2 stale-assignment branch (hub#284 generalized
   // from one vault to N). A non-admin user whose entire vault list has
   // been removed from services.json — admin removed / renamed the vaults
@@ -2709,6 +2726,7 @@ function consentProps(
     // verb against the stale assignment).
     blockApproveForStaleAssignment:
       staleAssignedVault !== undefined && (unnamedVerbs.length > 0 || hasNamedStaleVaultScope),
+    userCanAuthorizeRequest,
   };
 }
 

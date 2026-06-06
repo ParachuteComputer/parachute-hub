@@ -20,7 +20,7 @@
  *     module scopes that the hub doesn't know about) render verbatim.
  *   - **No JavaScript.** Entirely form-based. Submit is the only interaction.
  */
-import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
+import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import { type ScopeExplanation, explainScope } from "./scope-explanations.ts";
 
@@ -138,6 +138,15 @@ export interface ConsentViewProps {
    * the user can still proceed.
    */
   blockApproveForStaleAssignment?: boolean;
+  /**
+   * Multi-user (hub#431): false when the signed-in user can't authorize this
+   * request at all — a non-admin with zero assigned vaults requesting a vault
+   * scope (named or unnamed). The POST handler already 400s this case ("No
+   * vaults assigned"); this flag lets the consent screen render Approve
+   * disabled + show explanatory copy instead of an enabled button that lands
+   * the user on an error page. Defaults to authorizable when omitted.
+   */
+  userCanAuthorizeRequest?: boolean;
 }
 
 export interface VaultPicker {
@@ -318,6 +327,7 @@ export function renderConsent(props: ConsentViewProps): string {
     displayVault,
     staleAssignedVault,
     blockApproveForStaleAssignment,
+    userCanAuthorizeRequest,
   } = props;
   // Substitute unnamed `vault:<verb>` rows with the resolved named form so
   // the operator sees the scope shape that will appear in the token. Raw
@@ -345,11 +355,16 @@ export function renderConsent(props: ConsentViewProps): string {
   // requested scope actually depends on a vault — non-vault flows (e.g.
   // `scribe:transcribe` only) keep Approve enabled so the user can still
   // proceed despite the informational banner.
+  // Zero-vault non-admin requesting a vault scope (hub#431): the POST handler
+  // refuses with 400 "No vaults assigned", so render Approve disabled rather
+  // than leading the user to click into an error page.
+  const cannotAuthorize = userCanAuthorizeRequest === false;
   const approveDisabled =
     (vaultPicker &&
       vaultPicker.lockedVault === undefined &&
       vaultPicker.availableVaults.length === 0) ||
-    blockApproveForStaleAssignment === true
+    blockApproveForStaleAssignment === true ||
+    cannotAuthorize
       ? " disabled"
       : "";
   // Banner copy (hub#284). Worded to the *user* — "ask the admin" framing
@@ -366,6 +381,16 @@ export function renderConsent(props: ConsentViewProps): string {
             again.
           </p>`
       : "";
+  // No-vaults-assigned banner (hub#431). Shown when a non-admin with zero
+  // assigned vaults requests a vault scope — Approve is disabled above, this
+  // explains why and points at admin remediation.
+  const noVaultsBanner = cannotAuthorize
+    ? `<p class="stale-assignment-banner" role="alert">
+            <strong>You have no assigned vaults.</strong>
+            Ask the hub admin to assign you a vault via <code>/admin/users</code>
+            before authorizing vault access.
+          </p>`
+    : "";
   const body = `
     <div class="card">
       <div class="card-header">
@@ -383,6 +408,7 @@ export function renderConsent(props: ConsentViewProps): string {
         </p>
       </div>
       ${staleBanner}
+      ${noVaultsBanner}
       <section class="scopes">
         <h2 class="scopes-title">Permissions requested</h2>
         <ul class="scope-list">${scopeRows}</ul>
