@@ -178,6 +178,203 @@ describe("Supervisor.start + status transitions", () => {
   });
 });
 
+describe("Supervisor port-squatter detection (#580 item 4)", () => {
+  test("foreign pid on the module port → port_squatter error, no spawn", async () => {
+    const spawner = makeQueueSpawner();
+    // Note: NOTHING enqueued — if `start` tried to spawn, the spawner throws.
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      // A rogue pid 1921 holds :1940; it is NOT one of our children.
+      pidOnPort: (port) => (port === 1940 ? 1921 : undefined),
+      ownerOfPid: (pid) => (pid === 1921 ? "bun /x/vault/src/server.ts" : undefined),
+    });
+
+    const state = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+
+    // No spawn attempted (spawner.calls empty), module is `crashed` with the
+    // structured, actionable squatter error.
+    expect(spawner.calls).toHaveLength(0);
+    expect(state.status).toBe("crashed");
+    expect(state.pid).toBeUndefined();
+    expect(state.startError?.error_type).toBe("port_squatter");
+    expect(state.startError?.error_description).toContain("port 1940 is held by pid 1921");
+    expect(state.startError?.error_description).toContain("bun /x/vault/src/server.ts");
+    expect(state.startError?.error_description).toContain("kill 1921 && parachute start vault");
+  });
+
+  test("squatter message omits cmdline when ownerOfPid can't read it", async () => {
+    const spawner = makeQueueSpawner();
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      pidOnPort: () => 4242,
+      ownerOfPid: () => undefined,
+    });
+
+    const state = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+    expect(state.startError?.error_type).toBe("port_squatter");
+    expect(state.startError?.error_description).toContain("port 1940 is held by pid 4242");
+    expect(state.startError?.error_description).toContain("kill 4242 && parachute start vault");
+    // No parenthetical cmdline.
+    expect(state.startError?.error_description).not.toContain("(");
+  });
+
+  test("free port → no squatter error, module spawns normally", async () => {
+    const proc = makeFakeProc(500);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      pidOnPort: () => undefined, // port free / detection unavailable
+    });
+
+    const state = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+    expect(spawner.calls).toHaveLength(1);
+    expect(state.status).toBe("running");
+    expect(state.startError).toBeUndefined();
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("port held by one of OUR OWN children is not a squatter", async () => {
+    // vault is up on pid 700 holding :1940; starting a sibling (scribe) that
+    // somehow reports the same holder pid must NOT be flagged — the holder is
+    // a supervised child, not a foreign rogue.
+    const vaultProc = makeFakeProc(700);
+    const scribeProc = makeFakeProc(701);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(vaultProc);
+    spawner.enqueue(scribeProc);
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      // vault's port (1940) is free so vault spawns (pid 700). scribe's port
+      // (1943) then reports vault's pid 700 as the holder — a supervised child,
+      // NOT a foreign rogue, so scribe must still spawn.
+      pidOnPort: (port) => (port === 1943 ? 700 : undefined),
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    const scribe = await sup.start({
+      short: "scribe",
+      cmd: ["bun", "scribe.ts"],
+      env: { PORT: "1943" },
+    });
+    // scribe spawned (no false-positive squatter); both children spawned.
+    expect(spawner.calls).toHaveLength(2);
+    expect(scribe.status).toBe("running");
+    expect(scribe.startError).toBeUndefined();
+
+    vaultProc.closeStreams();
+    scribeProc.closeStreams();
+    sup.stop("vault");
+    sup.stop("scribe");
+    vaultProc.resolveExit(0);
+    scribeProc.resolveExit(0);
+  });
+
+  test("a CRASHED child's stale pid does NOT vouch for a port holder (N1 liveness)", async () => {
+    // vault spawns (pid 800), then crashes for good (maxRestarts: 1). Its entry
+    // keeps `proc.pid === 800` (never cleared on exit) but status is `crashed`.
+    // A fresh `start` where pid 800 now holds :1940 must be flagged as a
+    // SQUATTER — the stale pid of a dead child must not excuse the holder.
+    const first = makeFakeProc(800);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(first);
+    let portHeld = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      maxRestarts: 1,
+      restartDelayMs: 0,
+      sleep: () => Promise.resolve(),
+      // Free before the crash; pid 800 "holds" :1940 after we flip portHeld.
+      pidOnPort: (port) => (portHeld && port === 1940 ? 800 : undefined),
+      ownerOfPid: () => "bun /x/vault/src/server.ts",
+    });
+
+    await sup.start({ short: "vault", cmd: ["bun", "vault.ts"], env: { PORT: "1940" } });
+    // Crash past the budget → status `crashed`, entry.proc.pid still 800.
+    first.closeStreams();
+    first.resolveExit(1);
+    await tick();
+    expect(sup.get("vault")?.status).toBe("crashed");
+
+    // Now pid 800 holds the port. A re-start must NOT treat 800 as "ours".
+    portHeld = true;
+    const restarted = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+    expect(restarted.status).toBe("crashed");
+    expect(restarted.startError?.error_type).toBe("port_squatter");
+    expect(restarted.startError?.error_description).toContain("port 1940 is held by pid 800");
+    // No second spawn — the squatter check aborted before re-spawning.
+    expect(spawner.calls).toHaveLength(1);
+  });
+
+  test("no declared PORT → squatter check skipped (request without env.PORT)", async () => {
+    const proc = makeFakeProc(900);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    let probed = false;
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      pidOnPort: () => {
+        probed = true;
+        return 1;
+      },
+    });
+
+    const state = await sup.start({ short: "vault", cmd: ["bun", "vault.ts"] });
+    // No PORT in the request → we never probe a port, and the module spawns.
+    expect(probed).toBe(false);
+    expect(state.status).toBe("running");
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+
+  test("stub-spawner path defaults to no squatter (existing fake-proc tests unaffected)", async () => {
+    const proc = makeFakeProc(123);
+    const spawner = makeQueueSpawner();
+    spawner.enqueue(proc);
+    // No pidOnPort injected → on the stub-spawner (test) path it defaults to
+    // "no squatter", so a request carrying a PORT still spawns.
+    const sup = new Supervisor({ spawnFn: spawner.spawn, killFn: noopKill });
+    const state = await sup.start({
+      short: "vault",
+      cmd: ["bun", "vault.ts"],
+      env: { PORT: "1940" },
+    });
+    expect(spawner.calls).toHaveLength(1);
+    expect(state.status).toBe("running");
+
+    proc.closeStreams();
+    sup.stop("vault");
+    proc.resolveExit(0);
+  });
+});
+
 describe("Supervisor restart-on-crash", () => {
   test("restarts a crashed module within the budget", async () => {
     const first = makeFakeProc(101);

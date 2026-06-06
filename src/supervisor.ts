@@ -34,13 +34,54 @@
  * child state to disk (transient — re-derived from services.json on every boot).
  */
 
+import { spawnSync } from "node:child_process";
 import {
   MissingDependencyError,
   type MissingDependencyWire,
   ensureExecutable,
   rethrowIfMissing,
 } from "@openparachute/depcheck";
+import { defaultPidOnPort } from "./hub-control.ts";
 import { type PortListeningFn, defaultPortListening } from "./port-probe.ts";
+
+/**
+ * Which pid (if any) holds a TCP LISTEN on `port`. Production wires
+ * `hub-control.ts:defaultPidOnPort` (an `lsof -ti :<port> -sTCP:LISTEN`
+ * shell-out, macOS + Linux); a box without `lsof` / on an unsupported platform
+ * returns undefined → the squatter check degrades gracefully (falls back to the
+ * existing started-but-unbound error). Injectable so tests stay deterministic.
+ */
+export type PidOnPortFn = (port: number) => number | undefined;
+
+/**
+ * Best-effort command line of a pid (the squatter-surfacing detail). Returns
+ * undefined when it can't be read; the message then omits the cmdline.
+ */
+export type OwnerProbeFn = (pid: number) => string | undefined;
+
+/**
+ * Production `ownerOfPid`: `ps -o command= -p <pid>` → the process's full argv
+ * (one line). Mirrors `migrate-cutover.ts:defaultOwnerOfPid` (inlined rather
+ * than imported to keep the supervisor off the heavy command-module graph).
+ * Any failure (no `ps`, pid gone, permission, garbage) → undefined, so the
+ * squatter message degrades to "command line unavailable".
+ */
+export const defaultOwnerOfPid: OwnerProbeFn = (pid) => {
+  try {
+    const result = spawnSync("ps", ["-o", "command=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 2000,
+    });
+    if (result.status !== 0) return undefined;
+    const line = result.stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .find((s) => s.length > 0);
+    return line === undefined || line.length === 0 ? undefined : line;
+  } catch {
+    return undefined;
+  }
+};
 
 export type ModuleStatus = "starting" | "running" | "stopped" | "crashed" | "restarting";
 
@@ -221,6 +262,29 @@ export interface SupervisorOpts {
    * Tests exercising the missing-binary branch inject `which: () => null`.
    */
   readonly which?: (cmd: string) => string | null;
+  /**
+   * Pre-spawn port-squatter detection (#580 item 4). Returns the pid holding a
+   * TCP LISTEN on the module's port, or undefined when the port is free /
+   * undetectable. Before spawning a module, the supervisor checks whether the
+   * declared port is already held by a pid it does NOT own (not one of its live
+   * children). If so it records a structured `port_squatter` start-error with
+   * an actionable message and DOES NOT spawn — so a rogue process holding the
+   * port (the #580 field signature: a bare `vault/src/server.ts` outside the
+   * supervisor on :1940) surfaces in `status` instead of the supervised child
+   * EADDRINUSE-crash-looping into a bare `supervisor: crashed`.
+   *
+   * Detection ONLY — never auto-kills (that's an operator's unrelated process).
+   * Defaults to `hub-control.ts:defaultPidOnPort` on the production path; the
+   * stub-spawner test path defaults to "no squatter" (returns undefined) so
+   * existing fake-proc tests are unaffected unless they inject this explicitly.
+   */
+  readonly pidOnPort?: PidOnPortFn;
+  /**
+   * Best-effort cmdline probe for the squatter pid (the actionable message
+   * detail). Defaults to {@link defaultOwnerOfPid} on the production path; the
+   * stub-spawner test path defaults to "unknown" (returns undefined).
+   */
+  readonly ownerOfPid?: OwnerProbeFn;
 }
 
 /**
@@ -336,6 +400,12 @@ export class Supervisor {
       lateBindWatchMs: opts.lateBindWatchMs ?? DEFAULT_LATE_BIND_WATCH_MS,
       lateBindPollMs: opts.lateBindPollMs ?? DEFAULT_LATE_BIND_POLL_MS,
       which: opts.which ?? (isProductionPath ? Bun.which : () => "/stub/bin/preflight-skipped"),
+      // Squatter detection (#580 item 4): real probes on the production path;
+      // the stub-spawner test path defaults to "no squatter / unknown owner" so
+      // fake-proc tests (which never hold a real port) aren't tripped. Tests
+      // opt in by injecting `pidOnPort` / `ownerOfPid`.
+      pidOnPort: opts.pidOnPort ?? (isProductionPath ? defaultPidOnPort : () => undefined),
+      ownerOfPid: opts.ownerOfPid ?? (isProductionPath ? defaultOwnerOfPid : () => undefined),
     };
   }
 
@@ -389,6 +459,25 @@ export class Supervisor {
       }
     }
 
+    // Pre-spawn port-squatter detection (#580 item 4). If the module's declared
+    // port is already held by a process the supervisor does NOT own (not one of
+    // its live children), spawning would EADDRINUSE-crash-loop the child into a
+    // bare `supervisor: crashed` with no clue why. Detect the foreign holder and
+    // record a structured, actionable `port_squatter` start-error INSTEAD of
+    // spawning — the operator sees the offending pid + cmdline + a copy-paste
+    // recovery in `status` / the SPA. Detection only: we never kill someone
+    // else's process (it may be the operator's unrelated dev server).
+    const squatter = this.detectPortSquatter(entry);
+    if (squatter) {
+      entry.state = {
+        ...entry.state,
+        status: "crashed",
+        pid: undefined,
+        startError: squatter,
+      };
+      return entry.state;
+    }
+
     // Belt-and-suspenders for a spawn that slips past the preflight (binary
     // removed between check + spawn, or a path that didn't preflight): a
     // not-found spawn throw becomes the same structured MissingDependencyError
@@ -426,6 +515,65 @@ export class Supervisor {
     // crash watcher (`handleExit`), which owns the restart budget.
     await this.awaitPortReadiness(entry);
     return entry.state;
+  }
+
+  /**
+   * The set of pids the supervisor currently owns AND that are still alive — its
+   * live children's pids. Used by the squatter check to decide whether a process
+   * holding a module's port is "ours" (a re-probe of our own just-spawned child,
+   * or a sibling) vs a foreign rogue.
+   *
+   * Liveness guard (N1): `entry.proc` is NEVER cleared on exit (`handleExit`
+   * only updates `entry.state`), so a recycled OS pid could otherwise be
+   * misclassified as "our own child" and wrongly excused from the squatter
+   * check. We therefore only count an entry whose child is actually running —
+   * `state.status` is `running` or `starting`. A `crashed` / `restarting` /
+   * `stopped` module's recorded pid is stale (the process is gone or being
+   * replaced) and must not vouch for whoever now holds the port. An entry with
+   * no `proc` (never spawned) contributes no pid either.
+   */
+  private supervisedPids(): Set<number> {
+    const pids = new Set<number>();
+    for (const entry of this.modules.values()) {
+      if (entry.state.status !== "running" && entry.state.status !== "starting") continue;
+      const pid = entry.proc?.pid;
+      if (typeof pid === "number" && pid > 0) pids.add(pid);
+    }
+    return pids;
+  }
+
+  /**
+   * Pre-spawn port-squatter check (#580 item 4). Returns a structured
+   * `port_squatter` start-error when the module's declared port is held by a
+   * process the supervisor does NOT own; undefined when the port is free, the
+   * holder is one of our own children, or detection isn't available on this
+   * platform (no `lsof` → `pidOnPort` returns undefined → we degrade to the
+   * existing started-but-unbound path post-spawn).
+   *
+   * Ownership precedent mirrors `migrate-cutover.ts:sweepOrphanOnPort`'s "is
+   * this mine?" check — here the discriminant is "is the holder one of my live
+   * children's pids?". We deliberately do NOT kill the holder (detection only):
+   * a foreign pid on a module port may be the operator's unrelated process.
+   */
+  private detectPortSquatter(entry: ModuleEntry): ModuleStartError | undefined {
+    const portStr = entry.req.env?.PORT;
+    const port = portStr ? Number(portStr) : Number.NaN;
+    if (!Number.isFinite(port) || port <= 0) return undefined; // No declared port.
+
+    const holder = this.opts.pidOnPort(port);
+    if (holder === undefined) return undefined; // Port free, or detection unavailable.
+    if (this.supervisedPids().has(holder)) return undefined; // Our own child.
+
+    const cmdline = this.opts.ownerOfPid(holder);
+    const who = cmdline ? `pid ${holder} (${cmdline})` : `pid ${holder}`;
+    const short = entry.req.short;
+    return {
+      error_type: "port_squatter",
+      error_description:
+        `port ${port} is held by ${who} outside the supervisor — ` +
+        `kill it and retry: kill ${holder} && parachute start ${short}`,
+      at: new Date(this.opts.now()).toISOString(),
+    };
   }
 
   /**
