@@ -669,6 +669,11 @@ async function proxyToVault(
       headers: {
         location: mcpUrl,
         "content-type": "application/json",
+        // 308 is permanently cacheable by default; without no-store a client
+        // (or an intermediary) could cache the redirect and keep bouncing the
+        // bare path to `/mcp` even after a remount changes the routing. Same
+        // guard as the force-change-password redirect below.
+        "cache-control": "no-store",
       },
     });
   }

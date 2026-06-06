@@ -1649,6 +1649,9 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
       );
       expect(res.status).toBe(308);
       expect(res.headers.get("location")).toBe("/vault/aaron/mcp");
+      // 308 is permanently cacheable by default — no-store prevents a cached
+      // redirect outliving a remount.
+      expect(res.headers.get("cache-control")).toBe("no-store");
       const body = (await res.json()) as { error: string; mcp_url: string; message: string };
       expect(body.error).toBe("missing_mcp_suffix");
       expect(body.mcp_url).toBe("/vault/aaron/mcp");

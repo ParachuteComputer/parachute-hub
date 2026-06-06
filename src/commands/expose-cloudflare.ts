@@ -1138,6 +1138,17 @@ export async function exposeCloudflareOff(opts: ExposeCloudflareOpts = {}): Prom
   // downstream consumers stop resolving the now-dead public URL (mirrors the
   // up-path write above + the Tailscale off-path's expose-state teardown). When
   // other tunnels survive we leave it — a later off for the last one clears it.
+  //
+  // TODO(multi-tunnel) #588: with TWO CF tunnels up, tearing down the
+  // last-written-up one (whose hostname is what's in vault's `.env`) while the
+  // other survives leaves `.env` carrying the dead tunnel's origin while the
+  // surviving tunnel serves a different one → stale-iss on the next vault
+  // restart. Retention is still the only SAFE choice here: a single
+  // `PARACHUTE_HUB_ORIGIN` field can't represent "which surviving tunnel wins,"
+  // and clearing it would break the survivor's iss check. Properly fixing it
+  // needs re-resolving the effective origin from the survivor (or multi-origin
+  // issuer acceptance vault-side) — larger than the #503 single-tunnel fix, and
+  // multi-CF-tunnel-on-one-box is rare. See #588.
   if (!state) {
     clearExposeState(r.exposeStatePath);
     // Drop the persisted PARACHUTE_HUB_ORIGIN from vault's `.env` (#503). With
