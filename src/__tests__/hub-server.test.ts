@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildCsrfCookie, generateCsrfToken } from "../csrf.ts";
 import { HUB_SVC, hubPortPath } from "../hub-control.ts";
+import { createDbHolder } from "../hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
   findServiceUpstream,
@@ -1341,6 +1342,59 @@ describe("hubFetch routing", () => {
       );
       expect(onDbErrorCalls).toBe(0);
     } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a transient SQLITE_BUSY escaping a handler → 503, does NOT exit the hub (#594)", async () => {
+    const h = makeHarness();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      // Wire a REAL DbHolder so this pins the end-to-end transient path: the
+      // wrapper catches the throw, routes it to the holder's healOrExit, and
+      // the holder must classify SQLITE_BUSY as transient → "ignored" → NO
+      // reopen, NO exit. A spy `exit` that fails the test if ever called is the
+      // regression guard ("a momentary lock never kills the hub").
+      let exited = false;
+      let reopened = false;
+      const holder = createDbHolder(db, {
+        reopen: () => {
+          reopened = true;
+          return db;
+        },
+        exit: () => {
+          exited = true;
+        },
+        log: () => {},
+      });
+      const busy = Object.assign(new Error("database is locked"), {
+        name: "SQLiteError",
+        code: "SQLITE_BUSY",
+      });
+      // First getDb() (the wizard-redirect userCount read) throws BUSY; the
+      // wrapper's catch routes it through the holder.
+      let firstCall = true;
+      const res = await hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        getDb: () => {
+          if (firstCall) {
+            firstCall = false;
+            throw busy;
+          }
+          return holder.get();
+        },
+        onDbError: (err) => holder.healOrExit(err),
+      })(req("/", { headers: { accept: "text/html" } }));
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.error).toBe("db_unavailable");
+      // Transient class is named in the structured body, not "reopened".
+      expect(body.error_description as string).toContain("transient");
+      // The crux: the hub did NOT exit and did NOT reopen on a transient lock.
+      expect(exited).toBe(false);
+      expect(reopened).toBe(false);
+    } finally {
+      db.close();
       h.cleanup();
     }
   });

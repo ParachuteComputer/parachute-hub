@@ -300,7 +300,10 @@ export const defaultVerifyConnection: VerifyConnectionFn = async ({
   const deadline = Date.now() + timeoutMs;
   // Probe immediately, then poll until a connector registers or the budget
   // elapses. `tunnelConnectionCount` swallows its own CLI/parse errors → 0, so
-  // a not-yet-ready connector just costs another poll.
+  // a not-yet-ready connector just costs another poll. Worst case is roughly
+  // ceil(timeoutMs / pollMs) iterations (each = one `cloudflared tunnel info`
+  // call + one sleep) before the deadline check returns false — with the
+  // production defaults (25_000 / 1_000) that's ~25 probes over ~25s.
   for (;;) {
     if ((await tunnelConnectionCount(runner, tunnelName)) > 0) return true;
     if (Date.now() >= deadline) return false;

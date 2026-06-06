@@ -68,11 +68,28 @@ export function classifyDbError(err: unknown): DbErrorClass {
   if (/\bdatabase is locked\b/.test(sig) || /\bdatabase table is locked\b/.test(sig)) {
     return "transient";
   }
+  // A handful of SQLITE_IOERR *sub-codes* are contention, not corruption:
+  // SQLITE_IOERR_BLOCKED (a legacy busy variant) and SQLITE_IOERR_LOCK (a
+  // lock-acquisition failure). The generic `sqlite_ioerr` substring match
+  // below would otherwise sweep these into the fatal class and exit the hub on
+  // transient I/O contention. Check them FIRST so they classify as transient.
+  if (sig.includes("sqlite_ioerr_blocked") || sig.includes("sqlite_ioerr_lock")) {
+    return "transient";
+  }
 
   // Persistent-corruption / dead-handle class → fatal (reopen-once-or-exit).
   // `disk I/O error` is the exact field message (state dir deleted under a
   // running hub); the malformed-image + corrupt + notadb codes are the
   // related on-disk-corruption shapes the issue calls out.
+  //
+  // `sqlite_ioerr` matches the GENERIC `SQLITE_IOERR` code, which is what Bun
+  // surfaces for the dead-handle case (the unlinked-inode field repro reports
+  // exactly `code: "SQLITE_IOERR", message: "disk I/O error"`, not a
+  // sub-code). The two transient IOERR sub-codes are already filtered out
+  // above, so reaching this `includes` means either the generic code or a
+  // corruption sub-code — both fatal. (`disk i/o error` is also matched
+  // directly so a runtime that surfaces the message but not the code still
+  // classifies.)
   if (
     sig.includes("disk i/o error") ||
     sig.includes("sqlite_ioerr") ||

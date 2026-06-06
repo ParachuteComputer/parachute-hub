@@ -783,6 +783,33 @@ describe("ensureHubVersionMatches — version-check-and-restart at adoption (#59
     expect(restarts).toHaveLength(1);
   });
 
+  // #594: a SUSTAINED transient fault visible in /health (e.g. a write lock
+  // that never clears) is still an "error:" verdict, so the adoption probe
+  // treats it as needing a restart — same as the fatal case. Pins that
+  // `healthReportsDbFault` keys on the "error:" prefix, not the fatal class.
+  test("version matches but /health reports db error: transient → restart-once (#594)", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      // first probe: right version, sustained transient DB fault; after the
+      // restart the re-probe sees a live DB.
+      healthVersionSeq: [
+        { ok: true, version: INSTALLED, db: "error: transient" },
+        { ok: true, version: INSTALLED, db: "ok" },
+      ],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("restarted");
+    const restarts = f.calls.filter((c) => c.includes("kickstart"));
+    expect(restarts).toHaveLength(1);
+  });
+
   test("version + db both ok → match, NO restart (#594 doesn't fire on a healthy hub)", async () => {
     const f = fakeDeps({
       platform: "darwin",
