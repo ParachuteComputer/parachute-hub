@@ -53,6 +53,7 @@ import { HUB_UNIT_DEFAULT_PORT } from "../hub-unit.ts";
 import { type AliveFn, defaultAlive } from "../process-state.ts";
 import { readManifestLenient } from "../services-manifest.ts";
 import { type Runner, defaultRunner } from "../tailscale/run.ts";
+import { clearVaultHubOrigin } from "../vault-hub-origin-env.ts";
 import type { VaultAuthStatus } from "../vault/auth-status.ts";
 import { printPublic2FAWarning } from "./expose-2fa-warning.ts";
 import {
@@ -1139,6 +1140,22 @@ export async function exposeCloudflareOff(opts: ExposeCloudflareOpts = {}): Prom
   // other tunnels survive we leave it — a later off for the last one clears it.
   if (!state) {
     clearExposeState(r.exposeStatePath);
+    // Drop the persisted PARACHUTE_HUB_ORIGIN from vault's `.env` (#503). With
+    // the last Cloudflare tunnel gone, the hub is loopback-only and mints
+    // loopback-`iss` tokens; a stale public origin left in `vault/.env` would
+    // pin a public expected issuer and 401 every request on the next vault
+    // daemon restart ("not signed in to the hub" — the inverse of the bug
+    // selfHealVaultHubOrigin closed). This mirrors exactly what the Tailscale
+    // off-path does (`exposeOff` in expose.ts) — the Cloudflare path had been
+    // the asymmetric gap. expose-state's own `hubOrigin` is cleared above via
+    // clearExposeState, so hub's per-request `resolveIssuer`/`exposeIssuerOrigin`
+    // (which read expose-state) also stop minting the public iss after teardown.
+    // No restart needed for the gap this closes — the next vault restart picks
+    // up the cleared `.env` — but tell the operator so an already-running vault
+    // doesn't keep validating against the now-dead public origin.
+    if (clearVaultHubOrigin(r.configDir, r.log)) {
+      r.log("  Restart vault to apply the loopback issuer now: `parachute restart vault`.");
+    }
   }
   return failed ? 1 : 0;
 }
