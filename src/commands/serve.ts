@@ -337,13 +337,22 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   // hatch for setups that want loopback-only inside a sidecar.
   const hostname = env.PARACHUTE_BIND_HOST || "0.0.0.0";
 
-  // Ensure the well-known dir exists, and seed a static hub.html so `/`
+  // Ensure the well-known dir exists, and (re)write the static hub.html so `/`
   // serves something coherent on a fresh disk (the dynamic path through
   // `hubFetch` takes over once a DB row exists; the disk file is the
   // signed-out fallback).
+  //
+  // Regenerate on EVERY serve start, not just when the file is absent (#171):
+  // hub.html is a served artifact built from current code, and code ships via
+  // `git pull` + `parachute restart hub`. Guarding on `!existsSync` left the
+  // stale post-upgrade file on disk until an unrelated `parachute expose`
+  // re-ran — so operators saw old hub.html after an upgrade. The write is a
+  // cheap, deterministic, atomic (tmp+rename) render of static signed-out
+  // HTML with no expose-state or DB dependency, so it's safe to call every
+  // start.
   if (!existsSync(WELL_KNOWN_DIR)) mkdirSync(WELL_KNOWN_DIR, { recursive: true });
   const hubHtmlPath = join(WELL_KNOWN_DIR, "hub.html");
-  if (!existsSync(hubHtmlPath)) writeHubFile(hubHtmlPath);
+  writeHubFile(hubHtmlPath);
 
   const dbPath = hubDbPath();
   // Self-heal-or-die DB holder (#594). The handle lives behind a mutable

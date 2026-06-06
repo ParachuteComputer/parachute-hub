@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { renderHub, writeHubFile } from "../hub.ts";
@@ -296,6 +296,32 @@ describe("writeHubFile", () => {
       expect(written).toBe(path);
       expect(existsSync(path)).toBe(true);
       const content = readFileSync(path, "utf8");
+      expect(content).toBe(renderHub());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // hub#171: serve regenerates hub.html on EVERY start (the `!existsSync`
+  // guard in commands/serve.ts was dropped), so writeHubFile must be safe to
+  // call when the file already exists and must overwrite stale content with
+  // a fresh render from current code — otherwise an upgrade serves the old
+  // page until an unrelated `parachute expose` re-runs.
+  test("overwrites a pre-existing stale hub.html with a fresh render (hub#171)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pcli-hub-"));
+    try {
+      const path = join(dir, "well-known", "hub.html");
+      // First write creates the well-known dir + a real file; then plant
+      // stale content to simulate an old hub.html left over from a prior code
+      // version after `git pull` + `parachute restart hub`.
+      writeHubFile(path);
+      writeFileSync(path, "<!-- stale pre-upgrade hub.html -->");
+      expect(readFileSync(path, "utf8")).toContain("stale");
+
+      const written = writeHubFile(path);
+      expect(written).toBe(path);
+      const content = readFileSync(path, "utf8");
+      expect(content).not.toContain("stale");
       expect(content).toBe(renderHub());
     } finally {
       rmSync(dir, { recursive: true, force: true });

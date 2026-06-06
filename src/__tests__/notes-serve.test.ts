@@ -6,6 +6,7 @@ import {
   normalizeMount,
   notesDistCandidates,
   notesFetch,
+  notesServeOptions,
   resolveNotesDistFrom,
 } from "../notes-serve.ts";
 
@@ -25,6 +26,15 @@ function makeHarness(): Harness {
 function req(path: string): Request {
   return new Request(`http://127.0.0.1${path}`);
 }
+
+describe("notesServeOptions (hub#399 residual)", () => {
+  test("sets idleTimeout: 255 to outlast edge keep-alive pools, matching hub-server.ts", () => {
+    const opts = notesServeOptions(5173, "/tmp/dist", "/notes");
+    expect(opts.idleTimeout).toBe(255);
+    expect(opts.port).toBe(5173);
+    expect(typeof opts.fetch).toBe("function");
+  });
+});
 
 describe("normalizeMount", () => {
   test("strips trailing slashes", () => {
