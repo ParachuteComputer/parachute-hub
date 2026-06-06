@@ -2,7 +2,9 @@
 
 All notable changes to `@openparachute/hub` are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/) loosely; versions follow [SemVer](https://semver.org/) with the pre-1.0 RC governance described in [`parachute-patterns/patterns/governance.md`](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md).
 
-> **Backfill note (2026-06-06).** The entire 0.6.x line (0.6.0 → 0.6.4) shipped without changelog entries — the file stopped at `0.5.13-rc.48`. The block below backfills it retroactively at **stable granularity**: one entry per published stable, each summarizing its rc chain rather than logging every `rc.N` as the governance preamble prescribes. This mirrors the file's existing honesty about the 0.3.6 drift. Per-rc detail lives in the git history and tags (`git log v0.6.0..v0.6.1`, etc.); the [v0.6.4 GitHub Release](https://github.com/ParachuteComputer/parachute-hub/releases/tag/v0.6.4) is the only one with curated release notes. All five stables (0.6.0, 0.6.1, 0.6.2, 0.6.3, 0.6.4) published to npm; no intermediate stable was skipped.
+> **Backfill note (2026-06-06).** The entire 0.6.x line (0.6.0 → 0.6.4) shipped without changelog entries — the file stopped at `0.5.13-rc.48`. The block below backfills it retroactively at **stable granularity**: one entry per published stable, each summarizing its rc chain rather than logging every `rc.N` as the governance preamble prescribes. Per-rc detail lives in the git history and tags (`git log v0.6.0..v0.6.1`, etc.); the [v0.6.4 GitHub Release](https://github.com/ParachuteComputer/parachute-hub/releases/tag/v0.6.4) is the only one with curated release notes. All five stables (0.6.0, 0.6.1, 0.6.2, 0.6.3, 0.6.4) published to npm; no intermediate stable was skipped.
+>
+> This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
 ## [0.6.4] - 2026-06-06
 
@@ -19,7 +21,7 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 
 ### Install & init
 
-- `parachute init` never dead-ends: expose failures warn and continue to the wizard URL instead of aborting; the Cloudflare flow no longer requires a vault to route; typed hostnames persist across retries (#564–#567, #574).
+- `parachute init` never dead-ends: expose failures warn and continue to the wizard URL instead of aborting; the Cloudflare flow no longer requires a vault to route; an inline `cloudflared` install offer (macOS via brew, Linux via static binary) lands when it's missing; typed hostnames persist across retries (#564, #566, #567, #574).
 - **`parachute install <svc>` is light** — install → register → start → "manage it in the admin UI." The interactive interview is opt-in via `--interactive` (#579). The "Blocked 1 postinstall" warning on `bun add -g` is gone (#568).
 
 ### Lifecycle robustness
@@ -43,7 +45,7 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 
 ### Changed
 
-- **Supervisor unification, Phases 1–6** (#495–#510, #514). Module-ops start/stop endpoints + a CLI module-ops client (Phase 1); supervisor hardening — process-group reaping, per-module log ring buffer, port-readiness + structured start-errors (Phase 2a); a generalized `ManagedUnit` with env block + install-without-start (Phase 2b); `ensureHubUnit` + `init` installs/starts the hub unit (Phase 3a); start/stop/restart cutover to drive the supervisor with a detached fallback + fresh-box operator-token closure (Phase 3b); `status` reads the platform manager + running supervisor (Phase 3c); expose decouple + `upgrade-hub` restarts the unit (Phase 4 CLI); `POST /api/hub/upgrade` + detached one-shot helper + admin-SPA hub-upgrade affordance (Phase 4 SPA); migrate detached→supervised cutover + archive-guard fix + auto-offer (Phase 5a); **retire the detached spawners + collapse the dual-dispatch bridge — supervised is the only runtime** (Phase 5b); doc rewrite across Service-lifecycle, CLAUDE.md, help, and route headers (Phase 6).
+- **Supervisor unification, Phases 1–6** (#495, #496, #497, #498, #499, #500, #502, #504, #507, #510, #514). Module-ops start/stop endpoints + a CLI module-ops client (Phase 1); supervisor hardening — process-group reaping, per-module log ring buffer, port-readiness + structured start-errors (Phase 2a); a generalized `ManagedUnit` with env block + install-without-start (Phase 2b); `ensureHubUnit` + `init` installs/starts the hub unit (Phase 3a); start/stop/restart cutover to drive the supervisor with a detached fallback + fresh-box operator-token closure (Phase 3b); `status` reads the platform manager + running supervisor (Phase 3c); expose decouple + `upgrade-hub` restarts the unit (Phase 4 CLI); `POST /api/hub/upgrade` + detached one-shot helper + admin-SPA hub-upgrade affordance (Phase 4 SPA); migrate detached→supervised cutover + archive-guard fix + auto-offer (Phase 5a); **retire the detached spawners + collapse the dual-dispatch bridge — supervised is the only runtime** (Phase 5b); doc rewrite across Service-lifecycle, CLAUDE.md, help, and route headers (Phase 6).
 
 ### Fixed
 
@@ -89,7 +91,7 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 ### Added
 
 - **Single OAuth consent with grantable `vault:<name>:admin`** under a delegate-only-what-you-hold capability model (#484). One consent screen mints the named, vault-bound scope a client actually needs.
-- **`@openparachute/depcheck` library + hub adoption** — friendly missing-dependency UX (the systematic version of the cloudflared/git/tailscale guidance) (#483, follow-on to #481, #188).
+- **`@openparachute/depcheck` library + hub adoption** — friendly missing-dependency UX (the systematic version of the cloudflared/git/tailscale guidance) (#483, follow-on to #481). (The originating commit message also cited #188; that reference was erroneous — #188 is an unrelated login rate-limit change — and is omitted here.)
 - **Friend-facing `/account` connect-your-vault UX** for Claude.ai + Claude Code, plus a slimmed signed-out discovery page (#478); friends can mint a scoped (read/write, assignment-gated) vault token from `/account` (#479).
 - **Real TOTP 2FA at hub login** with backup codes (#473, #475).
 - **Capability attenuation throughout mint/revoke** — host-admin bearers mint `vault:<name>:admin`; that token mints same-vault subtokens; revoke can revoke what it could mint; malformed vault-shaped scopes rejected at mint (#449, #452, #454, #455, #461; scope-guard surfaces the `permissions` claim, #453).
