@@ -12,6 +12,7 @@ import {
 } from "../cloudflare/state.ts";
 import {
   type CloudflaredSpawner,
+  defaultVerifyConnection,
   exposeCloudflareOff,
   exposeCloudflareUp,
 } from "../commands/expose-cloudflare.ts";
@@ -116,6 +117,16 @@ function fakeSpawner(pid: number): { spawner: CloudflaredSpawner; seen: string[]
     },
   };
   return { spawner, seen };
+}
+
+/**
+ * Write a fake `~/.cloudflared/<uuid>.json` credentials file so the reuse-path
+ * credentials check (#593) sees a healthy local tunnel and reuses it instead of
+ * triggering the delete+recreate self-heal. Reuse-path tests that want to
+ * exercise the plain reuse behavior call this after `makeEnv()`.
+ */
+function seedCreds(env: TestEnv, uuid: string): void {
+  writeFileSync(join(env.cloudflaredHome, `${uuid}.json`), "{}");
 }
 
 describe("exposeCloudflareUp", () => {
@@ -350,6 +361,7 @@ describe("exposeCloudflareUp", () => {
     const env = makeEnv();
     try {
       const uuid = "bbbbbbbb-0000-0000-0000-000000000002";
+      seedCreds(env, uuid); // healthy local creds → plain reuse, no recreate (#593)
       const { runner, calls } = queueRunner([
         { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
         {
@@ -563,6 +575,7 @@ describe("exposeCloudflareUp", () => {
     const env = makeEnv();
     try {
       const uuid = "2c1a7c7e-1234-5678-9abc-def012345678";
+      seedCreds(env, uuid); // healthy local creds → plain reuse, no recreate (#593)
       const { runner } = queueRunner([
         { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
         { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
@@ -605,6 +618,8 @@ describe("exposeCloudflareUp", () => {
   test("stops a prior cloudflared process before spawning a new one", async () => {
     const env = makeEnv();
     try {
+      // Healthy local creds for the reused tunnel → plain reuse, no recreate (#593).
+      seedCreds(env, "cccccccc-0000-0000-0000-000000000003");
       const priorRecord: CloudflaredTunnelRecord = {
         pid: 99999,
         tunnelUuid: "old-tunnel-uuid",
@@ -668,6 +683,7 @@ describe("exposeCloudflareUp", () => {
     const env = makeEnv();
     try {
       const uuid = "cccccccc-0000-0000-0000-000000000003";
+      seedCreds(env, uuid); // healthy local creds → plain reuse, no recreate (#593)
       const priorRecord: CloudflaredTunnelRecord = {
         pid: 99999,
         tunnelUuid: uuid,
@@ -727,6 +743,7 @@ describe("exposeCloudflareUp", () => {
     const env = makeEnv();
     try {
       const uuid = "dddddddd-0000-0000-0000-000000000004";
+      seedCreds(env, uuid); // healthy local creds → plain reuse, no recreate (#593)
       const { runner } = queueRunner([
         { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
         { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
@@ -774,6 +791,7 @@ describe("exposeCloudflareUp", () => {
     const env = makeEnv();
     try {
       const uuid = "eeeeeeee-0000-0000-0000-000000000006";
+      seedCreds(env, uuid); // healthy local creds → plain reuse, no recreate (#593)
       const { runner } = queueRunner([
         { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
         { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
@@ -817,6 +835,7 @@ describe("exposeCloudflareUp", () => {
     const env = makeEnv();
     try {
       const uuid = "ffffffff-0000-0000-0000-000000000007";
+      seedCreds(env, uuid); // healthy local creds → plain reuse, no recreate (#593)
       const { runner } = queueRunner([
         { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
         { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
@@ -1158,6 +1177,7 @@ describe("exposeCloudflareUp", () => {
       const env = makeEnv();
       try {
         const uuid = "bbbb8888-1111-2222-3333-444455556666";
+        seedCreds(env, uuid); // healthy local creds → plain reuse, no recreate (#593)
         const legacy: CloudflaredTunnelRecord = {
           pid: 71001,
           tunnelUuid: uuid,
@@ -1377,6 +1397,239 @@ describe("exposeCloudflareUp", () => {
       } finally {
         env.cleanup();
       }
+    });
+  });
+
+  describe("#593: reuse-path credentials self-heal", () => {
+    test("recreates the tunnel when the local credentials file is missing", async () => {
+      const env = makeEnv();
+      try {
+        const staleUuid = "11110000-0000-0000-0000-0000000005aa";
+        const freshUuid = "22220000-0000-0000-0000-0000000005bb";
+        // NO seedCreds → the reused tunnel's local creds file is absent, the
+        // exact field state (account-side tunnel survives, local creds lost).
+        const { runner, calls } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" }, // --version
+          {
+            code: 0,
+            stdout: JSON.stringify([{ id: staleUuid, name: "parachute" }]),
+            stderr: "",
+          }, // tunnel list (exists account-side)
+          { code: 0, stdout: "Deleted tunnel parachute\n", stderr: "" }, // tunnel delete --force
+          {
+            code: 0,
+            stdout: `Created tunnel parachute with id ${freshUuid}\n`,
+            stderr: "",
+          }, // tunnel create (fresh creds)
+          { code: 0, stdout: "", stderr: "" }, // route dns
+        ]);
+        const { spawner } = fakeSpawner(43000);
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("vault.example.com", {
+          runner,
+          spawner,
+          alive: () => false,
+          kill: () => {},
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+          tunnelName: "parachute",
+        });
+
+        expect(code).toBe(0);
+        const cmds = calls.map((c) => c.cmd.join(" "));
+        expect(cmds).toContain("cloudflared tunnel delete --force parachute");
+        expect(cmds).toContain("cloudflared tunnel create parachute");
+        // State + config reflect the FRESH uuid, not the stale one.
+        const state = readCloudflaredState(env.statePath);
+        expect(findTunnelRecord(state, "parachute")?.tunnelUuid).toBe(freshUuid);
+        const yaml = readFileSync(env.configPath, "utf8");
+        expect(yaml).toContain(`tunnel: ${freshUuid}`);
+        const joined = logs.join("\n");
+        expect(joined).toContain("local credentials");
+        expect(joined).toContain("Recreated tunnel");
+      } finally {
+        env.cleanup();
+      }
+    });
+
+    test("fails with recovery commands when the stale-tunnel delete itself fails", async () => {
+      const env = makeEnv();
+      try {
+        const staleUuid = "11110000-0000-0000-0000-0000000005cc";
+        const { runner, calls } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" }, // --version
+          {
+            code: 0,
+            stdout: JSON.stringify([{ id: staleUuid, name: "parachute" }]),
+            stderr: "",
+          }, // tunnel list
+          { code: 1, stdout: "", stderr: "tunnel has active connections" }, // delete fails
+        ]);
+        const { spawner } = fakeSpawner(43001);
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("vault.example.com", {
+          runner,
+          spawner,
+          alive: () => false,
+          kill: () => {},
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+          tunnelName: "parachute",
+        });
+
+        expect(code).toBe(1);
+        // No connector spawned, no success print.
+        const joined = logs.join("\n");
+        expect(joined).toContain("Couldn't delete the stale tunnel");
+        expect(joined).toContain("cloudflared tunnel delete --force parachute");
+        expect(joined).not.toContain("Cloudflare tunnel up");
+        // create + route never ran.
+        const cmds = calls.map((c) => c.cmd.join(" "));
+        expect(cmds.some((c) => c.startsWith("cloudflared tunnel create"))).toBe(false);
+      } finally {
+        env.cleanup();
+      }
+    });
+  });
+
+  describe("#593: post-start connection verification", () => {
+    test("fails loudly when the connector never registers a connection (timeout)", async () => {
+      const env = makeEnv();
+      try {
+        const uuid = "33330000-0000-0000-0000-0000000005dd";
+        seedCreds(env, uuid);
+        const { runner } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+          { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
+          { code: 0, stdout: "", stderr: "" }, // route dns
+        ]);
+        const { spawner } = fakeSpawner(43002);
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("vault.example.com", {
+          runner,
+          spawner,
+          alive: () => false,
+          kill: () => {},
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+          tunnelName: "parachute",
+          // Drive the timeout branch directly (no real cloudflared/poll).
+          verifyConnection: async () => false,
+        });
+
+        expect(code).toBe(1);
+        const joined = logs.join("\n");
+        expect(joined).toContain("never registered a tunnel connection");
+        expect(joined).toContain("error 1033");
+        expect(joined).toContain(env.logPath); // names the connector log
+        expect(joined).not.toContain("✓ Cloudflare tunnel up");
+      } finally {
+        env.cleanup();
+      }
+    });
+
+    test("prints success when the connector verifies connected", async () => {
+      const env = makeEnv();
+      try {
+        const uuid = "44440000-0000-0000-0000-0000000005ee";
+        seedCreds(env, uuid);
+        const { runner } = queueRunner([
+          { code: 0, stdout: "cloudflared 2024.1.0\n", stderr: "" },
+          { code: 0, stdout: JSON.stringify([{ id: uuid, name: "parachute" }]), stderr: "" },
+          { code: 0, stdout: "", stderr: "" }, // route dns
+        ]);
+        const { spawner } = fakeSpawner(43003);
+        const logs: string[] = [];
+
+        const code = await exposeCloudflareUp("vault.example.com", {
+          runner,
+          spawner,
+          alive: () => false,
+          kill: () => {},
+          log: (l) => logs.push(l),
+          manifestPath: env.manifestPath,
+          statePath: env.statePath,
+          exposeStatePath: env.exposeStatePath,
+          configPath: env.configPath,
+          logPath: env.logPath,
+          cloudflaredHome: env.cloudflaredHome,
+          configDir: env.configDir,
+          skipHub: true,
+          tunnelName: "parachute",
+          verifyConnection: async () => true,
+        });
+
+        expect(code).toBe(0);
+        const joined = logs.join("\n");
+        expect(joined).toContain("Connector connected.");
+        expect(joined).toContain("✓ Cloudflare tunnel up");
+      } finally {
+        env.cleanup();
+      }
+    });
+
+    test("defaultVerifyConnection polls tunnelConnectionCount and returns true once connected", async () => {
+      // Drives the real default poll loop against a queued runner — first
+      // `tunnel info` reports no conns, the second reports one. No real sleep.
+      let infoCalls = 0;
+      const runner: Runner = async (cmd) => {
+        if (cmd.join(" ").startsWith("cloudflared tunnel info")) {
+          infoCalls += 1;
+          return infoCalls === 1
+            ? { code: 0, stdout: JSON.stringify({ conns: [] }), stderr: "" }
+            : { code: 0, stdout: JSON.stringify({ conns: [{ id: "c1" }] }), stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      };
+      const connected = await defaultVerifyConnection({
+        runner,
+        tunnelName: "parachute",
+        timeoutMs: 5_000,
+        pollMs: 1,
+        sleep: async () => {},
+      });
+      expect(connected).toBe(true);
+      expect(infoCalls).toBe(2);
+    });
+
+    test("defaultVerifyConnection returns false when the budget elapses with no connection", async () => {
+      const runner: Runner = async () => ({
+        code: 0,
+        stdout: JSON.stringify({ conns: [] }),
+        stderr: "",
+      });
+      const connected = await defaultVerifyConnection({
+        runner,
+        tunnelName: "parachute",
+        timeoutMs: 0, // immediate deadline → one probe then false
+        pollMs: 1,
+        sleep: async () => {},
+      });
+      expect(connected).toBe(false);
     });
   });
 });
