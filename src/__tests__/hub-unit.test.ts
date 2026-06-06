@@ -4,6 +4,7 @@ import {
   NO_MANAGER_MESSAGE,
   NO_UNIT_MESSAGE,
   ensureHubUnit,
+  ensureHubVersionMatches,
   installAndStartHubUnit,
   queryHubUnitState,
   restartHubUnit,
@@ -38,6 +39,12 @@ function fakeDeps(
   over: Partial<HubUnitDeps> & {
     runResults?: ServiceCommandResult[];
     healthSeq?: boolean[];
+    /**
+     * #590: scripted version-aware /health probe results. Each element is
+     * `null` (hub not answering) or `{ ok, version }`. Drives
+     * `probeHealthVersion` across the version-check + post-restart re-probe.
+     */
+    healthVersionSeq?: ({ ok: boolean; version?: string } | null)[];
     listeningSeq?: boolean[];
     installedUnit?: boolean;
   } = {},
@@ -46,6 +53,7 @@ function fakeDeps(
   const files = new Map<string, string>();
   let runIdx = 0;
   let healthIdx = 0;
+  let healthVersionIdx = 0;
   let listeningIdx = 0;
   const ok: ServiceCommandResult = { code: 0, stdout: "", stderr: "" };
 
@@ -95,6 +103,13 @@ function fakeDeps(
         const seq = over.healthSeq;
         if (!seq) return false;
         return seq[Math.min(healthIdx++, seq.length - 1)] ?? false;
+      }),
+    probeHealthVersion:
+      over.probeHealthVersion ??
+      (async () => {
+        const seq = over.healthVersionSeq;
+        if (!seq) return null;
+        return seq[Math.min(healthVersionIdx++, seq.length - 1)] ?? null;
       }),
     portListening:
       over.portListening ??
@@ -574,5 +589,171 @@ describe("queryHubUnitState — §6.4 hub-row manager query", () => {
     const r = queryHubUnitState(f.deps);
     expect(r.state).toBe("unknown");
     expect(r.detail).toContain("spawn EPERM");
+  });
+});
+
+describe("ensureHubVersionMatches — version-check-and-restart at adoption (#590)", () => {
+  const INSTALLED = "0.6.4-rc.9";
+
+  test("versions match → no-op, NO restart, NO manager call", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      healthVersionSeq: [{ ok: true, version: INSTALLED }],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("match");
+    expect(res.runningVersion).toBe(INSTALLED);
+    // No launchctl/systemctl call at all — the version agreed.
+    expect(f.calls).toEqual([]);
+  });
+
+  test("mismatch + unit-managed → restarts ONCE + re-probe shows new version → restarted", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      // first probe: stale zombie; after the restart the re-probe sees the new code.
+      healthVersionSeq: [
+        { ok: true, version: "0.5.14-rc.4" },
+        { ok: true, version: INSTALLED },
+      ],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("restarted");
+    // Exactly ONE restart (launchctl kickstart -k) was issued.
+    const restarts = f.calls.filter((c) => c.includes("kickstart"));
+    expect(restarts).toHaveLength(1);
+    expect(restarts[0]).toEqual(["launchctl", "kickstart", "-k", "gui/501/computer.parachute.hub"]);
+  });
+
+  test("/health has NO version field (very old hub) → treated as mismatch → restart", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      healthVersionSeq: [{ ok: true /* no version */ }, { ok: true, version: INSTALLED }],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("restarted");
+    expect(f.calls).toContainEqual(["systemctl", "--user", "restart", "parachute-hub.service"]);
+  });
+
+  test("mismatch but NOT unit-managed (no unit installed) → not-unit-managed, NO kill, actionable message", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: false, // a detached legacy pid / dev `bun run serve`
+      healthVersionSeq: [{ ok: true, version: "0.5.14-rc.4" }],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("not-unit-managed");
+    // Did NOT issue any manager command — we never blindly kill a hub we don't own.
+    expect(f.calls).toEqual([]);
+    const joined = res.messages.join("\n");
+    expect(joined).toContain("NOT managed by a Parachute service unit");
+    expect(joined).toContain("0.5.14-rc.4");
+    expect(joined).toContain(INSTALLED);
+  });
+
+  test("mismatch but no service manager at all → not-unit-managed (don't kill)", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      installedUnit: true,
+      which: () => null, // no systemctl → no manager
+      healthVersionSeq: [{ ok: true, version: "0.5.14-rc.4" }],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("not-unit-managed");
+    expect(f.calls).toEqual([]);
+  });
+
+  test("restart-loop guard: still mismatched after the single restart → still-mismatched, restarts ONCE", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      // bun-linked branch checkout: the restart comes back STILL on the old
+      // version (package.json trails). Every probe returns the stale version.
+      healthVersionSeq: [{ ok: true, version: "0.5.14-rc.4" }],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyTimeoutMs: 0, // immediate deadline → one re-probe then settle
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("still-mismatched");
+    // Restarted AT MOST once — no loop.
+    const restarts = f.calls.filter((c) => c.includes("kickstart"));
+    expect(restarts).toHaveLength(1);
+    expect(res.messages.join("\n")).toContain("still not reporting");
+  });
+
+  test("hub not answering /health at all → not-running (no-op, no restart)", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      healthVersionSeq: [null], // connection refused / timeout
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("not-running");
+    expect(f.calls).toEqual([]);
+  });
+
+  test("mismatch + unit-managed but the restart command fails → restart-failed", async () => {
+    const f = fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      installedUnit: true,
+      healthVersionSeq: [{ ok: true, version: "0.5.14-rc.4" }],
+      run: (cmd) => {
+        if (cmd.includes("restart")) {
+          return { code: 1, stdout: "", stderr: "Unit parachute-hub.service not found." };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("restart-failed");
+    expect(res.messages.join("\n")).toContain("Unit parachute-hub.service not found.");
   });
 });

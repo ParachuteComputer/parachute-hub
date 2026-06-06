@@ -16,15 +16,18 @@
  * `expose-cloudflare.ts` (cloudflared) use so the two paths can't drift.
  */
 
+import pkg from "../../package.json" with { type: "json" };
 import { readHubPort } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
   type EnsureHubUnitOpts,
   type EnsureHubUnitResult,
+  type EnsureHubVersionMatchesResult,
   HUB_UNIT_DEFAULT_PORT,
   type HubUnitDeps,
   defaultHubUnitDeps,
   ensureHubUnit as ensureHubUnitImpl,
+  ensureHubVersionMatches as ensureHubVersionMatchesImpl,
 } from "../hub-unit.ts";
 import {
   type DriveModuleOpDeps,
@@ -54,6 +57,17 @@ export interface ExposeSupervisorOpts {
   hubUnitDeps?: HubUnitDeps;
   /** Ensure the hub unit is up before / during expose (§3.2 / §4.3a). */
   ensureHubUnit?: (opts: EnsureHubUnitOpts) => Promise<EnsureHubUnitResult>;
+  /**
+   * Version-check-and-restart at the expose adoption point (#590). After the
+   * hub unit is confirmed up, compare the RUNNING hub's `/health` version to the
+   * installed package version; restart the managed unit on mismatch so an expose
+   * never wires a tunnel to a stale zombie. Production wires
+   * `ensureHubVersionMatches`; tests inject a stub.
+   */
+  ensureHubVersion?: (ctx: {
+    port: number;
+    log: (line: string) => void;
+  }) => Promise<EnsureHubVersionMatchesResult>;
   /** Drive a per-module op against the running hub (reads operator.token). */
   driveModuleOp?: (short: string, op: ModuleOp, deps: DriveModuleOpDeps) => Promise<ModuleOpResult>;
   /**
@@ -83,6 +97,10 @@ export interface ExposeSupervisorOpts {
 export interface ResolvedExposeSupervisor {
   hubUnitDeps: HubUnitDeps;
   ensureHubUnit: (opts: EnsureHubUnitOpts) => Promise<EnsureHubUnitResult>;
+  ensureHubVersion: (ctx: {
+    port: number;
+    log: (line: string) => void;
+  }) => Promise<EnsureHubVersionMatchesResult>;
   driveModuleOp: (short: string, op: ModuleOp, deps: DriveModuleOpDeps) => Promise<ModuleOpResult>;
   openDb: (configDir: string) => import("bun:sqlite").Database;
   selfHealOperatorTokenIssuer: (
@@ -105,6 +123,15 @@ export function resolveExposeSupervisor(
   return {
     hubUnitDeps,
     ensureHubUnit: opts?.ensureHubUnit ?? ensureHubUnitImpl,
+    ensureHubVersion:
+      opts?.ensureHubVersion ??
+      ((ctx) =>
+        ensureHubVersionMatchesImpl({
+          installedVersion: pkg.version,
+          port: ctx.port,
+          deps: hubUnitDeps,
+          log: ctx.log,
+        })),
     driveModuleOp: opts?.driveModuleOp ?? driveModuleOpImpl,
     openDb: opts?.openDb ?? ((configDir) => openHubDb(hubDbPath(configDir))),
     selfHealOperatorTokenIssuer:
@@ -145,6 +172,24 @@ export async function ensureHubUnitForExpose(
 ): Promise<{ ok: boolean; port: number }> {
   const ensured = await sup.ensureHubUnit({ port, deps: sup.hubUnitDeps, log });
   if (ensured.outcome === "already-up" || ensured.outcome === "started") {
+    // #590: the hub is up — but is it the version we installed? A zombie that
+    // merely answers /health must not become the target of a fresh tunnel.
+    // Compare + restart-on-mismatch (once). A non-unit-managed mismatch is NOT
+    // killed: surface it + fail the expose so the operator resolves it; a
+    // still-mismatched-after-restart (bun-linked branch) warns + continues.
+    try {
+      const versionResult = await sup.ensureHubVersion({ port: ensured.port, log });
+      for (const m of versionResult.messages) log(m);
+      if (
+        versionResult.outcome === "not-unit-managed" ||
+        versionResult.outcome === "restart-failed"
+      ) {
+        return { ok: false, port: ensured.port };
+      }
+    } catch (err) {
+      // A version-check failure must never block expose — degrade to a note.
+      log(`note: hub version check skipped (${err instanceof Error ? err.message : String(err)})`);
+    }
     return { ok: true, port: ensured.port };
   }
   for (const m of ensured.messages) log(m);

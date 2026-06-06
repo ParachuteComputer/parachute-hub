@@ -341,6 +341,96 @@ describe("install", () => {
     }
   });
 
+  test("names the squatter holding the canonical port when the walk assigns a fallback (#590)", async () => {
+    // Field bug #590 item 2: a stale pre-supervisor vault zombie squats 1940;
+    // the install-time port walk silently routed to a fallback. Now it names the
+    // holder (pid + command line) + hints it may be a stale daemon. Detection
+    // only — never kills. Reuses the #581 pidOnPort / ownerOfPid seams.
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      const code = await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        configDir,
+        startService: async () => 0,
+        isLinked: () => false,
+        // Only vault's canonical 1940 is held → the walk picks a fallback in-range.
+        portProbe: async (p) => p === 1940,
+        // Inject the #581 seams: a foreign pid squats 1940.
+        pidOnPort: (p) => (p === 1940 ? 1234 : undefined),
+        ownerOfPid: (pid) => (pid === 1234 ? "bun /opt/vault/src/server.ts" : undefined),
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      // The fallback warning still fires…
+      expect(joined).toMatch(/canonical port 1940 is in use; assigned/);
+      // …and now it NAMES the squatter + hints at a stale daemon.
+      expect(joined).toContain("pid 1234 (bun /opt/vault/src/server.ts)");
+      expect(joined).toMatch(/stale pre-supervisor daemon/);
+      expect(joined).toContain("kill 1234");
+      const entry = findService("parachute-vault", path);
+      expect(entry?.port).not.toBe(1940);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("squatter pid present but command line unreadable → names the pid alone (#590)", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      const code = await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        configDir,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async (p) => p === 1940,
+        pidOnPort: (p) => (p === 1940 ? 4321 : undefined),
+        ownerOfPid: () => undefined, // ps failed / pid gone
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toContain("held by pid 4321.");
+      expect(joined).not.toContain("(undefined)");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("no squatter naming when the canonical port is free (#590 — no false positive)", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      let pidProbed = false;
+      const code = await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        configDir,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false, // canonical 1940 is free
+        pidOnPort: () => {
+          pidProbed = true;
+          return 9999;
+        },
+        ownerOfPid: () => "should-not-appear",
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      // Canonical assigned → no fallback warning, no squatter probe at all.
+      expect(joined).not.toMatch(/is in use; assigned/);
+      expect(joined).not.toContain("should-not-appear");
+      expect(pidProbed).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("`install lens` aliases to notes with a rename notice", async () => {
     // Transition alias for the brief Notes→Lens rename (Apr 19) that was
     // reverted on launch eve (Apr 22). Accepted for one release cycle so

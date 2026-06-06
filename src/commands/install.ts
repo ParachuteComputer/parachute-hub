@@ -5,7 +5,12 @@ import { autoWireScribeAuth } from "../auto-wire.ts";
 import { bunGlobalPrefixes, isLinked as defaultIsLinkedShared } from "../bun-link.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
-import { HUB_DEFAULT_PORT, readHubPort } from "../hub-control.ts";
+import {
+  HUB_DEFAULT_PORT,
+  type PidOnPortFn,
+  defaultPidOnPort,
+  readHubPort,
+} from "../hub-control.ts";
 import { type HubUnitDeps, defaultHubUnitDeps, isHubUnitInstalled } from "../hub-unit.ts";
 import {
   type ModuleManifest,
@@ -34,6 +39,7 @@ import {
   type DisableStaleModuleUnitsResult,
   disableStaleModuleUnits as defaultDisableStaleModuleUnits,
 } from "../stale-module-units.ts";
+import { type OwnerProbeFn, defaultOwnerOfPid } from "../supervisor.ts";
 import { WELL_KNOWN_PATH } from "../well-known.ts";
 import { type LifecycleOpts, start as lifecycleStart } from "./lifecycle.ts";
 import { migrateNotice } from "./migrate.ts";
@@ -301,6 +307,22 @@ export interface InstallOpts {
    * unless the test populates services.json directly.
    */
   portProbe?: (port: number) => Promise<boolean>;
+  /**
+   * Test seam for the install-time port-squatter naming (#590 item 2). When the
+   * canonical port walk has to assign a fallback port because the canonical one
+   * is held, this looks up the pid LISTENing on the canonical port so the
+   * warning can name the holder (`pid 1234 (bun .../vault/src/server.ts)`) — the
+   * same #581 `pidOnPort` / `ownerOfPid` seams the supervisor start-path uses,
+   * reused (not duplicated). Detection-only — never kills. Production wires
+   * `defaultPidOnPort` (`lsof -ti :<port>`); tests inject a deterministic stub.
+   */
+  pidOnPort?: PidOnPortFn;
+  /**
+   * Test seam for the install-time port-squatter naming (#590 item 2): the
+   * best-effort command line of the squatting pid. Production wires
+   * `defaultOwnerOfPid` (`ps -o command= -p <pid>`); tests inject a stub.
+   */
+  ownerOfPid?: OwnerProbeFn;
   /**
    * Test seam for reading `<packageDir>/.parachute/module.json`. Production
    * uses the real file reader; tests inject a map from package-dir → manifest
@@ -974,6 +996,25 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   });
   if (portResult.warning) {
     log(`⚠ ${portResult.warning}`);
+    // #590 item 2: the canonical port was held, so we walked to a fallback. Name
+    // the squatter — the supervisor start-path does this post-#581; do it here at
+    // install-time too. Reuse the #581 pidOnPort / ownerOfPid seams (detection
+    // only; never kill). When the holder is a foreign pid (not one of OUR rows —
+    // which is the common case when a stale pre-supervisor daemon is squatting),
+    // surface its pid + command line + a hint.
+    if (canonicalPort !== undefined && portResult.source !== "canonical") {
+      const pidOnPort = opts.pidOnPort ?? defaultPidOnPort;
+      const ownerOfPid = opts.ownerOfPid ?? defaultOwnerOfPid;
+      const holder = pidOnPort(canonicalPort);
+      if (holder !== undefined) {
+        const cmdline = ownerOfPid(holder);
+        const who = cmdline ? `pid ${holder} (${cmdline})` : `pid ${holder}`;
+        log(`  canonical port ${canonicalPort} is held by ${who}.`);
+        log(
+          `  This may be a stale pre-supervisor daemon. If so, stop it (kill ${holder}) and re-run \`parachute install ${entryName}\` to reclaim the canonical port.`,
+        );
+      }
+    }
   }
 
   // Find-or-seed the manifest entry. Re-read after the seed write so a silent

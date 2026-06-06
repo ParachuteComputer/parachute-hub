@@ -76,6 +76,16 @@ export interface HubUnitDeps extends ManagedUnitDeps {
    * uses a bounded `fetch`; tests inject a deterministic stub.
    */
   probeHealth: (port: number) => Promise<boolean>;
+  /**
+   * HTTP `/health` probe that ALSO reads the JSON `version` field of the
+   * running hub (#590). Resolves to `{ ok, version }` — `ok` mirrors
+   * {@link probeHealth} (2xx), `version` is the running hub's reported version
+   * (or `undefined` when the body has no `version` field — a very old hub that
+   * predates the field; the caller treats that as a mismatch). Resolves to
+   * `null` when the hub doesn't answer at all (connection-refused / timeout).
+   * Production uses a bounded `fetch`; tests inject a deterministic stub.
+   */
+  probeHealthVersion: (port: number) => Promise<{ ok: boolean; version?: string } | null>;
   /** TCP connect-probe for readiness polling (reuses `defaultPortListening`). */
   portListening: PortListeningFn;
   /** Sleep between readiness polls (tests pin to 0). */
@@ -98,9 +108,41 @@ async function defaultProbeHealth(port: number): Promise<boolean> {
   }
 }
 
+/**
+ * Default version-aware `/health` probe (#590). Reads the JSON body and pulls
+ * out the `version` field. Returns `null` on any network error / timeout (the
+ * hub isn't answering); `{ ok, version }` otherwise — `version` is `undefined`
+ * when the body has no string `version` field (a very old hub, or a non-JSON
+ * body), which the caller treats as a mismatch. 1.5s timeout, mirroring
+ * {@link defaultProbeHealth}.
+ */
+async function defaultProbeHealthVersion(
+  port: number,
+): Promise<{ ok: boolean; version?: string } | null> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    let version: string | undefined;
+    try {
+      const body = (await res.json()) as unknown;
+      if (body && typeof body === "object" && "version" in body) {
+        const v = (body as { version?: unknown }).version;
+        if (typeof v === "string" && v.length > 0) version = v;
+      }
+    } catch {
+      // Non-JSON body → no version. Leave `version` undefined (→ mismatch).
+    }
+    return version !== undefined ? { ok: res.ok, version } : { ok: res.ok };
+  } catch {
+    return null;
+  }
+}
+
 export const defaultHubUnitDeps: HubUnitDeps = {
   ...defaultManagedUnitDeps,
   probeHealth: defaultProbeHealth,
+  probeHealthVersion: defaultProbeHealthVersion,
   portListening: defaultPortListening,
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
 };
@@ -158,6 +200,16 @@ export function isHubUnitInstalled(deps: HubUnitDeps): boolean {
  * Is a service manager (systemd / launchd) available on this platform at all?
  * macOS → launchctl; Linux → systemctl. A box with neither (a bare container,
  * an init-less host) has no manager — the foreground-`serve`-only path (R19/D1).
+ *
+ * NOTE: production `deps.which` is `Bun.which`, which resolves against the
+ * process PATH. This ASSUMES `launchctl` (`/bin/launchctl`) / `systemctl` are on
+ * the PATH — true on any normal macOS / systemd box. A deliberately stripped
+ * PATH (a `nix develop` shell that omits `/bin`, a minimal CI image) would make
+ * `which` return null and misclassify a genuinely launchd-managed hub as
+ * not-unit-managed. The #590 version-check then degrades to the "stop it
+ * yourself" path rather than restarting the unit — a safe (never-kill)
+ * degradation, but worth knowing if a dev sees not-unit-managed on a box that
+ * clearly runs the hub under launchd.
  */
 export function hasServiceManager(deps: HubUnitDeps): boolean {
   if (deps.platform === "darwin") return deps.which("launchctl") !== null;
@@ -340,6 +392,209 @@ export function restartHubUnit(deps: HubUnitDeps): HubUnitManagerOpResult {
     };
   }
   return { outcome: "ok", messages: [] };
+}
+
+/**
+ * Outcome of {@link ensureHubVersionMatches} (#590).
+ */
+export type HubVersionOutcome =
+  /** The running hub's version matched the installed version — no action. */
+  | "match"
+  /** Hub wasn't answering `/health` at all — nothing to compare (no-op). */
+  | "not-running"
+  /**
+   * Versions mismatched, the hub is unit-managed, the unit was restarted, and
+   * the running version now matches the installed version. The zombie was
+   * cleared.
+   */
+  | "restarted"
+  /**
+   * Versions mismatched and the hub is unit-managed, but after the (single)
+   * restart the running version STILL doesn't match — e.g. a bun-linked
+   * checkout on a feature branch whose package.json version trails the running
+   * code, or a restart that adopted yet-another stale build. We restart at most
+   * once and then continue rather than loop (the restart-loop guard).
+   */
+  | "still-mismatched"
+  /**
+   * Versions mismatched but the running hub is NOT unit-managed (a legacy
+   * detached pid, or a dev `bun run serve` in a terminal, or no service
+   * manager at all). We do NOT kill it blindly — we surface the mismatch +
+   * an actionable message and stop.
+   */
+  | "not-unit-managed"
+  /**
+   * Versions mismatched, the hub is unit-managed, but the restart command
+   * itself failed (the manager rejected it). Surface the manager's error.
+   */
+  | "restart-failed";
+
+export interface EnsureHubVersionMatchesResult {
+  outcome: HubVersionOutcome;
+  /** The running hub's reported version (undefined when it had no version field / wasn't running). */
+  runningVersion?: string;
+  /** The installed package version we compared against. */
+  installedVersion: string;
+  /** Human-readable lines the caller should surface (mismatch notice, actionable hints). */
+  messages: string[];
+}
+
+export interface EnsureHubVersionMatchesOpts {
+  /** The installed package version (the caller reads its own `package.json`). */
+  installedVersion: string;
+  /** Hub port to probe (default 1939). */
+  port?: number;
+  /** Injectable deps (defaults to production). */
+  deps?: HubUnitDeps;
+  /** Readiness budget after a restart, in ms (default 15s). */
+  readyTimeoutMs?: number;
+  /** Poll interval for the post-restart re-probe, in ms (default 250). */
+  readyPollMs?: number;
+  log?: (line: string) => void;
+}
+
+/**
+ * Version-check-and-restart at a hub adoption point (#590).
+ *
+ * The field bug: a freshly-installed hub (e.g. 0.6.4-rc.9) adopts an
+ * arbitrarily-stale RUNNING hub (0.5.14-rc.4) merely because it answers
+ * `/health` on 1939 — a zombie LaunchAgent survives `rm -rf ~/.parachute`, and
+ * everything downstream (tunnel, wizard, vault install) then binds to month-old
+ * code running against a directory deleted out from under it.
+ *
+ * This helper closes that edge. Given the INSTALLED package version (the caller
+ * reads its own `package.json` at runtime), it:
+ *   1. Probes `/health` for the RUNNING version. Not answering → `not-running`
+ *      (nothing to adopt; the caller's bringup path handles starting it).
+ *   2. Version matches → `match` (today's behavior, no extra restart).
+ *   3. Version mismatches (INCLUDING a hub with no `version` field — a very old
+ *      hub — which reads as "undefined ≠ installed"):
+ *        a. If the running hub is NOT unit-managed (no manager / no unit
+ *           installed) → `not-unit-managed`. We do NOT kill it blindly: a
+ *           detached legacy pid or a dev `bun run serve` may be the operator's,
+ *           and KeepAlive-less processes aren't ours to reap. Surface an
+ *           actionable message and stop.
+ *        b. If it IS unit-managed → restart the unit ONCE
+ *           ({@link restartHubUnit}), then re-probe `/health` until the version
+ *           matches or the timeout elapses:
+ *             - now matches → `restarted` (zombie cleared).
+ *             - still mismatched → `still-mismatched` (restart-loop guard: we
+ *               restart at most once; a bun-linked branch checkout whose
+ *               package.json trails the code stays here — warn + continue, do
+ *               not loop).
+ *             - restart command failed → `restart-failed`.
+ *
+ * The CALLER decides whether a given outcome is fatal. `init` and the expose
+ * chains both want: `match`/`not-running`/`restarted` → continue silently-ish;
+ * `not-unit-managed`/`still-mismatched`/`restart-failed` → warn loudly (and, for
+ * init, optionally bail) so a brand-new tunnel never wires to a zombie.
+ *
+ * Everything is behind the {@link HubUnitDeps} seam — no real launchctl /
+ * systemctl / HTTP call in tests.
+ */
+export async function ensureHubVersionMatches(
+  opts: EnsureHubVersionMatchesOpts,
+): Promise<EnsureHubVersionMatchesResult> {
+  const deps = opts.deps ?? defaultHubUnitDeps;
+  const port = opts.port ?? HUB_UNIT_DEFAULT_PORT;
+  const installedVersion = opts.installedVersion;
+  const readyTimeoutMs = opts.readyTimeoutMs ?? 15_000;
+  const readyPollMs = opts.readyPollMs ?? 250;
+  const log = opts.log ?? (() => {});
+
+  const probe = await deps.probeHealthVersion(port);
+  if (probe === null) {
+    // Hub isn't answering — nothing to compare. The caller's bringup path owns
+    // starting it; this helper is a no-op here.
+    return { outcome: "not-running", installedVersion, messages: [] };
+  }
+
+  const runningVersion = probe.version;
+  if (runningVersion === installedVersion) {
+    // Exactly today's behavior — versions agree, no extra restart.
+    return { outcome: "match", runningVersion, installedVersion, messages: [] };
+  }
+
+  // Mismatch (includes the no-`version`-field very-old-hub case → undefined).
+  const runningLabel = runningVersion ?? "an older version (no version field)";
+
+  // Is this hub one we can restart through the manager? If there's no manager,
+  // or no unit installed, the running hub is a legacy detached pid / a dev
+  // foreground `serve` — NOT ours to reap. Surface + stop (do not kill blindly).
+  if (!hasServiceManager(deps) || !isHubUnitInstalled(deps)) {
+    return {
+      outcome: "not-unit-managed",
+      runningVersion,
+      installedVersion,
+      messages: [
+        `⚠ the running hub is ${runningLabel} but ${installedVersion} is installed.`,
+        "  The running hub is NOT managed by a Parachute service unit (a detached process or a foreground `parachute serve` / `bun src/cli.ts serve`), so it won't be restarted automatically.",
+        `  Stop it yourself (find it with \`lsof -ti :${port}\` then \`kill <pid>\`, or quit the foreground \`parachute serve\` / \`bun src/cli.ts serve\` on a dev checkout), then re-run so the new code is adopted.`,
+      ],
+    };
+  }
+
+  // Unit-managed mismatch: restart the unit ONCE to pick up the new code.
+  log(
+    `⚠ the running hub is ${runningLabel} but ${installedVersion} is installed — restarting the hub unit to pick up the new code.`,
+  );
+  const restart = restartHubUnit(deps);
+  if (restart.outcome !== "ok") {
+    return {
+      outcome: "restart-failed",
+      runningVersion,
+      installedVersion,
+      messages: [
+        `⚠ the running hub is ${runningLabel} but ${installedVersion} is installed, and the hub unit restart failed.`,
+        ...restart.messages,
+      ],
+    };
+  }
+
+  // Builders for the two terminal outcomes of the post-restart re-probe loop.
+  const restartedResult = (v: string): EnsureHubVersionMatchesResult => ({
+    outcome: "restarted",
+    runningVersion: v,
+    installedVersion,
+    messages: [`✓ hub unit restarted; now running ${installedVersion}.`],
+  });
+  const stillMismatchedResult = (last: string | undefined): EnsureHubVersionMatchesResult => {
+    const reports = last ? ` (reports ${last})` : "";
+    return {
+      outcome: "still-mismatched",
+      ...(last !== undefined ? { runningVersion: last } : {}),
+      installedVersion,
+      messages: [
+        `⚠ restarted the hub unit, but it is still not reporting ${installedVersion}${reports}.`,
+        "  This can happen with a bun-linked checkout on a feature branch whose package.json version trails the running code.",
+        `  Continuing — verify with \`parachute status\` / \`curl http://127.0.0.1:${port}/health\` if the hub should be on a specific version.`,
+      ],
+    };
+  };
+
+  // Re-probe `/health` until the running version matches the installed version
+  // or the readiness budget elapses. Restart-loop guard: we restart AT MOST
+  // once — if it still mismatches after this single restart (e.g. a bun-linked
+  // checkout on a branch), we warn + continue rather than looping.
+  const deadline = Date.now() + readyTimeoutMs;
+  for (;;) {
+    const after = await deps.probeHealthVersion(port);
+    if (after !== null && after.version === installedVersion) {
+      return restartedResult(installedVersion);
+    }
+    if (Date.now() >= deadline) {
+      // Report the last-observed (still-stale) version if the hub came back.
+      return stillMismatchedResult(after?.version ?? runningVersion);
+    }
+    if (readyPollMs > 0) await deps.sleep(readyPollMs);
+    else break;
+  }
+  // readyPollMs === 0 fast-path: one more probe, then settle.
+  const finalProbe = await deps.probeHealthVersion(port);
+  if (finalProbe !== null && finalProbe.version === installedVersion) {
+    return restartedResult(installedVersion);
+  }
+  return stillMismatchedResult(finalProbe?.version ?? runningVersion);
 }
 
 /**
