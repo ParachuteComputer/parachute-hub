@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, openSync } from "node:fs";
+import { existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 import {
   DEFAULT_TUNNEL_NAME,
@@ -37,8 +37,10 @@ import {
   type Tunnel,
   createTunnel,
   credentialsPath,
+  deleteTunnel,
   findTunnelByName,
   routeDns,
+  tunnelConnectionCount,
 } from "../cloudflare/tunnel.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import {
@@ -267,6 +269,48 @@ export function looksLikeCloudflare(addresses: readonly string[]): boolean {
   return false;
 }
 
+/**
+ * Poll for the spawned connector establishing a live edge connection, bounded
+ * by `timeoutMs` (#593). Resolves true the first time `cloudflared tunnel
+ * info` reports ≥1 connector connection; false when the budget elapses with
+ * none. The pid existing is NOT proof of connection — the field repro had a
+ * live pid crash-looping on a missing creds file, every request returning
+ * Cloudflare error 1033. This is the loud verification that turns that silent
+ * false-success into an actionable failure.
+ *
+ * Injectable so tests drive both branches deterministically without a real
+ * cloudflared. Production uses `defaultVerifyConnection` (a bounded
+ * `tunnelConnectionCount` poll).
+ */
+export type VerifyConnectionFn = (args: {
+  runner: Runner;
+  tunnelName: string;
+  timeoutMs: number;
+  pollMs: number;
+  sleep: (ms: number) => Promise<void>;
+}) => Promise<boolean>;
+
+export const defaultVerifyConnection: VerifyConnectionFn = async ({
+  runner,
+  tunnelName,
+  timeoutMs,
+  pollMs,
+  sleep,
+}) => {
+  const deadline = Date.now() + timeoutMs;
+  // Probe immediately, then poll until a connector registers or the budget
+  // elapses. `tunnelConnectionCount` swallows its own CLI/parse errors → 0, so
+  // a not-yet-ready connector just costs another poll. Worst case is roughly
+  // ceil(timeoutMs / pollMs) iterations (each = one `cloudflared tunnel info`
+  // call + one sleep) before the deadline check returns false — with the
+  // production defaults (25_000 / 1_000) that's ~25 probes over ~25s.
+  for (;;) {
+    if ((await tunnelConnectionCount(runner, tunnelName)) > 0) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(pollMs);
+  }
+};
+
 export interface ExposeCloudflareOpts {
   runner?: Runner;
   spawner?: CloudflaredSpawner;
@@ -307,6 +351,23 @@ export interface ExposeCloudflareOpts {
    * Tests inject a stub; production uses `defaultResolveHost` (Bun DNS).
    */
   resolveHost?: ResolveHostFn;
+  /**
+   * Verify the spawned connector actually established an edge connection
+   * before claiming "✓ Cloudflare tunnel up" (#593). Production polls
+   * `cloudflared tunnel info` for a live connector (bounded). Tests inject a
+   * stub to drive the success / timeout branches without a real cloudflared.
+   * Returns true once at least one connection is live, false on timeout.
+   * Default policy mirrors `connectorPids`/`resolveHost`: when a test injects a
+   * stub `spawner` (and no explicit seam), default to an inert "connected"
+   * stub so existing stub-spawner suites don't have to model the probe.
+   */
+  verifyConnection?: VerifyConnectionFn;
+  /** Connection-verify budget in ms (default 25_000). */
+  verifyTimeoutMs?: number;
+  /** Poll interval for the connection-verify probe in ms (default 1_000). */
+  verifyPollMs?: number;
+  /** Sleep between connection-verify polls. Tests pin to a no-op. */
+  sleep?: (ms: number) => Promise<void>;
   log?: (line: string) => void;
   manifestPath?: string;
   statePath?: string;
@@ -402,6 +463,10 @@ interface Resolved {
   }) => InstallResult;
   removeService: (args: { tunnelName: string }) => RemoveResult;
   resolveHost: ResolveHostFn;
+  verifyConnection: VerifyConnectionFn;
+  verifyTimeoutMs: number;
+  verifyPollMs: number;
+  sleep: (ms: number) => Promise<void>;
   log: (line: string) => void;
   manifestPath: string;
   statePath: string;
@@ -488,6 +553,17 @@ function resolve(opts: ExposeCloudflareOpts, tunnelNameDefault: string): Resolve
     resolveHost:
       opts.resolveHost ??
       (opts.spawner === undefined ? defaultResolveHost : async () => ["104.16.0.1"]),
+    // Connection-verify seam (#593). Same defaulting policy as
+    // `connectorPids`/`resolveHost`: when a test injects a stub `spawner` (and
+    // no explicit seam), default to an inert "connected" stub so existing
+    // stub-spawner suites don't have to model the `tunnel info` probe.
+    // Production (no spawner override) gets the real bounded poll.
+    verifyConnection:
+      opts.verifyConnection ??
+      (opts.spawner === undefined ? defaultVerifyConnection : async () => true),
+    verifyTimeoutMs: opts.verifyTimeoutMs ?? 25_000,
+    verifyPollMs: opts.verifyPollMs ?? 1_000,
+    sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     log: opts.log ?? ((line) => console.log(line)),
     manifestPath: opts.manifestPath ?? SERVICES_MANIFEST_PATH,
     statePath: opts.statePath ?? CLOUDFLARED_STATE_PATH,
@@ -694,7 +770,50 @@ export async function exposeCloudflareUp(
       "  Each machine gets its own dedicated tunnel — you don't need to run `cloudflared tunnel create` separately; expose does it.",
     );
   } else {
-    r.log(`✓ Reusing existing tunnel "${r.tunnelName}" (${tunnel.id})`);
+    // Reuse-path credentials verification + self-heal (#593). `findTunnelByName`
+    // only proves the tunnel exists ACCOUNT-side. The connector needs the LOCAL
+    // credentials file (`~/.cloudflared/<uuid>.json`, written at `tunnel create`
+    // time) to authenticate — and that file gets lost on clean-slate flows
+    // (`rm -rf ~/.parachute` and friends) while the account-side tunnel
+    // survives. The field repro: tunnel reused, "✓ tunnel up" printed, connector
+    // crash-looping on "credentials file … doesn't exist", every request → 1033.
+    //
+    // If the creds file is missing we recreate the tunnel: delete the
+    // account-side tunnel by name (`--force`, so a stale registered connector
+    // doesn't block it), then `tunnel create` re-writes a fresh creds file. The
+    // new tunnel gets a new UUID; `routeDns` below uses `--overwrite-dns`, so the
+    // hostname's CNAME is repointed at the new UUID even though it pointed at the
+    // old one. The field case confirmed `tunnel delete` + re-run heals cleanly.
+    const existingCreds = credentialsPath(tunnel.id, r.cloudflaredHome);
+    if (existsSync(existingCreds)) {
+      r.log(`✓ Reusing existing tunnel "${r.tunnelName}" (${tunnel.id})`);
+    } else {
+      r.log(
+        `⚠ Tunnel "${r.tunnelName}" (${tunnel.id}) exists in Cloudflare, but its local credentials`,
+      );
+      r.log(`  file is missing (${existingCreds}) — the connector can't authenticate from this`);
+      r.log("  machine. Recreating the tunnel so a fresh credentials file is written…");
+      try {
+        await deleteTunnel(r.runner, r.tunnelName);
+      } catch (err) {
+        if (err instanceof CloudflaredError) {
+          r.log("");
+          r.log(`✗ Couldn't delete the stale tunnel automatically: ${err.message}`);
+          r.log("");
+          r.log("Recover manually, then re-run this command:");
+          r.log(`    cloudflared tunnel delete --force ${r.tunnelName}`);
+          r.log(`    parachute expose public --cloudflare --domain ${hostname}`);
+          return 1;
+        }
+        throw err;
+      }
+      try {
+        tunnel = await createTunnel(r.runner, r.tunnelName);
+      } catch (err) {
+        return reportCloudflaredError(err, r.log);
+      }
+      r.log(`✓ Recreated tunnel ${tunnel.id} (fresh credentials written).`);
+    }
   }
 
   r.log(`Routing DNS: ${hostname} → tunnel ${tunnel.id}…`);
@@ -954,6 +1073,42 @@ export async function exposeCloudflareUp(
       );
     }
   }
+
+  // Post-start connection verification (#593). The connector pid existing is
+  // NOT proof it connected — the field repro had a live pid crash-looping on a
+  // missing creds file, with every public request returning Cloudflare error
+  // 1033 (tunnel registered, no connector) while the CLI printed "✓ tunnel up".
+  // Poll `cloudflared tunnel info` for a live edge connection, bounded. On
+  // timeout, fail LOUDLY with the connector log path + the crash-loop signature
+  // to grep for, instead of claiming success.
+  r.log("");
+  r.log("Verifying the connector established a tunnel connection…");
+  const connected = await r.verifyConnection({
+    runner: r.runner,
+    tunnelName: r.tunnelName,
+    timeoutMs: r.verifyTimeoutMs,
+    pollMs: r.verifyPollMs,
+    sleep: r.sleep,
+  });
+  if (!connected) {
+    r.log("");
+    r.log(
+      `✗ The cloudflared connector (pid ${pid}) started but never registered a tunnel connection`,
+    );
+    r.log(`  within ${Math.round(r.verifyTimeoutMs / 1000)}s. Public requests to ${hostname} will`);
+    r.log("  return Cloudflare error 1033 (tunnel registered, no connector) until this resolves.");
+    r.log("");
+    r.log("Check the connector log for the crash-loop cause:");
+    r.log(`    tail -n 50 ${r.logPath}`);
+    r.log('  A repeating "credentials file … doesn\'t exist" line means the local credentials are');
+    r.log(
+      "  gone — re-run this command (it auto-recreates the tunnel). Other repeating errors point",
+    );
+    r.log("  at the specific failure. Confirm the connector once it's healthy with:");
+    r.log(`    cloudflared tunnel info ${r.tunnelName}`);
+    return 1;
+  }
+  r.log("✓ Connector connected.");
 
   const baseUrl = `https://${hostname}`;
   let vaultUrl: string | undefined;

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildCsrfCookie, generateCsrfToken } from "../csrf.ts";
 import { HUB_SVC, hubPortPath } from "../hub-control.ts";
+import { createDbHolder } from "../hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
   findServiceUpstream,
@@ -1240,14 +1241,10 @@ describe("hubFetch routing", () => {
   // open shouldn't cascade into a restart loop. The body advertises the
   // running version so a deploy verifier can confirm the rolled-out
   // image is the one it expected.
-  test("/health returns 200 JSON without invoking the db", async () => {
+  test("/health returns 200 JSON; unconfigured db field when no getDb", async () => {
     const h = makeHarness();
     try {
-      const res = await hubFetch(h.dir, {
-        getDb: () => {
-          throw new Error("getDb must not be called by /health");
-        },
-      })(req("/health"));
+      const res = await hubFetch(h.dir)(req("/health"));
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("application/json");
       expect(res.headers.get("cache-control")).toBe("no-store");
@@ -1255,7 +1252,149 @@ describe("hubFetch routing", () => {
       expect(body.status).toBe("ok");
       expect(body.service).toBe("parachute-hub");
       expect(typeof body.version).toBe("string");
+      expect(body.db).toBe("unconfigured");
     } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/health db field is ok on a live db (#594)", async () => {
+    const h = makeHarness();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = await hubFetch(h.dir, { getDb: () => db })(req("/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("ok");
+      expect(body.db).toBe("ok");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("/health db field reports error: <class> on a dead handle, still 200 (#594)", async () => {
+    const h = makeHarness();
+    const db = openHubDb(hubDbPath(h.dir));
+    db.close(); // dead handle — every SELECT throws
+    try {
+      const res = await hubFetch(h.dir, { getDb: () => db })(req("/health"));
+      // Always 200 while the process is up — the HTTP status is process
+      // liveness, the db field is the readiness signal.
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.status).toBe("ok");
+      expect(typeof body.db).toBe("string");
+      expect((body.db as string).startsWith("error:")).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a fatal DB throw escaping a handler returns a structured body + invokes onDbError (#594)", async () => {
+    const h = makeHarness();
+    try {
+      const fatal = Object.assign(new Error("disk I/O error"), {
+        name: "SQLiteError",
+        code: "SQLITE_IOERR",
+      });
+      let onDbErrorCalls = 0;
+      // A non-/health, DB-touching route (`/`) whose getDb throws the fatal
+      // class. The top-level self-heal wrapper catches it, calls onDbError,
+      // and returns a structured db_unavailable body (not a bare 500).
+      const res = await hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        getDb: () => {
+          throw fatal;
+        },
+        onDbError: () => {
+          onDbErrorCalls += 1;
+          return "healed";
+        },
+      })(req("/", { headers: { accept: "text/html" } }));
+      expect(onDbErrorCalls).toBe(1);
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.error).toBe("db_unavailable");
+      expect(typeof body.error_description).toBe("string");
+      expect(body.error_description as string).toContain("reopened");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a non-DB throw still propagates (not swallowed by the self-heal wrapper) (#594)", async () => {
+    const h = makeHarness();
+    try {
+      let onDbErrorCalls = 0;
+      const handler = hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        getDb: () => {
+          throw new Error("some unrelated programming error");
+        },
+        onDbError: () => {
+          onDbErrorCalls += 1;
+          return "ignored";
+        },
+      });
+      await expect(handler(req("/", { headers: { accept: "text/html" } }))).rejects.toThrow(
+        "some unrelated programming error",
+      );
+      expect(onDbErrorCalls).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a transient SQLITE_BUSY escaping a handler → 503, does NOT exit the hub (#594)", async () => {
+    const h = makeHarness();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      // Wire a REAL DbHolder so this pins the end-to-end transient path: the
+      // wrapper catches the throw, routes it to the holder's healOrExit, and
+      // the holder must classify SQLITE_BUSY as transient → "ignored" → NO
+      // reopen, NO exit. A spy `exit` that fails the test if ever called is the
+      // regression guard ("a momentary lock never kills the hub").
+      let exited = false;
+      let reopened = false;
+      const holder = createDbHolder(db, {
+        reopen: () => {
+          reopened = true;
+          return db;
+        },
+        exit: () => {
+          exited = true;
+        },
+        log: () => {},
+      });
+      const busy = Object.assign(new Error("database is locked"), {
+        name: "SQLiteError",
+        code: "SQLITE_BUSY",
+      });
+      // First getDb() (the wizard-redirect userCount read) throws BUSY; the
+      // wrapper's catch routes it through the holder.
+      let firstCall = true;
+      const res = await hubFetch(h.dir, {
+        manifestPath: h.manifestPath,
+        getDb: () => {
+          if (firstCall) {
+            firstCall = false;
+            throw busy;
+          }
+          return holder.get();
+        },
+        onDbError: (err) => holder.healOrExit(err),
+      })(req("/", { headers: { accept: "text/html" } }));
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.error).toBe("db_unavailable");
+      // Transient class is named in the structured body, not "reopened".
+      expect(body.error_description as string).toContain("transient");
+      // The crux: the hub did NOT exit and did NOT reopen on a transient lock.
+      expect(exited).toBe(false);
+      expect(reopened).toBe(false);
+    } finally {
+      db.close();
       h.cleanup();
     }
   });

@@ -34,6 +34,7 @@ import { generateBootstrapToken } from "../bootstrap-token.ts";
 // path isolation.
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { readExposeState } from "../expose-state.ts";
+import { createDbHolder } from "../hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
 import { writeHubFile } from "../hub.ts";
@@ -345,8 +346,16 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   if (!existsSync(hubHtmlPath)) writeHubFile(hubHtmlPath);
 
   const dbPath = hubDbPath();
-  const db = openHubDb(dbPath);
-  const adminBootstrap = await seedInitialAdminIfNeeded(db, env, log);
+  // Self-heal-or-die DB holder (#594). The handle lives behind a mutable
+  // holder so a request that hits the persistent-corruption class (disk I/O
+  // error / malformed image — e.g. the state dir deleted under a running hub)
+  // can reopen the handle once, or exit(1) for the platform manager to restart
+  // us with a fresh one. `getDb` reads the current handle from the holder.
+  const dbHolder = createDbHolder(openHubDb(dbPath), {
+    reopen: () => openHubDb(dbPath),
+    log,
+  });
+  const adminBootstrap = await seedInitialAdminIfNeeded(dbHolder.get(), env, log);
 
   if (adminBootstrap === "needs-setup") {
     log(
@@ -381,7 +390,8 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       // CMD), so the fix has to land here too. Closes hub#399.
       idleTimeout: 255,
       fetch: hubFetch(WELL_KNOWN_DIR, {
-        getDb: () => db,
+        getDb: () => dbHolder.get(),
+        onDbError: (err) => dbHolder.healOrExit(err),
         issuer,
         loopbackPort: port,
         supervisor,
@@ -468,7 +478,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
         await supervisor.stop(state.short);
       }
       await server.stop();
-      db.close();
+      dbHolder.get().close();
     },
   };
 }

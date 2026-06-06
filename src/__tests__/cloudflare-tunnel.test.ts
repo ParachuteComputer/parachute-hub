@@ -3,9 +3,11 @@ import {
   CloudflaredError,
   createTunnel,
   credentialsPath,
+  deleteTunnel,
   findTunnelByName,
   listTunnels,
   routeDns,
+  tunnelConnectionCount,
 } from "../cloudflare/tunnel.ts";
 import type { CommandResult, Runner } from "../tailscale/run.ts";
 
@@ -203,5 +205,81 @@ describe("cloudflare tunnel", () => {
 
   test("credentialsPath joins uuid under the cloudflared home", () => {
     expect(credentialsPath("abc", "/Users/x/.cloudflared")).toBe("/Users/x/.cloudflared/abc.json");
+  });
+
+  test("deleteTunnel passes --force and surfaces failures (#593)", async () => {
+    const { runner, seen } = makeRunner(
+      [["cloudflared", "tunnel", "delete", "--force", "parachute"]],
+      [{ code: 0, stdout: "Deleted tunnel parachute\n", stderr: "" }],
+    );
+    await deleteTunnel(runner, "parachute");
+    expect(seen[0]).toEqual(["cloudflared", "tunnel", "delete", "--force", "parachute"]);
+
+    const fail = makeRunner(
+      [["cloudflared", "tunnel", "delete", "--force", "parachute"]],
+      [{ code: 1, stdout: "", stderr: "tunnel has active connections" }],
+    );
+    await expect(deleteTunnel(fail.runner, "parachute")).rejects.toMatchObject({
+      message: expect.stringContaining("active connections"),
+    });
+  });
+
+  describe("tunnelConnectionCount (#593)", () => {
+    function infoRunner(result: CommandResult): Runner {
+      return async (cmd) => {
+        expect([...cmd]).toEqual([
+          "cloudflared",
+          "tunnel",
+          "info",
+          "--output",
+          "json",
+          "parachute",
+        ]);
+        return result;
+      };
+    }
+
+    test("counts connector entries under `conns`", async () => {
+      const runner = infoRunner({
+        code: 0,
+        stdout: JSON.stringify({ conns: [{ id: "a" }, { id: "b" }] }),
+        stderr: "",
+      });
+      expect(await tunnelConnectionCount(runner, "parachute")).toBe(2);
+    });
+
+    test("counts connector entries under the legacy `connections` shape", async () => {
+      const runner = infoRunner({
+        code: 0,
+        stdout: JSON.stringify({ connections: [{ id: "a" }] }),
+        stderr: "",
+      });
+      expect(await tunnelConnectionCount(runner, "parachute")).toBe(1);
+    });
+
+    test("returns 0 on empty conns, non-zero exit, unparseable JSON, or a runner throw", async () => {
+      expect(
+        await tunnelConnectionCount(
+          infoRunner({ code: 0, stdout: '{"conns":[]}', stderr: "" }),
+          "parachute",
+        ),
+      ).toBe(0);
+      expect(
+        await tunnelConnectionCount(
+          infoRunner({ code: 1, stdout: "", stderr: "not found" }),
+          "parachute",
+        ),
+      ).toBe(0);
+      expect(
+        await tunnelConnectionCount(
+          infoRunner({ code: 0, stdout: "not json", stderr: "" }),
+          "parachute",
+        ),
+      ).toBe(0);
+      const thrower: Runner = async () => {
+        throw new Error("spawn failed");
+      };
+      expect(await tunnelConnectionCount(thrower, "parachute")).toBe(0);
+    });
   });
 });

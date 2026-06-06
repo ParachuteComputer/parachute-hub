@@ -133,3 +133,73 @@ export async function routeDns(
 export function credentialsPath(uuid: string, cloudflaredHome: string): string {
   return join(cloudflaredHome, `${uuid}.json`);
 }
+
+/**
+ * `cloudflared tunnel delete <name>` removes the account-side tunnel. Used by
+ * the reuse-path self-heal (#593): when an existing tunnel's local credentials
+ * file is missing, the tunnel is unusable from this machine — we delete the
+ * account-side tunnel and recreate it so `tunnel create` re-writes a fresh
+ * `~/.cloudflared/<uuid>.json`.
+ *
+ * `--force` makes the delete non-interactive and tears down any lingering
+ * connector record cloudflared still has registered for the tunnel — without
+ * it, `tunnel delete` refuses ("tunnel has active connections") when a stale
+ * connector is registered account-side, which is exactly the crash-loop state
+ * #593 self-heals. Deleting a tunnel with no live local connector is safe: the
+ * field repro showed `tunnel delete` + re-run worked cleanly.
+ */
+export async function deleteTunnel(runner: Runner, name: string): Promise<void> {
+  const cmd = ["cloudflared", "tunnel", "delete", "--force", name];
+  const result = await runner(cmd);
+  if (result.code !== 0) {
+    throw new CloudflaredError(
+      `cloudflared tunnel delete failed: ${combineErrStreams(result)}`,
+      cmd,
+      result,
+    );
+  }
+}
+
+/**
+ * Count the active connector connections cloudflared reports for a tunnel via
+ * `cloudflared tunnel info --output json <name>`. Used by the post-start
+ * connection verification (#593): a spawned connector pid existing ≠ the
+ * connector actually registered an edge connection (the error-1033 field
+ * repro — pid alive, connector crash-looping on a missing creds file, every
+ * request 1033).
+ *
+ * The JSON shape is `{ conns: [ { ... }, … ] }` (or a top-level `connections`
+ * array on some cloudflared versions). We count entries defensively across
+ * both shapes and treat any parse/CLI failure as `0` (not-yet-connected) — the
+ * caller polls, so a transient miss just costs one more poll. Returns the
+ * connector count; `> 0` means at least one edge connection is live.
+ */
+export async function tunnelConnectionCount(runner: Runner, name: string): Promise<number> {
+  const cmd = ["cloudflared", "tunnel", "info", "--output", "json", name];
+  let result: CommandResult;
+  try {
+    result = await runner(cmd);
+  } catch {
+    return 0;
+  }
+  if (result.code !== 0) return 0;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    return 0;
+  }
+  if (!parsed || typeof parsed !== "object") return 0;
+  const obj = parsed as Record<string, unknown>;
+  // `cloudflared tunnel info --output json` reports per-connector entries under
+  // `conns` on current versions; older shapes used a flat `connections` array.
+  // Count whichever is present.
+  const conns = obj.conns ?? obj.connections;
+  if (Array.isArray(conns)) {
+    // Each entry may itself carry a nested `conns` array (per-colo connector
+    // detail). Count an entry as a live connection when it exists; that's the
+    // signal we need ("the connector registered at least one edge connection").
+    return conns.length;
+  }
+  return 0;
+}
