@@ -746,6 +746,128 @@ describe("handleAuthorizeGet — error redirects gated on redirect_uri validatio
       cleanup();
     }
   });
+
+  test("pending client + valid session + bad response_type → NOT promoted to approved, request rejected (#570 reviewer fold)", async () => {
+    // The pending-client auto-approve (`approveClient`) is a DB state
+    // mutation. It must not fire for a request we're about to reject — so
+    // redirect_uri validation (and, transitively, the protocol-error checks)
+    // gate it. A malformed `response_type` on a registered-but-pending
+    // client must leave the client `pending`, not silently promote it.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "MyApp",
+        status: "pending",
+      });
+      // Sanity: the client starts pending.
+      expect(getClient(db, reg.client.clientId)?.status).toBe("pending");
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          // Valid REGISTERED redirect_uri — so the rejection is driven by the
+          // malformed response_type, not the redirect mismatch. This isolates
+          // the "mutation before full validation" class the fold closes.
+          redirect_uri: "https://app.example/cb",
+          response_type: "token",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "pend-1",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      // Registered redirect_uri → the protocol error redirects (spec-correct).
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.searchParams.get("error")).toBe("unsupported_response_type");
+      // The crux: the client must STILL be pending — no silent promotion.
+      expect(getClient(db, reg.client.clientId)?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pending client + valid session + UNREGISTERED redirect_uri → HTML error, not promoted (#570 reviewer fold)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "MyApp",
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://evil.example/steal",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(400);
+      expect(res.headers.get("location")).toBeNull();
+      expect(await res.text()).toContain("Redirect mismatch");
+      // Still pending — unregistered redirect_uri never promotes the client.
+      expect(getClient(db, reg.client.clientId)?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pending client + valid session + valid request → auto-approved → consent (happy path preserved)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "MyApp",
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      // Valid client + valid uri + pending → auto-approve → consent render.
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('name="__action" value="consent"');
+      // The valid request DID promote the client (auto-approve still works).
+      expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 // Q1 of 2026-04-28-vault-config-and-scopes.md: an unnamed `vault:<verb>` is

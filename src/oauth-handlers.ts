@@ -920,6 +920,49 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     url.searchParams.set("scope", parsed.scope);
   }
 
+  // Validate the FULL request BEFORE any state mutation (the pending-client
+  // auto-approve below calls `approveClient`). Two reasons, both #570:
+  //
+  //   1. RFC 6749 §4.1.2.1 — an unvalidated redirect_uri error is shown to
+  //      the user, never redirected. `requireRegisteredRedirectUri` first
+  //      confirms the (client_id, redirect_uri) pair is registered; only then
+  //      may we redirect the protocol errors (response_type / PKCE) to it.
+  //   2. We must not permanently promote a pending client to `approved` for a
+  //      request we're about to reject. Pre-fix the redirect-uri + protocol
+  //      checks sat BELOW the auto-approve block, so a malformed request
+  //      (bad response_type / PKCE) against a registered-but-pending client
+  //      mutated the DB before validation ever ran (#570 reviewer fold).
+  //
+  // So: redirect_uri registration → response_type → PKCE, all ahead of the
+  // pending-client auto-approve.
+  try {
+    requireRegisteredRedirectUri(client, parsed.redirectUri);
+  } catch {
+    return htmlError(
+      "Redirect mismatch",
+      "The redirect_uri does not match any URI registered for this app.",
+      400,
+    );
+  }
+  // The pair is confirmed registered, so redirecting these protocol errors to
+  // it is spec-correct (RFC 6749 §4.1.2.1).
+  if (parsed.responseType !== "code") {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "unsupported_response_type",
+      "only response_type=code is supported",
+      parsed.state,
+    );
+  }
+  if (parsed.codeChallengeMethod !== "S256") {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "invalid_request",
+      "PKCE S256 is required",
+      parsed.state,
+    );
+  }
+
   if (client.status !== "approved") {
     // Single-consent change (2026-05-29): the separate operator "approve this
     // client" gate is retired — the user's OAuth consent IS the authorization.
@@ -986,36 +1029,6 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       return pendingClientResponse(db, req, client, url, deps);
     }
     client = refreshed;
-  }
-  try {
-    requireRegisteredRedirectUri(client, parsed.redirectUri);
-  } catch {
-    return htmlError(
-      "Redirect mismatch",
-      "The redirect_uri does not match any URI registered for this app.",
-      400,
-    );
-  }
-
-  // The (client_id, redirect_uri) pair is now confirmed registered, so it is
-  // spec-correct (RFC 6749 §4.1.2.1) to deliver these protocol errors by
-  // redirect to that trusted URI. Validating BEFORE these checks closes the
-  // pre-validation open-redirect on a crafted redirect_uri (hub#570).
-  if (parsed.responseType !== "code") {
-    return oauthErrorRedirect(
-      parsed.redirectUri,
-      "unsupported_response_type",
-      "only response_type=code is supported",
-      parsed.state,
-    );
-  }
-  if (parsed.codeChallengeMethod !== "S256") {
-    return oauthErrorRedirect(
-      parsed.redirectUri,
-      "invalid_request",
-      "PKCE S256 is required",
-      parsed.state,
-    );
   }
 
   // Operator-only scope gate (#96). Reject any request that names a scope
