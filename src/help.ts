@@ -104,7 +104,7 @@ Examples:
   parachute install vault                                   # light: installs + starts vault, points you at the admin UI
   parachute install vault --interactive                     # full interactive vault init (name / MCP / token prompts)
   parachute install surface                                 # installs surface (auto-bootstraps Notes)
-  parachute install notes                                   # back-compat: legacy notes-daemon (Phase 2 deprecating)
+  parachute install notes                                   # legacy notes-daemon — deprecated; use \`parachute install surface\` instead
   parachute install scribe                                  # installs, prompts for provider, starts scribe
   parachute install scribe --scribe-provider groq --scribe-key gsk_…
                                                             # non-interactive scribe setup

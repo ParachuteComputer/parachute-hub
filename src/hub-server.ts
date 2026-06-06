@@ -643,6 +643,40 @@ async function proxyToVault(
   ) {
     return new Response("not found", { status: 404 });
   }
+  // Bare `/vault/<name>` POST → point at `/vault/<name>/mcp` (#525). Operators
+  // paste the bare vault URL (no `/mcp` suffix) into MCP clients; OAuth completes
+  // against the bare path (so the client looks "connected") but the JSON-RPC POST
+  // then hits a path vault has no MCP handler for and 405s — a confusing
+  // "connected but erroring" half-state. We catch the bare-path POST here, BEFORE
+  // proxying, and 308-redirect to the canonical `<mount>/mcp`. 308 (vs 307)
+  // signals the redirect is permanent/cacheable, and like 307 it preserves the
+  // method + body, so a spec-compliant MCP client re-POSTs the JSON-RPC payload
+  // to the right endpoint and connects cleanly. Clients that DON'T follow
+  // redirects still get an actionable signal: the Location header + JSON body name
+  // the correct URL (vs the old opaque 405). Only the EXACT bare mount is caught —
+  // any sub-path (`<mount>/mcp`, `<mount>/api/...`, the Notes PWA) proxies through
+  // untouched, and only POST (the MCP transport verb) is redirected so a stray
+  // browser GET to the bare path keeps its existing proxy behavior.
+  if (req.method === "POST" && url.pathname === match.mount) {
+    const mcpUrl = `${match.mount}/mcp`;
+    const body = {
+      error: "missing_mcp_suffix",
+      message: `This is a Parachute vault path, not an MCP endpoint. Use ${mcpUrl} as your MCP server URL.`,
+      mcp_url: mcpUrl,
+    };
+    return new Response(JSON.stringify(body), {
+      status: 308,
+      headers: {
+        location: mcpUrl,
+        "content-type": "application/json",
+        // 308 is permanently cacheable by default; without no-store a client
+        // (or an intermediary) could cache the redirect and keep bouncing the
+        // bare path to `/mcp` even after a remount changes the routing. Same
+        // guard as the force-change-password redirect below.
+        "cache-control": "no-store",
+      },
+    });
+  }
   // Symmetry with proxyToService (#196): honor `stripPrefix` with FIRST_-
   // PARTY_FALLBACKS as a fallback source. No first-party vault fallback
   // declares stripPrefix today (vault expects the full `/vault/<name>/*`

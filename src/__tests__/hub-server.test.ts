@@ -1630,6 +1630,139 @@ describe("hubFetch /vault/<name>/* dynamic proxy (#144)", () => {
     }
   });
 
+  // #525: bare `/vault/<name>` POST (no `/mcp` suffix) half-connects MCP
+  // clients. The fix 308-redirects the bare-path POST to `<mount>/mcp` BEFORE
+  // proxying, so a compliant client re-POSTs to the right endpoint and clients
+  // that don't follow redirects at least get an actionable Location + JSON body
+  // (vs the old opaque vault 405).
+  test("POST to bare /vault/<name> 308-redirects to /vault/<name>/mcp with an actionable body (#525)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("aaron")] }, h.manifestPath);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(
+        req("/vault/aaron", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1 }),
+        }),
+      );
+      expect(res.status).toBe(308);
+      expect(res.headers.get("location")).toBe("/vault/aaron/mcp");
+      // 308 is permanently cacheable by default — no-store prevents a cached
+      // redirect outliving a remount.
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      const body = (await res.json()) as { error: string; mcp_url: string; message: string };
+      expect(body.error).toBe("missing_mcp_suffix");
+      expect(body.mcp_url).toBe("/vault/aaron/mcp");
+      expect(body.message).toContain("/vault/aaron/mcp");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("bare-path 308 honors a trailing-slash mount: POST /vault/default → /vault/default/mcp (#525)", async () => {
+    // Mounts in services.json sometimes carry a trailing slash (#197). The
+    // redirect target must be built from the *normalized* mount so it stays
+    // `/vault/default/mcp`, never `/vault/default//mcp`.
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-default",
+              port: 1940,
+              paths: ["/vault/default/"],
+              health: "/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/vault/default", { method: "POST" }));
+      expect(res.status).toBe(308);
+      expect(res.headers.get("location")).toBe("/vault/default/mcp");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("GET to bare /vault/<name> is NOT redirected — proxies through untouched (#525)", async () => {
+    // Only POST (the MCP transport verb) is caught. A browser GET to the bare
+    // path keeps its existing proxy behavior so we don't break any bare-path
+    // GET surface.
+    const h = makeHarness();
+    const upstream = startUpstream("bare-get");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-aaron",
+              port: upstream.port,
+              paths: ["/vault/aaron"],
+              health: "/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/vault/aaron", { method: "GET" }));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string; method: string; pathname: string };
+      expect(body.tag).toBe("bare-get");
+      expect(body.method).toBe("GET");
+      expect(body.pathname).toBe("/vault/aaron");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("POST to the canonical /vault/<name>/mcp sub-path is NOT redirected — proxies through (#525)", async () => {
+    // The real MCP endpoint must keep working: a POST that already carries the
+    // `/mcp` suffix is a sub-path (not the exact bare mount) and proxies
+    // straight to the vault backend.
+    const h = makeHarness();
+    const upstream = startUpstream("mcp-post");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-aaron",
+              port: upstream.port,
+              paths: ["/vault/aaron"],
+              health: "/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(
+        req("/vault/aaron/mcp", {
+          method: "POST",
+          body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 2 }),
+        }),
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string; method: string; pathname: string };
+      expect(body.tag).toBe("mcp-post");
+      expect(body.method).toBe("POST");
+      expect(body.pathname).toBe("/vault/aaron/mcp");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
   test("synthesizes X-Forwarded-Proto when edge didn't set it (direct HTTPS to hub)", async () => {
     // Non-Render shape: hub bound directly to https (e.g. local TLS or a
     // proxy that doesn't set X-Forwarded-Proto). isHttpsRequest sees the

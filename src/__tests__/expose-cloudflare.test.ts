@@ -1464,6 +1464,109 @@ describe("exposeCloudflareOff", () => {
     }
   });
 
+  test("clears stale PARACHUTE_HUB_ORIGIN from vault/.env on last-tunnel down (#503)", async () => {
+    const env = makeEnv();
+    try {
+      // Seed the stale public origin the up-path persisted into vault/.env.
+      // After teardown the hub is loopback-only, so leaving this would pin a
+      // public expected issuer and 401 every request on the next vault restart.
+      const vaultEnvPath = join(env.configDir, "vault", ".env");
+      require("node:fs").mkdirSync(join(env.configDir, "vault"), { recursive: true });
+      writeFileSync(vaultEnvPath, "PARACHUTE_HUB_ORIGIN=https://vault.example.com\n");
+
+      writeCloudflaredState(
+        {
+          version: 2,
+          tunnels: {
+            parachute: {
+              pid: 55557,
+              tunnelUuid: "ffffffff-0000-0000-0000-000000000006",
+              tunnelName: "parachute",
+              hostname: "vault.example.com",
+              startedAt: "2026-04-22T12:00:00.000Z",
+              configPath: env.configPath,
+            },
+          },
+        },
+        env.statePath,
+      );
+
+      const logs: string[] = [];
+      const code = await exposeCloudflareOff({
+        configDir: env.configDir,
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        alive: () => false,
+        kill: () => {},
+        log: (l) => logs.push(l),
+      });
+
+      expect(code).toBe(0);
+      // The stale public origin is gone — vault reverts to its loopback default.
+      expect(readEnvFileValues(vaultEnvPath).PARACHUTE_HUB_ORIGIN).toBeUndefined();
+      // Operator is told what to restart so a running vault picks up the change.
+      expect(logs.join("\n")).toContain("cleared PARACHUTE_HUB_ORIGIN");
+      expect(logs.join("\n")).toContain("parachute restart vault");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test("leaves vault/.env untouched while other tunnels survive (#503)", async () => {
+    const env = makeEnv();
+    try {
+      const vaultEnvPath = join(env.configDir, "vault", ".env");
+      require("node:fs").mkdirSync(join(env.configDir, "vault"), { recursive: true });
+      writeFileSync(vaultEnvPath, "PARACHUTE_HUB_ORIGIN=https://vault.example.com\n");
+
+      // Two tunnels; tear down only one by name → the box stays exposed, so the
+      // persisted public origin must remain (clearing it would break the live
+      // tunnel's iss check). Symmetric with the expose-state.json retention.
+      writeCloudflaredState(
+        {
+          version: 2,
+          tunnels: {
+            alpha: {
+              pid: 55558,
+              tunnelUuid: "11111111-0000-0000-0000-000000000007",
+              tunnelName: "alpha",
+              hostname: "alpha.example.com",
+              startedAt: "2026-04-22T12:00:00.000Z",
+              configPath: env.configPath,
+            },
+            beta: {
+              pid: 55559,
+              tunnelUuid: "22222222-0000-0000-0000-000000000008",
+              tunnelName: "beta",
+              hostname: "beta.example.com",
+              startedAt: "2026-04-22T12:00:00.000Z",
+              configPath: env.configPath,
+            },
+          },
+        },
+        env.statePath,
+      );
+
+      const code = await exposeCloudflareOff({
+        configDir: env.configDir,
+        tunnelName: "alpha",
+        statePath: env.statePath,
+        exposeStatePath: env.exposeStatePath,
+        alive: () => false,
+        kill: () => {},
+        log: () => {},
+      });
+
+      expect(code).toBe(0);
+      // Beta tunnel survives → public origin stays.
+      expect(readEnvFileValues(vaultEnvPath).PARACHUTE_HUB_ORIGIN).toBe(
+        "https://vault.example.com",
+      );
+    } finally {
+      env.cleanup();
+    }
+  });
+
   test("clears stale state when the process is already gone", async () => {
     const env = makeEnv();
     try {

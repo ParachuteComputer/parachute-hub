@@ -13,9 +13,9 @@
  *     client to hit `/oauth/register` *within* that window is auto-approved
  *     (single-use, the value is cleared on consume). Past-due or absent
  *     means the standard pending-approval flow applies. Motivator: a
- *     canonical onboarding (install hub → wizard → install Notes →
- *     authorize) shouldn't bounce the operator through a manual approve
- *     step they just set up the hub for.
+ *     canonical onboarding (install hub → expose → wizard installs
+ *     vault/surface → authorize) shouldn't bounce the operator through a
+ *     manual approve step they just set up the hub for.
  *
  * Schema lives in `hub-db.ts` migration v7. This module is just the typed
  * accessor — single-row reads/writes per key, no joins, no caching. The
