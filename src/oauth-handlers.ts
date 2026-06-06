@@ -861,22 +861,14 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   if ("error" in parsed) {
     return htmlError("Invalid authorization request", parsed.error, 400);
   }
-  if (parsed.responseType !== "code") {
-    return oauthErrorRedirect(
-      parsed.redirectUri,
-      "unsupported_response_type",
-      "only response_type=code is supported",
-      parsed.state,
-    );
-  }
-  if (parsed.codeChallengeMethod !== "S256") {
-    return oauthErrorRedirect(
-      parsed.redirectUri,
-      "invalid_request",
-      "PKCE S256 is required",
-      parsed.state,
-    );
-  }
+  // NOTE: response_type / code_challenge_method validation is DELIBERATELY
+  // deferred until after the (client_id, redirect_uri) pair is confirmed
+  // registered (below, just past `requireRegisteredRedirectUri`). RFC 6749
+  // §4.1.2.1: when the redirect_uri can't be validated against the client,
+  // errors MUST be shown to the user — NOT redirected to the supplied URI.
+  // Redirecting here (pre-validation) on a crafted redirect_uri is an open
+  // redirect (hub#570). Once the pair is validated, redirecting these errors
+  // back to the now-trusted URI is spec-correct.
   let client = getClient(db, parsed.clientId);
   if (!client) {
     // Can't safely redirect — we don't trust the redirect_uri until we've
@@ -926,6 +918,49 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       boundVault,
     ).join(" ");
     url.searchParams.set("scope", parsed.scope);
+  }
+
+  // Validate the FULL request BEFORE any state mutation (the pending-client
+  // auto-approve below calls `approveClient`). Two reasons, both #570:
+  //
+  //   1. RFC 6749 §4.1.2.1 — an unvalidated redirect_uri error is shown to
+  //      the user, never redirected. `requireRegisteredRedirectUri` first
+  //      confirms the (client_id, redirect_uri) pair is registered; only then
+  //      may we redirect the protocol errors (response_type / PKCE) to it.
+  //   2. We must not permanently promote a pending client to `approved` for a
+  //      request we're about to reject. Pre-fix the redirect-uri + protocol
+  //      checks sat BELOW the auto-approve block, so a malformed request
+  //      (bad response_type / PKCE) against a registered-but-pending client
+  //      mutated the DB before validation ever ran (#570 reviewer fold).
+  //
+  // So: redirect_uri registration → response_type → PKCE, all ahead of the
+  // pending-client auto-approve.
+  try {
+    requireRegisteredRedirectUri(client, parsed.redirectUri);
+  } catch {
+    return htmlError(
+      "Redirect mismatch",
+      "The redirect_uri does not match any URI registered for this app.",
+      400,
+    );
+  }
+  // The pair is confirmed registered, so redirecting these protocol errors to
+  // it is spec-correct (RFC 6749 §4.1.2.1).
+  if (parsed.responseType !== "code") {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "unsupported_response_type",
+      "only response_type=code is supported",
+      parsed.state,
+    );
+  }
+  if (parsed.codeChallengeMethod !== "S256") {
+    return oauthErrorRedirect(
+      parsed.redirectUri,
+      "invalid_request",
+      "PKCE S256 is required",
+      parsed.state,
+    );
   }
 
   if (client.status !== "approved") {
@@ -994,15 +1029,6 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
       return pendingClientResponse(db, req, client, url, deps);
     }
     client = refreshed;
-  }
-  try {
-    requireRegisteredRedirectUri(client, parsed.redirectUri);
-  } catch {
-    return htmlError(
-      "Redirect mismatch",
-      "The redirect_uri does not match any URI registered for this app.",
-      400,
-    );
   }
 
   // Operator-only scope gate (#96). Reject any request that names a scope
@@ -2571,6 +2597,23 @@ function consentProps(
 ) {
   const scopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(scopes);
+  // Zero-vault non-admin can't authorize a vault-scoped request (hub#431).
+  // The POST handler already 400s this case ("No vaults assigned"); this
+  // flag lets the consent screen render Approve disabled + explain why,
+  // instead of showing an enabled button that lands the user on an error.
+  // Mirrors the vault-scope detection in `handleConsentSubmit`'s zero-vault
+  // gate. Non-vault scopes (`scribe:transcribe`, etc.) stay authorizable.
+  const requestsVaultScope = scopes.some((s) => {
+    if (s === "vault:read" || s === "vault:write" || s === "vault:admin") return true;
+    const parts = s.split(":");
+    return (
+      parts.length === 3 &&
+      parts[0] === "vault" &&
+      parts[2] !== undefined &&
+      VAULT_VERBS.has(parts[2])
+    );
+  });
+  const userCanAuthorizeRequest = userIsAdmin || assignedVaults.length > 0 || !requestsVaultScope;
   // Multi-user Phase 2 PR 2 stale-assignment branch (hub#284 generalized
   // from one vault to N). A non-admin user whose entire vault list has
   // been removed from services.json — admin removed / renamed the vaults
@@ -2696,6 +2739,7 @@ function consentProps(
     // verb against the stale assignment).
     blockApproveForStaleAssignment:
       staleAssignedVault !== undefined && (unnamedVerbs.length > 0 || hasNamedStaleVaultScope),
+    userCanAuthorizeRequest,
   };
 }
 

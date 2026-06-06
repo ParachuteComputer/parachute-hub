@@ -578,6 +578,298 @@ describe("handleAuthorizeGet", () => {
   });
 });
 
+// hub#570 — open-redirect: protocol errors (unsupported_response_type,
+// invalid_request for non-S256 PKCE) MUST NOT redirect to the supplied
+// redirect_uri until the (client_id, redirect_uri) pair is confirmed
+// registered. RFC 6749 §4.1.2.1: an unvalidated redirect_uri error is shown
+// to the user, never redirected. Pre-fix, an attacker with a valid client_id
+// + crafted redirect_uri + bad response_type got an error redirect to the
+// attacker-controlled URI.
+describe("handleAuthorizeGet — error redirects gated on redirect_uri validation (hub#570)", () => {
+  test("invalid response_type + UNREGISTERED redirect_uri → HTML error, no redirect", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          // Crafted attacker-controlled URI, NOT registered for this client.
+          redirect_uri: "https://evil.example/steal",
+          response_type: "token",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "abc",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      // Must be the HTML "Redirect mismatch" error page, NOT a 302 to evil.
+      expect(res.status).toBe(400);
+      expect(res.headers.get("location")).toBeNull();
+      const body = await res.text();
+      expect(body).toContain("Redirect mismatch");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("invalid code_challenge_method + UNREGISTERED redirect_uri → HTML error, no redirect", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://evil.example/steal",
+          response_type: "code",
+          code_challenge: "challenge",
+          code_challenge_method: "plain",
+          state: "abc",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(400);
+      expect(res.headers.get("location")).toBeNull();
+      const body = await res.text();
+      expect(body).toContain("Redirect mismatch");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("invalid response_type + VALID registered redirect_uri → error redirect (spec-correct)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "token",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "abc",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      // Pair is registered → redirecting the protocol error is RFC-correct.
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("error")).toBe("unsupported_response_type");
+      expect(loc.searchParams.get("state")).toBe("abc");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("invalid code_challenge_method + VALID registered redirect_uri → error redirect (spec-correct)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: "challenge",
+          code_challenge_method: "plain",
+          state: "abc",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
+      expect(loc.searchParams.get("error")).toBe("invalid_request");
+      expect(loc.searchParams.get("state")).toBe("abc");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("unknown client_id + invalid response_type → HTML error, no redirect", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: "no-such-client",
+          redirect_uri: "https://evil.example/steal",
+          response_type: "token",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(400);
+      expect(res.headers.get("location")).toBeNull();
+      const body = await res.text();
+      expect(body).toContain("Unknown application");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("valid full flow still reaches consent (regression guard)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "MyApp",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("Approve");
+      expect(html).toContain('name="__action" value="consent"');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pending client + valid session + bad response_type → NOT promoted to approved, request rejected (#570 reviewer fold)", async () => {
+    // The pending-client auto-approve (`approveClient`) is a DB state
+    // mutation. It must not fire for a request we're about to reject — so
+    // redirect_uri validation (and, transitively, the protocol-error checks)
+    // gate it. A malformed `response_type` on a registered-but-pending
+    // client must leave the client `pending`, not silently promote it.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "MyApp",
+        status: "pending",
+      });
+      // Sanity: the client starts pending.
+      expect(getClient(db, reg.client.clientId)?.status).toBe("pending");
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          // Valid REGISTERED redirect_uri — so the rejection is driven by the
+          // malformed response_type, not the redirect mismatch. This isolates
+          // the "mutation before full validation" class the fold closes.
+          redirect_uri: "https://app.example/cb",
+          response_type: "token",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "pend-1",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      // Registered redirect_uri → the protocol error redirects (spec-correct).
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.searchParams.get("error")).toBe("unsupported_response_type");
+      // The crux: the client must STILL be pending — no silent promotion.
+      expect(getClient(db, reg.client.clientId)?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pending client + valid session + UNREGISTERED redirect_uri → HTML error, not promoted (#570 reviewer fold)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "MyApp",
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://evil.example/steal",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(400);
+      expect(res.headers.get("location")).toBeNull();
+      expect(await res.text()).toContain("Redirect mismatch");
+      // Still pending — unregistered redirect_uri never promotes the client.
+      expect(getClient(db, reg.client.clientId)?.status).toBe("pending");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pending client + valid session + valid request → auto-approved → consent (happy path preserved)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "MyApp",
+        status: "pending",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      // Valid client + valid uri + pending → auto-approve → consent render.
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('name="__action" value="consent"');
+      // The valid request DID promote the client (auto-approve still works).
+      expect(getClient(db, reg.client.clientId)?.status).toBe("approved");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 // Q1 of 2026-04-28-vault-config-and-scopes.md: an unnamed `vault:<verb>` is
 // ambiguous, so the consent screen forces the operator to pick a vault before
 // the JWT is minted. Picked vault rewrites the scope to `vault:<picked>:<verb>`
@@ -7951,6 +8243,171 @@ describe("zero-vault non-admin privesc gate (hub#429 reviewer)", () => {
       expect(loc.origin + loc.pathname).toBe("https://app.example/cb");
       expect(loc.searchParams.get("code")?.length).toBeGreaterThan(20);
       expect(loc.searchParams.get("state")).toBe("first-admin-ok");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// hub#431 — consent UX: a non-admin with zero assigned vaults requesting a
+// NAMED vault scope (`vault:<name>:read`) renders an enabled Approve button
+// pre-fix, even though the POST is correctly 400'd. (Unnamed `vault:read` was
+// already covered by the empty-picker disable; the gap was named scopes,
+// which carry no picker.) The fix disables Approve + shows explanatory copy.
+describe("handleAuthorizeGet — zero-vault non-admin named vault scope disables Approve (hub#431)", () => {
+  test("non-admin / zero vaults / named vault scope → Approve disabled + copy", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", { allowMulti: true });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          // NAMED vault scope — no picker, so pre-fix Approve stayed enabled.
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("You have no assigned vaults");
+      expect(html).toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("admin / named vault scope → Approve enabled", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const admin = await createUser(db, "admin-aaron", "pw");
+      const session = createSession(db, { userId: admin.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("You have no assigned vaults");
+      expect(html).not.toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin WITH an assigned vault / named vault scope → Approve enabled", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", { allowMulti: true });
+      setUserVaults(db, bob.id, ["default"]);
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "vault:default:read",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("You have no assigned vaults");
+      expect(html).not.toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("non-admin / zero vaults / NON-vault scope → Approve enabled", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "admin-aaron", "pw");
+      const bob = await createUser(db, "bob", "pw", { allowMulti: true });
+      const session = createSession(db, { userId: bob.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          // Non-vault scope — the user can still consent without a vault.
+          scope: "scribe:transcribe",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, {
+        issuer: ISSUER,
+        loadServicesManifest: fixtureLoadServicesManifest,
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("You have no assigned vaults");
+      expect(html).not.toMatch(/<button[^>]*name="approve"[^>]*value="yes"[^>]*disabled/);
     } finally {
       cleanup();
     }
