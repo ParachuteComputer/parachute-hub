@@ -82,6 +82,7 @@ import {
   installManagedUnit,
   removeManagedUnit,
 } from "../managed-unit.ts";
+import { type OwnerProbeFn, orphanAttributable } from "../orphan-attribution.ts";
 import { type PortListeningFn, defaultPortListening } from "../port-probe.ts";
 import { type AliveFn, clearPid, readPid } from "../process-state.ts";
 import { shortNameForManifest } from "../service-spec.ts";
@@ -103,12 +104,12 @@ export function defaultHubCliPath(): string {
   return fileURLToPath(new URL("../cli.ts", import.meta.url));
 }
 
-/**
- * Best-effort command-line probe for a pid (the orphan-sweep ownership check).
- * Returns the process's command line, or undefined when it can't be read. See
- * `CutoverDeps.ownerOfPid`.
- */
-export type OwnerProbeFn = (pid: number) => string | undefined;
+// `OwnerProbeFn` + the attribution heuristic (`orphanAttributable`) now live in
+// the shared `src/orphan-attribution.ts` so the migrate orphan-sweep and the
+// supervisor's crash-restart adopt-kill share ONE implementation (no drift on
+// the safety-critical "is this mine?" check). Re-exported here for the existing
+// `migrate-cutover` import surface.
+export type { OwnerProbeFn } from "../orphan-attribution.ts";
 
 /**
  * Production `ownerOfPid`: `ps -o command= -p <pid>` returns the full argv of the
@@ -454,49 +455,10 @@ async function stopDetachedModule(
   log(`  ✓ stopped ${target.short}`);
 }
 
-/**
- * Decide whether an orphan pid bound to a MODULE port is plausibly attributable
- * to that parachute module — the MUST-FIX-2 guard against blind-killing an
- * operator's unrelated process that merely squats a declared port. Attributable
- * when ANY of:
- *   - the orphan pid equals the module's RECORDED pid (services.json/pidfile);
- *   - its command line mentions `parachute` (any parachute-managed process —
- *     the `~/.parachute/...` install path and the `@openparachute/<mod>`
- *     package name both carry this marker, so it catches every genuine
- *     parachute-managed module);
- *   - its command line mentions the module's start command (when a hint is
- *     supplied — currently always unset at the call site, the seam is kept
- *     for a future services.json-derived start command).
- * An unreadable command line (probe returned undefined) + a non-matching pid is
- * NOT attributable — we refuse to kill it.
- *
- * NOTE: the bare module short-name needle (`vault`/`runner`/`scribe`/`notes`)
- * was deliberately dropped — on the most destructive command (a process KILL),
- * a bare short-name is too loose: a `runner` substring matches an unrelated CI
- * runner squatting the port. The `parachute` marker already attributes every
- * genuine parachute-managed process, so the short-name arm only widened the
- * false-positive surface.
- */
-function orphanAttributable(args: {
-  orphan: number;
-  recordedPid: number | undefined;
-  short: string;
-  startCmdHint: string | undefined;
-  ownerOfPid: OwnerProbeFn;
-}): { attributable: boolean; cmdline: string | undefined } {
-  const { orphan, recordedPid, startCmdHint, ownerOfPid } = args;
-  if (recordedPid !== undefined && orphan === recordedPid) {
-    return { attributable: true, cmdline: undefined };
-  }
-  const cmdline = ownerOfPid(orphan);
-  if (cmdline === undefined) return { attributable: false, cmdline: undefined };
-  const haystack = cmdline.toLowerCase();
-  const needles = ["parachute", ...(startCmdHint ? [startCmdHint.toLowerCase()] : [])].filter(
-    (n) => n.length > 0,
-  );
-  const attributable = needles.some((n) => haystack.includes(n));
-  return { attributable, cmdline };
-}
+// `orphanAttributable` — the safety-critical "is this orphan plausibly this
+// module?" heuristic — now lives in the shared `src/orphan-attribution.ts`
+// (imported above), so the supervisor's crash-restart adopt-kill uses the same
+// implementation. See that file for the full attribution contract.
 
 /**
  * §7.2 orphan sweep: lsof a port, and if a live process is bound to it, adopt +
