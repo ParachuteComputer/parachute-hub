@@ -26,6 +26,9 @@
   },
   "scripts": {
     "start": "bun src/cli.ts",
+    "build:depcheck": "[ ! -f packages/depcheck/package.json ] || [ -f packages/depcheck/dist/index.js ] || bun run --cwd packages/depcheck build",
+    "prepare": "bun run build:depcheck",
+    "pretest": "bun run build:depcheck",
     "test": "bun test ./src",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
