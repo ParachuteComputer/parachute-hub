@@ -200,6 +200,16 @@ export function isHubUnitInstalled(deps: HubUnitDeps): boolean {
  * Is a service manager (systemd / launchd) available on this platform at all?
  * macOS → launchctl; Linux → systemctl. A box with neither (a bare container,
  * an init-less host) has no manager — the foreground-`serve`-only path (R19/D1).
+ *
+ * NOTE: production `deps.which` is `Bun.which`, which resolves against the
+ * process PATH. This ASSUMES `launchctl` (`/bin/launchctl`) / `systemctl` are on
+ * the PATH — true on any normal macOS / systemd box. A deliberately stripped
+ * PATH (a `nix develop` shell that omits `/bin`, a minimal CI image) would make
+ * `which` return null and misclassify a genuinely launchd-managed hub as
+ * not-unit-managed. The #590 version-check then degrades to the "stop it
+ * yourself" path rather than restarting the unit — a safe (never-kill)
+ * degradation, but worth knowing if a dev sees not-unit-managed on a box that
+ * clearly runs the hub under launchd.
  */
 export function hasServiceManager(deps: HubUnitDeps): boolean {
   if (deps.platform === "darwin") return deps.which("launchctl") !== null;
@@ -518,8 +528,8 @@ export async function ensureHubVersionMatches(
       installedVersion,
       messages: [
         `⚠ the running hub is ${runningLabel} but ${installedVersion} is installed.`,
-        "  The running hub is NOT managed by a Parachute service unit (a detached process or a foreground `parachute serve`), so it won't be restarted automatically.",
-        `  Stop it yourself (find it with \`lsof -ti :${port}\` then \`kill <pid>\`, or quit the foreground \`parachute serve\`), then re-run so the new code is adopted.`,
+        "  The running hub is NOT managed by a Parachute service unit (a detached process or a foreground `parachute serve` / `bun src/cli.ts serve`), so it won't be restarted automatically.",
+        `  Stop it yourself (find it with \`lsof -ti :${port}\` then \`kill <pid>\`, or quit the foreground \`parachute serve\` / \`bun src/cli.ts serve\` on a dev checkout), then re-run so the new code is adopted.`,
       ],
     };
   }

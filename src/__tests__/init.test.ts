@@ -656,6 +656,52 @@ describe("init — version-check-and-restart at the hub adoption point (#590)", 
     }
   });
 
+  test("a restart-failed outcome bails init with exit 1 + an orienting line (don't continue past a failed restart)", async () => {
+    const h = makeHarness();
+    try {
+      const logs: string[] = [];
+      let exposeRan = false;
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => false,
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: false };
+        },
+        ensureHubVersion: async () => ({
+          outcome: "restart-failed" as const,
+          runningVersion: "0.5.14-rc.4",
+          installedVersion: "0.6.4-rc.9",
+          messages: [
+            "⚠ the running hub is 0.5.14-rc.4 but 0.6.4-rc.9 is installed, and the hub unit restart failed.",
+            "failed to restart the hub unit via the service manager (Unit parachute-hub.service not found.)",
+          ],
+        }),
+        // If init wrongly continued past the failed restart, this would run.
+        exposeChoice: "tailnet",
+        exposeTailnetImpl: async () => {
+          exposeRan = true;
+          return 0;
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(1);
+      expect(exposeRan).toBe(false);
+      const joined = logs.join("\n");
+      // The version-check messages + the orienting line + the logs hint surface.
+      expect(joined).toContain("the hub unit restart failed");
+      expect(joined).toContain("The hub service manager rejected the restart command.");
+      expect(joined).toContain("parachute logs hub");
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("a still-mismatched outcome warns but continues (bun-linked branch)", async () => {
     const h = makeHarness();
     try {

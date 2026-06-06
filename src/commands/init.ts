@@ -691,6 +691,7 @@ export async function init(opts: InitOpts = {}): Promise<number> {
     }
     if (versionResult.outcome === "restart-failed") {
       log("");
+      log("The hub service manager rejected the restart command.");
       log("Try checking the logs:");
       log("  parachute logs hub");
       return 1;
