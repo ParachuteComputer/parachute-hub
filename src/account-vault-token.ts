@@ -69,7 +69,7 @@ import {
 } from "./account-home-ui.ts";
 import { renderAdminError } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { userHasVaultGrant } from "./grants.ts";
+import { userHasExternalAiGrant } from "./grants.ts";
 import { inferAudience } from "./jwt-audience.ts";
 import { recordTokenMint, signAccessToken } from "./jwt-sign.ts";
 import { vaultTokenMintRateLimiter } from "./rate-limit.ts";
@@ -190,7 +190,14 @@ export async function handleAccountVaultTokenPost(
         csrfToken: csrf.token,
         twoFactorEnabled: isTotpEnrolled(deps.db, user.id),
         mintableVerbs: buildMintableVerbs(deps.db, user.id, user.assignedVaults),
-        connectedVault: user.assignedVaults.some((v) => userHasVaultGrant(deps.db, user.id, v)),
+        // hub#583: "connected" means an EXTERNAL AI/MCP client (Claude, Cursor,
+        // …) was wired to a vault — NOT a first-party browser sign-in. Notes /
+        // the admin SPA are OAuth clients too and write vault-scoped grants, so
+        // the old `userHasVaultGrant` lit "✓ You're connected" the moment the
+        // user opened Notes. `userHasExternalAiGrant` filters those out.
+        connectedVault: user.assignedVaults.some((v) =>
+          userHasExternalAiGrant(deps.db, user.id, v),
+        ),
         ...extras,
       }),
       status,

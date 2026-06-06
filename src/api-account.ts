@@ -54,7 +54,7 @@ import { fetchVaultUsage, formatUsageStat } from "./account-usage.ts";
 import { POST_LOGIN_DEFAULT } from "./admin-handlers.ts";
 import { renderAdminError } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
-import { userHasVaultGrant } from "./grants.ts";
+import { userHasExternalAiGrant } from "./grants.ts";
 import { changePasswordRateLimiter } from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { findActiveSession } from "./sessions.ts";
@@ -601,11 +601,18 @@ export async function handleAccountHomeGet(req: Request, deps: AccountHomeDeps):
     );
   }
 
-  // "Has this user connected an AI to any of their vaults yet?" — drives the
-  // onboarding checklist's "Connect your AI" step (done/condensed when true).
-  // A grant row only lands after the user clicks through an OAuth consent for a
-  // client wired to one of their vaults.
-  const connectedVault = user.assignedVaults.some((v) => userHasVaultGrant(deps.db, user.id, v));
+  // hub#583: "connected" means an EXTERNAL AI/MCP client (Claude, Cursor, …)
+  // was wired to a vault — NOT a first-party browser sign-in. This is the
+  // PRIMARY browser GET /account/ route — the exact page the field report
+  // describes — so it must use the same filtered check as the vault-token
+  // re-render (account-vault-token.ts:196): the old `userHasVaultGrant` lit
+  // "✓ You're connected" the moment the user opened Notes (a first-party OAuth
+  // client that writes a vault-scoped grant). `userHasExternalAiGrant` excludes
+  // first-party browser surfaces so the checklist only condenses on a real AI
+  // connection.
+  const connectedVault = user.assignedVaults.some((v) =>
+    userHasExternalAiGrant(deps.db, user.id, v),
+  );
 
   return htmlResponse(
     renderAccountHome({

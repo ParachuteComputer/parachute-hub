@@ -28,7 +28,9 @@ import {
   handleAccountHomeGet,
   markPasswordChanged,
 } from "../api-account.ts";
+import { registerClient } from "../clients.ts";
 import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
+import { recordGrant } from "../grants.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { recordTokenMint } from "../jwt-sign.ts";
 import {
@@ -830,6 +832,65 @@ describe("handleAccountHomeGet", () => {
     // Notes CTA carries the hub-origin-encoded vault URL.
     const encoded = encodeURIComponent(`${HUB_ORIGIN}/vault/alice`);
     expect(html).toContain(`https://notes.parachute.computer/add?url=${encoded}`);
+  });
+
+  test("onboarding NOT condensed when only a first-party browser grant exists (hub#583, GET /account/)", async () => {
+    // The exact field report: create account → open Notes (a first-party OAuth
+    // client that writes a vault-scoped grant) → later visit /account/ to wire
+    // up Claude. The checklist must NOT already be condensed.
+    await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
+    const friend = await createUser(harness.db, "alice", "alice-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVaults: ["alice"],
+    });
+    // Notes signs in via DCR (generated client_id, client_name "Notes") and
+    // records a vault-scoped grant.
+    const notes = registerClient(harness.db, {
+      redirectUris: ["https://hub.test/notes/cb"],
+      clientName: "Notes",
+    });
+    recordGrant(harness.db, friend.id, notes.client.clientId, ["vault:alice:read"]);
+
+    const session = createSession(harness.db, { userId: friend.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = await handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Full checklist (not condensed): the connect step is present, the
+    // "you're connected" done-line is NOT.
+    expect(html).toContain('data-connected="false"');
+    expect(html).toContain('data-testid="onboarding-step-2"');
+    expect(html).not.toContain('data-testid="onboarding-done-line"');
+  });
+
+  test("onboarding condensed when an external AI client grant exists (hub#583, GET /account/)", async () => {
+    await createUser(harness.db, "admin", "admin-passphrase", { passwordChanged: true });
+    const friend = await createUser(harness.db, "alice", "alice-passphrase", {
+      allowMulti: true,
+      passwordChanged: true,
+      assignedVaults: ["alice"],
+    });
+    // Claude Code: a genuine external MCP client.
+    const claude = registerClient(harness.db, {
+      redirectUris: ["https://claude.ai/cb"],
+      clientName: "Claude",
+    });
+    recordGrant(harness.db, friend.id, claude.client.clientId, ["vault:alice:read"]);
+
+    const session = createSession(harness.db, { userId: friend.id });
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    const req = new Request(`${HUB_ORIGIN}/account/`, { headers: { cookie } });
+    const res = await handleAccountHomeGet(req, { db: harness.db, hubOrigin: HUB_ORIGIN });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Condensed done-state.
+    expect(html).toContain('data-connected="true"');
+    expect(html).toContain('data-testid="onboarding-done-line"');
+    expect(html).toContain("You're connected");
+    // And it still keeps the "Connect another AI" expander.
+    expect(html).toContain('data-testid="onboarding-connect-another"');
   });
 
   test("200 + admin branch when the first-admin signs in (no vault assignments)", async () => {

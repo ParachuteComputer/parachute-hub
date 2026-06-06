@@ -162,6 +162,17 @@ export interface InitOpts {
    * already known so there's no question to ask).
    */
   noWizardPrompt?: boolean;
+  /**
+   * Test seam: probe the running hub for its first-claim bootstrap token
+   * (hub#576). Production hits `GET http://127.0.0.1:<port>/admin/setup` with
+   * `accept: application/json` and reads `bootstrapToken` (the hub returns it
+   * only to loopback callers). Returns the token string when the hub is in
+   * wizard mode (no admin yet), or `undefined` when there's no token to surface
+   * (admin already exists, or the probe failed). Init uses it to print the
+   * token next to the admin URL when the hub is publicly exposed, so a browser
+   * operator can claim the box without digging through the hub logs.
+   */
+  fetchBootstrapTokenImpl?: (loopbackUrl: string) => Promise<string | undefined>;
 }
 
 /**
@@ -462,6 +473,41 @@ async function defaultRunCliWizard(opts: {
 }
 
 /**
+ * Default impl for the bootstrap-token probe (hub#576). GETs the loopback hub's
+ * `/admin/setup` with `accept: application/json` and returns the `bootstrapToken`
+ * the hub hands to loopback callers. Returns `undefined` on any failure (hub
+ * not answering, no token because an admin already exists, malformed body) —
+ * surfacing the token is a convenience, never a hard dependency of init.
+ */
+async function defaultFetchBootstrapToken(loopbackUrl: string): Promise<string | undefined> {
+  // Debug breadcrumb (gated on PARACHUTE_DEBUG so it never clutters the normal
+  // operator output). When the token doesn't print in the field, this tells a
+  // troubleshooter WHY — hub didn't answer, returned non-200, or the body
+  // carried no token (already-claimed / no-gate) — instead of a silent nothing.
+  const debug = (msg: string): void => {
+    if (process.env.PARACHUTE_DEBUG) console.error(`[init][bootstrap-token] ${msg}`);
+  };
+  try {
+    const res = await fetch(`${loopbackUrl.replace(/\/+$/, "")}/admin/setup`, {
+      headers: { accept: "application/json" },
+    });
+    if (!res.ok) {
+      debug(`probe returned ${res.status}; not printing a token`);
+      return undefined;
+    }
+    const body = (await res.json()) as { bootstrapToken?: unknown };
+    if (typeof body.bootstrapToken === "string" && body.bootstrapToken.length > 0) {
+      return body.bootstrapToken;
+    }
+    debug("probe ok but no bootstrapToken in body (already-claimed or no gate active)");
+    return undefined;
+  } catch (err) {
+    debug(`probe failed: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
+/**
  * Prompt for the wizard-choice question (hub#168 Cut 4). Returns the
  * picked option, or `undefined` if the operator quit. Default is
  * `browser` because (a) the browser flow is the canonical post-launch
@@ -547,6 +593,7 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   const exposeCloudflareImpl = opts.exposeCloudflareImpl ?? defaultExposeCloudflare;
   const installVaultModuleImpl = opts.installVaultModuleImpl ?? defaultInstallVaultModule;
   const runCliWizardImpl = opts.runCliWizardImpl ?? defaultRunCliWizard;
+  const fetchBootstrapTokenImpl = opts.fetchBootstrapTokenImpl ?? defaultFetchBootstrapToken;
 
   log("Parachute init — getting your hub set up.");
   log("");
@@ -711,6 +758,19 @@ export async function init(opts: InitOpts = {}): Promise<number> {
     return 1;
   }
 
+  // hub#576: when the hub is publicly exposed AND still in wizard mode (no
+  // admin yet), the admin URL above is a public FQDN — whoever opens it first
+  // claims the box. Surface the first-claim bootstrap token in the operator's
+  // OWN terminal so the wizard's account step demands proof of box access. We
+  // only probe + print on the public-FQDN path: a loopback-only install needs
+  // no token (reaching 127.0.0.1 already proves access), and the CLI-wizard
+  // path picks the token up transparently over loopback (above). The probe is
+  // best-effort — a failure (or an already-claimed hub) just prints nothing.
+  let bootstrapToken: string | undefined;
+  if (exposeState?.canonicalFqdn) {
+    bootstrapToken = await fetchBootstrapTokenImpl(`http://127.0.0.1:${hubPort}`);
+  }
+
   log("");
   if (hasVault) {
     log("Looks good — your hub is up and a vault is configured.");
@@ -720,6 +780,17 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   log("");
   log(`  ${adminUrl}`);
   log("");
+  if (bootstrapToken) {
+    log("Because this hub is reachable on the public internet, the wizard asks for a");
+    log("one-time bootstrap token before it lets anyone create the admin account —");
+    log("so whoever opens the URL first can't claim your hub. Paste this when asked:");
+    log("");
+    log(`  ${bootstrapToken}`);
+    log("");
+    log("(Valid until the admin is created or the hub restarts. Re-run `parachute init`");
+    log(" to mint a fresh one.)");
+    log("");
+  }
   // hub#565: when we're on the loopback URL (no public exposure active),
   // remind the operator they can expose later. Skipped once an FQDN is up.
   if (!exposeState?.canonicalFqdn) {
@@ -756,7 +827,13 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   if (choice === "cli") {
     log("");
     log("Launching the CLI wizard. (You can also visit the URL above in a browser any time.)");
-    return await runCliWizardImpl({ hubUrl: adminUrl.replace(/\/admin\/?$/, ""), log });
+    // hub#576: drive the CLI wizard against the LOOPBACK hub, not the public
+    // FQDN in `adminUrl`. The wizard runs on this box, so loopback is both
+    // correct and what lets the hub hand it the bootstrap token transparently
+    // (the loopback-gated GET /admin/setup probe) — the operator never has to
+    // copy the token out of the startup logs.
+    const cliWizardUrl = `http://127.0.0.1:${hubPort}`;
+    return await runCliWizardImpl({ hubUrl: cliWizardUrl, log });
   }
 
   // Step 5: offer to open the browser. Skip in non-TTY shells (CI),

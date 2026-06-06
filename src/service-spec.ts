@@ -182,7 +182,15 @@ const NOTES_SERVE_PATH = fileURLToPath(new URL("./notes-serve.ts", import.meta.u
  * telegraphs the state: the row is a stopgap, and the service's first boot
  * will overwrite with its own authoritative write.
  */
-const SEED_VERSION = "0.0.0-linked";
+/**
+ * Version string stamped on a CLI-seeded services.json entry — the
+ * "module installed, but its own daemon hasn't booted and registered a real
+ * row yet" placeholder. A real service boot overwrites this with the package's
+ * actual version (see "Services own their write side of services.json" in
+ * CLAUDE.md). Exported so consumers (e.g. well-known generation, hub#577) can
+ * tell a placeholder entry apart from a live one.
+ */
+export const SEED_VERSION = "0.0.0-linked";
 
 function pathBasedUrl(entry: ServiceEntry): string {
   const first = entry.paths[0] ?? "";

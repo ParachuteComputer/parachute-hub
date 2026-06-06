@@ -4051,6 +4051,116 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
     }
   });
 
+  test("JSON probe hands the bootstrap token VALUE to a loopback caller (hub#576)", async () => {
+    const { generateBootstrapToken, _resetBootstrapTokenForTests } = await import(
+      "../bootstrap-token.ts"
+    );
+    _resetBootstrapTokenForTests();
+    const token = generateBootstrapToken();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = handleSetupGet(req("/admin/setup", { headers: { accept: "application/json" } }), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+        requestIsLoopback: true,
+      });
+      const body = (await res.json()) as {
+        requireBootstrapToken: boolean;
+        bootstrapToken?: string;
+      };
+      expect(body.requireBootstrapToken).toBe(true);
+      expect(body.bootstrapToken).toBe(token);
+    } finally {
+      _resetBootstrapTokenForTests();
+      db.close();
+    }
+  });
+
+  test("JSON probe withholds the token VALUE from a non-loopback caller (hub#576)", async () => {
+    const { generateBootstrapToken, _resetBootstrapTokenForTests } = await import(
+      "../bootstrap-token.ts"
+    );
+    _resetBootstrapTokenForTests();
+    generateBootstrapToken();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = handleSetupGet(req("/admin/setup", { headers: { accept: "application/json" } }), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+        requestIsLoopback: false,
+      });
+      const body = (await res.json()) as {
+        requireBootstrapToken: boolean;
+        bootstrapToken?: string;
+      };
+      // The boolean still tells a public browser a token is required...
+      expect(body.requireBootstrapToken).toBe(true);
+      // ...but the VALUE never leaks to it.
+      expect(body.bootstrapToken).toBeUndefined();
+    } finally {
+      _resetBootstrapTokenForTests();
+      db.close();
+    }
+  });
+
+  test("JSON probe fails CLOSED when loopback is unknown (hub#576)", async () => {
+    const { generateBootstrapToken, _resetBootstrapTokenForTests } = await import(
+      "../bootstrap-token.ts"
+    );
+    _resetBootstrapTokenForTests();
+    generateBootstrapToken();
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      // `requestIsLoopback` omitted entirely — must be treated as non-loopback.
+      const res = handleSetupGet(req("/admin/setup", { headers: { accept: "application/json" } }), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const body = (await res.json()) as { bootstrapToken?: string };
+      expect(body.bootstrapToken).toBeUndefined();
+    } finally {
+      _resetBootstrapTokenForTests();
+      db.close();
+    }
+  });
+
+  test("JSON probe omits the token when no admin gate is active (hub#576)", async () => {
+    const { _resetBootstrapTokenForTests } = await import("../bootstrap-token.ts");
+    _resetBootstrapTokenForTests(); // no token minted → not in wizard mode
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = handleSetupGet(req("/admin/setup", { headers: { accept: "application/json" } }), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+        requestIsLoopback: true,
+      });
+      const body = (await res.json()) as {
+        requireBootstrapToken: boolean;
+        bootstrapToken?: string;
+      };
+      expect(body.requireBootstrapToken).toBe(false);
+      expect(body.bootstrapToken).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
   test("vault step skip mode short-circuits + persists setup_vault_skipped", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {

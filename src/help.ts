@@ -160,7 +160,7 @@ Flags:
   --no-expose-prompt        skip the exposure question; fall through to localhost URL
   --expose <choice>         non-interactive exposure override:
                               none       — stay loopback-only
-                              tailnet    — set up Tailscale Funnel (private to your tailnet)
+                              tailnet    — set up Tailscale serve (private to your tailnet)
                               cloudflare — set up Cloudflare Tunnel (your own domain)
   --cli-wizard              skip the "browser or CLI?" prompt and walk the wizard
                             in this terminal (hub#168 Cut 4)

@@ -485,6 +485,142 @@ describe("init", () => {
   });
 });
 
+describe("init bootstrap-token first-claim (hub#576)", () => {
+  function publicState(): ExposeState {
+    return {
+      version: 1,
+      layer: "public",
+      mode: "path",
+      canonicalFqdn: "demo.parachute.computer",
+      port: 443,
+      funnel: false,
+      entries: [],
+      hubOrigin: "https://demo.parachute.computer",
+    };
+  }
+
+  test("publicly-exposed + wizard mode: prints the bootstrap token in the terminal", async () => {
+    const h = makeHarness();
+    try {
+      writeHubPort(1939, h.configDir);
+      const probed: string[] = [];
+      const logs: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => true,
+        ensureHub: async () => ({ pid: 4321, port: 1939, started: false }),
+        readExposeStateFn: () => publicState(),
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+        fetchBootstrapTokenImpl: async (loopbackUrl) => {
+          probed.push(loopbackUrl);
+          return "parachute-bootstrap-XYZ";
+        },
+      });
+      expect(code).toBe(0);
+      // Probed the LOOPBACK hub, not the public FQDN.
+      expect(probed).toEqual(["http://127.0.0.1:1939"]);
+      const joined = logs.join("\n");
+      expect(joined).toContain("parachute-bootstrap-XYZ");
+      expect(joined).toContain("bootstrap token");
+      // Still prints the public admin URL.
+      expect(joined).toContain("https://demo.parachute.computer/admin/");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("loopback-only install: does NOT probe or print a token", async () => {
+    const h = makeHarness();
+    try {
+      writeHubPort(1939, h.configDir);
+      let probedCount = 0;
+      const logs: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => true,
+        ensureHub: async () => ({ pid: 4321, port: 1939, started: false }),
+        readExposeStateFn: () => undefined, // no public exposure
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+        fetchBootstrapTokenImpl: async () => {
+          probedCount++;
+          return "parachute-bootstrap-XYZ";
+        },
+      });
+      expect(code).toBe(0);
+      expect(probedCount).toBe(0);
+      expect(logs.join("\n")).not.toContain("parachute-bootstrap-");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("admin already exists (no token): prints the URL without a token block", async () => {
+    const h = makeHarness();
+    try {
+      writeHubPort(1939, h.configDir);
+      const logs: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => true,
+        ensureHub: async () => ({ pid: 4321, port: 1939, started: false }),
+        readExposeStateFn: () => publicState(),
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+        // Hub returns undefined → already-claimed / no token to surface.
+        fetchBootstrapTokenImpl: async () => undefined,
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toContain("https://demo.parachute.computer/admin/");
+      expect(joined).not.toContain("bootstrap token");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("CLI wizard is driven against the LOOPBACK hub, not the public FQDN", async () => {
+    const h = makeHarness();
+    try {
+      writeHubPort(1939, h.configDir);
+      const wizardUrls: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => true,
+        ensureHub: async () => ({ pid: 4321, port: 1939, started: false }),
+        readExposeStateFn: () => publicState(),
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+        wizardChoice: "cli",
+        fetchBootstrapTokenImpl: async () => "parachute-bootstrap-XYZ",
+        runCliWizardImpl: async ({ hubUrl }) => {
+          wizardUrls.push(hubUrl);
+          return 0;
+        },
+      });
+      expect(code).toBe(0);
+      // The CLI wizard runs on-box → must use loopback (where the hub hands it
+      // the token transparently), never the public FQDN.
+      expect(wizardUrls).toEqual(["http://127.0.0.1:1939"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 describe("looksLikeServer heuristic", () => {
   test("macOS is never a server", () => {
     expect(looksLikeServer("darwin", { SSH_CONNECTION: "1.2.3.4 22 5.6.7.8 22" })).toBe(false);

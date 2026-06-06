@@ -255,6 +255,14 @@ interface WizardStateSnapshot {
   hasVault: boolean;
   hasExposeMode: boolean;
   requireBootstrapToken: boolean;
+  /**
+   * The actual bootstrap token, present ONLY when the wizard-state probe ran
+   * over loopback (the on-box operator's own shell — hub#576). The hub returns
+   * it so the CLI wizard can satisfy the first-claim gate transparently without
+   * the operator copy-pasting it from the startup logs. Absent on any
+   * public/tailnet probe.
+   */
+  bootstrapToken?: string;
   csrfToken: string;
   /** Optional URL to redirect to (when state is fully done — 301 to /login). */
   redirectTo?: string;
@@ -294,7 +302,7 @@ async function fetchWizardState(
     );
   }
   const body = res.json as Partial<WizardStateSnapshot> & { csrfToken?: string };
-  return {
+  const snapshot: WizardStateSnapshot = {
     step: body.step ?? "welcome",
     hasAdmin: Boolean(body.hasAdmin),
     hasVault: Boolean(body.hasVault),
@@ -302,6 +310,12 @@ async function fetchWizardState(
     requireBootstrapToken: Boolean(body.requireBootstrapToken),
     csrfToken: typeof body.csrfToken === "string" ? body.csrfToken : (jar.csrf ?? ""),
   };
+  // hub#576: the loopback probe carries the actual token. Thread it through so
+  // the account step can submit it without prompting the operator.
+  if (typeof body.bootstrapToken === "string" && body.bootstrapToken.length > 0) {
+    snapshot.bootstrapToken = body.bootstrapToken;
+  }
+  return snapshot;
 }
 
 /**
@@ -422,7 +436,27 @@ async function walkAccountStep(
     log(`  ✗ ${pwErr}`);
     return 1;
   }
-  let bootstrap = opts.bootstrapToken ?? process.env.PARACHUTE_BOOTSTRAP_TOKEN;
+  // Token resolution order (hub#576):
+  //   1. Explicit `--bootstrap-token` flag / `opts.bootstrapToken` (init passes
+  //      this when it fetched the token from the loopback probe).
+  //   2. `PARACHUTE_BOOTSTRAP_TOKEN` env.
+  //   3. The token carried on the loopback wizard-state probe itself — the
+  //      common on-box `parachute init` path: the hub handed us the value
+  //      because we reached it over loopback, so we satisfy the gate
+  //      transparently with no operator action.
+  //   4. Prompt — the fallback when none of the above apply (e.g. a remote
+  //      `parachute init --cli-wizard` against a public hub, where the probe
+  //      didn't carry the token). The operator reads it from the startup logs.
+  // Treat an empty / whitespace value at any level as "absent" so a falsy
+  // `PARACHUTE_BOOTSTRAP_TOKEN=` (exported-but-empty) doesn't suppress the
+  // loopback-probe token and silently submit a blank token.
+  const firstNonEmpty = (...vals: Array<string | undefined>): string | undefined =>
+    vals.find((v) => typeof v === "string" && v.trim().length > 0);
+  let bootstrap = firstNonEmpty(
+    opts.bootstrapToken,
+    process.env.PARACHUTE_BOOTSTRAP_TOKEN,
+    state.bootstrapToken,
+  );
   if (state.requireBootstrapToken && !bootstrap) {
     log("");
     log("  This hub is in container/serve mode and minted a one-time");

@@ -1671,13 +1671,19 @@ describe("well-known regen after module ops", () => {
     const vaultRow = manifest.services.find((s) => s.name === "parachute-vault");
     expect(vaultRow?.installDir).toBe(install.installDir);
 
-    // The on-disk well-known doc reflects the new module.
+    // The on-disk well-known doc reflects the new module in `services`...
     const doc = JSON.parse(readFileSync(wkPath, "utf8")) as {
       services: Array<{ name: string; version: string }>;
       vaults: Array<{ name: string }>;
     };
     expect(doc.services.some((s) => s.name === "parachute-vault")).toBe(true);
-    expect(doc.vaults.some((v) => v.name === "default")).toBe(true);
+    // ...but does NOT fabricate a phantom `default` vault row (hub#577). The
+    // install seeds the entry at SEED_VERSION ("module installed, no instance
+    // booted"); vault's own boot registers the real instance later. Until then
+    // the vaults[] list is honestly empty so the management page reads "No
+    // vaults yet" rather than showing a `default` that doesn't exist.
+    expect(doc.vaults.some((v) => v.name === "default")).toBe(false);
+    expect(doc.vaults).toEqual([]);
   });
 
   test("runInstall sets PORT in child env from services.json entry (hub#356)", async () => {
