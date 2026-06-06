@@ -86,6 +86,13 @@ describe("init", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => false,
@@ -127,6 +134,13 @@ describe("init", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         // No pidfile (unit-managed) → processState reports not-running.
@@ -168,6 +182,13 @@ describe("init", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => true,
@@ -213,6 +234,13 @@ describe("init", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => true,
@@ -237,6 +265,13 @@ describe("init", () => {
       const opened: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -270,6 +305,13 @@ describe("init", () => {
       const opened: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -306,6 +348,13 @@ describe("init", () => {
       let prompted = false;
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -339,6 +388,13 @@ describe("init", () => {
       let prompted = false;
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -366,6 +422,13 @@ describe("init", () => {
       const opened: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -400,6 +463,13 @@ describe("init", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => false,
@@ -434,6 +504,13 @@ describe("init", () => {
       const opened: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -464,6 +541,13 @@ describe("init", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => false,
@@ -479,6 +563,130 @@ describe("init", () => {
       const joined = logs.join("\n");
       expect(joined).toContain("Hub failed to start: port 1939 is in use");
       expect(joined).toContain("parachute logs hub");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("init — version-check-and-restart at the hub adoption point (#590)", () => {
+  test("invokes the version check with the resolved hub port after the hub is up", async () => {
+    const h = makeHarness();
+    try {
+      const logs: string[] = [];
+      let seenPort: number | undefined;
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => false,
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: false };
+        },
+        ensureHubVersion: async ({ port, log }) => {
+          seenPort = port;
+          log(
+            "⚠ the running hub is 0.5.14-rc.4 but 0.6.4-rc.9 is installed — restarting the hub unit to pick up the new code.",
+          );
+          return {
+            outcome: "restarted" as const,
+            runningVersion: "0.6.4-rc.9",
+            installedVersion: "0.6.4-rc.9",
+            messages: ["✓ hub unit restarted; now running 0.6.4-rc.9."],
+          };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      expect(seenPort).toBe(1939);
+      const joined = logs.join("\n");
+      // The mismatch notice + the restart confirmation both surface.
+      expect(joined).toContain("restarting the hub unit to pick up the new code");
+      expect(joined).toContain("now running 0.6.4-rc.9");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a not-unit-managed mismatch bails init with exit 1 (don't wire a tunnel to a zombie)", async () => {
+    const h = makeHarness();
+    try {
+      const logs: string[] = [];
+      let exposeRan = false;
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => false,
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: false };
+        },
+        ensureHubVersion: async () => ({
+          outcome: "not-unit-managed" as const,
+          runningVersion: "0.5.14-rc.4",
+          installedVersion: "0.6.4-rc.9",
+          messages: [
+            "⚠ the running hub is 0.5.14-rc.4 but 0.6.4-rc.9 is installed.",
+            "  The running hub is NOT managed by a Parachute service unit (a detached process or a foreground `parachute serve`), so it won't be restarted automatically.",
+          ],
+        }),
+        // If init wrongly continued, this would run — assert it does NOT.
+        exposeChoice: "tailnet",
+        exposeTailnetImpl: async () => {
+          exposeRan = true;
+          return 0;
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(1);
+      expect(exposeRan).toBe(false);
+      const joined = logs.join("\n");
+      expect(joined).toContain("NOT managed by a Parachute service unit");
+      expect(joined).toContain("re-run `parachute init`");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a still-mismatched outcome warns but continues (bun-linked branch)", async () => {
+    const h = makeHarness();
+    try {
+      const logs: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => false,
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: false };
+        },
+        ensureHubVersion: async () => ({
+          outcome: "still-mismatched" as const,
+          runningVersion: "0.6.4-rc.8",
+          installedVersion: "0.6.4-rc.9",
+          messages: [
+            "⚠ restarted the hub unit, but it is still not reporting 0.6.4-rc.9 (reports 0.6.4-rc.8).",
+          ],
+        }),
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      // Continues (does NOT bail) — the warning surfaces but init reaches the URL.
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toContain("still not reporting 0.6.4-rc.9");
+      expect(joined).toContain("http://127.0.0.1:1939/admin/");
     } finally {
       h.cleanup();
     }
@@ -507,6 +715,13 @@ describe("init bootstrap-token first-claim (hub#576)", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => true,
@@ -541,6 +756,13 @@ describe("init bootstrap-token first-claim (hub#576)", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => true,
@@ -569,6 +791,13 @@ describe("init bootstrap-token first-claim (hub#576)", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => true,
@@ -596,6 +825,13 @@ describe("init bootstrap-token first-claim (hub#576)", () => {
       const wizardUrls: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => true,
@@ -686,6 +922,13 @@ describe("init exposure chain", () => {
       const promptCalls: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -719,6 +962,13 @@ describe("init exposure chain", () => {
       const promptCalls: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -765,6 +1015,13 @@ describe("init exposure chain", () => {
       const promptCalls: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -808,6 +1065,13 @@ describe("init exposure chain", () => {
       let cloudflareCalls = 0;
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -842,6 +1106,13 @@ describe("init exposure chain", () => {
       let cloudflareCalls = 0;
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -884,6 +1155,13 @@ describe("init exposure chain", () => {
       };
       await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => promptLog.push(l),
         alive: () => false,
@@ -918,6 +1196,13 @@ describe("init exposure chain", () => {
       setChained("none");
       await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => promptLog.push(l),
         alive: () => true,
@@ -967,6 +1252,13 @@ describe("init exposure chain", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => false,
@@ -1010,6 +1302,13 @@ describe("init exposure chain", () => {
       let chained = false;
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -1041,6 +1340,13 @@ describe("init exposure chain", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => false,
@@ -1077,6 +1383,13 @@ describe("init exposure chain", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => false,
@@ -1111,6 +1424,13 @@ describe("init exposure chain", () => {
       const order: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -1156,6 +1476,13 @@ describe("init exposure chain", () => {
 
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -1193,6 +1520,13 @@ describe("init exposure chain", () => {
 
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -1221,6 +1555,13 @@ describe("init exposure chain", () => {
       // wizard creates first-admin.
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: () => {},
         alive: () => false,
@@ -1247,6 +1588,13 @@ describe("init exposure chain", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => false,
@@ -1289,6 +1637,13 @@ describe("init exposure chain", () => {
       const logs: string[] = [];
       const code = await init({
         configDir: h.configDir,
+        // #590: keep the version-check a no-op in init tests — NEVER let the
+        // production default fire a real /health fetch + restart the live unit.
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
         manifestPath: h.manifestPath,
         log: (l) => logs.push(l),
         alive: () => false,

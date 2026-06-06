@@ -67,6 +67,7 @@ function fakeHubUnitDeps(): HubUnitDeps {
     readFile: () => undefined,
     exists: () => false,
     probeHealth: async () => false,
+    probeHealthVersion: async () => null,
     portListening: async () => false,
     sleep: async () => {},
   };

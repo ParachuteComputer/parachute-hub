@@ -35,12 +35,18 @@
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import pkg from "../../package.json" with { type: "json" };
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
 import { type EnsureHubOpts, HUB_DEFAULT_PORT, HUB_SVC, readHubPort } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
-import { ensureHubUnit, installAndStartHubUnit } from "../hub-unit.ts";
+import {
+  type EnsureHubVersionMatchesResult,
+  ensureHubUnit,
+  ensureHubVersionMatches,
+  installAndStartHubUnit,
+} from "../hub-unit.ts";
 import { issueOperatorToken, readOperatorTokenFile } from "../operator-token.ts";
 import { type AliveFn, defaultAlive, processState } from "../process-state.ts";
 import { findService, readManifestLenient } from "../services-manifest.ts";
@@ -81,6 +87,18 @@ export interface InitOpts {
    * Design §3.3 (init row), §4.1/§4.2, appendix (c).
    */
   ensureHub?: (opts: EnsureHubOpts) => Promise<{ pid: number; port: number; started: boolean }>;
+  /**
+   * Test seam: version-check-and-restart at the hub adoption point (#590).
+   * After init confirms a hub is answering on the canonical port, it compares
+   * the RUNNING hub's `/health` version against this installed package version;
+   * on mismatch it restarts the managed unit (once) so a freshly-installed hub
+   * never adopts a stale zombie. Production wires `ensureHubVersionMatches`;
+   * tests stub it to assert the call without touching launchctl / the live hub.
+   */
+  ensureHubVersion?: (ctx: {
+    port: number;
+    log: (line: string) => void;
+  }) => Promise<EnsureHubVersionMatchesResult>;
   /**
    * Test seam: guarantee an operator token exists once the hub is up (design
    * §3.1 / §3.3). Production reads `operator.token`; if absent AND a hub user
@@ -582,6 +600,18 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   // spawn). The `ensureHub` seam is preserved for tests (and the return shape is
   // unchanged); only the production default flipped.
   const ensureHub = opts.ensureHub ?? defaultEnsureHubViaUnit;
+  // #590: after the hub is confirmed up, compare its RUNNING version to the
+  // installed package version and restart the managed unit on mismatch, so a
+  // freshly-installed hub never adopts a stale zombie that merely answers
+  // /health. Injectable for tests.
+  const ensureHubVersion =
+    opts.ensureHubVersion ??
+    ((ctx) =>
+      ensureHubVersionMatches({
+        installedVersion: pkg.version,
+        port: ctx.port,
+        log: ctx.log,
+      }));
   const guaranteeOperatorToken = opts.guaranteeOperatorToken ?? defaultGuaranteeOperatorToken;
   const readExposeStateFn = opts.readExposeStateFn ?? (() => readExposeState());
   const isTty = opts.isTty ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -639,6 +669,37 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   // that didn't write a port file). The hub binds 1939 unless explicitly
   // overridden, so the fallback is almost always correct.
   if (hubPort === undefined) hubPort = HUB_DEFAULT_PORT;
+
+  // Step 1.25 (#590): the hub answered /health, but is it the version we just
+  // installed? A zombie LaunchAgent survives `rm -rf ~/.parachute`, so a brand-
+  // new install can adopt month-old code that merely keeps the port. Compare the
+  // RUNNING version to the installed package version; on mismatch, restart the
+  // managed unit (once) so the tunnel/wizard/vault-install downstream bind to the
+  // NEW code. A non-unit-managed hub (legacy detached pid / dev `bun run serve`)
+  // is NOT killed — we surface the mismatch + an actionable message and bail so
+  // the operator decides. A still-mismatched-after-restart (bun-linked branch)
+  // warns + continues rather than looping.
+  try {
+    const versionResult = await ensureHubVersion({ port: hubPort, log });
+    for (const m of versionResult.messages) log(m);
+    if (versionResult.outcome === "not-unit-managed") {
+      // We can't safely take over a hub we don't own. Stop here so init doesn't
+      // wire a fresh tunnel + credentials to a stale runtime (the #590 field bug).
+      log("");
+      log("Resolve the version mismatch above, then re-run `parachute init`.");
+      return 1;
+    }
+    if (versionResult.outcome === "restart-failed") {
+      log("");
+      log("Try checking the logs:");
+      log("  parachute logs hub");
+      return 1;
+    }
+    // `match` / `not-running` / `restarted` / `still-mismatched` → continue.
+  } catch (err) {
+    // A version-check failure must never block init — degrade to a note.
+    log(`note: hub version check skipped (${err instanceof Error ? err.message : String(err)})`);
+  }
 
   // Step 1.5: guarantee an operator token exists (design §3.1 / §3.3). Under
   // the unified model every per-module verb is an authenticated module-ops
