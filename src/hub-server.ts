@@ -1553,6 +1553,11 @@ export function hubFetch(
         configDir: CONFIG_DIR,
         issuer: oauthDeps(req).issuer,
         registry: getDefaultOperationsRegistry(),
+        // hub#576: a loopback peer (the on-box operator's own shell) is allowed
+        // to read the actual bootstrap token from the GET /admin/setup JSON
+        // probe. `layerOf` fails closed to non-loopback when peerAddr is
+        // unknown, so a header-less caller never gets the token.
+        requestIsLoopback: layerOf(req, peerAddr) === "loopback",
       };
       if (deps?.supervisor !== undefined) wizardDeps.supervisor = deps.supervisor;
       if (pathname === "/admin/setup") {

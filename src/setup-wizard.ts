@@ -399,6 +399,18 @@ export interface SetupWizardDeps {
     userId: string,
     opts: MintOperatorTokenOpts & { dir?: string },
   ) => Promise<IssueOperatorTokenResult>;
+  /**
+   * Whether the in-flight request arrived over loopback (peer `127.0.0.1` /
+   * `::1`). Set by `hub-server.ts` from `layerOf(req, peerAddr)`. hub#576: a
+   * loopback caller already proves on-box access (it's the operator's own
+   * shell — `parachute init` driving the CLI wizard), so the GET `/admin/setup`
+   * JSON probe reveals the actual bootstrap token VALUE to it, not just the
+   * `requireBootstrapToken` boolean. Public / tailnet callers (any browser
+   * that found the FQDN) get only the boolean and must paste the token the
+   * operator copied from their terminal. Absent (undefined) is treated as
+   * NON-loopback — fail closed, never leak the token to a header-less caller.
+   */
+  requestIsLoopback?: boolean;
 }
 
 /**
@@ -1601,8 +1613,17 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
   // the HTML rendering branches means the CLI gets the answer it needs
   // without the wizard having to render a 30KB HTML page per poll.
   if (wantsJson) {
-    const requireToken = getBootstrapToken() !== undefined;
-    const envelope = {
+    const activeToken = getBootstrapToken();
+    const requireToken = activeToken !== undefined;
+    const envelope: {
+      step: typeof state.step;
+      hasAdmin: boolean;
+      hasVault: boolean;
+      hasExposeMode: boolean;
+      requireBootstrapToken: boolean;
+      csrfToken: string;
+      bootstrapToken?: string;
+    } = {
       step: state.step,
       hasAdmin: state.hasAdmin,
       hasVault: state.hasVault,
@@ -1610,6 +1631,17 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       requireBootstrapToken: requireToken,
       csrfToken: csrf.token,
     };
+    // hub#576: hand the actual token to a LOOPBACK caller only. The on-box
+    // operator (`parachute init` → CLI wizard, or a curl from their own shell)
+    // already proves box access by reaching loopback — same trust level as
+    // reading the token off the startup banner in the hub log. This lets init
+    // surface the token in the operator's terminal and feed it to the CLI
+    // wizard transparently, instead of making them dig through `parachute logs
+    // hub`. A public / tailnet browser never gets the value — it stays gated on
+    // the operator pasting what they copied from their terminal.
+    if (requireToken && deps.requestIsLoopback === true && activeToken !== undefined) {
+      envelope.bootstrapToken = activeToken;
+    }
     const jsonHeaders: Record<string, string> = {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",

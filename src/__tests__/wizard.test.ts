@@ -32,6 +32,12 @@ interface FakeHubState {
   importParams?: { remoteUrl: string; pat?: string; mode: string };
   exposeMode?: string;
   posted: Array<{ path: string; body: unknown }>;
+  /** hub#576: when set, the fake GET /admin/setup reports requireBootstrapToken=true. */
+  requireBootstrapToken?: boolean;
+  /** hub#576: when set, the fake GET also returns it (loopback-probe behavior). */
+  bootstrapToken?: string;
+  /** hub#576: when true, the account POST 401s unless the right token is supplied. */
+  enforceBootstrapToken?: boolean;
 }
 
 function makeFakeHub(initialState?: Partial<FakeHubState>): {
@@ -86,8 +92,10 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
         hasAdmin: state.hasAdmin,
         hasVault: state.hasVault,
         hasExposeMode: state.hasExposeMode,
-        requireBootstrapToken: false,
+        requireBootstrapToken: state.requireBootstrapToken ?? false,
         csrfToken: csrf,
+        // hub#576: a loopback probe carries the actual token value.
+        ...(state.bootstrapToken ? { bootstrapToken: state.bootstrapToken } : {}),
       });
       return new Response(respBody, {
         status: 200,
@@ -101,6 +109,17 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
     // POST /admin/setup/account
     if (path === "/admin/setup/account" && method === "POST") {
       state.posted.push({ path, body: bodyJson });
+      // hub#576: reject when the gate is enforced and the supplied token is
+      // wrong / missing — proves the CLI wizard actually sends it.
+      if (state.enforceBootstrapToken) {
+        const supplied = (bodyJson as { bootstrap_token?: string })?.bootstrap_token;
+        if (supplied !== state.bootstrapToken) {
+          return new Response(JSON.stringify({ error: "bad bootstrap token" }), {
+            status: 401,
+            headers: { "content-type": "application/json; charset=utf-8" },
+          });
+        }
+      }
       state.hasAdmin = true;
       return new Response(JSON.stringify({ step: "vault", message: "admin created" }), {
         status: 200,
@@ -268,6 +287,58 @@ describe("runCliWizard", () => {
     expect(vaultBody.mode).toBe("create");
     expect(vaultBody.vault_name).toBe("default");
     expect(state.exposeMode).toBe("localhost");
+  });
+
+  test("loopback-probe bootstrap token is sent transparently (no prompt) — hub#576", async () => {
+    const { state, fetchImpl } = makeFakeHub({
+      requireBootstrapToken: true,
+      bootstrapToken: "parachute-bootstrap-LOOPBACK",
+      enforceBootstrapToken: true,
+    });
+    let prompted = false;
+    const code = await runCliWizard({
+      hubUrl: "http://127.0.0.1:1939",
+      log: () => {},
+      fetchImpl,
+      sleep: async () => {},
+      // No --bootstrap-token flag, no env: the value must come from the probe.
+      prompt: async () => {
+        prompted = true;
+        return "";
+      },
+      accountUsername: "admin",
+      accountPassword: "longpassword",
+      vaultMode: "skip",
+      exposeMode: "localhost",
+    });
+    expect(code).toBe(0);
+    // The account POST carried the probe-supplied token...
+    const accountBody = state.posted[0]?.body as Record<string, string>;
+    expect(accountBody.bootstrap_token).toBe("parachute-bootstrap-LOOPBACK");
+    // ...and the operator was never asked for it.
+    expect(prompted).toBe(false);
+  });
+
+  test("explicit --bootstrap-token flag still wins over the probe value — hub#576", async () => {
+    const { state, fetchImpl } = makeFakeHub({
+      requireBootstrapToken: true,
+      bootstrapToken: "parachute-bootstrap-PROBE",
+      enforceBootstrapToken: false,
+    });
+    const code = await runCliWizard({
+      hubUrl: "http://127.0.0.1:1939",
+      log: () => {},
+      fetchImpl,
+      sleep: async () => {},
+      bootstrapToken: "parachute-bootstrap-EXPLICIT",
+      accountUsername: "admin",
+      accountPassword: "longpassword",
+      vaultMode: "skip",
+      exposeMode: "localhost",
+    });
+    expect(code).toBe(0);
+    const accountBody = state.posted[0]?.body as Record<string, string>;
+    expect(accountBody.bootstrap_token).toBe("parachute-bootstrap-EXPLICIT");
   });
 
   test("vault import mode threads remote_url + pat + import_mode", async () => {
