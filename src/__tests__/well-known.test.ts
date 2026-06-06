@@ -123,6 +123,31 @@ describe("buildWellKnown", () => {
     ]);
   });
 
+  test("SEED placeholder vault entry is NOT fabricated into a vault row (hub#577)", () => {
+    // `parachute init` installs the vault MODULE without creating an instance,
+    // seeding a services.json entry at version "0.0.0-linked" with the
+    // canonical /vault/default mount. That must NOT surface as a phantom
+    // `default` vault in the management page.
+    const seed: ServiceEntry = { ...vault, version: "0.0.0-linked" };
+    const doc = buildWellKnown({
+      services: [seed],
+      canonicalOrigin: "https://x.example",
+    });
+    // No phantom vault row...
+    expect(doc.vaults).toEqual([]);
+    // ...but the services entry stays so the SPA knows the module IS installed
+    // (offers "New vault", not "Install module").
+    expect(doc.services.map((s) => s.name)).toEqual(["parachute-vault"]);
+  });
+
+  test("a REAL (non-seed) vault entry still lands in vaults[] (hub#577 regression guard)", () => {
+    const doc = buildWellKnown({
+      services: [{ ...vault, version: "0.5.1", paths: ["/vault/techne"] }],
+      canonicalOrigin: "https://x.example",
+    });
+    expect(doc.vaults.map((v) => v.name)).toEqual(["techne"]);
+  });
+
   test("multiple installs of the same kind both land in the array (#92)", () => {
     const work: ServiceEntry = { ...notes, paths: ["/notes-work"], port: 5174 };
     const doc = buildWellKnown({

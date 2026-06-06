@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "./config.ts";
 import { type ModuleManifest, readModuleManifest } from "./module-manifest.ts";
+import { SEED_VERSION } from "./service-spec.ts";
 import {
   type ServiceEntry,
   type UiSubUnit,
@@ -315,6 +316,18 @@ export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
       }
       doc.services.push(entry);
       if (isVault) {
+        // hub#577: don't fabricate a phantom vault row from a SEED placeholder.
+        // `parachute init` installs the vault MODULE without creating an
+        // instance (hub#168 Cut 1: `noCreate`), seeding a services.json entry
+        // at SEED_VERSION with the canonical `/vault/default` mount. Vault's
+        // own boot overwrites that entry with the real instance path(s) once a
+        // vault is actually created. Until then, emitting a `vaults[]` row here
+        // makes the management page show a `default` vault that doesn't exist —
+        // it vanishes the moment a real vault registers. Keep the `services`
+        // entry (so the SPA knows the module IS installed and offers "New
+        // vault" rather than "Install module"), but suppress the vault row so
+        // the list honestly reads "No vaults yet."
+        if (s.version === SEED_VERSION) continue;
         const managementUrl = opts.managementUrlFor?.(s);
         const entry: WellKnownVaultEntry = {
           name: vaultInstanceNameFor(s.name, path),
