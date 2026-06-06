@@ -184,6 +184,7 @@ import { applyCorsHeaders, corsPreflightResponse, isCorsAllowedRoute } from "./c
 import { ensureCsrfToken } from "./csrf.ts";
 import { readExposeState } from "./expose-state.ts";
 import { HUB_DEFAULT_PORT, HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
+import { classifyDbError, createDbHolder, probeDbLiveness } from "./hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
 import { getHubOrigin } from "./hub-settings.ts";
 import { type RenderHubOpts, renderHub } from "./hub.ts";
@@ -832,6 +833,16 @@ export interface HubFetchDeps {
    */
   getDb?: () => Database;
   /**
+   * React to a thrown SQLite error per the self-heal-or-die policy (#594).
+   * Production wires the {@link DbHolder}'s `healOrExit` so a request that
+   * hits the persistent-corruption class (disk I/O error / malformed image)
+   * triggers ONE reopen attempt, then `process.exit(1)` if reopen fails — the
+   * platform manager restarts the hub with a fresh handle. Returns the holder
+   * verdict (`"healed"` / `"ignored"` / `"exited"`) so the handler can shape
+   * the response. Absent in tests that don't exercise the DB-error path.
+   */
+  onDbError?: (err: unknown) => "ignored" | "healed" | "exited";
+  /**
    * Hub origin used as the OAuth `iss` claim and to build the authorization-
    * server metadata document. When omitted, OAuth endpoints fall back to the
    * request's own origin — fine for local dev, surprising under a reverse
@@ -1429,1219 +1440,1272 @@ export function hubFetch(
     // is then null and `layerOf` fails closed to `public`.
     const peerAddr = server?.requestIP(req)?.address ?? null;
 
-    // 301 back-compat for the pre-hub#231 admin-SPA mounts:
-    //
-    //   `/vault`            → `/admin/vaults`
-    //   `/vault/new`        → `/admin/vaults/new`
-    //   `/hub/vaults*`      → `/admin/vaults*` (this redirect predates #231;
-    //                        it now retargets at the new admin mount instead
-    //                        of the interim `/vault` mount)
-    //   `/hub/permissions`  → `/admin/permissions`
-    //   `/hub/tokens`       → `/admin/tokens`
-    //   `/hub` (bare)       → `/admin/vaults`
-    //
-    // Permanent redirect so cached operator URLs keep working without
-    // leaving dangling SPA routes. Query string preserved; fragment is
-    // client-side and survives the redirect at the browser. Method-agnostic
-    // — even a misrouted POST gets the redirect; none of these paths host a
-    // POST endpoint to protect.
-    //
-    // `/vault/<name>/*` is INTENTIONALLY excluded — that's the per-vault
-    // content proxy (Notes PWA, etc.), not the admin SPA. Stays where it is.
-    if (pathname === "/vault" || pathname === "/vault/" || pathname === "/vault/new") {
-      const sub = pathname === "/vault/new" ? "/new" : "";
-      return new Response("", {
-        status: 301,
-        headers: { location: `/admin/vaults${sub}${url.search}` },
-      });
-    }
-    if (pathname === "/hub/vaults" || pathname.startsWith("/hub/vaults/")) {
-      const newPath = `/admin/vaults${pathname.slice("/hub/vaults".length)}`;
-      return new Response("", {
-        status: 301,
-        headers: { location: `${newPath}${url.search}` },
-      });
-    }
-    if (pathname === "/hub/permissions") {
-      return new Response("", {
-        status: 301,
-        headers: { location: `/admin/permissions${url.search}` },
-      });
-    }
-    if (pathname === "/hub/tokens") {
-      return new Response("", {
-        status: 301,
-        headers: { location: `/admin/tokens${url.search}` },
-      });
-    }
-    if (pathname === "/hub" || pathname === "/hub/") {
-      return new Response("", {
-        status: 301,
-        headers: { location: `/admin/vaults${url.search}` },
-      });
-    }
-
-    // Login surface rename: `/admin/login` and `/admin/logout` 301 to the
-    // canonical `/login` and `/logout`. The names were "admin" only by
-    // historical accident — the handlers serve every parachute auth flow
-    // (operator, OAuth user-redirect, future SPA sign-in). Renaming makes
-    // the surface name match its actual scope.
-    if (pathname === "/admin/login") {
-      return new Response("", {
-        status: 301,
-        headers: { location: `/login${url.search}` },
-      });
-    }
-    if (pathname === "/admin/logout") {
-      return new Response("", {
-        status: 301,
-        headers: { location: `/logout${url.search}` },
-      });
-    }
-
-    // Notes-as-app migration Phase 2 (parachute-app design doc §16).
-    // `/notes/*` 301-redirects to `/surface/notes/*` so legacy bookmarks land on
-    // the apps-hosted Notes. Default-on; operators on notes-as-module-only
-    // installs can opt out via `hub_settings.notes_redirect_disabled = true`
-    // (see hub-settings.ts). The opt-out exists so a legacy operator
-    // doesn't hit redirect → 404 in the deprecation window. Phase 3
-    // (parachute-notes v0.5) retires this redirect entirely.
-    //
-    // Method-agnostic — same shape as the other back-compat 301s above.
-    // The browser re-issues GET on the new URL per RFC 7231 (a POST won't
-    // round-trip its body, but no /notes/* path hosts a POST endpoint
-    // worth preserving — the Notes PWA is read-write against vault, not
-    // against the hub mount itself).
-    //
-    // Lazy DB read: only consult `getDb` when the path actually matches a
-    // legacy notes prefix — every non-notes request must NOT touch the DB
-    // here (some tests + the /health route assert getDb is never called).
-    if (isLegacyNotesPath(pathname)) {
-      const notesRedirect = maybeRedirectNotes(pathname, url.search, getDb?.());
-      if (notesRedirect !== undefined) {
-        logNotesRedirect(pathname, notesRedirect);
-        return new Response("", {
-          status: 301,
-          headers: { location: notesRedirect },
-        });
-      }
-    }
-
-    // CORS preflight for the public OAuth + discovery surface. Browsers
-    // issue OPTIONS before any non-simple cross-origin request — third-party
-    // SPAs hitting `/oauth/register` (RFC 7591 DCR), `/oauth/token`,
-    // `/.well-known/oauth-authorization-server`, etc. Handling this above
-    // the route table means an OPTIONS to e.g. `/oauth/register` doesn't
-    // hit the method-not-allowed branch in the handler — the preflight is a
-    // CORS-protocol artifact, not a "real" request to the endpoint. The
-    // single `isCorsAllowedRoute` predicate is the source of truth for
-    // which paths carry wildcard-CORS; see `src/cors.ts` for the rationale.
-    // Out-of-scope paths (`/api/*`, `/admin/*`, `/login`, `/account/*`,
-    // `/vault/*`, generic service proxy) fall through and OPTIONS reaches
-    // whatever default the downstream handler enforces (typically 405).
-    if (req.method === "OPTIONS" && isCorsAllowedRoute(pathname)) {
-      return corsPreflightResponse(req);
-    }
-
-    // Platform health check (Render, Fly, Kubernetes, etc.). Plain JSON,
-    // no DB required — the route reports liveness, not readiness. Anything
-    // more invasive (DB ping, schema check) would let a transient lock turn
-    // into a restart loop on the platform side. 200 always while the
-    // process is up.
-    if (pathname === "/health") {
-      return new Response(
-        JSON.stringify({ status: "ok", service: "parachute-hub", version: pkg.version }),
-        {
-          headers: {
-            "content-type": "application/json",
-            "cache-control": "no-store",
-          },
-        },
-      );
-    }
-
-    // Boot-readiness probe (hub#443). Used by the transient-state proxy
-    // error page's inline poll script to detect when a still-booting
-    // module has come up. Public + DB-free so it works during the pre-
-    // admin lockout (the page that polls it is itself served pre-auth).
-    if (pathname === "/api/ready") {
-      const readyDeps: Parameters<typeof handleApiReady>[1] = {};
-      if (deps?.supervisor !== undefined) readyDeps.supervisor = deps.supervisor;
-      return handleApiReady(req, readyDeps);
-    }
-
-    // First-boot setup wizard (hub#259). Three steps server-rendered:
-    //   GET  /admin/setup            — derive state, render the right step
-    //   POST /admin/setup/account    — create the admin row, set session
-    //   POST /admin/setup/vault      — provision the first vault
-    //
-    // The wizard owns the "should I 301 to /login now?" decision: setup is
-    // complete only when admin AND a vault entry both exist. A re-visit
-    // after partial setup picks up at the next step. See
-    // src/setup-wizard.ts for the renderer + handler internals.
-    if (pathname === "/admin/setup" || pathname.startsWith("/admin/setup/")) {
-      if (!getDb) return dbNotConfigured();
-      const wizardDeps: SetupWizardDeps = {
-        db: getDb(),
-        manifestPath,
-        configDir: CONFIG_DIR,
-        issuer: oauthDeps(req).issuer,
-        registry: getDefaultOperationsRegistry(),
-        // hub#576: a loopback peer (the on-box operator's own shell) is allowed
-        // to read the actual bootstrap token from the GET /admin/setup JSON
-        // probe. `layerOf` fails closed to non-loopback when peerAddr is
-        // unknown, so a header-less caller never gets the token.
-        requestIsLoopback: layerOf(req, peerAddr) === "loopback",
-      };
-      if (deps?.supervisor !== undefined) wizardDeps.supervisor = deps.supervisor;
-      if (pathname === "/admin/setup") {
-        if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
-        return handleSetupGet(req, wizardDeps);
-      }
-      if (pathname === "/admin/setup/account") {
-        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-        return handleSetupAccountPost(req, wizardDeps);
-      }
-      if (pathname === "/admin/setup/vault") {
-        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-        return handleSetupVaultPost(req, wizardDeps);
-      }
-      if (pathname === "/admin/setup/expose") {
-        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-        return handleSetupExposePost(req, wizardDeps);
-      }
-      // hub#272 Item B: post-wizard direct module-install POSTs from
-      // the done-screen "What's next?" tiles. Path shape is
-      // `/admin/setup/install/<short>`; the handler rejects on
-      // unknown shorts, on `vault` (the wizard's own step owns that),
-      // and on missing session/CSRF — same gates as the vault POST.
-      if (pathname.startsWith("/admin/setup/install/")) {
-        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-        const short = pathname.slice("/admin/setup/install/".length);
-        return handleSetupInstallPost(req, short, wizardDeps);
-      }
-      return new Response("not found", { status: 404 });
-    }
-
-    // Fresh-hub redirect: when the wizard still has work to do, the
-    // discovery page (`/`, `/hub.html`) funnels straight to it. Two
-    // wizard-mode conditions trigger the redirect:
-    //
-    //   1. No admin row exists (the original fresh-deploy case). The
-    //      static portal carries no usable signal — no installed
-    //      services to discover, no admin to sign in as.
-    //   2. Admin exists but no vault is installed (env-seed deploys
-    //      where the operator baked admin into env vars but hasn't
-    //      walked the wizard's vault step). Pre-fix, env-seeded
-    //      operators bounced past the wizard entirely and had to
-    //      hand-find /admin/modules + /admin/vaults; surface
-    //      "let me finish the wizard" instead.
-    //
-    // The wizard's GET handler already picks the right step
-    // (`deriveWizardState` resumes at vault step when admin exists +
-    // no vault), so we just need the redirect to fire.
-    //
-    // 302 (not 301) so the redirect disappears the moment the wizard
-    // finishes. Sits before the JSON-shaped 503 gate below because `/`
-    // is an HTML surface — a JSON 503 there would render as raw text
-    // in the operator's browser tab. The 503 gate handles API + admin
-    // SPA + OAuth callers that branch on the structured body.
-    if (getDb && (pathname === "/" || pathname === "/hub.html")) {
-      const db = getDb();
-      // Either condition triggers the wizard funnel:
-      //   - no admin row (the fresh-deploy case)
-      //   - admin row exists but no vault installed (env-seed case)
-      // Short-circuit the manifest read when `noAdmin` is true; the
-      // wizard's first step is admin creation regardless of vault state.
-      const needsWizard = userCount(db) === 0 || !hasVaultInstalled(manifestPath);
-      if (needsWizard) {
-        return new Response(null, {
-          status: 302,
-          headers: { location: "/admin/setup" },
-        });
-      }
-    }
-
-    // Pre-admin lockout. When the hub has booted with no admin row (the
-    // fresh-container case before PARACHUTE_INITIAL_ADMIN_* is set or
-    // /admin/setup is walked), every operator-facing surface that requires
-    // identity is meaningless — auth flows can't validate, the SPA can't
-    // mint a host-admin token, OAuth can't issue codes. Route those to a
-    // 503 that points at /admin/setup. Health, well-known, /admin/setup
-    // itself, OAuth third-party endpoints, and content proxies pass
-    // through; the fresh-hub `/` and `/hub.html` redirect above handled
-    // the discovery-page case.
-    //
-    // `shouldGateForSetup` runs first so non-gated paths (well-known, /,
-    // /health, /admin/setup) never touch getDb — keeping the
-    // existing OPTIONS-preflight contract that those routes are db-free.
-    if (getDb && shouldGateForSetup(pathname) && userCount(getDb()) === 0) {
+    // Self-heal-or-die wrapper (#594). Any DB throw that escapes a route
+    // handler lands here. A persistent-corruption error (disk I/O error /
+    // malformed image — the state-dir-deleted-under-a-running-hub class)
+    // triggers ONE reopen attempt via `onDbError`; if reopen fails the holder
+    // exits the process so the platform manager restarts with a fresh handle.
+    // The CALLER (this catch) shapes the HTTP response so the operator/CLI see
+    // a structured cause instead of a bare bodyless 500 ("HTTP 500 with no
+    // error detail"). A transient SQLITE_BUSY is classified non-fatal and just
+    // surfaces a 503 the next request clears — it never kills the hub.
+    try {
+      return await dispatch();
+    } catch (err) {
+      const klass = classifyDbError(err);
+      if (klass === "other") throw err; // not a DB-handle failure — let it propagate
+      const verdict = deps?.onDbError?.(err) ?? "ignored";
+      const detail = err instanceof Error ? err.message : String(err);
+      // 503 (not bare 500): the fault is transient-from-the-client's-view —
+      // either the handle was just reopened (`healed`) or it's a momentary
+      // lock (`ignored`/transient); a retry is the right next move. `exited` is
+      // only reachable in tests (production has exited the process). All carry
+      // a structured body so the CLI's `asErrorBody` prints the real cause
+      // instead of "HTTP 500 with no error detail" (#594 part 3).
       return new Response(
         JSON.stringify({
-          error: "setup_required",
+          error: "db_unavailable",
           error_description:
-            "no admin configured. Visit /admin/setup, or set PARACHUTE_INITIAL_ADMIN_USERNAME + PARACHUTE_INITIAL_ADMIN_PASSWORD and restart.",
-          setup_url: "/admin/setup",
+            verdict === "healed"
+              ? `hub database handle was reopened after a fault (${detail}); retry the request.`
+              : `hub database error (${klass}): ${detail}`,
         }),
         {
           status: 503,
-          headers: {
-            "content-type": "application/json",
-            "cache-control": "no-store",
-          },
+          headers: { "content-type": "application/json", "cache-control": "no-store" },
         },
       );
     }
 
-    if (pathname === "/" || pathname === "/hub.html") {
-      // When a DB is configured, render the discovery page dynamically so
-      // the header carries a "Signed in as <name>" affordance for the
-      // active session. Without a DB, fall back to the static disk file
-      // (signed-out shape) — the disk file is what `parachute expose`
-      // wrote out, used when the hub-server is running without state.
-      if (getDb) {
-        const db = getDb();
-        const session = findActiveSession(db, req);
-        let renderOpts: RenderHubOpts = {};
-        const headers: Record<string, string> = {
-          "content-type": "text/html; charset=utf-8",
-        };
-        if (session) {
-          const user = getUserById(db, session.userId);
-          if (user) {
-            const csrf = ensureCsrfToken(req);
-            renderOpts = {
-              session: { displayName: user.username, csrfToken: csrf.token },
-            };
-            if (csrf.setCookie) headers["set-cookie"] = csrf.setCookie;
+    async function dispatch(): Promise<Response> {
+      // 301 back-compat for the pre-hub#231 admin-SPA mounts:
+      //
+      //   `/vault`            → `/admin/vaults`
+      //   `/vault/new`        → `/admin/vaults/new`
+      //   `/hub/vaults*`      → `/admin/vaults*` (this redirect predates #231;
+      //                        it now retargets at the new admin mount instead
+      //                        of the interim `/vault` mount)
+      //   `/hub/permissions`  → `/admin/permissions`
+      //   `/hub/tokens`       → `/admin/tokens`
+      //   `/hub` (bare)       → `/admin/vaults`
+      //
+      // Permanent redirect so cached operator URLs keep working without
+      // leaving dangling SPA routes. Query string preserved; fragment is
+      // client-side and survives the redirect at the browser. Method-agnostic
+      // — even a misrouted POST gets the redirect; none of these paths host a
+      // POST endpoint to protect.
+      //
+      // `/vault/<name>/*` is INTENTIONALLY excluded — that's the per-vault
+      // content proxy (Notes PWA, etc.), not the admin SPA. Stays where it is.
+      if (pathname === "/vault" || pathname === "/vault/" || pathname === "/vault/new") {
+        const sub = pathname === "/vault/new" ? "/new" : "";
+        return new Response("", {
+          status: 301,
+          headers: { location: `/admin/vaults${sub}${url.search}` },
+        });
+      }
+      if (pathname === "/hub/vaults" || pathname.startsWith("/hub/vaults/")) {
+        const newPath = `/admin/vaults${pathname.slice("/hub/vaults".length)}`;
+        return new Response("", {
+          status: 301,
+          headers: { location: `${newPath}${url.search}` },
+        });
+      }
+      if (pathname === "/hub/permissions") {
+        return new Response("", {
+          status: 301,
+          headers: { location: `/admin/permissions${url.search}` },
+        });
+      }
+      if (pathname === "/hub/tokens") {
+        return new Response("", {
+          status: 301,
+          headers: { location: `/admin/tokens${url.search}` },
+        });
+      }
+      if (pathname === "/hub" || pathname === "/hub/") {
+        return new Response("", {
+          status: 301,
+          headers: { location: `/admin/vaults${url.search}` },
+        });
+      }
+
+      // Login surface rename: `/admin/login` and `/admin/logout` 301 to the
+      // canonical `/login` and `/logout`. The names were "admin" only by
+      // historical accident — the handlers serve every parachute auth flow
+      // (operator, OAuth user-redirect, future SPA sign-in). Renaming makes
+      // the surface name match its actual scope.
+      if (pathname === "/admin/login") {
+        return new Response("", {
+          status: 301,
+          headers: { location: `/login${url.search}` },
+        });
+      }
+      if (pathname === "/admin/logout") {
+        return new Response("", {
+          status: 301,
+          headers: { location: `/logout${url.search}` },
+        });
+      }
+
+      // Notes-as-app migration Phase 2 (parachute-app design doc §16).
+      // `/notes/*` 301-redirects to `/surface/notes/*` so legacy bookmarks land on
+      // the apps-hosted Notes. Default-on; operators on notes-as-module-only
+      // installs can opt out via `hub_settings.notes_redirect_disabled = true`
+      // (see hub-settings.ts). The opt-out exists so a legacy operator
+      // doesn't hit redirect → 404 in the deprecation window. Phase 3
+      // (parachute-notes v0.5) retires this redirect entirely.
+      //
+      // Method-agnostic — same shape as the other back-compat 301s above.
+      // The browser re-issues GET on the new URL per RFC 7231 (a POST won't
+      // round-trip its body, but no /notes/* path hosts a POST endpoint
+      // worth preserving — the Notes PWA is read-write against vault, not
+      // against the hub mount itself).
+      //
+      // Lazy DB read: only consult `getDb` when the path actually matches a
+      // legacy notes prefix — every non-notes request must NOT touch the DB
+      // here (some tests + the /health route assert getDb is never called).
+      if (isLegacyNotesPath(pathname)) {
+        const notesRedirect = maybeRedirectNotes(pathname, url.search, getDb?.());
+        if (notesRedirect !== undefined) {
+          logNotesRedirect(pathname, notesRedirect);
+          return new Response("", {
+            status: 301,
+            headers: { location: notesRedirect },
+          });
+        }
+      }
+
+      // CORS preflight for the public OAuth + discovery surface. Browsers
+      // issue OPTIONS before any non-simple cross-origin request — third-party
+      // SPAs hitting `/oauth/register` (RFC 7591 DCR), `/oauth/token`,
+      // `/.well-known/oauth-authorization-server`, etc. Handling this above
+      // the route table means an OPTIONS to e.g. `/oauth/register` doesn't
+      // hit the method-not-allowed branch in the handler — the preflight is a
+      // CORS-protocol artifact, not a "real" request to the endpoint. The
+      // single `isCorsAllowedRoute` predicate is the source of truth for
+      // which paths carry wildcard-CORS; see `src/cors.ts` for the rationale.
+      // Out-of-scope paths (`/api/*`, `/admin/*`, `/login`, `/account/*`,
+      // `/vault/*`, generic service proxy) fall through and OPTIONS reaches
+      // whatever default the downstream handler enforces (typically 405).
+      if (req.method === "OPTIONS" && isCorsAllowedRoute(pathname)) {
+        return corsPreflightResponse(req);
+      }
+
+      // Platform health check (Render, Fly, Kubernetes, etc.). Plain JSON.
+      // Always 200 while the process is up — the HTTP status reports process
+      // liveness, not DB readiness, so a transient DB blip never turns into a
+      // platform-side restart loop. The `db` field (#594) carries the cheap
+      // `SELECT 1` verdict ("ok" / "error: <class>") so monitoring, `parachute
+      // status`, and the #590/#591 adoption probe can distinguish "hub up" from
+      // "hub up but its database is gone" (the dead-handle field repro: green
+      // /health while every DB route 500s). The probe NEVER throws — a thrown
+      // probe would make /health itself 500, defeating the point.
+      if (pathname === "/health") {
+        let db: "ok" | string = "unconfigured";
+        if (getDb) {
+          try {
+            db = probeDbLiveness(getDb());
+          } catch {
+            // getDb() itself threw (e.g. openHubDb failed) — report it as an
+            // error class without letting /health 500.
+            db = "error: other";
           }
         }
-        return new Response(renderHub(renderOpts), { headers });
+        return new Response(
+          JSON.stringify({ status: "ok", service: "parachute-hub", version: pkg.version, db }),
+          {
+            headers: {
+              "content-type": "application/json",
+              "cache-control": "no-store",
+            },
+          },
+        );
       }
-      // No DB configured → fall back to static file (signed-out only).
-      if (!existsSync(hubHtmlPath)) {
-        return new Response("hub.html not found", { status: 404 });
-      }
-      return new Response(Bun.file(hubHtmlPath), {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
-    }
 
-    if (pathname === "/.well-known/parachute.json") {
-      // The well-known doc is a public service-discovery manifest (no
-      // secrets, no PII), and Notes / future browser clients fetch it
-      // cross-origin from their own loopback port. Wildcard CORS is the
-      // shape it needs. Browsers send an OPTIONS preflight when the request
-      // adds non-simple headers; answer it with 204 + the same allow-list.
+      // Boot-readiness probe (hub#443). Used by the transient-state proxy
+      // error page's inline poll script to detect when a still-booting
+      // module has come up. Public + DB-free so it works during the pre-
+      // admin lockout (the page that polls it is itself served pre-auth).
+      if (pathname === "/api/ready") {
+        const readyDeps: Parameters<typeof handleApiReady>[1] = {};
+        if (deps?.supervisor !== undefined) readyDeps.supervisor = deps.supervisor;
+        return handleApiReady(req, readyDeps);
+      }
+
+      // First-boot setup wizard (hub#259). Three steps server-rendered:
+      //   GET  /admin/setup            — derive state, render the right step
+      //   POST /admin/setup/account    — create the admin row, set session
+      //   POST /admin/setup/vault      — provision the first vault
       //
-      // `cache-control: no-store` matters here: the discovery page (`/`)
-      // fetches this doc and renders Service tiles from it; without
-      // no-store, the browser's HTTP cache returns the stale services list
-      // the next time the operator navigates back to `/` after installing
-      // a module via the admin SPA. The doc is small and built per-request
-      // anyway, so giving up cacheability has no real cost (hub#268 Item 1).
-      const corsHeaders = {
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET, OPTIONS",
-        "cache-control": "no-store",
-      };
-      if (req.method === "OPTIONS") {
-        return new Response(null, { status: 204, headers: corsHeaders });
-      }
-      // Built dynamically from services.json on every request — that's what
-      // makes `parachute vault create` show up here without re-running
-      // expose. canonicalOrigin reuses the OAuth issuer fallback: prefer the
-      // configured public origin (set by `--issuer https://<fqdn>`), else
-      // the request's own origin (fine for direct loopback hits).
-      try {
-        // Lenient — see hub#406.
-        const manifest = readManifestLenient(manifestPath);
-        // Same precedence as the OAuth issuer (hub#298): hub_settings →
-        // env → request origin. The well-known doc embeds this origin
-        // in service URLs + the issuer metadata link, so it must follow
-        // the same chain — otherwise a public-domain operator who set
-        // `hub_origin` would still see the Render-assigned URL on
-        // `/.well-known/parachute.json` while their JWTs carry the
-        // canonical URL, and discovery clients would split-brain on
-        // which one to trust.
-        const canonicalOrigin = resolveIssuer(
-          req,
-          getDb?.(),
-          configuredIssuer,
-          loadExposeHubOrigin,
-        );
-        const readManifestFn = deps?.readModuleManifest ?? defaultReadModuleManifest;
-        const [managementUrlByName, serviceUiMeta] = await Promise.all([
-          loadManagementUrls(manifest.services, readManifestFn),
-          loadServiceUiMetadata(manifest.services, readManifestFn),
-        ]);
-        const doc = buildWellKnown({
-          services: manifest.services,
-          canonicalOrigin,
-          managementUrlFor: (entry) => managementUrlByName.get(entry.name),
-          uiUrlFor: (entry) => serviceUiMeta.uiUrls.get(entry.name),
-          displayNameFor: (entry) => serviceUiMeta.displayNames.get(entry.name),
-        });
-        return new Response(JSON.stringify(doc), {
-          headers: { "content-type": "application/json", ...corsHeaders },
-        });
-      } catch (err) {
-        // ServicesManifestError lands here too — corrupt JSON or schema
-        // violation in services.json shouldn't crash the hub for everyone.
-        const msg = err instanceof Error ? err.message : String(err);
-        return new Response(JSON.stringify({ error: `well-known build failed: ${msg}` }), {
-          status: 500,
-          headers: { "content-type": "application/json", ...corsHeaders },
-        });
-      }
-    }
-
-    if (pathname === REVOCATION_LIST_MOUNT) {
-      // Revocation list (hub#212 Phase 1). Public — same CORS posture as
-      // jwks.json since resource servers (vault/scribe/agent) fetch it
-      // cross-origin on the 60s polling cadence wired in Phase 4.
-      const corsHeaders = {
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET, OPTIONS",
-      };
-      if (req.method === "OPTIONS") {
-        return new Response(null, { status: 204, headers: corsHeaders });
-      }
-      if (!getDb) {
-        return new Response('{"error":"revocation list unavailable: db not configured"}', {
-          status: 503,
-          headers: { "content-type": "application/json", ...corsHeaders },
-        });
-      }
-      const resp = handleRevocationList(req, { db: getDb() });
-      // Layer the wildcard CORS over whatever cache-control the handler set.
-      const merged = new Headers(resp.headers);
-      for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
-      return new Response(resp.body, { status: resp.status, headers: merged });
-    }
-
-    if (pathname === "/.well-known/jwks.json") {
-      // JWKS is also a cross-origin fetch target (browser-side OAuth
-      // libraries pull this to verify access tokens). Same wildcard CORS
-      // shape as parachute.json — JWKS is public-by-design (only public
-      // keys leave the server).
-      const corsHeaders = {
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET, OPTIONS",
-      };
-      if (req.method === "OPTIONS") {
-        return new Response(null, { status: 204, headers: corsHeaders });
-      }
-      if (!getDb) {
-        return new Response('{"error":"jwks unavailable: db not configured"}', {
-          status: 503,
-          headers: { "content-type": "application/json", ...corsHeaders },
-        });
-      }
-      try {
-        const db = getDb();
-        const keys = getAllPublicKeys(db).map((k) => pemToJwk(k.publicKeyPem, k.kid));
-        return new Response(JSON.stringify({ keys }), {
-          headers: { "content-type": "application/json", ...corsHeaders },
-        });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return new Response(JSON.stringify({ error: `jwks failed: ${msg}` }), {
-          status: 500,
-          headers: { "content-type": "application/json", ...corsHeaders },
-        });
-      }
-    }
-
-    if (pathname === "/.well-known/oauth-authorization-server") {
-      // Public discovery doc — clients pull this cross-origin to find the
-      // authorize/token endpoints. Same wildcard CORS shape as the JWKS
-      // and the parachute manifest.
-      const corsHeaders = {
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET, OPTIONS",
-      };
-      if (req.method === "OPTIONS") {
-        return new Response(null, { status: 204, headers: corsHeaders });
-      }
-      const res = authorizationServerMetadata(oauthDeps(req));
-      // Fold CORS into the existing JSON response.
-      const merged = new Headers(res.headers);
-      for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
-      return new Response(res.body, { status: res.status, headers: merged });
-    }
-
-    if (pathname === "/.well-known/oauth-protected-resource") {
-      // RFC 9728 — companion to oauth-authorization-server. MCP clients
-      // (since 2025-06-18 spec) probe this to discover scopes + the
-      // authorization server. Same wildcard CORS shape. Closes hub#393.
-      const corsHeaders = {
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET, OPTIONS",
-      };
-      if (req.method === "OPTIONS") {
-        return new Response(null, { status: 204, headers: corsHeaders });
-      }
-      const res = protectedResourceMetadata(oauthDeps(req));
-      const merged = new Headers(res.headers);
-      for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
-      return new Response(res.body, { status: res.status, headers: merged });
-    }
-
-    // OAuth surface — every handler return is wrapped in `applyCorsHeaders`
-    // so third-party SPAs can fetch these endpoints cross-origin (the entire
-    // point of OAuth DCR: arbitrary SPAs register → authorize → exchange
-    // tokens). Preflight OPTIONS already returned at the top of dispatch.
-    // See `src/cors.ts` for the wildcard-origin rationale.
-    if (pathname === "/oauth/authorize") {
-      if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
-      // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 3:
-      // a signed-in pre-rotation user must NOT be able to ride the consent flow
-      // to an auth code → `/oauth/token` exchange → vault-scoped access token
-      // without rotating the temp password. Gating `/oauth/authorize` (the
-      // session-backed consent path) is sufficient — no code is issued without
-      // it, so `/oauth/token` (back-channel code exchange, no session cookie)
-      // is intentionally NOT gated (gating it would break the legitimate
-      // exchange). An UNAUTHENTICATED authorize request returns null from the
-      // gate and falls through to render the login form, unchanged.
-      const oauthGate = forceChangePasswordGate(getDb(), req);
-      if (oauthGate) return applyCorsHeaders(req, oauthGate);
-      if (req.method === "GET") {
-        // handleAuthorizeGet is sync (returns Response, not Promise<Response>).
-        // handleAuthorizePost is async — keep the await on POST only.
-        return applyCorsHeaders(req, handleAuthorizeGet(getDb(), req, oauthDeps(req)));
-      }
-      if (req.method === "POST") {
-        return applyCorsHeaders(req, await handleAuthorizePost(getDb(), req, oauthDeps(req)));
-      }
-      return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
-    }
-
-    // Inline approve form for the operator-driven pending-client flow (#208).
-    // Receives `client_id` + `csrf_token` + `return_to` from the form rendered
-    // by handleAuthorizeGet when the operator hits a pending client. Three
-    // gates inside the handler: CSRF, active session, same-origin Origin.
-    if (pathname === "/oauth/authorize/approve") {
-      if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
-      if (req.method !== "POST") {
-        return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
-      }
-      return applyCorsHeaders(req, await handleApproveClientPost(getDb(), req, oauthDeps(req)));
-    }
-
-    if (pathname === "/oauth/token") {
-      if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
-      if (req.method !== "POST") {
-        return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
-      }
-      return applyCorsHeaders(req, await handleToken(getDb(), req, oauthDeps(req)));
-    }
-
-    if (pathname === "/oauth/register") {
-      if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
-      if (req.method !== "POST") {
-        return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
-      }
-      return applyCorsHeaders(req, await handleRegister(getDb(), req, oauthDeps(req)));
-    }
-
-    if (pathname === "/oauth/revoke") {
-      if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
-      if (req.method !== "POST") {
-        return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
-      }
-      return applyCorsHeaders(req, await handleRevoke(getDb(), req, oauthDeps(req)));
-    }
-
-    if (pathname === "/vaults") {
-      if (!getDb) return dbNotConfigured();
-      return handleCreateVault(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-      });
-    }
-
-    // Note: the old `/hub/*` SPA mount has been retired. Known prefixes
-    // (`/hub`, `/hub/vaults*`, `/hub/permissions`, `/hub/tokens`) are
-    // 301-redirected at the top of dispatch. Any other `/hub/*` path falls
-    // through to the catch-all 404 — there's no admin surface left there.
-
-    if (pathname === "/admin/host-admin-token") {
-      if (!getDb) return dbNotConfigured();
-      return handleHostAdminToken(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-      });
-    }
-
-    if (pathname.startsWith("/admin/vault-admin-token/")) {
-      if (!getDb) return dbNotConfigured();
-      const vaultName = decodeURIComponent(pathname.slice("/admin/vault-admin-token/".length));
-      // The vault name must correspond to an actual vault instance — same
-      // shape the well-known doc derives. Source from services.json so a
-      // freshly-created vault is mintable on the next request without a
-      // restart.
-      // Lenient — see hub#406.
-      const manifest = readManifestLenient(manifestPath);
-      const knownVaultNames = new Set<string>();
-      for (const s of manifest.services) {
-        if (!isVaultEntry(s)) continue;
-        for (const path of s.paths) knownVaultNames.add(vaultInstanceNameFor(s.name, path));
-      }
-      return handleVaultAdminToken(req, vaultName, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-        knownVaultNames,
-      });
-    }
-
-    if (pathname === "/api/me") {
-      if (!getDb) return dbNotConfigured();
-      return handleApiMe(req, { db: getDb() });
-    }
-
-    // SPA-driven hub self-upgrade (design 2026-06-01 §5.3 / D4). Dedicated
-    // endpoint — the hub is NOT a supervised module (no /api/modules/hub/*),
-    // so it gets its own route. Checked BEFORE the `/api/hub` exact match
-    // below (and the `/api/modules/*` switch) so the more-specific path wins.
-    // Does NOT require a supervisor: the hub upgrades itself via a detached
-    // helper, not the supervisor. Host-admin gated inside the handler (reuses
-    // the same validateAccessToken + scope check the module-ops API uses); the
-    // channel param is a closed enum (rc|latest) — no injection surface.
-    if (pathname === "/api/hub/upgrade") {
-      if (!getDb) return dbNotConfigured();
-      return handleHubUpgrade(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-        configDir: CONFIG_DIR,
-      });
-    }
-    if (pathname === "/api/hub/upgrade/status") {
-      if (!getDb) return dbNotConfigured();
-      return handleHubUpgradeStatus(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-        configDir: CONFIG_DIR,
-      });
-    }
-
-    // Hub version + uptime + install-source — drives the admin SPA's
-    // version badge (hub#348). Bearer-gated on `parachute:host:admin`
-    // (same as the rest of the operator-only admin surface).
-    if (pathname === "/api/hub") {
-      if (!getDb) return dbNotConfigured();
-      return handleApiHub(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-      });
-    }
-
-    if (pathname === "/api/modules") {
-      if (!getDb) return dbNotConfigured();
-      const od = oauthDeps(req);
-      const modulesDeps: Parameters<typeof handleApiModules>[1] = {
-        db: getDb(),
-        issuer: od.issuer,
-        // hub#516: validate the host-admin bearer's `iss` against the SET of
-        // origins the hub answers on (loopback ∪ expose-state ∪ env/platform ∪
-        // per-request issuer), so `parachute status` works on an exposed box
-        // where the operator token carries the public origin but the loopback
-        // request resolves the loopback issuer.
-        knownIssuers: od.hubBoundOrigins(),
-        manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
-      };
-      if (deps?.supervisor !== undefined) modulesDeps.supervisor = deps.supervisor;
-      // hub#342: thread the test-injectable module-manifest reader
-      // through so `management_url` resolution can be exercised in
-      // unit tests without writing real install dirs.
-      if (deps?.readModuleManifest !== undefined)
-        modulesDeps.readModuleManifest = deps.readModuleManifest;
-      return handleApiModules(req, modulesDeps);
-    }
-
-    // Channel toggle (hub#275) — pre-empts the /api/modules/:short/*
-    // routes below so `/api/modules/channel` doesn't accidentally match
-    // `parseModulesPath` (which would reject it as a non-curated short
-    // anyway, but precedence makes the intent explicit).
-    if (pathname === "/api/modules/channel") {
-      if (!getDb) return dbNotConfigured();
-      return handleApiModulesChannel(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-      });
-    }
-
-    // Canonical hub URL (hub#298). Admin SPA reads + writes the
-    // operator-set issuer override. The handler computes the resolved
-    // issuer + source here so it can surface them in the GET payload
-    // without re-walking the precedence chain inside the handler.
-    if (pathname === "/api/settings/hub-origin") {
-      if (!getDb) return dbNotConfigured();
-      const db = getDb();
-      return handleApiSettingsHubOrigin(req, {
-        db,
-        issuer: oauthDeps(req).issuer,
-        resolvedIssuer: resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin),
-        resolvedSource: resolveIssuerSource(db, configuredIssuer, loadExposeHubOrigin),
-      });
-    }
-
-    // Module operation poll surface — pre-empts the /api/modules/:short/*
-    // routes below so `/api/modules/operations/<uuid>` doesn't accidentally
-    // match a parseModulesPath("/operations") and fall through.
-    if (pathname.startsWith("/api/modules/operations/")) {
-      if (!getDb) return dbNotConfigured();
-      if (!deps?.supervisor) {
-        return new Response(
-          JSON.stringify({
-            error: "supervisor_unavailable",
-            error_description:
-              "module operations require `parachute serve` (supervisor mode); on-box CLI uses `parachute install/upgrade/restart`",
-          }),
-          { status: 503, headers: { "content-type": "application/json" } },
-        );
-      }
-      const opId = decodeURIComponent(pathname.slice("/api/modules/operations/".length));
-      if (!opId || opId.includes("/")) return new Response("not found", { status: 404 });
-      const od = oauthDeps(req);
-      return handleOperationGet(req, opId, {
-        db: getDb(),
-        issuer: od.issuer,
-        // hub#516: see the `/api/modules` deps note — the CLI polls async ops
-        // on loopback with the operator token (public `iss`).
-        knownIssuers: od.hubBoundOrigins(),
-        manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
-        configDir: CONFIG_DIR,
-        supervisor: deps.supervisor,
-      });
-    }
-
-    // Per-module config surface (hub#260) — schema + values GET, values PUT.
-    // Sits ahead of the install/restart/upgrade/uninstall switch below so
-    // `/api/modules/<short>/config[/schema]` doesn't fall into the default-
-    // branch 404 (`parseModulesPath` only matches the action-suffix shape,
-    // not the `config` / `config/schema` shape).
-    //
-    // Diverges from the action endpoints in two ways: doesn't require a
-    // supervisor (we just proxy to the running module's HTTP surface, not
-    // spawn a child), and mints a `<short>:admin` token at proxy time so
-    // the upstream auth gate is satisfied without forcing the SPA bearer
-    // to carry per-module scopes.
-    {
-      const configMatch = parseModulesConfigPath(pathname);
-      if (configMatch) {
+      // The wizard owns the "should I 301 to /login now?" decision: setup is
+      // complete only when admin AND a vault entry both exist. A re-visit
+      // after partial setup picks up at the next step. See
+      // src/setup-wizard.ts for the renderer + handler internals.
+      if (pathname === "/admin/setup" || pathname.startsWith("/admin/setup/")) {
         if (!getDb) return dbNotConfigured();
-        return handleApiModulesConfig(req, configMatch, {
+        const wizardDeps: SetupWizardDeps = {
           db: getDb(),
+          manifestPath,
+          configDir: CONFIG_DIR,
           issuer: oauthDeps(req).issuer,
-          manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
-        });
-      }
-    }
-
-    // Per-module action endpoints: /api/modules/:short/{install,restart,upgrade,uninstall}.
-    if (pathname.startsWith("/api/modules/")) {
-      if (!getDb) return dbNotConfigured();
-      if (!deps?.supervisor) {
-        return new Response(
-          JSON.stringify({
-            error: "supervisor_unavailable",
-            error_description:
-              "module operations require `parachute serve` (supervisor mode); on-box CLI uses `parachute install/upgrade/restart`",
-          }),
-          { status: 503, headers: { "content-type": "application/json" } },
-        );
-      }
-      const match = parseModulesPath(pathname);
-      if (!match) return new Response("not found", { status: 404 });
-      const od = oauthDeps(req);
-      const opsDeps = {
-        db: getDb(),
-        issuer: od.issuer,
-        // hub#516: the CLI drives start/stop/restart/install/upgrade/uninstall
-        // on loopback with the operator token, whose `iss` is the hub's public
-        // origin after `expose`. Validate against the hub's known-origin set.
-        knownIssuers: od.hubBoundOrigins(),
-        manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
-        configDir: CONFIG_DIR,
-        supervisor: deps.supervisor,
-      };
-      switch (match.rest) {
-        case "install":
-          return handleInstall(req, match.short, opsDeps);
-        case "start":
-          return handleStart(req, match.short, opsDeps);
-        case "stop":
-          return handleStop(req, match.short, opsDeps);
-        case "restart":
-          return handleRestart(req, match.short, opsDeps);
-        case "logs":
-          return handleLogs(req, match.short, opsDeps);
-        case "upgrade":
-          return handleUpgrade(req, match.short, opsDeps);
-        case "uninstall":
-          return handleUninstall(req, match.short, opsDeps);
-        default:
-          return new Response("not found", { status: 404 });
-      }
-    }
-
-    if (pathname === "/api/auth/mint-token") {
-      if (!getDb) return dbNotConfigured();
-      // Derive the set of registered vault names so the handler can reject a
-      // `vault:<typo>:admin` mint (item D / hub#450) — same source + shape the
-      // session-cookie `/admin/vault-admin-token/<name>` path uses. Lenient
-      // read so a malformed manifest doesn't 500 the mint endpoint.
-      const mintManifest = readManifestLenient(manifestPath);
-      const mintKnownVaultNames = new Set<string>();
-      for (const s of mintManifest.services) {
-        if (!isVaultEntry(s)) continue;
-        for (const path of s.paths) mintKnownVaultNames.add(vaultInstanceNameFor(s.name, path));
-      }
-      return handleApiMintToken(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-        knownVaultNames: mintKnownVaultNames,
-      });
-    }
-
-    if (pathname === "/api/auth/revoke-token") {
-      if (!getDb) return dbNotConfigured();
-      return handleApiRevokeToken(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-      });
-    }
-
-    if (pathname === "/api/auth/tokens") {
-      if (!getDb) return dbNotConfigured();
-      return handleApiTokens(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-      });
-    }
-
-    if (pathname === "/api/grants") {
-      if (!getDb) return dbNotConfigured();
-      return handleListGrants(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-      });
-    }
-
-    if (pathname.startsWith("/api/grants/")) {
-      if (!getDb) return dbNotConfigured();
-      const clientId = decodeURIComponent(pathname.slice("/api/grants/".length));
-      if (!clientId || clientId.includes("/")) {
+          registry: getDefaultOperationsRegistry(),
+          // hub#576: a loopback peer (the on-box operator's own shell) is allowed
+          // to read the actual bootstrap token from the GET /admin/setup JSON
+          // probe. `layerOf` fails closed to non-loopback when peerAddr is
+          // unknown, so a header-less caller never gets the token.
+          requestIsLoopback: layerOf(req, peerAddr) === "loopback",
+        };
+        if (deps?.supervisor !== undefined) wizardDeps.supervisor = deps.supervisor;
+        if (pathname === "/admin/setup") {
+          if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+          return handleSetupGet(req, wizardDeps);
+        }
+        if (pathname === "/admin/setup/account") {
+          if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+          return handleSetupAccountPost(req, wizardDeps);
+        }
+        if (pathname === "/admin/setup/vault") {
+          if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+          return handleSetupVaultPost(req, wizardDeps);
+        }
+        if (pathname === "/admin/setup/expose") {
+          if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+          return handleSetupExposePost(req, wizardDeps);
+        }
+        // hub#272 Item B: post-wizard direct module-install POSTs from
+        // the done-screen "What's next?" tiles. Path shape is
+        // `/admin/setup/install/<short>`; the handler rejects on
+        // unknown shorts, on `vault` (the wizard's own step owns that),
+        // and on missing session/CSRF — same gates as the vault POST.
+        if (pathname.startsWith("/admin/setup/install/")) {
+          if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+          const short = pathname.slice("/admin/setup/install/".length);
+          return handleSetupInstallPost(req, short, wizardDeps);
+        }
         return new Response("not found", { status: 404 });
       }
-      return handleRevokeGrant(req, clientId, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-      });
-    }
 
-    // OAuth client lookup + approval. Both bearer-gated under host:admin.
-    // Two paths: `/api/oauth/clients/<id>` (GET, details) and
-    // `/api/oauth/clients/<id>/approve` (POST, flip to approved). The
-    // SPA approve-client deep link reads details from the first and
-    // submits approval to the second — keeps the surface easy to test
-    // and audit without overloading a single verb.
-    if (pathname.startsWith("/api/oauth/clients/")) {
-      if (!getDb) return dbNotConfigured();
-      const tail = pathname.slice("/api/oauth/clients/".length);
-      if (!tail) return new Response("not found", { status: 404 });
-      const approveSuffix = "/approve";
-      if (tail.endsWith(approveSuffix)) {
-        const clientId = decodeURIComponent(tail.slice(0, -approveSuffix.length));
+      // Fresh-hub redirect: when the wizard still has work to do, the
+      // discovery page (`/`, `/hub.html`) funnels straight to it. Two
+      // wizard-mode conditions trigger the redirect:
+      //
+      //   1. No admin row exists (the original fresh-deploy case). The
+      //      static portal carries no usable signal — no installed
+      //      services to discover, no admin to sign in as.
+      //   2. Admin exists but no vault is installed (env-seed deploys
+      //      where the operator baked admin into env vars but hasn't
+      //      walked the wizard's vault step). Pre-fix, env-seeded
+      //      operators bounced past the wizard entirely and had to
+      //      hand-find /admin/modules + /admin/vaults; surface
+      //      "let me finish the wizard" instead.
+      //
+      // The wizard's GET handler already picks the right step
+      // (`deriveWizardState` resumes at vault step when admin exists +
+      // no vault), so we just need the redirect to fire.
+      //
+      // 302 (not 301) so the redirect disappears the moment the wizard
+      // finishes. Sits before the JSON-shaped 503 gate below because `/`
+      // is an HTML surface — a JSON 503 there would render as raw text
+      // in the operator's browser tab. The 503 gate handles API + admin
+      // SPA + OAuth callers that branch on the structured body.
+      if (getDb && (pathname === "/" || pathname === "/hub.html")) {
+        const db = getDb();
+        // Either condition triggers the wizard funnel:
+        //   - no admin row (the fresh-deploy case)
+        //   - admin row exists but no vault installed (env-seed case)
+        // Short-circuit the manifest read when `noAdmin` is true; the
+        // wizard's first step is admin creation regardless of vault state.
+        const needsWizard = userCount(db) === 0 || !hasVaultInstalled(manifestPath);
+        if (needsWizard) {
+          return new Response(null, {
+            status: 302,
+            headers: { location: "/admin/setup" },
+          });
+        }
+      }
+
+      // Pre-admin lockout. When the hub has booted with no admin row (the
+      // fresh-container case before PARACHUTE_INITIAL_ADMIN_* is set or
+      // /admin/setup is walked), every operator-facing surface that requires
+      // identity is meaningless — auth flows can't validate, the SPA can't
+      // mint a host-admin token, OAuth can't issue codes. Route those to a
+      // 503 that points at /admin/setup. Health, well-known, /admin/setup
+      // itself, OAuth third-party endpoints, and content proxies pass
+      // through; the fresh-hub `/` and `/hub.html` redirect above handled
+      // the discovery-page case.
+      //
+      // `shouldGateForSetup` runs first so non-gated paths (well-known, /,
+      // /health, /admin/setup) never touch getDb — keeping the
+      // existing OPTIONS-preflight contract that those routes are db-free.
+      if (getDb && shouldGateForSetup(pathname) && userCount(getDb()) === 0) {
+        return new Response(
+          JSON.stringify({
+            error: "setup_required",
+            error_description:
+              "no admin configured. Visit /admin/setup, or set PARACHUTE_INITIAL_ADMIN_USERNAME + PARACHUTE_INITIAL_ADMIN_PASSWORD and restart.",
+            setup_url: "/admin/setup",
+          }),
+          {
+            status: 503,
+            headers: {
+              "content-type": "application/json",
+              "cache-control": "no-store",
+            },
+          },
+        );
+      }
+
+      if (pathname === "/" || pathname === "/hub.html") {
+        // When a DB is configured, render the discovery page dynamically so
+        // the header carries a "Signed in as <name>" affordance for the
+        // active session. Without a DB, fall back to the static disk file
+        // (signed-out shape) — the disk file is what `parachute expose`
+        // wrote out, used when the hub-server is running without state.
+        if (getDb) {
+          const db = getDb();
+          const session = findActiveSession(db, req);
+          let renderOpts: RenderHubOpts = {};
+          const headers: Record<string, string> = {
+            "content-type": "text/html; charset=utf-8",
+          };
+          if (session) {
+            const user = getUserById(db, session.userId);
+            if (user) {
+              const csrf = ensureCsrfToken(req);
+              renderOpts = {
+                session: { displayName: user.username, csrfToken: csrf.token },
+              };
+              if (csrf.setCookie) headers["set-cookie"] = csrf.setCookie;
+            }
+          }
+          return new Response(renderHub(renderOpts), { headers });
+        }
+        // No DB configured → fall back to static file (signed-out only).
+        if (!existsSync(hubHtmlPath)) {
+          return new Response("hub.html not found", { status: 404 });
+        }
+        return new Response(Bun.file(hubHtmlPath), {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
+
+      if (pathname === "/.well-known/parachute.json") {
+        // The well-known doc is a public service-discovery manifest (no
+        // secrets, no PII), and Notes / future browser clients fetch it
+        // cross-origin from their own loopback port. Wildcard CORS is the
+        // shape it needs. Browsers send an OPTIONS preflight when the request
+        // adds non-simple headers; answer it with 204 + the same allow-list.
+        //
+        // `cache-control: no-store` matters here: the discovery page (`/`)
+        // fetches this doc and renders Service tiles from it; without
+        // no-store, the browser's HTTP cache returns the stale services list
+        // the next time the operator navigates back to `/` after installing
+        // a module via the admin SPA. The doc is small and built per-request
+        // anyway, so giving up cacheability has no real cost (hub#268 Item 1).
+        const corsHeaders = {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, OPTIONS",
+          "cache-control": "no-store",
+        };
+        if (req.method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        // Built dynamically from services.json on every request — that's what
+        // makes `parachute vault create` show up here without re-running
+        // expose. canonicalOrigin reuses the OAuth issuer fallback: prefer the
+        // configured public origin (set by `--issuer https://<fqdn>`), else
+        // the request's own origin (fine for direct loopback hits).
+        try {
+          // Lenient — see hub#406.
+          const manifest = readManifestLenient(manifestPath);
+          // Same precedence as the OAuth issuer (hub#298): hub_settings →
+          // env → request origin. The well-known doc embeds this origin
+          // in service URLs + the issuer metadata link, so it must follow
+          // the same chain — otherwise a public-domain operator who set
+          // `hub_origin` would still see the Render-assigned URL on
+          // `/.well-known/parachute.json` while their JWTs carry the
+          // canonical URL, and discovery clients would split-brain on
+          // which one to trust.
+          const canonicalOrigin = resolveIssuer(
+            req,
+            getDb?.(),
+            configuredIssuer,
+            loadExposeHubOrigin,
+          );
+          const readManifestFn = deps?.readModuleManifest ?? defaultReadModuleManifest;
+          const [managementUrlByName, serviceUiMeta] = await Promise.all([
+            loadManagementUrls(manifest.services, readManifestFn),
+            loadServiceUiMetadata(manifest.services, readManifestFn),
+          ]);
+          const doc = buildWellKnown({
+            services: manifest.services,
+            canonicalOrigin,
+            managementUrlFor: (entry) => managementUrlByName.get(entry.name),
+            uiUrlFor: (entry) => serviceUiMeta.uiUrls.get(entry.name),
+            displayNameFor: (entry) => serviceUiMeta.displayNames.get(entry.name),
+          });
+          return new Response(JSON.stringify(doc), {
+            headers: { "content-type": "application/json", ...corsHeaders },
+          });
+        } catch (err) {
+          // ServicesManifestError lands here too — corrupt JSON or schema
+          // violation in services.json shouldn't crash the hub for everyone.
+          const msg = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ error: `well-known build failed: ${msg}` }), {
+            status: 500,
+            headers: { "content-type": "application/json", ...corsHeaders },
+          });
+        }
+      }
+
+      if (pathname === REVOCATION_LIST_MOUNT) {
+        // Revocation list (hub#212 Phase 1). Public — same CORS posture as
+        // jwks.json since resource servers (vault/scribe/agent) fetch it
+        // cross-origin on the 60s polling cadence wired in Phase 4.
+        const corsHeaders = {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, OPTIONS",
+        };
+        if (req.method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        if (!getDb) {
+          return new Response('{"error":"revocation list unavailable: db not configured"}', {
+            status: 503,
+            headers: { "content-type": "application/json", ...corsHeaders },
+          });
+        }
+        const resp = handleRevocationList(req, { db: getDb() });
+        // Layer the wildcard CORS over whatever cache-control the handler set.
+        const merged = new Headers(resp.headers);
+        for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
+        return new Response(resp.body, { status: resp.status, headers: merged });
+      }
+
+      if (pathname === "/.well-known/jwks.json") {
+        // JWKS is also a cross-origin fetch target (browser-side OAuth
+        // libraries pull this to verify access tokens). Same wildcard CORS
+        // shape as parachute.json — JWKS is public-by-design (only public
+        // keys leave the server).
+        const corsHeaders = {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, OPTIONS",
+        };
+        if (req.method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        if (!getDb) {
+          return new Response('{"error":"jwks unavailable: db not configured"}', {
+            status: 503,
+            headers: { "content-type": "application/json", ...corsHeaders },
+          });
+        }
+        try {
+          const db = getDb();
+          const keys = getAllPublicKeys(db).map((k) => pemToJwk(k.publicKeyPem, k.kid));
+          return new Response(JSON.stringify({ keys }), {
+            headers: { "content-type": "application/json", ...corsHeaders },
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return new Response(JSON.stringify({ error: `jwks failed: ${msg}` }), {
+            status: 500,
+            headers: { "content-type": "application/json", ...corsHeaders },
+          });
+        }
+      }
+
+      if (pathname === "/.well-known/oauth-authorization-server") {
+        // Public discovery doc — clients pull this cross-origin to find the
+        // authorize/token endpoints. Same wildcard CORS shape as the JWKS
+        // and the parachute manifest.
+        const corsHeaders = {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, OPTIONS",
+        };
+        if (req.method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        const res = authorizationServerMetadata(oauthDeps(req));
+        // Fold CORS into the existing JSON response.
+        const merged = new Headers(res.headers);
+        for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
+        return new Response(res.body, { status: res.status, headers: merged });
+      }
+
+      if (pathname === "/.well-known/oauth-protected-resource") {
+        // RFC 9728 — companion to oauth-authorization-server. MCP clients
+        // (since 2025-06-18 spec) probe this to discover scopes + the
+        // authorization server. Same wildcard CORS shape. Closes hub#393.
+        const corsHeaders = {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, OPTIONS",
+        };
+        if (req.method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        const res = protectedResourceMetadata(oauthDeps(req));
+        const merged = new Headers(res.headers);
+        for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
+        return new Response(res.body, { status: res.status, headers: merged });
+      }
+
+      // OAuth surface — every handler return is wrapped in `applyCorsHeaders`
+      // so third-party SPAs can fetch these endpoints cross-origin (the entire
+      // point of OAuth DCR: arbitrary SPAs register → authorize → exchange
+      // tokens). Preflight OPTIONS already returned at the top of dispatch.
+      // See `src/cors.ts` for the wildcard-origin rationale.
+      if (pathname === "/oauth/authorize") {
+        if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
+        // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 3:
+        // a signed-in pre-rotation user must NOT be able to ride the consent flow
+        // to an auth code → `/oauth/token` exchange → vault-scoped access token
+        // without rotating the temp password. Gating `/oauth/authorize` (the
+        // session-backed consent path) is sufficient — no code is issued without
+        // it, so `/oauth/token` (back-channel code exchange, no session cookie)
+        // is intentionally NOT gated (gating it would break the legitimate
+        // exchange). An UNAUTHENTICATED authorize request returns null from the
+        // gate and falls through to render the login form, unchanged.
+        const oauthGate = forceChangePasswordGate(getDb(), req);
+        if (oauthGate) return applyCorsHeaders(req, oauthGate);
+        if (req.method === "GET") {
+          // handleAuthorizeGet is sync (returns Response, not Promise<Response>).
+          // handleAuthorizePost is async — keep the await on POST only.
+          return applyCorsHeaders(req, handleAuthorizeGet(getDb(), req, oauthDeps(req)));
+        }
+        if (req.method === "POST") {
+          return applyCorsHeaders(req, await handleAuthorizePost(getDb(), req, oauthDeps(req)));
+        }
+        return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
+      }
+
+      // Inline approve form for the operator-driven pending-client flow (#208).
+      // Receives `client_id` + `csrf_token` + `return_to` from the form rendered
+      // by handleAuthorizeGet when the operator hits a pending client. Three
+      // gates inside the handler: CSRF, active session, same-origin Origin.
+      if (pathname === "/oauth/authorize/approve") {
+        if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
+        if (req.method !== "POST") {
+          return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
+        }
+        return applyCorsHeaders(req, await handleApproveClientPost(getDb(), req, oauthDeps(req)));
+      }
+
+      if (pathname === "/oauth/token") {
+        if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
+        if (req.method !== "POST") {
+          return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
+        }
+        return applyCorsHeaders(req, await handleToken(getDb(), req, oauthDeps(req)));
+      }
+
+      if (pathname === "/oauth/register") {
+        if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
+        if (req.method !== "POST") {
+          return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
+        }
+        return applyCorsHeaders(req, await handleRegister(getDb(), req, oauthDeps(req)));
+      }
+
+      if (pathname === "/oauth/revoke") {
+        if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
+        if (req.method !== "POST") {
+          return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
+        }
+        return applyCorsHeaders(req, await handleRevoke(getDb(), req, oauthDeps(req)));
+      }
+
+      if (pathname === "/vaults") {
+        if (!getDb) return dbNotConfigured();
+        return handleCreateVault(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      // Note: the old `/hub/*` SPA mount has been retired. Known prefixes
+      // (`/hub`, `/hub/vaults*`, `/hub/permissions`, `/hub/tokens`) are
+      // 301-redirected at the top of dispatch. Any other `/hub/*` path falls
+      // through to the catch-all 404 — there's no admin surface left there.
+
+      if (pathname === "/admin/host-admin-token") {
+        if (!getDb) return dbNotConfigured();
+        return handleHostAdminToken(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      if (pathname.startsWith("/admin/vault-admin-token/")) {
+        if (!getDb) return dbNotConfigured();
+        const vaultName = decodeURIComponent(pathname.slice("/admin/vault-admin-token/".length));
+        // The vault name must correspond to an actual vault instance — same
+        // shape the well-known doc derives. Source from services.json so a
+        // freshly-created vault is mintable on the next request without a
+        // restart.
+        // Lenient — see hub#406.
+        const manifest = readManifestLenient(manifestPath);
+        const knownVaultNames = new Set<string>();
+        for (const s of manifest.services) {
+          if (!isVaultEntry(s)) continue;
+          for (const path of s.paths) knownVaultNames.add(vaultInstanceNameFor(s.name, path));
+        }
+        return handleVaultAdminToken(req, vaultName, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownVaultNames,
+        });
+      }
+
+      if (pathname === "/api/me") {
+        if (!getDb) return dbNotConfigured();
+        return handleApiMe(req, { db: getDb() });
+      }
+
+      // SPA-driven hub self-upgrade (design 2026-06-01 §5.3 / D4). Dedicated
+      // endpoint — the hub is NOT a supervised module (no /api/modules/hub/*),
+      // so it gets its own route. Checked BEFORE the `/api/hub` exact match
+      // below (and the `/api/modules/*` switch) so the more-specific path wins.
+      // Does NOT require a supervisor: the hub upgrades itself via a detached
+      // helper, not the supervisor. Host-admin gated inside the handler (reuses
+      // the same validateAccessToken + scope check the module-ops API uses); the
+      // channel param is a closed enum (rc|latest) — no injection surface.
+      if (pathname === "/api/hub/upgrade") {
+        if (!getDb) return dbNotConfigured();
+        return handleHubUpgrade(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          configDir: CONFIG_DIR,
+        });
+      }
+      if (pathname === "/api/hub/upgrade/status") {
+        if (!getDb) return dbNotConfigured();
+        return handleHubUpgradeStatus(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          configDir: CONFIG_DIR,
+        });
+      }
+
+      // Hub version + uptime + install-source — drives the admin SPA's
+      // version badge (hub#348). Bearer-gated on `parachute:host:admin`
+      // (same as the rest of the operator-only admin surface).
+      if (pathname === "/api/hub") {
+        if (!getDb) return dbNotConfigured();
+        return handleApiHub(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      if (pathname === "/api/modules") {
+        if (!getDb) return dbNotConfigured();
+        const od = oauthDeps(req);
+        const modulesDeps: Parameters<typeof handleApiModules>[1] = {
+          db: getDb(),
+          issuer: od.issuer,
+          // hub#516: validate the host-admin bearer's `iss` against the SET of
+          // origins the hub answers on (loopback ∪ expose-state ∪ env/platform ∪
+          // per-request issuer), so `parachute status` works on an exposed box
+          // where the operator token carries the public origin but the loopback
+          // request resolves the loopback issuer.
+          knownIssuers: od.hubBoundOrigins(),
+          manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
+        };
+        if (deps?.supervisor !== undefined) modulesDeps.supervisor = deps.supervisor;
+        // hub#342: thread the test-injectable module-manifest reader
+        // through so `management_url` resolution can be exercised in
+        // unit tests without writing real install dirs.
+        if (deps?.readModuleManifest !== undefined)
+          modulesDeps.readModuleManifest = deps.readModuleManifest;
+        return handleApiModules(req, modulesDeps);
+      }
+
+      // Channel toggle (hub#275) — pre-empts the /api/modules/:short/*
+      // routes below so `/api/modules/channel` doesn't accidentally match
+      // `parseModulesPath` (which would reject it as a non-curated short
+      // anyway, but precedence makes the intent explicit).
+      if (pathname === "/api/modules/channel") {
+        if (!getDb) return dbNotConfigured();
+        return handleApiModulesChannel(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      // Canonical hub URL (hub#298). Admin SPA reads + writes the
+      // operator-set issuer override. The handler computes the resolved
+      // issuer + source here so it can surface them in the GET payload
+      // without re-walking the precedence chain inside the handler.
+      if (pathname === "/api/settings/hub-origin") {
+        if (!getDb) return dbNotConfigured();
+        const db = getDb();
+        return handleApiSettingsHubOrigin(req, {
+          db,
+          issuer: oauthDeps(req).issuer,
+          resolvedIssuer: resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin),
+          resolvedSource: resolveIssuerSource(db, configuredIssuer, loadExposeHubOrigin),
+        });
+      }
+
+      // Module operation poll surface — pre-empts the /api/modules/:short/*
+      // routes below so `/api/modules/operations/<uuid>` doesn't accidentally
+      // match a parseModulesPath("/operations") and fall through.
+      if (pathname.startsWith("/api/modules/operations/")) {
+        if (!getDb) return dbNotConfigured();
+        if (!deps?.supervisor) {
+          return new Response(
+            JSON.stringify({
+              error: "supervisor_unavailable",
+              error_description:
+                "module operations require `parachute serve` (supervisor mode); on-box CLI uses `parachute install/upgrade/restart`",
+            }),
+            { status: 503, headers: { "content-type": "application/json" } },
+          );
+        }
+        const opId = decodeURIComponent(pathname.slice("/api/modules/operations/".length));
+        if (!opId || opId.includes("/")) return new Response("not found", { status: 404 });
+        const od = oauthDeps(req);
+        return handleOperationGet(req, opId, {
+          db: getDb(),
+          issuer: od.issuer,
+          // hub#516: see the `/api/modules` deps note — the CLI polls async ops
+          // on loopback with the operator token (public `iss`).
+          knownIssuers: od.hubBoundOrigins(),
+          manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
+          configDir: CONFIG_DIR,
+          supervisor: deps.supervisor,
+        });
+      }
+
+      // Per-module config surface (hub#260) — schema + values GET, values PUT.
+      // Sits ahead of the install/restart/upgrade/uninstall switch below so
+      // `/api/modules/<short>/config[/schema]` doesn't fall into the default-
+      // branch 404 (`parseModulesPath` only matches the action-suffix shape,
+      // not the `config` / `config/schema` shape).
+      //
+      // Diverges from the action endpoints in two ways: doesn't require a
+      // supervisor (we just proxy to the running module's HTTP surface, not
+      // spawn a child), and mints a `<short>:admin` token at proxy time so
+      // the upstream auth gate is satisfied without forcing the SPA bearer
+      // to carry per-module scopes.
+      {
+        const configMatch = parseModulesConfigPath(pathname);
+        if (configMatch) {
+          if (!getDb) return dbNotConfigured();
+          return handleApiModulesConfig(req, configMatch, {
+            db: getDb(),
+            issuer: oauthDeps(req).issuer,
+            manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
+          });
+        }
+      }
+
+      // Per-module action endpoints: /api/modules/:short/{install,restart,upgrade,uninstall}.
+      if (pathname.startsWith("/api/modules/")) {
+        if (!getDb) return dbNotConfigured();
+        if (!deps?.supervisor) {
+          return new Response(
+            JSON.stringify({
+              error: "supervisor_unavailable",
+              error_description:
+                "module operations require `parachute serve` (supervisor mode); on-box CLI uses `parachute install/upgrade/restart`",
+            }),
+            { status: 503, headers: { "content-type": "application/json" } },
+          );
+        }
+        const match = parseModulesPath(pathname);
+        if (!match) return new Response("not found", { status: 404 });
+        const od = oauthDeps(req);
+        const opsDeps = {
+          db: getDb(),
+          issuer: od.issuer,
+          // hub#516: the CLI drives start/stop/restart/install/upgrade/uninstall
+          // on loopback with the operator token, whose `iss` is the hub's public
+          // origin after `expose`. Validate against the hub's known-origin set.
+          knownIssuers: od.hubBoundOrigins(),
+          manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
+          configDir: CONFIG_DIR,
+          supervisor: deps.supervisor,
+        };
+        switch (match.rest) {
+          case "install":
+            return handleInstall(req, match.short, opsDeps);
+          case "start":
+            return handleStart(req, match.short, opsDeps);
+          case "stop":
+            return handleStop(req, match.short, opsDeps);
+          case "restart":
+            return handleRestart(req, match.short, opsDeps);
+          case "logs":
+            return handleLogs(req, match.short, opsDeps);
+          case "upgrade":
+            return handleUpgrade(req, match.short, opsDeps);
+          case "uninstall":
+            return handleUninstall(req, match.short, opsDeps);
+          default:
+            return new Response("not found", { status: 404 });
+        }
+      }
+
+      if (pathname === "/api/auth/mint-token") {
+        if (!getDb) return dbNotConfigured();
+        // Derive the set of registered vault names so the handler can reject a
+        // `vault:<typo>:admin` mint (item D / hub#450) — same source + shape the
+        // session-cookie `/admin/vault-admin-token/<name>` path uses. Lenient
+        // read so a malformed manifest doesn't 500 the mint endpoint.
+        const mintManifest = readManifestLenient(manifestPath);
+        const mintKnownVaultNames = new Set<string>();
+        for (const s of mintManifest.services) {
+          if (!isVaultEntry(s)) continue;
+          for (const path of s.paths) mintKnownVaultNames.add(vaultInstanceNameFor(s.name, path));
+        }
+        return handleApiMintToken(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownVaultNames: mintKnownVaultNames,
+        });
+      }
+
+      if (pathname === "/api/auth/revoke-token") {
+        if (!getDb) return dbNotConfigured();
+        return handleApiRevokeToken(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      if (pathname === "/api/auth/tokens") {
+        if (!getDb) return dbNotConfigured();
+        return handleApiTokens(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      if (pathname === "/api/grants") {
+        if (!getDb) return dbNotConfigured();
+        return handleListGrants(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      if (pathname.startsWith("/api/grants/")) {
+        if (!getDb) return dbNotConfigured();
+        const clientId = decodeURIComponent(pathname.slice("/api/grants/".length));
         if (!clientId || clientId.includes("/")) {
           return new Response("not found", { status: 404 });
         }
-        return handleApproveClient(req, clientId, {
+        return handleRevokeGrant(req, clientId, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
         });
       }
-      const clientId = decodeURIComponent(tail);
-      if (!clientId || clientId.includes("/")) {
-        return new Response("not found", { status: 404 });
-      }
-      return handleGetClient(req, clientId, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-      });
-    }
 
-    // Multi-user Phase 1 admin endpoints (hub#252, design 2026-05-20).
-    // `/api/users` collection (GET list / POST create) and
-    // `/api/users/vaults` for the assigned-vault picker. Per-id route
-    // `/api/users/:id` (DELETE only — Phase 1 doesn't ship edit) is
-    // handled by the `startsWith("/api/users/")` branch below, with the
-    // `/api/users/vaults` sub-path pre-empted *before* the catch-all so
-    // a literal `vaults` segment can't be mistaken for a user id.
-    if (pathname === "/api/users") {
-      if (!getDb) return dbNotConfigured();
-      const usersDeps = {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-        manifestPath,
-      };
-      if (req.method === "GET") return handleListUsers(req, usersDeps);
-      if (req.method === "POST") return handleCreateUser(req, usersDeps);
-      return new Response("method not allowed", { status: 405 });
-    }
-    if (pathname === "/api/users/vaults") {
-      if (!getDb) return dbNotConfigured();
-      return handleListVaults(req, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-        manifestPath,
-      });
-    }
-    // Phase 2 PR 1 — `/api/users/:id/reset-password` (admin-initiated
-    // password reset for non-admin users). Routed BEFORE the per-id DELETE
-    // catch-all so the trailing `/reset-password` segment isn't mistaken
-    // for part of a user id. Same `host:admin` Bearer gate as the other
-    // /api/users surfaces.
-    {
-      const resetMatch = pathname.match(/^\/api\/users\/([^/]+)\/reset-password$/);
-      if (resetMatch) {
+      // OAuth client lookup + approval. Both bearer-gated under host:admin.
+      // Two paths: `/api/oauth/clients/<id>` (GET, details) and
+      // `/api/oauth/clients/<id>/approve` (POST, flip to approved). The
+      // SPA approve-client deep link reads details from the first and
+      // submits approval to the second — keeps the surface easy to test
+      // and audit without overloading a single verb.
+      if (pathname.startsWith("/api/oauth/clients/")) {
         if (!getDb) return dbNotConfigured();
-        const id = decodeURIComponent(resetMatch[1] ?? "");
-        if (!id) {
+        const tail = pathname.slice("/api/oauth/clients/".length);
+        if (!tail) return new Response("not found", { status: 404 });
+        const approveSuffix = "/approve";
+        if (tail.endsWith(approveSuffix)) {
+          const clientId = decodeURIComponent(tail.slice(0, -approveSuffix.length));
+          if (!clientId || clientId.includes("/")) {
+            return new Response("not found", { status: 404 });
+          }
+          return handleApproveClient(req, clientId, {
+            db: getDb(),
+            issuer: oauthDeps(req).issuer,
+          });
+        }
+        const clientId = decodeURIComponent(tail);
+        if (!clientId || clientId.includes("/")) {
           return new Response("not found", { status: 404 });
         }
-        return handleResetUserPassword(req, id, {
+        return handleGetClient(req, clientId, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      // Multi-user Phase 1 admin endpoints (hub#252, design 2026-05-20).
+      // `/api/users` collection (GET list / POST create) and
+      // `/api/users/vaults` for the assigned-vault picker. Per-id route
+      // `/api/users/:id` (DELETE only — Phase 1 doesn't ship edit) is
+      // handled by the `startsWith("/api/users/")` branch below, with the
+      // `/api/users/vaults` sub-path pre-empted *before* the catch-all so
+      // a literal `vaults` segment can't be mistaken for a user id.
+      if (pathname === "/api/users") {
+        if (!getDb) return dbNotConfigured();
+        const usersDeps = {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          manifestPath,
+        };
+        if (req.method === "GET") return handleListUsers(req, usersDeps);
+        if (req.method === "POST") return handleCreateUser(req, usersDeps);
+        return new Response("method not allowed", { status: 405 });
+      }
+      if (pathname === "/api/users/vaults") {
+        if (!getDb) return dbNotConfigured();
+        return handleListVaults(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
           manifestPath,
         });
       }
-    }
-    // Phase 2 PR 2 — `/api/users/:id/vaults` (replace a user's vault
-    // assignments). Routed before the per-id DELETE catch-all so the
-    // trailing `/vaults` segment isn't mistaken for part of a user id.
-    {
-      const vaultsMatch = pathname.match(/^\/api\/users\/([^/]+)\/vaults$/);
-      if (vaultsMatch) {
+      // Phase 2 PR 1 — `/api/users/:id/reset-password` (admin-initiated
+      // password reset for non-admin users). Routed BEFORE the per-id DELETE
+      // catch-all so the trailing `/reset-password` segment isn't mistaken
+      // for part of a user id. Same `host:admin` Bearer gate as the other
+      // /api/users surfaces.
+      {
+        const resetMatch = pathname.match(/^\/api\/users\/([^/]+)\/reset-password$/);
+        if (resetMatch) {
+          if (!getDb) return dbNotConfigured();
+          const id = decodeURIComponent(resetMatch[1] ?? "");
+          if (!id) {
+            return new Response("not found", { status: 404 });
+          }
+          return handleResetUserPassword(req, id, {
+            db: getDb(),
+            issuer: oauthDeps(req).issuer,
+            manifestPath,
+          });
+        }
+      }
+      // Phase 2 PR 2 — `/api/users/:id/vaults` (replace a user's vault
+      // assignments). Routed before the per-id DELETE catch-all so the
+      // trailing `/vaults` segment isn't mistaken for part of a user id.
+      {
+        const vaultsMatch = pathname.match(/^\/api\/users\/([^/]+)\/vaults$/);
+        if (vaultsMatch) {
+          if (!getDb) return dbNotConfigured();
+          const id = decodeURIComponent(vaultsMatch[1] ?? "");
+          if (!id) {
+            return new Response("not found", { status: 404 });
+          }
+          return handleUpdateUserVaults(req, id, {
+            db: getDb(),
+            issuer: oauthDeps(req).issuer,
+            manifestPath,
+          });
+        }
+      }
+      if (pathname.startsWith("/api/users/")) {
         if (!getDb) return dbNotConfigured();
-        const id = decodeURIComponent(vaultsMatch[1] ?? "");
-        if (!id) {
+        const id = decodeURIComponent(pathname.slice("/api/users/".length));
+        if (!id || id.includes("/")) {
           return new Response("not found", { status: 404 });
         }
-        return handleUpdateUserVaults(req, id, {
+        return handleDeleteUser(req, id, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
           manifestPath,
         });
       }
-    }
-    if (pathname.startsWith("/api/users/")) {
-      if (!getDb) return dbNotConfigured();
-      const id = decodeURIComponent(pathname.slice("/api/users/".length));
-      if (!id || id.includes("/")) {
-        return new Response("not found", { status: 404 });
+
+      // One-time invite links (design §7). host:admin-gated, same gate flavor
+      // as /api/users. POST creates (returns the single-emit token + URL), GET
+      // lists (status-annotated), DELETE /:id revokes by sha256 hash.
+      if (pathname === "/api/invites") {
+        if (!getDb) return dbNotConfigured();
+        const invitesDeps = { db: getDb(), issuer: oauthDeps(req).issuer, manifestPath };
+        if (req.method === "GET") return handleListInvites(req, invitesDeps);
+        if (req.method === "POST") return handleCreateInvite(req, invitesDeps);
+        return new Response("method not allowed", { status: 405 });
       }
-      return handleDeleteUser(req, id, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-        manifestPath,
-      });
-    }
-
-    // One-time invite links (design §7). host:admin-gated, same gate flavor
-    // as /api/users. POST creates (returns the single-emit token + URL), GET
-    // lists (status-annotated), DELETE /:id revokes by sha256 hash.
-    if (pathname === "/api/invites") {
-      if (!getDb) return dbNotConfigured();
-      const invitesDeps = { db: getDb(), issuer: oauthDeps(req).issuer, manifestPath };
-      if (req.method === "GET") return handleListInvites(req, invitesDeps);
-      if (req.method === "POST") return handleCreateInvite(req, invitesDeps);
-      return new Response("method not allowed", { status: 405 });
-    }
-    if (pathname.startsWith("/api/invites/")) {
-      if (!getDb) return dbNotConfigured();
-      const id = decodeURIComponent(pathname.slice("/api/invites/".length));
-      if (!id || id.includes("/")) {
-        return new Response("not found", { status: 404 });
-      }
-      return handleRevokeInvite(req, id, {
-        db: getDb(),
-        issuer: oauthDeps(req).issuer,
-        manifestPath,
-      });
-    }
-
-    // Canonical login/logout. The handlers themselves are unchanged from
-    // when they lived at /admin/login + /admin/logout; the rename surfaced
-    // via #231-followup so the URL reflects the surface's actual scope
-    // (entry point for ALL parachute auth — not admin-only). The
-    // /admin/login and /admin/logout paths 301 to here, dispatched at the
-    // top of this fn alongside the other back-compat redirects.
-    if (pathname === "/login") {
-      if (!getDb) return dbNotConfigured();
-      if (req.method === "GET") return handleAdminLoginGet(getDb(), req);
-      if (req.method === "POST") return handleAdminLoginPost(getDb(), req);
-      return new Response("method not allowed", { status: 405 });
-    }
-
-    // /login/2fa — second-factor step (hub#473). POST-only: reached only
-    // after a correct password POST for a 2FA-enrolled user handed back a
-    // pending-login cookie + rendered the challenge page. A bare GET (e.g.
-    // browser back button) has no form to render usefully, so 405 → the
-    // operator restarts at /login.
-    if (pathname === "/login/2fa") {
-      if (!getDb) return dbNotConfigured();
-      if (req.method === "POST") return handleAdminLoginTotpPost(getDb(), req);
-      return new Response("method not allowed", { status: 405 });
-    }
-
-    if (pathname === "/logout") {
-      if (!getDb) return dbNotConfigured();
-      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-      return handleAdminLogoutPost(getDb(), req);
-    }
-
-    // Invite redemption — `/account/setup/<token>` (design §7). Un-authed
-    // onboarding surface (the invitee has no session yet); routed BEFORE the
-    // per-request force-change choke point and the `/account/` matches below.
-    // GET renders the claim form; POST redeems → creates account + own vault,
-    // mints a session, 302 → /account/. The handler validates the invite
-    // (sha256 lookup, expiry/used/revoked), CSRF, and rate-limits on the
-    // /login IP bucket. The invite alone is the authorization — no host:admin.
-    if (pathname.startsWith("/account/setup/")) {
-      if (!getDb) return dbNotConfigured();
-      const rawToken = decodeURIComponent(pathname.slice("/account/setup/".length));
-      if (!rawToken || rawToken.includes("/")) {
-        return new Response("not found", { status: 404 });
-      }
-      const db = getDb();
-      const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
-      const setupDeps = { db, hubOrigin, manifestPath };
-      if (req.method === "GET") return handleAccountSetupGet(req, rawToken, setupDeps);
-      if (req.method === "POST") return handleAccountSetupPost(req, rawToken, setupDeps);
-      return new Response("method not allowed", { status: 405 });
-    }
-
-    // Multi-user Phase 1 PR 3 — user self-service change-password surface
-    // (hub#252, design §sign-in flow change). Both GET (render form) and
-    // POST (apply change) require a session cookie. The handler itself
-    // does the session check + 302 to /login when missing — same posture
-    // as the rest of /account/* will use as Phase 2 broadens this prefix.
-    //
-    // This route is intentionally NOT gated by `password_changed === false`
-    // — that's only the *redirect* path from /login. A signed-in user with
-    // `password_changed: true` can still navigate here to rotate their
-    // password (design §"Direct navigation").
-    if (pathname === "/account/change-password") {
-      if (!getDb) return dbNotConfigured();
-      // `now` deliberately omitted — handlers fall through to `new Date()` in
-      // production; the seam exists only so tests can advance the rate-limiter
-      // clock deterministically.
-      const accountDeps = { db: getDb() };
-      if (req.method === "GET") return handleAccountChangePasswordGet(req, accountDeps);
-      if (req.method === "POST") return handleAccountChangePasswordPost(req, accountDeps);
-      return new Response("method not allowed", { status: 405 });
-    }
-
-    // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 1:
-    // every `/account/*` route BELOW this line is gated. `/logout` and
-    // `/account/change-password` (the rotation/exit path) ran above and already
-    // returned, so they're never reached here — they stay reachable
-    // pre-rotation by construction. A signed-in user with
-    // `password_changed === false` is bounced (302 → change-password for
-    // browsers, 403 JSON for API clients) before any account surface
-    // (2fa, vault-token, vault-admin-token, account home) resolves. DRY: one
-    // gate for the whole `/account/*` family rather than per-route. The
-    // per-route mints in `account-vault-{token,admin-token}.ts` keep their own
-    // gate as defence-in-depth (they're also reachable in tests directly).
-    //
-    // The bare `/account` (no trailing slash) is matched explicitly too —
-    // otherwise it would slip past `startsWith("/account/")` to its 301 →
-    // `/account/` below, and a pre-rotation user wouldn't be gated until the
-    // second hop. Exact-match `/account` (not `startsWith("/account")`) so
-    // unrelated paths like `/accounts-something` aren't caught.
-    if (getDb && (pathname === "/account" || pathname.startsWith("/account/"))) {
-      const gate = forceChangePasswordGate(getDb(), req);
-      if (gate) return gate;
-    }
-
-    // /account/2fa — user self-service TOTP 2FA enroll / disenroll (hub#473).
-    // Both GET (render state) and POST (start/confirm/disable) require an
-    // active session; the handler does the session check + 302 to /login when
-    // missing, same posture as /account/change-password.
-    if (pathname === "/account/2fa") {
-      if (!getDb) return dbNotConfigured();
-      const twoFactorDeps = { db: getDb() };
-      if (req.method === "GET") return handleTwoFactorGet(req, twoFactorDeps);
-      if (req.method === "POST") return handleTwoFactorPost(req, twoFactorDeps);
-      return new Response("method not allowed", { status: 405 });
-    }
-
-    // /account/vault-admin-token/<name> — friend-facing vault ADMIN deep-link.
-    // POST-only, session-gated, assignment-capped to the `admin` verb: an
-    // assigned non-admin user mints a `vault:<name>:admin` bootstrap token and
-    // 303-redirects into the vault's own admin SPA (`#token=<jwt>`), where they
-    // can rotate vault tokens AND configure Git backup / mirror. The non-admin
-    // sibling of `/admin/vault-admin-token/<name>` (which is first-admin-gated
-    // and returns JSON for the hub SPA). The handler enforces session →
-    // assignment-grants-admin → CSRF → force-change-password (item F / #469)
-    // before minting. Must precede `/account/vault-token/` (it isn't a prefix
-    // of it, but keep the more-specific admin path first for clarity) and the
-    // `/account/` match below. See `account-vault-admin-token.ts`.
-    if (pathname.startsWith("/account/vault-admin-token/")) {
-      if (!getDb) return dbNotConfigured();
-      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-      const vaultName = decodeURIComponent(pathname.slice("/account/vault-admin-token/".length));
-      const db = getDb();
-      const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
-      // Resolve the vault's declared `managementUrl` at request time (same
-      // source the well-known doc reads — `installDir/.parachute/module.json`)
-      // so the deep-link lands on the vault admin SPA's real entry point. Quiet
-      // on a malformed/absent manifest: the handler defaults to `/admin/`
-      // (vault's canonical value), the same target the admin sibling uses.
-      const readManifestFn = deps?.readModuleManifest ?? defaultReadModuleManifest;
-      const manifest = readManifestLenient(manifestPath);
-      let managementUrl: string | undefined;
-      for (const s of manifest.services) {
-        if (!isVaultEntry(s) || !s.installDir) continue;
-        const instanceNames = new Set(s.paths.map((p) => vaultInstanceNameFor(s.name, p)));
-        if (!instanceNames.has(vaultName)) continue;
-        try {
-          const m = await readManifestFn(s.installDir);
-          if (m?.managementUrl) managementUrl = m.managementUrl;
-        } catch {
-          // Leave undefined → handler defaults to /admin/.
+      if (pathname.startsWith("/api/invites/")) {
+        if (!getDb) return dbNotConfigured();
+        const id = decodeURIComponent(pathname.slice("/api/invites/".length));
+        if (!id || id.includes("/")) {
+          return new Response("not found", { status: 404 });
         }
-        break;
+        return handleRevokeInvite(req, id, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          manifestPath,
+        });
       }
-      return handleAccountVaultAdminTokenPost(req, vaultName, {
-        db,
-        hubOrigin,
-        ...(managementUrl !== undefined ? { managementUrl } : {}),
-      });
-    }
 
-    // /account/vault-token/<name> — friend-facing scoped vault token mint.
-    // POST-only, session-gated, assignment-capped: a non-admin friend mints a
-    // `vault:<name>:read|write` bearer for a vault they're ASSIGNED to, for
-    // scripts / headless clients that can't do browser OAuth. The handler
-    // enforces session → assignment → scope-cap (never `:admin`, never a
-    // vault outside the assignment, never a broader verb than the role
-    // grants) + CSRF + per-user rate limit. Must precede the `/account/`
-    // match below (more specific prefix). See `account-vault-token.ts`.
-    if (pathname.startsWith("/account/vault-token/")) {
-      if (!getDb) return dbNotConfigured();
-      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-      const vaultName = decodeURIComponent(pathname.slice("/account/vault-token/".length));
-      const db = getDb();
-      const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
-      return handleAccountVaultTokenPost(req, vaultName, { db, hubOrigin });
-    }
-
-    // /account/ — friend-facing user home (multi-user Phase 1 follow-up).
-    // Companion to the first-admin gate on `/admin/host-admin-token`: a
-    // signed-in non-admin (friend) lands here instead of bouncing against
-    // a 403 wall on the admin SPA. Admin users also land here when they
-    // hit `/account/` directly, with a "you're the administrator → /admin/"
-    // exit ramp. Bare `/account` 301-redirects to `/account/` so links
-    // without the trailing slash work.
-    if (pathname === "/account" || pathname === "/account/") {
-      if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
-      if (pathname === "/account") {
-        return new Response(null, { status: 301, headers: { location: "/account/" } });
+      // Canonical login/logout. The handlers themselves are unchanged from
+      // when they lived at /admin/login + /admin/logout; the rename surfaced
+      // via #231-followup so the URL reflects the surface's actual scope
+      // (entry point for ALL parachute auth — not admin-only). The
+      // /admin/login and /admin/logout paths 301 to here, dispatched at the
+      // top of this fn alongside the other back-compat redirects.
+      if (pathname === "/login") {
+        if (!getDb) return dbNotConfigured();
+        if (req.method === "GET") return handleAdminLoginGet(getDb(), req);
+        if (req.method === "POST") return handleAdminLoginPost(getDb(), req);
+        return new Response("method not allowed", { status: 405 });
       }
-      if (!getDb) return dbNotConfigured();
-      const db = getDb();
-      const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
-      // Resolve each assigned vault's loopback port from services.json so the
-      // home can fetch per-vault usage. Read at request time (same dynamism as
-      // proxyToVault) — a vault created seconds ago surfaces a stat without a
-      // restart. Returns null for an unknown name → that tile skips the stat.
-      const resolveVaultPort = (vaultName: string): number | null => {
-        const services = readManifestLenient(manifestPath).services;
-        const match = findVaultUpstream(services, `/vault/${vaultName}`);
-        return match ? match.port : null;
-      };
-      return handleAccountHomeGet(req, { db, hubOrigin, resolveVaultPort });
-    }
 
-    // Legacy `/admin/config` (server-rendered module-config portal, #46)
-    // retired post-SPA-rework. 301 → the SPA home so any bookmark or stale
-    // post-login redirect lands somewhere useful. The route stays here in
-    // dispatch order (above the /admin/* SPA catch-all) so the redirect
-    // wins over a SPA shell render.
-    if (pathname === "/admin/config" || pathname.startsWith("/admin/config/")) {
-      return new Response(null, {
-        status: 301,
-        headers: { location: "/admin/vaults" },
-      });
-    }
+      // /login/2fa — second-factor step (hub#473). POST-only: reached only
+      // after a correct password POST for a 2FA-enrolled user handed back a
+      // pending-login cookie + rendered the challenge page. A bare GET (e.g.
+      // browser back button) has no form to render usefully, so 405 → the
+      // operator restarts at /login.
+      if (pathname === "/login/2fa") {
+        if (!getDb) return dbNotConfigured();
+        if (req.method === "POST") return handleAdminLoginTotpPost(getDb(), req);
+        return new Response("method not allowed", { status: 405 });
+      }
 
-    // /vault/<name>/* — per-vault content proxy. Stays as user-facing
-    // surface (the Notes PWA loads through here, etc.). The bare `/vault`
-    // and `/vault/new` paths were SPA routes pre-#231; they 301-redirect at
-    // the top of dispatch now. Multi-segment requests like
-    // `/vault/<unknown>/health` are vault-API shapes targeting a
-    // non-existent vault and 404 directly — there's no SPA-shell fallback
-    // here anymore (the SPA moved to /admin), so we can't accidentally
-    // mask a backend 404 with HTML.
-    if (pathname.startsWith("/vault/")) {
-      // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 2:
-      // a pre-rotation signed-in user can't reach a per-vault user surface
-      // (Notes PWA, MCP, vault API) on the un-rotated temp password — they're
-      // bounced to change-password (browser) / 403 (API). Same posture as the
-      // `/account/*` gate above. An UNAUTHENTICATED proxy request (no hub
-      // session — the common Notes/MCP case carrying its own bearer) passes the
-      // gate untouched (`forceChangePasswordGate` returns null with no session)
-      // and is handled by the vault's own auth downstream.
-      if (getDb) {
+      if (pathname === "/logout") {
+        if (!getDb) return dbNotConfigured();
+        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+        return handleAdminLogoutPost(getDb(), req);
+      }
+
+      // Invite redemption — `/account/setup/<token>` (design §7). Un-authed
+      // onboarding surface (the invitee has no session yet); routed BEFORE the
+      // per-request force-change choke point and the `/account/` matches below.
+      // GET renders the claim form; POST redeems → creates account + own vault,
+      // mints a session, 302 → /account/. The handler validates the invite
+      // (sha256 lookup, expiry/used/revoked), CSRF, and rate-limits on the
+      // /login IP bucket. The invite alone is the authorization — no host:admin.
+      if (pathname.startsWith("/account/setup/")) {
+        if (!getDb) return dbNotConfigured();
+        const rawToken = decodeURIComponent(pathname.slice("/account/setup/".length));
+        if (!rawToken || rawToken.includes("/")) {
+          return new Response("not found", { status: 404 });
+        }
+        const db = getDb();
+        const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
+        const setupDeps = { db, hubOrigin, manifestPath };
+        if (req.method === "GET") return handleAccountSetupGet(req, rawToken, setupDeps);
+        if (req.method === "POST") return handleAccountSetupPost(req, rawToken, setupDeps);
+        return new Response("method not allowed", { status: 405 });
+      }
+
+      // Multi-user Phase 1 PR 3 — user self-service change-password surface
+      // (hub#252, design §sign-in flow change). Both GET (render form) and
+      // POST (apply change) require a session cookie. The handler itself
+      // does the session check + 302 to /login when missing — same posture
+      // as the rest of /account/* will use as Phase 2 broadens this prefix.
+      //
+      // This route is intentionally NOT gated by `password_changed === false`
+      // — that's only the *redirect* path from /login. A signed-in user with
+      // `password_changed: true` can still navigate here to rotate their
+      // password (design §"Direct navigation").
+      if (pathname === "/account/change-password") {
+        if (!getDb) return dbNotConfigured();
+        // `now` deliberately omitted — handlers fall through to `new Date()` in
+        // production; the seam exists only so tests can advance the rate-limiter
+        // clock deterministically.
+        const accountDeps = { db: getDb() };
+        if (req.method === "GET") return handleAccountChangePasswordGet(req, accountDeps);
+        if (req.method === "POST") return handleAccountChangePasswordPost(req, accountDeps);
+        return new Response("method not allowed", { status: 405 });
+      }
+
+      // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 1:
+      // every `/account/*` route BELOW this line is gated. `/logout` and
+      // `/account/change-password` (the rotation/exit path) ran above and already
+      // returned, so they're never reached here — they stay reachable
+      // pre-rotation by construction. A signed-in user with
+      // `password_changed === false` is bounced (302 → change-password for
+      // browsers, 403 JSON for API clients) before any account surface
+      // (2fa, vault-token, vault-admin-token, account home) resolves. DRY: one
+      // gate for the whole `/account/*` family rather than per-route. The
+      // per-route mints in `account-vault-{token,admin-token}.ts` keep their own
+      // gate as defence-in-depth (they're also reachable in tests directly).
+      //
+      // The bare `/account` (no trailing slash) is matched explicitly too —
+      // otherwise it would slip past `startsWith("/account/")` to its 301 →
+      // `/account/` below, and a pre-rotation user wouldn't be gated until the
+      // second hop. Exact-match `/account` (not `startsWith("/account")`) so
+      // unrelated paths like `/accounts-something` aren't caught.
+      if (getDb && (pathname === "/account" || pathname.startsWith("/account/"))) {
         const gate = forceChangePasswordGate(getDb(), req);
         if (gate) return gate;
       }
-      const proxied = await proxyToVault(req, manifestPath, deps?.supervisor, peerAddr);
+
+      // /account/2fa — user self-service TOTP 2FA enroll / disenroll (hub#473).
+      // Both GET (render state) and POST (start/confirm/disable) require an
+      // active session; the handler does the session check + 302 to /login when
+      // missing, same posture as /account/change-password.
+      if (pathname === "/account/2fa") {
+        if (!getDb) return dbNotConfigured();
+        const twoFactorDeps = { db: getDb() };
+        if (req.method === "GET") return handleTwoFactorGet(req, twoFactorDeps);
+        if (req.method === "POST") return handleTwoFactorPost(req, twoFactorDeps);
+        return new Response("method not allowed", { status: 405 });
+      }
+
+      // /account/vault-admin-token/<name> — friend-facing vault ADMIN deep-link.
+      // POST-only, session-gated, assignment-capped to the `admin` verb: an
+      // assigned non-admin user mints a `vault:<name>:admin` bootstrap token and
+      // 303-redirects into the vault's own admin SPA (`#token=<jwt>`), where they
+      // can rotate vault tokens AND configure Git backup / mirror. The non-admin
+      // sibling of `/admin/vault-admin-token/<name>` (which is first-admin-gated
+      // and returns JSON for the hub SPA). The handler enforces session →
+      // assignment-grants-admin → CSRF → force-change-password (item F / #469)
+      // before minting. Must precede `/account/vault-token/` (it isn't a prefix
+      // of it, but keep the more-specific admin path first for clarity) and the
+      // `/account/` match below. See `account-vault-admin-token.ts`.
+      if (pathname.startsWith("/account/vault-admin-token/")) {
+        if (!getDb) return dbNotConfigured();
+        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+        const vaultName = decodeURIComponent(pathname.slice("/account/vault-admin-token/".length));
+        const db = getDb();
+        const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
+        // Resolve the vault's declared `managementUrl` at request time (same
+        // source the well-known doc reads — `installDir/.parachute/module.json`)
+        // so the deep-link lands on the vault admin SPA's real entry point. Quiet
+        // on a malformed/absent manifest: the handler defaults to `/admin/`
+        // (vault's canonical value), the same target the admin sibling uses.
+        const readManifestFn = deps?.readModuleManifest ?? defaultReadModuleManifest;
+        const manifest = readManifestLenient(manifestPath);
+        let managementUrl: string | undefined;
+        for (const s of manifest.services) {
+          if (!isVaultEntry(s) || !s.installDir) continue;
+          const instanceNames = new Set(s.paths.map((p) => vaultInstanceNameFor(s.name, p)));
+          if (!instanceNames.has(vaultName)) continue;
+          try {
+            const m = await readManifestFn(s.installDir);
+            if (m?.managementUrl) managementUrl = m.managementUrl;
+          } catch {
+            // Leave undefined → handler defaults to /admin/.
+          }
+          break;
+        }
+        return handleAccountVaultAdminTokenPost(req, vaultName, {
+          db,
+          hubOrigin,
+          ...(managementUrl !== undefined ? { managementUrl } : {}),
+        });
+      }
+
+      // /account/vault-token/<name> — friend-facing scoped vault token mint.
+      // POST-only, session-gated, assignment-capped: a non-admin friend mints a
+      // `vault:<name>:read|write` bearer for a vault they're ASSIGNED to, for
+      // scripts / headless clients that can't do browser OAuth. The handler
+      // enforces session → assignment → scope-cap (never `:admin`, never a
+      // vault outside the assignment, never a broader verb than the role
+      // grants) + CSRF + per-user rate limit. Must precede the `/account/`
+      // match below (more specific prefix). See `account-vault-token.ts`.
+      if (pathname.startsWith("/account/vault-token/")) {
+        if (!getDb) return dbNotConfigured();
+        if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+        const vaultName = decodeURIComponent(pathname.slice("/account/vault-token/".length));
+        const db = getDb();
+        const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
+        return handleAccountVaultTokenPost(req, vaultName, { db, hubOrigin });
+      }
+
+      // /account/ — friend-facing user home (multi-user Phase 1 follow-up).
+      // Companion to the first-admin gate on `/admin/host-admin-token`: a
+      // signed-in non-admin (friend) lands here instead of bouncing against
+      // a 403 wall on the admin SPA. Admin users also land here when they
+      // hit `/account/` directly, with a "you're the administrator → /admin/"
+      // exit ramp. Bare `/account` 301-redirects to `/account/` so links
+      // without the trailing slash work.
+      if (pathname === "/account" || pathname === "/account/") {
+        if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+        if (pathname === "/account") {
+          return new Response(null, { status: 301, headers: { location: "/account/" } });
+        }
+        if (!getDb) return dbNotConfigured();
+        const db = getDb();
+        const hubOrigin = resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin);
+        // Resolve each assigned vault's loopback port from services.json so the
+        // home can fetch per-vault usage. Read at request time (same dynamism as
+        // proxyToVault) — a vault created seconds ago surfaces a stat without a
+        // restart. Returns null for an unknown name → that tile skips the stat.
+        const resolveVaultPort = (vaultName: string): number | null => {
+          const services = readManifestLenient(manifestPath).services;
+          const match = findVaultUpstream(services, `/vault/${vaultName}`);
+          return match ? match.port : null;
+        };
+        return handleAccountHomeGet(req, { db, hubOrigin, resolveVaultPort });
+      }
+
+      // Legacy `/admin/config` (server-rendered module-config portal, #46)
+      // retired post-SPA-rework. 301 → the SPA home so any bookmark or stale
+      // post-login redirect lands somewhere useful. The route stays here in
+      // dispatch order (above the /admin/* SPA catch-all) so the redirect
+      // wins over a SPA shell render.
+      if (pathname === "/admin/config" || pathname.startsWith("/admin/config/")) {
+        return new Response(null, {
+          status: 301,
+          headers: { location: "/admin/vaults" },
+        });
+      }
+
+      // /vault/<name>/* — per-vault content proxy. Stays as user-facing
+      // surface (the Notes PWA loads through here, etc.). The bare `/vault`
+      // and `/vault/new` paths were SPA routes pre-#231; they 301-redirect at
+      // the top of dispatch now. Multi-segment requests like
+      // `/vault/<unknown>/health` are vault-API shapes targeting a
+      // non-existent vault and 404 directly — there's no SPA-shell fallback
+      // here anymore (the SPA moved to /admin), so we can't accidentally
+      // mask a backend 404 with HTML.
+      if (pathname.startsWith("/vault/")) {
+        // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 2:
+        // a pre-rotation signed-in user can't reach a per-vault user surface
+        // (Notes PWA, MCP, vault API) on the un-rotated temp password — they're
+        // bounced to change-password (browser) / 403 (API). Same posture as the
+        // `/account/*` gate above. An UNAUTHENTICATED proxy request (no hub
+        // session — the common Notes/MCP case carrying its own bearer) passes the
+        // gate untouched (`forceChangePasswordGate` returns null with no session)
+        // and is handled by the vault's own auth downstream.
+        if (getDb) {
+          const gate = forceChangePasswordGate(getDb(), req);
+          if (gate) return gate;
+        }
+        const proxied = await proxyToVault(req, manifestPath, deps?.supervisor, peerAddr);
+        if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
+        return new Response("not found", { status: 404 });
+      }
+
+      // /admin/* SPA mount. All non-SPA admin handlers (host-admin-token,
+      // vault-admin-token, login, logout, config, api/auth/*, api/grants,
+      // grants/*) ran above and either matched or returned. Anything that
+      // makes it here under /admin/* is a SPA route or asset request; the
+      // SPA's own router renders the page and handles 404 client-side for
+      // unknown sub-paths.
+      if (pathname === "/admin" || pathname === "/admin/") {
+        // Unprefixed /admin → SPA shell pointed at the vault list (its home).
+        // The SPA's basename is /admin, so the router will land on / and
+        // render VaultsList.
+        if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+        return serveSpa(spaDistDir, pathname, "/admin");
+      }
+      if (pathname.startsWith("/admin/")) {
+        if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
+        return serveSpa(spaDistDir, pathname, "/admin");
+      }
+
+      // Generic services.json-driven dispatch for non-vault modules. Reaches
+      // here only after every hub-owned prefix above has had its turn — so
+      // `/`, `/admin/*`, `/oauth/*`, `/.well-known/*`, `/hub/*`, `/vault/*`,
+      // `/api/*` are excluded by ordering, not by an explicit denylist (#182).
+      const proxied = await proxyToService(req, manifestPath, deps?.supervisor, peerAddr);
       if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
+
+      // Branded fall-through 404 (closes hub#392) — the operator who mistyped
+      // a URL sees a clear "not found" page with a path back home, not the
+      // browser's default empty-body chrome. Only HTML clients get the
+      // rendered page; non-HTML callers (curl, API probes) still see the
+      // shorter "not found" text so log noise stays low.
+      const wantsHtml = (req.headers.get("accept") ?? "").includes("text/html");
+      if (wantsHtml) {
+        return new Response(renderNotFoundPage(pathname), {
+          status: 404,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
       return new Response("not found", { status: 404 });
-    }
-
-    // /admin/* SPA mount. All non-SPA admin handlers (host-admin-token,
-    // vault-admin-token, login, logout, config, api/auth/*, api/grants,
-    // grants/*) ran above and either matched or returned. Anything that
-    // makes it here under /admin/* is a SPA route or asset request; the
-    // SPA's own router renders the page and handles 404 client-side for
-    // unknown sub-paths.
-    if (pathname === "/admin" || pathname === "/admin/") {
-      // Unprefixed /admin → SPA shell pointed at the vault list (its home).
-      // The SPA's basename is /admin, so the router will land on / and
-      // render VaultsList.
-      if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
-      return serveSpa(spaDistDir, pathname, "/admin");
-    }
-    if (pathname.startsWith("/admin/")) {
-      if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
-      return serveSpa(spaDistDir, pathname, "/admin");
-    }
-
-    // Generic services.json-driven dispatch for non-vault modules. Reaches
-    // here only after every hub-owned prefix above has had its turn — so
-    // `/`, `/admin/*`, `/oauth/*`, `/.well-known/*`, `/hub/*`, `/vault/*`,
-    // `/api/*` are excluded by ordering, not by an explicit denylist (#182).
-    const proxied = await proxyToService(req, manifestPath, deps?.supervisor, peerAddr);
-    if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
-
-    // Branded fall-through 404 (closes hub#392) — the operator who mistyped
-    // a URL sees a clear "not found" page with a path back home, not the
-    // browser's default empty-body chrome. Only HTML clients get the
-    // rendered page; non-HTML callers (curl, API probes) still see the
-    // shorter "not found" text so log noise stays low.
-    const wantsHtml = (req.headers.get("accept") ?? "").includes("text/html");
-    if (wantsHtml) {
-      return new Response(renderNotFoundPage(pathname), {
-        status: 404,
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
-    }
-    return new Response("not found", { status: 404 });
+    } // end dispatch()
   };
 }
 
@@ -2701,11 +2765,18 @@ async function decorateWithChrome(
 
 if (import.meta.main) {
   const { port, hostname, wellKnownDir, dbPath, issuer } = parseArgs(process.argv.slice(2));
-  let cachedDb: Database | undefined;
+  // Self-heal-or-die DB holder (#594), opened lazily so a route that doesn't
+  // touch the DB still works before first open. Once opened, the holder owns
+  // reopen-once-or-exit on a persistent SQLite fault.
+  let holder: ReturnType<typeof createDbHolder> | undefined;
   const getDb = () => {
-    if (!cachedDb) cachedDb = openHubDb(dbPath);
-    return cachedDb;
+    if (!holder) {
+      holder = createDbHolder(openHubDb(dbPath), { reopen: () => openHubDb(dbPath) });
+    }
+    return holder.get();
   };
+  const onDbError = (err: unknown): "ignored" | "healed" | "exited" =>
+    holder ? holder.healOrExit(err) : "ignored";
   Bun.serve({
     port,
     hostname,
@@ -2721,7 +2792,7 @@ if (import.meta.main) {
     // Bun's equivalent is this. 255s comfortably exceeds Render's edge
     // pool TTL (community-observed ~120s). Closes hub#399.
     idleTimeout: 255,
-    fetch: hubFetch(wellKnownDir, { getDb, issuer, loopbackPort: port }),
+    fetch: hubFetch(wellKnownDir, { getDb, onDbError, issuer, loopbackPort: port }),
   });
   // Register PID + port from the running hub itself so any startup path
   // (spawn-via-`ensureHubRunning` or a direct `bun src/hub-server.ts` from

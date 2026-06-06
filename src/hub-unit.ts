@@ -85,7 +85,9 @@ export interface HubUnitDeps extends ManagedUnitDeps {
    * `null` when the hub doesn't answer at all (connection-refused / timeout).
    * Production uses a bounded `fetch`; tests inject a deterministic stub.
    */
-  probeHealthVersion: (port: number) => Promise<{ ok: boolean; version?: string } | null>;
+  probeHealthVersion: (
+    port: number,
+  ) => Promise<{ ok: boolean; version?: string; db?: string } | null>;
   /** TCP connect-probe for readiness polling (reuses `defaultPortListening`). */
   portListening: PortListeningFn;
   /** Sleep between readiness polls (tests pin to 0). */
@@ -118,25 +120,46 @@ async function defaultProbeHealth(port: number): Promise<boolean> {
  */
 async function defaultProbeHealthVersion(
   port: number,
-): Promise<{ ok: boolean; version?: string } | null> {
+): Promise<{ ok: boolean; version?: string; db?: string } | null> {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/health`, {
       signal: AbortSignal.timeout(1500),
     });
     let version: string | undefined;
+    let db: string | undefined;
     try {
       const body = (await res.json()) as unknown;
-      if (body && typeof body === "object" && "version" in body) {
+      if (body && typeof body === "object") {
         const v = (body as { version?: unknown }).version;
         if (typeof v === "string" && v.length > 0) version = v;
+        // `db` liveness verdict (#594): "ok" / "error: <class>" / "unconfigured".
+        // Threaded through so the adoption probe can treat a db-error hub as
+        // needing a restart even when its version matches.
+        const d = (body as { db?: unknown }).db;
+        if (typeof d === "string" && d.length > 0) db = d;
       }
     } catch {
-      // Non-JSON body → no version. Leave `version` undefined (→ mismatch).
+      // Non-JSON body → no version/db. Leave undefined (→ mismatch / unknown db).
     }
-    return version !== undefined ? { ok: res.ok, version } : { ok: res.ok };
+    const out: { ok: boolean; version?: string; db?: string } = { ok: res.ok };
+    if (version !== undefined) out.version = version;
+    if (db !== undefined) out.db = db;
+    return out;
   } catch {
     return null;
   }
+}
+
+/**
+ * True when a `/health` `db` field reports a non-recoverable liveness fault
+ * (#594) — anything starting with "error:" (e.g. "error: fatal" from the
+ * dead-handle field repro). "ok" and "unconfigured" are not faults: a
+ * pre-wizard hub with no DB rows still reports a working handle. A missing
+ * `db` field (an older hub that predates #594) reads as "unknown → don't
+ * treat as a fault" so we never restart a hub merely for lacking the field.
+ */
+function healthReportsDbFault(db: string | undefined): boolean {
+  return typeof db === "string" && db.startsWith("error:");
 }
 
 export const defaultHubUnitDeps: HubUnitDeps = {
@@ -510,13 +533,22 @@ export async function ensureHubVersionMatches(
   }
 
   const runningVersion = probe.version;
-  if (runningVersion === installedVersion) {
-    // Exactly today's behavior — versions agree, no extra restart.
+  const dbFault = healthReportsDbFault(probe.db);
+  if (runningVersion === installedVersion && !dbFault) {
+    // Versions agree AND the DB handle is live — today's behavior, no restart.
     return { outcome: "match", runningVersion, installedVersion, messages: [] };
   }
 
-  // Mismatch (includes the no-`version`-field very-old-hub case → undefined).
-  const runningLabel = runningVersion ?? "an older version (no version field)";
+  // From here we know the running hub needs a restart: EITHER its version is
+  // stale (the #590 zombie-adoption case) OR it's reporting a dead DB handle
+  // (#594 — a hub that adopted-as-version-match but whose state dir was deleted
+  // under it; /health stays 200 while every DB route 500s). Both run through
+  // the same restart-once machinery. `runningLabel` describes whichever fault
+  // we're acting on so the operator sees an accurate reason.
+  const versionMismatch = runningVersion !== installedVersion;
+  const runningLabel = versionMismatch
+    ? (runningVersion ?? "an older version (no version field)")
+    : `${runningVersion} with a dead database handle (${probe.db})`;
 
   // Is this hub one we can restart through the manager? If there's no manager,
   // or no unit installed, the running hub is a legacy detached pid / a dev
@@ -556,45 +588,60 @@ export async function ensureHubVersionMatches(
     outcome: "restarted",
     runningVersion: v,
     installedVersion,
-    messages: [`✓ hub unit restarted; now running ${installedVersion}.`],
+    messages: [`✓ hub unit restarted; now running ${installedVersion} with a live database.`],
   });
-  const stillMismatchedResult = (last: string | undefined): EnsureHubVersionMatchesResult => {
-    const reports = last ? ` (reports ${last})` : "";
+  const stillMismatchedResult = (
+    last: { version?: string; db?: string } | undefined,
+  ): EnsureHubVersionMatchesResult => {
+    const lastVersion = last?.version;
+    const reports = lastVersion ? ` (reports ${lastVersion})` : "";
+    const dbStillBad = healthReportsDbFault(last?.db);
     return {
       outcome: "still-mismatched",
-      ...(last !== undefined ? { runningVersion: last } : {}),
+      ...(lastVersion !== undefined ? { runningVersion: lastVersion } : {}),
       installedVersion,
-      messages: [
-        `⚠ restarted the hub unit, but it is still not reporting ${installedVersion}${reports}.`,
-        "  This can happen with a bun-linked checkout on a feature branch whose package.json version trails the running code.",
-        `  Continuing — verify with \`parachute status\` / \`curl http://127.0.0.1:${port}/health\` if the hub should be on a specific version.`,
-      ],
+      messages: dbStillBad
+        ? [
+            `⚠ restarted the hub unit, but its database still reports a fault (${last?.db}).`,
+            "  The state directory may still be missing or the database file corrupted.",
+            `  Check it with \`curl http://127.0.0.1:${port}/health\` and ensure ~/.parachute exists.`,
+          ]
+        : [
+            `⚠ restarted the hub unit, but it is still not reporting ${installedVersion}${reports}.`,
+            "  This can happen with a bun-linked checkout on a feature branch whose package.json version trails the running code.",
+            `  Continuing — verify with \`parachute status\` / \`curl http://127.0.0.1:${port}/health\` if the hub should be on a specific version.`,
+          ],
     };
   };
 
-  // Re-probe `/health` until the running version matches the installed version
-  // or the readiness budget elapses. Restart-loop guard: we restart AT MOST
-  // once — if it still mismatches after this single restart (e.g. a bun-linked
-  // checkout on a branch), we warn + continue rather than looping.
+  // A re-probe counts as "healed" only when the version matches AND the DB
+  // handle is live — a restart that came back on the right version but with a
+  // still-dead handle hasn't actually fixed the #594 fault.
+  const probeHealed = (p: { version?: string; db?: string } | null): boolean =>
+    p !== null && p.version === installedVersion && !healthReportsDbFault(p.db);
+
+  // Re-probe `/health` until the hub is healed or the readiness budget elapses.
+  // Restart-loop guard: we restart AT MOST once — if it still mismatches /
+  // db-faults after this single restart (e.g. a bun-linked checkout on a
+  // branch, or a still-missing state dir), we warn + continue rather than loop.
   const deadline = Date.now() + readyTimeoutMs;
   for (;;) {
     const after = await deps.probeHealthVersion(port);
-    if (after !== null && after.version === installedVersion) {
+    if (probeHealed(after)) {
       return restartedResult(installedVersion);
     }
     if (Date.now() >= deadline) {
-      // Report the last-observed (still-stale) version if the hub came back.
-      return stillMismatchedResult(after?.version ?? runningVersion);
+      return stillMismatchedResult(after ?? { version: runningVersion });
     }
     if (readyPollMs > 0) await deps.sleep(readyPollMs);
     else break;
   }
   // readyPollMs === 0 fast-path: one more probe, then settle.
   const finalProbe = await deps.probeHealthVersion(port);
-  if (finalProbe !== null && finalProbe.version === installedVersion) {
+  if (probeHealed(finalProbe)) {
     return restartedResult(installedVersion);
   }
-  return stillMismatchedResult(finalProbe?.version ?? runningVersion);
+  return stillMismatchedResult(finalProbe ?? { version: runningVersion });
 }
 
 /**

@@ -44,7 +44,7 @@ function fakeDeps(
      * `null` (hub not answering) or `{ ok, version }`. Drives
      * `probeHealthVersion` across the version-check + post-restart re-probe.
      */
-    healthVersionSeq?: ({ ok: boolean; version?: string } | null)[];
+    healthVersionSeq?: ({ ok: boolean; version?: string; db?: string } | null)[];
     listeningSeq?: boolean[];
     installedUnit?: boolean;
   } = {},
@@ -755,5 +755,87 @@ describe("ensureHubVersionMatches — version-check-and-restart at adoption (#59
     });
     expect(res.outcome).toBe("restart-failed");
     expect(res.messages.join("\n")).toContain("Unit parachute-hub.service not found.");
+  });
+
+  // #594: a hub whose VERSION matches but whose /health reports a db fault
+  // (dead handle — state dir deleted under it) must be treated as needing a
+  // restart, through the same restart-once machinery.
+  test("version matches but /health reports db fault → restart-once → restarted when db heals", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      // first probe: right version but dead DB handle; after the restart the
+      // re-probe sees a live DB.
+      healthVersionSeq: [
+        { ok: true, version: INSTALLED, db: "error: fatal" },
+        { ok: true, version: INSTALLED, db: "ok" },
+      ],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("restarted");
+    const restarts = f.calls.filter((c) => c.includes("kickstart"));
+    expect(restarts).toHaveLength(1);
+  });
+
+  test("version + db both ok → match, NO restart (#594 doesn't fire on a healthy hub)", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      healthVersionSeq: [{ ok: true, version: INSTALLED, db: "ok" }],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("match");
+    expect(f.calls).toEqual([]);
+  });
+
+  test("db fault persists after the restart → still-mismatched with a db-specific message (#594)", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      // Every probe reports the dead handle (state dir still gone). Restart
+      // once, then settle — no loop.
+      healthVersionSeq: [{ ok: true, version: INSTALLED, db: "error: fatal" }],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyTimeoutMs: 0,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("still-mismatched");
+    const restarts = f.calls.filter((c) => c.includes("kickstart"));
+    expect(restarts).toHaveLength(1);
+    expect(res.messages.join("\n")).toContain("database still reports a fault");
+  });
+
+  test("a hub with NO db field (pre-#594) on a version match → match, not treated as a fault", async () => {
+    const f = fakeDeps({
+      platform: "darwin",
+      getuid: () => 501,
+      installedUnit: true,
+      healthVersionSeq: [{ ok: true, version: INSTALLED /* no db field */ }],
+    });
+    const res = await ensureHubVersionMatches({
+      installedVersion: INSTALLED,
+      port: 1939,
+      deps: f.deps,
+      readyPollMs: 0,
+    });
+    expect(res.outcome).toBe("match");
+    expect(f.calls).toEqual([]);
   });
 });
