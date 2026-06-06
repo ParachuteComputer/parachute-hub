@@ -8,9 +8,11 @@ import {
   findGrantByClientName,
   isCoveredByGrant,
   isCoveredByGrantForClientName,
+  isFirstPartyBrowserClient,
   listGrantsForUser,
   recordGrant,
   revokeGrant,
+  userHasExternalAiGrant,
   userHasVaultGrant,
 } from "../grants.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
@@ -390,6 +392,103 @@ describe("findGrantByClientName / isCoveredByGrantForClientName (hub#409)", () =
       recordGrant(h.db, h.userId, h.clientId, ["vault:default-2:read"]);
       expect(userHasVaultGrant(h.db, h.userId, "default")).toBe(false);
       expect(userHasVaultGrant(h.db, h.userId, "default-2")).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("userHasExternalAiGrant / isFirstPartyBrowserClient (hub#583)", () => {
+  test("isFirstPartyBrowserClient matches fixed first-party client_ids", () => {
+    expect(isFirstPartyBrowserClient("parachute-hub-spa", null)).toBe(true);
+    expect(isFirstPartyBrowserClient("parachute-account", null)).toBe(true);
+    expect(isFirstPartyBrowserClient("some-random-dcr-id", null)).toBe(false);
+  });
+
+  test("isFirstPartyBrowserClient matches Notes by client_name (case-insensitive)", () => {
+    expect(isFirstPartyBrowserClient("dcr-generated-id", "Notes")).toBe(true);
+    expect(isFirstPartyBrowserClient("dcr-generated-id", "notes")).toBe(true);
+    expect(isFirstPartyBrowserClient("dcr-generated-id", "Claude")).toBe(false);
+    expect(isFirstPartyBrowserClient("dcr-generated-id", null)).toBe(false);
+  });
+
+  test("a first-party browser grant does NOT count as a connected AI", async () => {
+    const h = await harness();
+    try {
+      // Notes signs in via DCR (generated client_id, client_name "Notes") and
+      // writes a vault-scoped grant — the exact false-positive in hub#583.
+      const notes = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "Notes",
+      });
+      recordGrant(h.db, h.userId, notes.client.clientId, ["vault:default:read"]);
+      // The coarse signal lights up...
+      expect(userHasVaultGrant(h.db, h.userId, "default")).toBe(true);
+      // ...but the AI-connection signal does NOT.
+      expect(userHasExternalAiGrant(h.db, h.userId, "default")).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the fixed first-party SPA client_id does NOT count as a connected AI", async () => {
+    const h = await harness();
+    try {
+      registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientId: "parachute-hub-spa",
+      });
+      recordGrant(h.db, h.userId, "parachute-hub-spa", ["vault:default:read"]);
+      expect(userHasExternalAiGrant(h.db, h.userId, "default")).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("an external AI/MCP client grant DOES count as connected", async () => {
+    const h = await harness();
+    try {
+      // Claude Code: DCR-registered, ordinary client_name, vault scope.
+      const claude = registerClient(h.db, {
+        redirectUris: ["https://claude.ai/cb"],
+        clientName: "Claude",
+      });
+      recordGrant(h.db, h.userId, claude.client.clientId, ["vault:default:read"]);
+      expect(userHasExternalAiGrant(h.db, h.userId, "default")).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("external grant is scoped to the named vault", async () => {
+    const h = await harness();
+    try {
+      const claude = registerClient(h.db, {
+        redirectUris: ["https://claude.ai/cb"],
+        clientName: "Claude",
+      });
+      recordGrant(h.db, h.userId, claude.client.clientId, ["vault:other:read"]);
+      expect(userHasExternalAiGrant(h.db, h.userId, "default")).toBe(false);
+      expect(userHasExternalAiGrant(h.db, h.userId, "other")).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("Notes + Claude both granted: still counts (the external one wins)", async () => {
+    const h = await harness();
+    try {
+      const notes = registerClient(h.db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "Notes",
+      });
+      const claude = registerClient(h.db, {
+        redirectUris: ["https://claude.ai/cb"],
+        clientName: "Claude",
+      });
+      recordGrant(h.db, h.userId, notes.client.clientId, ["vault:default:read"]);
+      recordGrant(h.db, h.userId, claude.client.clientId, ["vault:default:read"]);
+      expect(userHasExternalAiGrant(h.db, h.userId, "default")).toBe(true);
     } finally {
       h.cleanup();
     }

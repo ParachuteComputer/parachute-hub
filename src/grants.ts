@@ -191,6 +191,85 @@ export function isCoveredByGrantForClientName(
 const VAULT_SCOPE_PREFIX_RE = /^vault:([^:]+):/;
 
 /**
+ * Fixed `client_id`s the hub mints for its OWN first-party browser surfaces.
+ * A grant carrying one of these is a browser sign-in (the operator opened the
+ * admin SPA, the account-home friend surface, etc.) — NOT "the operator
+ * connected an AI to their vault." See `userHasExternalAiGrant` (hub#583).
+ *
+ *   - `parachute-hub-spa`   — hub admin SPA + vault admin SPA mints
+ *     (`admin-host-admin-token.ts`, `admin-vault-admin-token.ts`,
+ *     `account-vault-admin-token.ts`).
+ *   - `parachute-account`   — account-home friend-vault token mints
+ *     (`account-vault-token.ts`).
+ */
+const FIRST_PARTY_BROWSER_CLIENT_IDS = new Set(["parachute-hub-spa", "parachute-account"]);
+
+/**
+ * `client_name`s of first-party browser SPAs that register dynamically via DCR
+ * (so their `client_id` is generated per-registration and can't be enumerated).
+ * Notes registers with `client_name: "Notes"` (the @openparachute/notes-ui PWA
+ * signing into a vault). Matched case-insensitively. See hub#583.
+ */
+const FIRST_PARTY_BROWSER_CLIENT_NAMES = new Set(["notes"]);
+
+/**
+ * True when a grant belongs to one of the hub's own first-party browser
+ * surfaces (admin SPA, account home, Notes PWA) rather than an external AI/MCP
+ * client (Claude, Cursor, …). Used to keep a browser sign-in from
+ * false-positiving the "you've connected your AI" onboarding signal (hub#583).
+ *
+ * Discriminates two ways because first-party surfaces register two ways: the
+ * hub-minted SPAs use fixed `client_id`s; DCR-registered SPAs (Notes) get a
+ * generated id but a stable `client_name`.
+ */
+export function isFirstPartyBrowserClient(
+  clientId: string,
+  clientName: string | null | undefined,
+): boolean {
+  if (FIRST_PARTY_BROWSER_CLIENT_IDS.has(clientId)) return true;
+  if (clientName && FIRST_PARTY_BROWSER_CLIENT_NAMES.has(clientName.trim().toLowerCase())) {
+    return true;
+  }
+  return false;
+}
+
+interface GrantWithClientNameRow extends GrantRow {
+  client_name: string | null;
+}
+
+/**
+ * True when the user has approved at least one EXTERNAL AI/MCP client (Claude,
+ * Cursor, etc.) whose granted scopes touch `vaultName` — i.e. "has this person
+ * actually wired up an AI to this vault yet?" (hub#583).
+ *
+ * Stricter than {@link userHasVaultGrant}: it excludes grants from the hub's
+ * own first-party browser surfaces (admin SPA, account home, Notes PWA). Those
+ * are OAuth clients too — signing into Notes writes a vault-scoped grant — so
+ * the coarse "any vault grant" signal lit up the `/account/` onboarding
+ * checklist's "✓ You're connected" line even when no AI was ever connected.
+ * This is the detection the checklist should use.
+ */
+export function userHasExternalAiGrant(db: Database, userId: string, vaultName: string): boolean {
+  const rows = db
+    .prepare(
+      `SELECT g.user_id, g.client_id, g.scopes, g.granted_at, c.client_name
+         FROM grants g
+         LEFT JOIN clients c ON g.client_id = c.client_id
+        WHERE g.user_id = ?`,
+    )
+    .all(userId) as GrantWithClientNameRow[];
+  for (const row of rows) {
+    if (isFirstPartyBrowserClient(row.client_id, row.client_name)) continue;
+    const scopes = row.scopes.split(" ").filter((s) => s.length > 0);
+    for (const s of scopes) {
+      const m = s.match(VAULT_SCOPE_PREFIX_RE);
+      if (m && m[1] === vaultName) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * True when the user has approved at least one OAuth client whose granted
  * scopes touch `vaultName` (any `vault:<name>:<verb>` scope). This is the
  * "has this person actually connected an AI to this vault yet?" signal — the

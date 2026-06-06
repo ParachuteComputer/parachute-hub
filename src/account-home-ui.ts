@@ -327,8 +327,31 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
   const safeEndpoint = escapeHtml(endpoint);
   const safeAddCmd = escapeHtml(addCmd);
 
-  // Condensed state — they've connected, so the checklist shrinks to a single
-  // reassuring line. The vault card below remains the place to actually work.
+  // The endpoint + both connect methods. Shared between the full checklist
+  // (step 2) and the condensed "Connect another AI" expander (hub#583) so a
+  // genuinely-connected user can still wire up a SECOND client without losing
+  // the instructions.
+  const connectMethods = `
+            <div class="copy-row">
+              <code data-testid="onboarding-mcp-endpoint">${safeEndpoint}</code>
+              <button type="button" class="btn btn-copy" data-copy="${safeEndpoint}"
+                      data-testid="copy-onboarding-endpoint">Copy</button>
+            </div>
+            <p class="onboarding-method"><strong>Claude.ai (web):</strong> open
+               Settings → Connectors → Add custom connector, and paste the address above.</p>
+            <p class="onboarding-method"><strong>Claude Code (terminal):</strong> run this command:</p>
+            <div class="copy-row">
+              <code data-testid="onboarding-mcp-add-command">${safeAddCmd}</code>
+              <button type="button" class="btn btn-copy" data-copy="${safeAddCmd}"
+                      data-testid="copy-onboarding-add-command">Copy</button>
+            </div>`;
+
+  // Condensed state — they've connected, so the checklist shrinks to a quiet
+  // reassuring line. But keep a "Connect another AI" expander (hub#583): the
+  // condensed line used to DELETE the endpoint + methods outright, leaving a
+  // connected user no way to wire up a second client. A <details> expander
+  // (server-rendered, no-JS-required — the copy buttons stay progressive
+  // enhancement) re-reveals the full inline instructions on demand.
   if (connected) {
     return `
     <section class="section onboarding onboarding-done" data-testid="onboarding-checklist"
@@ -336,6 +359,14 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
       <p class="onboarding-done-line" data-testid="onboarding-done-line">
         <span class="onboarding-check" aria-hidden="true">✓</span>
         You're connected — here's your vault.</p>
+      <details class="onboarding-connect-another" data-testid="onboarding-connect-another">
+        <summary data-testid="onboarding-connect-another-summary">Connect another AI →</summary>
+        <div class="onboarding-step-body">
+          <p class="onboarding-step-sub">Point another AI client at your vault using this
+             address — you'll sign in and approve the first time:</p>
+          ${connectMethods}
+        </div>
+      </details>
     </section>`;
   }
 
@@ -360,19 +391,7 @@ function renderOnboardingChecklist(opts: OnboardingChecklistOpts): string {
             <p class="onboarding-step-title">Connect your AI</p>
             <p class="onboarding-step-sub">Point Claude (or another AI) at your vault using this
                address — no token to copy, you'll sign in and approve the first time:</p>
-            <div class="copy-row">
-              <code data-testid="onboarding-mcp-endpoint">${safeEndpoint}</code>
-              <button type="button" class="btn btn-copy" data-copy="${safeEndpoint}"
-                      data-testid="copy-onboarding-endpoint">Copy</button>
-            </div>
-            <p class="onboarding-method"><strong>Claude.ai (web):</strong> open
-               Settings → Connectors → Add custom connector, and paste the address above.</p>
-            <p class="onboarding-method"><strong>Claude Code (terminal):</strong> run this command:</p>
-            <div class="copy-row">
-              <code data-testid="onboarding-mcp-add-command">${safeAddCmd}</code>
-              <button type="button" class="btn btn-copy" data-copy="${safeAddCmd}"
-                      data-testid="copy-onboarding-add-command">Copy</button>
-            </div>
+            ${connectMethods}
           </div>
         </li>
 
@@ -955,6 +974,18 @@ const STYLES = `
     align-items: center;
     justify-content: center;
   }
+  .onboarding-connect-another { margin: 0.7rem 0 0; }
+  .onboarding-connect-another > summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: ${PALETTE.accent};
+    list-style: none;
+    user-select: none;
+  }
+  .onboarding-connect-another > summary::-webkit-details-marker { display: none; }
+  .onboarding-connect-another[open] > summary { margin-bottom: 0.4rem; }
+  .onboarding-connect-another .copy-row { margin: 0.35rem 0; }
 
   .account-security {
     margin: 0.9rem 0 0;

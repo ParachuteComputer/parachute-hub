@@ -660,6 +660,47 @@ describe("renderAccountHome", () => {
     expect(html).toContain('data-testid="vault-card"');
   });
 
+  test("onboarding condensed state keeps a 'Connect another AI' expander with the full instructions (hub#583)", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      connectedVault: true,
+    });
+    // The expander itself...
+    expect(html).toContain('data-testid="onboarding-connect-another"');
+    expect(html).toContain('data-testid="onboarding-connect-another-summary"');
+    expect(html).toContain("Connect another AI");
+    // ...re-reveals the endpoint + BOTH connect methods that the condensed
+    // line used to delete entirely (the hub#583 defect).
+    expect(html).toContain('data-testid="onboarding-mcp-endpoint"');
+    expect(html).toContain('data-testid="onboarding-mcp-add-command"');
+    expect(html).toContain("Claude.ai (web)");
+    expect(html).toContain("Claude Code (terminal)");
+  });
+
+  test("onboarding NON-condensed (not connected) state has no 'Connect another AI' expander (hub#583)", () => {
+    const html = renderAccountHome({
+      username: "alice",
+      assignedVaults: ["alice"],
+      passwordChanged: true,
+      hubOrigin: HUB_ORIGIN,
+      isFirstAdmin: false,
+      csrfToken: CSRF,
+      twoFactorEnabled: false,
+      connectedVault: false,
+    });
+    // Full checklist already shows the inline instructions in step 2, so the
+    // expander is condensed-state-only.
+    expect(html).not.toContain('data-testid="onboarding-connect-another"');
+    expect(html).toContain('data-testid="onboarding-step-2"');
+    expect(html).toContain('data-testid="onboarding-mcp-endpoint"');
+  });
+
   test("onboarding checklist — leads the page: BEFORE the vault card and the starter prompts", () => {
     const html = renderAccountHome({
       username: "alice",
