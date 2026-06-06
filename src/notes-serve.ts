@@ -176,6 +176,29 @@ export function notesFetch(dist: string, mount: string): (req: Request) => Respo
   };
 }
 
+/**
+ * Build the `Bun.serve` config for the notes static server.
+ *
+ * `idleTimeout: 255` matches hub-server.ts. When this static-serve sits behind
+ * an edge proxy that pools keep-alive connections (Render, Cloudflare, fly
+ * proxy), the edge's idle timeout outlasts Bun's default — the proxy reuses a
+ * connection we just closed and returns a "random" 502. 255s comfortably
+ * exceeds Render's community-observed ~120s edge pool TTL. Closes the hub#399
+ * residual on the second serve entrypoint (the Notes PWA path). Exported so a
+ * test can assert the option is set without booting a server.
+ */
+export function notesServeOptions(
+  port: number,
+  dist: string,
+  mount: string,
+): { port: number; idleTimeout: number; fetch: (req: Request) => Response } {
+  return {
+    port,
+    idleTimeout: 255,
+    fetch: notesFetch(dist, mount),
+  };
+}
+
 if (import.meta.main) {
   const { port, dist: distArg, mount } = parseArgs(process.argv.slice(2));
 
@@ -187,10 +210,7 @@ if (import.meta.main) {
     process.exit(1);
   }
 
-  Bun.serve({
-    port,
-    fetch: notesFetch(dist, mount),
-  });
+  Bun.serve(notesServeOptions(port, dist, mount));
 
   console.log(`notes static-serve listening on :${port} (dist=${dist}, mount=${mount || "/"})`);
 }
