@@ -248,6 +248,15 @@ interface GrantWithClientNameRow extends GrantRow {
  * the coarse "any vault grant" signal lit up the `/account/` onboarding
  * checklist's "✓ You're connected" line even when no AI was ever connected.
  * This is the detection the checklist should use.
+ *
+ * Trade-off: this fetches ALL of the user's grants (joined to `clients` for
+ * `client_name`) and filters in JS, rather than pushing the first-party
+ * exclusion into a WHERE clause. Fine at current scale — a user has a handful
+ * of grants, and the scope/client-name discrimination is awkward to express in
+ * SQL (scopes are a space-joined column, first-party names are an in-process
+ * set). If the grants table grows large per-user, add an index on
+ * `grants(user_id)` (already the PK prefix) and consider a `client_name`-aware
+ * WHERE filter.
  */
 export function userHasExternalAiGrant(db: Database, userId: string, vaultName: string): boolean {
   const rows = db

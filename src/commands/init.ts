@@ -480,16 +480,29 @@ async function defaultRunCliWizard(opts: {
  * surfacing the token is a convenience, never a hard dependency of init.
  */
 async function defaultFetchBootstrapToken(loopbackUrl: string): Promise<string | undefined> {
+  // Debug breadcrumb (gated on PARACHUTE_DEBUG so it never clutters the normal
+  // operator output). When the token doesn't print in the field, this tells a
+  // troubleshooter WHY — hub didn't answer, returned non-200, or the body
+  // carried no token (already-claimed / no-gate) — instead of a silent nothing.
+  const debug = (msg: string): void => {
+    if (process.env.PARACHUTE_DEBUG) console.error(`[init][bootstrap-token] ${msg}`);
+  };
   try {
     const res = await fetch(`${loopbackUrl.replace(/\/+$/, "")}/admin/setup`, {
       headers: { accept: "application/json" },
     });
-    if (!res.ok) return undefined;
+    if (!res.ok) {
+      debug(`probe returned ${res.status}; not printing a token`);
+      return undefined;
+    }
     const body = (await res.json()) as { bootstrapToken?: unknown };
-    return typeof body.bootstrapToken === "string" && body.bootstrapToken.length > 0
-      ? body.bootstrapToken
-      : undefined;
-  } catch {
+    if (typeof body.bootstrapToken === "string" && body.bootstrapToken.length > 0) {
+      return body.bootstrapToken;
+    }
+    debug("probe ok but no bootstrapToken in body (already-claimed or no gate active)");
+    return undefined;
+  } catch (err) {
+    debug(`probe failed: ${err instanceof Error ? err.message : String(err)}`);
     return undefined;
   }
 }
