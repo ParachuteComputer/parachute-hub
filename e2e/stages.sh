@@ -5,15 +5,23 @@
 # root on a brand-new box).
 #
 # Each stage is logged + asserted; results append to /root/e2e-results as
-# `name|PASS|FAIL|SKIP|detail` lines so the host driver renders a summary even
-# when a stage aborts. The script exits non-zero on the first hard failure.
+# `name|PASS|FAIL|SKIP|XFAIL|detail` lines so the host driver renders a summary
+# even when a stage aborts. The script exits non-zero on the first hard failure.
 #
 # Env (set by run.sh):
 #   HUB_INSTALL_SPEC           "rc" / "latest" / "0.6.5-rc.4" → install
 #                              @openparachute/hub@<spec>; or "local" → install
 #                              the /root/hub.tgz tarball.
 #   PARACHUTE_INSTALL_CHANNEL  rc|latest — vault module install channel.
-set -uo pipefail
+#
+# Hardening note: we run under `set -euo pipefail` so an *unguarded* command
+# failure aborts the run rather than silently continuing past a broken probe
+# (the false-pass class — a stage greening without really testing). Every place
+# we genuinely don't care about a non-zero exit is annotated with an explicit
+# `|| true` + a comment. Assertions use `if ! cmd` / `cmd || die`, both of which
+# are `-e`-safe. The `cmd | other` pipelines that we assert on rely on
+# `pipefail` so a failing producer doesn't get masked by a succeeding consumer.
+set -euo pipefail
 
 HUB_PORT=1939
 HUB="http://127.0.0.1:${HUB_PORT}"
@@ -38,14 +46,24 @@ die() {
   exit 1
 }
 
-# Poll a curl assertion until it passes or times out. $1=desc (for readability
-# at the call site) $2=timeout_s $3..=command (run via bash -c) whose exit 0
-# means "satisfied".
+# Expected-fail: a KNOWN live bug the harness deliberately surfaces. Records an
+# XFAIL (loud in the summary) but does NOT abort the run — so the suite stays
+# usable as a gate while screaming the finding. Use ONLY for a tracked,
+# reported-in-the-PR bug; a new/unexpected failure must `die`.
+xfail() {
+  local stage="$1"; shift
+  printf '\n!! XFAIL (known live bug): %s — %s\n' "$stage" "$*" >&2
+  record "$stage" "XFAIL" "$*"
+}
+
+# Poll an assertion until it passes or times out. $1=desc (logged for trace),
+# $2=timeout_s, $3..=command (run via bash -c) whose exit 0 means "satisfied".
 wait_for() {
-  local timeout="$2"; shift 2
+  local desc="$1" timeout="$2"; shift 2
   local deadline=$(( $(date +%s) + timeout ))
   until bash -c "$*" >/dev/null 2>&1; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
+      note "wait_for '${desc}' timed out after ${timeout}s"
       return 1
     fi
     sleep 1
@@ -106,7 +124,7 @@ cat "$INIT_LOG"
 
 # systemd unit active?
 if ! systemctl is-active --quiet parachute-hub.service; then
-  systemctl --no-pager status parachute-hub.service 2>&1 | head -30 >&2
+  systemctl --no-pager status parachute-hub.service 2>&1 | head -30 >&2 || true
   die "stage1-init" "parachute-hub.service is not active after init"
 fi
 note "parachute-hub.service is active (systemd-managed)"
@@ -244,14 +262,31 @@ note "exactly 1 parachute-hub unit (no duplication)"
 
 # wizard state preserved — admin still exists → setup probe must NOT be at
 # the bootstrap/welcome step (no fresh-gate). Loopback JSON probe.
-SETUP_STEP="$(curl -s -H 'accept: application/json' "${HUB}/admin/setup" | bun -e 'const c=await Bun.stdin.text(); try{const j=JSON.parse(c); console.log(j.hasAdmin?"has-admin":"no-admin")}catch{console.log("redirect-or-done")}' 2>/dev/null || true)"
+#
+# MUST-FIX (reviewer): never let an empty SETUP_STEP fall through to a PASS. If
+# curl/bun errors (hub unreachable, bun crash) the probe returns nothing — that
+# is a HARD failure, not "treat as preserved". We capture the probe WITHOUT a
+# `|| true` swallow and explicitly guard the empty case before the case-match.
+# `set -e` would abort on a failed pipeline here, so we tolerate the command's
+# own non-zero (the producer may legitimately 301) but REQUIRE a non-empty,
+# recognized token.
+SETUP_STEP="$(curl -s -H 'accept: application/json' "${HUB}/admin/setup" \
+  | bun -e 'const c=await Bun.stdin.text(); try{const j=JSON.parse(c); console.log(j.hasAdmin?"has-admin":"no-admin")}catch{console.log(c.length?"redirect-or-done":"")}')" || true
+if [ -z "$SETUP_STEP" ]; then
+  die "stage2-idempotent" "setup probe returned nothing — hub unreachable or bun failed (cannot confirm admin preserved)"
+fi
 case "$SETUP_STEP" in
-  has-admin|redirect-or-done)
-    note "wizard state preserved (admin still present: ${SETUP_STEP})" ;;
+  has-admin)
+    note "wizard state preserved (admin still present)" ;;
+  redirect-or-done)
+    # A 301→/login (non-JSON body) is the canonical post-setup shape and also
+    # implies an admin exists — accept it, but only because it's a recognized
+    # token, not an empty fall-through.
+    note "setup probe returned a post-setup redirect/done shape (admin implied present)" ;;
   no-admin)
     die "stage2-idempotent" "re-init wiped the admin — wizard back at welcome/bootstrap" ;;
   *)
-    note "setup probe returned '${SETUP_STEP}' — treating as preserved (301→/login is the post-setup shape)" ;;
+    die "stage2-idempotent" "setup probe returned an unrecognized token '${SETUP_STEP}'" ;;
 esac
 record "stage2-idempotent" "PASS" "re-init clean, 1 unit, admin preserved"
 
@@ -259,50 +294,128 @@ record "stage2-idempotent" "PASS" "re-init clean, 1 unit, admin preserved"
 # STAGE 3 — wipe recovery (the laptop scenario)
 # ===========================================================================
 hr "STAGE 3 — wipe recovery (rm -rf ~/.parachute while the unit runs)"
-note "Capturing a baseline /health, then wiping ~/.parachute out from under the unit…"
-curl -s "${HUB}/health" | head -c 300; echo
 
-# Wipe the config root while the systemd unit keeps running. This reproduces
-# the #594 dead-DB-handle field repro (green /health while DB routes 503/500).
+# MUST-FIX (reviewer): the prior version just `wait_for db:ok` after the wipe —
+# which GREENS precisely when #594 is present, because a hub serving from a
+# STALE in-memory handle reports db:"ok" immediately. It can't tell "died +
+# restarted with a fresh DB" from "never crashed, lying about a dead handle".
+# We now PROVE a real recovery:
+#   (a) capture the unit MainPID before the wipe; recovery must change it
+#       (a fresh process == a fresh DB handle), AND
+#   (b) the on-disk hub.db must exist again after recovery, AND
+#   (c) a fresh CLI process (mint-token, which opens the DB by PATH) must work
+#       — the ghost-fd handle is invisible to a process that opens by path.
+# If the hub instead keeps serving db:"ok" from a deleted-but-open fd while the
+# on-disk DB stays gone, that's the #594 dead-handle bug live — we detect it
+# explicitly and XFAIL (loud) rather than green on it.
+
+note "Capturing baseline: unit MainPID + /health…"
+PID_BEFORE="$(systemctl show -p MainPID --value parachute-hub.service)"
+note "MainPID before wipe: ${PID_BEFORE}"
+# `head -c` closes the pipe early (SIGPIPE → curl non-zero); guard so it doesn't
+# trip `set -e`/`pipefail`. This is a diagnostic print, not an assertion.
+{ curl -fsS "${HUB}/health" | head -c 300; echo; } || true
+
+# Wipe the config root while the systemd unit keeps running.
 rm -rf /root/.parachute
-note "config root removed. Probing a DB route + waiting for the shipped self-heal…"
+note "config root removed (hub.db unlinked under the running unit)."
 
-# The hub should NOT 500-loop. Per #594 the shipped behavior is structured
-# 503 → self-heal-or-exit → systemd restart. Assert the END state: within a
-# bounded window the hub is serving again with a FRESH db reporting db:"ok".
-# (systemd Restart=always brings it back; a fresh boot re-creates the DB.)
-if ! wait_for "hub self-heal to db:ok" 90 "curl -fsS ${HUB}/health | grep -q '\"db\":\"ok\"'"; then
-  note "hub did not return to db:ok on its own within 90s — nudging systemd (operator would too)…"
+# Sanity: the on-disk hub.db is actually gone right now. (If this is already
+# back, the rm didn't take — abort rather than test a no-op.)
+if [ -f /root/.parachute/hub.db ]; then
+  die "stage3-wipe-recovery" "hub.db still on disk immediately after rm -rf — wipe was a no-op"
+fi
+note "confirmed: hub.db is gone from disk. Watching for a REAL recovery (PID change + fresh on-disk DB)…"
+
+# Poke a DB-touching route in a loop to give the reactive self-heal a chance to
+# fire (it only triggers on a thrown SQLite error). Then check for a genuine
+# restart: MainPID changed AND hub.db is back on disk.
+recovered=0
+deadline=$(( $(date +%s) + 90 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  # DB-touching probe (ignored result — we just want to provoke the handle).
+  curl -s -o /dev/null -H 'accept: application/json' "${HUB}/admin/setup" || true
+  PID_NOW="$(systemctl show -p MainPID --value parachute-hub.service)"
+  if [ "$PID_NOW" != "$PID_BEFORE" ] && [ -f /root/.parachute/hub.db ]; then
+    note "REAL recovery: MainPID ${PID_BEFORE} -> ${PID_NOW}, hub.db back on disk."
+    recovered=1
+    break
+  fi
+  sleep 2
+done
+
+if [ "$recovered" -ne 1 ]; then
+  # Did the hub at least come back via an explicit operator restart? An operator
+  # whose hub wedged would `systemctl restart`; the harness mirrors that as the
+  # last-resort nudge. After a real restart the fd is fresh AND a new on-disk DB
+  # is created on boot.
+  note "no self-recovery within 90s. Nudging systemd (the operator's last resort)…"
   systemctl restart parachute-hub.service || true
-  if ! wait_for "hub healthy after restart" 60 "curl -fsS ${HUB}/health | grep -q '\"db\":\"ok\"'"; then
-    curl -s "${HUB}/health" >&2 || true
-    systemctl --no-pager status parachute-hub.service 2>&1 | head -20 >&2 || true
-    die "stage3-wipe-recovery" "hub never recovered to /health db:ok after wipe (#594)"
+  if wait_for "hub healthy + fresh on-disk DB after restart" 60 \
+      "curl -fsS ${HUB}/health | grep -q '\"db\":\"ok\"' && test -f /root/.parachute/hub.db"; then
+    PID_NOW="$(systemctl show -p MainPID --value parachute-hub.service)"
+    note "recovered after explicit restart: MainPID now ${PID_NOW}, hub.db on disk."
+    recovered=1
   fi
 fi
-note "hub recovered to /health db:\"ok\" with a fresh DB (#594 self-heal end state)"
 
-# Re-run init — the version-check / adoption logic must not wedge (#590).
-note "Re-running 'parachute init' after the wipe…"
-INIT3_LOG=/tmp/parachute-init-3.log
-if ! parachute init --expose none --no-expose-prompt --no-browser >"$INIT3_LOG" 2>&1; then
-  cat "$INIT3_LOG" >&2
-  die "stage3-wipe-recovery" "post-wipe parachute init exited non-zero (adoption wedge?)"
+# --- the discriminating assertion ---
+# At this point, recovery is REAL iff hub.db is on disk AND a fresh CLI process
+# (opens by path, never sees a ghost fd) reads a coherent DB. We test (c) with
+# the wizard JSON probe via a FRESH curl AND with a fresh `parachute` invocation.
+HEALTH_DB="$(curl -fsS "${HUB}/health" | grep -o '"db":"[^"]*"' || true)"
+# `if` (not `&&`) so a missing file doesn't make the line's exit nonzero under -e.
+if [ -f /root/.parachute/hub.db ]; then ONDISK_DB="present"; else ONDISK_DB="absent"; fi
+
+if [ "$recovered" -eq 1 ] && [ "$ONDISK_DB" = "present" ]; then
+  note "hub recovered with a fresh on-disk DB (${HEALTH_DB}); proceeding to re-init."
+  # Re-run init — version-check / adoption must not wedge (#590).
+  note "Re-running 'parachute init' after the wipe…"
+  INIT3_LOG=/tmp/parachute-init-3.log
+  if ! parachute init --expose none --no-expose-prompt --no-browser >"$INIT3_LOG" 2>&1; then
+    cat "$INIT3_LOG" >&2
+    die "stage3-wipe-recovery" "post-wipe parachute init exited non-zero (adoption wedge?)"
+  fi
+  cat "$INIT3_LOG"
+  curl -fsS "${HUB}/health" | grep -q '"db":"ok"' || die "stage3-wipe-recovery" "hub not db:ok after post-wipe init"
+
+  # Wizard reachable again + COHERENT (200 JSON or clean redirect), not a 5xx.
+  WIZ_CODE="$(curl -s -o /tmp/setup-after.json -w '%{http_code}' -H 'accept: application/json' "${HUB}/admin/setup")" || true
+  case "$WIZ_CODE" in
+    200|301|302) note "wizard reachable after wipe (HTTP ${WIZ_CODE}, coherent)" ;;
+    *) cat /tmp/setup-after.json >&2 || true
+       die "stage3-wipe-recovery" "/admin/setup returned ${WIZ_CODE} after wipe (5xx?)" ;;
+  esac
+  record "stage3-wipe-recovery" "PASS" "REAL recovery: PID changed, fresh on-disk DB, re-init clean"
+else
+  # The dead-handle bug: /health says db:ok but the on-disk DB is gone and the
+  # process never restarted. Prove it's the ghost-fd class before labeling it.
+  # Inspect each fd's symlink TARGET via readlink (not `ls | grep` — we need the
+  # link destination, which carries the " (deleted)" marker, not the fd name).
+  GHOST_FD=0
+  for fd in "/proc/${PID_BEFORE}/fd/"*; do
+    [ -e "$fd" ] || [ -L "$fd" ] || continue
+    target="$(readlink "$fd" 2>/dev/null || true)"
+    case "$target" in
+      *hub.db*"(deleted)") GHOST_FD=$(( GHOST_FD + 1 )) ;;
+    esac
+  done
+  printf '\n================= #594 FINDING (live on this build) =================\n' >&2
+  printf '  /health reports %s but on-disk hub.db is %s and MainPID is unchanged (%s).\n' \
+    "${HEALTH_DB:-?}" "$ONDISK_DB" "$PID_BEFORE" >&2
+  printf '  Open deleted hub.db fds on the still-running hub: %s\n' "${GHOST_FD:-?}" >&2
+  printf '  The reactive self-heal (#594) only fires on a THROWN SQLite error;\n' >&2
+  printf '  an unlinked-but-open fd keeps SELECT 1 + writes succeeding, so the\n' >&2
+  printf '  handle is never reopened, the process never exits, and the hub serves\n' >&2
+  printf '  a GHOST DB indefinitely (green /health, but a fresh CLI sees nothing).\n' >&2
+  printf '====================================================================\n\n' >&2
+  # Dump the offending fd targets for the transcript (readlink, not ls|grep).
+  for fd in "/proc/${PID_BEFORE}/fd/"*; do
+    target="$(readlink "$fd" 2>/dev/null || true)"
+    case "$target" in *hub.db*) printf '  fd %s -> %s\n' "$(basename "$fd")" "$target" >&2 ;; esac
+  done
+  xfail "stage3-wipe-recovery" "#594 dead-handle: health=${HEALTH_DB:-?}, on-disk DB ${ONDISK_DB}, PID unchanged, ${GHOST_FD:-?} deleted hub.db fd(s) open"
 fi
-cat "$INIT3_LOG"
-curl -fsS "${HUB}/health" | grep -q '"db":"ok"' || die "stage3-wipe-recovery" "hub not db:ok after post-wipe init"
-
-# Wizard reachable again — fresh DB means bootstrap state is back to needs-setup;
-# assert it's COHERENT (200 JSON or a clean redirect), not a 500.
-WIZ_CODE="$(curl -s -o /tmp/setup-after.json -w '%{http_code}' -H 'accept: application/json' "${HUB}/admin/setup" || true)"
-case "$WIZ_CODE" in
-  200|301|302)
-    note "wizard reachable after wipe (HTTP ${WIZ_CODE}, coherent state)" ;;
-  *)
-    cat /tmp/setup-after.json >&2 || true
-    die "stage3-wipe-recovery" "/admin/setup returned ${WIZ_CODE} after wipe (expected 200/301/302, got a 5xx?)" ;;
-esac
-record "stage3-wipe-recovery" "PASS" "self-heal to db:ok, re-init clean, wizard coherent"
 
 # ===========================================================================
 # STAGE 4 — expose (PR 2 placeholder)

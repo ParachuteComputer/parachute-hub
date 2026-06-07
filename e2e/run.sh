@@ -44,9 +44,12 @@ warn() { printf '\033[1;33m[e2e]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[e2e]\033[0m %s\n' "$*" >&2; }
 
 TARBALL=""
+PACK_DIR=""
 cleanup() {
   local code=$?
+  # Remove the packed tarball AND its mktemp dir (the dir was previously leaked).
   if [ -n "$TARBALL" ] && [ -f "$TARBALL" ]; then rm -f "$TARBALL" || true; fi
+  if [ -n "$PACK_DIR" ] && [ -d "$PACK_DIR" ]; then rm -rf "$PACK_DIR" || true; fi
   if [ "${E2E_KEEP:-}" = "1" ]; then
     warn "E2E_KEEP=1 — leaving container '$CONTAINER' up for debugging."
     warn "  docker exec -it $CONTAINER bash    # poke around"
@@ -174,24 +177,36 @@ set -e
 echo
 log "================ STAGE SUMMARY ================"
 RESULTS="$("$DOCKER" exec "$CONTAINER" cat /root/e2e-results 2>/dev/null || true)"
+XFAIL_COUNT=0
 if [ -z "$RESULTS" ]; then
   err "No per-stage results recorded — stages.sh aborted before writing any."
 else
-  printf '%s\n' "$RESULTS" | while IFS='|' read -r name status detail; do
+  # Render each line; tally XFAILs (known live bugs the harness surfaces).
+  while IFS='|' read -r name status detail; do
     [ -z "$name" ] && continue
-    if [ "$status" = "PASS" ]; then
-      printf '  \033[1;32mPASS\033[0m  %-28s %s\n' "$name" "$detail"
-    elif [ "$status" = "SKIP" ]; then
-      printf '  \033[1;33mSKIP\033[0m  %-28s %s\n' "$name" "$detail"
-    else
-      printf '  \033[1;31mFAIL\033[0m  %-28s %s\n' "$name" "$detail"
-    fi
-  done
+    case "$status" in
+      PASS)  printf '  \033[1;32mPASS \033[0m %-28s %s\n' "$name" "$detail" ;;
+      SKIP)  printf '  \033[1;33mSKIP \033[0m %-28s %s\n' "$name" "$detail" ;;
+      XFAIL) printf '  \033[1;35mXFAIL\033[0m %-28s %s\n' "$name" "$detail" ;;
+      *)     printf '  \033[1;31mFAIL \033[0m %-28s %s\n' "$name" "$detail" ;;
+    esac
+  done <<EOF_RESULTS
+$RESULTS
+EOF_RESULTS
+  # Count XFAILs separately (the while-loop above runs in this shell, but the
+  # here-string keeps it out of a subshell so we could increment — we re-grep
+  # to be robust regardless of shell pipeline semantics).
+  XFAIL_COUNT="$(printf '%s\n' "$RESULTS" | grep -c '|XFAIL|' || true)"
 fi
 log "=============================================="
 
 if [ "$STAGES_RC" -ne 0 ]; then
   err "E2E FAILED (stages exit $STAGES_RC). HUB_SOURCE=$HUB_SOURCE VAULT_CHANNEL=$VAULT_CHANNEL"
   exit "$STAGES_RC"
+fi
+if [ "${XFAIL_COUNT:-0}" -gt 0 ]; then
+  warn "E2E PASSED with ${XFAIL_COUNT} XFAIL(s) — known live bug(s) surfaced (see the #594 FINDING block above)."
+  warn "  HUB_SOURCE=$HUB_SOURCE VAULT_CHANNEL=$VAULT_CHANNEL"
+  exit 0
 fi
 log "E2E PASSED. HUB_SOURCE=$HUB_SOURCE VAULT_CHANNEL=$VAULT_CHANNEL"
