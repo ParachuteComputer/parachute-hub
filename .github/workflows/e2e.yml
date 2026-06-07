@@ -49,4 +49,11 @@ jobs:
           # from the registry / local tarball per HUB_SOURCE.
           HUB_SOURCE: ${{ github.event.inputs.hub_source || 'npm:rc' }}
           VAULT_CHANNEL: ${{ github.event.inputs.vault_channel || 'rc' }}
+          # Stage 4 (public Cloudflare expose). CLOUDFLARED_CERT_PEM is the
+          # cloudflared origin cert for the test zone (a repo/org secret); when
+          # it's empty (PRs from forks, or the secret unset) Stage 4 SKIPs and
+          # stages 1-3 still run. E2E_TEST_ZONE selects the zone to provision
+          # the per-run hostname under (defaults to parachute.place in run.sh).
+          CLOUDFLARED_CERT_PEM: ${{ secrets.CLOUDFLARED_CERT_PEM }}
+          E2E_TEST_ZONE: ${{ vars.E2E_TEST_ZONE }}
         run: ./e2e/run.sh
