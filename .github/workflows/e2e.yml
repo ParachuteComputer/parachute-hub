@@ -1,0 +1,52 @@
+name: e2e
+
+# Tier-1 end-to-end harness: systemd-in-container fresh-install flow.
+#
+# Runs the REAL operator install path (curl bun.sh/install → bun add -g
+# @openparachute/hub → parachute init → wizard → MCP OAuth dance) against a
+# privileged Ubuntu+systemd container, replaying recent field-failure
+# scenarios as staged assertions. See e2e/README.md.
+#
+# Triggers:
+#   workflow_dispatch  — manual, with a hub_source input (default npm:rc).
+#   push tags v*       — every release-candidate / stable tag.
+#
+# NOTE: this does NOT run on pull_request — it's heavy + needs a privileged
+# container, and the load-bearing verification is the local pre-push run. We
+# dispatch it manually after merge and on tag pushes.
+on:
+  workflow_dispatch:
+    inputs:
+      hub_source:
+        description: "HUB_SOURCE (npm:<spec> from registry, or 'local' to pack the checkout)"
+        required: false
+        default: "npm:rc"
+      vault_channel:
+        description: "VAULT_CHANNEL for the vault module install (rc|latest)"
+        required: false
+        default: "rc"
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  systemd-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install bun (host — needed for HUB_SOURCE=local pack)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run Tier-1 E2E
+        env:
+          # On a tag push, default to npm:rc (the freshly-published artifact);
+          # on manual dispatch, honor the input. The container itself fetches
+          # from the registry / local tarball per HUB_SOURCE.
+          HUB_SOURCE: ${{ github.event.inputs.hub_source || 'npm:rc' }}
+          VAULT_CHANNEL: ${{ github.event.inputs.vault_channel || 'rc' }}
+        run: ./e2e/run.sh

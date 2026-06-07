@@ -1,0 +1,64 @@
+# Tier-1 E2E base image: Ubuntu with systemd as PID 1.
+#
+# This is deliberately a "bare VPS" image, NOT a Parachute image. We pre-bake
+# only the OS-level dependencies a real fresh Linux box would already have (or
+# that aren't themselves under test): a libc, curl/unzip (to fetch bun), CA
+# certs (TLS to npm + bun.sh), git (vault import + mirror), python3 (some
+# postinstall scripts assume it present on Linux).
+#
+# We DO NOT pre-install bun or @openparachute/hub — installing those is the
+# test (Stage 1 of e2e/stages.sh runs the real `curl bun.sh/install` +
+# `bun add -g @openparachute/hub` an operator runs). Baking them in would
+# defeat the whole point of the harness.
+#
+# systemd-as-PID-1 is the load-bearing choice: `parachute init` installs and
+# manages a REAL `parachute-hub.service` systemd unit (exactly like an
+# operator's VPS), so the harness exercises the systemd-unit lifecycle bugs
+# (zombie units surviving wipes, version-mismatch adoption, dead-DB self-heal)
+# that the existing `parachute serve` foreground container-smoke cannot catch.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV container=docker
+
+# OS-level deps a real box has / that aren't under test. `systemd` +
+# `systemd-sysv` give us PID-1 systemd + `systemctl`. `dbus` is required for
+# systemd to come up cleanly inside a container.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    systemd systemd-sysv dbus \
+    curl unzip ca-certificates git python3 \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
+
+# Mask the units that fight a container (no real ttys, no hardware, no swap,
+# no network-management daemon). This is the standard systemd-in-container
+# hygiene — without it systemd spends boot trying to bring up getty + udev +
+# networkd and `is-system-running` never settles to running/degraded.
+RUN systemctl mask \
+    getty.target \
+    console-getty.service \
+    getty@tty1.service \
+    systemd-udevd.service \
+    systemd-udev-trigger.service \
+    systemd-modules-load.service \
+    systemd-logind.service \
+    dev-hugepages.mount \
+    sys-fs-fuse-connections.mount \
+    sys-kernel-config.mount \
+    display-manager.service \
+    systemd-networkd.service \
+    systemd-networkd.socket \
+  || true
+
+# network-online.target is what the hub unit declares After=. Inside a
+# container there's no ifupdown/networkd to satisfy it, so without help the
+# unit would wait forever on the ordering dep. Alias systemd-networkd-wait-online
+# to a no-op so `multi-user.target` (and our unit) reach active.
+RUN systemctl mask systemd-networkd-wait-online.service NetworkManager-wait-online.service || true
+
+STOPSIGNAL SIGRTMIN+3
+
+# systemd as PID 1. The host driver execs `e2e/stages.sh` inside this via
+# `docker exec` once `systemctl is-system-running` settles.
+CMD ["/lib/systemd/systemd"]
