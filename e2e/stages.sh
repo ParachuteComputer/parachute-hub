@@ -330,19 +330,55 @@ note "confirmed: hub.db is gone from disk. Watching for a REAL recovery (PID cha
 # Poke a DB-touching route in a loop to give the reactive self-heal a chance to
 # fire (it only triggers on a thrown SQLite error). Then check for a genuine
 # restart: MainPID changed AND hub.db is back on disk.
+# Helper: count deleted hub.db fds held open by the still-running hub PID. This
+# is the #610 fingerprint — an unlinked-but-open SQLite fd the reactive
+# self-heal can't see (it only fires on a THROWN error; SELECT 1 keeps
+# succeeding against the ghost inode). readlink (not `ls | grep`) because we
+# need the symlink TARGET, which carries the " (deleted)" marker.
+count_ghost_fds() {
+  local pid="$1" n=0 fd target
+  for fd in "/proc/${pid}/fd/"*; do
+    [ -e "$fd" ] || [ -L "$fd" ] || continue
+    target="$(readlink "$fd" 2>/dev/null || true)"
+    case "$target" in
+      *hub.db*"(deleted)") n=$(( n + 1 )) ;;
+    esac
+  done
+  printf '%s' "$n"
+}
+
+# Did we observe the #610 ghost-fd at any point in the wipe window? Capturing it
+# independently of recovery is the key fix: the ghost-fd is the #610 fingerprint
+# whether or not a later restart recovers, so it drives the result classification
+# (XFAIL even when restart recovers — vs. a genuinely-dead hub with NO ghost-fd,
+# which must FAIL).
+GHOST_SEEN=0
+
 recovered=0
 deadline=$(( $(date +%s) + 90 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
   # DB-touching probe (ignored result — we just want to provoke the handle).
   curl -s -o /dev/null -H 'accept: application/json' "${HUB}/admin/setup" || true
+  # Observe the ghost-fd while the original PID is still alive (it won't exist
+  # once the process restarts).
+  if [ "$(systemctl show -p MainPID --value parachute-hub.service)" = "$PID_BEFORE" ]; then
+    [ "$(count_ghost_fds "$PID_BEFORE")" -gt 0 ] && GHOST_SEEN=1
+  fi
   PID_NOW="$(systemctl show -p MainPID --value parachute-hub.service)"
   if [ "$PID_NOW" != "$PID_BEFORE" ] && [ -f /root/.parachute/hub.db ]; then
-    note "REAL recovery: MainPID ${PID_BEFORE} -> ${PID_NOW}, hub.db back on disk."
+    note "self-recovery: MainPID ${PID_BEFORE} -> ${PID_NOW}, hub.db back on disk."
     recovered=1
     break
   fi
   sleep 2
 done
+
+# Snapshot the ghost-fd count one more time before any restart (for the report).
+GHOST_FD=0
+if [ "$(systemctl show -p MainPID --value parachute-hub.service)" = "$PID_BEFORE" ]; then
+  GHOST_FD="$(count_ghost_fds "$PID_BEFORE")"
+  [ "$GHOST_FD" -gt 0 ] && GHOST_SEEN=1
+fi
 
 if [ "$recovered" -ne 1 ]; then
   # Did the hub at least come back via an explicit operator restart? An operator
@@ -360,15 +396,22 @@ if [ "$recovered" -ne 1 ]; then
 fi
 
 # --- the discriminating assertion ---
-# At this point, recovery is REAL iff hub.db is on disk AND a fresh CLI process
-# (opens by path, never sees a ghost fd) reads a coherent DB. We test (c) with
-# the wizard JSON probe via a FRESH curl AND with a fresh `parachute` invocation.
+# Recovery is REAL iff hub.db is on disk AND a fresh process serves it (a fresh
+# CLI opens by path, never sees a ghost fd).
 HEALTH_DB="$(curl -fsS "${HUB}/health" | grep -o '"db":"[^"]*"' || true)"
 # `if` (not `&&`) so a missing file doesn't make the line's exit nonzero under -e.
 if [ -f /root/.parachute/hub.db ]; then ONDISK_DB="present"; else ONDISK_DB="absent"; fi
 
-if [ "$recovered" -eq 1 ] && [ "$ONDISK_DB" = "present" ]; then
-  note "hub recovered with a fresh on-disk DB (${HEALTH_DB}); proceeding to re-init."
+# Three-way classification (reviewer fold):
+#   1. recovered (self OR restart) AND NO ghost-fd was ever seen → clean PASS.
+#   2. ghost-fd WAS seen (the #610 fingerprint) → XFAIL, even if a restart later
+#      recovered. The ghost-fd window is itself the shipped bug we've filed as
+#      hub#610; greening on it would be the false-confidence we're guarding
+#      against. Loud banner, exit 0 (known bug, not a harness failure).
+#   3. NO ghost-fd AND NOT recovered → a genuinely-dead hub with no #610
+#      explanation (startup crash, bad binary, perms). HARD FAIL (non-zero).
+if [ "$recovered" -eq 1 ] && [ "$GHOST_SEEN" -eq 0 ] && [ "$ONDISK_DB" = "present" ]; then
+  note "clean recovery with a fresh on-disk DB (${HEALTH_DB}); no ghost-fd observed. Proceeding to re-init."
   # Re-run init — version-check / adoption must not wedge (#590).
   note "Re-running 'parachute init' after the wipe…"
   INIT3_LOG=/tmp/parachute-init-3.log
@@ -386,35 +429,39 @@ if [ "$recovered" -eq 1 ] && [ "$ONDISK_DB" = "present" ]; then
     *) cat /tmp/setup-after.json >&2 || true
        die "stage3-wipe-recovery" "/admin/setup returned ${WIZ_CODE} after wipe (5xx?)" ;;
   esac
-  record "stage3-wipe-recovery" "PASS" "REAL recovery: PID changed, fresh on-disk DB, re-init clean"
-else
-  # The dead-handle bug: /health says db:ok but the on-disk DB is gone and the
-  # process never restarted. Prove it's the ghost-fd class before labeling it.
-  # Inspect each fd's symlink TARGET via readlink (not `ls | grep` — we need the
-  # link destination, which carries the " (deleted)" marker, not the fd name).
-  GHOST_FD=0
-  for fd in "/proc/${PID_BEFORE}/fd/"*; do
-    [ -e "$fd" ] || [ -L "$fd" ] || continue
-    target="$(readlink "$fd" 2>/dev/null || true)"
-    case "$target" in
-      *hub.db*"(deleted)") GHOST_FD=$(( GHOST_FD + 1 )) ;;
-    esac
-  done
-  printf '\n================= #594 FINDING (live on this build) =================\n' >&2
-  printf '  /health reports %s but on-disk hub.db is %s and MainPID is unchanged (%s).\n' \
-    "${HEALTH_DB:-?}" "$ONDISK_DB" "$PID_BEFORE" >&2
-  printf '  Open deleted hub.db fds on the still-running hub: %s\n' "${GHOST_FD:-?}" >&2
+  record "stage3-wipe-recovery" "PASS" "clean recovery: PID changed, fresh on-disk DB, no ghost-fd, re-init clean"
+elif [ "$GHOST_SEEN" -eq 1 ]; then
+  # The KNOWN #610 ghost-fd gap. On rc this is the live shape: the hub serves a
+  # ghost DB during the wipe window (reactive self-heal never fires on the
+  # unlinked-but-open fd), and an operator `systemctl restart` recovers it. We
+  # XFAIL — a filed, tracked shipped bug, not a harness failure.
+  printf '\n=========== hub#610 FINDING (ghost-fd, live on this build) ===========\n' >&2
+  printf '  After rm -rf ~/.parachute, the hub kept open deleted hub.db fd(s)\n' >&2
+  printf '  (count seen: %s) and served /health=%s from the ghost inode.\n' "${GHOST_FD:-?}" "${HEALTH_DB:-?}" >&2
   printf '  The reactive self-heal (#594) only fires on a THROWN SQLite error;\n' >&2
   printf '  an unlinked-but-open fd keeps SELECT 1 + writes succeeding, so the\n' >&2
-  printf '  handle is never reopened, the process never exits, and the hub serves\n' >&2
-  printf '  a GHOST DB indefinitely (green /health, but a fresh CLI sees nothing).\n' >&2
-  printf '====================================================================\n\n' >&2
+  printf '  handle is never reopened and a fresh CLI (opens by path) sees nothing.\n' >&2
+  printf '  Recovery here: %s. Tracked as hub#610.\n' \
+    "$([ "$recovered" -eq 1 ] && echo "operator restart succeeded" || echo "NOT recovered even after restart")" >&2
+  printf '======================================================================\n\n' >&2
   # Dump the offending fd targets for the transcript (readlink, not ls|grep).
-  for fd in "/proc/${PID_BEFORE}/fd/"*; do
-    target="$(readlink "$fd" 2>/dev/null || true)"
-    case "$target" in *hub.db*) printf '  fd %s -> %s\n' "$(basename "$fd")" "$target" >&2 ;; esac
-  done
-  xfail "stage3-wipe-recovery" "#594 dead-handle: health=${HEALTH_DB:-?}, on-disk DB ${ONDISK_DB}, PID unchanged, ${GHOST_FD:-?} deleted hub.db fd(s) open"
+  if [ "$(systemctl show -p MainPID --value parachute-hub.service)" = "$PID_BEFORE" ]; then
+    for fd in "/proc/${PID_BEFORE}/fd/"*; do
+      target="$(readlink "$fd" 2>/dev/null || true)"
+      case "$target" in *hub.db*) printf '  fd %s -> %s\n' "$(basename "$fd")" "$target" >&2 ;; esac
+    done
+  fi
+  xfail "stage3-wipe-recovery" "hub#610 ghost-fd: health=${HEALTH_DB:-?}, ${GHOST_FD:-?} deleted hub.db fd(s), restart-recovered=$([ "$recovered" -eq 1 ] && echo yes || echo no)"
+else
+  # No ghost-fd explanation AND the hub did not recover → genuinely dead.
+  # This is a REAL failure (startup crash / bad binary / perms), NOT the #610
+  # gap, so it must FAIL the run with a non-zero exit.
+  printf '\n!! Stage 3: hub did NOT recover and NO ghost-fd was observed.\n' >&2
+  printf '   MainPID before=%s now=%s ; /health db=%s ; on-disk hub.db=%s\n' \
+    "$PID_BEFORE" "$(systemctl show -p MainPID --value parachute-hub.service)" "${HEALTH_DB:-?}" "$ONDISK_DB" >&2
+  systemctl --no-pager status parachute-hub.service 2>&1 | head -25 >&2 || true
+  curl -s "${HUB}/health" >&2 || true; echo >&2
+  die "stage3-wipe-recovery" "hub unrecoverable after wipe with no ghost-fd explanation (genuine failure, not hub#610): health=${HEALTH_DB:-?}, on-disk DB ${ONDISK_DB}"
 fi
 
 # ===========================================================================

@@ -205,7 +205,7 @@ if [ "$STAGES_RC" -ne 0 ]; then
   exit "$STAGES_RC"
 fi
 if [ "${XFAIL_COUNT:-0}" -gt 0 ]; then
-  warn "E2E PASSED with ${XFAIL_COUNT} XFAIL(s) — known live bug(s) surfaced (see the #594 FINDING block above)."
+  warn "E2E PASSED with ${XFAIL_COUNT} XFAIL(s) — known, tracked live bug(s) surfaced (see the FINDING block(s) above, e.g. hub#610)."
   warn "  HUB_SOURCE=$HUB_SOURCE VAULT_CHANNEL=$VAULT_CHANNEL"
   exit 0
 fi
