@@ -23,11 +23,16 @@ ENV container=docker
 
 # OS-level deps a real box has / that aren't under test. `systemd` +
 # `systemd-sysv` give us PID-1 systemd + `systemctl`. `dbus` is required for
-# systemd to come up cleanly inside a container.
+# systemd to come up cleanly inside a container. `dnsutils` (`dig`) is the DNS
+# troubleshooting tool an operator reaches for when a fresh tunnel hostname
+# "won't resolve" — Stage 4 uses it to query Cloudflare's resolver DIRECTLY
+# (`dig @1.1.1.1 <fqdn>`), bypassing the container's stub-resolver negative-
+# cache of the pre-creation NXDOMAIN (the false-FAIL the prior probe hit).
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     systemd systemd-sysv dbus \
     curl unzip ca-certificates git python3 \
+    dnsutils \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 

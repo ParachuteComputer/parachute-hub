@@ -39,11 +39,11 @@ restart paths.
 
 | File | Role |
 |---|---|
-| `Dockerfile.systemd` | Ubuntu 24.04 + systemd PID 1. Bakes only OS deps a real box has (curl, unzip, ca-certs, git, python3) — **not** bun or parachute (installing those is the test). Masks container-hostile units. |
+| `Dockerfile.systemd` | Ubuntu 24.04 + systemd PID 1. Bakes only OS deps a real box has (curl, unzip, ca-certs, git, python3, `dnsutils` for `dig`) — **not** bun or parachute (installing those is the test). Masks container-hostile units. |
 | `run.sh` | Host-side driver (runs on macOS / ubuntu runners). Builds the image, boots the container with the systemd flags, waits for `systemctl is-system-running`, copies + execs the staged script, **always** tears down (trap), prints a per-stage summary table. |
 | `stages.sh` | Runs **inside** the container as root (matching real fresh-VPS transcripts). The staged assertions. |
 | `mcp-probe.ts` | The full OAuth dance + MCP round-trip, run with `bun` inside the container. DCR → login → PKCE authorize/consent → token → MCP `initialize`/`tools/list`/`create-note`/`query-notes`. Takes `--hub <origin>`, so Stage 4 re-runs it against the **public** tunnel origin. |
-| `cf-dns-cleanup.ts` | Stage-4 DNS-record teardown. `cloudflared` can create a CNAME (`tunnel route dns`) but has no delete; this parses the `ARGO TUNNEL TOKEN` embedded in the cloudflared cert.pem and deletes the per-run record via the CF API, so the shared test zone never accumulates orphaned records. |
+| `cf-dns-cleanup.ts` | Stage-4 DNS-record teardown. `cloudflared` can create a CNAME (`tunnel route dns`) but has no delete; this parses the `cfut_…` API token embedded in the cloudflared cert.pem, authenticates with `Authorization: Bearer` (the token that **created** the record can **delete** it — self-contained, no second secret), deletes the per-run record via the CF API, and **self-verifies** the zone re-list is empty before exiting 0. So the shared test zone never accumulates orphaned records. |
 | `e2e.yml` (in `.github/workflows/`) | `workflow_dispatch` + `push: tags v*`. Passes `secrets.CLOUDFLARED_CERT_PEM` + `vars.E2E_TEST_ZONE` so Stage 4 runs in CI. |
 
 ## Running it locally
@@ -91,7 +91,7 @@ the sandbox — the harness **never** touches the host's launchd / live hub /
 | **1 — fresh install happy path** | bun installs; `bun add -g @openparachute/hub` shows **no** "Blocked postinstall"; `parachute init` brings up an **active** `parachute-hub.service`; `/health` is 200 with `db:"ok"`; vault module installs honoring `PARACHUTE_INSTALL_CHANNEL`; the setup wizard (driven over loopback, bootstrap-token-free per #576) creates the admin + sets expose; a named vault is created + served (401 auth-gated health); the **full OAuth dance + MCP note round-trip** succeeds; `mint-token` → REST `/api/notes` 200. | **#568** (blocked-postinstall regression), **#576** (loopback wizard token-free), **#594** (`/health` `db` field), **#423** (401 = healthy vault). |
 | **2 — idempotent re-run** | a second `parachute init` exits 0; hub still `db:"ok"`; **exactly one** `parachute-hub` unit (no duplicate); admin preserved — the setup probe is asserted to return a **recognized non-empty** token (an empty probe result is a HARD fail, never a silent pass). | the "re-running init duplicated/zombied a unit" class. |
 | **3 — wipe recovery (the laptop scenario)** | `rm -rf ~/.parachute` while the unit runs. **Proves a REAL recovery, not a stale-handle lie:** captures the unit MainPID + confirms `hub.db` is actually gone from disk, watches for the ghost-fd fingerprint, then classifies three-way (clean PASS / known-#610 XFAIL / genuine FAIL — see below). On the happy path it requires recovery to (a) **change the MainPID** (fresh process == fresh DB handle) AND (b) put `hub.db` **back on disk**, before re-running `parachute init` (must not wedge, #590) + asserting the wizard is coherent. | **#594** (dead-DB-handle: green `/health` on a ghost DB), **hub#610** (the ghost-fd self-heal gap), **#590** (stale-zombie version adoption). |
-| **4 — public Cloudflare expose** | installs `cloudflared` (static binary), places the origin cert, runs the **real** `parachute expose public --cloudflare --domain <per-run FQDN>`, then asserts the **public URL serves** (`https://<fqdn>/health` → 200 `db:ok` through the tunnel — a 1033 / DNS-not-live **fails**), re-runs the **full OAuth dance + MCP round-trip over the public origin** (`mcp-probe.ts --hub https://<fqdn>`), checks the origin-pinned-credential self-heal (vault `.env` `PARACHUTE_HUB_ORIGIN` → public origin, survives a restart), and **always tears the tunnel + DNS record down** (in-container trap + host-side net). **Gated:** with no `CLOUDFLARED_CERT_PEM` it SKIPs (loopback-only run stays green). | **#593** / error-**1033** (connector verified before "tunnel up"), **#503/#481** (origin-pinned-credential self-heal on expose / clear on teardown), the Cloudflare connector OAuth-403 field cases. |
+| **4 — public Cloudflare expose** | installs `cloudflared` (static binary), places the origin cert, runs the **real** `parachute expose public --cloudflare --domain <per-run FQDN>`, then asserts the **public URL serves** in two phases — **Phase A** waits for DNS to resolve (`dig @1.1.1.1`, bypassing the container's stub-resolver negative-cache, bounded 180s); **Phase B** probes `https://<fqdn>/health` → 200 `db:ok` pinned to the resolved edge IP (`curl --resolve`). Three-way failure classification: DNS-never-resolves vs resolves-but-1033 (connector down) vs resolves-and-up-but-5xx (product bug). Then re-runs the **full OAuth dance + MCP round-trip over the public origin** (`mcp-probe.ts --hub https://<fqdn>`), checks the origin-pinned-credential self-heal (vault `.env` `PARACHUTE_HUB_ORIGIN` → public origin, survives a restart), and **always tears the tunnel + DNS record down + verifies zero orphans** (in-container trap + host-side net). **Gated:** with no `CLOUDFLARED_CERT_PEM` it SKIPs (loopback-only run stays green). | **#593** / error-**1033** (connector verified before "tunnel up"; failure-mode disambiguated from DNS-propagation), **#503/#481** (origin-pinned-credential self-heal on expose / clear on teardown), the Cloudflare connector OAuth-403 field cases. |
 
 ### Why Stage 3 is built this way (false-pass avoidance)
 
@@ -129,23 +129,53 @@ each run's tunnel + DNS record is uniquely named and torn down independently.
 
 **What it asserts.** Install `cloudflared` (static binary, the path the product
 drives) → place the cert at `~/.cloudflared/cert.pem` → run the real
-`parachute expose public --cloudflare --domain <fqdn>` → poll the **public**
-`https://<fqdn>/health` until 200 `db:ok` through the tunnel (a 1033 / DNS-not-
-live **fails** the stage — the exact field failure this pins, #593) → re-run
-the **full OAuth dance + MCP round-trip over the public origin** → check the
-origin-pinned-credential self-heal (vault `.env` `PARACHUTE_HUB_ORIGIN` reflects
-the public origin and survives a restart; cleared on teardown — #503/#481).
+`parachute expose public --cloudflare --domain <fqdn>` → verify the **public**
+URL serves through the tunnel (two phases, below) → re-run the **full OAuth
+dance + MCP round-trip over the public origin** → check the origin-pinned-
+credential self-heal (vault `.env` `PARACHUTE_HUB_ORIGIN` reflects the public
+origin and survives a restart; cleared on teardown — #503/#481).
 
-**Teardown is non-negotiable.** The tunnel AND the per-run DNS record are
-deleted on EVERY exit — success, assertion failure, or container death:
+**Public-serve probe — two phases, never conflated.** The naive "loop curl
+until /health is green" false-FAILs: the container's stub resolver
+negatively-caches the pre-creation NXDOMAIN, so `curl` gets "Could not resolve
+host" for the whole window even when the connector is confirmed up — and the
+FAIL blames 1033, hiding that DNS was the issue. Instead:
+- **Phase A — DNS resolution.** Poll `dig @1.1.1.1 <fqdn>` (query Cloudflare's
+  resolver *directly*, dodging the container's negative-cache), bounded 180s.
+  If it never resolves → FAIL labelled **DNS-never-resolves** (propagation/zone),
+  with the connector count printed for context (so a fine connector isn't
+  blamed).
+- **Phase B — health through the edge.** Pin `curl --resolve <fqdn>:443:<ip>`
+  to the resolved edge IP (so it doesn't re-hit the stub resolver) and poll for
+  200 `db:ok`. On failure, classify: **resolves-but-1033** (connector count 0 /
+  a 1033 body — the #593 connector-down path) vs **resolves-and-up-but-5xx** (a
+  real product bug). Before the MCP phase, the container resolver is repointed
+  at 1.1.1.1 so `mcp-probe.ts`'s `fetch()` resolves fresh too.
+
+**Teardown is non-negotiable — zero orphans guaranteed.** The tunnel AND the
+per-run DNS record are deleted on EVERY exit — success, assertion failure, or
+container death:
 - In-container trap (`stage4_teardown`, fires on the stage's `EXIT`/`die`):
   `parachute expose … off` → `cloudflared tunnel delete -f <name>` →
-  `cf-dns-cleanup.ts` deletes the CNAME via the CF API (cloudflared has no
-  unroute command; the cert's embedded `ARGO TUNNEL TOKEN` authorizes the API).
+  `cf-dns-cleanup.ts` deletes the CNAME via the CF API and **self-verifies the
+  zone re-list is empty** before exiting 0. cloudflared has no unroute command,
+  so the helper hits the CF API directly — authenticating with the `cfut_…`
+  token embedded in the cert via `Authorization: Bearer` (**the token that
+  created the record can delete it** — self-contained, no second secret). The
+  trap then does an independent `dig @1.1.1.1` NXDOMAIN check.
 - Host-side net in `run.sh`'s trap: re-runs the same `tunnel delete` +
   `cf-dns-cleanup.ts` for the case where the whole container dies before its
-  trap can run. Best-effort, idempotent (deleting an already-gone record is a
-  no-op). A leaked tunnel/DNS record per run is unacceptable on a shared zone.
+  trap can run, surfacing a leak LOUDLY. Best-effort, idempotent (deleting an
+  already-gone record is a no-op). A leaked tunnel/DNS record per run is
+  unacceptable on a shared zone.
+
+> **Auth note (the orphan bug this fixes):** the cert token is a Cloudflare
+> *API token* (`cfut_…`), not a legacy "service key". The first cut sent it via
+> the legacy `X-Auth-User-Service-Key` header, which the generic `/dns_records`
+> endpoint rejects with HTTP 400 — so teardown failed and leaked a CNAME.
+> `cf-dns-cleanup.ts` now sends `Authorization: Bearer` first (verified live
+> against the CF API), falling back to the legacy header only for genuinely-old
+> `serviceKey`/`s` certs.
 
 ## When to run it
 
