@@ -39,6 +39,13 @@ note() { printf '  -> %s\n' "$*"; }
 record() { printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$RESULTS"; }
 
 # Hard-fail: record FAIL + abort the whole run (non-zero exit propagates).
+# NOTE on the matrix: a `die` aborts immediately, so any LATER stage is skipped
+# (its result never recorded). This is intentional — stages have real ordering
+# dependencies (2/3/4 all need Stage 1's install; the wipe needs a live hub) and
+# a genuine hard failure should stop loudly rather than soldier on against a
+# broken box. `xfail` (known bugs) continues; only a true FAIL aborts. The
+# expose stage (3) running before the destructive wipe (4) means a green Stage 3
+# is the gate for Stage 4 running — which is exactly why we keep Stage 3 robust.
 die() {
   local stage="$1"; shift
   printf '\n!! STAGE FAILED: %s — %s\n' "$stage" "$*" >&2
