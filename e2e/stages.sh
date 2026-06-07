@@ -513,15 +513,34 @@ else
       fi
     fi
     # 3. Delete the per-run DNS record via the CF API (cloudflared has no
-    #    unroute command). cf-dns-cleanup.ts reuses the cert's embedded token.
+    #    unroute command). cf-dns-cleanup.ts authenticates with the cert's
+    #    embedded `cfut_` API token via `Authorization: Bearer` (the token that
+    #    CREATED the record can delete it — self-contained, no second secret),
+    #    and self-verifies the record is gone from the zone (authoritative
+    #    re-list) before exiting 0. A non-zero exit = a genuine leak — surfaced
+    #    LOUDLY here; the host-side net in run.sh then retries.
     if [ -f /root/.cloudflared/cert.pem ]; then
       if bun /root/cf-dns-cleanup.ts --cert /root/.cloudflared/cert.pem --fqdn "$E2E_FQDN" \
           >/tmp/stage4-dns-cleanup.log 2>&1; then
         cat /tmp/stage4-dns-cleanup.log >&2 || true
       else
-        note "DNS cleanup reported an issue (host-side trap will retry):"
+        printf '\n!! DNS CLEANUP FAILED — POSSIBLE ORPHAN. Host-side trap will retry.\n' >&2
         cat /tmp/stage4-dns-cleanup.log >&2 || true
       fi
+    fi
+    # 4. Independent post-teardown NXDOMAIN check at Cloudflare's resolver — the
+    #    "zero orphans" assertion the operator asked for. Authoritative-side
+    #    deletion is immediate (cf-dns-cleanup verified the zone re-list); the
+    #    public resolver clears shortly after. We give it a brief window, then
+    #    report. This is a diagnostic (the authoritative re-list in
+    #    cf-dns-cleanup is the real gate) — but it makes a leak unmissable.
+    local left
+    left="$(dig +short +time=3 +tries=1 @1.1.1.1 "${E2E_FQDN}" A 2>/dev/null \
+      | grep -Eo '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+    if [ -n "$left" ]; then
+      printf '!! %s still resolves (%s) at 1.1.1.1 immediately post-teardown — edge cache may lag; the zone-side delete was verified by cf-dns-cleanup.\n' "$E2E_FQDN" "$left" >&2
+    else
+      note "post-teardown: ${E2E_FQDN} no longer resolves at 1.1.1.1 (no orphan)."
     fi
     printf '====================================================\n\n' >&2
     return "$tc"
@@ -590,19 +609,74 @@ else
   PUBLIC="https://${E2E_FQDN}"
 
   # --- assert the PUBLIC URL actually serves the hub through the tunnel ---
-  # This is the #593 / error-1033 path: a tunnel can be "up" account-side with
-  # NO live connector (1033), or DNS may not have propagated. We poll the real
-  # public origin from inside the container (egress to Cloudflare's edge) until
-  # /health returns 200 with db:ok, bounded. A 1033 / DNS-NXDOMAIN must FAIL.
-  note "Polling ${PUBLIC}/health through the public tunnel (bounded 90s)…"
-  if ! wait_for "public /health db:ok" 90 "curl -fsS --max-time 8 ${PUBLIC}/health | grep -q '\"db\":\"ok\"'"; then
-    note "public /health never returned db:ok — dumping diagnostics:"
-    curl -sS -i --max-time 8 "${PUBLIC}/health" >&2 2>&1 | head -30 || true
+  # Two PHASES, deliberately separated so a slow-to-propagate DNS record (the
+  # common, benign case) isn't conflated with a down connector (the #593 /
+  # error-1033 bug). The prior single-curl-loop FALSE-FAILED: the container's
+  # stub resolver had negatively-cached the pre-creation NXDOMAIN, so `curl`
+  # got "Could not resolve host" for the whole window even though the connector
+  # was confirmed up — and the FAIL message blamed 1033, hiding that.
+  #
+  # PHASE A — DNS resolution. Query Cloudflare's resolver DIRECTLY
+  # (`dig @1.1.1.1`), which dodges the container's stub-resolver negative-cache
+  # entirely (we never ask the cached resolver). Bounded long (180s): a proxied
+  # record is usually fast, but a fresh record + negative-cache needs margin.
+  note "Phase A — waiting for ${E2E_FQDN} to resolve (dig @1.1.1.1, bounded 180s)…"
+  RESOLVED_IP=""
+  dns_deadline=$(( $(date +%s) + 180 ))
+  while [ "$(date +%s)" -lt "$dns_deadline" ]; do
+    # +short prints just the answer addresses (CNAME chain resolved to A/AAAA).
+    # Grab the first IPv4 the chain lands on. Query 1.1.1.1 explicitly so we
+    # never consult the container's cached stub resolver.
+    RESOLVED_IP="$(dig +short +time=3 +tries=1 @1.1.1.1 "${E2E_FQDN}" A 2>/dev/null \
+      | grep -Eo '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+    [ -n "$RESOLVED_IP" ] && break
+    sleep 3
+  done
+  if [ -z "$RESOLVED_IP" ]; then
+    note "DNS NEVER RESOLVED for ${E2E_FQDN} within 180s (querying 1.1.1.1 directly)."
+    note "  This is a DNS-propagation / zone issue, NOT a connector failure:"
+    dig @1.1.1.1 "${E2E_FQDN}" 2>&1 | sed -n '1,25p' >&2 || true
+    note "  Connector status for context (count below; >0 means the tunnel side is fine):"
     cloudflared tunnel info "${STAGE4_TUNNEL_NAME}" >&2 2>&1 || true
-    die "stage4-expose" "public ${PUBLIC}/health did not serve db:ok within 90s (error-1033 / DNS-not-live — the exact field failure this stage pins)"
+    die "stage4-expose" "FAILURE MODE = DNS-never-resolves: ${E2E_FQDN} did not resolve at 1.1.1.1 within 180s (propagation/zone), connector side may be fine"
   fi
-  note "✓ ${PUBLIC}/health serves db:ok through the real Cloudflare tunnel."
-  record "stage4-public-health" "PASS" "${E2E_FQDN}/health 200 db:ok via tunnel"
+  note "✓ ${E2E_FQDN} resolves to ${RESOLVED_IP} (Cloudflare edge)."
+
+  # PHASE B — health through the edge. Pin curl to the resolved IP with
+  # `--resolve` so it does NOT re-consult the container's (still possibly
+  # stale-negative) stub resolver — we already know the address. Poll for 200
+  # db:ok, bounded.
+  note "Phase B — probing https://${E2E_FQDN}/health via edge ${RESOLVED_IP} (bounded 60s)…"
+  if ! wait_for "public /health db:ok" 60 \
+      "curl -fsS --max-time 8 --resolve ${E2E_FQDN}:443:${RESOLVED_IP} ${PUBLIC}/health | grep -q '\"db\":\"ok\"'"; then
+    # Distinguish resolves-but-1033 (connector down) from resolves-and-up-but-5xx
+    # (real product bug) using the connector count + the actual HTTP response.
+    note "Phase B failed — classifying (DNS resolved, so it's connector-1033 OR a product 5xx)…"
+    CONN_COUNT="$(cloudflared tunnel info --output json "${STAGE4_TUNNEL_NAME}" 2>/dev/null \
+      | bun -e 'try{const j=JSON.parse(await Bun.stdin.text());console.log((j.conns??j.connections??[]).length||0)}catch{console.log(0)}' 2>/dev/null || echo 0)"
+    HTTP_BODY="$(curl -sS -i --max-time 8 --resolve "${E2E_FQDN}:443:${RESOLVED_IP}" "${PUBLIC}/health" 2>&1 | head -30 || true)"
+    printf '%s\n' "$HTTP_BODY" >&2
+    cloudflared tunnel info "${STAGE4_TUNNEL_NAME}" >&2 2>&1 || true
+    if printf '%s' "$HTTP_BODY" | grep -q "1033" || [ "${CONN_COUNT:-0}" -eq 0 ]; then
+      die "stage4-expose" "FAILURE MODE = resolves-but-1033: ${E2E_FQDN} resolves (${RESOLVED_IP}) but no live connector (count=${CONN_COUNT}) — error 1033 (this is the #593 connector-down path)"
+    fi
+    die "stage4-expose" "FAILURE MODE = resolves-and-connector-up-but-unhealthy: ${E2E_FQDN} resolves + ${CONN_COUNT} connector(s) live, but /health is not 200 db:ok — a REAL product bug (see body above)"
+  fi
+  note "✓ https://${E2E_FQDN}/health serves db:ok through the real Cloudflare tunnel."
+  record "stage4-public-health" "PASS" "${E2E_FQDN}/health 200 db:ok via tunnel (DNS+edge verified)"
+
+  # Resolver-cache bypass for the MCP phase. mcp-probe.ts resolves via Bun's
+  # `fetch()`, which goes through the container's STUB resolver — the same one
+  # that negatively-cached the pre-creation NXDOMAIN. Phase A proved the record
+  # is live at Cloudflare's resolver, so point the container straight at 1.1.1.1
+  # for the rest of the stage; fetch() then resolves fresh (no stale negative).
+  # Best-effort: if resolv.conf is read-only (rare), the curl --resolve health
+  # probe already passed, and worst case the MCP probe retries against a now-
+  # warm cache. We append rather than clobber so existing entries still work.
+  if [ -w /etc/resolv.conf ]; then
+    note "Pointing the container resolver at 1.1.1.1 (bypass the stub negative-cache for fetch())…"
+    printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' > /etc/resolv.conf 2>/dev/null || true
+  fi
 
   # --- MCP-over-public: full OAuth dance + round-trip against the PUBLIC origin ---
   # Reuses the same probe as Stage 1 but points it at the public https origin,

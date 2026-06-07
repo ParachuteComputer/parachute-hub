@@ -110,12 +110,17 @@ host_side_cf_teardown() {
     TUNNEL_ORIGIN_CERT="$CERT_FILE" cloudflared tunnel delete -f "$tname" >/dev/null 2>&1 \
       && log "  host-side: deleted tunnel '$tname'." || true
   fi
-  # DNS record cleanup via the CF API (reuses the cert's embedded token). bun is
-  # installed on the host for HUB_SOURCE=local; if absent, the in-container trap
-  # already handled it on the happy path.
+  # DNS record cleanup via the CF API (reuses the cert's embedded `cfut_` token
+  # via Bearer; self-verifies the zone re-list is empty). bun is on the host for
+  # HUB_SOURCE=local; if absent, the in-container trap already handled it. We
+  # surface the outcome (not >/dev/null) so a genuine orphan-leak is LOUD —
+  # this is the last line of defense on a shared zone.
   if [ -n "$CERT_FILE" ] && [ -f "$CERT_FILE" ] && command -v bun >/dev/null 2>&1; then
-    bun "$HERE/cf-dns-cleanup.ts" --cert "$CERT_FILE" --fqdn "$E2E_FQDN" >/dev/null 2>&1 \
-      && log "  host-side: DNS record for ${E2E_FQDN} cleaned." || true
+    if bun "$HERE/cf-dns-cleanup.ts" --cert "$CERT_FILE" --fqdn "$E2E_FQDN" 2>&1; then
+      log "  host-side: DNS record for ${E2E_FQDN} cleaned + verified gone."
+    else
+      err "  host-side: DNS cleanup FAILED for ${E2E_FQDN} — POSSIBLE ORPHAN, check the zone manually."
+    fi
   fi
 }
 
