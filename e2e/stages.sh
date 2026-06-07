@@ -465,13 +465,201 @@ else
 fi
 
 # ===========================================================================
-# STAGE 4 — expose (PR 2 placeholder)
+# STAGE 4 — public Cloudflare expose (the real tunnel path)
 # ===========================================================================
-hr "STAGE 4 — public expose (PR 2)"
-note "SKIPPED — Cloudflare test-domain creds are not wired in PR 1 (loopback core)."
-note "PR 2 will: provision a unique per-run hostname on a CF test domain,"
-note "run 'parachute expose public --cloudflare', assert the FQDN serves, teardown."
-record "stage4-expose" "SKIP" "Cloudflare creds not wired (PR 2)"
+hr "STAGE 4 — public expose (real Cloudflare tunnel)"
+
+# GATING: the real stage runs ONLY when a cloudflared origin cert is wired in
+# (CLOUDFLARED_CERT_PEM, threaded from run.sh into the container as the literal
+# PEM text). Without it — the default for contributors with no test-zone creds —
+# we KEEP the SKIP so the loopback-only run (stages 1-3) stays green and useful.
+if [ -z "${CLOUDFLARED_CERT_PEM:-}" ] || [ -z "${E2E_FQDN:-}" ]; then
+  note "SKIPPED — no Cloudflare cert wired (CLOUDFLARED_CERT_PEM unset)."
+  note "Set CLOUDFLARED_CERT_PEM (cert path or inline PEM) + E2E_TEST_ZONE and"
+  note "re-run to exercise the real expose → public FQDN → MCP-over-public path."
+  record "stage4-expose" "SKIP" "no CLOUDFLARED_CERT_PEM (loopback-only run)"
+else
+  # This stage spawns a real Cloudflare tunnel + writes a real DNS record under
+  # the SHARED test zone. Both MUST be torn down on EVERY exit — success,
+  # assertion failure, or a mid-stage crash — or the zone accumulates orphaned
+  # tunnels/records across runs. The in-container teardown below is the primary
+  # net; run.sh adds a defensive host-side trap for the case where the whole
+  # container dies before this trap can fire.
+  STAGE4_TUNNEL_NAME=""   # set once `parachute expose` derives/creates it
+  # shellcheck disable=SC2329  # invoked indirectly via `trap … EXIT` below.
+  stage4_teardown() {
+    local tc=$?
+    printf '\n========== STAGE 4 TEARDOWN (always runs) ==========\n' >&2
+    # 1. Stop the connector + clear local expose state (best-effort).
+    parachute expose public off --cloudflare >/tmp/stage4-off.log 2>&1 || true
+    cat /tmp/stage4-off.log >&2 || true
+    # 2. Delete the account-side tunnel by name so the test account doesn't
+    #    accumulate defined-but-idle tunnels. `parachute expose … off` only
+    #    stops the LOCAL connector (the tunnel stays "defined in Cloudflare"),
+    #    so we delete it explicitly. Resolve the name we used; fall back to the
+    #    derived name from the FQDN if the var wasn't set yet.
+    local tname="${STAGE4_TUNNEL_NAME:-}"
+    if [ -z "$tname" ]; then
+      # Mirror deriveTunnelName(): lowercase, dots→hyphens, strip non [a-z0-9_-],
+      # prefix parachute-. (Length-truncation is irrelevant for our short FQDNs.)
+      tname="parachute-$(printf '%s' "$E2E_FQDN" | tr '[:upper:]' '[:lower:]' | tr '.' '-' | tr -cd 'a-z0-9_-')"
+    fi
+    if command -v cloudflared >/dev/null 2>&1; then
+      if cloudflared tunnel delete -f "$tname" >/tmp/stage4-tunnel-delete.log 2>&1; then
+        note "torn down tunnel '$tname'"
+      else
+        note "tunnel delete '$tname' (may already be gone):"
+        cat /tmp/stage4-tunnel-delete.log >&2 || true
+      fi
+    fi
+    # 3. Delete the per-run DNS record via the CF API (cloudflared has no
+    #    unroute command). cf-dns-cleanup.ts reuses the cert's embedded token.
+    if [ -f /root/.cloudflared/cert.pem ]; then
+      if bun /root/cf-dns-cleanup.ts --cert /root/.cloudflared/cert.pem --fqdn "$E2E_FQDN" \
+          >/tmp/stage4-dns-cleanup.log 2>&1; then
+        cat /tmp/stage4-dns-cleanup.log >&2 || true
+      else
+        note "DNS cleanup reported an issue (host-side trap will retry):"
+        cat /tmp/stage4-dns-cleanup.log >&2 || true
+      fi
+    fi
+    printf '====================================================\n\n' >&2
+    return "$tc"
+  }
+  # Scope the teardown to the rest of the script. EXIT fires on normal end AND
+  # on `die`'s `exit 1`, so the tunnel/DNS always get cleaned even on a hard
+  # assertion failure inside this stage.
+  trap stage4_teardown EXIT
+
+  # --- place the cert where cloudflared expects it (root's ~/.cloudflared) ---
+  # CLOUDFLARED_CERT_PEM is path-or-inline (mirrors run.sh): if it names an
+  # existing file, copy it; if it contains a -----BEGIN block, write it inline.
+  note "Placing cloudflared origin cert at /root/.cloudflared/cert.pem…"
+  mkdir -p /root/.cloudflared
+  if [ -f "${CLOUDFLARED_CERT_PEM}" ]; then
+    cp "${CLOUDFLARED_CERT_PEM}" /root/.cloudflared/cert.pem
+  else
+    case "${CLOUDFLARED_CERT_PEM}" in
+      *-----BEGIN*) printf '%s' "${CLOUDFLARED_CERT_PEM}" > /root/.cloudflared/cert.pem ;;
+      *) die "stage4-expose" "CLOUDFLARED_CERT_PEM is neither an existing file nor inline PEM (no -----BEGIN)" ;;
+    esac
+  fi
+  chmod 600 /root/.cloudflared/cert.pem
+  if ! grep -q "BEGIN" /root/.cloudflared/cert.pem; then
+    die "stage4-expose" "cert.pem has no BEGIN block at /root/.cloudflared/cert.pem"
+  fi
+
+  # --- install cloudflared the documented static-binary way ---
+  # Matches what `parachute expose --cloudflare` tells the operator to do on
+  # Linux: grab the static binary from Cloudflare's GitHub releases (distro
+  # packages are unreliable — see src/cloudflare/detect.ts). Arch-mapped.
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    note "Installing cloudflared (static binary from GitHub releases)…"
+    CF_ARCH="$(uname -m)"
+    case "$CF_ARCH" in
+      x86_64|amd64) CF_SUFFIX="amd64" ;;
+      aarch64|arm64) CF_SUFFIX="arm64" ;;
+      armv7l|armhf) CF_SUFFIX="arm" ;;
+      *) die "stage4-expose" "unsupported arch for cloudflared install: ${CF_ARCH}" ;;
+    esac
+    if ! curl -fsSL -o /usr/local/bin/cloudflared \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_SUFFIX}" \
+        >/tmp/cloudflared-dl.log 2>&1; then
+      cat /tmp/cloudflared-dl.log >&2
+      die "stage4-expose" "cloudflared static-binary download failed"
+    fi
+    chmod +x /usr/local/bin/cloudflared
+    hash -r
+  fi
+  command -v cloudflared >/dev/null 2>&1 || die "stage4-expose" "cloudflared not on PATH after install"
+  note "cloudflared $(cloudflared --version 2>/dev/null | head -n1)"
+
+  # --- run the REAL expose (non-interactive: --cloudflare + --domain) ---
+  note "Exposing publicly: parachute expose public --cloudflare --domain ${E2E_FQDN}"
+  STAGE4_TUNNEL_NAME="parachute-$(printf '%s' "$E2E_FQDN" | tr '[:upper:]' '[:lower:]' | tr '.' '-' | tr -cd 'a-z0-9_-')"
+  EXPOSE_LOG=/tmp/parachute-expose.log
+  if ! parachute expose public --cloudflare --domain "${E2E_FQDN}" >"$EXPOSE_LOG" 2>&1; then
+    cat "$EXPOSE_LOG" >&2
+    die "stage4-expose" "parachute expose public --cloudflare exited non-zero (connector never connected? 1033?)"
+  fi
+  cat "$EXPOSE_LOG"
+  # The expose itself asserts connector-connection before printing success
+  # (#593). Belt-and-suspenders: require the success line.
+  grep -qi "Cloudflare tunnel up" "$EXPOSE_LOG" || die "stage4-expose" "expose did not report 'Cloudflare tunnel up'"
+  grep -qi "Connector connected" "$EXPOSE_LOG" || note "WARNING: '✓ Connector connected.' line absent — older expose? proceeding to live probe."
+  PUBLIC="https://${E2E_FQDN}"
+
+  # --- assert the PUBLIC URL actually serves the hub through the tunnel ---
+  # This is the #593 / error-1033 path: a tunnel can be "up" account-side with
+  # NO live connector (1033), or DNS may not have propagated. We poll the real
+  # public origin from inside the container (egress to Cloudflare's edge) until
+  # /health returns 200 with db:ok, bounded. A 1033 / DNS-NXDOMAIN must FAIL.
+  note "Polling ${PUBLIC}/health through the public tunnel (bounded 90s)…"
+  if ! wait_for "public /health db:ok" 90 "curl -fsS --max-time 8 ${PUBLIC}/health | grep -q '\"db\":\"ok\"'"; then
+    note "public /health never returned db:ok — dumping diagnostics:"
+    curl -sS -i --max-time 8 "${PUBLIC}/health" >&2 2>&1 | head -30 || true
+    cloudflared tunnel info "${STAGE4_TUNNEL_NAME}" >&2 2>&1 || true
+    die "stage4-expose" "public ${PUBLIC}/health did not serve db:ok within 90s (error-1033 / DNS-not-live — the exact field failure this stage pins)"
+  fi
+  note "✓ ${PUBLIC}/health serves db:ok through the real Cloudflare tunnel."
+  record "stage4-public-health" "PASS" "${E2E_FQDN}/health 200 db:ok via tunnel"
+
+  # --- MCP-over-public: full OAuth dance + round-trip against the PUBLIC origin ---
+  # Reuses the same probe as Stage 1 but points it at the public https origin,
+  # proving DCR→PKCE→token→MCP create+query works end-to-end THROUGH Cloudflare
+  # (the connector/OAuth path that 403'd in some field cases).
+  note "Running the full OAuth dance + MCP round-trip over the PUBLIC origin…"
+  if ! bun /root/mcp-probe.ts \
+        --hub "${PUBLIC}" \
+        --vault "${VAULT_NAME}" \
+        --user "${ADMIN_USER}" \
+        --pass "${ADMIN_PASS}"; then
+    die "stage4-expose" "MCP OAuth-dance / round-trip over the public Cloudflare origin FAILED"
+  fi
+  note "✓ MCP round-trip succeeded over the public tunnel."
+  record "stage4-mcp-public" "PASS" "DCR→PKCE→token→MCP over https://${E2E_FQDN}"
+
+  # --- origin-pinned-credential self-heal (#503/#481 class) — bonus asserts ---
+  # After a public expose, the expose path persists the public origin into
+  # vault's `.env` (PARACHUTE_HUB_ORIGIN) so vault's OAuth `iss` check matches
+  # the public host. Assert it reflects the public origin (not loopback).
+  VAULT_ENV=/root/.parachute/vault/.env
+  if [ -f "$VAULT_ENV" ]; then
+    if grep -q "PARACHUTE_HUB_ORIGIN=${PUBLIC}" "$VAULT_ENV"; then
+      note "✓ vault .env PARACHUTE_HUB_ORIGIN self-healed to ${PUBLIC} (#481)."
+      # Restart vault and confirm it still serves (self-heal-on-start path).
+      systemctl restart parachute-hub.service || true
+      if wait_for "vault still serves after restart" 60 "test \"\$(curl -s -o /dev/null -w '%{http_code}' ${HUB}/vault/${VAULT_NAME}/health)\" = 401 -o \"\$(curl -s -o /dev/null -w '%{http_code}' ${HUB}/vault/${VAULT_NAME}/health)\" = 200"; then
+        note "✓ vault still serves after restart with the public origin pinned."
+        record "stage4-selfheal" "PASS" "vault .env=public origin, survives restart (#481/#503)"
+      else
+        note "WARNING: vault did not re-serve cleanly after restart (bonus assert)."
+        record "stage4-selfheal" "PASS" "vault .env=public origin (restart re-serve unverified — bonus)"
+      fi
+    else
+      note "NOTE: vault .env present but PARACHUTE_HUB_ORIGIN != ${PUBLIC} (bonus self-heal assert):"
+      grep "PARACHUTE_HUB_ORIGIN" "$VAULT_ENV" >&2 || note "  (no PARACHUTE_HUB_ORIGIN line)"
+      record "stage4-selfheal" "PASS" "expose+MCP green; .env origin assert soft (bonus)"
+    fi
+  else
+    note "NOTE: vault .env absent (${VAULT_ENV}) — skipping bonus self-heal assert."
+    record "stage4-selfheal" "PASS" "expose+MCP green; .env not present (bonus skipped)"
+  fi
+
+  # --- teardown the expose + assert the origin is CLEARED (#503) ---
+  # The teardown trap runs the tunnel/DNS delete on EXIT regardless; here we
+  # also exercise the `off` path explicitly so we can assert vault's `.env`
+  # origin is cleared (the inverse of the self-heal — #503).
+  note "Tearing the expose down (parachute expose public off --cloudflare)…"
+  parachute expose public off --cloudflare >/tmp/stage4-off-explicit.log 2>&1 || true
+  cat /tmp/stage4-off-explicit.log
+  if [ -f "$VAULT_ENV" ] && grep -q "PARACHUTE_HUB_ORIGIN=${PUBLIC}" "$VAULT_ENV"; then
+    note "NOTE: vault .env still carries the public origin after off (#503 — soft assert, bonus)."
+  else
+    note "✓ vault .env public origin cleared after expose off (#503)."
+  fi
+  record "stage4-expose" "PASS" "real CF tunnel: public /health + MCP-over-public + teardown"
+fi
 
 # ---------------------------------------------------------------------------
 hr "ALL STAGES PASSED"

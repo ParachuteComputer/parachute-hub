@@ -33,11 +33,56 @@ HUB_SOURCE="${HUB_SOURCE:-npm:rc}"
 VAULT_CHANNEL="${VAULT_CHANNEL:-rc}"
 DOCKER="${E2E_DOCKER:-docker}"
 
+# Stage-4 (public Cloudflare expose) creds. OPTIONAL — when absent, Stage 4
+# SKIPs (stages 1-3 still run, so contributors without a test zone keep a
+# useful run). When present:
+#   CLOUDFLARED_CERT_PEM  the cloudflared origin cert for the test zone, as
+#                         EITHER a file path OR the literal PEM text (we detect
+#                         `-----BEGIN`). The cert authorizes `cloudflared tunnel
+#                         route dns` AND (via its embedded token) the CF-API DNS
+#                         cleanup. In CI it's `secrets.CLOUDFLARED_CERT_PEM`.
+#   E2E_TEST_ZONE         the Cloudflare zone to provision the per-run hostname
+#                         under (default: parachute.place). `vars.E2E_TEST_ZONE`
+#                         in CI.
+# `:-` covers unset; the `[ -z ]` also covers an empty-string value (CI passes
+# `vars.E2E_TEST_ZONE` which is "" when the variable isn't configured).
+E2E_TEST_ZONE="${E2E_TEST_ZONE:-parachute.place}"
+[ -z "$E2E_TEST_ZONE" ] && E2E_TEST_ZONE="parachute.place"
+
 # Unique per-run names so concurrent runs (and the host's live install) never
 # collide. PID + epoch keeps it unique even on a fast re-run.
 RUN_ID="$$-$(date +%s)"
 IMAGE="e2e-parachute-img-${RUN_ID}"
 CONTAINER="e2e-parachute-${RUN_ID}"
+
+# Per-run public hostname under the test zone. The short random suffix is
+# derived from the host RUN_ID (epoch+pid) so two concurrent/repeat runs never
+# collide on a hostname — and a crashed run never poisons the next (each run's
+# tunnel + DNS record is uniquely named, torn down independently). Lowercased,
+# dots-as-hyphens already (RUN_ID is digits + one hyphen).
+E2E_SUFFIX="$(printf '%s' "$RUN_ID" | tr -cd 'a-z0-9-')"
+E2E_FQDN="e2e-${E2E_SUFFIX}.${E2E_TEST_ZONE}"
+
+# Resolve CLOUDFLARED_CERT_PEM to the literal PEM text (supporting a path OR
+# inline content). Empty when unset → Stage 4 SKIPs.
+CERT_PEM_TEXT=""
+if [ -n "${CLOUDFLARED_CERT_PEM:-}" ]; then
+  case "$CLOUDFLARED_CERT_PEM" in
+    *-----BEGIN*)
+      # Inline PEM content passed directly.
+      CERT_PEM_TEXT="$CLOUDFLARED_CERT_PEM"
+      ;;
+    *)
+      # Treat as a file path.
+      if [ -f "$CLOUDFLARED_CERT_PEM" ]; then
+        CERT_PEM_TEXT="$(cat "$CLOUDFLARED_CERT_PEM")"
+      else
+        err "CLOUDFLARED_CERT_PEM is set but is neither inline PEM (no -----BEGIN) nor an existing file path: '$CLOUDFLARED_CERT_PEM'"
+        exit 1
+      fi
+      ;;
+  esac
+fi
 
 log()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[e2e]\033[0m %s\n' "$*"; }
@@ -45,11 +90,45 @@ err()  { printf '\033[1;31m[e2e]\033[0m %s\n' "$*" >&2; }
 
 TARBALL=""
 PACK_DIR=""
+CERT_FILE=""
+
+# Defensive HOST-SIDE teardown of the Stage-4 tunnel + DNS record. The
+# in-container trap (stages.sh `stage4_teardown`) is the PRIMARY cleanup; this
+# is the net for when the whole CONTAINER dies before that trap can run (a
+# kernel OOM, a `docker rm -f` race, a privileged-container wedge). A leaked
+# tunnel/DNS record per run is unacceptable on a SHARED test zone, so we always
+# try — best-effort, idempotent (deleting an already-gone record is a no-op).
+# Runs only when Stage 4 was actually armed (cert present).
+host_side_cf_teardown() {
+  [ -z "$CERT_PEM_TEXT" ] && return 0
+  log "Host-side Cloudflare teardown net (tunnel + DNS for ${E2E_FQDN})…"
+  # Derive the tunnel name exactly as deriveTunnelName() does.
+  local tname
+  tname="parachute-$(printf '%s' "$E2E_FQDN" | tr '[:upper:]' '[:lower:]' | tr '.' '-' | tr -cd 'a-z0-9_-')"
+  # Best-effort, only if cloudflared + the cert are available on the host.
+  if command -v cloudflared >/dev/null 2>&1 && [ -n "$CERT_FILE" ] && [ -f "$CERT_FILE" ]; then
+    TUNNEL_ORIGIN_CERT="$CERT_FILE" cloudflared tunnel delete -f "$tname" >/dev/null 2>&1 \
+      && log "  host-side: deleted tunnel '$tname'." || true
+  fi
+  # DNS record cleanup via the CF API (reuses the cert's embedded token). bun is
+  # installed on the host for HUB_SOURCE=local; if absent, the in-container trap
+  # already handled it on the happy path.
+  if [ -n "$CERT_FILE" ] && [ -f "$CERT_FILE" ] && command -v bun >/dev/null 2>&1; then
+    bun "$HERE/cf-dns-cleanup.ts" --cert "$CERT_FILE" --fqdn "$E2E_FQDN" >/dev/null 2>&1 \
+      && log "  host-side: DNS record for ${E2E_FQDN} cleaned." || true
+  fi
+}
+
 cleanup() {
   local code=$?
+  # Stage-4 tunnel/DNS net BEFORE we nuke the container (so the in-container
+  # trap got first crack; this catches the container-died case).
+  host_side_cf_teardown
   # Remove the packed tarball AND its mktemp dir (the dir was previously leaked).
   if [ -n "$TARBALL" ] && [ -f "$TARBALL" ]; then rm -f "$TARBALL" || true; fi
   if [ -n "$PACK_DIR" ] && [ -d "$PACK_DIR" ]; then rm -rf "$PACK_DIR" || true; fi
+  # The host-side cert temp file (never committed; lives only for this run).
+  if [ -n "$CERT_FILE" ] && [ -f "$CERT_FILE" ]; then rm -f "$CERT_FILE" || true; fi
   if [ "${E2E_KEEP:-}" = "1" ]; then
     warn "E2E_KEEP=1 — leaving container '$CONTAINER' up for debugging."
     warn "  docker exec -it $CONTAINER bash    # poke around"
@@ -62,6 +141,15 @@ cleanup() {
   exit "$code"
 }
 trap cleanup EXIT INT TERM
+
+# Materialize the resolved cert PEM to a host temp file (used to copy INTO the
+# container as a file — never as a `-e` env arg, so it stays off the process
+# arg list / `docker inspect`). Empty CERT_PEM_TEXT → no file, Stage 4 SKIPs.
+if [ -n "$CERT_PEM_TEXT" ]; then
+  CERT_FILE="$(mktemp)"
+  printf '%s' "$CERT_PEM_TEXT" > "$CERT_FILE"
+  chmod 600 "$CERT_FILE"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Build the image.
@@ -118,6 +206,8 @@ log "Starting container '$CONTAINER' (systemd PID 1)…"
   --tmpfs /run/lock \
   -e "HUB_INSTALL_SPEC=${HUB_INSTALL_SPEC}" \
   -e "PARACHUTE_INSTALL_CHANNEL=${VAULT_CHANNEL}" \
+  -e "E2E_FQDN=${E2E_FQDN}" \
+  -e "E2E_TEST_ZONE=${E2E_TEST_ZONE}" \
   "$IMAGE" >/dev/null
 
 # ---------------------------------------------------------------------------
@@ -152,9 +242,20 @@ done
 log "Copying test assets into the container…"
 "$DOCKER" cp "$HERE/stages.sh"   "$CONTAINER:/root/stages.sh"
 "$DOCKER" cp "$HERE/mcp-probe.ts" "$CONTAINER:/root/mcp-probe.ts"
+"$DOCKER" cp "$HERE/cf-dns-cleanup.ts" "$CONTAINER:/root/cf-dns-cleanup.ts"
 "$DOCKER" exec "$CONTAINER" chmod +x /root/stages.sh
 if [ -n "$TARBALL" ]; then
   "$DOCKER" cp "$TARBALL" "$CONTAINER:/root/hub.tgz"
+fi
+# Stage-4 cert: copy the resolved PEM in as a FILE (never an `-e` env arg, so
+# the secret stays off the exec process arg list / `docker inspect`). stages.sh
+# reads CLOUDFLARED_CERT_PEM as a path-or-inline value (it detects -----BEGIN),
+# so pointing it at this in-container path arms Stage 4; absent → Stage 4 SKIPs.
+CONTAINER_CERT_PATH=""
+if [ -n "$CERT_FILE" ] && [ -f "$CERT_FILE" ]; then
+  "$DOCKER" cp "$CERT_FILE" "$CONTAINER:/root/cf-cert-src.pem"
+  "$DOCKER" exec "$CONTAINER" chmod 600 /root/cf-cert-src.pem
+  CONTAINER_CERT_PATH="/root/cf-cert-src.pem"
 fi
 
 # ---------------------------------------------------------------------------
@@ -167,6 +268,9 @@ set +e
 "$DOCKER" exec \
   -e "HUB_INSTALL_SPEC=${HUB_INSTALL_SPEC}" \
   -e "PARACHUTE_INSTALL_CHANNEL=${VAULT_CHANNEL}" \
+  -e "E2E_FQDN=${E2E_FQDN}" \
+  -e "E2E_TEST_ZONE=${E2E_TEST_ZONE}" \
+  -e "CLOUDFLARED_CERT_PEM=${CONTAINER_CERT_PATH}" \
   "$CONTAINER" /root/stages.sh
 STAGES_RC=$?
 set -e
