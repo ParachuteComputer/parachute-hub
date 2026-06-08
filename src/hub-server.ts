@@ -1627,8 +1627,11 @@ export function hubFetch(
             // succeeding, so `probeDbLiveness` alone would report `db:"ok"` on a
             // database that's gone from disk (the /health lie the issue calls
             // out). `probeDbPath` stat()s the path + compares inodes; on a
-            // gone/replaced verdict it ALSO self-heals (reopen-or-exit) and we
-            // surface the fault so the #591 adoption probe + monitoring see it.
+            // "replaced" verdict it self-heals in-place (reopen-or-exit, adopt
+            // the new inode); on a "gone" verdict it exits the process directly
+            // (#621 — a full wipe needs a clean platform-manager restart, not an
+            // empty-db reopen). Either way we surface the fault so the #591
+            // adoption probe + monitoring see it.
             const pathVerdict = deps?.probeDbPath?.();
             if (pathVerdict === "gone" || pathVerdict === "replaced") {
               // One-request anomaly on "replaced": probeDbPath already healed the
