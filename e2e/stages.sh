@@ -156,15 +156,19 @@ record "stage1-init" "PASS" "systemd unit active, /health db:ok, channel=${PARAC
 # transparently (#576). `parachute setup-wizard` drives the SAME endpoints the
 # browser wizard hits (Account → Vault → Expose), fully non-interactive.
 #
-# FIELD NOTE (rc 0.6.5-rc.4): `parachute init` pre-seeds the vault MODULE into
+# hub#607 + hub#608 (fixed): `parachute init` pre-seeds the vault MODULE into
 # services.json (a `default` placeholder, version 0.0.0-linked) under hub#168
-# Cut 1. `deriveWizardState.hasVault` keys off `findService("parachute-vault")`,
-# which the placeholder satisfies — so the wizard SKIPS its vault step on an
-# init'd box. The wizard's real job in this sequence is the account + expose
-# decisions; the vault is provisioned separately (below). We therefore drive
-# the wizard for account+expose, then create the named '${VAULT_NAME}' vault
-# the way an operator who wants a named vault does: `parachute vault create`.
-note "Driving the setup wizard over loopback (admin account + expose mode)…"
+# Cut 1. Pre-fix, `deriveWizardState.hasVault` matched that placeholder, so the
+# wizard SILENTLY SKIPPED its vault step on an init'd box — the operator
+# finished setup with no vault, and the harness had to work around it with an
+# explicit `parachute vault create` + a manual start/restart. With hub#607,
+# `hasVault` discriminates the SEED_VERSION placeholder from a real instance,
+# so the wizard PRESENTS its create/import/skip step and creates the named
+# vault itself (`--vault-mode create --vault-name`). With hub#608, the create
+# path drives the supervisor to START the new vault, so it is ACTIVE
+# immediately — no `parachute vault create`, no manual start, no hub restart.
+# This stage now asserts that fixed end-to-end behavior directly.
+note "Driving the setup wizard over loopback (account → create vault '${VAULT_NAME}' → expose)…"
 WIZ_LOG=/tmp/parachute-wizard.log
 if ! parachute setup-wizard \
       --hub-url "${HUB}" \
@@ -179,27 +183,19 @@ fi
 cat "$WIZ_LOG"
 grep -qi "Setup complete" "$WIZ_LOG" || die "stage1-wizard" "wizard did not report 'Setup complete'"
 grep -qi "admin account created" "$WIZ_LOG" || die "stage1-wizard" "wizard did not create the admin account"
-note "wizard created admin '${ADMIN_USER}' + set expose mode (vault step skipped — pre-seeded module)"
-record "stage1-wizard" "PASS" "admin '${ADMIN_USER}' created + expose=localhost via wizard"
+# hub#607: the wizard must actually walk its vault step (not skip it). The CLI
+# wizard logs "Vault ready" once the create op succeeds; a skipped step never
+# would. This guards against a regression back to the silent-skip behavior.
+grep -qi "Vault ready" "$WIZ_LOG" || die "stage1-wizard" \
+  "wizard did not run its vault step (hub#607 regression — vault step silently skipped on the init'd box)"
+note "wizard created admin '${ADMIN_USER}' + created vault '${VAULT_NAME}' + set expose mode"
+record "stage1-wizard" "PASS" "admin + vault '${VAULT_NAME}' created via wizard (hub#607); expose=localhost"
 
-# --- create the named vault ---
-# `parachute vault create <name>` is the operator path to a named vault.
-note "Creating the named vault '${VAULT_NAME}' (parachute vault create)…"
-VC_LOG=/tmp/parachute-vault-create.log
-if ! parachute vault create "${VAULT_NAME}" >"$VC_LOG" 2>&1; then
-  cat "$VC_LOG" >&2
-  die "stage1-vault" "parachute vault create ${VAULT_NAME} failed"
-fi
-cat "$VC_LOG"
-# The supervisor mounts the new vault on its next boot; nudge it (an operator
-# would `parachute restart` or the next reboot does it). `parachute start vault`
-# ensures the vault child is running under the supervisor.
-parachute start vault >/dev/null 2>&1 || true
-systemctl restart parachute-hub.service || true
-if ! wait_for "hub healthy after vault-mount restart" 30 "curl -fsS ${HUB}/health | grep -q '\"db\":\"ok\"'"; then
-  die "stage1-vault" "hub did not come back healthy after mounting vault '${VAULT_NAME}'"
-fi
-
+# --- vault is live immediately after the wizard (hub#608) ---
+# No `parachute vault create`, no `parachute start vault`, no hub restart: the
+# wizard's create path drove the supervisor to start the vault child, so it is
+# already serving. Assert it WITHOUT any manual nudge.
+note "Asserting vault '${VAULT_NAME}' is active right after the wizard (hub#608 — no manual start)…"
 # vault running + auth-gated (401 = healthy per hub#423 semantics)
 if ! wait_for "vault ${VAULT_NAME} health 401" 60 "test \"\$(curl -s -o /dev/null -w '%{http_code}' ${HUB}/vault/${VAULT_NAME}/health)\" = 401"; then
   code="$(curl -s -o /dev/null -w '%{http_code}' "${HUB}/vault/${VAULT_NAME}/health" || true)"
@@ -211,8 +207,19 @@ if ! wait_for "vault ${VAULT_NAME} health 401" 60 "test \"\$(curl -s -o /dev/nul
   esac
 fi
 note "vault '${VAULT_NAME}' is up (auth-gated health, hub#423 semantics)"
-parachute status 2>&1 | head -30 || true
-record "stage1-vault" "PASS" "vault '${VAULT_NAME}' created + served (401 health)"
+# hub#608: `parachute status` must show the vault as active (the issue's
+# operator-visible symptom was a freshly-created vault stuck `inactive` until a
+# restart). The supervisor child is named by the short `vault`; assert the
+# status table reports it active without any manual start having been issued.
+STATUS_LOG=/tmp/parachute-status.log
+parachute status >"$STATUS_LOG" 2>&1 || true
+head -30 "$STATUS_LOG"
+if ! grep -qiE 'vault.*(active|running)' "$STATUS_LOG"; then
+  die "stage1-vault" \
+    "parachute status does not show vault active right after the wizard (hub#608 regression — vault inactive until restart)"
+fi
+note "parachute status reports vault active (hub#608 — live without a manual start)"
+record "stage1-vault" "PASS" "vault '${VAULT_NAME}' created by wizard + active + served (401 health); hub#607/#608"
 
 # --- MCP handshake — full OAuth dance + round-trip ---
 note "Running the full OAuth dance + MCP round-trip (mcp-probe.ts)…"

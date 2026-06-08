@@ -179,6 +179,46 @@ describe("deriveWizardState", () => {
     }
   });
 
+  test("vault step when admin exists and only the SEED placeholder vault row is present (hub#607)", async () => {
+    // `parachute init` seeds a `parachute-vault` placeholder into
+    // services.json at SEED_VERSION ("0.0.0-linked") under hub#168 Cut 1
+    // (`noCreate`): the MODULE is installed, but no instance exists yet.
+    // Pre-#607, `hasVault` keyed off a bare `findService(...) !== undefined`
+    // check, which the placeholder satisfied — so the wizard silently
+    // skipped its vault step on EVERY init'd box and the operator finished
+    // setup with no vault. The placeholder must NOT count as a real vault.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.0.0-linked",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      // The placeholder is module-installed-but-no-instance, so the wizard
+      // still owns vault creation: it presents the create/import/skip step.
+      expect(s.step).toBe("vault");
+      expect(s.hasAdmin).toBe(true);
+      expect(s.hasVault).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
   test("expose step when admin + vault exist but expose mode not set yet (hub#268 Item 2)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
@@ -1501,6 +1541,105 @@ describe("handleSetupVaultPost", () => {
       const op = getDefaultOperationsRegistry().get(opId);
       expect(op?.status).toBe("succeeded");
       expect(op?.log.join("\n")).toContain("already supervised");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("create on a SEED-placeholder box: does NOT short-circuit + drives the supervisor to start vault (hub#607 + hub#608)", async () => {
+    // hub#607 + hub#608 coupled fresh-operator flow. On an init'd box,
+    // services.json already carries a `parachute-vault` placeholder at
+    // SEED_VERSION ("0.0.0-linked") — the MODULE is installed, no instance
+    // exists. With the hub#607 `hasVault` discrimination, the wizard's vault
+    // step still appears (the placeholder isn't a real vault), so a
+    // `mode=create` POST must NOT be treated as "already provisioned" and
+    // short-circuit to expose. It runs `runInstall`, which seeds/stamps the
+    // row and — the hub#608 fix — drives `supervisor.start(...)` so the
+    // freshly-created vault is ACTIVE immediately, not inactive-until-
+    // restart. We assert both: the install op fired (no short-circuit) AND
+    // the supervisor now reports a live vault child.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession, SESSION_COOKIE_NAME: SC } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      // Simulate `parachute init`: the vault MODULE is seeded as a
+      // placeholder, no supervisor entry yet (init ran with noStart).
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.0.0-linked",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const supervisor = makeSupervisor();
+      // Sanity: no vault child before the wizard create.
+      expect(supervisor.get("vault")).toBeUndefined();
+      const runCalls: string[][] = [];
+      const stubbedRun = async (cmd: readonly string[]) => {
+        runCalls.push([...cmd]);
+        return 0;
+      };
+      const post = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          body: new URLSearchParams({
+            [CSRF_FIELD_NAME]: csrf,
+            mode: "create",
+            vault_name: "myvault",
+            scribe_provider: "none",
+          }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SC}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
+          issuer: "https://hub.example",
+          supervisor,
+          registry: getDefaultOperationsRegistry(),
+          run: stubbedRun,
+          isLinked: () => false,
+        },
+      );
+      // Not short-circuited: the placeholder is not a real vault, so the
+      // POST enqueues an install op rather than redirecting to expose.
+      expect(post.status).toBe(303);
+      const location = post.headers.get("location") ?? "";
+      expect(location).toMatch(/^\/admin\/setup\?op=/);
+      // Let the background runInstall promise reach the runner + supervisor.
+      await new Promise((r) => setTimeout(r, 50));
+      // #607 proof: the install actually ran (not the "already provisioned"
+      // short-circuit, which fires no `bun add`).
+      expect(runCalls.some((c) => c.join(" ").includes("bun add -g @openparachute/vault"))).toBe(
+        true,
+      );
+      // #608 proof: the supervisor was driven to start the vault child, so
+      // the vault is live immediately after the wizard create — no manual
+      // `parachute start vault` / hub restart needed.
+      const vaultState = supervisor.get("vault");
+      expect(vaultState).toBeDefined();
+      expect(["starting", "running", "restarting"]).toContain(vaultState?.status ?? "");
     } finally {
       db.close();
     }
