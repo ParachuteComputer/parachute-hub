@@ -110,6 +110,69 @@ describe("hubFetch routing", () => {
     }
   });
 
+  test("/health reports db:ok when getDb is live and the proactive path probe is ok (#610)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          probeDbPath: () => "ok",
+        })(req("/health"));
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { status: string; db: string };
+        expect(body.status).toBe("ok");
+        expect(body.db).toBe("ok");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/health surfaces db:error:path-gone when the proactive probe sees a wiped path (#610)", async () => {
+    // The ghost-fd lie: SELECT 1 still succeeds against the unlinked inode, so
+    // probeDbLiveness alone would report ok. probeDbPath stat()s the PATH and
+    // returns "gone" → /health must report the fault instead of lying.
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          probeDbPath: () => "gone",
+        })(req("/health"));
+        expect(res.status).toBe(200); // /health stays 200 (process liveness)
+        const body = (await res.json()) as { db: string };
+        expect(body.db).toBe("error: path-gone");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/health surfaces db:error:path-replaced when the proactive probe sees an inode swap (#610)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          probeDbPath: () => "replaced",
+        })(req("/health"));
+        const body = (await res.json()) as { db: string };
+        expect(body.db).toBe("error: path-replaced");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("/ renders the signed-out indicator dynamically when DB is configured but no session cookie (rc.13)", async () => {
     // The dynamic path takes over from the static disk file the moment a
     // DB is configured. With no session cookie, we still render — just
