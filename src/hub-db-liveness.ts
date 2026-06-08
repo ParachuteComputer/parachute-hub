@@ -383,25 +383,41 @@ export function createDbHolder(initial: Database, deps: DbHolderDeps): DbHolder 
       const verdict = classifyPathLiveness({ expected: currentInode, current: pathInode });
       if (verdict === "ok" || verdict === "unknown") return verdict;
 
-      // Genuine wipe signal: the on-disk DB the handle points at is gone
-      // ("gone") or was replaced underneath us ("replaced"). Trigger the SAME
-      // reopen-or-exit machinery. When the path is gone, reopen's SELECT-1
-      // verify fails → exit → platform manager restarts with a fresh on-disk
-      // handle (seconds, not "never"). When replaced, we adopt the fresh inode.
+      if (verdict === "gone") {
+        // The whole state dir was wiped under the running hub (`rm -rf
+        // ~/.parachute`). We must NOT reopen-in-place here: `reopen` is
+        // `openHubDb`, which `mkdirSync`'s the dir back + opens a fresh EMPTY db,
+        // so its SELECT-1 verify would PASS and we'd "heal" into a half-recovered
+        // hub — empty db, but stale in-memory state, wiped well-known files, and
+        // supervised modules whose own state dirs are gone yet never re-spawned
+        // (#619 follow-up). The correct recovery for a full wipe is a clean
+        // process exit so the platform manager (systemd / launchd / container)
+        // restarts `parachute serve`, which re-bootstraps everything (well-known,
+        // admin seed, supervisor re-spawn). This restores the #610 design intent
+        // ("we exit, letting the platform manager restart") that the shared
+        // reopen-or-exit path silently defeated via openHubDb's mkdir-recursive.
+        log(
+          `parachute hub: db path ${deps.dbPath} no longer exists (state dir wiped under a running hub, #610); exiting so the platform manager restarts the hub with a freshly bootstrapped state dir.`,
+        );
+        exit(1);
+        return verdict;
+      }
+
+      // "replaced": the db FILE was swapped underneath us (e.g. a restore copied
+      // a new file over the same path) while the rest of the state dir is intact.
+      // Adopting the fresh inode in-place via reopen-or-exit is correct here — a
+      // process restart would be heavier than needed.
       //
-      // ONE-TICK /health ANOMALY (intentional): on a "replaced" verdict the
-      // reopenOrExit below heals SYNCHRONOUSLY, but we still RETURN "replaced"
-      // for this one call — so the /health request that drove this probe reports
-      // `db:"error: path-replaced"` even though the handle is now healthy; the
-      // very next request reads `ok`. We don't mask it (returning "ok" here would
-      // hide that a heal just happened, which is exactly what monitoring wants to
-      // see). It's safe because #591's adoption probe checks only HTTP 200
-      // (`res.ok`), not the specific `db` string, so a single transient error
-      // string can't cascade.
+      // ONE-TICK /health ANOMALY (intentional): the reopenOrExit below heals
+      // SYNCHRONOUSLY, but we still RETURN "replaced" for this one call — so the
+      // /health request that drove this probe reports `db:"error: path-replaced"`
+      // even though the handle is now healthy; the very next request reads `ok`.
+      // We don't mask it (returning "ok" here would hide that a heal just
+      // happened, which is exactly what monitoring wants to see). It's safe
+      // because #591's adoption probe checks only HTTP 200 (`res.ok`), not the
+      // specific `db` string, so a single transient error string can't cascade.
       reopenOrExit(
-        verdict === "gone"
-          ? `db path ${deps.dbPath} no longer exists (state dir wiped under a running hub, #610)`
-          : `db path ${deps.dbPath} now resolves to a different inode (DB file replaced underneath the open handle, #610)`,
+        `db path ${deps.dbPath} now resolves to a different inode (DB file replaced underneath the open handle, #610)`,
       );
       return verdict;
     },
