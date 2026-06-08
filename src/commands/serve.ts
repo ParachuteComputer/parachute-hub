@@ -304,6 +304,75 @@ export function formatBootstrapTokenBanner(token: string, hubUrl?: string): stri
   ].join("\n");
 }
 
+/** Injectable seams for {@link armServeDbWatchdog} (test-only). */
+export interface ServeDbWatchdogDeps {
+  log?: (line: string) => void;
+  /** Open a db handle (default {@link openHubDb}). Tests inject a fake that creates a fixture. */
+  openDb?: (path: string) => ReturnType<typeof openHubDb>;
+  /** Path stat for the inode snapshot + proactive probe (default {@link defaultStatInode}). */
+  statInode?: typeof defaultStatInode;
+  /** Injectable scheduler threaded to the liveness timer (default `setInterval`). */
+  setIntervalFn?: (cb: () => void, ms: number) => ReturnType<typeof setInterval>;
+  /** Injectable clear threaded to the liveness timer (default `clearInterval`). */
+  clearIntervalFn?: (handle: ReturnType<typeof setInterval>) => void;
+  /** Process-exit fn threaded into the holder's reopen-or-exit (default `process.exit`). */
+  exit?: (code: number) => void;
+}
+
+/**
+ * Build the self-heal DB holder (#594) + start the proactive ghost-fd watchdog
+ * (#610) for the `parachute serve` path, returning both so the caller wires
+ * `getDb`/`onDbError`/`probeDbPath` and stops the timer on shutdown.
+ *
+ * Extracted + exported so the wiring is unit-testable WITHOUT binding a real
+ * port (#619): a serve()-level test would have to `Bun.serve` and risk the
+ * hub#535 launchd-bootout hazard, so this pure helper carries the load-bearing
+ * invariants instead — (1) the db is OPENED before the inode is snapshotted, so
+ * a fresh-install first boot gets a defined baseline (an ENOENT snapshot would
+ * silently disable the proactive probe for the whole process lifetime), and
+ * (2) the liveness timer is actually started. Both were absent on this path
+ * before #619 — the watchdog was wired only into `createHubServer`.
+ */
+export function armServeDbWatchdog(
+  dbPath: string,
+  deps: ServeDbWatchdogDeps = {},
+): {
+  dbHolder: ReturnType<typeof createDbHolder>;
+  livenessTimer: ReturnType<typeof startDbPathLivenessTimer>;
+} {
+  const openDb = deps.openDb ?? openHubDb;
+  const statInode = deps.statInode ?? defaultStatInode;
+  // Open FIRST — `openHubDb` mkdir's + creates the file when absent, so the
+  // stat below sees a real inode on a fresh-install first boot. Reversing this
+  // would leave `initialInode` undefined (ENOENT) and the probe at "unknown"
+  // for the process lifetime. Mirrors `createHubServer`'s ordering.
+  const db = openDb(dbPath);
+  let initialInode: ReturnType<typeof defaultStatInode> | undefined;
+  try {
+    initialInode = statInode(dbPath);
+  } catch {
+    initialInode = undefined;
+  }
+  const dbHolder = createDbHolder(db, {
+    reopen: () => openDb(dbPath),
+    dbPath,
+    statInode,
+    initialInode,
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
+    ...(deps.exit !== undefined ? { exit: deps.exit } : {}),
+  });
+  // The active `parachute serve` path (systemd / launchd / container ExecStart)
+  // MUST start the watchdog here, not only in `createHubServer` — else a
+  // `rm -rf ~/.parachute` under a running unit leaves a ghost fd that keeps
+  // SELECT 1 succeeding with no thrown error, the reactive path never fires,
+  // and the hub never self-recovers (#619).
+  const livenessTimer = startDbPathLivenessTimer(dbHolder, {
+    ...(deps.setIntervalFn !== undefined ? { setIntervalFn: deps.setIntervalFn } : {}),
+    ...(deps.clearIntervalFn !== undefined ? { clearIntervalFn: deps.clearIntervalFn } : {}),
+  });
+  return { dbHolder, livenessTimer };
+}
+
 /**
  * Run the hub fetch loop in the foreground. Resolves when `Bun.serve` is
  * bound; the returned `stop()` shuts the server down for tests.
@@ -355,37 +424,8 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   writeHubFile(hubHtmlPath);
 
   const dbPath = hubDbPath();
-  // Self-heal-or-die DB holder (#594). The handle lives behind a mutable
-  // holder so a request that hits the persistent-corruption class (disk I/O
-  // error / malformed image — e.g. the state dir deleted under a running hub)
-  // can reopen the handle once, or exit(1) for the platform manager to restart
-  // us with a fresh one. `getDb` reads the current handle from the holder.
-  // Snapshot the inode the handle binds to NOW so the proactive watchdog
-  // (#610) can later notice the path has gone / been replaced. Best-effort — a
-  // failed snapshot leaves the proactive probe at "unknown" (never self-heals
-  // without a baseline); the reactive `healOrExit` path still covers thrown
-  // faults.
-  let initialInode: ReturnType<typeof defaultStatInode> | undefined;
-  try {
-    initialInode = defaultStatInode(dbPath);
-  } catch {
-    initialInode = undefined;
-  }
-  const dbHolder = createDbHolder(openHubDb(dbPath), {
-    reopen: () => openHubDb(dbPath),
-    dbPath,
-    statInode: defaultStatInode,
-    initialInode,
-    log,
-  });
-  // Start the bounded proactive-liveness watchdog (#610). This is the ACTIVE
-  // `parachute serve` path (the systemd / launchd / container ExecStart) — the
-  // watchdog MUST be wired here, not only in `createHubServer` (hub-server.ts),
-  // or a `rm -rf ~/.parachute` under a running unit leaves a ghost fd that keeps
-  // SELECT 1 succeeding with no thrown error, so the reactive path never fires
-  // and the hub never self-recovers (#619). The timer stat()s the db path on a
-  // low-frequency tick and reopen-or-exits the moment the on-disk DB is wiped.
-  const livenessTimer = startDbPathLivenessTimer(dbHolder);
+  // Self-heal-or-die DB holder (#594) + proactive ghost-fd watchdog (#610/#619).
+  const { dbHolder, livenessTimer } = armServeDbWatchdog(dbPath, { log });
   const adminBootstrap = await seedInitialAdminIfNeeded(dbHolder.get(), env, log);
 
   if (adminBootstrap === "needs-setup") {

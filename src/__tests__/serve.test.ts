@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _resetBootstrapTokenForTests, getBootstrapToken } from "../bootstrap-token.ts";
 import {
+  armServeDbWatchdog,
   formatBootstrapTokenBanner,
   formatListeningBanner,
   hubPortConflictMessage,
@@ -461,5 +462,76 @@ describe("resolveStartupIssuer — expose-state fallback (#531)", () => {
     };
     expect(() => resolveStartupIssuer({}, {}, throwing)).not.toThrow();
     expect(resolveStartupIssuer({}, {}, throwing)).toBeUndefined();
+  });
+});
+
+describe("armServeDbWatchdog — #610/#619 ghost-fd watchdog wiring on the serve path", () => {
+  let tmp: string;
+  let realDbPath: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "serve-watchdog-"));
+    realDbPath = join(tmp, "hub.db");
+  });
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("starts the liveness timer (without it, a wipe is never noticed)", () => {
+    let tick: (() => void) | undefined;
+    const { livenessTimer } = armServeDbWatchdog(realDbPath, {
+      openDb: () => openHubDb(realDbPath),
+      statInode: () => ({ dev: 1, ino: 42 }),
+      setIntervalFn: (cb) => {
+        tick = cb;
+        return 0 as unknown as ReturnType<typeof setInterval>;
+      },
+      clearIntervalFn: () => {},
+    });
+    // The timer must actually be armed — the captured tick callback proves
+    // startDbPathLivenessTimer ran (the #619 bug was that it never did on this path).
+    expect(tick).toBeInstanceOf(Function);
+    expect(livenessTimer).toBeDefined();
+  });
+
+  test("opens the db BEFORE snapshotting the inode, so a wipe tick self-exits (#619 ordering)", () => {
+    // The load-bearing invariant: `initialInode` must be a DEFINED baseline so
+    // a later "gone" verdict fires reopen-or-exit. If the helper statted before
+    // opening (the bug), a fresh path would yield ENOENT → undefined baseline →
+    // probe stuck at "unknown" → NEVER exits on a wipe.
+    let opened = false;
+    let wiped = false;
+    let tick: (() => void) | undefined;
+    const exitCodes: number[] = [];
+    armServeDbWatchdog(realDbPath, {
+      openDb: () => {
+        if (wiped) throw new Error("ENOENT: state dir wiped");
+        opened = true;
+        return openHubDb(realDbPath);
+      },
+      statInode: () => {
+        if (wiped) return undefined; // path gone
+        // Proves ordering: if the helper statted before opening, this throws and
+        // the helper's catch leaves initialInode undefined (watchdog disabled).
+        if (!opened) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return { dev: 1, ino: 42 };
+      },
+      setIntervalFn: (cb) => {
+        tick = cb;
+        return 0 as unknown as ReturnType<typeof setInterval>;
+      },
+      clearIntervalFn: () => {},
+      exit: (code) => exitCodes.push(code),
+    });
+
+    // Simulate the wipe, then drive one watchdog tick.
+    wiped = true;
+    expect(tick).toBeInstanceOf(Function);
+    tick?.();
+
+    // The probe saw "gone" against a real baseline → reopen threw (dir gone) →
+    // exit(1). A non-zero exitCodes proves `initialInode` was a defined baseline,
+    // which proves the db was opened before the inode snapshot.
+    expect(exitCodes).toEqual([1]);
   });
 });
