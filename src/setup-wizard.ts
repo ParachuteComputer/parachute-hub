@@ -1640,6 +1640,12 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       requireBootstrapToken: boolean;
       csrfToken: string;
       bootstrapToken?: string;
+      operation?: {
+        id: string;
+        status: "pending" | "running" | "succeeded" | "failed";
+        log: readonly string[];
+        error?: string;
+      };
     } = {
       step: state.step,
       hasAdmin: state.hasAdmin,
@@ -1648,6 +1654,25 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       requireBootstrapToken: requireToken,
       csrfToken: csrf.token,
     };
+    // hub#616: the CLI wizard polls vault-provisioning over THIS session-authed
+    // surface (mirroring the browser wizard's `/admin/setup?op=<id>` re-GET),
+    // not the Bearer-gated `/api/modules/operations/:id` the SPA + install CLI
+    // use. The wizard holds only a session cookie mid-setup; the op endpoint
+    // requires a host-admin Bearer it doesn't have, so a direct poll 401s and
+    // the vault step dies. Threading the op snapshot into the envelope keeps the
+    // poll on the auth the wizard already carries.
+    const opId = url.searchParams.get("op");
+    if (opId) {
+      const op = deps.registry?.get(opId);
+      if (op) {
+        envelope.operation = {
+          id: op.id,
+          status: op.status,
+          log: op.log,
+          ...(op.error !== undefined ? { error: op.error } : {}),
+        };
+      }
+    }
     // hub#576: hand the actual token to a LOOPBACK caller only. The on-box
     // operator (`parachute init` → CLI wizard, or a curl from their own shell)
     // already proves box access by reaching loopback — same trust level as
