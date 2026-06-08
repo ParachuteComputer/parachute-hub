@@ -213,7 +213,7 @@ note "vault '${VAULT_NAME}' is up (auth-gated health, hub#423 semantics)"
 # status table reports it active without any manual start having been issued.
 STATUS_LOG=/tmp/parachute-status.log
 parachute status >"$STATUS_LOG" 2>&1 || true
-cat "$STATUS_LOG" | head -30
+head -30 "$STATUS_LOG"
 if ! grep -qiE 'vault.*(active|running)' "$STATUS_LOG"; then
   die "stage1-vault" \
     "parachute status does not show vault active right after the wizard (hub#608 regression — vault inactive until restart)"
