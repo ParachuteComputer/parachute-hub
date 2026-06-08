@@ -34,7 +34,7 @@ import { generateBootstrapToken } from "../bootstrap-token.ts";
 // path isolation.
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { readExposeState } from "../expose-state.ts";
-import { createDbHolder } from "../hub-db-liveness.ts";
+import { createDbHolder, defaultStatInode, startDbPathLivenessTimer } from "../hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
 import { writeHubFile } from "../hub.ts";
@@ -360,10 +360,32 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   // error / malformed image — e.g. the state dir deleted under a running hub)
   // can reopen the handle once, or exit(1) for the platform manager to restart
   // us with a fresh one. `getDb` reads the current handle from the holder.
+  // Snapshot the inode the handle binds to NOW so the proactive watchdog
+  // (#610) can later notice the path has gone / been replaced. Best-effort — a
+  // failed snapshot leaves the proactive probe at "unknown" (never self-heals
+  // without a baseline); the reactive `healOrExit` path still covers thrown
+  // faults.
+  let initialInode: ReturnType<typeof defaultStatInode> | undefined;
+  try {
+    initialInode = defaultStatInode(dbPath);
+  } catch {
+    initialInode = undefined;
+  }
   const dbHolder = createDbHolder(openHubDb(dbPath), {
     reopen: () => openHubDb(dbPath),
+    dbPath,
+    statInode: defaultStatInode,
+    initialInode,
     log,
   });
+  // Start the bounded proactive-liveness watchdog (#610). This is the ACTIVE
+  // `parachute serve` path (the systemd / launchd / container ExecStart) — the
+  // watchdog MUST be wired here, not only in `createHubServer` (hub-server.ts),
+  // or a `rm -rf ~/.parachute` under a running unit leaves a ghost fd that keeps
+  // SELECT 1 succeeding with no thrown error, so the reactive path never fires
+  // and the hub never self-recovers (#619). The timer stat()s the db path on a
+  // low-frequency tick and reopen-or-exits the moment the on-disk DB is wiped.
+  const livenessTimer = startDbPathLivenessTimer(dbHolder);
   const adminBootstrap = await seedInitialAdminIfNeeded(dbHolder.get(), env, log);
 
   if (adminBootstrap === "needs-setup") {
@@ -401,6 +423,9 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       fetch: hubFetch(WELL_KNOWN_DIR, {
         getDb: () => dbHolder.get(),
         onDbError: (err) => dbHolder.healOrExit(err),
+        // #610: /health's db check probes the path so monitoring + the #591
+        // adoption probe see a wipe instead of the ghost-fd lie.
+        probeDbPath: () => dbHolder.probePath(),
         issuer,
         loopbackPort: port,
         supervisor,
@@ -486,6 +511,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       for (const state of supervisor.list()) {
         await supervisor.stop(state.short);
       }
+      livenessTimer.stop();
       await server.stop();
       dbHolder.get().close();
     },
