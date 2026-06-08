@@ -484,7 +484,7 @@ describe("armServeDbWatchdog — #610/#619 ghost-fd watchdog wiring on the serve
       statInode: () => ({ dev: 1, ino: 42 }),
       setIntervalFn: (cb) => {
         tick = cb;
-        return 0 as unknown as ReturnType<typeof setInterval>;
+        return 0;
       },
       clearIntervalFn: () => {},
     });
@@ -518,7 +518,7 @@ describe("armServeDbWatchdog — #610/#619 ghost-fd watchdog wiring on the serve
       },
       setIntervalFn: (cb) => {
         tick = cb;
-        return 0 as unknown as ReturnType<typeof setInterval>;
+        return 0;
       },
       clearIntervalFn: () => {},
       exit: (code) => exitCodes.push(code),

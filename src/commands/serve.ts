@@ -304,17 +304,22 @@ export function formatBootstrapTokenBanner(token: string, hubUrl?: string): stri
   ].join("\n");
 }
 
-/** Injectable seams for {@link armServeDbWatchdog} (test-only). */
-export interface ServeDbWatchdogDeps {
+/**
+ * Injectable seams for {@link armServeDbWatchdog} (test-only). Generic on the
+ * timer handle `H` so the scheduler seams never name `setInterval` in type
+ * position — mirrors `DbLivenessTimerDeps<H>` in hub-db-liveness.ts, which
+ * keeps the public interface portable to a types-less tsc environment.
+ */
+export interface ServeDbWatchdogDeps<H = unknown> {
   log?: (line: string) => void;
   /** Open a db handle (default {@link openHubDb}). Tests inject a fake that creates a fixture. */
   openDb?: (path: string) => ReturnType<typeof openHubDb>;
   /** Path stat for the inode snapshot + proactive probe (default {@link defaultStatInode}). */
   statInode?: typeof defaultStatInode;
   /** Injectable scheduler threaded to the liveness timer (default `setInterval`). */
-  setIntervalFn?: (cb: () => void, ms: number) => ReturnType<typeof setInterval>;
+  setIntervalFn?: (cb: () => void, ms: number) => H;
   /** Injectable clear threaded to the liveness timer (default `clearInterval`). */
-  clearIntervalFn?: (handle: ReturnType<typeof setInterval>) => void;
+  clearIntervalFn?: (handle: H) => void;
   /** Process-exit fn threaded into the holder's reopen-or-exit (default `process.exit`). */
   exit?: (code: number) => void;
 }
@@ -333,9 +338,9 @@ export interface ServeDbWatchdogDeps {
  * (2) the liveness timer is actually started. Both were absent on this path
  * before #619 — the watchdog was wired only into `createHubServer`.
  */
-export function armServeDbWatchdog(
+export function armServeDbWatchdog<H = unknown>(
   dbPath: string,
-  deps: ServeDbWatchdogDeps = {},
+  deps: ServeDbWatchdogDeps<H> = {},
 ): {
   dbHolder: ReturnType<typeof createDbHolder>;
   livenessTimer: ReturnType<typeof startDbPathLivenessTimer>;
@@ -366,7 +371,7 @@ export function armServeDbWatchdog(
   // `rm -rf ~/.parachute` under a running unit leaves a ghost fd that keeps
   // SELECT 1 succeeding with no thrown error, the reactive path never fires,
   // and the hub never self-recovers (#619).
-  const livenessTimer = startDbPathLivenessTimer(dbHolder, {
+  const livenessTimer = startDbPathLivenessTimer<H>(dbHolder, {
     ...(deps.setIntervalFn !== undefined ? { setIntervalFn: deps.setIntervalFn } : {}),
     ...(deps.clearIntervalFn !== undefined ? { clearIntervalFn: deps.clearIntervalFn } : {}),
   });
