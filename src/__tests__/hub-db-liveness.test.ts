@@ -214,18 +214,23 @@ describe("DbHolder.probePath (#610 proactive detection)", () => {
     h.cleanup();
   });
 
-  test("path GONE (ENOENT) → reopen attempted; reopen verify fails → exit(1)", () => {
-    // Reopen returns a closed handle (the dir is still gone) → SELECT 1 throws
-    // → exit. This is the genuine `rm -rf ~/.parachute` field shape.
-    const dead = new Database(":memory:");
-    dead.close();
+  test("path GONE (ENOENT) → exit(1) directly, NO reopen (#619 follow-up)", () => {
+    // The genuine `rm -rf ~/.parachute` field shape. We must NOT reopen here:
+    // reopen is openHubDb, which mkdir-recursive's the dir back + opens a fresh
+    // EMPTY db, so its SELECT-1 verify would PASS and the hub would "heal" into a
+    // half-recovered state (empty db, stale in-memory state, wiped well-known,
+    // un-respawned modules). A full wipe must exit so the platform manager does a
+    // clean restart that re-bootstraps everything. `onReopen` throws to PROVE the
+    // reopen path is never taken — if it were, this test would surface the throw.
     const h = makeHolder({
       initialInode: INODE_A,
       statInode: () => undefined, // ENOENT
-      onReopen: () => dead,
+      onReopen: () => {
+        throw new Error("reopen must NOT be called on a gone verdict");
+      },
     });
     expect(h.holder.probePath()).toBe("gone");
-    expect(h.stats().reopens).toBe(1);
+    expect(h.stats().reopens).toBe(0);
     expect(h.stats().exits).toBe(1);
     expect(h.stats().exitCode).toBe(1);
     h.cleanup();
