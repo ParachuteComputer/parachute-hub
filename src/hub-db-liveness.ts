@@ -366,9 +366,12 @@ export function createDbHolder(initial: Database, deps: DbHolderDeps): DbHolder 
       // No path configured → proactive probe disabled (reactive-only callers).
       if (deps.dbPath === undefined) return "unknown";
 
-      let current: DbInode | undefined;
+      // `pathInode` (NOT `current`) — the inode the db PATH resolves to right
+      // now. Named distinctly from the outer `current` (the live Database
+      // handle) so a reader can't misread this as the DB handle.
+      let pathInode: DbInode | undefined;
       try {
-        current = statInode(deps.dbPath);
+        pathInode = statInode(deps.dbPath);
       } catch {
         // A non-ENOENT stat failure (EACCES, EINTR, a transient FS hiccup) is
         // explicitly NOT a wipe signal. Leave the hub alone — the next probe
@@ -377,7 +380,7 @@ export function createDbHolder(initial: Database, deps: DbHolderDeps): DbHolder 
         return "ok";
       }
 
-      const verdict = classifyPathLiveness({ expected: currentInode, current });
+      const verdict = classifyPathLiveness({ expected: currentInode, current: pathInode });
       if (verdict === "ok" || verdict === "unknown") return verdict;
 
       // Genuine wipe signal: the on-disk DB the handle points at is gone
@@ -385,6 +388,16 @@ export function createDbHolder(initial: Database, deps: DbHolderDeps): DbHolder 
       // reopen-or-exit machinery. When the path is gone, reopen's SELECT-1
       // verify fails → exit → platform manager restarts with a fresh on-disk
       // handle (seconds, not "never"). When replaced, we adopt the fresh inode.
+      //
+      // ONE-TICK /health ANOMALY (intentional): on a "replaced" verdict the
+      // reopenOrExit below heals SYNCHRONOUSLY, but we still RETURN "replaced"
+      // for this one call — so the /health request that drove this probe reports
+      // `db:"error: path-replaced"` even though the handle is now healthy; the
+      // very next request reads `ok`. We don't mask it (returning "ok" here would
+      // hide that a heal just happened, which is exactly what monitoring wants to
+      // see). It's safe because #591's adoption probe checks only HTTP 200
+      // (`res.ok`), not the specific `db` string, so a single transient error
+      // string can't cascade.
       reopenOrExit(
         verdict === "gone"
           ? `db path ${deps.dbPath} no longer exists (state dir wiped under a running hub, #610)`

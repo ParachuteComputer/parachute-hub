@@ -1631,6 +1631,13 @@ export function hubFetch(
             // surface the fault so the #591 adoption probe + monitoring see it.
             const pathVerdict = deps?.probeDbPath?.();
             if (pathVerdict === "gone" || pathVerdict === "replaced") {
+              // One-request anomaly on "replaced": probeDbPath already healed the
+              // handle synchronously, but THIS request still reports the fault
+              // (the next /health reads `db:"ok"`). Intentional — we surface that
+              // a heal just occurred rather than masking it. Safe because #591's
+              // adoption probe gates on HTTP 200 (`res.ok`), not the `db` string,
+              // so a single transient error string can't cascade. ("gone" exits
+              // the process, usually before this response is even sent.)
               db = `error: path-${pathVerdict}`;
             } else {
               db = probeDbLiveness(getDb());
