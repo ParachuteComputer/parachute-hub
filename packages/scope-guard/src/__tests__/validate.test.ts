@@ -1159,3 +1159,175 @@ describe("createScopeGuard — permissions claim surfacing", () => {
     guard.resetJwksCache();
   });
 });
+
+describe("createScopeGuard — jwksOrigin seam (vault#464)", () => {
+  // A SECOND JWKS endpoint standing in for the co-located loopback hub. The
+  // module-scoped `fixture` plays the role of the PUBLIC origin (the FQDN the
+  // token's `iss` is minted against, post-expose). The vault#464 scenario:
+  // validate `iss` against the public origin, but FETCH the keys from loopback.
+  let loopback: JwksFixture;
+
+  beforeAll(() => {
+    loopback = startJwksFixture();
+    loopback.setKeys([kp]);
+  });
+
+  afterAll(() => {
+    loopback.stop();
+  });
+
+  beforeEach(() => {
+    loopback.setUnreachable(false);
+    loopback.setKeys([kp]);
+    loopback.resetJwksFetchCount();
+  });
+
+  test("public iss + loopback jwksOrigin → keys fetched from loopback, iss matches public", async () => {
+    // The crux of vault#464: the token is minted by the PUBLIC hub (iss =
+    // public FQDN), but only the LOOPBACK endpoint serves the signing keys.
+    // The public endpoint serves NO keys — so if the guard fetched JWKS from
+    // `hubOrigin` (the bug), verification would fail with no-matching-key.
+    fixture.setKeys([]); // public origin: zero keys
+    loopback.setKeys([kp]); // loopback origin: the real signing key
+    fixture.resetJwksFetchCount();
+    loopback.resetJwksFetchCount();
+
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin, // public FQDN — validates iss
+      jwksOrigin: () => loopback.origin, // loopback — fetches keys
+    });
+    const token = await signJwt(kp, { iss: fixture.origin });
+
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.sub).toBe("user-1");
+
+    // The keys came from loopback, never the public origin.
+    expect(loopback.jwksFetchCount()).toBeGreaterThan(0);
+    expect(fixture.jwksFetchCount()).toBe(0);
+
+    guard.resetJwksCache();
+    fixture.setKeys([kp]); // restore for the shared module fixture
+  });
+
+  test("public iss but loopback serves wrong key → signature/kid failure (proves fetch origin is loopback)", async () => {
+    // Positive control for the test above: if the fetch origin really is
+    // loopback, swapping loopback's key out (while the public origin holds the
+    // correct one) must FAIL — confirming the public origin's keys are never
+    // consulted.
+    const otherKp = await makeKeypair("k-other");
+    fixture.setKeys([kp]); // public has the correct key — must be ignored
+    loopback.setKeys([otherKp]); // loopback has a different key
+
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      jwksOrigin: () => loopback.origin,
+      // Disable the rotation-retry reload storm; one shot is enough to assert.
+      jwksReloadMinIntervalMs: 0,
+    });
+    const token = await signJwt(kp, { iss: fixture.origin });
+
+    // kid "k1" isn't in loopback's set → no-matching-key (kid).
+    await expectError(guard.validateHubJwt(token), "kid");
+
+    guard.resetJwksCache();
+    loopback.setKeys([kp]);
+  });
+
+  test("iss is still validated against hubOrigin, NOT jwksOrigin", async () => {
+    // Decoupling must not weaken the iss pin: a token whose iss is the LOOPBACK
+    // origin (not the public hubOrigin) must be rejected even though the keys
+    // would verify — the iss check uses hubOrigin alone.
+    loopback.setKeys([kp]);
+
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      jwksOrigin: () => loopback.origin,
+    });
+    // Token minted against the loopback origin — wrong issuer for this guard.
+    const token = await signJwt(kp, { iss: loopback.origin });
+
+    await expectError(guard.validateHubJwt(token), "issuer");
+
+    guard.resetJwksCache();
+  });
+
+  test("jwksOrigin omitted → fetches from hubOrigin exactly as before (backward compat)", async () => {
+    // The default path: no jwksOrigin. Keys MUST be fetched from hubOrigin and
+    // the loopback endpoint must never be touched.
+    fixture.setKeys([kp]);
+    fixture.resetJwksFetchCount();
+    loopback.resetJwksFetchCount();
+
+    const guard = createScopeGuard({ hubOrigin: fixture.origin });
+    const token = await signJwt(kp, { iss: fixture.origin });
+
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.sub).toBe("user-1");
+    expect(fixture.jwksFetchCount()).toBeGreaterThan(0);
+    expect(loopback.jwksFetchCount()).toBe(0);
+
+    guard.resetJwksCache();
+  });
+
+  test("jwksOrigin as a literal string (not just a resolver)", async () => {
+    fixture.setKeys([]); // public: no keys
+    loopback.setKeys([kp]);
+
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      jwksOrigin: loopback.origin, // literal string form
+    });
+    const token = await signJwt(kp, { iss: fixture.origin });
+
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.sub).toBe("user-1");
+
+    guard.resetJwksCache();
+    fixture.setKeys([kp]);
+  });
+
+  test("jwksOrigin resolver is re-evaluated per call (env change picked up without restart)", async () => {
+    // The resolver flips from public→loopback mid-life. The first call (public,
+    // no keys) fails; after the env flips, the next call succeeds from loopback
+    // — proving the resolver isn't captured once at construction.
+    fixture.setKeys([]); // public has no keys → first call must fail
+    loopback.setKeys([kp]);
+
+    let current = fixture.origin;
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      jwksOrigin: () => current,
+      jwksReloadMinIntervalMs: 0,
+    });
+    const token = await signJwt(kp, { iss: fixture.origin });
+
+    // First: jwksOrigin === public (no keys) → kid failure.
+    await expectError(guard.validateHubJwt(token), "kid");
+
+    // Env flips to loopback; the guard must pick it up on the next call.
+    current = loopback.origin;
+    guard.resetJwksCache(); // drop the public-keyed (empty) cache entry
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.sub).toBe("user-1");
+
+    guard.resetJwksCache();
+    fixture.setKeys([kp]);
+  });
+
+  test("trailing slash on jwksOrigin is stripped", async () => {
+    fixture.setKeys([]);
+    loopback.setKeys([kp]);
+
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      jwksOrigin: `${loopback.origin}/`,
+    });
+    const token = await signJwt(kp, { iss: fixture.origin });
+
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.sub).toBe("user-1");
+
+    guard.resetJwksCache();
+    fixture.setKeys([kp]);
+  });
+});

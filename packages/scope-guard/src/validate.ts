@@ -21,7 +21,11 @@ import {
  *   - The hub origin is the trust pin. `iss` MUST equal it; without that
  *     check, anyone could mint a token against any RSA key and pass JWKS
  *     verification (jose verifies the signature, not who issued the token).
- *   - JWKS is fetched from `<origin>/.well-known/jwks.json`.
+ *   - JWKS is fetched from `<jwksOrigin>/.well-known/jwks.json`, defaulting
+ *     to the same `hubOrigin` used for the `iss` pin. Co-located resource
+ *     servers can override `jwksOrigin` (e.g. loopback) to read their hub's
+ *     keys without egressing through a public tunnel (vault#464), while still
+ *     validating `iss` against the public origin.
  *   - `aud` is strict-checked against `expectedAudience` when supplied —
  *     this is the resource-server backstop for per-resource binding.
  *
@@ -140,6 +144,36 @@ export interface CreateScopeGuardOptions {
    * form matches what the hub mints.
    */
   hubOrigin: string | (() => string);
+
+  /**
+   * Origin to FETCH the JWKS from, when it must differ from the `hubOrigin`
+   * used to validate the token's `iss`. Same shape as `hubOrigin` — a literal
+   * string or a resolver function — and re-evaluated per call so env changes
+   * are picked up without a restart. Trailing slashes are stripped.
+   *
+   * **Defaults to `hubOrigin` when omitted** — existing callers (scribe,
+   * paraclaw, and vault until it opts in) are completely unaffected: the JWKS
+   * is fetched from the same origin the `iss` is validated against, exactly as
+   * before this seam existed.
+   *
+   * Motivation (vault#464): on a co-located deploy (hub + vault on one box),
+   * `parachute expose` pins `hubOrigin` to the PUBLIC Cloudflare FQDN so the
+   * token's `iss` claim matches what the hub mints. But fetching JWKS from that
+   * public origin hairpins out through the tunnel and back to the same box —
+   * slow on a real VPS, a hard timeout under Docker NAT-loopback. The fix is to
+   * keep validating `iss` against the public origin while fetching the keys
+   * from the LOCAL hub (loopback). The consumer passes
+   * `jwksOrigin: () => "http://127.0.0.1:1939"` (or its internal override) and
+   * leaves `hubOrigin` as the public FQDN.
+   *
+   * The JWKS cache is keyed on the fetch origin (this value), so a
+   * public-`iss` + loopback-`jwksOrigin` guard caches under the loopback key —
+   * the iss-pin and the fetch-origin are fully decoupled.
+   *
+   * If an explicit `jwksGetter` is also supplied, that getter owns the fetch
+   * path and `jwksOrigin` has no effect (the getter is used verbatim).
+   */
+  jwksOrigin?: string | (() => string);
 
   /**
    * Accept hub-signed JWTs that lack the `jti` claim entirely. **Default
@@ -281,11 +315,19 @@ function resolveOrigin(input: string | (() => string)): string {
 export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
   const {
     hubOrigin,
+    jwksOrigin,
     jwks: jwksOpts,
     jwksGetter: injected,
     allowMissingJti = false,
     missingJtiLogger,
   } = opts;
+
+  // The origin the JWKS is FETCHED from. Defaults to `hubOrigin` (zero change
+  // for existing callers) — when supplied, it decouples the fetch origin from
+  // the `iss`-validation origin so a co-located RS can read keys from loopback
+  // while accepting a public `iss` (vault#464). Both resolvers are re-evaluated
+  // per request, so env changes propagate without a restart.
+  const jwksOriginInput = jwksOrigin ?? hubOrigin;
 
   const reloadMinIntervalMs = opts.jwksReloadMinIntervalMs ?? DEFAULT_JWKS_RELOAD_MIN_INTERVAL_MS;
   const reloadNow = opts.jwksReloadNow ?? (() => Date.now());
@@ -401,8 +443,13 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
 
   return {
     async validateHubJwt(token, validateOpts = {}) {
+      // `origin` pins the `iss` check (and the revocation-list endpoint, which
+      // lives on the issuer). `jwksFetchOrigin` is where the keys are fetched —
+      // identical to `origin` unless the caller supplied `jwksOrigin`. Both are
+      // resolved per call so env changes propagate without a restart.
       const origin = resolveOrigin(hubOrigin);
-      const getter = pickGetter(origin);
+      const jwksFetchOrigin = resolveOrigin(jwksOriginInput);
+      const getter = pickGetter(jwksFetchOrigin);
 
       const payload: JWTPayload = await verifyWithRotationRetry(token, origin, getter);
 
@@ -534,8 +581,10 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
 
     resetJwksCache() {
       if (injected) return; // injected getter has no cache we own
-      const origin = resolveOrigin(hubOrigin);
-      resetCache(origin);
+      // The cache is keyed on the FETCH origin, so reset under the jwksOrigin
+      // (which defaults to hubOrigin). Re-resolve per call to match the key
+      // a concurrent env change would have written under.
+      resetCache(resolveOrigin(jwksOriginInput));
     },
 
     resetRevocationCache() {
