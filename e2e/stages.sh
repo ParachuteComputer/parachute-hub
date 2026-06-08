@@ -650,9 +650,23 @@ hr "STAGE 4 — wipe recovery (rm -rf ~/.parachute while the unit runs)"
 #   (b) the on-disk hub.db must exist again after recovery, AND
 #   (c) a fresh CLI process (mint-token, which opens the DB by PATH) must work
 #       — the ghost-fd handle is invisible to a process that opens by path.
-# If the hub instead keeps serving db:"ok" from a deleted-but-open fd while the
-# on-disk DB stays gone, that's the #594 dead-handle bug live — we detect it
-# explicitly and XFAIL (loud) rather than green on it.
+#
+# #610 FIXED (this PR): the hub now SELF-RECOVERS without an operator nudge. A
+# bounded proactive DB-liveness watchdog (`startDbPathLivenessTimer` → the
+# DbHolder's `probePath`) stat()s the configured db path on a low-frequency
+# timer and compares its inode to the open handle's. When `rm -rf ~/.parachute`
+# unlinks the DB under the running unit, the path stat returns ENOENT (or a
+# different inode) — the genuine wipe signal the REACTIVE path (#594) can't see
+# (the ghost inode keeps SELECT 1 succeeding, nothing throws). The watchdog then
+# triggers the same reopen-or-exit machinery; the path is gone so reopen's verify
+# fails → exit(1) → systemd restarts the unit with a fresh on-disk handle, in
+# seconds. So Stage 4 now asserts AUTOMATIC self-recovery (MainPID changed +
+# on-disk hub.db + /health db:ok) WITHIN the wait window, with NO `systemctl
+# restart` nudge. If the hub does NOT self-recover, that's a #610 REGRESSION —
+# a hard FAIL, not an XFAIL. The ghost-fd readlink machinery is kept purely as a
+# diagnostic: a transiently-observed ghost fd that the watchdog then heals is
+# expected (the timer fires a beat after the unlink); only a hub that STAYS on
+# the ghost inode past the window (never self-recovers) fails.
 
 note "Capturing baseline: unit MainPID + /health…"
 PID_BEFORE="$(systemctl show -p MainPID --value parachute-hub.service)"
@@ -672,14 +686,19 @@ if [ -f /root/.parachute/hub.db ]; then
 fi
 note "confirmed: hub.db is gone from disk. Watching for a REAL recovery (PID change + fresh on-disk DB)…"
 
-# Poke a DB-touching route in a loop to give the reactive self-heal a chance to
-# fire (it only triggers on a thrown SQLite error). Then check for a genuine
-# restart: MainPID changed AND hub.db is back on disk.
+# Watch for the AUTOMATIC self-recovery the #610 proactive watchdog now drives:
+# MainPID changed AND hub.db is back on disk — no operator nudge. We still poke a
+# DB-touching route each tick (harmless; also gives the reactive path a chance on
+# the off chance a write throws first) and observe the ghost-fd window purely as a
+# diagnostic. The proactive timer self-heals (exit → systemd restart) within its
+# cadence, so the on-disk DB + a fresh PID appear here on their own.
 # Helper: count deleted hub.db fds held open by the still-running hub PID. This
-# is the #610 fingerprint — an unlinked-but-open SQLite fd the reactive
-# self-heal can't see (it only fires on a THROWN error; SELECT 1 keeps
-# succeeding against the ghost inode). readlink (not `ls | grep`) because we
-# need the symlink TARGET, which carries the " (deleted)" marker.
+# is the #610 fingerprint — an unlinked-but-open SQLite fd the REACTIVE self-heal
+# can't see (it only fires on a THROWN error; SELECT 1 keeps succeeding against
+# the ghost inode). The PROACTIVE watchdog is what clears it. A transient sighting
+# (before the timer fires) is expected; it's only a problem if it never heals.
+# readlink (not `ls | grep`) because we need the symlink TARGET, which carries the
+# " (deleted)" marker.
 count_ghost_fds() {
   local pid="$1" n=0 fd target
   for fd in "/proc/${pid}/fd/"*; do
@@ -692,53 +711,46 @@ count_ghost_fds() {
   printf '%s' "$n"
 }
 
-# Did we observe the #610 ghost-fd at any point in the wipe window? Capturing it
-# independently of recovery is the key fix: the ghost-fd is the #610 fingerprint
-# whether or not a later restart recovers, so it drives the result classification
-# (XFAIL even when restart recovers — vs. a genuinely-dead hub with NO ghost-fd,
-# which must FAIL).
+# Diagnostic only (post-#610): did we transiently observe the ghost-fd before the
+# proactive watchdog healed it? A brief sighting (the timer fires a beat after the
+# unlink) is EXPECTED and benign now — it no longer drives the result. What drives
+# the result is whether the hub SELF-RECOVERS (it must).
 GHOST_SEEN=0
 
+# #610 now self-recovers WITHOUT an operator nudge. Give the bounded proactive
+# watchdog (default 15s cadence) a couple of cycles to detect the wiped path,
+# exit, and let systemd restart with a fresh on-disk handle. 90s is comfortably
+# several timer cycles + the systemd restart.
 recovered=0
 deadline=$(( $(date +%s) + 90 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  # DB-touching probe (ignored result — we just want to provoke the handle).
+  # DB-touching probe (ignored result). Harmless; the proactive timer is what
+  # drives recovery now, but a provoked write can't hurt.
   curl -s -o /dev/null -H 'accept: application/json' "${HUB}/admin/setup" || true
-  # Observe the ghost-fd while the original PID is still alive (it won't exist
-  # once the process restarts).
+  # Observe the (transient) ghost-fd while the original PID is still alive.
   if [ "$(systemctl show -p MainPID --value parachute-hub.service)" = "$PID_BEFORE" ]; then
     [ "$(count_ghost_fds "$PID_BEFORE")" -gt 0 ] && GHOST_SEEN=1
   fi
   PID_NOW="$(systemctl show -p MainPID --value parachute-hub.service)"
   if [ "$PID_NOW" != "$PID_BEFORE" ] && [ -f /root/.parachute/hub.db ]; then
-    note "self-recovery: MainPID ${PID_BEFORE} -> ${PID_NOW}, hub.db back on disk."
+    note "SELF-RECOVERY (no nudge): MainPID ${PID_BEFORE} -> ${PID_NOW}, hub.db back on disk."
     recovered=1
     break
   fi
   sleep 2
 done
 
-# Snapshot the ghost-fd count one more time before any restart (for the report).
+# Snapshot the ghost-fd count one more time (for the report).
 GHOST_FD=0
 if [ "$(systemctl show -p MainPID --value parachute-hub.service)" = "$PID_BEFORE" ]; then
   GHOST_FD="$(count_ghost_fds "$PID_BEFORE")"
   [ "$GHOST_FD" -gt 0 ] && GHOST_SEEN=1
 fi
 
-if [ "$recovered" -ne 1 ]; then
-  # Did the hub at least come back via an explicit operator restart? An operator
-  # whose hub wedged would `systemctl restart`; the harness mirrors that as the
-  # last-resort nudge. After a real restart the fd is fresh AND a new on-disk DB
-  # is created on boot.
-  note "no self-recovery within 90s. Nudging systemd (the operator's last resort)…"
-  systemctl restart parachute-hub.service || true
-  if wait_for "hub healthy + fresh on-disk DB after restart" 60 \
-      "curl -fsS ${HUB}/health | grep -q '\"db\":\"ok\"' && test -f /root/.parachute/hub.db"; then
-    PID_NOW="$(systemctl show -p MainPID --value parachute-hub.service)"
-    note "recovered after explicit restart: MainPID now ${PID_NOW}, hub.db on disk."
-    recovered=1
-  fi
-fi
+# NOTE: the operator-`systemctl restart` nudge is intentionally GONE. #610's fix
+# means the hub must recover on its OWN. If `recovered` is still 0 here, that is a
+# #610 REGRESSION (the proactive watchdog didn't fire / didn't exit) — a hard FAIL
+# below, not a soft "operator can always restart" XFAIL.
 
 # --- the discriminating assertion ---
 # Recovery is REAL iff hub.db is on disk AND a fresh process serves it (a fresh
@@ -747,17 +759,24 @@ HEALTH_DB="$(curl -fsS "${HUB}/health" | grep -o '"db":"[^"]*"' || true)"
 # `if` (not `&&`) so a missing file doesn't make the line's exit nonzero under -e.
 if [ -f /root/.parachute/hub.db ]; then ONDISK_DB="present"; else ONDISK_DB="absent"; fi
 
-# Three-way classification (reviewer fold):
-#   1. recovered (self OR restart) AND NO ghost-fd was ever seen → clean PASS.
-#   2. ghost-fd WAS seen (the #610 fingerprint) → XFAIL, even if a restart later
-#      recovered. The ghost-fd window is itself the shipped bug we've filed as
-#      hub#610; greening on it would be the false-confidence we're guarding
-#      against. Loud banner, exit 0 (known bug, not a harness failure).
-#   3. NO ghost-fd AND NOT recovered → a genuinely-dead hub with no #610
-#      explanation (startup crash, bad binary, perms). HARD FAIL (non-zero).
-if [ "$recovered" -eq 1 ] && [ "$GHOST_SEEN" -eq 0 ] && [ "$ONDISK_DB" = "present" ]; then
-  note "clean recovery with a fresh on-disk DB (${HEALTH_DB}); no ghost-fd observed. Proceeding to re-init."
-  # Re-run init — version-check / adoption must not wedge (#590).
+# Post-#610 classification (this PR flipped XFAIL → PASS):
+#   1. SELF-RECOVERED (no nudge) AND on-disk hub.db present AND /health db:ok →
+#      PASS. This is the #610 fix working: the proactive watchdog detected the
+#      wiped path, exited, and systemd restarted with a fresh handle on its own.
+#      A transiently-seen ghost-fd is fine — the watchdog healed it (we note it
+#      for the record but it no longer downgrades the result).
+#   2. NOT self-recovered (recovered==0) → #610 REGRESSION. The proactive
+#      watchdog didn't fire / didn't exit, or systemd didn't restart. HARD FAIL
+#      (non-zero). We dump the still-open ghost-fd(s) + unit status as evidence.
+#      (No operator-`systemctl restart` rescue — the whole point of #610 is that
+#      recovery is automatic; rescuing here would re-hide a regression.)
+if [ "$recovered" -eq 1 ] && [ "$ONDISK_DB" = "present" ] && \
+   printf '%s' "${HEALTH_DB}" | grep -q '"db":"ok"'; then
+  if [ "$GHOST_SEEN" -eq 1 ]; then
+    note "self-recovery confirmed; a transient ghost-fd was observed before the proactive watchdog healed it (expected — the timer fires a beat after the unlink). ${GHOST_FD:-0} deleted hub.db fd(s) at last snapshot."
+  fi
+  note "clean SELF-recovery with a fresh on-disk DB (${HEALTH_DB}); no operator nudge needed. Proceeding to re-init."
+  # Re-run init — version-check / adoption must not wedge (#590 / #609).
   note "Re-running 'parachute init' after the wipe…"
   INIT3_LOG=/tmp/parachute-init-3.log
   if ! parachute init --expose none --no-expose-prompt --no-browser >"$INIT3_LOG" 2>&1; then
@@ -765,6 +784,15 @@ if [ "$recovered" -eq 1 ] && [ "$GHOST_SEEN" -eq 0 ] && [ "$ONDISK_DB" = "presen
     die "stage4-wipe-recovery" "post-wipe parachute init exited non-zero (adoption wedge?)"
   fi
   cat "$INIT3_LOG"
+  # #609: the re-init's vault install must reclaim the canonical port (adopt-kill
+  # the surviving vault child), NOT port-walk to a non-canonical fallback. A
+  # "canonical port 1940 is in use; assigned 19XX" line here would mean #609
+  # regressed. (Soft check — the surviving child may already have been reaped by
+  # the supervisor restart in step 1; either way the canonical port must win.)
+  if grep -qE 'canonical port 1940 is in use; assigned' "$INIT3_LOG"; then
+    cat "$INIT3_LOG" >&2
+    die "stage4-wipe-recovery" "#609 regression: post-wipe re-init port-walked vault off the canonical 1940 instead of adopt-killing the surviving child"
+  fi
   curl -fsS "${HUB}/health" | grep -q '"db":"ok"' || die "stage4-wipe-recovery" "hub not db:ok after post-wipe init"
 
   # Wizard reachable again + COHERENT (200 JSON or clean redirect), not a 5xx.
@@ -774,39 +802,28 @@ if [ "$recovered" -eq 1 ] && [ "$GHOST_SEEN" -eq 0 ] && [ "$ONDISK_DB" = "presen
     *) cat /tmp/setup-after.json >&2 || true
        die "stage4-wipe-recovery" "/admin/setup returned ${WIZ_CODE} after wipe (5xx?)" ;;
   esac
-  record "stage4-wipe-recovery" "PASS" "clean recovery: PID changed, fresh on-disk DB, no ghost-fd, re-init clean"
-elif [ "$GHOST_SEEN" -eq 1 ]; then
-  # The KNOWN #610 ghost-fd gap. On rc this is the live shape: the hub serves a
-  # ghost DB during the wipe window (reactive self-heal never fires on the
-  # unlinked-but-open fd), and an operator `systemctl restart` recovers it. We
-  # XFAIL — a filed, tracked shipped bug, not a harness failure.
-  printf '\n=========== hub#610 FINDING (ghost-fd, live on this build) ===========\n' >&2
-  printf '  After rm -rf ~/.parachute, the hub kept open deleted hub.db fd(s)\n' >&2
-  printf '  (count seen: %s) and served /health=%s from the ghost inode.\n' "${GHOST_FD:-?}" "${HEALTH_DB:-?}" >&2
-  printf '  The reactive self-heal (#594) only fires on a THROWN SQLite error;\n' >&2
-  printf '  an unlinked-but-open fd keeps SELECT 1 + writes succeeding, so the\n' >&2
-  printf '  handle is never reopened and a fresh CLI (opens by path) sees nothing.\n' >&2
-  printf '  Recovery here: %s. Tracked as hub#610.\n' \
-    "$([ "$recovered" -eq 1 ] && echo "operator restart succeeded" || echo "NOT recovered even after restart")" >&2
-  printf '======================================================================\n\n' >&2
-  # Dump the offending fd targets for the transcript (readlink, not ls|grep).
+  record "stage4-wipe-recovery" "PASS" "automatic self-recovery (#610): PID changed w/o nudge, fresh on-disk DB, db:ok; re-init reclaimed canonical port (#609)"
+else
+  # The hub did NOT self-recover within the window → #610 regression. On a build
+  # with the fix this should not happen; the proactive watchdog detects the wiped
+  # path and exits within a couple of timer cycles. Dump the ghost-fd evidence +
+  # unit status and FAIL hard (non-zero).
+  printf '\n!! Stage 4: hub did NOT self-recover after the wipe — #610 REGRESSION.\n' >&2
+  printf '   The proactive DB-liveness watchdog should have detected the unlinked\n' >&2
+  printf '   path and exit(1)'"'"'d so systemd restarts with a fresh on-disk handle.\n' >&2
+  printf '   MainPID before=%s now=%s ; /health db=%s ; on-disk hub.db=%s ; ghost-fd seen=%s (count=%s)\n' \
+    "$PID_BEFORE" "$(systemctl show -p MainPID --value parachute-hub.service)" \
+    "${HEALTH_DB:-?}" "$ONDISK_DB" "$GHOST_SEEN" "${GHOST_FD:-?}" >&2
+  # Dump the offending ghost fd targets for the transcript (readlink, not ls|grep).
   if [ "$(systemctl show -p MainPID --value parachute-hub.service)" = "$PID_BEFORE" ]; then
     for fd in "/proc/${PID_BEFORE}/fd/"*; do
       target="$(readlink "$fd" 2>/dev/null || true)"
       case "$target" in *hub.db*) printf '  fd %s -> %s\n' "$(basename "$fd")" "$target" >&2 ;; esac
     done
   fi
-  xfail "stage4-wipe-recovery" "hub#610 ghost-fd: health=${HEALTH_DB:-?}, ${GHOST_FD:-?} deleted hub.db fd(s), restart-recovered=$([ "$recovered" -eq 1 ] && echo yes || echo no)"
-else
-  # No ghost-fd explanation AND the hub did not recover → genuinely dead.
-  # This is a REAL failure (startup crash / bad binary / perms), NOT the #610
-  # gap, so it must FAIL the run with a non-zero exit.
-  printf '\n!! Stage 4: hub did NOT recover and NO ghost-fd was observed.\n' >&2
-  printf '   MainPID before=%s now=%s ; /health db=%s ; on-disk hub.db=%s\n' \
-    "$PID_BEFORE" "$(systemctl show -p MainPID --value parachute-hub.service)" "${HEALTH_DB:-?}" "$ONDISK_DB" >&2
   systemctl --no-pager status parachute-hub.service 2>&1 | head -25 >&2 || true
   curl -s "${HUB}/health" >&2 || true; echo >&2
-  die "stage4-wipe-recovery" "hub unrecoverable after wipe with no ghost-fd explanation (genuine failure, not hub#610): health=${HEALTH_DB:-?}, on-disk DB ${ONDISK_DB}"
+  die "stage4-wipe-recovery" "#610 regression: hub did not self-recover after wipe (health=${HEALTH_DB:-?}, on-disk DB ${ONDISK_DB}, ghost-fd seen=${GHOST_SEEN})"
 fi
 
 # ---------------------------------------------------------------------------
