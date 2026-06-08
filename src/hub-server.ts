@@ -184,7 +184,13 @@ import { applyCorsHeaders, corsPreflightResponse, isCorsAllowedRoute } from "./c
 import { ensureCsrfToken } from "./csrf.ts";
 import { readExposeState } from "./expose-state.ts";
 import { HUB_DEFAULT_PORT, HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
-import { classifyDbError, createDbHolder, probeDbLiveness } from "./hub-db-liveness.ts";
+import {
+  classifyDbError,
+  createDbHolder,
+  defaultStatInode,
+  probeDbLiveness,
+  startDbPathLivenessTimer,
+} from "./hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
 import { getHubOrigin } from "./hub-settings.ts";
 import { type RenderHubOpts, renderHub } from "./hub.ts";
@@ -842,6 +848,17 @@ export interface HubFetchDeps {
    * the response. Absent in tests that don't exercise the DB-error path.
    */
   onDbError?: (err: unknown) => "ignored" | "healed" | "exited";
+  /**
+   * PROACTIVE db-path liveness probe (#610). Production wires the
+   * {@link DbHolder}'s `probePath` so the `/health` db check `stat()`s the
+   * configured db path and compares its inode to the open handle's — catching
+   * the "operator wiped `~/.parachute` under a running hub" case that NEVER
+   * throws on Linux (the unlinked-but-open ghost inode keeps `SELECT 1`
+   * succeeding). Returns the path-liveness verdict; on a genuine wipe it ALSO
+   * triggers the reopen-or-exit self-heal. Absent in tests that don't exercise
+   * the proactive path — `/health` then falls back to the `SELECT 1` probe only.
+   */
+  probeDbPath?: () => "ok" | "gone" | "replaced" | "unknown";
   /**
    * Hub origin used as the OAuth `iss` claim and to build the authorization-
    * server metadata document. When omitted, OAuth endpoints fall back to the
@@ -1605,7 +1622,26 @@ export function hubFetch(
         let db: "ok" | string = "unconfigured";
         if (getDb) {
           try {
-            db = probeDbLiveness(getDb());
+            // PROACTIVE path check FIRST (#610): on Linux a wiped state dir
+            // doesn't throw — the unlinked-but-open ghost inode keeps SELECT 1
+            // succeeding, so `probeDbLiveness` alone would report `db:"ok"` on a
+            // database that's gone from disk (the /health lie the issue calls
+            // out). `probeDbPath` stat()s the path + compares inodes; on a
+            // gone/replaced verdict it ALSO self-heals (reopen-or-exit) and we
+            // surface the fault so the #591 adoption probe + monitoring see it.
+            const pathVerdict = deps?.probeDbPath?.();
+            if (pathVerdict === "gone" || pathVerdict === "replaced") {
+              // One-request anomaly on "replaced": probeDbPath already healed the
+              // handle synchronously, but THIS request still reports the fault
+              // (the next /health reads `db:"ok"`). Intentional — we surface that
+              // a heal just occurred rather than masking it. Safe because #591's
+              // adoption probe gates on HTTP 200 (`res.ok`), not the `db` string,
+              // so a single transient error string can't cascade. ("gone" exits
+              // the process, usually before this response is even sent.)
+              db = `error: path-${pathVerdict}`;
+            } else {
+              db = probeDbLiveness(getDb());
+            }
           } catch {
             // getDb() itself threw (e.g. openHubDb failed) — report it as an
             // error class without letting /health 500.
@@ -2769,12 +2805,36 @@ if (import.meta.main) {
   // touch the DB still works before first open. Once opened, the holder owns
   // reopen-once-or-exit on a persistent SQLite fault.
   let holder: ReturnType<typeof createDbHolder> | undefined;
-  const getDb = () => {
+  let livenessTimer: ReturnType<typeof startDbPathLivenessTimer> | undefined;
+  const ensureHolder = (): ReturnType<typeof createDbHolder> => {
     if (!holder) {
-      holder = createDbHolder(openHubDb(dbPath), { reopen: () => openHubDb(dbPath) });
+      const db = openHubDb(dbPath);
+      // Snapshot the inode the handle is bound to NOW, so the proactive probe
+      // (#610) can later notice the path has gone / been replaced. Best-effort
+      // — a failed snapshot leaves the proactive probe at "unknown" (it never
+      // self-heals without a baseline), while the reactive path still covers
+      // thrown faults.
+      let initialInode: ReturnType<typeof defaultStatInode> | undefined;
+      try {
+        initialInode = defaultStatInode(dbPath);
+      } catch {
+        initialInode = undefined;
+      }
+      holder = createDbHolder(db, {
+        reopen: () => openHubDb(dbPath),
+        dbPath,
+        statInode: defaultStatInode,
+        initialInode,
+      });
+      // Start the bounded proactive-liveness watchdog (#610) once the handle is
+      // open. It stat()s the db path on a low-frequency timer and self-heals
+      // (reopen-or-exit) the moment the on-disk DB is wiped — closing the
+      // ghost-fd gap the reactive path can't see (no thrown error on Linux).
+      livenessTimer = startDbPathLivenessTimer(holder);
     }
-    return holder.get();
+    return holder;
   };
+  const getDb = () => ensureHolder().get();
   const onDbError = (err: unknown): "ignored" | "healed" | "exited" =>
     holder ? holder.healOrExit(err) : "ignored";
   Bun.serve({
@@ -2792,7 +2852,13 @@ if (import.meta.main) {
     // Bun's equivalent is this. 255s comfortably exceeds Render's edge
     // pool TTL (community-observed ~120s). Closes hub#399.
     idleTimeout: 255,
-    fetch: hubFetch(wellKnownDir, { getDb, onDbError, issuer, loopbackPort: port }),
+    fetch: hubFetch(wellKnownDir, {
+      getDb,
+      onDbError,
+      probeDbPath: () => holder?.probePath() ?? "unknown",
+      issuer,
+      loopbackPort: port,
+    }),
   });
   // Register PID + port from the running hub itself so any startup path
   // (spawn-via-`ensureHubRunning` or a direct `bun src/hub-server.ts` from
@@ -2802,6 +2868,7 @@ if (import.meta.main) {
   writePid(HUB_SVC, process.pid);
   writeHubPort(port);
   const cleanup = () => {
+    livenessTimer?.stop();
     clearPid(HUB_SVC);
     clearHubPort();
   };

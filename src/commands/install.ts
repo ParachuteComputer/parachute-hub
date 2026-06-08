@@ -7,8 +7,12 @@ import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
 import {
   HUB_DEFAULT_PORT,
+  type KillFn,
   type PidOnPortFn,
+  type SleepFn,
+  defaultKill,
   defaultPidOnPort,
+  defaultSleep,
   readHubPort,
 } from "../hub-control.ts";
 import { type HubUnitDeps, defaultHubUnitDeps, isHubUnitInstalled } from "../hub-unit.ts";
@@ -18,6 +22,7 @@ import {
   readModuleManifest,
   validateModuleManifest,
 } from "../module-manifest.ts";
+import { orphanAttributable } from "../orphan-attribution.ts";
 import { assignServicePort } from "../port-assign.ts";
 import { finalizeModuleInstall, stampInstallDirOnRow } from "../post-install.ts";
 import {
@@ -324,6 +329,30 @@ export interface InstallOpts {
    */
   ownerOfPid?: OwnerProbeFn;
   /**
+   * Test seam for the install-time canonical-port ADOPT-KILL (#609). When the
+   * canonical port is held by an attributable prior instance of THE SAME module
+   * (a surviving orphan child after `rm -rf ~/.parachute` + re-`init`), we
+   * SIGTERM→SIGKILL it to reclaim the canonical port instead of walking to a
+   * non-canonical fallback. Reuses the #601 `orphanAttributable` machinery in
+   * per-module mode (marker = this install's `installDir`); a foreign /
+   * unattributable holder is NEVER killed — it falls through to the #590
+   * warn-and-walk path. Production wires `defaultKill` (`process.kill`); tests
+   * inject a spy so no real process is signalled.
+   */
+  killPid?: KillFn;
+  /**
+   * Test seam for the grace delay between SIGTERM and the SIGKILL escalation in
+   * the #609 adopt-kill. Production wires `defaultSleep`; tests inject a no-op
+   * so the path runs instantly.
+   */
+  sleep?: SleepFn;
+  /**
+   * Test seam: ms to wait after SIGTERM before re-probing + escalating to
+   * SIGKILL in the #609 adopt-kill. Default 1500ms (a listener-release grace);
+   * tests pass 0.
+   */
+  reclaimDelayMs?: number;
+  /**
    * Test seam for reading `<packageDir>/.parachute/module.json`. Production
    * uses the real file reader; tests inject a map from package-dir → manifest
    * (or throw to simulate malformed JSON). Returns null when the package
@@ -450,6 +479,50 @@ async function collectOccupiedPorts(
     }
   }
   return ports;
+}
+
+/**
+ * Adopt-kill an ATTRIBUTABLE orphan holding the canonical port (#609). The
+ * caller has ALREADY confirmed attribution (per-module marker) — this is purely
+ * the signal sequence, mirroring the supervisor's `adoptKillOrphanOnPort`:
+ * SIGTERM, a listener-release grace, then SIGKILL only if the SAME pid still
+ * holds the SAME port. Best-effort: a kill that doesn't free the port degrades
+ * to the normal warn-and-walk path (the subsequent `collectOccupiedPorts` still
+ * sees the port held and `assignServicePort` walks).
+ *
+ * The re-probe before SIGKILL is deliberately NOT re-attributed: we already
+ * attributed `holder` to this module, and only escalate if that exact pid still
+ * holds the port (the same accepted, vanishingly-small TOCTOU window the
+ * supervisor + migrate sweep carry).
+ */
+async function adoptKillOnPort(args: {
+  port: number;
+  holder: number;
+  kill: KillFn;
+  sleep: SleepFn;
+  pidOnPort: PidOnPortFn;
+  delayMs: number;
+  log: (line: string) => void;
+}): Promise<void> {
+  const { port, holder, kill, sleep, pidOnPort, delayMs, log } = args;
+  try {
+    kill(holder, "SIGTERM");
+  } catch {
+    // ESRCH (already gone) / EPERM (can't signal) — nothing more to do; the
+    // re-probe + walk path handles a still-held port.
+    return;
+  }
+  await sleep(delayMs);
+  if (pidOnPort(port) === holder) {
+    try {
+      kill(holder, "SIGKILL");
+      log(`  pid ${holder} did not release ${port} on SIGTERM; escalated to SIGKILL.`);
+    } catch {
+      // Already gone / can't signal — best-effort; fall through to the walk.
+    }
+  } else {
+    log(`  reclaimed canonical port ${port} (pid ${holder} released it).`);
+  }
 }
 
 function defaultFindGlobalInstall(pkg: string): string | null {
@@ -988,23 +1061,98 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   // future installs no longer touch them.
   const preInitEntry = findService(entryName, manifestPath);
   const probe = opts.portProbe ?? defaultPortProbe;
-  const occupied = await collectOccupiedPorts(manifestPath, entryName, preInitEntry?.port, probe);
+  const pidOnPort = opts.pidOnPort ?? defaultPidOnPort;
+  const ownerOfPid = opts.ownerOfPid ?? defaultOwnerOfPid;
   const canonicalPort = spec.seedEntry?.().port ?? preInitEntry?.port;
+
+  // #609 wipe-recovery adopt-kill: BEFORE assigning, if the canonical port is
+  // held by an attributable prior instance of THE SAME module (the classic
+  // `rm -rf ~/.parachute` + re-`init` case — the supervised vault child keeps
+  // running on :1940 and the fresh install would otherwise port-walk to 1944),
+  // reclaim the port by adopt-killing the orphan rather than walking. Reuses the
+  // #601 `orphanAttributable` machinery in PER-MODULE mode (marker = THIS
+  // install's installDir, the same module-specific marker the supervisor's
+  // crash-restart path uses) so a FOREIGN / sibling-module / operator process is
+  // NEVER killed — it falls through to the #590 warn-and-walk path below.
+  // Detection + module-specific attribution only; the kill is gated hard.
+  // Gate the probe on the canonical port actually being OCCUPIED — when it's
+  // free there's nothing to reclaim, and probing pid would be wasted work (and
+  // a false "I looked at the port" signal). `probe` is the same TCP listen probe
+  // `collectOccupiedPorts` uses below; a services.json row on the canonical port
+  // also counts as occupied (a prior install's lingering entry).
+  const canonicalOccupied =
+    canonicalPort !== undefined &&
+    (preInitEntry?.port === canonicalPort ||
+      (await (async () => {
+        try {
+          return await probe(canonicalPort);
+        } catch {
+          return false;
+        }
+      })()));
+  if (canonicalPort !== undefined && installDir && canonicalOccupied) {
+    const holder = pidOnPort(canonicalPort);
+    if (holder !== undefined && holder !== process.pid) {
+      const { attributable, cmdline } = orphanAttributable({
+        orphan: holder,
+        // No recorded pid to trust here — a wiped services.json carries none —
+        // so attribution rides entirely on the per-module cmdline marker.
+        recordedPid: undefined,
+        short,
+        startCmdHint: undefined,
+        ownerOfPid,
+        // Per-module marker = installDir (e.g. `~/.parachute/vault/`); a prior
+        // instance of this module was launched from there, so its `ps` cmdline
+        // carries it. NOT the broad `parachute` marker — that would let a
+        // sibling module's orphan on this port be (wrongly) adopted.
+        moduleMarker: installDir,
+      });
+      if (attributable) {
+        log(
+          `Canonical port ${canonicalPort} is held by an attributable prior ${short} instance (pid ${holder}${cmdline ? `, ${cmdline}` : ""}) — reclaiming it (adopt-kill) instead of walking to a fallback (#609).`,
+        );
+        await adoptKillOnPort({
+          port: canonicalPort,
+          holder,
+          kill: opts.killPid ?? defaultKill,
+          sleep: opts.sleep ?? defaultSleep,
+          pidOnPort,
+          delayMs: opts.reclaimDelayMs ?? 1500,
+          log,
+        });
+      }
+    }
+  }
+
+  // Hub-as-port-authority (#53): pick the service's port now and reflect it
+  // in services.json. Pre-hub#206 the install path also wrote `PORT=<port>`
+  // into the service's `.env`; post-#206 (option A) services.json is the
+  // single source of truth — services follow the 4-tier resolvePort ladder
+  // (services.json → service config → bare PORT env → compiled-in default,
+  // per parachute-scribe#41 / parachute-agent#146 / parachute-agent#148 /
+  // parachute-patterns#45), so the duplicate `.env` PORT was at best dead
+  // weight and at worst a source of drift on re-install. Existing `.env`
+  // PORT lines on operator machines stay where they are — harmless — and
+  // future installs no longer touch them.
+  //
+  // collectOccupiedPorts runs AFTER the #609 adopt-kill above so a reclaimed
+  // canonical port is seen as free and the assignment lands on it (no walk).
+  const occupied = await collectOccupiedPorts(manifestPath, entryName, preInitEntry?.port, probe);
   const portResult = assignServicePort({
     canonical: canonicalPort,
     occupied,
   });
   if (portResult.warning) {
     log(`⚠ ${portResult.warning}`);
-    // #590 item 2: the canonical port was held, so we walked to a fallback. Name
-    // the squatter — the supervisor start-path does this post-#581; do it here at
-    // install-time too. Reuse the #581 pidOnPort / ownerOfPid seams (detection
-    // only; never kill). When the holder is a foreign pid (not one of OUR rows —
-    // which is the common case when a stale pre-supervisor daemon is squatting),
-    // surface its pid + command line + a hint.
+    // #590 item 2: the canonical port was held by a NON-attributable holder (the
+    // #609 adopt-kill above already reclaimed an attributable same-module
+    // orphan), so we walked to a fallback. Name the squatter — the supervisor
+    // start-path does this post-#581; do it here at install-time too. Reuse the
+    // #581 pidOnPort / ownerOfPid seams (detection only; never kill). When the
+    // holder is a foreign pid (not one of OUR rows — which is the common case
+    // when a stale pre-supervisor daemon is squatting), surface its pid +
+    // command line + a hint.
     if (canonicalPort !== undefined && portResult.source !== "canonical") {
-      const pidOnPort = opts.pidOnPort ?? defaultPidOnPort;
-      const ownerOfPid = opts.ownerOfPid ?? defaultOwnerOfPid;
       const holder = pidOnPort(canonicalPort);
       if (holder !== undefined) {
         const cmdline = ownerOfPid(holder);
