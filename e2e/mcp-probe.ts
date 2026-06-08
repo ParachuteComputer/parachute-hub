@@ -147,59 +147,102 @@ async function main(): Promise<void> {
     state: "e2e-state",
     resource: `${HUB}/vault/${args.vault}`,
   });
-  // GET the consent screen (must be served with a valid session). This also
-  // refreshes the CSRF cookie used by the consent POST.
+  // GET /oauth/authorize. Two valid outcomes a real MCP client (Claude Code /
+  // claude.ai) must handle — and the probe now handles BOTH:
+  //   200 — the consent SCREEN is rendered. First-time client (no prior trust).
+  //         We parse the form, POST __action=consent, and read the auth code
+  //         from the resulting 302 callback Location. (Stage 1 loopback path:
+  //         the probe's client is brand-new.)
+  //   302 — consent was AUTO-APPROVED (hub#409 trust-by-client_name): a client
+  //         with the same client_name was already approved, so the hub skips
+  //         the consent screen and 302s straight to the callback with ?code=.
+  //         (Stage 3 public path: the probe registers a SECOND client with the
+  //         same client_name as Stage 1's, so trust-by-client_name fires.)
+  // Either way we end up with an auth code → /oauth/token → MCP. A 302 carrying
+  // ?error= (denied / invalid) is a REAL failure and fails loudly.
   const authGet = await fetch(`${HUB}/oauth/authorize?${authQuery.toString()}`, {
     headers: { cookie: `parachute_hub_session=${sessionCookie}` },
     redirect: "manual",
   });
-  const authHtml = await authGet.text();
-  if (authGet.status !== 200) {
-    fail(
-      `GET /oauth/authorize returned ${authGet.status} (expected consent 200): ${authHtml.slice(0, 300)}`,
-    );
-  }
-  if (!authHtml.includes('value="consent"')) {
-    fail(`GET /oauth/authorize did not render the consent screen: ${authHtml.slice(0, 300)}`);
-  }
-  const authCsrfCookie = cookieFrom(authGet, "parachute_hub_csrf") ?? csrfCookie;
-  const authCsrfField =
-    authHtml.match(/name="__csrf"\s+value="([^"]+)"/)?.[1] ?? authCsrfCookie ?? "";
 
-  const consentBody = new URLSearchParams({
-    __action: "consent",
-    __csrf: authCsrfField,
-    approve: "yes",
-    client_id: reg.client_id,
-    redirect_uri: redirectUri,
-    response_type: "code",
-    scope: `vault:${args.vault}:read vault:${args.vault}:write`,
-    code_challenge: challenge,
-    code_challenge_method: "S256",
-    state: "e2e-state",
-    resource: `${HUB}/vault/${args.vault}`,
-    vault_pick: args.vault,
-  });
-  const consentCookies = [`parachute_hub_session=${sessionCookie}`];
-  if (authCsrfCookie) consentCookies.push(`parachute_hub_csrf=${authCsrfCookie}`);
-  const consentRes = await fetch(`${HUB}/oauth/authorize`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-      cookie: consentCookies.join("; "),
-    },
-    body: consentBody,
-    redirect: "manual",
-  });
-  if (consentRes.status !== 302) {
+  let code: string | null = null;
+
+  if (authGet.status === 302) {
+    // Auto-approved path (hub#409). The code is already in the redirect target.
+    const loc = authGet.headers.get("location") ?? "";
+    const locUrl = new URL(loc, HUB);
+    const errParam = locUrl.searchParams.get("error");
+    if (errParam) {
+      fail(
+        `GET /oauth/authorize auto-redirect carried ?error=${errParam} (${locUrl.searchParams.get("error_description") ?? "no description"}): ${loc}`,
+      );
+    }
+    // Verify the state round-trips (CSRF / response-binding sanity).
+    const returnedState = locUrl.searchParams.get("state");
+    if (returnedState !== "e2e-state") {
+      fail(`auto-approve redirect state mismatch: expected "e2e-state", got "${returnedState}"`);
+    }
+    code = locUrl.searchParams.get("code");
+    if (!code) fail(`auto-approve redirect carried no ?code= : ${loc}`);
+    console.log("[mcp-probe] authorization code obtained (auto-approved — hub#409 trust-by-client_name)");
+  } else if (authGet.status === 200) {
+    // Consent-screen path (first-time client). Parse + POST the consent form.
+    const authHtml = await authGet.text();
+    if (!authHtml.includes('value="consent"')) {
+      fail(`GET /oauth/authorize did not render the consent screen: ${authHtml.slice(0, 300)}`);
+    }
+    const authCsrfCookie = cookieFrom(authGet, "parachute_hub_csrf") ?? csrfCookie;
+    const authCsrfField =
+      authHtml.match(/name="__csrf"\s+value="([^"]+)"/)?.[1] ?? authCsrfCookie ?? "";
+
+    const consentBody = new URLSearchParams({
+      __action: "consent",
+      __csrf: authCsrfField,
+      approve: "yes",
+      client_id: reg.client_id,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: `vault:${args.vault}:read vault:${args.vault}:write`,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "e2e-state",
+      resource: `${HUB}/vault/${args.vault}`,
+      vault_pick: args.vault,
+    });
+    const consentCookies = [`parachute_hub_session=${sessionCookie}`];
+    if (authCsrfCookie) consentCookies.push(`parachute_hub_csrf=${authCsrfCookie}`);
+    const consentRes = await fetch(`${HUB}/oauth/authorize`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        cookie: consentCookies.join("; "),
+      },
+      body: consentBody,
+      redirect: "manual",
+    });
+    if (consentRes.status !== 302) {
+      fail(
+        `consent POST returned ${consentRes.status} (expected 302): ${(await consentRes.text()).slice(0, 300)}`,
+      );
+    }
+    const loc = consentRes.headers.get("location") ?? "";
+    const locUrl = new URL(loc, HUB);
+    const errParam = locUrl.searchParams.get("error");
+    if (errParam) fail(`consent redirect carried ?error=${errParam} : ${loc}`);
+    code = locUrl.searchParams.get("code");
+    if (!code) fail(`consent redirect carried no ?code= : ${loc}`);
+    console.log("[mcp-probe] authorization code obtained (consent screen — first-time client)");
+  } else {
+    const body = await authGet.text();
     fail(
-      `consent POST returned ${consentRes.status} (expected 302): ${(await consentRes.text()).slice(0, 300)}`,
+      `GET /oauth/authorize returned ${authGet.status} (expected 200 consent or 302 auto-approve): ${body.slice(0, 300)}`,
     );
   }
-  const loc = consentRes.headers.get("location") ?? "";
-  const code = new URL(loc, HUB).searchParams.get("code");
-  if (!code) fail(`consent redirect carried no ?code= : ${loc}`);
-  console.log("[mcp-probe] authorization code obtained");
+
+  // Both branches above either set a non-null `code` or `fail()` (→ never), so
+  // this is belt-and-suspenders — and it narrows `code` to `string` for the
+  // token exchange below.
+  if (!code) fail("no authorization code obtained from /oauth/authorize");
 
   // --- 4. Token exchange ----------------------------------------------------
   const tokenRes = await fetch(`${HUB}/oauth/token`, {
