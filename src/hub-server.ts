@@ -45,6 +45,7 @@
  *   /vaults                       (POST)       → create vault
  *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
+ *   /admin/channel-token          (GET)        → channel UI bearer mint (cookie-gated)
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
  *   /api/hub                      (GET)        → hub version + uptime + install-source (host:admin)
  *   /api/hub/upgrade              (POST)       → SPA-driven hub self-upgrade → 202 + detached helper (host:admin, §5.3/D4)
@@ -138,6 +139,7 @@ import {
   handleAdminLoginTotpPost,
   handleAdminLogoutPost,
 } from "./admin-handlers.ts";
+import { handleChannelToken } from "./admin-channel-token.ts";
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
@@ -2071,6 +2073,14 @@ export function hubFetch(
       if (pathname === "/admin/host-admin-token") {
         if (!getDb) return dbNotConfigured();
         return handleHostAdminToken(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      if (pathname === "/admin/channel-token") {
+        if (!getDb) return dbNotConfigured();
+        return handleChannelToken(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
         });
