@@ -36,6 +36,13 @@ interface FakeHubState {
   posted: Array<{ path: string; body: unknown }>;
   /** hub#616: path+query of every op-poll GET, to assert the wizard polls the session surface. */
   polled: string[];
+  /**
+   * hub#616: number of poll ticks the vault op reports `"running"` before
+   * flipping to `"succeeded"`. 0 (default) = succeeds immediately on the first
+   * poll. >0 exercises the multi-tick poll loop (the import-mode long-running
+   * provisioning path).
+   */
+  vaultProvisionTicks?: number;
   /** hub#576: when set, the fake GET /admin/setup reports requireBootstrapToken=true. */
   requireBootstrapToken?: boolean;
   /** hub#576: when set, the fake GET also returns it (loopback-probe behavior). */
@@ -74,6 +81,9 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
       error?: string;
     }
   >();
+  // hub#616: per-op countdown of remaining `"running"` poll ticks before the
+  // op flips to `"succeeded"` (see FakeHubState.vaultProvisionTicks).
+  const opTicksRemaining = new Map<string, number>();
 
   const fetchImpl = async (
     input: string | URL | Request,
@@ -97,6 +107,17 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
       const opId = url.searchParams.get("op");
       if (opId) state.polled.push(path);
       const op = opId ? ops.get(opId) : undefined;
+      // hub#616: drive a multi-tick op (running → succeeded) so the poll loop
+      // is exercised across more than one fetch when configured.
+      if (op && op.status === "running") {
+        const remaining = opTicksRemaining.get(op.id) ?? 0;
+        if (remaining <= 0) {
+          op.status = "succeeded";
+          state.hasVault = true;
+        } else {
+          opTicksRemaining.set(op.id, remaining - 1);
+        }
+      }
       const respBody = JSON.stringify({
         step,
         hasAdmin: state.hasAdmin,
@@ -166,10 +187,18 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
           ...(b.pat ? { pat: b.pat } : {}),
         };
       }
-      // Create an op + drive it to succeeded immediately for the test.
+      // Create an op. By default it succeeds immediately on the first poll;
+      // when `vaultProvisionTicks` is set it reports `"running"` for that many
+      // poll ticks first (hub#616 — exercises the multi-tick poll loop).
       const opId = `op-test-${++opCount}`;
-      ops.set(opId, { id: opId, status: "succeeded", log: ["bun add -g", "spawned"] });
-      state.hasVault = true;
+      const ticks = state.vaultProvisionTicks ?? 0;
+      if (ticks > 0) {
+        ops.set(opId, { id: opId, status: "running", log: ["bun add -g"] });
+        opTicksRemaining.set(opId, ticks);
+      } else {
+        ops.set(opId, { id: opId, status: "succeeded", log: ["bun add -g", "spawned"] });
+        state.hasVault = true;
+      }
       return new Response(JSON.stringify({ op_id: opId, step: "vault", mode: b.mode }), {
         status: 200,
         headers: { "content-type": "application/json; charset=utf-8" },
@@ -302,6 +331,31 @@ describe("runCliWizard", () => {
     // /admin/setup?op=, and every poll must use that path.
     expect(state.polled.length).toBeGreaterThan(0);
     for (const p of state.polled) expect(p.startsWith("/admin/setup?op=")).toBe(true);
+  });
+
+  test("multi-tick vault op (running → succeeded) polls the session surface across ticks — hub#616", async () => {
+    // Models the import-mode long-running provisioning path: the op reports
+    // `running` for two poll ticks before flipping to `succeeded`.
+    const { state, fetchImpl } = makeFakeHub({ vaultProvisionTicks: 2 });
+    const logs: string[] = [];
+    const code = await runCliWizard({
+      hubUrl: "http://127.0.0.1:1939",
+      log: (l) => logs.push(l),
+      fetchImpl,
+      sleep: async () => {},
+      accountUsername: "admin",
+      accountPassword: "longpassword",
+      vaultMode: "create",
+      vaultName: "default",
+      exposeMode: "localhost",
+    });
+    expect(code).toBe(0);
+    // The loop ran more than once (2 running ticks + the terminal succeeded
+    // poll), and every tick used the session-authed surface — never the
+    // Bearer-gated /api/modules/operations/:id.
+    expect(state.polled.length).toBeGreaterThanOrEqual(3);
+    for (const p of state.polled) expect(p.startsWith("/admin/setup?op=")).toBe(true);
+    expect(state.exposeMode).toBe("localhost");
   });
 
   test("loopback-probe bootstrap token is sent transparently (no prompt) — hub#576", async () => {
