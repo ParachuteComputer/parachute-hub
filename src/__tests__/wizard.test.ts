@@ -9,7 +9,9 @@
  *      OK envelope.
  *   3. POST /admin/setup/vault (application/json) → 200 OK envelope
  *      with `op_id`.
- *   4. GET /api/modules/operations/<id> until terminal status.
+ *   4. GET /admin/setup?op=<id> until the `operation` envelope field
+ *      reaches a terminal status (hub#616 — session-authed poll surface,
+ *      NOT the Bearer-gated /api/modules/operations/:id the SPA uses).
  *   5. POST /admin/setup/expose (application/json) → 200 OK.
  *
  * The stub fetch in this file is a mini-router that mimics the
@@ -32,6 +34,15 @@ interface FakeHubState {
   importParams?: { remoteUrl: string; pat?: string; mode: string };
   exposeMode?: string;
   posted: Array<{ path: string; body: unknown }>;
+  /** hub#616: path+query of every op-poll GET, to assert the wizard polls the session surface. */
+  polled: string[];
+  /**
+   * hub#616: number of poll ticks the vault op reports `"running"` before
+   * flipping to `"succeeded"`. 0 (default) = succeeds immediately on the first
+   * poll. >0 exercises the multi-tick poll loop (the import-mode long-running
+   * provisioning path).
+   */
+  vaultProvisionTicks?: number;
   /** hub#576: when set, the fake GET /admin/setup reports requireBootstrapToken=true. */
   requireBootstrapToken?: boolean;
   /** hub#576: when set, the fake GET also returns it (loopback-probe behavior). */
@@ -52,6 +63,7 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
     hasVault: false,
     hasExposeMode: false,
     posted: [],
+    polled: [],
     ...initialState,
   };
   // Synthesize a stable CSRF token + session token for the stub. The
@@ -69,6 +81,9 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
       error?: string;
     }
   >();
+  // hub#616: per-op countdown of remaining `"running"` poll ticks before the
+  // op flips to `"succeeded"` (see FakeHubState.vaultProvisionTicks).
+  const opTicksRemaining = new Map<string, number>();
 
   const fetchImpl = async (
     input: string | URL | Request,
@@ -81,12 +96,28 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
     const body = init?.body;
     const bodyJson: unknown = body ? JSON.parse(String(body)) : null;
 
-    // GET /admin/setup
-    if (path === "/admin/setup" && method === "GET") {
+    // GET /admin/setup (incl. the `?op=<id>` poll surface — hub#616)
+    if (url.pathname === "/admin/setup" && method === "GET") {
       let step: "welcome" | "vault" | "expose" | "done" = "welcome";
       if (state.hasAdmin && state.hasVault && state.hasExposeMode) step = "done";
       else if (state.hasAdmin && state.hasVault) step = "expose";
       else if (state.hasAdmin) step = "vault";
+      // hub#616: the CLI wizard polls vault provisioning via this session-authed
+      // GET with `?op=<id>`; the op snapshot rides in the `operation` field.
+      const opId = url.searchParams.get("op");
+      if (opId) state.polled.push(path);
+      const op = opId ? ops.get(opId) : undefined;
+      // hub#616: drive a multi-tick op (running → succeeded) so the poll loop
+      // is exercised across more than one fetch when configured.
+      if (op && op.status === "running") {
+        const remaining = opTicksRemaining.get(op.id) ?? 0;
+        if (remaining <= 0) {
+          op.status = "succeeded";
+          state.hasVault = true;
+        } else {
+          opTicksRemaining.set(op.id, remaining - 1);
+        }
+      }
       const respBody = JSON.stringify({
         step,
         hasAdmin: state.hasAdmin,
@@ -96,6 +127,7 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
         csrfToken: csrf,
         // hub#576: a loopback probe carries the actual token value.
         ...(state.bootstrapToken ? { bootstrapToken: state.bootstrapToken } : {}),
+        ...(op ? { operation: op } : {}),
       });
       return new Response(respBody, {
         status: 200,
@@ -155,30 +187,36 @@ function makeFakeHub(initialState?: Partial<FakeHubState>): {
           ...(b.pat ? { pat: b.pat } : {}),
         };
       }
-      // Create an op + drive it to succeeded immediately for the test.
+      // Create an op. By default it succeeds immediately on the first poll;
+      // when `vaultProvisionTicks` is set it reports `"running"` for that many
+      // poll ticks first (hub#616 — exercises the multi-tick poll loop).
       const opId = `op-test-${++opCount}`;
-      ops.set(opId, { id: opId, status: "succeeded", log: ["bun add -g", "spawned"] });
-      state.hasVault = true;
+      const ticks = state.vaultProvisionTicks ?? 0;
+      if (ticks > 0) {
+        ops.set(opId, { id: opId, status: "running", log: ["bun add -g"] });
+        opTicksRemaining.set(opId, ticks);
+      } else {
+        ops.set(opId, { id: opId, status: "succeeded", log: ["bun add -g", "spawned"] });
+        state.hasVault = true;
+      }
       return new Response(JSON.stringify({ op_id: opId, step: "vault", mode: b.mode }), {
         status: 200,
         headers: { "content-type": "application/json; charset=utf-8" },
       });
     }
 
-    // GET /api/modules/operations/<id>
-    if (path.startsWith("/api/modules/operations/") && method === "GET") {
-      const id = path.slice("/api/modules/operations/".length);
-      const op = ops.get(id);
-      if (!op) {
-        return new Response(JSON.stringify({ error: "not found" }), {
-          status: 404,
-          headers: { "content-type": "application/json; charset=utf-8" },
-        });
-      }
-      return new Response(JSON.stringify(op), {
-        status: 200,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
+    // GET /api/modules/operations/<id> — the Bearer-gated SPA/install-CLI poll
+    // surface. hub#616: the CLI wizard must NOT use it (it holds only a session
+    // cookie, not a host-admin Bearer). Mirror the real 401 so any regression
+    // back to this path fails the wizard poll loudly instead of silently.
+    if (url.pathname.startsWith("/api/modules/operations/") && method === "GET") {
+      return new Response(
+        JSON.stringify({
+          error: "unauthenticated",
+          error_description: "Authorization: Bearer required",
+        }),
+        { status: 401, headers: { "content-type": "application/json; charset=utf-8" } },
+      );
     }
 
     // POST /admin/setup/expose
@@ -286,6 +324,37 @@ describe("runCliWizard", () => {
     const vaultBody = state.posted[1]?.body as Record<string, string>;
     expect(vaultBody.mode).toBe("create");
     expect(vaultBody.vault_name).toBe("default");
+    expect(state.exposeMode).toBe("localhost");
+    // hub#616: the vault-provisioning op is polled over the session-authed
+    // wizard surface, NOT the Bearer-gated /api/modules/operations/:id (which
+    // the fake 401s, mirroring the real gate). At least one poll must land on
+    // /admin/setup?op=, and every poll must use that path.
+    expect(state.polled.length).toBeGreaterThan(0);
+    for (const p of state.polled) expect(p.startsWith("/admin/setup?op=")).toBe(true);
+  });
+
+  test("multi-tick vault op (running → succeeded) polls the session surface across ticks — hub#616", async () => {
+    // Models the import-mode long-running provisioning path: the op reports
+    // `running` for two poll ticks before flipping to `succeeded`.
+    const { state, fetchImpl } = makeFakeHub({ vaultProvisionTicks: 2 });
+    const logs: string[] = [];
+    const code = await runCliWizard({
+      hubUrl: "http://127.0.0.1:1939",
+      log: (l) => logs.push(l),
+      fetchImpl,
+      sleep: async () => {},
+      accountUsername: "admin",
+      accountPassword: "longpassword",
+      vaultMode: "create",
+      vaultName: "default",
+      exposeMode: "localhost",
+    });
+    expect(code).toBe(0);
+    // The loop ran more than once (2 running ticks + the terminal succeeded
+    // poll), and every tick used the session-authed surface — never the
+    // Bearer-gated /api/modules/operations/:id.
+    expect(state.polled.length).toBeGreaterThanOrEqual(3);
+    for (const p of state.polled) expect(p.startsWith("/admin/setup?op=")).toBe(true);
     expect(state.exposeMode).toBe("localhost");
   });
 

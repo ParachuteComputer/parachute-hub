@@ -347,9 +347,15 @@ async function pollOperation(
   const start = Date.now();
   let lastLogIndex = 0;
   for (;;) {
+    // hub#616: poll over the session-authed wizard surface (`/admin/setup?op=`),
+    // mirroring the browser wizard's re-GET — NOT the Bearer-gated
+    // `/api/modules/operations/:id` the SPA + install CLI use. Mid-setup the
+    // wizard holds only a session cookie; the op endpoint demands a host-admin
+    // Bearer it doesn't have, so a direct poll 401s and the vault step dies.
+    // The op snapshot rides back in the envelope's `operation` field.
     const res = await setupFetch(
       hubUrl,
-      `/api/modules/operations/${encodeURIComponent(opId)}`,
+      `/admin/setup?op=${encodeURIComponent(opId)}`,
       jar,
       fetchImpl,
     );
@@ -358,10 +364,11 @@ async function pollOperation(
         `op-poll failed (${res.status}) for ${shortLabel} op ${opId}: ${res.bodyText.slice(0, 200)}`,
       );
     }
-    const body = res.json as Partial<OperationSnapshot> | undefined;
+    const envelope = res.json as { operation?: Partial<OperationSnapshot> } | undefined;
+    const body = envelope?.operation;
     if (!body || typeof body !== "object" || typeof body.id !== "string") {
       throw new Error(
-        `op-poll returned unexpected body for ${shortLabel} op ${opId}: ${res.bodyText.slice(0, 200)}`,
+        `op-poll returned no operation snapshot for ${shortLabel} op ${opId}: ${res.bodyText.slice(0, 200)}`,
       );
     }
     // Print any new log lines since the last tick so the operator sees
