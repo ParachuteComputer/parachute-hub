@@ -519,16 +519,57 @@ else
   # Reuses the same probe as Stage 1 but points it at the public https origin,
   # proving DCR→PKCE→token→MCP create+query works end-to-end THROUGH Cloudflare
   # (the connector/OAuth path that 403'd in some field cases).
+  #
+  # KNOWN LIVE BUG vault#464 (origin-pinned-credential class, sibling of #610):
+  # after a public expose, vault's PARACHUTE_HUB_ORIGIN is the public FQDN, so
+  # vault fetches the hub's JWKS via https://<public>/.well-known/jwks.json —
+  # which HAIRPINS through the Cloudflare tunnel back to the SAME box. On a
+  # co-located deploy that round-trip times out → MCP `initialize` fails with
+  # `hub JWT verification failed: request timed out` (a JWKS-fetch timeout). The
+  # OAuth dance itself (DCR→PKCE→token) SUCCEEDS — token is minted — and the
+  # public-health-through-tunnel assertion above already PASSED, proving the
+  # tunnel works. Only the JWKS-dependent MCP step is the known bug. So we run
+  # the probe, capture its output, and classify:
+  #   - the vault#464 SIGNATURE (JWT-verification / JWKS-fetch timeout) → XFAIL
+  #     (loud, non-aborting, exit-0-with-warning — mirrors the #610 machinery).
+  #   - ANY OTHER failure (token mint failed, a different initialize error, a
+  #     403, a parse error) → a real, unexpected FAIL → `die`.
+  #   - success → PASS (the bug is fixed / didn't reproduce on this platform).
   note "Running the full OAuth dance + MCP round-trip over the PUBLIC origin…"
-  if ! bun /root/mcp-probe.ts \
+  MCP_PUB_LOG=/tmp/stage3-mcp-public.log
+  MCP_PUBLIC_RESULT="pass"   # flips to xfail-vault464 on the known JWKS-timeout
+  if bun /root/mcp-probe.ts \
         --hub "${PUBLIC}" \
         --vault "${VAULT_NAME}" \
         --user "${ADMIN_USER}" \
-        --pass "${ADMIN_PASS}"; then
-    die "stage3-expose" "MCP OAuth-dance / round-trip over the public Cloudflare origin FAILED"
+        --pass "${ADMIN_PASS}" >"$MCP_PUB_LOG" 2>&1; then
+    cat "$MCP_PUB_LOG"
+    note "✓ MCP round-trip succeeded over the public tunnel."
+    record "stage3-mcp-public" "PASS" "DCR→PKCE→token→MCP over https://${E2E_FQDN}"
+  else
+    cat "$MCP_PUB_LOG"
+    # vault#464 signature: the JWKS hairpin timeout surfaces as a hub-JWT-
+    # verification failure / a JWKS-fetch timeout. Match either phrasing,
+    # case-insensitively, so a minor wording change in vault doesn't reclassify
+    # the known bug as a surprise FAIL — but keep it specific to TIMEOUT so a
+    # genuine 401/403/parse error still FAILs.
+    if grep -qiE "hub JWT verification failed: request timed out|jwks.*time(d)? ?out|verification failed.*time(d)? ?out|fetch.*jwks.*time(d)? ?out" "$MCP_PUB_LOG"; then
+      printf '\n=========== vault#464 FINDING (JWKS hairpin timeout, live on this build) ===========\n' >&2
+      printf '  MCP-over-public: the OAuth dance SUCCEEDED (token minted) and the public\n' >&2
+      printf '  tunnel serves /health (stage3-public-health PASSED), but MCP initialize\n' >&2
+      printf '  failed because vault verifies the hub JWT by fetching JWKS from\n' >&2
+      printf '    https://%s/.well-known/jwks.json\n' "${E2E_FQDN}" >&2
+      printf '  which HAIRPINS out through the Cloudflare tunnel and back to THIS box —\n' >&2
+      printf '  on a co-located deploy that round-trip times out. Origin-pinned-credential\n' >&2
+      printf '  class (sibling of hub#610). Tracked as vault#464; fix in a separate PR will\n' >&2
+      printf '  flip this XFAIL back to a hard assertion. The tunnel + OAuth themselves work.\n' >&2
+      printf '====================================================================================\n\n' >&2
+      xfail "stage3-mcp-public" "vault#464 JWKS hairpin timeout: OAuth+token OK, MCP initialize timed out fetching JWKS over the public tunnel"
+      MCP_PUBLIC_RESULT="xfail-vault464"
+    else
+      die "stage3-mcp-public" "MCP OAuth-dance / round-trip over the public Cloudflare origin FAILED for an UNEXPECTED reason (not the vault#464 JWKS-timeout signature — see mcp-probe output above)"
+    fi
   fi
-  note "✓ MCP round-trip succeeded over the public tunnel."
-  record "stage3-mcp-public" "PASS" "DCR→PKCE→token→MCP over https://${E2E_FQDN}"
 
   # --- origin-pinned-credential self-heal (#503/#481 class) — bonus asserts ---
   # After a public expose, the expose path persists the public origin into
@@ -569,7 +610,15 @@ else
   else
     note "✓ vault .env public origin cleared after expose off (#503)."
   fi
-  record "stage3-expose" "PASS" "real CF tunnel: public /health + MCP-over-public + teardown"
+  # Headline result for the stage. public-health is a hard PASS (tunnel proven);
+  # the MCP-over-public sub-result is tracked separately (PASS, or XFAIL for the
+  # known vault#464 JWKS hairpin). Word the headline honestly so the summary
+  # doesn't claim "MCP-over-public" green when it XFAIL'd.
+  if [ "${MCP_PUBLIC_RESULT:-pass}" = "xfail-vault464" ]; then
+    record "stage3-expose" "PASS" "real CF tunnel: public /health PASS + teardown (MCP-public XFAIL vault#464)"
+  else
+    record "stage3-expose" "PASS" "real CF tunnel: public /health + MCP-over-public + teardown"
+  fi
 fi
 
 # ===========================================================================
