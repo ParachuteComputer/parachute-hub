@@ -377,6 +377,127 @@ describe("install", () => {
     }
   });
 
+  test("ADOPT-KILLS an attributable same-module orphan on the canonical port + reclaims it (#609)", async () => {
+    // Wipe-recovery: `rm -rf ~/.parachute` + re-`init` leaves the supervised
+    // vault child running on :1940. The fresh install must reclaim the canonical
+    // port (adopt-kill the attributable orphan) rather than port-walk to 1944.
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      const kills: Array<{ pid: number; signal: string | number }> = [];
+      // installDir = /opt/.parachute/vault → the orphan's cmdline carries it, so
+      // attribution (per-module marker = installDir) succeeds.
+      const installDirPkg = "/opt/.parachute/vault/package.json";
+      // Port 1940 is held UNTIL the SIGTERM lands; after the kill the re-probe
+      // (collectOccupiedPorts) sees it free, so the assignment lands on 1940.
+      let killed = false;
+      const code = await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        configDir,
+        startService: async () => 0,
+        isLinked: () => false,
+        findGlobalInstall: () => installDirPkg,
+        portProbe: async (p) => p === 1940 && !killed,
+        pidOnPort: (p) => (p === 1940 && !killed ? 7777 : undefined),
+        ownerOfPid: (pid) =>
+          pid === 7777 ? "parachute-vault --port 1940 (/opt/.parachute/vault)" : undefined,
+        killPid: (pid, signal) => {
+          kills.push({ pid, signal });
+          killed = true; // the orphan releases the port on SIGTERM
+        },
+        sleep: async () => {},
+        reclaimDelayMs: 0,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      // We adopt-killed the attributable orphan…
+      expect(joined).toMatch(/attributable prior vault instance \(pid 7777/);
+      expect(joined).toMatch(/reclaiming it \(adopt-kill\)/);
+      expect(kills.map((k) => k.signal)).toContain("SIGTERM");
+      // …and the fresh install landed on the CANONICAL port, not a fallback.
+      const entry = findService("parachute-vault", path);
+      expect(entry?.port).toBe(1940);
+      expect(joined).not.toMatch(/is in use; assigned/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("escalates to SIGKILL when the orphan ignores SIGTERM (#609)", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      const signals: Array<string | number> = [];
+      const code = await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        configDir,
+        startService: async () => 0,
+        isLinked: () => false,
+        findGlobalInstall: () => "/opt/.parachute/vault/package.json",
+        // Orphan never releases 1940 → install ultimately walks (degrades
+        // gracefully), but it MUST have escalated to SIGKILL first.
+        portProbe: async (p) => p === 1940,
+        pidOnPort: (p) => (p === 1940 ? 8888 : undefined),
+        ownerOfPid: (pid) => (pid === 8888 ? "parachute-vault (/opt/.parachute/vault)" : undefined),
+        killPid: (_pid, signal) => {
+          signals.push(signal);
+        },
+        sleep: async () => {},
+        reclaimDelayMs: 0,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(signals).toContain("SIGTERM");
+      expect(signals).toContain("SIGKILL");
+      expect(logs.join("\n")).toMatch(/escalated to SIGKILL/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("does NOT kill a FOREIGN holder on the canonical port — walks + warns instead (#609 safety)", async () => {
+    // The crux: a non-attributable holder (an operator's unrelated process, or a
+    // sibling module) on :1940 must NEVER be killed. We fall through to the #590
+    // warn-and-walk path unchanged.
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      let killCalled = false;
+      const code = await install("vault", {
+        runner: async () => 0,
+        manifestPath: path,
+        configDir,
+        startService: async () => 0,
+        isLinked: () => false,
+        findGlobalInstall: () => "/opt/.parachute/vault/package.json",
+        portProbe: async (p) => p === 1940,
+        pidOnPort: (p) => (p === 1940 ? 5555 : undefined),
+        // Foreign cmdline — does NOT contain the vault installDir marker.
+        ownerOfPid: (pid) => (pid === 5555 ? "/usr/bin/python3 /opt/my-own-server.py" : undefined),
+        killPid: () => {
+          killCalled = true;
+        },
+        sleep: async () => {},
+        reclaimDelayMs: 0,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(killCalled).toBe(false); // NEVER kill a foreign process
+      const joined = logs.join("\n");
+      // The #590 warn-and-walk path is unchanged for the foreign holder.
+      expect(joined).toMatch(/canonical port 1940 is in use; assigned/);
+      expect(joined).toContain("pid 5555 (/usr/bin/python3 /opt/my-own-server.py)");
+      expect(joined).toMatch(/stale pre-supervisor daemon/);
+      const entry = findService("parachute-vault", path);
+      expect(entry?.port).not.toBe(1940); // walked, not reclaimed
+    } finally {
+      cleanup();
+    }
+  });
+
   test("squatter pid present but command line unreadable → names the pid alone (#590)", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
