@@ -32,6 +32,22 @@ Those produced hard 401s until `cacheMaxAge` (default 5 min) expired or the reso
 
 - **Additive at the construction site** — both new options are optional; no behavior change for existing callers beyond the recovery itself, which only fires on a path that previously hard-failed. An injected `jwksGetter` without a `.reload` method (a bare function) degrades gracefully: no forced reload, behavior identical to before.
 
+## 0.4.1-rc.1 — 2026-06-07
+
+Adds a `jwksOrigin` seam so a resource server can FETCH the JWKS from a different origin than the one it validates the token's `iss` against (vault#464). Additive + backward-compatible.
+
+### Why
+
+`createScopeGuard({ hubOrigin })` used `hubOrigin` for BOTH the `iss` pin and the JWKS fetch URL (`${origin}/.well-known/jwks.json`). On a co-located deploy (hub + vault on one box), `parachute expose` pins `hubOrigin` to the PUBLIC Cloudflare FQDN so the token's `iss` claim matches what the hub mints — but the JWKS fetch then hairpins out through the tunnel and back to the same box (slow on a real VPS, a hard timeout under Docker NAT-loopback). This is the origin-pinned-credential class (#481/#503/#531) on the JWKS-fetch surface.
+
+### Added
+
+- **`CreateScopeGuardOptions.jwksOrigin?: string | (() => string)`** — origin to fetch the JWKS from when it must differ from the `hubOrigin` used for `iss` validation. Same shape as `hubOrigin` (literal or resolver), re-evaluated per call so env changes propagate without a restart, trailing slash stripped. The JWKS cache is keyed on the fetch origin, so the `iss`-pin and the fetch-origin are fully decoupled. The consumer (vault) passes `jwksOrigin: () => loopback` while leaving `hubOrigin` as the public FQDN.
+
+### Compatibility
+
+- **Defaults to `hubOrigin` when omitted** — zero change for existing callers (scribe, paraclaw, and vault until it opts in): keys are fetched from the same origin the `iss` is validated against, exactly as before. The `iss` pin and the revocation-list endpoint (which lives on the issuer) continue to use `hubOrigin` alone.
+
 ## 0.4.0-rc.2 — 2026-05-28
 
 Surfaces the raw `permissions` claim on `HubJwtClaims` (additive) so resource servers (e.g. vault reading `permissions.scoped_tags` for tag-scoping) can read it without re-decoding the token. scope-guard passes the object through verbatim — a non-null plain object surfaces; absent / null / non-object (string, number, array) leaves `permissions` `undefined`, distinct from an empty `{}`. Auth-unification arc C0.
