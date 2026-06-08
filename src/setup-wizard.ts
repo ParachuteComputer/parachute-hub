@@ -75,6 +75,7 @@ import {
   readOperatorTokenFile,
 } from "./operator-token.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
+import { SEED_VERSION } from "./service-spec.ts";
 import { findService, readManifestLenient } from "./services-manifest.ts";
 import {
   SESSION_TTL_MS,
@@ -274,13 +275,29 @@ export function deriveWizardState(deps: {
   // which maps to `parachute-vault` in services.json.
   const vaultSpec = specFor(FIRST_VAULT_SHORT);
   const vaultEntry = findService(vaultSpec.manifestName, deps.manifestPath);
+  // hub#607: distinguish the SEED placeholder from a real vault instance.
+  // `parachute init` installs the vault MODULE without creating an instance
+  // (hub#168 Cut 1: `noCreate`), seeding a services.json entry at
+  // SEED_VERSION ("0.0.0-linked") with the canonical `/vault/default` mount.
+  // Vault's own first-boot overwrites that entry with the real instance once
+  // a vault is actually created. A bare `findService(...) !== undefined`
+  // check matches the placeholder, so on EVERY init'd box the wizard treated
+  // the vault step as already-done and skipped straight to expose — the
+  // operator finished setup with no vault and no prompt. Treat a
+  // SEED_VERSION row as "module installed, no instance" so the wizard still
+  // presents its create / import / skip step. This is the SAME
+  // discrimination `buildWellKnown` gained in hub#577 (it suppresses the
+  // phantom `vaults[]` row at SEED_VERSION); both surfaces must agree that a
+  // placeholder is not a real vault.
+  const vaultIsPlaceholder = vaultEntry !== undefined && vaultEntry.version === SEED_VERSION;
+  const hasRealVault = vaultEntry !== undefined && !vaultIsPlaceholder;
   // hub#168 Cut 2: `setup_vault_skipped === "true"` advances the wizard
   // past the vault step even when no vault row exists. The operator
   // explicitly chose Skip; the module is installed (Cut 1) but no
   // instance was provisioned. Treat as "vault step is done" for the
   // purposes of state-derivation so the wizard moves to expose.
   const vaultSkipped = getSetting(deps.db, "setup_vault_skipped") === "true";
-  const hasVault = vaultEntry !== undefined || vaultSkipped;
+  const hasVault = hasRealVault || vaultSkipped;
   // Expose-mode is the operator's "how will this hub be reached?" answer
   // (hub#268 Item 2). Stored as a hub_setting; the wizard's expose step
   // sets it; absence means we should still ask. EXCEPT — if we're
