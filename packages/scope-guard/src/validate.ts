@@ -169,6 +169,9 @@ export interface CreateScopeGuardOptions {
    * The JWKS cache is keyed on the fetch origin (this value), so a
    * public-`iss` + loopback-`jwksOrigin` guard caches under the loopback key —
    * the iss-pin and the fetch-origin are fully decoupled.
+   *
+   * If an explicit `jwksGetter` is also supplied, that getter owns the fetch
+   * path and `jwksOrigin` has no effect (the getter is used verbatim).
    */
   jwksOrigin?: string | (() => string);
 
