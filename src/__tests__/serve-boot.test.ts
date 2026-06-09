@@ -2,8 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bootSupervisedModules, buildModuleSpawnRequest } from "../commands/serve-boot.ts";
-import { type ServiceEntry, writeManifest } from "../services-manifest.ts";
+import {
+  bootSupervisedModules,
+  buildModuleSpawnRequest,
+  reconcilePortToCanonical,
+} from "../commands/serve-boot.ts";
+import { type ServiceEntry, readManifestLenient, writeManifest } from "../services-manifest.ts";
 import { type SpawnRequest, type SupervisedProc, Supervisor } from "../supervisor.ts";
 
 interface Harness {
@@ -283,5 +287,132 @@ describe("bootSupervisedModules", () => {
     expect(results[0]?.reason).toBe("no-spec");
     expect(recorder.calls).toEqual([]);
     expect(logs.some((l) => l.includes("no startCmd resolvable"))).toBe(true);
+  });
+});
+
+// channel#41 — a transiently-wrong (drifted) services.json port for a
+// fixed-port first-party module self-perpetuates: the supervisor injects PORT /
+// probes / proxies from that row, so the wrong port strands the module forever.
+// The boot path snaps it back to canonical before spawn AND persists the fix so
+// the reverse-proxy (which reads services.json) routes correctly.
+describe("reconcilePortToCanonical (channel#41)", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+  });
+  afterEach(() => h.cleanup());
+
+  // The live-observed signature: channel's row carried 19415 instead of its
+  // canonical 1941.
+  const DRIFTED_CHANNEL: ServiceEntry = {
+    name: "parachute-channel",
+    port: 19415,
+    paths: ["/channel"],
+    health: "/health",
+    version: "0.1.0",
+  };
+
+  test("snaps a drifted fixed-port row back to canonical + persists it", () => {
+    writeManifest({ services: [DRIFTED_CHANNEL] }, h.manifestPath);
+    const logs: string[] = [];
+
+    const reconciled = reconcilePortToCanonical(DRIFTED_CHANNEL, h.manifestPath, (l) =>
+      logs.push(l),
+    );
+
+    // Returned entry carries canonical (channel → 1941).
+    expect(reconciled.port).toBe(1941);
+    // And it's PERSISTED — the proxy reads services.json, so the row itself must
+    // now point at 1941 or `/channel/*` keeps routing to the dead 19415.
+    const onDisk = readManifestLenient(h.manifestPath).services.find(
+      (s) => s.name === "parachute-channel",
+    );
+    expect(onDisk?.port).toBe(1941);
+    expect(
+      logs.some((l) => l.includes("reconciled") && l.includes("19415") && l.includes("1941")),
+    ).toBe(true);
+  });
+
+  test("no-op when the row already sits on its canonical port (vault/scribe/surface common path)", () => {
+    writeManifest({ services: [VAULT_ENTRY] }, h.manifestPath);
+    const out = reconcilePortToCanonical(VAULT_ENTRY, h.manifestPath);
+    expect(out).toBe(VAULT_ENTRY); // identity — untouched
+    expect(out.port).toBe(1940);
+  });
+
+  test("third-party module (no canonical) is never touched", () => {
+    const thirdParty: ServiceEntry = {
+      name: "third-party-thing",
+      port: 7777,
+      paths: ["/thing"],
+      health: "/thing/health",
+      version: "1.0.0",
+    };
+    writeManifest({ services: [thirdParty] }, h.manifestPath);
+    const out = reconcilePortToCanonical(thirdParty, h.manifestPath);
+    expect(out).toBe(thirdParty);
+    expect(out.port).toBe(7777);
+  });
+
+  test("does NOT steal the canonical port when another row already holds it", () => {
+    // Another row legitimately occupies 1941 — reconciling would trip the
+    // write-side duplicate-port guard and isn't channel's to take. Leave the
+    // drift; the supervisor's squatter detection surfaces it.
+    const squatter: ServiceEntry = {
+      name: "parachute-vault",
+      port: 1941, // unusual, but it owns this slot right now
+      paths: ["/vault/default"],
+      health: "/vault/default/health",
+      version: "0.4.5",
+    };
+    writeManifest({ services: [squatter, DRIFTED_CHANNEL] }, h.manifestPath);
+    const logs: string[] = [];
+
+    const out = reconcilePortToCanonical(DRIFTED_CHANNEL, h.manifestPath, (l) => logs.push(l));
+
+    expect(out.port).toBe(19415); // unchanged
+    const onDisk = readManifestLenient(h.manifestPath).services.find(
+      (s) => s.name === "parachute-channel",
+    );
+    expect(onDisk?.port).toBe(19415); // not rewritten
+    expect(logs.some((l) => l.includes("held by another row"))).toBe(true);
+  });
+
+  test("boot path injects PORT=canonical + persists the fix for a drifted channel row", async () => {
+    writeManifest({ services: [DRIFTED_CHANNEL] }, h.manifestPath);
+    const recorder = makeRecorder();
+    const sup = new Supervisor({ spawnFn: recorder.spawn });
+
+    await bootSupervisedModules(sup, {
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+    });
+
+    // The supervisor child gets PORT=1941 (so it binds + the readiness probe
+    // checks the right port), not the drifted 19415.
+    expect(recorder.calls[0]?.short).toBe("channel");
+    expect(recorder.calls[0]?.env?.PORT).toBe("1941");
+    // services.json row is reconciled → proxy routes /channel/* to 1941.
+    const onDisk = readManifestLenient(h.manifestPath).services.find(
+      (s) => s.name === "parachute-channel",
+    );
+    expect(onDisk?.port).toBe(1941);
+  });
+
+  test("boot path leaves a non-drifted vault row's port untouched", async () => {
+    writeManifest({ services: [VAULT_ENTRY] }, h.manifestPath);
+    const recorder = makeRecorder();
+    const sup = new Supervisor({ spawnFn: recorder.spawn });
+
+    await bootSupervisedModules(sup, {
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+    });
+
+    expect(recorder.calls[0]?.env?.PORT).toBe("1940");
+    const onDisk = readManifestLenient(h.manifestPath).services.find(
+      (s) => s.name === "parachute-vault",
+    );
+    expect(onDisk?.port).toBe(1940);
   });
 });

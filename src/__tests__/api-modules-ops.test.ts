@@ -1012,6 +1012,55 @@ describe("POST /api/modules/:short/start", () => {
     expect(spawns).toEqual([]);
     expect(calls).toEqual([]);
   });
+
+  test("channel#41: start reconciles a drifted services.json port back to canonical (API path)", async () => {
+    // The live signature: channel's row carried 19415 instead of canonical 1941.
+    // The API start path (admin SPA / `parachute start channel`) must apply the
+    // SAME reconcile the boot path does — otherwise an operator-triggered start
+    // re-strands the module on the dead port.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-channel",
+        port: 19415,
+        paths: ["/channel"],
+        health: "/health",
+        version: "0.0.0-linked",
+      },
+    ]);
+    const { supervisor, spawns } = makeIdleSupervisor();
+    const logs: string[] = [];
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+
+    const res = await handleStart(
+      postReq("/api/modules/channel/start", { authorization: `Bearer ${bearer}` }),
+      "channel",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        log: (l) => logs.push(l),
+      },
+    );
+
+    expect(res.status).toBe(200);
+    // The supervisor child gets PORT=1941 (canonical), not the drifted 19415 —
+    // so it binds + the readiness probe checks the right port.
+    expect(spawns.length).toBe(1);
+    expect(spawns[0]?.short).toBe("channel");
+    expect(spawns[0]?.env?.PORT).toBe("1941");
+    // services.json row is rewritten to 1941 → the reverse-proxy (which reads
+    // services.json) routes /channel/* to the live port.
+    const onDisk = JSON.parse(readFileSync(h.manifestPath, "utf8")) as {
+      services: { name: string; port: number }[];
+    };
+    expect(onDisk.services.find((s) => s.name === "parachute-channel")?.port).toBe(1941);
+    // The reconcile event logged on the API path too (deps.log wired — #41 review).
+    expect(
+      logs.some((l) => l.includes("reconciled") && l.includes("19415") && l.includes("1941")),
+    ).toBe(true);
+  });
 });
 
 describe("POST /api/modules/:short/stop", () => {
