@@ -46,6 +46,7 @@
  *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /admin/channel-token          (GET)        → channel UI bearer mint (cookie-gated)
+ *   /admin/module-token/<short>   (GET)        → generic module config-UI bearer mint <short>:admin (cookie-gated)
  *   /admin/channels               (POST/GET)   → vault-channel provision/list (cookie-gated)
  *   /admin/channels/<name>        (DELETE)     → vault-channel teardown (cookie-gated)
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
@@ -133,6 +134,8 @@ import pkg from "../package.json" with { type: "json" };
 import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.ts";
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
 import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
+import { handleChannelToken } from "./admin-channel-token.ts";
+import { handleChannels } from "./admin-channels.ts";
 import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
 import { handleListGrants, handleRevokeGrant } from "./admin-grants.ts";
 import {
@@ -141,9 +144,8 @@ import {
   handleAdminLoginTotpPost,
   handleAdminLogoutPost,
 } from "./admin-handlers.ts";
-import { handleChannelToken } from "./admin-channel-token.ts";
-import { handleChannels } from "./admin-channels.ts";
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
+import { handleModuleToken } from "./admin-module-token.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
 import {
@@ -156,7 +158,6 @@ import { handleApiHub } from "./api-hub.ts";
 import { handleCreateInvite, handleListInvites, handleRevokeInvite } from "./api-invites.ts";
 import { handleApiMe } from "./api-me.ts";
 import { handleApiMintToken } from "./api-mint-token.ts";
-import { handleApiModulesConfig, parseModulesConfigPath } from "./api-modules-config.ts";
 import {
   getDefaultOperationsRegistry,
   handleInstall,
@@ -2089,6 +2090,22 @@ export function hubFetch(
         });
       }
 
+      // Generic per-module config-UI bearer mint (2026-06-09 modular-UI
+      // architecture, P3). `<short>:admin` for any known single-audience
+      // module (scribe / runner / surface / channel) — the admin scope each
+      // module-owned config UI needs to call its own endpoints. Cookie-gated
+      // to the first-admin operator, exactly like /admin/channel-token +
+      // /admin/vault-admin-token. Vault is per-instance and routed to
+      // /admin/vault-admin-token/<name> instead.
+      if (pathname.startsWith("/admin/module-token/")) {
+        if (!getDb) return dbNotConfigured();
+        const short = decodeURIComponent(pathname.slice("/admin/module-token/".length));
+        return handleModuleToken(req, short, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+        });
+      }
+
       // /admin/channels — one-action vault-channel provisioning (frictionless
       // channel setup PR 3). Cookie-gated operator session (first-admin),
       // exactly like /admin/channel-token above. POST provisions everything
@@ -2262,28 +2279,12 @@ export function hubFetch(
         });
       }
 
-      // Per-module config surface (hub#260) — schema + values GET, values PUT.
-      // Sits ahead of the install/restart/upgrade/uninstall switch below so
-      // `/api/modules/<short>/config[/schema]` doesn't fall into the default-
-      // branch 404 (`parseModulesPath` only matches the action-suffix shape,
-      // not the `config` / `config/schema` shape).
-      //
-      // Diverges from the action endpoints in two ways: doesn't require a
-      // supervisor (we just proxy to the running module's HTTP surface, not
-      // spawn a child), and mints a `<short>:admin` token at proxy time so
-      // the upstream auth gate is satisfied without forcing the SPA bearer
-      // to carry per-module scopes.
-      {
-        const configMatch = parseModulesConfigPath(pathname);
-        if (configMatch) {
-          if (!getDb) return dbNotConfigured();
-          return handleApiModulesConfig(req, configMatch, {
-            db: getDb(),
-            issuer: oauthDeps(req).issuer,
-            manifestPath: deps?.manifestPath ?? SERVICES_MANIFEST_PATH,
-          });
-        }
-      }
+      // NOTE: the hub-hosted generic per-module config proxy
+      // (`/api/modules/<short>/config[/schema]`) + its SPA form were RETIRED in
+      // the 2026-06-09 modular-UI architecture P3. Config is module-owned +
+      // hub-framed now: the Modules page "Configure" action opens the module's
+      // OWN config UI (`configUiUrl`), which mints its admin Bearer from the
+      // cookie-gated `/admin/module-token/<short>` (or `/admin/channel-token`).
 
       // Per-module action endpoints: /api/modules/:short/{install,restart,upgrade,uninstall}.
       if (pathname.startsWith("/api/modules/")) {

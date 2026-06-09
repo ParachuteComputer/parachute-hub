@@ -28,7 +28,6 @@ import { HubVersionBadge } from "./components/HubVersionBadge.tsx";
 import { type MeResponse, type ModuleListing, getMe, listModules, signOut } from "./lib/api.ts";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
 import { Channels } from "./routes/Channels.tsx";
-import { ModuleConfig } from "./routes/ModuleConfig.tsx";
 import { Modules } from "./routes/Modules.tsx";
 import { NewVault } from "./routes/NewVault.tsx";
 import { Permissions } from "./routes/Permissions.tsx";
@@ -50,10 +49,6 @@ function subtitleFor(pathname: string): string {
     return "tokens";
   }
   if (pathname === "/modules" || pathname.startsWith("/modules/")) {
-    // Sub-page disambiguation for the per-module config form so the nav
-    // breadcrumb tells the operator they're inside a module's settings,
-    // not on the module catalog.
-    if (/^\/modules\/[a-z][a-z0-9-]*\/config$/.test(pathname)) return "module config";
     return "modules";
   }
   if (pathname === "/users" || pathname.startsWith("/users/")) {
@@ -191,7 +186,6 @@ export function App() {
         <Route path="/vaults" element={<VaultsList />} />
         <Route path="/vaults/new" element={<NewVault />} />
         <Route path="/modules" element={<Modules />} />
-        <Route path="/modules/:short/config" element={<ModuleConfig />} />
         <Route path="/users" element={<Users />} />
         <Route path="/channels" element={<Channels />} />
         <Route path="/permissions" element={<Permissions />} />

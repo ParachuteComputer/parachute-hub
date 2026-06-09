@@ -503,17 +503,18 @@ const NO_UI_FOLLOWUPS: Record<string, string> = {
  * Row for an installed module — shows version + supervisor status +
  * Open / Restart / Upgrade / Uninstall affordances.
  *
- * The "Open" button (hub#342) is the architectural-pivot affordance:
- * Aaron's framing is that each module ships its OWN UI that handles
- * both viewing and configuring; hub becomes a dispatcher. Pre-#342
- * had both "Configure" (in-hub config form at `/admin/modules/<short>/config`)
- * and an implicit "navigate to the module's own UI somewhere" — the
- * two surfaces blurred. Post-#342 there's one click target: Open,
- * which lands the operator on the module's `managementUrl`
- * (resolved server-side from `.parachute/module.json`). The in-hub
- * config form code at `/admin/modules/:short/config` is retained for
- * the moment but no longer linked from this page; a future PR
- * deletes it after the migration period.
+ * Two surface affordances, both module-owned (hub frames, never hosts):
+ *   - **Open** (hub#342) → the module's `managementUrl` — its primary
+ *     user/admin surface.
+ *   - **Configure** (2026-06-09 modular-UI architecture, P3) → the module's
+ *     `configUiUrl` — its own config/admin UI. Rendered consistently for
+ *     every module that declares one; omitted (no dead button) otherwise.
+ *
+ * The old hub-hosted generic config form at `/admin/modules/<short>/config`
+ * (+ the `/api/modules/:short/config{,/schema}` proxy endpoints) is RETIRED
+ * as of P3: config is module-owned + hub-framed, never a bespoke React view
+ * in the hub SPA. Each module ships its own UI handling both viewing AND
+ * configuring; the hub is the dispatcher.
  *
  * Modules without a declared `management_url` (today: scribe, runner —
  * tracked at scribe#53, runner#8) get a disabled Open button with a
@@ -537,6 +538,11 @@ function ModuleRow({
     mod.installed_version !== mod.latest_version && mod.latest_version !== null;
   const openUrl = mod.management_url;
   const openFollowup = NO_UI_FOLLOWUPS[mod.short];
+  // Configure → the module's OWN config UI (2026-06-09 modular-UI architecture,
+  // P3). Rendered only when the module declares `configUiUrl`; the module owns
+  // the surface, hub just frames it. Full-page nav (leaving the SPA), same
+  // shape as Open. No hub-hosted generic config form anymore.
+  const configUrl = mod.config_ui_url;
 
   return (
     <li className="module-row" data-short={mod.short}>
@@ -617,6 +623,16 @@ function ModuleRow({
             Open
           </button>
         )}
+        {/* Configure → the module's own config UI (2026-06-09 modular-UI
+            architecture, P3). Consistent affordance across every module that
+            declares `configUiUrl`; full-page nav since the module owns the
+            surface. Omitted entirely when a module declares no config UI —
+            no dead button, no hub-hosted generic form. */}
+        {configUrl ? (
+          <a className="btn" href={configUrl} data-testid={`configure-${mod.short}`}>
+            Configure
+          </a>
+        ) : null}
         <button type="button" disabled={!canAct} onClick={onRestart}>
           Restart
         </button>

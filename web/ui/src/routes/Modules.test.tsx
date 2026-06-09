@@ -69,6 +69,7 @@ function moduleRow(short: string, overrides: Partial<api.ModuleListing> = {}): a
     install_dir: null,
     uis: [],
     management_url: null,
+    config_ui_url: null,
     ...overrides,
   };
 }
@@ -300,7 +301,7 @@ describe("Modules — Open button (hub#342)", () => {
     expect(open.getAttribute("title")).toContain("scribe#53");
   });
 
-  it("does not render the Configure link anymore (it was collapsed into Open)", async () => {
+  it("omits the Configure action when config_ui_url is null", async () => {
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [
         moduleRow("vault", {
@@ -309,6 +310,7 @@ describe("Modules — Open button (hub#342)", () => {
           latest_version: "0.4.5",
           supervisor_status: "running",
           management_url: "/vault/default/admin",
+          config_ui_url: null,
         }),
       ],
       supervisor_available: true,
@@ -316,9 +318,59 @@ describe("Modules — Open button (hub#342)", () => {
     });
     renderRoute();
     await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
-    // Pre-#342 had a "Configure" link under the actions row. Post-#342
-    // has only "Open" (and Restart / Upgrade / Uninstall).
+    // No hub-hosted generic config form, and no Configure action for a module
+    // that doesn't declare `configUiUrl` — no dead button.
+    expect(screen.queryByTestId("configure-vault")).toBeNull();
     expect(screen.queryByText(/^Configure$/)).toBeNull();
+  });
+});
+
+describe("Modules — Configure action (2026-06-09 modular-UI architecture, P3)", () => {
+  it("renders an active <a> to the module's config UI when config_ui_url is set", async () => {
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        moduleRow("channel", {
+          focus: "experimental",
+          installed: true,
+          installed_version: "0.1.0",
+          latest_version: "0.1.0",
+          supervisor_status: "running",
+          management_url: "/channel/ui",
+          config_ui_url: "/channel/admin",
+        }),
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Channel")).toBeInTheDocument());
+    const configure = screen.getByTestId("configure-channel");
+    // Full-page nav (module owns the surface) — an <a href>, not a SPA Link.
+    expect(configure.tagName).toBe("A");
+    expect(configure.getAttribute("href")).toBe("/channel/admin");
+    expect(configure.textContent).toBe("Configure");
+  });
+
+  it("renders Configure alongside Open when a module declares both", async () => {
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        moduleRow("channel", {
+          focus: "experimental",
+          installed: true,
+          installed_version: "0.1.0",
+          latest_version: "0.1.0",
+          supervisor_status: "running",
+          management_url: "/channel/ui",
+          config_ui_url: "/channel/admin",
+        }),
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Channel")).toBeInTheDocument());
+    expect(screen.getByTestId("open-channel").getAttribute("href")).toBe("/channel/ui");
+    expect(screen.getByTestId("configure-channel").getAttribute("href")).toBe("/channel/admin");
   });
 });
 

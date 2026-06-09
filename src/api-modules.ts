@@ -261,6 +261,23 @@ interface ModuleWireShape {
    * surfaces, unused by first-party modules today).
    */
   management_url: string | null;
+  /**
+   * Where the module's OWN config/admin surface lives (2026-06-09 modular-UI
+   * architecture, P3). Resolved server-side from the module's
+   * `.parachute/module.json` `configUiUrl`, joined against its mount path the
+   * same way `management_url` resolves `managementUrl`/`uiUrl`. Drives the
+   * Modules page's consistent **Configure** action — clicking lands the
+   * operator on the module's own config UI (channel `/channel/admin`, scribe
+   * `/scribe/admin`, …), which mints its admin Bearer from the hub's
+   * cookie-gated `/admin/module-token/<short>` (or `/admin/channel-token`).
+   *
+   * Null when the module hasn't declared `configUiUrl` — the SPA omits the
+   * Configure action for that module rather than rendering a dead button.
+   * Distinct from `management_url`: a module may declare one, both, or
+   * neither. Channel declares `configUiUrl: "/channel/admin"` + `uiUrl`;
+   * vault declares `managementUrl` (its admin SPA is the config surface).
+   */
+  config_ui_url: string | null;
 }
 
 /**
@@ -451,6 +468,10 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   // management_url and the SPA shows the disabled "Open" tooltip.
   const readModuleManifestFn = deps.readModuleManifest ?? defaultReadModuleManifest;
   const managementUrlByShort = new Map<string, string>();
+  // The module's OWN config surface (2026-06-09 modular-UI architecture, P3) —
+  // resolved from `configUiUrl` the same way `managementUrl` is. Drives the
+  // consistent Configure action.
+  const configUiUrlByShort = new Map<string, string>();
   // Manifest-declared `focus` per installed short. Prefer this over the default
   // map when composing the wire shape (2026-06-09 modular-UI architecture).
   const declaredFocusByShort = new Map<string, ModuleFocus>();
@@ -467,37 +488,17 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
         // against the module's mount path (entry.paths[0]) since both
         // surfaces conventionally live under it (vault's `/admin`,
         // app's `/admin`). Absolute URLs pass through verbatim.
-        const candidate = m.managementUrl ?? m.uiUrl;
-        if (candidate === undefined) return;
-        if (/^https?:\/\//i.test(candidate)) {
-          managementUrlByShort.set(short, candidate);
-          return;
-        }
-        const mount = value.mountPath;
-        if (mount === undefined) {
-          // No user-facing mount declared — we can't resolve a relative
-          // path. Skip rather than guess. Vault rows hit this when
-          // services.json was hand-edited to remove the mount; the
-          // disabled-tooltip state in the SPA is the right surface.
-          return;
-        }
-        // Resolution rule (per module-ui-declaration.md):
-        //   - Multi-instance modules (vault) declare a per-instance
-        //     relative path (e.g. `/admin/`); hub prepends the mount
-        //     (e.g. `/vault/default` + `/admin/` → `/vault/default/admin/`).
-        //   - Single-instance modules (app, scribe, runner) declare a
-        //     full hub-origin path that ALREADY includes the mount
-        //     (e.g. `/surface/admin/`, `/scribe/admin`); the mount must NOT
-        //     be prepended again or the result is `/app/surface/admin/`
-        //     (the audit bug caught 2026-05-25 on the SPA's Services
-        //     dropdown).
-        // Detect by checking if candidate is already mount-prefixed.
-        const tail = candidate.startsWith("/") ? candidate : `/${candidate}`;
-        const alreadyMountPrefixed = tail === mount || tail.startsWith(`${mount}/`);
-        managementUrlByShort.set(short, alreadyMountPrefixed ? tail : `${mount}${tail}`);
+        const resolvedManagement = resolveModuleUrl(m.managementUrl ?? m.uiUrl, value.mountPath);
+        if (resolvedManagement !== undefined) managementUrlByShort.set(short, resolvedManagement);
+        // The config surface resolves with the SAME rule. A module may declare
+        // `configUiUrl` independently of `managementUrl` — channel ships
+        // `configUiUrl: "/channel/admin"` (single-instance, already
+        // mount-prefixed) alongside a separate `uiUrl`.
+        const resolvedConfig = resolveModuleUrl(m.configUiUrl, value.mountPath);
+        if (resolvedConfig !== undefined) configUiUrlByShort.set(short, resolvedConfig);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`api-modules: skipping managementUrl for ${short}: ${msg}`);
+        console.warn(`api-modules: skipping module URLs for ${short}: ${msg}`);
       }
     }),
   );
@@ -591,6 +592,7 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
       install_dir: installed?.installDir ?? null,
       uis: toUisWireShape(installed?.uis),
       management_url: managementUrlByShort.get(short) ?? null,
+      config_ui_url: configUiUrlByShort.get(short) ?? null,
     };
     return row;
   });
@@ -719,6 +721,41 @@ function jsonError(status: number, code: string, description: string): Response 
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+/**
+ * Resolve a module-declared "path or http(s) URL" surface field (`managementUrl`,
+ * `uiUrl`, `configUiUrl`) to a full hub-origin path the SPA can navigate to.
+ *
+ *   - `undefined` candidate → `undefined` (the module didn't declare it).
+ *   - Absolute http(s) URL → returned verbatim (off-origin escape hatch).
+ *   - Relative path + no mount → `undefined` (can't resolve; the SPA renders
+ *     the disabled/omitted state rather than guessing).
+ *   - Relative path + mount → joined per the module-ui-declaration.md rule:
+ *       · Multi-instance modules (vault) declare a per-instance relative path
+ *         (`/admin/`); hub prepends the mount (`/vault/default` + `/admin/`
+ *         → `/vault/default/admin/`).
+ *       · Single-instance modules (surface, scribe, runner, channel) declare a
+ *         full hub-origin path that ALREADY includes the mount (`/surface/admin/`,
+ *         `/scribe/admin`, `/channel/admin`); the mount must NOT be prepended
+ *         again or the result double-prefixes (the audit bug caught 2026-05-25
+ *         on the SPA's Services dropdown). Detected by checking if the candidate
+ *         is already mount-prefixed.
+ *
+ * Shared by `managementUrl`/`uiUrl` (the Open action) and `configUiUrl` (the
+ * Configure action, 2026-06-09 modular-UI architecture P3) so the two resolve
+ * identically.
+ */
+function resolveModuleUrl(
+  candidate: string | undefined,
+  mount: string | undefined,
+): string | undefined {
+  if (candidate === undefined) return undefined;
+  if (/^https?:\/\//i.test(candidate)) return candidate;
+  if (mount === undefined) return undefined;
+  const tail = candidate.startsWith("/") ? candidate : `/${candidate}`;
+  const alreadyMountPrefixed = tail === mount || tail.startsWith(`${mount}/`);
+  return alreadyMountPrefixed ? tail : `${mount}${tail}`;
 }
 
 /**

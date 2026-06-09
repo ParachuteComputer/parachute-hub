@@ -176,8 +176,11 @@ describe("App — document title", () => {
   });
 
   it("title-cases multi-word sections", async () => {
-    renderAt("/modules/scribe/config");
-    await waitFor(() => expect(document.title).toBe("Module Config · Parachute"));
+    // `/approve-client/:id` → subtitle "approve app" → title-cased "Approve App".
+    // (The old `/modules/:short/config` "Module Config" route was retired in the
+    // 2026-06-09 modular-UI architecture P3 — config is module-owned now.)
+    renderAt("/approve-client/some-client");
+    await waitFor(() => expect(document.title).toBe("Approve App · Parachute"));
   });
 
   it("falls back to Vaults on the index route", async () => {
@@ -312,6 +315,7 @@ describe("App — installed-services dropdown (hub#342)", () => {
           install_dir: null,
           uis: [],
           management_url: "/vault/default/admin",
+          config_ui_url: null,
         },
         {
           short: "scribe",
@@ -328,6 +332,7 @@ describe("App — installed-services dropdown (hub#342)", () => {
           install_dir: null,
           uis: [],
           management_url: null,
+          config_ui_url: null,
         },
       ],
       supervisor_available: true,

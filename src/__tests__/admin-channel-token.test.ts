@@ -5,7 +5,7 @@
  *   - 401 when no admin session cookie is present.
  *   - 401 when the cookie names a deleted session.
  *   - 405 on POST.
- *   - 200 + JWT carrying `aud: "channel"` and `channel:read channel:send`.
+ *   - 200 + JWT carrying `aud: "channel"` and `channel:read channel:send channel:admin`.
  *   - First-admin gate: 403 for a signed-in non-first-admin (friend); the
  *     admin's happy path still mints when a friend exists alongside.
  */
@@ -107,7 +107,7 @@ describe("handleChannelToken", () => {
     expect(res.status).toBe(405);
   });
 
-  test("200 mints a JWT carrying aud:channel + channel:read channel:send", async () => {
+  test("200 mints a JWT carrying aud:channel + channel:read channel:send channel:admin", async () => {
     const { cookie, userId } = await withSession();
     rotateSigningKey(harness.db);
     const req = new Request(`${ISSUER}/admin/channel-token`, { headers: { cookie } });
@@ -116,9 +116,10 @@ describe("handleChannelToken", () => {
     expect(res.headers.get("cache-control")).toBe("no-store");
 
     const body = (await res.json()) as { token: string; expires_at: string; scopes: string[] };
-    // `channel:send` (post) + `channel:read` (SSE replies). Deliberately NOT
-    // `channel:write` — that's the session-reply scope a UI token must not hold.
-    expect(body.scopes).toEqual(["channel:read", "channel:send"]);
+    // `channel:send` (post) + `channel:read` (SSE replies) + `channel:admin`
+    // (config UI list/edit — 2026-06-09 modular-UI architecture P3). Deliberately
+    // NOT `channel:write` — that's the session-reply scope a UI token must not hold.
+    expect(body.scopes).toEqual(["channel:read", "channel:send", "channel:admin"]);
     expect(body.scopes).not.toContain("channel:write");
     expect(body.token.length).toBeGreaterThan(20);
 
@@ -137,6 +138,7 @@ describe("handleChannelToken", () => {
     const scopes = scopeClaim.split(/\s+/);
     expect(scopes).toContain("channel:read");
     expect(scopes).toContain("channel:send");
+    expect(scopes).toContain("channel:admin");
     expect(scopes).not.toContain("channel:write");
   });
 
