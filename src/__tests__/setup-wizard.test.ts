@@ -4476,6 +4476,32 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
     }
   });
 
+  test("GET ?step=vault with NO admin falls through to the welcome step (hasAdmin guard)", async () => {
+    // Fresh box, no user rows: the re-entry branch is gated on
+    // `state.hasAdmin` — the param must not jump a brand-new operator past
+    // account creation into a provisioning form (the POST would reject the
+    // session-less submit anyway, but the GET shouldn't render out of order
+    // either).
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = handleSetupGet(req("/admin/setup?step=vault"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+      });
+      expect(res.status).toBe(200);
+      // The welcome/account form — not the vault create form, not a redirect.
+      const html = await res.text();
+      expect(html).toContain('action="/admin/setup/account"');
+      expect(html).not.toContain('action="/admin/setup/vault"');
+    } finally {
+      db.close();
+    }
+  });
+
   test("GET ?step=vault is ignored when a real vault instance exists", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {

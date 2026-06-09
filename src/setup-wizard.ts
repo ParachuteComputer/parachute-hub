@@ -300,6 +300,14 @@ export function deriveWizardState(deps: {
   // phantom `vaults[]` row at SEED_VERSION); both surfaces must agree that a
   // placeholder is not a real vault.
   const vaultIsPlaceholder = vaultEntry !== undefined && vaultEntry.version === SEED_VERSION;
+  // INVARIANT (B5 re-enterable vault step): hasRealVault means "a real
+  // instance row exists" — placeholder excluded here, skip-marker excluded
+  // below (skip flips hasVault, never hasRealVault). THREE sites key on this
+  // same placeholder logic and must move together: this derivation,
+  // handleSetupGet's `?step=vault` re-entry gate, and handleSetupVaultPost's
+  // already-provisioned short-circuit. Changing one without the others
+  // either re-opens a provisioning form over a real vault or dead-ends the
+  // post-skip re-entry path.
   const hasRealVault = vaultEntry !== undefined && !vaultIsPlaceholder;
   // hub#168 Cut 2: `setup_vault_skipped === "true"` advances the wizard
   // past the vault step even when no vault row exists. The operator
@@ -1718,6 +1726,11 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
   // would leak setup state (the POST is session+CSRF-gated either way).
   // With a real vault present the param is ignored and the normal flow
   // (expose step / 301 → /login) runs.
+  //
+  // INVARIANT: this gate keys on `hasRealVault` (deriveWizardState) — the
+  // same placeholder logic handleSetupVaultPost's short-circuit uses. The
+  // three sites must move together; see the derivation comment in
+  // deriveWizardState.
   if (url.searchParams.get("step") === "vault" && state.hasAdmin && !state.hasRealVault) {
     const session = findActiveSession(deps.db, req);
     if (!session) {
@@ -2213,6 +2226,11 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
   // a skipped box has no instance and the re-entered vault step (B5,
   // `?step=vault`) must be able to POST create/import — `mode=create` below
   // clears the skip marker; `mode=skip` just re-sets it (idempotent).
+  //
+  // INVARIANT: same placeholder logic as deriveWizardState's hasRealVault
+  // derivation and handleSetupGet's `?step=vault` re-entry gate — the three
+  // sites must move together; see the derivation comment in
+  // deriveWizardState.
   const state = deriveWizardState(deps);
   if (state.hasRealVault) {
     if (form.isJson) {
