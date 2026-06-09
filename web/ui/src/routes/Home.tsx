@@ -12,25 +12,27 @@
  * page's content into three clearly-separated groups:
  *
  *   1. **Administer (hub)** — in-shell links to every hub-native section
- *      (Connections, Modules, Users, Vaults, Tokens, Settings). These open
+ *      (Connections, Modules, Users, Tokens, Permissions, Settings). These open
  *      WITHIN the admin shell (react-router `<Link>`), so the persistent nav
- *      stays put and you never lose your place.
+ *      stays put and you never lose your place. Vault management lives under
+ *      the Vault module card below — not here — because the hub-rendered vault
+ *      list IS the vault module's admin surface.
  *
- *   2. **Modules** — one card per installed module, opening the MODULE's OWN
- *      admin / config UI (`config_ui_url` ?? `management_url`). Explicitly
- *      labeled "opens <module>'s own admin ↗" with an external affordance so
- *      the hub-vs-module boundary is obvious — clicking leaves the shell into
- *      a surface the module owns. Modules without either URL render disabled
- *      with a "no admin UI yet" note (never a dead 404 click).
+ *   2. **Modules** — one card per installed module. Vault is special: it has no
+ *      separate admin SPA of its own — the hub SPA is vault's admin — so its
+ *      card opens `/vaults` in-shell (no `↗`). All other modules open their own
+ *      admin/config UI off-shell (full-page `<a href>`, explicit `↗` mark +
+ *      "opens <module>'s own admin" caption). Modules without any URL render
+ *      disabled with a "no admin UI yet" note (never a dead 404 click).
  *
  *   3. **Your surfaces** — the user-facing module UIs (Notes etc.) sourced from
  *      each installed module's hosted-UI sub-units (`uis[]`). These are the
  *      `uiUrl` tiles that lived on the old discovery page; kept reachable here
  *      so an operator can jump straight into "browse my content" from the shell.
  *
- * The visual through-line: hub-native sections read as in-shell cards (no
- * external arrow); module-owned + user surfaces carry the `↗` external mark and
- * a "opens <module>'s own surface" caption. That contrast IS the clarity fix.
+ * The visual through-line: hub-native sections (including the Vault card) read
+ * as in-shell cards (no external arrow); module-owned + user surfaces carry the
+ * `↗` external mark. That contrast IS the clarity fix.
  *
  * Data: a single `/api/modules` round-trip drives both the Modules and Your
  * surfaces groups (it already carries `config_ui_url` / `management_url` and the
@@ -64,7 +66,6 @@ const HUB_SECTIONS: readonly HubSection[] = [
   },
   { to: "/modules", label: "Modules", desc: "Install, upgrade, and manage modules." },
   { to: "/users", label: "Users", desc: "Manage operators and invite members." },
-  { to: "/vaults", label: "Vaults", desc: "Create and manage vaults on this hub." },
   { to: "/tokens", label: "Tokens", desc: "Mint and revoke access tokens." },
   { to: "/permissions", label: "Permissions", desc: "OAuth consent grants per app." },
   { to: "/settings", label: "Settings", desc: "Canonical URL, install channel, more." },
@@ -147,15 +148,17 @@ export function Home() {
         </div>
       </section>
 
-      {/* 2. Modules — each opens the MODULE's OWN admin/config UI (off-shell). */}
+      {/* 2. Modules — most open the MODULE's OWN admin/config UI (off-shell);
+          vault is the exception (hub-rendered, opens /vaults in-shell). */}
       <section className="home-group" data-testid="home-modules">
         <div className="home-group-head">
           <h2>Modules</h2>
-          <span className="home-group-tag home-group-tag-module">module-owned</span>
+          <span className="home-group-tag home-group-tag-module">modules</span>
         </div>
         <p className="muted home-group-sub">
-          Installed modules. Each card opens the module's own admin surface — outside the hub shell.
-          Manage install / upgrade / restart from <Link to="/modules">Modules</Link>.
+          Installed modules. Vault opens here in the shell; other modules open their own admin
+          surface outside the hub shell. Manage install / upgrade / restart from{" "}
+          <Link to="/modules">Modules</Link>.
         </p>
         {state.kind === "loading" ? (
           <p className="muted" data-loading="true">
@@ -212,17 +215,39 @@ export function Home() {
 }
 
 /**
- * One installed-module card on the Home overview. Links to the module's OWN
- * admin/config UI (`config_ui_url` first — that's the module's dedicated config
- * surface — falling back to `management_url`). Full-page `<a href>` (NOT a
- * react-router `<Link>`) because we're LEAVING the shell into a surface the
- * module owns; the `↗` mark + owner caption make that boundary explicit.
+ * One installed-module card on the Home overview.
  *
- * A module that declares neither URL (scribe, runner today) renders as a
- * disabled card with a "no admin UI yet" note rather than a dead click —
+ * **Vault is special**: the hub SPA *is* vault's admin — there is no separate
+ * vault admin SPA. So vault's card opens `/vaults` in-shell via a react-router
+ * `<Link>` (no `↗` mark, `home-card-hub` treatment). The "all vaults + click
+ * through to each" experience lives there.
+ *
+ * **All other modules** link to the module's OWN admin/config UI
+ * (`config_ui_url` first — the module's dedicated config surface — falling back
+ * to `management_url`). Full-page `<a href>` (NOT a react-router `<Link>`)
+ * because we're LEAVING the shell; the `↗` mark + owner caption make that
+ * boundary explicit.
+ *
+ * A non-vault module that declares neither URL (scribe, runner today) renders
+ * as a disabled card with a "no admin UI yet" note rather than a dead click —
  * the operator still sees it's installed.
  */
 function ModuleAdminCard({ module: m }: { module: ModuleListing }) {
+  // Vault: hub-native admin lives at /vaults — open in-shell, no external mark.
+  if (m.short === "vault") {
+    return (
+      <Link
+        to="/vaults"
+        className="home-card home-card-hub"
+        data-testid={`home-module-${m.short}`}
+      >
+        <span className="home-card-title">{m.display_name}</span>
+        {m.tagline ? <span className="home-card-desc">{m.tagline}</span> : null}
+        <span className="home-card-owner">manage all vaults — opens here</span>
+      </Link>
+    );
+  }
+
   const adminUrl = m.config_ui_url ?? m.management_url;
   if (!adminUrl) {
     return (
