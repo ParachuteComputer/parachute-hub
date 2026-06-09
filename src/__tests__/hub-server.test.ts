@@ -85,20 +85,26 @@ function vaultEntry(name: string): ServiceEntry {
 }
 
 describe("hubFetch routing", () => {
-  test("/ serves hub.html with text/html content-type", async () => {
+  // Admin-shell IA (R1): the bare `/` page redirects into the single coherent
+  // admin shell at `/admin`. The old discovery-page content moved into the
+  // shell's Home overview. Only the bare `/` redirects — `/hub.html` still
+  // serves the discovery page (static expose file + explicit-`.html` bookmarks).
+  test("/ redirects (302) to /admin (admin-shell IA)", async () => {
     const h = makeHarness();
     try {
+      // No DB → exercises the redirect on the static-fallback path. The
+      // redirect sits above the static hub.html serve, so it fires regardless
+      // of whether a disk file exists.
       writeFileSync(join(h.dir, "hub.html"), "<html><body>hi</body></html>");
       const res = await hubFetch(h.dir)(req("/"));
-      expect(res.status).toBe(200);
-      expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
-      expect(await res.text()).toContain("<html>");
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin");
     } finally {
       h.cleanup();
     }
   });
 
-  test("/hub.html serves the same file as / (no DB → static fallback)", async () => {
+  test("/hub.html still serves the discovery page (no DB → static fallback)", async () => {
     const h = makeHarness();
     try {
       writeFileSync(join(h.dir, "hub.html"), "<html>x</html>");
@@ -173,10 +179,13 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/ renders the signed-out indicator dynamically when DB is configured but no session cookie (rc.13)", async () => {
+  test("/hub.html renders the signed-out indicator dynamically when DB is configured but no session cookie (rc.13)", async () => {
     // The dynamic path takes over from the static disk file the moment a
     // DB is configured. With no session cookie, we still render — just
     // with the "Sign in" affordance.
+    //
+    // Targets `/hub.html` (not `/`): bare `/` now 302-redirects to the admin
+    // shell (R1). `/hub.html` still serves the dynamic discovery page.
     //
     // hub#259 rc.6: requires an admin row to bypass the fresh-hub
     // funnel redirect to /admin/setup (Bug 2 fix). Seed one so this
@@ -198,7 +207,7 @@ describe("hubFetch routing", () => {
         const res = await hubFetch(h.dir, {
           getDb: () => db,
           manifestPath: h.manifestPath,
-        })(req("/"));
+        })(req("/hub.html"));
         expect(res.status).toBe(200);
         expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
         const body = await res.text();
@@ -213,10 +222,11 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("/ renders 'Signed in as <name>' + sign-out form when session cookie is active (rc.13)", async () => {
+  test("/hub.html renders 'Signed in as <name>' + sign-out form when session cookie is active (rc.13)", async () => {
     // Same wizard-funnel bypass as the signed-out test above — seed a
     // vault row and pass an explicit manifestPath so CI doesn't fall back
-    // to ~/.parachute/services.json.
+    // to ~/.parachute/services.json. Targets `/hub.html` (bare `/` now
+    // redirects to the admin shell, R1).
     const h = makeHarness();
     try {
       writeManifest({ services: [vaultEntry("default")] }, h.manifestPath);
@@ -232,7 +242,7 @@ describe("hubFetch routing", () => {
         const res = await hubFetch(h.dir, {
           getDb: () => db,
           manifestPath: h.manifestPath,
-        })(req("/", { headers: { cookie } }));
+        })(req("/hub.html", { headers: { cookie } }));
         expect(res.status).toBe(200);
         const body = await res.text();
         expect(body).toContain("Signed in as");
@@ -241,6 +251,36 @@ describe("hubFetch routing", () => {
         expect(body).toContain('name="__csrf"');
         // CSRF cookie was minted on the response (no prior cookie present).
         expect(res.headers.get("set-cookie") ?? "").toContain("parachute_hub_csrf=");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("/ → /admin even with a DB + admin + vault (setup complete; not the wizard funnel)", async () => {
+    // Distinguishes the admin-shell redirect (302 → /admin) from the fresh-hub
+    // wizard funnel (302 → /admin/setup). With admin + vault seeded, the wizard
+    // funnel is bypassed and the bare `/` lands on the admin shell. Also proves
+    // the redirect fires on the DB-configured path, not just the static
+    // fallback. `/hub.html` under the same setup still renders the discovery
+    // page (asserted separately above) — only bare `/` redirects.
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [vaultEntry("default")] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { createUser } = await import("../users.ts");
+        await createUser(db, "owner", "pw");
+        const handler = hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath });
+        const rootRes = await handler(req("/"));
+        expect(rootRes.status).toBe(302);
+        expect(rootRes.headers.get("location")).toBe("/admin");
+        // /hub.html under the same setup-complete state still serves discovery.
+        const hubHtmlRes = await handler(req("/hub.html"));
+        expect(hubHtmlRes.status).toBe(200);
+        expect(hubHtmlRes.headers.get("content-type")).toBe("text/html; charset=utf-8");
       } finally {
         db.close();
       }
@@ -648,8 +688,9 @@ describe("hubFetch routing", () => {
   test("missing hub.html returns 404 rather than crashing", async () => {
     const h = makeHarness();
     try {
-      // dir exists but no files in it
-      const res = await hubFetch(h.dir)(req("/"));
+      // dir exists but no files in it. Targets `/hub.html` directly — bare `/`
+      // now 302-redirects to the admin shell before reaching the static serve.
+      const res = await hubFetch(h.dir)(req("/hub.html"));
       expect(res.status).toBe(404);
     } finally {
       h.cleanup();
@@ -1622,7 +1663,7 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("live Bun.serve round-trip: / and /.well-known resolve", async () => {
+  test("live Bun.serve round-trip: /, /hub.html and /.well-known resolve", async () => {
     const h = makeHarness();
     try {
       writeFileSync(join(h.dir, "hub.html"), "<html>live</html>");
@@ -1634,9 +1675,15 @@ describe("hubFetch routing", () => {
       });
       try {
         const base = `http://127.0.0.1:${server.port}`;
-        const r1 = await fetch(`${base}/`);
-        expect(r1.status).toBe(200);
-        expect(await r1.text()).toBe("<html>live</html>");
+        // Bare `/` 302-redirects into the admin shell (R1). `redirect: "manual"`
+        // so we observe the redirect itself rather than following it to /admin.
+        const r1 = await fetch(`${base}/`, { redirect: "manual" });
+        expect(r1.status).toBe(302);
+        expect(r1.headers.get("location")).toBe("/admin");
+        // The discovery page still serves at /hub.html.
+        const rHub = await fetch(`${base}/hub.html`);
+        expect(rHub.status).toBe(200);
+        expect(await rHub.text()).toBe("<html>live</html>");
         const r2 = await fetch(`${base}/.well-known/parachute.json`);
         expect(r2.headers.get("content-type")).toBe("application/json");
         expect(await r2.json()).toEqual({ vaults: [], services: [] });

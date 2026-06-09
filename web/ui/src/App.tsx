@@ -22,13 +22,13 @@
  * Admin section links here.
  */
 import { type ReactNode, useEffect, useState } from "react";
-import { Link, Route, Routes, useLocation } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { BrandMark, WORDMARK_TEXT } from "./components/BrandMark.tsx";
 import { HubVersionBadge } from "./components/HubVersionBadge.tsx";
 import { type MeResponse, type ModuleListing, getMe, listModules, signOut } from "./lib/api.ts";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
-import { Channels } from "./routes/Channels.tsx";
 import { Connections } from "./routes/Connections.tsx";
+import { Home } from "./routes/Home.tsx";
 import { Modules } from "./routes/Modules.tsx";
 import { NewVault } from "./routes/NewVault.tsx";
 import { Permissions } from "./routes/Permissions.tsx";
@@ -58,8 +58,8 @@ function subtitleFor(pathname: string): string {
   if (pathname === "/connections" || pathname.startsWith("/connections/")) {
     return "connections";
   }
-  if (pathname === "/channels" || pathname.startsWith("/channels/")) {
-    return "channels";
+  if (pathname === "/vaults" || pathname.startsWith("/vaults/")) {
+    return "vaults";
   }
   if (pathname === "/settings" || pathname.startsWith("/settings/")) {
     return "settings";
@@ -67,7 +67,8 @@ function subtitleFor(pathname: string): string {
   if (pathname.startsWith("/approve-client/")) {
     return "approve app";
   }
-  return "vaults";
+  // `/` (and `/channels`, which redirects to /connections) land on Home.
+  return "home";
 }
 
 /**
@@ -164,36 +165,52 @@ export function App() {
 
   return (
     <div className="page">
+      {/*
+        Persistent admin-shell nav (admin-shell IA, R1). Always present, and
+        every hub-native section is one click from anywhere. The brand links to
+        Home (the orientation overview), then the hub-native sections, then —
+        across a divider — the module-owned affordances (the "Surfaces" dropdown
+        of user-facing module UIs + the Discovery escape hatch). The divider
+        marks the hub-native ↔ module-owned boundary the same way the Home cards
+        do.
+      */}
       <nav className="nav">
-        <Link to="/vaults" className="brand">
+        <Link to="/" className="brand">
           <BrandMark size={18} idSuffix="spa-nav" className="brand-mark-icon" />
           <span className="brand-wordmark">{WORDMARK_TEXT}</span>
           <span className="sub">{subtitle}</span>
         </Link>
         <AuthIndicator me={me} signingOut={signingOut} onSignOut={onSignOut} />
-        <NavSection to="/vaults" label="Vaults" alsoActiveAt="/" />
-        <NavSection to="/modules" label="Modules" />
-        <InstalledServicesDropdown services={installedServices} />
-        <NavSection to="/users" label="Users" />
+        {/* Hub-native sections — open in-shell. Home first, then the cross-
+            cutting host-admin surfaces. */}
+        <NavSection to="/" label="Home" exact />
         <NavSection to="/connections" label="Connections" />
-        <NavSection to="/permissions" label="Permissions" />
+        <NavSection to="/modules" label="Modules" />
+        <NavSection to="/users" label="Users" />
+        <NavSection to="/vaults" label="Vaults" />
         <NavSection to="/tokens" label="Tokens" />
+        <NavSection to="/permissions" label="Permissions" />
         <NavSection to="/settings" label="Settings" />
+        {/* Boundary: everything past here is module-owned / off-shell. */}
         <span className="nav-divider" aria-hidden="true" />
-        <a href="/" title="Hub discovery page (top-level)">
+        <InstalledServicesDropdown services={installedServices} />
+        <a href="/hub.html" title="Hub discovery page (top-level)">
           Discovery
         </a>
       </nav>
 
       <Routes>
-        <Route path="/" element={<VaultsList />} />
+        <Route path="/" element={<Home />} />
         <Route path="/vaults" element={<VaultsList />} />
         <Route path="/vaults/new" element={<NewVault />} />
         <Route path="/modules" element={<Modules />} />
         <Route path="/users" element={<Users />} />
         <Route path="/connections" element={<Connections />} />
-        {/* Back-compat: the pre-P5 Channels view stays routable for bookmarks. */}
-        <Route path="/channels" element={<Channels />} />
+        {/* The pre-P5 Channels view was retired when P5 moved the feature into
+            the general Connections engine. The back-compat route shouldn't
+            linger as a dead end — redirect it to Connections. */}
+        <Route path="/channels" element={<Navigate to="/connections" replace />} />
+        <Route path="/channels/*" element={<Navigate to="/connections" replace />} />
         <Route path="/permissions" element={<Permissions />} />
         <Route path="/tokens" element={<Tokens />} />
         <Route path="/settings" element={<Settings />} />
@@ -202,7 +219,7 @@ export function App() {
           path="*"
           element={
             <div className="empty">
-              404 — back to <Link to="/vaults">vaults</Link>.
+              404 — back to <Link to="/">Home</Link>.
             </div>
           }
         />
@@ -237,13 +254,20 @@ function NavSection({
   to,
   label,
   alsoActiveAt,
+  exact,
 }: {
   to: string;
   label: string;
   alsoActiveAt?: string;
+  /**
+   * Exact-match only. The Home link (`to="/"`) needs this: a prefix match on
+   * `/` would light Home up on EVERY route. With `exact`, Home is active only
+   * on the bare index path.
+   */
+  exact?: boolean;
 }) {
   const { pathname } = useLocation();
-  const isPrefix = pathname === to || pathname.startsWith(`${to}/`);
+  const isPrefix = exact ? pathname === to : pathname === to || pathname.startsWith(`${to}/`);
   const aliasActive = alsoActiveAt !== undefined && pathname === alsoActiveAt;
   const active = isPrefix || aliasActive;
   return (

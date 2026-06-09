@@ -1254,3 +1254,123 @@ a.btn:hover {
   color: var(--error);
   font-size: 0.9rem;
 }
+
+/* ---------------------------------------------------------------------------
+ * Admin Home / Overview (admin-shell IA, R1).
+ *
+ * The single orientation landing at /admin. Three clearly-separated groups —
+ * Administer (hub-native, in-shell), Modules (module-owned admin, off-shell),
+ * Your surfaces (module-owned user UIs, off-shell). The hub-native ↔ module-
+ * owned boundary is the core clarity fix: hub cards read as plain in-shell
+ * links; module/surface cards carry the `↗` external mark + an owner caption.
+ * ------------------------------------------------------------------------- */
+.admin-home > .muted {
+  margin-bottom: 1.75rem;
+}
+
+.home-group {
+  margin-bottom: 2.25rem;
+}
+.home-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  margin-bottom: 0.25rem;
+}
+.home-group-head h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+.home-group-sub {
+  margin: 0 0 1rem;
+}
+
+/* Group tag — telegraphs whether a group is hub-native or module-owned, the
+   same hub-vs-module axis the cards carry. Built on the `.tag` base palette. */
+.home-group-tag {
+  display: inline-block;
+  padding: 0.1em 0.55em;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.home-group-tag-hub {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.home-group-tag-module {
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+}
+
+.home-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.85rem;
+}
+
+.home-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.95rem 1.1rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
+}
+.home-card:hover {
+  text-decoration: none;
+  border-color: var(--accent);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.05);
+  transform: translateY(-1px);
+}
+/* Module-owned cards (admin + surface) sit on the soft background so the
+   off-shell group reads as visually distinct from the in-shell hub cards. */
+.home-card-module,
+.home-card-surface {
+  background: var(--bg-soft);
+}
+.home-card-disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+.home-card-disabled:hover {
+  border-color: var(--border);
+  box-shadow: none;
+  transform: none;
+}
+
+.home-card-title {
+  font-weight: 600;
+  font-size: 1rem;
+  color: var(--fg);
+}
+.home-card-desc {
+  font-size: 0.86rem;
+  color: var(--fg-muted);
+  line-height: 1.4;
+}
+/* Owner caption — "opens <module>'s own admin". The explicit hub-vs-module
+   boundary label, paired with the `↗` mark in the title. */
+.home-card-owner {
+  margin-top: 0.15rem;
+  font-size: 0.76rem;
+  color: var(--accent);
+  font-weight: 500;
+}
+.home-card-owner-empty {
+  color: var(--fg-dim);
+  font-weight: 400;
+}
+
+/* External-surface mark — the `↗` that flags "this leaves the hub shell". */
+.ext-mark {
+  font-size: 0.85em;
+  color: var(--accent);
+  font-weight: 600;
+}

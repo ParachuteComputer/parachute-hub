@@ -190,7 +190,9 @@ export function VaultsList() {
       </div>
 
       <p className="muted">
-        Vaults registered with this hub at <code>/.well-known/parachute.json</code>.
+        Vaults registered with this hub at <code>/.well-known/parachute.json</code>.{" "}
+        <strong>Manage</strong> opens the vault's own admin app (outside the hub shell); use your
+        browser's back button to return here.
       </p>
 
       {state.vaults.length === 0 ? (
