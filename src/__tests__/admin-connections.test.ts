@@ -560,6 +560,95 @@ describe("POST /admin/connections — general vault-trigger provision", () => {
 });
 
 // ===========================================================================
+// POST — provenance (modular-UI R2, module-initiated connections)
+// ===========================================================================
+
+describe("POST /admin/connections — provenance (R2)", () => {
+  test("records the requestedBy label a module-owned UI supplies, returns it on GET", async () => {
+    const { cookie } = await adminCookie();
+    const { fetchImpl } = mockFetch({
+      "POST /vault/default/api/triggers": () => ok({ ok: true }),
+    });
+    const deps = baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, WIDGET_MANIFEST));
+    const res = await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections`, {
+        method: "POST",
+        headers: { cookie },
+        body: JSON.stringify({
+          id: "w1",
+          requestedBy: "channel",
+          source: { module: "vault", vault: "default", event: "note.created" },
+          sink: { module: "widget", action: "thing.do" },
+        }),
+      }),
+      "",
+      deps,
+    );
+    expect(res.status).toBe(200);
+    // Persisted on the record.
+    const stored = readConnections(harness.storePath);
+    expect(stored[0]!.requestedBy).toBe("channel");
+    // Returned (snake_case) on the GET wire shape.
+    const list = await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections`, { method: "GET", headers: { cookie } }),
+      "",
+      deps,
+    );
+    const out = (await list.json()) as { connections: Array<{ requested_by?: string }> };
+    expect(out.connections[0]!.requested_by).toBe("channel");
+  });
+
+  test("defaults requestedBy to custom when the body omits it", async () => {
+    const { cookie } = await adminCookie();
+    const { fetchImpl } = mockFetch({
+      "POST /vault/default/api/triggers": () => ok({ ok: true }),
+    });
+    const deps = baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, WIDGET_MANIFEST));
+    await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections`, {
+        method: "POST",
+        headers: { cookie },
+        body: JSON.stringify({
+          id: "w2",
+          source: { module: "vault", vault: "default", event: "note.created" },
+          sink: { module: "widget", action: "thing.do" },
+        }),
+      }),
+      "",
+      deps,
+    );
+    expect(readConnections(harness.storePath)[0]!.requestedBy).toBe("custom");
+  });
+
+  test("rejects a non-slug requestedBy with 400 before provisioning", async () => {
+    const { cookie } = await adminCookie();
+    const { fetchImpl, calls } = mockFetch({
+      "POST /vault/default/api/triggers": () => ok({ ok: true }),
+    });
+    const deps = baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, WIDGET_MANIFEST));
+    const res = await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections`, {
+        method: "POST",
+        headers: { cookie },
+        body: JSON.stringify({
+          id: "w3",
+          requestedBy: "<script>",
+          source: { module: "vault", vault: "default", event: "note.created" },
+          sink: { module: "widget", action: "thing.do" },
+        }),
+      }),
+      "",
+      deps,
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_request");
+    // Nothing provisioned, nothing persisted.
+    expect(calls.length).toBe(0);
+    expect(readConnections(harness.storePath)).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
 // POST — channel-backed connection (parity with hub#624)
 // ===========================================================================
 

@@ -106,6 +106,51 @@ describe("Connections — list rendering", () => {
     expect(screen.getByText(/vault\.note\.created/)).toBeInTheDocument();
     expect(screen.getByText(/channel\.message\.deliver/)).toBeInTheDocument();
   });
+
+  it("groups connections by provenance — module-initiated vs custom (R2)", async () => {
+    const fromChannel: api.ConnectionListing = {
+      ...connection("channel-eng"),
+      requested_by: "channel",
+    };
+    const custom: api.ConnectionListing = { ...connection("custom-one"), requested_by: "custom" };
+    vi.mocked(api.listConnections).mockResolvedValue([custom, fromChannel]);
+    vi.mocked(api.getConnectionsCatalog).mockResolvedValue(catalog());
+    vi.mocked(api.listVaults).mockResolvedValue(vaultsResult("default"));
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("channel-eng")).toBeInTheDocument());
+
+    // Two labeled groups appear: "Added from channel" and "Custom (built here)".
+    expect(screen.getByText(/added from channel/i)).toBeInTheDocument();
+    expect(screen.getByText(/custom \(built here\)/i)).toBeInTheDocument();
+
+    // The channel-initiated connection carries a provenance badge; the
+    // hand-built one does not (it shows the muted "custom" marker instead).
+    const channelRow = document.querySelector('[data-connection-id="channel-eng"]');
+    expect(channelRow?.getAttribute("data-requested-by")).toBe("channel");
+    expect(within(channelRow as HTMLElement).getByTestId("provenance-badge").textContent).toBe(
+      "channel",
+    );
+    const customRow = document.querySelector('[data-connection-id="custom-one"]');
+    expect(customRow?.getAttribute("data-requested-by")).toBe("custom");
+    expect(within(customRow as HTMLElement).queryByTestId("provenance-badge")).toBeNull();
+
+    // The module-initiated group sorts before custom (custom sorts last).
+    const groups = Array.from(document.querySelectorAll("[data-provenance-group]")).map((g) =>
+      g.getAttribute("data-provenance-group"),
+    );
+    expect(groups).toEqual(["channel", "custom"]);
+  });
+
+  it("treats a connection with no requested_by as custom (pre-R2 back-compat)", async () => {
+    vi.mocked(api.listConnections).mockResolvedValue([connection("legacy")]);
+    vi.mocked(api.getConnectionsCatalog).mockResolvedValue(catalog());
+    vi.mocked(api.listVaults).mockResolvedValue(vaultsResult("default"));
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("legacy")).toBeInTheDocument());
+    expect(screen.getByText(/custom \(built here\)/i)).toBeInTheDocument();
+    const row = document.querySelector('[data-connection-id="legacy"]');
+    expect(row?.getAttribute("data-requested-by")).toBe("custom");
+  });
 });
 
 describe("Connections — builder", () => {

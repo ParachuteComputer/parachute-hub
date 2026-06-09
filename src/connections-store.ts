@@ -59,6 +59,17 @@ export interface ConnectionRecord {
   readonly sink: ConnectionSink;
   readonly provisioned: ConnectionProvisioned;
   readonly createdAt: string;
+  /**
+   * Provenance — WHO requested this connection (modular-UI R2, module-initiated
+   * connections). A module-owned config UI that creates a connection on the
+   * operator's behalf (e.g. the channel admin page's "link to a vault" flow)
+   * labels itself here (e.g. `"channel"`); a connection built by hand in the
+   * hub's own Connections builder is `"custom"`. Lets the operator see which
+   * connections a module initiated vs which they wired themselves. Optional for
+   * back-compat: records written before R2 read back as `undefined`, which the
+   * SPA treats as `"custom"`.
+   */
+  readonly requestedBy?: string;
 }
 
 interface ConnectionsFile {

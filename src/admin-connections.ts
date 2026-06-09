@@ -72,6 +72,15 @@ const CONNECTION_ID_RE = /^[a-z0-9][a-z0-9_-]*$/i;
  */
 const CHANNEL_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/i;
 
+/**
+ * Provenance label charset (modular-UI R2). `requestedBy` is an operator-/module-
+ * supplied label that lands in the Connections SPA as a grouping key — keep it a
+ * conservative slug so it can't carry markup or odd characters into the view.
+ * Defaults to `"custom"` (the hub's own builder) when omitted.
+ */
+const REQUESTED_BY_RE = /^[a-z0-9][a-z0-9_-]*$/i;
+const DEFAULT_REQUESTED_BY = "custom";
+
 /** A module installed on this hub, with its manifest + resolved mount path. */
 export interface InstalledModuleInfo {
   /** Module short name (the catalog/wire key). */
@@ -215,6 +224,9 @@ function listConnections(deps: ConnectionsDeps): Response {
     sink: c.sink,
     provisioned: c.provisioned,
     created_at: c.createdAt,
+    // Provenance (modular-UI R2). Records written before R2 carry no
+    // `requestedBy`; project them as the default so the SPA grouping is total.
+    requested_by: c.requestedBy ?? DEFAULT_REQUESTED_BY,
   }));
   return json(200, { ok: true, connections });
 }
@@ -237,6 +249,12 @@ interface CreateBody {
   };
   /** Optional operator-supplied id; otherwise derived from source/sink. */
   id?: unknown;
+  /**
+   * Provenance — WHO requested this connection (modular-UI R2). A module-owned
+   * config UI calling this endpoint on the operator's behalf labels itself (e.g.
+   * `"channel"`); the hub's own builder omits it and falls back to `"custom"`.
+   */
+  requestedBy?: unknown;
 }
 
 async function createConnection(
@@ -255,6 +273,19 @@ async function createConnection(
   const sourceEvent = str(body.source?.event);
   const sinkModule = str(body.sink?.module);
   const sinkAction = str(body.sink?.action);
+
+  // Provenance label (modular-UI R2). Default to the hub's own builder; a
+  // module-owned config UI that POSTs on the operator's behalf labels itself.
+  // Validated to a slug so a bad value can't poison the SPA grouping.
+  const requestedByRaw = str(body.requestedBy);
+  const requestedBy = requestedByRaw === "" ? DEFAULT_REQUESTED_BY : requestedByRaw.toLowerCase();
+  if (!REQUESTED_BY_RE.test(requestedBy)) {
+    return jsonError(
+      400,
+      "invalid_request",
+      `requestedBy "${requestedByRaw}" is not a valid label (letters, numbers, dash, underscore)`,
+    );
+  }
   if (!sourceModule || !sourceEvent || !sinkModule || !sinkAction) {
     return jsonError(
       400,
@@ -428,6 +459,7 @@ async function createConnection(
     sink: sinkRec,
     provisioned: { type: "vault-trigger", vault, triggerName },
     createdAt: (deps.now?.() ?? new Date()).toISOString(),
+    requestedBy,
   };
   putConnection(deps.storePath, record);
 
