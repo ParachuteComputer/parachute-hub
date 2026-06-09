@@ -572,10 +572,11 @@ h2 {
 
 /*
  * Per-vault "MCP connection" card (the SPA twin of setup-wizard.ts
- * renderMcpTile). Surfaced inline under a vault row (Vaults list) and
- * inside the NewVault created-view. The endpoint + command codeboxes
- * reuse the `.token-box` shape from the mint banner so copy affordances
- * read consistently across the SPA.
+ * renderMcpTile). Surfaced inline under a vault row in the legacy Vaults
+ * list (McpConnectCard.tsx — its NewVault created-view consumer left with
+ * B5 of the 2026-06-09 hub-module-boundary migration). The endpoint +
+ * command codeboxes reuse the `.token-box` shape from the mint banner so
+ * copy affordances read consistently across the SPA.
  */
 .mcp-connect-card {
   background: var(--bg-soft);

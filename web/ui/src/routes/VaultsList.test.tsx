@@ -1,8 +1,10 @@
 /**
- * VaultsList smoke tests — loading → ok / empty / error, plus the
- * managementUrl-driven Manage button behaviour (mint + redirect, mint
- * failure surfacing, "CLI only" stub when the vault doesn't declare
- * a management URL).
+ * VaultsList tests — the B5 feature-detect gate (forward to /vault/admin/
+ * on a new-manifest vault, legacy list otherwise) plus the legacy list:
+ * loading → ok / empty / error, the managementUrl-driven Manage button
+ * (mint + redirect, mint failure surfacing, "CLI only" stub), and the
+ * post-NewVault create affordances (wizard deep-link empty state, CLI
+ * hint when vaults already exist).
  */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -15,23 +17,55 @@ vi.mock("../lib/api.ts", async (orig) => {
   const actual = (await orig()) as typeof api;
   return {
     ...actual,
+    listModules: vi.fn(),
     listVaults: vi.fn(),
     mintVaultAdminToken: vi.fn(),
   };
 });
 
+/** Full ModuleListing for the feature-detect catalog; override per-test. */
+function makeModule(short: string, overrides: Partial<api.ModuleListing> = {}): api.ModuleListing {
+  return {
+    short,
+    package: `@openparachute/${short}`,
+    display_name: short.charAt(0).toUpperCase() + short.slice(1),
+    tagline: `the ${short} module`,
+    focus: "core",
+    available: true,
+    installed: true,
+    installed_version: "1.0.0",
+    latest_version: "1.0.0",
+    supervisor_status: "running",
+    pid: 1234,
+    install_dir: `/home/.parachute/${short}`,
+    uis: [],
+    management_url: null,
+    config_ui_url: null,
+    ...overrides,
+  };
+}
+
+function makeCatalog(modules: api.ModuleListing[]): api.ModulesCatalog {
+  return { modules, supervisor_available: true, module_install_channel: "latest" };
+}
+
 let assignSpy: ReturnType<typeof vi.fn<(url: string | URL) => void>>;
+let replaceSpy: ReturnType<typeof vi.fn<(url: string | URL) => void>>;
 const originalLocation = window.location;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default detect outcome: vault module installed but OLD manifest (no
+  // config_ui_url) → the legacy list renders. The redirect tests override.
+  vi.mocked(api.listModules).mockResolvedValue(makeCatalog([makeModule("vault")]));
   assignSpy = vi.fn<(url: string | URL) => void>();
+  replaceSpy = vi.fn<(url: string | URL) => void>();
   // jsdom locks individual Location members non-configurable, so we swap
   // the whole `window.location` slot — that property *is* configurable.
   Object.defineProperty(window, "location", {
     configurable: true,
     writable: true,
-    value: { ...originalLocation, assign: assignSpy },
+    value: { ...originalLocation, assign: assignSpy, replace: replaceSpy },
   });
 });
 
@@ -52,14 +86,63 @@ function renderList() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// B5 feature-detect: /vaults is a compatibility route now
+// ---------------------------------------------------------------------------
+
+describe("VaultsList — feature-detected forward to /vault/admin/", () => {
+  it("full-document-replaces to /vault/admin/ when vault's config_ui_url is exactly /vault/admin/", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog([makeModule("vault", { config_ui_url: "/vault/admin/" })]),
+    );
+    renderList();
+    await waitFor(() => expect(replaceSpy).toHaveBeenCalledWith("/vault/admin/"));
+    // The legacy list never loads — no well-known fetch, no list render.
+    expect(api.listVaults).not.toHaveBeenCalled();
+    expect(screen.getByTestId("vaults-detecting")).toHaveTextContent(/opening the vault admin/i);
+  });
+
+  it("renders the legacy list (no redirect) when config_ui_url is null — old vault manifest", async () => {
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog([makeModule("vault", { config_ui_url: null })]),
+    );
+    vi.mocked(api.listVaults).mockResolvedValue({ vaults: [], moduleInstalled: true });
+    renderList();
+    await waitFor(() => expect(screen.getByText(/no vaults yet/i)).toBeInTheDocument());
+    expect(replaceSpy).not.toHaveBeenCalled();
+  });
+
+  it("does NOT redirect on a per-instance config_ui_url (exact-match guard)", async () => {
+    // Anything that isn't the daemon-level home — e.g. a mount-joined
+    // per-instance path — keeps the legacy list.
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog([makeModule("vault", { config_ui_url: "/vault/default/admin/" })]),
+    );
+    vi.mocked(api.listVaults).mockResolvedValue({ vaults: [], moduleInstalled: true });
+    renderList();
+    await waitFor(() => expect(screen.getByText(/no vaults yet/i)).toBeInTheDocument());
+    expect(replaceSpy).not.toHaveBeenCalled();
+  });
+
+  it("degrades to the legacy list when the module catalog can't be read", async () => {
+    vi.mocked(api.listModules).mockRejectedValue(new api.HttpError(500, "catalog down"));
+    vi.mocked(api.listVaults).mockResolvedValue({ vaults: [], moduleInstalled: true });
+    renderList();
+    await waitFor(() => expect(screen.getByText(/no vaults yet/i)).toBeInTheDocument());
+    expect(replaceSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe("VaultsList", () => {
-  it("renders empty state with a 'Create a vault' link when module installed but no vaults", async () => {
+  it("empty state's 'Create a vault' deep-links the re-enterable wizard vault step", async () => {
+    // The hub-side NewVault form left with B5 — the bootstrap affordance is
+    // the server-rendered /admin/setup?step=vault (full-document anchor).
     vi.mocked(api.listVaults).mockResolvedValue({ vaults: [], moduleInstalled: true });
     renderList();
     await waitFor(() => expect(screen.getByText(/no vaults yet/i)).toBeInTheDocument());
     expect(screen.getByRole("link", { name: /create a vault/i })).toHaveAttribute(
       "href",
-      "/vaults/new",
+      "/admin/setup?step=vault",
     );
   });
 
@@ -73,13 +156,13 @@ describe("VaultsList", () => {
       "href",
       "/modules",
     );
-    // Header CTA also flips to "Install vault module" so the operator
-    // can't click their way into /vaults/new on a vault-less hub.
+    // Header CTA is "Install vault module" — creating a vault on a
+    // vault-less hub has nothing to provision against.
     expect(screen.getByRole("link", { name: /install vault module$/i })).toHaveAttribute(
       "href",
       "/modules",
     );
-    // The "New vault" CTA is replaced — not present at all.
+    // No "New vault" CTA anywhere (the hub-side create form left with B5).
     expect(screen.queryByRole("button", { name: /^new vault$/i })).toBeNull();
   });
 
@@ -106,6 +189,12 @@ describe("VaultsList", () => {
     expect(screen.getByText("work")).toBeInTheDocument();
     expect(screen.getByText("scratch")).toBeInTheDocument();
     expect(screen.getAllByText(/v0\.5\.1/)).toHaveLength(2);
+    // The header "New vault" button is gone (B5); in its place, the legacy
+    // list points at CLI-or-upgrade for additional instances.
+    expect(screen.queryByRole("button", { name: /^new vault$/i })).toBeNull();
+    expect(screen.getByTestId("vaults-legacy-create-hint")).toHaveTextContent(
+      /parachute vault create/i,
+    );
   });
 
   it("renders the error banner + retry button on failure", async () => {

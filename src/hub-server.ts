@@ -15,7 +15,8 @@
  *
  *   # Pre-rename 301 back-compat (hub#231 — first so they preempt any
  *   # remaining handlers under /vault or /hub).
- *   /vault, /vault/, /vault/new                → 301 → /admin/vaults[/new]
+ *   /vault, /vault/, /vault/new                → 301 → /vault/admin/ (B5:
+ *                                                vault's daemon-level admin)
  *   /hub/vaults*                               → 301 → /admin/vaults*
  *   /hub/permissions                           → 301 → /admin/permissions
  *   /hub/tokens                                → 301 → /admin/tokens
@@ -1141,8 +1142,9 @@ function defaultSpaDistDir(): string {
  * The admin SPA serves at a single mount: `/admin/*` (since hub#231).
  *
  * Routes:
- *   - `/admin/vaults`       → vault list (the SPA's home)
- *   - `/admin/vaults/new`   → vault create form
+ *   - `/admin/`             → Home (the admin-shell overview)
+ *   - `/admin/vaults`       → legacy vault list; feature-detects a new-manifest
+ *                             vault and forwards to `/vault/admin/` (B5)
  *   - `/admin/permissions`  → OAuth consent grant management
  *   - `/admin/tokens`       → token registry: mint / list / revoke
  *
@@ -1614,11 +1616,17 @@ export function hubFetch(
     async function dispatch(): Promise<Response> {
       // 301 back-compat for the pre-hub#231 admin-SPA mounts:
       //
-      //   `/vault`            → `/admin/vaults`
-      //   `/vault/new`        → `/admin/vaults/new`
+      //   `/vault`, `/vault/new` → `/vault/admin/` (vault's own daemon-level
+      //                        admin surface — B5, 2026-06-09 hub-module-
+      //                        boundary migration. These pointed at
+      //                        `/admin/vaults[/new]` until B5; with the
+      //                        list+create UX module-owned, pointing DIRECTLY
+      //                        at the target avoids a redirect → SPA-load →
+      //                        client-side-forward chain)
       //   `/hub/vaults*`      → `/admin/vaults*` (this redirect predates #231;
-      //                        it now retargets at the new admin mount instead
-      //                        of the interim `/vault` mount)
+      //                        /admin/vaults survives as the feature-detected
+      //                        legacy list, so the target stays valid on both
+      //                        old-vault and new-vault boxes)
       //   `/hub/permissions`  → `/admin/permissions`
       //   `/hub/tokens`       → `/admin/tokens`
       //   `/hub` (bare)       → `/admin/vaults`
@@ -1630,12 +1638,13 @@ export function hubFetch(
       // POST endpoint to protect.
       //
       // `/vault/<name>/*` is INTENTIONALLY excluded — that's the per-vault
-      // content proxy (Notes PWA, etc.), not the admin SPA. Stays where it is.
+      // content proxy (Notes PWA, etc.), not the admin SPA. The exact-match
+      // condition here also never touches `/vault/admin*` — the daemon-level
+      // mount dispatched further down.
       if (pathname === "/vault" || pathname === "/vault/" || pathname === "/vault/new") {
-        const sub = pathname === "/vault/new" ? "/new" : "";
         return new Response("", {
           status: 301,
-          headers: { location: `/admin/vaults${sub}${url.search}` },
+          headers: { location: `/vault/admin/${url.search}` },
         });
       }
       if (pathname === "/hub/vaults" || pathname.startsWith("/hub/vaults/")) {
@@ -2957,8 +2966,10 @@ export function hubFetch(
       }
 
       // Legacy `/admin/config` (server-rendered module-config portal, #46)
-      // retired post-SPA-rework. 301 → the SPA home so any bookmark or stale
-      // post-login redirect lands somewhere useful. The route stays here in
+      // retired post-SPA-rework. 301 → /admin/vaults so any bookmark or stale
+      // post-login redirect lands somewhere useful (post-B5 that's the
+      // feature-detected vaults surface — legacy list on an old-vault box,
+      // forward to /vault/admin/ on a new one). The route stays here in
       // dispatch order (above the /admin/* SPA catch-all) so the redirect
       // wins over a SPA shell render.
       if (pathname === "/admin/config" || pathname.startsWith("/admin/config/")) {
@@ -2992,7 +3003,7 @@ export function hubFetch(
       // /vault/<name>/* — per-vault content proxy. Stays as user-facing
       // surface (the Notes PWA loads through here, etc.). The bare `/vault`
       // and `/vault/new` paths were SPA routes pre-#231; they 301-redirect at
-      // the top of dispatch now. Multi-segment requests like
+      // the top of dispatch now (to `/vault/admin/` since B5). Multi-segment requests like
       // `/vault/<unknown>/health` are vault-API shapes targeting a
       // non-existent vault and 404 directly — there's no SPA-shell fallback
       // here anymore (the SPA moved to /admin), so we can't accidentally
@@ -3022,9 +3033,9 @@ export function hubFetch(
       // SPA's own router renders the page and handles 404 client-side for
       // unknown sub-paths.
       if (pathname === "/admin" || pathname === "/admin/") {
-        // Unprefixed /admin → SPA shell pointed at the vault list (its home).
-        // The SPA's basename is /admin, so the router will land on / and
-        // render VaultsList.
+        // Unprefixed /admin → SPA shell at its index route. The SPA's
+        // basename is /admin, so the router lands on / and renders Home
+        // (the admin-shell overview).
         if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
         return serveSpa(spaDistDir, pathname, "/admin");
       }

@@ -14,36 +14,48 @@
  *   1. **Administer (hub)** — in-shell links to every hub-native section
  *      (Connections, Modules, Users, Tokens, Permissions, Settings). These open
  *      WITHIN the admin shell (react-router `<Link>`), so the persistent nav
- *      stays put and you never lose your place. Vault management lives under
- *      the Vault module card below — not here — because the hub-rendered vault
- *      list IS the vault module's admin surface.
+ *      stays put and you never lose your place.
  *
- *   2. **Modules** — one card per installed module. Vault is special: it has no
- *      separate admin SPA of its own — the hub SPA is vault's admin — so its
- *      card opens `/vaults` in-shell (no `↗`). All other modules open their own
- *      admin/config UI off-shell (full-page `<a href>`, explicit `↗` mark +
- *      "opens <module>'s own admin" caption). Modules without any URL render
- *      disabled with a "no admin UI yet" note (never a dead 404 click).
+ *   2. **Modules** — one card per installed module, uniformly: each opens the
+ *      module's OWN admin/config UI off-shell (full-page `<a href>`, explicit
+ *      `↗` mark + "opens <module>'s own admin" caption), resolved from
+ *      `config_ui_url` (falling back to `management_url`). Vault joined this
+ *      uniform pattern in B5 (2026-06-09 hub-module-boundary migration): its
+ *      new manifest declares `configUiUrl: "/vault/admin/"` — the daemon-level
+ *      multi-vault home — and the in-shell `/vaults` special-case (hub#635) is
+ *      retired. Modules without any URL render disabled with a "no admin UI
+ *      yet" note (never a dead 404 click); an old-manifest vault feature-
+ *      detects by absence the same way.
+ *
+ *      One bootstrap exception (charter-sanctioned): when vault is installed
+ *      with ZERO instances (the wizard-skip state, hub#607), there is no
+ *      vault daemon to serve `/vault/admin/` — the card becomes a hub-side
+ *      "create your first vault" affordance deep-linking the re-enterable
+ *      `/admin/setup?step=vault` wizard step.
  *
  *   3. **Your surfaces** — the user-facing module UIs (Notes etc.) sourced from
  *      each installed module's hosted-UI sub-units (`uis[]`). These are the
  *      `uiUrl` tiles that lived on the old discovery page; kept reachable here
  *      so an operator can jump straight into "browse my content" from the shell.
  *
- * The visual through-line: hub-native sections (including the Vault card) read
- * as in-shell cards (no external arrow); module-owned + user surfaces carry the
- * `↗` external mark. That contrast IS the clarity fix.
+ * The visual through-line: hub-native sections read as in-shell cards (no
+ * external arrow); module-owned + user surfaces carry the `↗` external mark.
+ * That contrast IS the clarity fix.
  *
  * Data: a single `/api/modules` round-trip drives both the Modules and Your
  * surfaces groups (it already carries `config_ui_url` / `management_url` and the
- * `uis[]` sub-units). The Administer group is static — those sections live in
- * the hub SPA, not in services.json. A modules-fetch failure degrades the two
- * module-driven groups to a small inline note; the Administer group always
+ * `uis[]` sub-units), plus one anonymous `/.well-known/parachute.json` read for
+ * the vault instance count (the zero-instances card's signal — the well-known
+ * `vaults[]` is the canonical instance list and already suppresses the install
+ * placeholder, hub#577). The Administer group is static — those sections live
+ * in the hub SPA, not in services.json. A modules-fetch failure degrades the
+ * two module-driven groups to a small inline note; a well-known failure just
+ * disables the zero-instances substitution. The Administer group always
  * renders so the operator can always reach the hub-native sections.
  */
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { type ModuleListing, type ModuleUiSubUnit, listModules } from "../lib/api.ts";
+import { type ModuleListing, type ModuleUiSubUnit, listModules, listVaults } from "../lib/api.ts";
 
 /** A hub-native section reachable in-shell. Order = how an operator scans. */
 interface HubSection {
@@ -87,6 +99,13 @@ interface SurfaceTile {
 
 export function Home() {
   const [state, setState] = useState<ModulesState>({ kind: "loading" });
+  // Vault instance count from the well-known `vaults[]` (anonymous read).
+  // `null` = unknown (pending or fetch failed) — the vault card renders the
+  // normal uniform shape; only a CONFIRMED zero swaps in the bootstrap
+  // "create your first vault" card. Erring toward the normal card on
+  // uncertainty avoids hiding a working /vault/admin/ link behind a flaky
+  // discovery read.
+  const [vaultInstances, setVaultInstances] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -99,6 +118,18 @@ export function Home() {
         if (cancelled) return;
         const message = err instanceof Error ? err.message : String(err);
         setState({ kind: "error", message });
+      });
+    // Fired in parallel with the modules read — it only matters when the
+    // vault module turns out to be installed, but the well-known doc is a
+    // cheap anonymous fetch and racing them keeps first paint fast.
+    listVaults()
+      .then((result) => {
+        if (cancelled) return;
+        setVaultInstances(result.vaults.length);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setVaultInstances(null);
       });
     return () => {
       cancelled = true;
@@ -148,17 +179,18 @@ export function Home() {
         </div>
       </section>
 
-      {/* 2. Modules — most open the MODULE's OWN admin/config UI (off-shell);
-          vault is the exception (hub-rendered, opens /vaults in-shell). */}
+      {/* 2. Modules — every card opens the MODULE's OWN admin/config UI
+          (off-shell), vault included (B5). The one substitution: vault
+          installed with zero instances renders the bootstrap "create your
+          first vault" card instead (no daemon to serve /vault/admin/). */}
       <section className="home-group" data-testid="home-modules">
         <div className="home-group-head">
           <h2>Modules</h2>
           <span className="home-group-tag home-group-tag-module">modules</span>
         </div>
         <p className="muted home-group-sub">
-          Installed modules. Vault opens here in the shell; other modules open their own admin
-          surface outside the hub shell. Manage install / upgrade / restart from{" "}
-          <Link to="/modules">Modules</Link>.
+          Installed modules. Each opens its own admin surface outside the hub shell. Manage install
+          / upgrade / restart from <Link to="/modules">Modules</Link>.
         </p>
         {state.kind === "loading" ? (
           <p className="muted" data-loading="true">
@@ -175,9 +207,13 @@ export function Home() {
           </p>
         ) : (
           <div className="home-grid">
-            {installedModules.map((m) => (
-              <ModuleAdminCard key={m.short} module={m} />
-            ))}
+            {installedModules.map((m) =>
+              m.short === "vault" && vaultInstances === 0 ? (
+                <FirstVaultCard key={m.short} module={m} />
+              ) : (
+                <ModuleAdminCard key={m.short} module={m} />
+              ),
+            )}
           </div>
         )}
       </section>
@@ -215,39 +251,24 @@ export function Home() {
 }
 
 /**
- * One installed-module card on the Home overview.
+ * One installed-module card on the Home overview — the uniform module
+ * pattern, vault included (B5, 2026-06-09 hub-module-boundary migration).
  *
- * **Vault is special**: the hub SPA *is* vault's admin — there is no separate
- * vault admin SPA. So vault's card opens `/vaults` in-shell via a react-router
- * `<Link>` (no `↗` mark, `home-card-hub` treatment). The "all vaults + click
- * through to each" experience lives there.
+ * Links to the module's OWN admin/config UI (`config_ui_url` first — the
+ * module's dedicated config surface — falling back to `management_url`).
+ * For a new-manifest vault, `config_ui_url` resolves to `/vault/admin/`
+ * (the daemon-level multi-vault home). Full-page `<a href>` (NOT a
+ * react-router `<Link>`) because we're LEAVING the shell; the `↗` mark +
+ * owner caption make that boundary explicit.
  *
- * **All other modules** link to the module's OWN admin/config UI
- * (`config_ui_url` first — the module's dedicated config surface — falling back
- * to `management_url`). Full-page `<a href>` (NOT a react-router `<Link>`)
- * because we're LEAVING the shell; the `↗` mark + owner caption make that
- * boundary explicit.
- *
- * A non-vault module that declares neither URL (scribe, runner today) renders
- * as a disabled card with a "no admin UI yet" note rather than a dead click —
- * the operator still sees it's installed.
+ * A module that declares neither URL (scribe, runner today; a vault whose
+ * manifest predates the vault wave AND resolves no management URL) renders
+ * as a disabled card with a "no admin UI yet" note rather than a dead
+ * click — the operator still sees it's installed. The pre-B5 in-shell
+ * `/vaults` special-case (hub#635) is gone; nothing in this component
+ * branches on the module short.
  */
 function ModuleAdminCard({ module: m }: { module: ModuleListing }) {
-  // Vault: hub-native admin lives at /vaults — open in-shell, no external mark.
-  if (m.short === "vault") {
-    return (
-      <Link
-        to="/vaults"
-        className="home-card home-card-hub"
-        data-testid={`home-module-${m.short}`}
-      >
-        <span className="home-card-title">{m.display_name}</span>
-        {m.tagline ? <span className="home-card-desc">{m.tagline}</span> : null}
-        <span className="home-card-owner">manage all vaults — opens here</span>
-      </Link>
-    );
-  }
-
   const adminUrl = m.config_ui_url ?? m.management_url;
   if (!adminUrl) {
     return (
@@ -273,6 +294,30 @@ function ModuleAdminCard({ module: m }: { module: ModuleListing }) {
       </span>
       {m.tagline ? <span className="home-card-desc">{m.tagline}</span> : null}
       <span className="home-card-owner">opens {m.display_name}'s own admin</span>
+    </a>
+  );
+}
+
+/**
+ * The zero-instances bootstrap card (B5's one sanctioned exception to the
+ * uniform module pattern). Vault is installed but has NO instances — the
+ * wizard-skip state (hub#607). There's no vault daemon running, so linking
+ * `/vault/admin/` would dead-end; instead, deep-link the re-enterable
+ * `/admin/setup?step=vault` wizard step (server-rendered, outside the SPA —
+ * hence a full-document `<a href>`, hub-card treatment, no module `↗`).
+ */
+function FirstVaultCard({ module: m }: { module: ModuleListing }) {
+  return (
+    <a
+      href="/admin/setup?step=vault"
+      className="home-card home-card-hub"
+      data-testid={`home-module-${m.short}`}
+    >
+      <span className="home-card-title">{m.display_name}</span>
+      <span className="home-card-desc">
+        No vaults yet — create your first vault to start storing notes, tokens, and secrets.
+      </span>
+      <span className="home-card-owner">create your first vault — opens the setup wizard</span>
     </a>
   );
 }

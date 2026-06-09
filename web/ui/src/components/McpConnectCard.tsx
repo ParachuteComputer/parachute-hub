@@ -7,13 +7,11 @@
  *
  * It's the SPA twin of the server-rendered `renderMcpTile` in
  * `src/setup-wizard.ts` — same command shape, same OAuth-first framing,
- * same one-time-reveal posture for the optional header-auth token. Two
- * mount points consume it:
- *
- *   1. The Vaults list — a per-row "Connect" toggle (VaultsList.tsx).
- *   2. The NewVault created-view — replaces the bare "here's your token"
- *      display so the freshly-minted token has a clear, in-context purpose
- *      (NewVault.tsx CreatedView).
+ * same one-time-reveal posture for the optional header-auth token. One
+ * mount point consumes it today: the legacy Vaults list's per-row
+ * "Connect" toggle (VaultsList.tsx). The NewVault created-view consumer
+ * left with B5 (2026-06-09 hub-module-boundary — vault creation UX is
+ * module-owned now).
  *
  * Why two auth paths, OAuth-first:
  *   - **OAuth (default).** `claude mcp add --transport http …` with NO
@@ -89,9 +87,11 @@ interface McpConnectCardProps {
    */
   vaultUrl: string;
   /**
-   * Render without the outer `.mcp-connect-card` chrome — used inside the
-   * NewVault created-view where the card already sits in a surrounding
-   * banner. Defaults to false (standalone card with its own border).
+   * Render with the lighter embedded chrome — for hosts that already wrap
+   * the card in a surrounding banner. Consumer-less since the NewVault
+   * created-view left with B5; kept because the styling hook is cheap and
+   * vault-surface hosts may want it. Defaults to false (standalone card
+   * with its own border).
    */
   embedded?: boolean;
 }

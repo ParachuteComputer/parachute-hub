@@ -1,10 +1,12 @@
 # Hub web UI
 
-Vite + React + TypeScript SPA. The bundle serves at two mounts on the
-running hub: `/vault/*` (primary, since the hub#168 realignment) and
-`/hub/*` (back-compat for `/hub/permissions` and any bookmark that
-predates the rename). Vault management Phase 1 surfaces: list + create;
-Phase 2+ will add mint/revoke/config.
+Vite + React + TypeScript SPA. The bundle serves at the single `/admin/*`
+mount on the running hub (since hub#231; the old `/vault` + `/hub` mounts
+301-redirect). Vault instance-lifecycle UX (list/create/delete) is
+module-owned at `/vault/admin/` since B5 of the 2026-06-09
+hub-module-boundary migration — the SPA's `/vaults` route is a
+feature-detected forwarder that keeps a legacy list for old vault
+modules.
 
 ## Mount-aware contract
 
@@ -80,11 +82,11 @@ web/ui/
     ├── styles.css          # brand tokens (kept in sync with oauth-ui.ts)
     ├── lib/
     │   ├── auth.ts         # session→JWT mint, in-memory cache
-    │   └── api.ts          # listVaults + createVault
-    ├── routes/
-    │   ├── VaultsList.tsx  # / (under /vault basename)
-    │   ├── NewVault.tsx    # /new (one-shot hub access-token banner)
-    │   └── VaultDetail.tsx # /:name (Phase 2 placeholder)
+    │   └── api.ts          # typed fetch helpers (/api/*, well-known, mints)
+    ├── routes/             # one file per admin section (Home, Modules,
+    │                       # Connections, Users, Tokens, Permissions,
+    │                       # Settings, ApproveClient, VaultsList — the B5
+    │                       # feature-detected legacy /vaults route)
     └── test/setup.ts
 ```
 

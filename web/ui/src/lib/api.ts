@@ -2,13 +2,18 @@
  * HTTP client for the hub SPA. Two surfaces:
  *
  *   - `/.well-known/parachute.json` — public discovery doc (no auth).
- *   - `/vaults` — admin endpoint (POST creates, requires
- *     `parachute:host:admin` Bearer).
+ *   - `/api/*` + `/admin/*` JSON endpoints — require the
+ *     `parachute:host:admin` Bearer (or the session cookie directly).
  *
  * The Bearer comes from `lib/auth.ts:getHostAdminToken()`, which trades
  * the `parachute_hub_session` cookie for a short-lived JWT. On 401 from
  * the admin endpoint after a fresh mint, the auth helper navigates the
  * browser to /admin/login — we don't try to recover.
+ *
+ * The `createVault` helper (POST /vaults) left with B5 (2026-06-09
+ * hub-module-boundary migration): vault-creation UX is module-owned at
+ * `/vault/admin/`. The hub endpoint survives as the transaction vault's
+ * own surface drives; this SPA just no longer calls it.
  */
 import { clearCachedToken, getHostAdminToken, redirectToLoginAndHang } from "./auth.ts";
 
@@ -31,47 +36,6 @@ export interface MintedVaultAdminToken {
   /** ISO 8601 expiry — vault SPA recomputes its refresh window from this. */
   expiresAt: string;
   scopes: string[];
-}
-
-export interface CreateVaultInput {
-  name: string;
-}
-
-export interface CreateVaultResult {
-  name: string;
-  url: string;
-  version: string;
-  /**
-   * Whether THIS request freshly created the vault (HTTP 201) vs hit an
-   * already-existing one (idempotent re-POST, HTTP 200). Branch the UI on
-   * this, NOT on `token` truthiness — post the pvt_* DROP a freshly-created
-   * vault can come back with `token: ""` (the bootstrap mint was
-   * unavailable, e.g. on a loopback origin the hub can't mint against), and
-   * treating `""` as "already existed" wrongly tells the operator nothing
-   * was created. Status is the authoritative create signal.
-   */
-  created: boolean;
-  /**
-   * One-shot hub ACCESS token (a JWT scoped `vault:<name>:admin`) captured
-   * from `parachute-vault create --json`. Present and non-empty only when
-   * the hub could mint at create time. Empty string (or absent) on a 201
-   * means the vault was created but no token was minted — see
-   * `tokenGuidance`. This is NOT a `pvt_*` vault token (those were dropped);
-   * it's a hub-issued JWT the connect command can carry as a header.
-   */
-  token?: string;
-  /**
-   * Vault-supplied human-readable reason no token was minted (e.g. "no hub
-   * origin reachable to mint against"), forwarded verbatim from the vault
-   * create JSON's `token_guidance` field. Surfaced on the empty-token-on-201
-   * state so the operator understands the gap rather than seeing a blank.
-   */
-  tokenGuidance?: string;
-  paths?: {
-    vault_dir: string;
-    vault_db: string;
-    vault_config: string;
-  };
 }
 
 /** Status code carried alongside the message so callers can branch numerically. */
@@ -165,62 +129,6 @@ function pathFor(
   } catch {
     return `/vault/${name}`;
   }
-}
-
-/** POST /vaults — create a new vault. Requires `parachute:host:admin`. */
-export async function createVault(input: CreateVaultInput): Promise<CreateVaultResult> {
-  const bearer = await getHostAdminToken();
-  const res = await fetch("/vaults", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json",
-      authorization: `Bearer ${bearer}`,
-    },
-    body: JSON.stringify(input),
-  });
-  if (res.status === 401 || res.status === 403) {
-    // Token didn't carry the scope (shouldn't happen — mint ensures it) OR
-    // the cached JWT lapsed mid-flight. Drop the cache; the auth helper
-    // navigates to /admin/login on the next mint attempt if the cookie has
-    // also expired. Surface the 401 so the form can re-issue cleanly.
-    //
-    // Deliberate: we don't auto-mint-and-retry transparently. A failed
-    // POST gets surfaced to the operator and a re-click drives the next
-    // attempt — which mints fresh after `clearCachedToken`. Manual retry
-    // keeps a stale-token mid-submit visible (vs. silently swallowing
-    // a state mismatch) and avoids retrying a request the user might
-    // not actually want repeated.
-    clearCachedToken();
-    throw new HttpError(res.status, await readError(res));
-  }
-  if (!res.ok) {
-    throw new HttpError(res.status, await readError(res));
-  }
-  // The hub returns 201 on a fresh create, 200 on an idempotent re-POST
-  // against an existing vault. Carry that distinction into `created` so the
-  // UI branches on status, not on `token` truthiness — a 201 can legitimately
-  // carry `token: ""` post-DROP (mint unavailable) and must NOT be treated as
-  // "already existed."
-  const created = res.status === 201;
-  const body = (await res.json()) as {
-    name: string;
-    url: string;
-    version: string;
-    token?: string;
-    token_guidance?: string;
-    paths?: CreateVaultResult["paths"];
-  };
-  const result: CreateVaultResult = {
-    name: body.name,
-    url: body.url,
-    version: body.version,
-    created,
-  };
-  if (body.token) result.token = body.token;
-  if (body.token_guidance) result.tokenGuidance = body.token_guidance;
-  if (body.paths) result.paths = body.paths;
-  return result;
 }
 
 /**
@@ -326,7 +234,7 @@ export interface AdminGrantListing {
 /**
  * GET /api/grants — list the operator's OAuth-grant skip-list. Optional
  * `vault` filter narrows to grants whose scope set touches `vault:<name>:*`.
- * Same Bearer pattern as `createVault`: a 401/403 dumps the cached token so
+ * Same Bearer pattern as the other admin helpers: a 401/403 dumps the cached token so
  * the next call re-mints from the session cookie (or hands off to login).
  */
 export async function listGrants(opts: { vault?: string } = {}): Promise<AdminGrantListing[]> {
@@ -521,7 +429,7 @@ export interface ListTokensOpts {
 
 /**
  * GET /api/auth/tokens — paginated list of registry rows. Same Bearer
- * pattern as `createVault` / `listGrants`.
+ * pattern as `listGrants`.
  */
 export async function listTokens(opts: ListTokensOpts = {}): Promise<AdminTokensPage> {
   const params = new URLSearchParams();
