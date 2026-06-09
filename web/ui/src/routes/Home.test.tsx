@@ -1,9 +1,10 @@
 /**
  * Home route tests — Administer group (no /vaults card), Modules group
- * (vault card = in-shell Link to /vaults; non-vault module = off-shell <a>),
- * loading / error / empty states.
+ * (every module card uniform off-shell via config_ui_url — vault included
+ * since B5 of the 2026-06-09 hub-module-boundary migration — plus the
+ * zero-instances bootstrap card), loading / error / empty states.
  */
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -15,11 +16,25 @@ vi.mock("../lib/api.ts", async (orig) => {
   return {
     ...actual,
     listModules: vi.fn(),
+    listVaults: vi.fn(),
   };
 });
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default: one vault instance exists, so the vault card takes the normal
+  // uniform module shape. The zero-instances tests override per-case.
+  vi.mocked(api.listVaults).mockResolvedValue({
+    moduleInstalled: true,
+    vaults: [
+      {
+        name: "default",
+        url: "http://hub.local/vault/default/",
+        version: "0.5.0",
+        path: "/vault/default",
+      },
+    ],
+  });
 });
 
 /** Build a full ModuleListing; tests override only what they need. */
@@ -82,7 +97,14 @@ describe("Administer group", () => {
 
     const administer = await screen.findByTestId("home-administer");
     // These six sections should be present; /vaults should not.
-    for (const path of ["/connections", "/modules", "/users", "/tokens", "/permissions", "/settings"]) {
+    for (const path of [
+      "/connections",
+      "/modules",
+      "/users",
+      "/tokens",
+      "/permissions",
+      "/settings",
+    ]) {
       expect(administer.querySelector(`[data-section='${path}']`)).not.toBeNull();
     }
     expect(administer.querySelector("[data-section='/vaults']")).toBeNull();
@@ -90,59 +112,116 @@ describe("Administer group", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Modules group — vault card (in-shell)
+// Modules group — vault card (uniform module pattern since B5)
 // ---------------------------------------------------------------------------
 
 describe("Modules group — vault card", () => {
-  it("renders the vault module card as an in-shell <Link> to /vaults (not an <a>)", async () => {
+  it("renders the vault card EXACTLY like other modules: off-shell <a> to config_ui_url with ↗", async () => {
+    // New-manifest vault: configUiUrl "/vault/admin/" resolved verbatim by
+    // the catalog. The card is the same off-shell shape channel/scribe/
+    // surface get — the hub#635 in-shell /vaults special-case is retired.
     vi.mocked(api.listModules).mockResolvedValue(
-      makeCatalog([makeModule("vault", { management_url: "http://vault.example.com/manage" })]),
+      makeCatalog([makeModule("vault", { config_ui_url: "/vault/admin/" })]),
     );
     renderRoute();
 
     await screen.findByTestId("home-modules");
     const card = screen.getByTestId("home-module-vault");
-
-    // Must be rendered as a <a> by react-router's Link (not a bare <a href>
-    // pointing at an external URL). The Link renders as an <a> with an
-    // href derived from the router basename — here "/vaults".
     expect(card.tagName).toBe("A");
-    expect(card).toHaveAttribute("href", "/vaults");
+    expect(card).toHaveAttribute("href", "/vault/admin/");
+    expect(card.querySelector(".ext-mark")).not.toBeNull();
+    expect(card.textContent).toContain("opens Vault's own admin");
+    // No residue of the old in-shell card.
+    expect(card.getAttribute("href")).not.toBe("/vaults");
+    expect(card.textContent).not.toContain("opens here");
   });
 
-  it("vault card does NOT carry the external ↗ mark", async () => {
+  it("vault card falls back to management_url when config_ui_url is null (generic fallback)", async () => {
+    // Old-manifest vault that still resolves a managementUrl (the B4 compat
+    // shim mount-joins the legacy "/admin/" to the instance mount). Same
+    // fallback every module gets — still off-shell.
     vi.mocked(api.listModules).mockResolvedValue(
-      makeCatalog([makeModule("vault")]),
+      makeCatalog([
+        makeModule("vault", { config_ui_url: null, management_url: "/vault/default/admin/" }),
+      ]),
     );
     renderRoute();
 
     await screen.findByTestId("home-modules");
     const card = screen.getByTestId("home-module-vault");
+    expect(card.tagName).toBe("A");
+    expect(card).toHaveAttribute("href", "/vault/default/admin/");
+    expect(card.querySelector(".ext-mark")).not.toBeNull();
+  });
+
+  it("vault card renders DISABLED when neither URL resolves (no in-shell /vaults link anymore)", async () => {
+    // Feature-detect by absence: a vault manifest that predates the vault
+    // wave and resolves no URL gets the same disabled fallback as any other
+    // module — never the retired in-shell special-case.
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog([makeModule("vault", { config_ui_url: null, management_url: null })]),
+    );
+    renderRoute();
+
+    await screen.findByTestId("home-modules");
+    const card = screen.getByTestId("home-module-vault");
+    expect(card.tagName).toBe("DIV");
+    expect(card).toHaveAttribute("aria-disabled", "true");
+    expect(card.textContent).toContain("no admin UI yet");
+  });
+
+  it("zero instances → bootstrap 'create your first vault' card deep-linking the wizard step", async () => {
+    // Wizard-skip state (hub#607): vault module installed, no instances, no
+    // daemon — /vault/admin/ has nothing to serve. The charter's bootstrap
+    // exception: a hub-side card deep-linking the re-enterable
+    // /admin/setup?step=vault (full-document anchor, hub treatment, no ↗).
+    vi.mocked(api.listVaults).mockResolvedValue({ moduleInstalled: true, vaults: [] });
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog([makeModule("vault", { config_ui_url: "/vault/admin/" })]),
+    );
+    renderRoute();
+
+    // waitFor: the card swaps to the bootstrap shape only once BOTH the
+    // catalog and the well-known instance count have settled.
+    await waitFor(() =>
+      expect(screen.getByTestId("home-module-vault")).toHaveAttribute(
+        "href",
+        "/admin/setup?step=vault",
+      ),
+    );
+    const card = screen.getByTestId("home-module-vault");
+    expect(card.tagName).toBe("A");
     expect(card.querySelector(".ext-mark")).toBeNull();
+    expect(card.textContent).toContain("create your first vault");
   });
 
-  it("vault card shows the in-shell caption", async () => {
+  it("zero instances substitutes the bootstrap card even on an old-manifest vault", async () => {
+    vi.mocked(api.listVaults).mockResolvedValue({ moduleInstalled: true, vaults: [] });
     vi.mocked(api.listModules).mockResolvedValue(
-      makeCatalog([makeModule("vault")]),
+      makeCatalog([makeModule("vault", { config_ui_url: null, management_url: null })]),
+    );
+    renderRoute();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("home-module-vault")).toHaveAttribute(
+        "href",
+        "/admin/setup?step=vault",
+      ),
+    );
+  });
+
+  it("unknown instance count (well-known read failed) keeps the normal uniform card", async () => {
+    // Only a CONFIRMED zero swaps in the bootstrap card — a flaky discovery
+    // read must not hide a working /vault/admin/ link.
+    vi.mocked(api.listVaults).mockRejectedValue(new Error("network down"));
+    vi.mocked(api.listModules).mockResolvedValue(
+      makeCatalog([makeModule("vault", { config_ui_url: "/vault/admin/" })]),
     );
     renderRoute();
 
     await screen.findByTestId("home-modules");
     const card = screen.getByTestId("home-module-vault");
-    expect(card.textContent).toContain("manage all vaults");
-    expect(card.textContent).toContain("opens here");
-  });
-
-  it("vault card opens /vaults even when management_url is null", async () => {
-    // Vault has no management_url but we still link in-shell.
-    vi.mocked(api.listModules).mockResolvedValue(
-      makeCatalog([makeModule("vault", { management_url: null })]),
-    );
-    renderRoute();
-
-    await screen.findByTestId("home-modules");
-    const card = screen.getByTestId("home-module-vault");
-    expect(card).toHaveAttribute("href", "/vaults");
+    expect(card).toHaveAttribute("href", "/vault/admin/");
   });
 });
 
@@ -153,9 +232,7 @@ describe("Modules group — vault card", () => {
 describe("Modules group — non-vault module cards", () => {
   it("renders a non-vault module with a config_ui_url as an off-shell <a>", async () => {
     vi.mocked(api.listModules).mockResolvedValue(
-      makeCatalog([
-        makeModule("scribe", { config_ui_url: "http://hub.example.com/scribe/admin" }),
-      ]),
+      makeCatalog([makeModule("scribe", { config_ui_url: "http://hub.example.com/scribe/admin" })]),
     );
     renderRoute();
 

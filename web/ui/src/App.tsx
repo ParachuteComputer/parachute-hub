@@ -3,11 +3,17 @@
  *
  * Hub-served browser UI for cross-cutting host concerns:
  *
- *   - **`/admin/vaults`** — vault provisioning. List + create. Per-vault
- *     content (the Notes PWA, etc.) lives at `/vault/<name>/*` and is NOT
- *     part of this SPA — vaults own their own user-facing surfaces.
  *   - **`/admin/permissions`** — OAuth consent grant management.
  *   - **`/admin/tokens`** — token registry: mint, list, revoke.
+ *
+ * Vault instance-lifecycle UX is MODULE-OWNED as of B5 (2026-06-09
+ * hub-module-boundary migration): vault's own surface at `/vault/admin/`
+ * holds the list/create/delete experience. `/admin/vaults` survives only
+ * as a feature-detected compatibility route — it forwards to
+ * `/vault/admin/` when the installed vault declares the new manifest, and
+ * renders the legacy list for vaults that predate the vault wave. Per-vault
+ * content (the Notes PWA, etc.) lives at `/vault/<name>/*` and was never
+ * part of this SPA — vaults own their own user-facing surfaces.
  *
  * Single mount at `/admin/*` (as of hub#231). The prior dual mounts
  * (`/vault` for the vault SPA, `/hub/*` for permissions+tokens) are
@@ -30,7 +36,6 @@ import { ApproveClient } from "./routes/ApproveClient.tsx";
 import { Connections } from "./routes/Connections.tsx";
 import { Home } from "./routes/Home.tsx";
 import { Modules } from "./routes/Modules.tsx";
-import { NewVault } from "./routes/NewVault.tsx";
 import { Permissions } from "./routes/Permissions.tsx";
 import { Settings } from "./routes/Settings.tsx";
 import { Tokens } from "./routes/Tokens.tsx";
@@ -182,12 +187,16 @@ export function App() {
         </Link>
         <AuthIndicator me={me} signingOut={signingOut} onSignOut={onSignOut} />
         {/* Hub-native sections — open in-shell. Home first, then the cross-
-            cutting host-admin surfaces. */}
+            cutting host-admin surfaces. "Vaults" left this group in B5
+            (2026-06-09 hub-module-boundary): vault lifecycle UX is module-
+            owned at /vault/admin/, reachable like every other module — via
+            its Home module card and the Services dropdown past the divider.
+            A persistent hub-native link to a module-owned surface would
+            blur the exact boundary the divider marks. */}
         <NavSection to="/" label="Home" exact />
         <NavSection to="/connections" label="Connections" />
         <NavSection to="/modules" label="Modules" />
         <NavSection to="/users" label="Users" />
-        <NavSection to="/vaults" label="Vaults" />
         <NavSection to="/tokens" label="Tokens" />
         <NavSection to="/permissions" label="Permissions" />
         <NavSection to="/settings" label="Settings" />
@@ -201,8 +210,12 @@ export function App() {
 
       <Routes>
         <Route path="/" element={<Home />} />
+        {/* /vaults is a compatibility route (B5): VaultsList feature-detects
+            a new-manifest vault and forwards to /vault/admin/; otherwise it
+            renders the legacy list. /vaults/new (the retired NewVault form)
+            folds into the same gate — create lives module-side now. */}
         <Route path="/vaults" element={<VaultsList />} />
-        <Route path="/vaults/new" element={<NewVault />} />
+        <Route path="/vaults/new" element={<Navigate to="/vaults" replace />} />
         <Route path="/modules" element={<Modules />} />
         <Route path="/users" element={<Users />} />
         <Route path="/connections" element={<Connections />} />

@@ -973,23 +973,28 @@ describe("hubFetch routing", () => {
   // 301-redirect to the new /admin/* mount. Tests cover every entry in the
   // dispatch — operator bookmarks landing on any of these still work.
 
-  test("301: /vault → /admin/vaults", async () => {
+  // B5 (2026-06-09 hub-module-boundary): the legacy `/vault[/new]` 301s point
+  // DIRECTLY at vault's daemon-level admin surface — not at /admin/vaults,
+  // whose SPA route is now just a feature-detected forwarder. Pointing at the
+  // final target avoids a redirect → SPA-load → client-side-forward chain.
+
+  test("301: /vault → /vault/admin/ (direct — no chain through /admin/vaults)", async () => {
     const h = makeHarness();
     try {
       const res = await hubFetch(h.dir)(req("/vault"));
       expect(res.status).toBe(301);
-      expect(res.headers.get("location")).toBe("/admin/vaults");
+      expect(res.headers.get("location")).toBe("/vault/admin/");
     } finally {
       h.cleanup();
     }
   });
 
-  test("301: /vault/new → /admin/vaults/new", async () => {
+  test("301: /vault/new → /vault/admin/ (create relocated into vault's surface)", async () => {
     const h = makeHarness();
     try {
       const res = await hubFetch(h.dir)(req("/vault/new"));
       expect(res.status).toBe(301);
-      expect(res.headers.get("location")).toBe("/admin/vaults/new");
+      expect(res.headers.get("location")).toBe("/vault/admin/");
     } finally {
       h.cleanup();
     }
@@ -1000,7 +1005,7 @@ describe("hubFetch routing", () => {
     try {
       const res = await hubFetch(h.dir)(req("/vault?next=foo"));
       expect(res.status).toBe(301);
-      expect(res.headers.get("location")).toBe("/admin/vaults?next=foo");
+      expect(res.headers.get("location")).toBe("/vault/admin/?next=foo");
     } finally {
       h.cleanup();
     }

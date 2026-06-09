@@ -1,12 +1,13 @@
 /**
- * api.ts unit tests — list + create flows.
+ * api.ts unit tests — list + mint flows.
  *
- * `listVaults` is anonymous (no Bearer); `createVault` mints + sends one.
- * The mock surface is `fetch` for the wire, plus `./auth.ts` for the
- * mint helper. We don't exercise the real auth flow here — that's
- * covered separately — only that the Bearer makes it onto the request
- * and that 401/403 causes `clearCachedToken` to fire so the next
- * mint attempt redirects to /admin/login.
+ * `listVaults` is anonymous (no Bearer); the admin helpers mint + send one.
+ * (`createVault` left with B5 — vault creation UX is module-owned at
+ * /vault/admin/ now.) The mock surface is `fetch` for the wire, plus
+ * `./auth.ts` for the mint helper. We don't exercise the real auth flow
+ * here — that's covered separately — only that the Bearer makes it onto
+ * the request and that 401/403 causes `clearCachedToken` to fire so the
+ * next mint attempt redirects to /admin/login.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -176,122 +177,6 @@ describe("listVaults", () => {
     const api = await import("./api.ts");
     const result = await api.listVaults();
     expect(result.vaults[0]?.managementUrl).toBeUndefined();
-  });
-});
-
-describe("createVault", () => {
-  it("sends Bearer + JSON body and returns the parsed result", async () => {
-    const fetchMock = vi.fn(async () =>
-      jsonResponse(201, {
-        name: "work",
-        url: "http://hub.local/vault/work/",
-        version: "0.5.1",
-        token: "hubjwt.abc123",
-        paths: {
-          vault_dir: "/home/u/.parachute/vault/work",
-          vault_db: "/home/u/.parachute/vault/work/vault.db",
-          vault_config: "/home/u/.parachute/vault/work/config.yaml",
-        },
-      }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-
-    const api = await import("./api.ts");
-    const result = await api.createVault({ name: "work" });
-
-    // 201 → `created: true` is the authoritative create signal.
-    expect(result.created).toBe(true);
-    expect(result.token).toBe("hubjwt.abc123");
-    expect(result.paths?.vault_dir).toContain("/vault/work");
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/vaults",
-      expect.objectContaining({
-        method: "POST",
-        headers: expect.objectContaining({
-          authorization: "Bearer test-bearer",
-          "content-type": "application/json",
-        }),
-        body: JSON.stringify({ name: "work" }),
-      }),
-    );
-  });
-
-  it("on 200 idempotent re-POST returns the existing entry without a token (created: false)", async () => {
-    // Server short-circuits when the vault already exists: same name + url +
-    // version, but no fresh `token` (the create-time access token isn't
-    // retrievable later). `created: false` is the authoritative signal —
-    // NewVault.tsx renders the "already existed" branch off it.
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        jsonResponse(200, {
-          name: "work",
-          url: "http://hub.local/vault/work/",
-          version: "0.5.1",
-        }),
-      ),
-    );
-    const api = await import("./api.ts");
-    const result = await api.createVault({ name: "work" });
-    expect(result.name).toBe("work");
-    expect(result.created).toBe(false);
-    expect(result.token).toBeUndefined();
-    expect(result.paths).toBeUndefined();
-  });
-
-  it("on 201 with an empty token reports created: true + forwards token_guidance", async () => {
-    // Post the pvt_* DROP, the vault emits `token: ""` when the bootstrap
-    // mint was unavailable (e.g. loopback origin). `created` must come from
-    // the HTTP status (201), NOT token truthiness — and the empty token must
-    // not survive as a falsy-but-present field. `token_guidance` is forwarded
-    // so the UI can explain the gap.
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        jsonResponse(201, {
-          name: "work",
-          url: "http://hub.local/vault/work/",
-          version: "0.5.1",
-          token: "",
-          token_guidance: "no hub origin reachable to mint against",
-        }),
-      ),
-    );
-    const api = await import("./api.ts");
-    const result = await api.createVault({ name: "work" });
-    expect(result.created).toBe(true);
-    expect(result.token).toBeUndefined();
-    expect(result.tokenGuidance).toBe("no hub origin reachable to mint against");
-  });
-
-  it("on 401 clears the cached token and throws HttpError(401)", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => jsonResponse(401, { error: "unauthenticated", error_description: "bad" })),
-    );
-    const api = await import("./api.ts");
-    await expect(api.createVault({ name: "x" })).rejects.toMatchObject({
-      name: "HttpError",
-      status: 401,
-    });
-    expect(auth.clearCachedToken).toHaveBeenCalled();
-  });
-
-  it("surfaces error_description from the body when present", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        jsonResponse(400, {
-          error: "invalid_request",
-          error_description: '"name" must be a non-empty string',
-        }),
-      ),
-    );
-    const api = await import("./api.ts");
-    await expect(api.createVault({ name: "" })).rejects.toMatchObject({
-      status: 400,
-      message: '"name" must be a non-empty string',
-    });
   });
 });
 

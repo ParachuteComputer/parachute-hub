@@ -4398,14 +4398,167 @@ describe("setup-wizard JSON surface (hub#168 Cuts 2/3)", () => {
       expect(body.step).toBe("expose");
       // The skip flag is persisted.
       expect(getSetting(db, "setup_vault_skipped")).toBe("true");
-      // deriveWizardState advances past the vault step.
+      // deriveWizardState advances past the vault step — but hasRealVault
+      // stays false (no instance exists; only the skip marker is set). The
+      // distinction is what the re-enterable vault step (B5) keys on.
       const s = deriveWizardState({
         db,
         manifestPath: h.manifestPath,
         readExposeStateFn: h.readExposeStateFn,
       });
       expect(s.hasVault).toBe(true);
+      expect(s.hasRealVault).toBe(false);
       expect(s.step).toBe("expose");
+    } finally {
+      db.close();
+    }
+  });
+
+  // --- B5 (2026-06-09 hub-module-boundary): re-enterable vault step --------
+  //
+  // A wizard-skip leaves the vault module installed with zero instances and
+  // `setup_vault_skipped` satisfying hasVault — pre-B5 the create form was
+  // unreachable forever after. The hub-side "create your first vault"
+  // affordances (Home's vault card, the legacy /admin/vaults empty state)
+  // deep-link `/admin/setup?step=vault`, which must re-enter the form.
+
+  test("GET ?step=vault re-enters the create form after a wizard-skip (session-gated)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      setSetting(db, "setup_vault_skipped", "true");
+      const { createSession } = await import("../sessions.ts");
+      const user = getUserByUsername(db, "owner");
+      if (!user) throw new Error("user missing");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?step=vault", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
+          issuer: "http://127.0.0.1:1939",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // The vault create/import/skip form — not the expose step the plain
+      // GET would resume at post-skip.
+      expect(html).toContain('action="/admin/setup/vault"');
+    } finally {
+      db.close();
+    }
+  });
+
+  test("GET ?step=vault without a session 302s to /login (post-skip)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      setSetting(db, "setup_vault_skipped", "true");
+      const res = handleSetupGet(req("/admin/setup?step=vault"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+      });
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe(
+        `/login?next=${encodeURIComponent("/admin/setup?step=vault")}`,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test("GET ?step=vault is ignored when a real vault instance exists", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      setSetting(db, "setup_expose_mode", "localhost");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const res = handleSetupGet(req("/admin/setup?step=vault"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+      });
+      // Setup is fully complete — the param must not reopen a provisioning
+      // form; the normal completed flow (301 → /login) runs instead.
+      expect(res.status).toBe(301);
+      expect(res.headers.get("location")).toBe("/login");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("vault POST mode=create proceeds after a skip (short-circuit keys on hasRealVault)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      setSetting(db, "setup_vault_skipped", "true");
+      // No supervisor in deps: a create that gets PAST the short-circuit hits
+      // the supervisor gate and 503s. Pre-B5 this returned 200
+      // `{ step: "expose", message: "vault already provisioned" }` because the
+      // skip marker satisfied hasVault — the form was a dead end.
+      const baseDeps = {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "http://127.0.0.1:1939",
+        registry: getDefaultOperationsRegistry(),
+      };
+      const getRes = handleSetupGet(
+        req("/admin/setup", { headers: { accept: "application/json" } }),
+        baseDeps,
+      );
+      const csrf = setCookie(getRes, CSRF_COOKIE_NAME) ?? "";
+      const envelope = (await getRes.json()) as { csrfToken: string };
+      const { createSession } = await import("../sessions.ts");
+      const user = getUserByUsername(db, "owner");
+      if (!user) throw new Error("user missing");
+      const session = createSession(db, { userId: user.id });
+      const cookieHeader = `${SESSION_COOKIE_NAME}=${session.id}; ${CSRF_COOKIE_NAME}=${csrf}`;
+      const postRes = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            "content-type": "application/json",
+            cookie: cookieHeader,
+          },
+          body: JSON.stringify({
+            [CSRF_FIELD_NAME]: envelope.csrfToken,
+            mode: "create",
+            vault_name: "second-chance",
+          }),
+        }),
+        baseDeps,
+      );
+      expect(postRes.status).toBe(503);
+      const body = (await postRes.json()) as { error: string };
+      expect(body.error).toContain("supervisor");
     } finally {
       db.close();
     }

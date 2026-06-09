@@ -200,6 +200,16 @@ export interface DerivedWizardState {
   /** Whether the first vault (curated) has been provisioned in services.json. */
   hasVault: boolean;
   /**
+   * Whether a REAL vault instance exists (a non-placeholder services.json
+   * row) — `hasVault` minus the `setup_vault_skipped` marker. The
+   * re-enterable vault step (B5, 2026-06-09 hub-module-boundary) keys on
+   * this: an operator who skipped the wizard's vault step has
+   * `hasVault === true` but `hasRealVault === false`, and the
+   * `/admin/setup?step=vault` deep-link (Home's "create your first vault"
+   * card) must still reach the create/import form.
+   */
+  hasRealVault: boolean;
+  /**
    * Whether the operator has answered the "how will this hub be reached?"
    * question (the expose step, hub#268 Item 2). When admin + vault both
    * exist but the operator hasn't picked an expose mode yet, the wizard
@@ -339,7 +349,7 @@ export function deriveWizardState(deps: {
   else if (!hasVault) step = "vault";
   else if (!hasExposeMode) step = "expose";
   else step = "done";
-  return { step, hasAdmin, hasVault, hasExposeMode };
+  return { step, hasAdmin, hasVault, hasRealVault, hasExposeMode };
 }
 
 // --- handler types -------------------------------------------------------
@@ -724,7 +734,7 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
         <h2>What's next</h2>
         <p>You'll land on a success screen with copy-paste MCP install
           instructions for Claude Code and a link to the admin UI, where
-          you can rename or add additional vaults.</p>
+          you can add more vaults.</p>
       </section>
       <section class="preview">
         <p class="preview-label">About to create</p>
@@ -735,8 +745,8 @@ export function renderVaultStep(props: RenderVaultStepProps): string {
         </div>
         <p class="preview-fine">
           The name shows up in the MCP URL (<code>/vault/&lt;name&gt;/mcp</code>)
-          and on the admin UI. You can rename or add vaults later from
-          <code>/admin/vaults</code>.
+          and on the admin UI. You can add or manage vaults later from the
+          vault module's own admin at <code>/vault/admin/</code>.
         </p>
       </section>
       ${error}
@@ -1696,6 +1706,36 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
   };
   if (csrf.setCookie) extraHeaders["set-cookie"] = csrf.setCookie;
 
+  // Re-enterable vault step (B5, 2026-06-09 hub-module-boundary migration).
+  // A wizard-skip leaves the vault MODULE installed with no instances and no
+  // daemon (hub#607's zero-instances state) — and `setup_vault_skipped`
+  // makes `hasVault` true, so a plain GET resumes at expose/done and the
+  // create form is unreachable. The hub-side "create your first vault"
+  // affordance (Home's vault card + the legacy /admin/vaults empty state)
+  // deep-links `?step=vault`, which re-enters the create/import form as long
+  // as no REAL vault instance exists. Session-gated: post-account the box
+  // has an admin, and re-opening a provisioning form to a drive-by GET
+  // would leak setup state (the POST is session+CSRF-gated either way).
+  // With a real vault present the param is ignored and the normal flow
+  // (expose step / 301 → /login) runs.
+  if (url.searchParams.get("step") === "vault" && state.hasAdmin && !state.hasRealVault) {
+    const session = findActiveSession(deps.db, req);
+    if (!session) {
+      // Preserve the CSRF set-cookie across the bounce — same shape as the
+      // `?just_finished=1` session gate below.
+      const redirectHeaders: Record<string, string> = {
+        location: `/login?next=${encodeURIComponent("/admin/setup?step=vault")}`,
+      };
+      if (csrf.setCookie) redirectHeaders["set-cookie"] = csrf.setCookie;
+      return new Response(null, { status: 302, headers: redirectHeaders });
+    }
+    const cloudHost = detectAutoExposeMode(deps.env ?? process.env) === "public";
+    return new Response(renderVaultStep({ csrfToken: csrf.token, cloudHost }), {
+      status: 200,
+      headers: extraHeaders,
+    });
+  }
+
   // Setup fully complete (including expose-mode choice) — redirect to
   // /login unless we're rendering the success page once. The success
   // page sets `?just_finished=1` and the session cookie is on the
@@ -2168,9 +2208,13 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
       "Sign in to continue setup. (The wizard sets a session cookie on step 2; clearing cookies between steps will land you here.)",
     );
   }
-  // Already done — short-circuit to the done step.
+  // Already done — short-circuit to the done step. Keyed on hasRealVault
+  // (NOT hasVault): the `setup_vault_skipped` marker satisfies hasVault, but
+  // a skipped box has no instance and the re-entered vault step (B5,
+  // `?step=vault`) must be able to POST create/import — `mode=create` below
+  // clears the skip marker; `mode=skip` just re-sets it (idempotent).
   const state = deriveWizardState(deps);
-  if (state.hasVault) {
+  if (state.hasRealVault) {
     if (form.isJson) {
       return jsonOkResponse({ step: "expose", message: "vault already provisioned" });
     }

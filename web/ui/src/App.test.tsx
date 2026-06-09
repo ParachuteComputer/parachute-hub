@@ -55,7 +55,7 @@ describe("App — brand subtitle (route-derived)", () => {
     expect(screen.getByText(/vaults/i, { selector: ".sub" })).toBeInTheDocument();
   });
 
-  it("/vaults/new renders 'vaults' (sub-route still under vaults)", () => {
+  it("/vaults/new renders 'vaults' (redirects to /vaults — NewVault retired in B5)", () => {
     renderAt("/vaults/new");
     expect(screen.getByText(/vaults/i, { selector: ".sub" })).toBeInTheDocument();
   });
@@ -82,7 +82,7 @@ describe("App — brand subtitle (route-derived)", () => {
 });
 
 describe("App — nav structure", () => {
-  it("renders all hub-native nav links in order: brand, Home, Connections, Modules, Users, Vaults, Tokens, Permissions, Settings, Discovery (signed-out)", async () => {
+  it("renders all hub-native nav links in order: brand, Home, Connections, Modules, Users, Tokens, Permissions, Settings, Discovery (signed-out)", async () => {
     renderAt("/vaults");
     // Wait for /api/me to resolve so AuthIndicator's "Sign in" link
     // appears in the nav before we snapshot the link order.
@@ -100,11 +100,13 @@ describe("App — nav structure", () => {
       "Sign in", // AuthIndicator slot, sits between brand and Home
       // Hub-native sections — all reachable in one click, every section
       // exposed (admin-shell IA, R1). Home first, then cross-cutting admin.
+      // "Vaults" left this group in B5 — vault lifecycle UX is module-owned
+      // at /vault/admin/ (reachable via the Home module card + Services
+      // dropdown), so the hub-native group no longer carries it.
       "Home",
       "Connections",
       "Modules",
       "Users",
-      "Vaults",
       "Tokens",
       "Permissions",
       "Settings",
@@ -130,7 +132,6 @@ describe("App — nav structure", () => {
     const nav = screen.getByRole("navigation");
     for (const label of [
       "Home",
-      "Vaults",
       "Modules",
       "Connections",
       "Users",
@@ -207,12 +208,10 @@ describe("App — active nav indicator", () => {
     expect(home).not.toHaveClass("nav-link-active");
   });
 
-  it("keeps Vaults active on the /vaults/new sub-route", () => {
-    renderAt("/vaults/new");
-    const vaults = within(screen.getByRole("navigation")).getByRole("link", {
-      name: /^vaults$/i,
-    });
-    expect(vaults).toHaveClass("nav-link-active");
+  it("renders NO hub-native Vaults nav link (B5 — vault lifecycle is module-owned)", () => {
+    renderAt("/vaults");
+    const nav = screen.getByRole("navigation");
+    expect(within(nav).queryByRole("link", { name: /^vaults$/i })).toBeNull();
   });
 });
 
@@ -404,10 +403,12 @@ describe("App — route rendering", () => {
     expect(await screen.findByRole("heading", { name: /^vaults/i })).toBeInTheDocument();
   });
 
-  it("/vaults/new renders NewVault (form input for vault name)", () => {
+  it("/vaults/new redirects to /vaults (the NewVault form left with B5)", async () => {
     renderAt("/vaults/new");
-    // NewVault's form has a name input — surfaces immediately on mount.
-    expect(screen.getByLabelText(/vault name/i)).toBeInTheDocument();
+    // The route is a <Navigate replace> onto the feature-detected /vaults —
+    // we land on the Vaults surface, and no create form exists anymore.
+    expect(await screen.findByRole("heading", { name: /^vaults/i })).toBeInTheDocument();
+    expect(screen.queryByLabelText(/vault name/i)).toBeNull();
   });
 
   it("/permissions renders Permissions (heading 'Permissions')", () => {
