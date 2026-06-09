@@ -135,8 +135,17 @@ export interface SignRefreshTokenOpts {
  * one table for refresh tokens, one for CLI-minted access tokens, one
  * for operator tokens. Different mint paths = different rows; revocation
  * lookup + revocation list are uniform across all of them.
+ *
+ * `connection_provision` — long-lived tokens the Connections engine mints
+ * when provisioning a connection (the webhook bearer + the channel reply
+ * token). Registered so connection teardown can revoke them
+ * (hub-module-boundary charter, registered-mint rule).
  */
-export type TokenCreatedVia = "oauth_refresh" | "cli_mint" | "operator_mint";
+export type TokenCreatedVia =
+  | "oauth_refresh"
+  | "cli_mint"
+  | "operator_mint"
+  | "connection_provision";
 
 export interface SignedRefreshToken {
   /** Opaque token to return to the client. NOT recoverable from the DB. */

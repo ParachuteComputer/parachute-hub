@@ -51,6 +51,17 @@ export interface ConnectionProvisioned {
   readonly vault?: string;
   /** The exact vault trigger name registered — DELETE removes this. */
   readonly triggerName?: string;
+  /**
+   * jtis of the LONG-LIVED tokens minted for this connection (the webhook
+   * bearer, and for a channel sink the vault-write reply token). Each is
+   * registered in the hub's tokens table (`created_via='connection_provision'`)
+   * at mint time so teardown can revoke them — an unregistered long-lived
+   * token is unrevocable by construction (hub-module-boundary charter,
+   * registered-mint rule). Records written before this field existed read back
+   * as `undefined`; their tokens were never registered and ride to expiry
+   * (surfaced as `legacy: true` in the list wire shape).
+   */
+  readonly mintedJtis?: readonly string[];
 }
 
 export interface ConnectionRecord {

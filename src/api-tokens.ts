@@ -23,7 +23,7 @@
  *         "expires_at": "ISO-8601",
  *         "revoked_at": "ISO-8601" | null,
  *         "created_at": "ISO-8601",
- *         "created_via": "oauth_refresh" | "cli_mint" | "operator_mint",
+ *         "created_via": "oauth_refresh" | "cli_mint" | "operator_mint" | "connection_provision",
  *         "permissions": "<json-string>" | null
  *       }
  *     ],
@@ -45,8 +45,10 @@
  *   - `created_via=<value>` — narrow by mint provenance. One of
  *     `oauth_refresh` (OAuth refresh-token rotation), `operator_mint`
  *     (operator-token rotation via `parachute auth rotate-operator`),
- *     or `cli_mint` (CLI / `POST /api/auth/mint-token`). Powers the
- *     admin UI's "by source" filter pills (hub#212 Phase F).
+ *     `cli_mint` (CLI / `POST /api/auth/mint-token`), or
+ *     `connection_provision` (long-lived tokens the Connections engine
+ *     mints — see admin-connections.ts). Powers the admin UI's
+ *     "by source" filter pills (hub#212 Phase F).
  *
  * Why bearer-gated rather than session-cookie-gated: matches the rest
  * of `/api/auth/*` (mint-token, revoke-token), so an automation client
@@ -149,14 +151,15 @@ export async function handleApiTokens(req: Request, deps: ApiTokensDeps): Promis
   if (
     createdViaParam === "oauth_refresh" ||
     createdViaParam === "operator_mint" ||
-    createdViaParam === "cli_mint"
+    createdViaParam === "cli_mint" ||
+    createdViaParam === "connection_provision"
   ) {
     createdVia = createdViaParam;
   } else if (createdViaParam !== null) {
     return jsonError(
       400,
       "invalid_request",
-      "created_via must be one of: oauth_refresh | operator_mint | cli_mint",
+      "created_via must be one of: oauth_refresh | operator_mint | cli_mint | connection_provision",
     );
   }
   const cursor = url.searchParams.get("cursor");

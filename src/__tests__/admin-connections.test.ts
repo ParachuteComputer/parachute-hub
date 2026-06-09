@@ -30,8 +30,9 @@ import {
   handleConnectionsCatalog,
   whenFromFilter,
 } from "../admin-connections.ts";
-import { readConnections } from "../connections-store.ts";
+import { putConnection, readConnections } from "../connections-store.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { findTokenRowByJti, listActiveRevocations } from "../jwt-sign.ts";
 import { type ModuleManifest, validateModuleManifest } from "../module-manifest.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
@@ -897,6 +898,170 @@ describe("DELETE /admin/connections/:id — teardown", () => {
       baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST)),
     );
     expect(res.status).toBe(404);
+  });
+});
+
+// ===========================================================================
+// B0 — registered connection mints (hub-module-boundary, registered-mint rule)
+// ===========================================================================
+
+describe("B0 — registered connection mints", () => {
+  /** Create the canonical channel-backed connection; return the long-lived jtis. */
+  async function createChannelConnection(
+    cookie: string,
+    deps: ConnectionsDeps,
+    calls: Array<{ method: string; url: string; bearer: string | null; body: unknown }>,
+  ): Promise<{ replyJti: string; webhookJti: string }> {
+    const res = await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections`, {
+        method: "POST",
+        headers: { cookie },
+        body: JSON.stringify({
+          source: { module: "vault", vault: "default", event: "note.created" },
+          sink: { module: "channel", action: "message.deliver", params: { channel: "eng" } },
+        }),
+      }),
+      "",
+      deps,
+    );
+    expect(res.status).toBe(200);
+    const cfgCall = calls.find((c) => c.url.endsWith("/api/channels"));
+    const replyToken = (cfgCall!.body as { config: { token: string } }).config.token;
+    const trigCall = calls.find((c) => c.url.endsWith("/vault/default/api/triggers"));
+    const webhookBearer = (trigCall!.body as { action: { auth: { bearer: string } } }).action.auth
+      .bearer;
+    return {
+      replyJti: (decodeJwt(replyToken) as { jti?: string }).jti!,
+      webhookJti: (decodeJwt(webhookBearer) as { jti?: string }).jti!,
+    };
+  }
+
+  test("long-lived mints get a connection_provision registry row; jtis persist on the record; short-lived provisioning mints stay unregistered", async () => {
+    const { cookie } = await adminCookie();
+    const { fetchImpl, calls } = mockFetch({
+      "POST /api/channels": () => ok({ ok: true }),
+      "POST /vault/default/api/triggers": () => ok({ ok: true }),
+    });
+    const deps = baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, CHANNEL_MANIFEST));
+    const { replyJti, webhookJti } = await createChannelConnection(cookie, deps, calls);
+
+    // Both ~90d tokens are registered with the connection provenance + exact scopes.
+    const replyRow = findTokenRowByJti(harness.db, replyJti);
+    expect(replyRow).not.toBeNull();
+    expect(replyRow!.createdVia).toBe("connection_provision");
+    expect(replyRow!.scopes).toEqual(["vault:default:write"]);
+    expect(replyRow!.revokedAt).toBeNull();
+    const webhookRow = findTokenRowByJti(harness.db, webhookJti);
+    expect(webhookRow).not.toBeNull();
+    expect(webhookRow!.createdVia).toBe("connection_provision");
+    expect(webhookRow!.scopes).toEqual(["channel:send"]);
+
+    // The short-lived (60s) provisioning bearers — vault:<v>:admin on the
+    // trigger POST, channel:admin on the channel-config POST — ride to expiry
+    // by design (the documented ≤10-min unregistered bound). NOT registered.
+    const trigCall = calls.find((c) => c.url.endsWith("/vault/default/api/triggers"));
+    const cfgCall = calls.find((c) => c.url.endsWith("/api/channels"));
+    const trigAuthJti = (decodeJwt(trigCall!.bearer!) as { jti?: string }).jti!;
+    const cfgAuthJti = (decodeJwt(cfgCall!.bearer!) as { jti?: string }).jti!;
+    expect(findTokenRowByJti(harness.db, trigAuthJti)).toBeNull();
+    expect(findTokenRowByJti(harness.db, cfgAuthJti)).toBeNull();
+
+    // The jtis are persisted on the record's provisioned block for teardown.
+    const stored = readConnections(harness.storePath);
+    expect(stored).toHaveLength(1);
+    expect([...(stored[0]!.provisioned.mintedJtis ?? [])].sort()).toEqual(
+      [replyJti, webhookJti].sort(),
+    );
+  });
+
+  test("teardown revokes the registered jtis → they appear on the revocation list", async () => {
+    const { cookie } = await adminCookie();
+    const { fetchImpl, calls } = mockFetch({
+      "POST /api/channels": () => ok({ ok: true }),
+      "POST /vault/default/api/triggers": () => ok({ ok: true }),
+      "DELETE /api/channels/eng": () => ok({ ok: true }),
+      "DELETE /vault/default/api/triggers/conn_channel-eng": () => ok({ ok: true }),
+    });
+    const deps = baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, CHANNEL_MANIFEST));
+    const { replyJti, webhookJti } = await createChannelConnection(cookie, deps, calls);
+
+    const res = await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections/channel-eng`, {
+        method: "DELETE",
+        headers: { cookie },
+      }),
+      "/channel-eng",
+      deps,
+    );
+    expect(res.status).toBe(200);
+
+    // Registry rows flipped to revoked…
+    expect(findTokenRowByJti(harness.db, replyJti)!.revokedAt).not.toBeNull();
+    expect(findTokenRowByJti(harness.db, webhookJti)!.revokedAt).not.toBeNull();
+    // …and the revocation list (what resource servers poll) advertises them.
+    const revoked = listActiveRevocations(harness.db, new Date());
+    expect(revoked).toContain(replyJti);
+    expect(revoked).toContain(webhookJti);
+  });
+
+  test("legacy records (pre-B0, no mintedJtis): teardown proceeds; list surfaces legacy: true", async () => {
+    const { cookie } = await adminCookie();
+    const { fetchImpl, calls } = mockFetch({
+      "POST /vault/default/api/triggers": () => ok({ ok: true }),
+      "DELETE /vault/default/api/triggers/conn_old1": () => ok({ ok: true }),
+    });
+    const deps = baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, WIDGET_MANIFEST));
+
+    // A record written before B0 — provisioned block has no mintedJtis.
+    putConnection(harness.storePath, {
+      id: "old1",
+      source: { module: "vault", vault: "default", event: "note.created" },
+      sink: { module: "widget", action: "thing.do" },
+      provisioned: { type: "vault-trigger", vault: "default", triggerName: "conn_old1" },
+      createdAt: "2026-06-01T00:00:00.000Z",
+    });
+    // And a new-style one created through the engine.
+    await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections`, {
+        method: "POST",
+        headers: { cookie },
+        body: JSON.stringify({
+          id: "w-new",
+          source: { module: "vault", vault: "default", event: "note.created" },
+          sink: { module: "widget", action: "thing.do" },
+        }),
+      }),
+      "",
+      deps,
+    );
+
+    // List: the legacy record is flagged, the new one is not.
+    const list = await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections`, { method: "GET", headers: { cookie } }),
+      "",
+      deps,
+    );
+    const out = (await list.json()) as { connections: Array<{ id: string; legacy?: boolean }> };
+    expect(out.connections.find((c) => c.id === "old1")!.legacy).toBe(true);
+    expect(out.connections.find((c) => c.id === "w-new")!.legacy).toBeUndefined();
+
+    // Teardown of the legacy record proceeds cleanly (no crash, no revocation
+    // step — its tokens were never registered and ride to expiry).
+    const res = await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections/old1`, {
+        method: "DELETE",
+        headers: { cookie },
+      }),
+      "/old1",
+      deps,
+    );
+    expect(res.status).toBe(200);
+    expect(
+      calls.some(
+        (c) => c.method === "DELETE" && c.url.endsWith("/vault/default/api/triggers/conn_old1"),
+      ),
+    ).toBe(true);
+    expect(readConnections(harness.storePath).find((r) => r.id === "old1")).toBeUndefined();
   });
 });
 
