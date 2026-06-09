@@ -46,6 +46,8 @@
  *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /admin/channel-token          (GET)        → channel UI bearer mint (cookie-gated)
+ *   /admin/channels               (POST/GET)   → vault-channel provision/list (cookie-gated)
+ *   /admin/channels/<name>        (DELETE)     → vault-channel teardown (cookie-gated)
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
  *   /api/hub                      (GET)        → hub version + uptime + install-source (host:admin)
  *   /api/hub/upgrade              (POST)       → SPA-driven hub self-upgrade → 202 + detached helper (host:admin, §5.3/D4)
@@ -140,6 +142,7 @@ import {
   handleAdminLogoutPost,
 } from "./admin-handlers.ts";
 import { handleChannelToken } from "./admin-channel-token.ts";
+import { handleChannels } from "./admin-channels.ts";
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault } from "./admin-vaults.ts";
@@ -2083,6 +2086,37 @@ export function hubFetch(
         return handleChannelToken(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      // /admin/channels — one-action vault-channel provisioning (frictionless
+      // channel setup PR 3). Cookie-gated operator session (first-admin),
+      // exactly like /admin/channel-token above. POST provisions everything
+      // (mint vault:write + channel:admin + channel:send, write the channel
+      // config, register the vault inbound trigger); GET lists; DELETE tears
+      // down both sides. Internal channel/vault calls go over loopback (origins
+      // resolved from services.json at request time); the public origin is used
+      // only for the webhook URL + the copy-paste connect lines.
+      if (pathname === "/admin/channels" || pathname.startsWith("/admin/channels/")) {
+        if (!getDb) return dbNotConfigured();
+        const subPath = pathname.slice("/admin/channels".length);
+        const services = readManifestLenient(manifestPath).services;
+        // Channel's services.json row is `name: "channel"` on its loopback port.
+        const channelEntry = services.find((s) => s.name === "channel");
+        const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
+        const resolveVaultOrigin = (vaultName: string): string | null => {
+          const match = findVaultUpstream(
+            readManifestLenient(manifestPath).services,
+            `/vault/${vaultName}`,
+          );
+          return match ? `http://127.0.0.1:${match.port}` : null;
+        };
+        return handleChannels(req, subPath, {
+          db: getDb(),
+          // Public origin — webhook URL + connect lines + minted-token `iss`.
+          hubOrigin: oauthDeps(req).issuer,
+          channelOrigin,
+          resolveVaultOrigin,
         });
       }
 

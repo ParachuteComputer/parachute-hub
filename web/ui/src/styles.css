@@ -372,11 +372,13 @@ h2 {
  * (lines ~799) so the visual language is consistent across SPA list
  * shapes (rows of cards AND rows of cells). */
 .user-table tbody tr,
-.tokens-table tbody tr {
+.tokens-table tbody tr,
+.channel-table tbody tr {
   transition: background-color 0.12s ease;
 }
 .user-table tbody tr:hover,
-.tokens-table tbody tr:hover {
+.tokens-table tbody tr:hover,
+.channel-table tbody tr:hover {
   background: var(--bg-soft);
 }
 
