@@ -299,8 +299,8 @@ function NavSection({
  *
  * Lists each installed module that declares a `management_url`, linking
  * to that URL (full-page navigation — the module owns its surface).
- * Modules without a `management_url` (scribe, runner today; tracked at
- * scribe#53, runner#8) appear as disabled items with a follow-up
+ * Modules that declare no `management_url` (runner today — its admin
+ * surface is `configUiUrl`-only) appear as disabled items with a
  * tooltip so operators can see what's installed but-not-yet-open-able.
  *
  * Native `<details>` for the click-to-expand behavior — no client-side

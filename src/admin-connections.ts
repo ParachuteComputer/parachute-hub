@@ -141,18 +141,44 @@ interface CatalogAction {
   /** The provision descriptor (e.g. `{ type: "vault-trigger" }`), opaque to the SPA. */
   provision: unknown;
 }
+/**
+ * A connection preset declared in a module's `module.json`
+ * `connectionTemplates` (boundary D2). Drives the SPA builder's one-click
+ * preset buttons — declaration-driven, replacing the SPA's hardcoded
+ * channel preset (the charter's per-module-view test).
+ */
+interface CatalogTemplate {
+  /** Short of the DECLARING module (the template can wire other modules). */
+  module: string;
+  key: string;
+  title: string;
+  description: string | null;
+  requestedBy: string | null;
+  source: { module: string; event: string; filter: unknown };
+  sink: { module: string; action: string };
+  parameters: {
+    key: string;
+    target: string;
+    title: string | null;
+    description: string | null;
+    example: string | null;
+  }[];
+}
 
 /**
- * Build the catalog from the installed modules' declared events/actions. Drives
- * the SPA builder's source/sink dropdowns. NO tokens, NO secrets — pure
- * declaration metadata read from each `module.json`.
+ * Build the catalog from the installed modules' declared
+ * events/actions/templates. Drives the SPA builder's source/sink dropdowns +
+ * preset buttons. NO tokens, NO secrets — pure declaration metadata read from
+ * each `module.json`.
  */
 export function buildCatalog(modules: InstalledModuleInfo[]): {
   events: CatalogEvent[];
   actions: CatalogAction[];
+  templates: CatalogTemplate[];
 } {
   const events: CatalogEvent[] = [];
   const actions: CatalogAction[] = [];
+  const templates: CatalogTemplate[] = [];
   for (const { short, manifest } of modules) {
     for (const e of manifest.events ?? []) {
       events.push({
@@ -171,8 +197,30 @@ export function buildCatalog(modules: InstalledModuleInfo[]): {
         provision: a.provision ?? null,
       });
     }
+    for (const t of manifest.connectionTemplates ?? []) {
+      // Only event→action presets surface here — a template without BOTH
+      // source and sink (e.g. scribe's `kind: "config"` link, consumed by
+      // scribe's own UI) isn't something the hub builder can pre-fill.
+      if (!t.source || !t.sink) continue;
+      templates.push({
+        module: short,
+        key: t.key,
+        title: t.title,
+        description: t.description ?? null,
+        requestedBy: t.requestedBy ?? null,
+        source: { module: t.source.module, event: t.source.event, filter: t.source.filter ?? null },
+        sink: { module: t.sink.module, action: t.sink.action },
+        parameters: (t.parameters ?? []).map((p) => ({
+          key: p.key,
+          target: p.target,
+          title: p.title ?? null,
+          description: p.description ?? null,
+          example: p.example ?? null,
+        })),
+      });
+    }
   }
-  return { events, actions };
+  return { events, actions, templates };
 }
 
 export async function handleConnectionsCatalog(

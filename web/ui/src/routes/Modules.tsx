@@ -482,24 +482,6 @@ interface ModuleRowProps {
 }
 
 /**
- * Per-module follow-up issues filed alongside hub#342 (when a module
- * hasn't yet shipped its own admin UI surface). Rendered as the
- * `title` attribute on a disabled "Open" button so the operator knows
- * the issue tracking the gap, not just that the button is greyed out.
- *
- * Vault declares `managementUrl: "/admin"` already, so it's not in this
- * map — its row gets an active Open button pointing at its own UI.
- * Notes is the deprecating notes-daemon path; its install surface
- * still ships its own UI under `/notes/`, so it has a valid mount but
- * doesn't actively need a follow-up. Scribe + runner are the
- * outstanding gaps.
- */
-const NO_UI_FOLLOWUPS: Record<string, string> = {
-  scribe: "Scribe admin SPA tracked at scribe#53",
-  runner: "Runner admin SPA tracked at runner#8",
-};
-
-/**
  * Row for an installed module — shows version + supervisor status +
  * Open / Restart / Upgrade / Uninstall affordances.
  *
@@ -516,10 +498,12 @@ const NO_UI_FOLLOWUPS: Record<string, string> = {
  * in the hub SPA. Each module ships its own UI handling both viewing AND
  * configuring; the hub is the dispatcher.
  *
- * Modules without a declared `management_url` (today: scribe, runner —
- * tracked at scribe#53, runner#8) get a disabled Open button with a
- * tooltip pointing at the follow-up. Gentler than 404-on-click and
- * makes the gap discoverable to operators.
+ * Modules without a declared `management_url` get a disabled Open button
+ * with a tooltip — pointing at Configure when the module declares
+ * `configUiUrl` (runner's shape today), or a generic "no admin UI yet"
+ * otherwise. Gentler than 404-on-click. (The old per-module follow-up map —
+ * scribe#53 / runner#8 — retired in boundary D2: scribe ships `/scribe/admin`
+ * and runner ships `/runner/admin`.)
  *
  * The "install" action lives on `InstallableCard` instead; this row is
  * only rendered for `installed: true` modules.
@@ -537,7 +521,6 @@ function ModuleRow({
   const upgradeAvailable =
     mod.installed_version !== mod.latest_version && mod.latest_version !== null;
   const openUrl = mod.management_url;
-  const openFollowup = NO_UI_FOLLOWUPS[mod.short];
   // Configure → the module's OWN config UI (2026-06-09 modular-UI architecture,
   // P3). Rendered only when the module declares `configUiUrl`; the module owns
   // the surface, hub just frames it. Full-page nav (leaving the SPA), same
@@ -617,7 +600,11 @@ function ModuleRow({
             type="button"
             className="btn"
             disabled
-            title={openFollowup ?? "This module hasn't shipped an admin UI yet."}
+            title={
+              configUrl
+                ? "No separate Open surface — use Configure for this module's admin UI."
+                : "This module hasn't shipped an admin UI yet."
+            }
             data-testid={`open-${mod.short}`}
           >
             Open

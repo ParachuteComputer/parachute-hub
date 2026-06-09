@@ -1,10 +1,11 @@
 /**
  * Connections route tests (modular-UI P5) — loading, list, empty state, the
- * builder driven from the catalog, create posting the right body, the channel
- * preset pre-filling + showing connect lines, and remove confirm-then-DELETE.
+ * builder driven from the catalog, create posting the right body, the
+ * template-driven presets (boundary D2) pre-filling + showing connect lines,
+ * and remove confirm-then-DELETE.
  *
- * Same shape as Channels.test.tsx: mock `lib/api.ts` so the route's fetch
- * helpers are stubbed and assert on the rendered DOM + the calls made.
+ * Mock `lib/api.ts` so the route's fetch helpers are stubbed and assert on
+ * the rendered DOM + the calls made.
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -53,6 +54,43 @@ function catalog(): api.ConnectionsCatalog {
         title: "Deliver an inbound message",
         inputSchema: null,
         provision: { type: "vault-trigger" },
+      },
+    ],
+    // The declaration channel ships in its module.json `connectionTemplates`
+    // (boundary D2) — the preset button derives from this, nothing hardcoded.
+    templates: [
+      {
+        module: "channel",
+        key: "link-to-vault",
+        title: "Link a channel to a vault",
+        description: "Back a channel with a Parachute vault.",
+        requestedBy: "channel",
+        source: {
+          module: "vault",
+          event: "note.created",
+          filter: {
+            tags: ["#channel-message/inbound"],
+            has_metadata: ["channel"],
+            missing_metadata: ["channel_inbound_rendered_at"],
+          },
+        },
+        sink: { module: "channel", action: "message.deliver" },
+        parameters: [
+          {
+            key: "vault",
+            target: "source.vault",
+            title: "Vault",
+            description: null,
+            example: null,
+          },
+          {
+            key: "channel",
+            target: "sink.params.channel",
+            title: "Channel name",
+            description: null,
+            example: null,
+          },
+        ],
       },
     ],
   };
@@ -159,7 +197,9 @@ describe("Connections — builder", () => {
     vi.mocked(api.getConnectionsCatalog).mockResolvedValue(catalog());
     vi.mocked(api.listVaults).mockResolvedValue(vaultsResult("default"));
     renderRoute();
-    await waitFor(() => expect(screen.getByTestId("channel-preset")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId("preset-channel-link-to-vault")).toBeInTheDocument(),
+    );
     // Source module select offers vault.
     const srcModule = screen.getByLabelText("Module", { selector: "#conn-source-module" });
     expect(within(srcModule).getByRole("option", { name: "vault" })).toBeInTheDocument();
@@ -168,13 +208,15 @@ describe("Connections — builder", () => {
     expect(within(sinkModule).getByRole("option", { name: "channel" })).toBeInTheDocument();
   });
 
-  it("the channel preset pre-fills the builder", async () => {
+  it("a module-declared preset pre-fills the builder", async () => {
     vi.mocked(api.listConnections).mockResolvedValue([]);
     vi.mocked(api.getConnectionsCatalog).mockResolvedValue(catalog());
     vi.mocked(api.listVaults).mockResolvedValue(vaultsResult("default"));
     renderRoute();
-    await waitFor(() => expect(screen.getByTestId("channel-preset")).toBeInTheDocument());
-    fireEvent.click(screen.getByTestId("channel-preset"));
+    await waitFor(() =>
+      expect(screen.getByTestId("preset-channel-link-to-vault")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("preset-channel-link-to-vault"));
     // Source module + event get set.
     const srcModule = screen.getByLabelText("Module", {
       selector: "#conn-source-module",
@@ -201,8 +243,10 @@ describe("Connections — builder", () => {
       },
     });
     renderRoute();
-    await waitFor(() => expect(screen.getByTestId("channel-preset")).toBeInTheDocument());
-    fireEvent.click(screen.getByTestId("channel-preset"));
+    await waitFor(() =>
+      expect(screen.getByTestId("preset-channel-link-to-vault")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("preset-channel-link-to-vault"));
     fireEvent.click(screen.getByRole("button", { name: /create connection/i }));
 
     await waitFor(() => expect(api.createConnection).toHaveBeenCalledTimes(1));
@@ -214,7 +258,7 @@ describe("Connections — builder", () => {
     expect(arg.sink).toMatchObject({
       module: "channel",
       action: "message.deliver",
-      params: { channel: "eng" },
+      params: { channel: "my-channel" },
     });
 
     // Connect lines surface.
@@ -227,7 +271,9 @@ describe("Connections — builder", () => {
     vi.mocked(api.getConnectionsCatalog).mockResolvedValue(catalog());
     vi.mocked(api.listVaults).mockResolvedValue(vaultsResult("default"));
     renderRoute();
-    await waitFor(() => expect(screen.getByTestId("channel-preset")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId("preset-channel-link-to-vault")).toBeInTheDocument(),
+    );
     // Pick valid source/sink, then a broken filter.
     fireEvent.change(screen.getByLabelText("Module", { selector: "#conn-source-module" }), {
       target: { value: "vault" },

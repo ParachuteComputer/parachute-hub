@@ -1452,9 +1452,42 @@ export interface CatalogAction {
   provision: unknown;
 }
 
+/**
+ * One declared parameter of a connection preset — the operator-chosen blank
+ * (e.g. WHICH vault, the channel name).
+ */
+export interface CatalogTemplateParameter {
+  key: string;
+  /** Where the value lands: `source.vault` or `sink.params.<key>` today. */
+  target: string;
+  title: string | null;
+  description: string | null;
+  /** Optional pre-fill example for the builder. */
+  example: string | null;
+}
+
+/**
+ * A connection preset a module declares in its `module.json`
+ * `connectionTemplates` (boundary D2). The builder renders one preset button
+ * per template — declaration-driven; nothing module-specific lives in the SPA.
+ */
+export interface CatalogTemplate {
+  /** Short of the declaring module. */
+  module: string;
+  key: string;
+  title: string;
+  description: string | null;
+  requestedBy: string | null;
+  source: { module: string; event: string; filter: unknown };
+  sink: { module: string; action: string };
+  parameters: CatalogTemplateParameter[];
+}
+
 export interface ConnectionsCatalog {
   events: CatalogEvent[];
   actions: CatalogAction[];
+  /** Declared presets. Empty on hubs/modules predating connectionTemplates. */
+  templates: CatalogTemplate[];
 }
 
 /** A provisioned connection (the list/wire shape from `/admin/connections`). */
@@ -1504,10 +1537,12 @@ export async function getConnectionsCatalog(): Promise<ConnectionsCatalog> {
   });
   if (res.status === 401) return redirectToLoginAndHang<ConnectionsCatalog>();
   if (!res.ok) throw new HttpError(res.status, await readError(res));
-  const body = (await res.json()) as { events?: unknown; actions?: unknown };
+  const body = (await res.json()) as { events?: unknown; actions?: unknown; templates?: unknown };
   const events = Array.isArray(body.events) ? (body.events as CatalogEvent[]) : [];
   const actions = Array.isArray(body.actions) ? (body.actions as CatalogAction[]) : [];
-  return { events, actions };
+  // Tolerant default — a hub predating connectionTemplates omits the field.
+  const templates = Array.isArray(body.templates) ? (body.templates as CatalogTemplate[]) : [];
+  return { events, actions, templates };
 }
 
 /** GET /admin/connections — list provisioned connections. */

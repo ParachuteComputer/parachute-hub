@@ -9,10 +9,12 @@
  *
  * "Add a vault-backed channel" is no longer a bespoke view — it's the first
  * connection (`vault.note.created` filtered to the inbound tag →
- * `channel.message.deliver`). A one-click **preset** pre-fills that common case
- * and still shows the connect-a-session lines on success.
+ * `channel.message.deliver`). One-click **presets** pre-fill the common cases;
+ * they derive from the catalog's `templates` (each module declares its own
+ * `connectionTemplates` in `module.json` — boundary D2), so nothing
+ * module-specific lives in this view (the charter's per-module-view test).
  *
- * Modeled on Channels.tsx + Users.tsx for visual continuity. Auth: the
+ * Modeled on Users.tsx for visual continuity. Auth: the
  * `/admin/*` + catalog endpoints are session-cookie-gated; the `lib/api.ts`
  * helpers redirect to login on 401 and surface `error_description` verbatim.
  */
@@ -20,6 +22,7 @@ import { type FormEvent, useEffect, useState } from "react";
 import {
   type CatalogAction,
   type CatalogEvent,
+  type CatalogTemplate,
   type ConnectionConnect,
   type ConnectionListing,
   type ConnectionsCatalog,
@@ -34,14 +37,20 @@ import {
 
 const SLUG_REGEX = /^[a-z0-9][a-z0-9_-]*$/i;
 
-/** The channel-add preset — the common vault.note.created → channel.message.deliver case. */
-const CHANNEL_PRESET = {
-  sourceModule: "vault",
-  sourceEvent: "note.created",
-  sinkModule: "channel",
-  sinkAction: "message.deliver",
-  inboundTag: "#channel-message/inbound",
-} as const;
+/**
+ * Pre-fill values for a template's `sink.params.<key>` parameters: the
+ * declared `example` when the module ships one, else a generic editable
+ * `my-<key>` sample (e.g. `{ "channel": "my-channel" }`). Parameters
+ * targeting `source.vault` are covered by the vault dropdown and skipped.
+ */
+function sinkParamsFor(template: CatalogTemplate): Record<string, string> {
+  const params: Record<string, string> = {};
+  for (const p of template.parameters) {
+    const m = /^sink\.params\.(.+)$/.exec(p.target);
+    if (m?.[1]) params[m[1]] = p.example ?? `my-${p.key}`;
+  }
+  return params;
+}
 
 interface ConnectionsData {
   connections: ConnectionListing[];
@@ -72,7 +81,7 @@ function errMessage(err: unknown, verb: string): string {
   return String(err);
 }
 
-/** Copy-to-clipboard button (mirrors Channels.tsx / McpConnectCard). */
+/** Copy-to-clipboard button (mirrors McpConnectCard). */
 function CopyButton({ value, label = "Copy" }: { value: string; label?: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -126,23 +135,15 @@ export function Connections() {
     };
   }, [reload]);
 
-  function applyChannelPreset(): void {
-    setSourceModule(CHANNEL_PRESET.sourceModule);
-    setSourceEvent(CHANNEL_PRESET.sourceEvent);
-    setSinkModule(CHANNEL_PRESET.sinkModule);
-    setSinkAction(CHANNEL_PRESET.sinkAction);
-    setFilterText(
-      JSON.stringify(
-        {
-          tags: [CHANNEL_PRESET.inboundTag],
-          has_metadata: ["channel"],
-          missing_metadata: ["channel_inbound_rendered_at"],
-        },
-        null,
-        2,
-      ),
-    );
-    setParamsText(JSON.stringify({ channel: "eng" }, null, 2));
+  /** Pre-fill the builder from a module-declared preset (boundary D2). */
+  function applyTemplate(t: CatalogTemplate): void {
+    setSourceModule(t.source.module);
+    setSourceEvent(t.source.event);
+    setSinkModule(t.sink.module);
+    setSinkAction(t.sink.action);
+    setFilterText(t.source.filter ? JSON.stringify(t.source.filter, null, 2) : "");
+    const params = sinkParamsFor(t);
+    setParamsText(Object.keys(params).length > 0 ? JSON.stringify(params, null, 2) : "");
     setCreateSt({ kind: "idle" });
   }
 
@@ -208,8 +209,8 @@ export function Connections() {
 
       <p className="muted">
         A connection wires <em>when [event] in a module → do [action] in another module</em>. The
-        hub mints the tokens and registers the trigger. The most common one — chat with a Claude
-        Code session through your vault — is the channel preset below.
+        hub mints the tokens and registers the trigger. Modules declare presets for the common cases
+        — pick one below to pre-fill the builder.
       </p>
 
       {renderList(state, removeSt, setRemoveSt, onConfirmRemove, () => setReload((n) => n + 1))}
@@ -235,7 +236,7 @@ export function Connections() {
           createSt={createSt}
           setCreateSt={setCreateSt}
           onSubmit={onSubmitCreate}
-          onApplyChannelPreset={applyChannelPreset}
+          onApplyTemplate={applyTemplate}
         />
       )}
     </div>
@@ -267,7 +268,7 @@ function renderList(
     return (
       <div className="empty empty-rich">
         <p className="empty-headline">No connections yet.</p>
-        <p className="muted">Build one below, or use the channel preset for the common case.</p>
+        <p className="muted">Build one below, or start from a module's preset.</p>
       </div>
     );
   }
@@ -466,7 +467,7 @@ interface BuilderProps {
   createSt: CreateState;
   setCreateSt: (s: CreateState) => void;
   onSubmit: (e: FormEvent) => Promise<void>;
-  onApplyChannelPreset: () => void;
+  onApplyTemplate: (t: CatalogTemplate) => void;
 }
 
 function BuilderSection(props: BuilderProps): React.ReactNode {
@@ -483,16 +484,22 @@ function BuilderSection(props: BuilderProps): React.ReactNode {
 
   return (
     <section style={{ marginTop: "1.5rem" }}>
-      <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+      <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", flexWrap: "wrap" }}>
         <h3 style={{ marginRight: "auto" }}>Build a connection</h3>
-        <button
-          type="button"
-          className="secondary"
-          onClick={props.onApplyChannelPreset}
-          data-testid="channel-preset"
-        >
-          Use channel preset
-        </button>
+        {/* One preset button per module-declared template (boundary D2) —
+            none render when no installed module declares any. */}
+        {catalog.templates.map((t) => (
+          <button
+            key={`${t.module}/${t.key}`}
+            type="button"
+            className="secondary"
+            onClick={() => props.onApplyTemplate(t)}
+            data-testid={`preset-${t.module}-${t.key}`}
+            {...(t.description ? { title: t.description } : {})}
+          >
+            Preset: {t.title}
+          </button>
+        ))}
       </div>
 
       <form onSubmit={(e) => void props.onSubmit(e)} aria-label="Build a connection">

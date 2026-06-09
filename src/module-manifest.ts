@@ -131,6 +131,65 @@ export interface ModuleAction {
   readonly provision?: unknown;
 }
 
+/**
+ * One declared parameter of a {@link ConnectionTemplate} — the operator-chosen
+ * blank in the template (e.g. WHICH vault, the channel name).
+ */
+export interface ConnectionTemplateParameter {
+  /** Parameter identifier within the template, e.g. `vault`, `channel`. */
+  readonly key: string;
+  /**
+   * Where the chosen value lands on the connection body, e.g. `source.vault`
+   * or `sink.params.channel`. Opaque to the hub at P1 — builder UIs interpret
+   * the two shapes above; anything else rides through for future targets.
+   */
+  readonly target: string;
+  /** Operator-facing label. */
+  readonly title?: string;
+  readonly description?: string;
+  /** Optional pre-fill example a builder UI may show for this parameter. */
+  readonly example?: string;
+}
+
+/**
+ * A connection PRESET a module declares in `module.json` (boundary D2).
+ *
+ * Two shapes ship today, discriminated by presence of `source` + `sink`:
+ *   - **event→action preset** (channel's `link-to-vault`): `source` (a module
+ *     event + optional filter) + `sink` (a module action). The hub's
+ *     Connections builder offers these as one-click pre-fills.
+ *   - **config link** (scribe's `link-to-vault`, `kind: "config"`): no
+ *     `source`/`sink` — a module-owned config flow described by other fields
+ *     (`provider`/`target`, which ride through `extra`-style and are NOT
+ *     interpreted by the hub). These are consumed by the module's own UI,
+ *     not the hub builder.
+ *
+ * Declaration-driven so the hub SPA never hardcodes a per-module preset (the
+ * charter's per-module-view test); the hub only round-trips these through
+ * `/api/connections/catalog` (event→action presets only).
+ */
+export interface ConnectionTemplate {
+  /** Template identifier within the module, e.g. `link-to-vault`. */
+  readonly key: string;
+  /** Operator-facing label. */
+  readonly title: string;
+  readonly description?: string;
+  /** Provenance label for connections created from this template. */
+  readonly requestedBy?: string;
+  /** Optional discriminator — scribe ships `"config"`. Absent = event→action. */
+  readonly kind?: string;
+  /** The source event the template pre-fills (+ optional filter, opaque). */
+  readonly source?: {
+    readonly module: string;
+    readonly event: string;
+    readonly filter?: unknown;
+  };
+  /** The sink action the template pre-fills. */
+  readonly sink?: { readonly module: string; readonly action: string };
+  /** Operator-chosen blanks. */
+  readonly parameters?: readonly ConnectionTemplateParameter[];
+}
+
 export interface ModuleManifest {
   /** Stable ecosystem identifier — `[a-z][a-z0-9-]*`, also the services.json key. */
   readonly name: string;
@@ -237,6 +296,8 @@ export interface ModuleManifest {
   readonly events?: readonly ModuleEvent[];
   /** Actions this module ACCEPTS — Connections right-hand side (P5). */
   readonly actions?: readonly ModuleAction[];
+  /** Connection presets this module declares — see {@link ConnectionTemplate}. */
+  readonly connectionTemplates?: readonly ConnectionTemplate[];
 }
 
 export class ModuleManifestError extends Error {
@@ -500,6 +561,7 @@ export function validateModuleManifest(
       : asStringArray(m.adminCapabilities, where, "adminCapabilities");
   const events = asEvents(m.events, where);
   const actions = asActions(m.actions, where, name);
+  const connectionTemplates = asConnectionTemplates(m.connectionTemplates, where);
   let stripPrefix: boolean | undefined;
   if (m.stripPrefix !== undefined) {
     if (typeof m.stripPrefix !== "boolean") {
@@ -535,6 +597,10 @@ export function validateModuleManifest(
   }
   if (events !== undefined) (out as { events?: readonly ModuleEvent[] }).events = events;
   if (actions !== undefined) (out as { actions?: readonly ModuleAction[] }).actions = actions;
+  if (connectionTemplates !== undefined) {
+    (out as { connectionTemplates?: readonly ConnectionTemplate[] }).connectionTemplates =
+      connectionTemplates;
+  }
   return out;
 }
 
@@ -626,6 +692,98 @@ function asActions(
       (out as { scope?: string }).scope = scope;
     }
     if (a.provision !== undefined) (out as { provision?: unknown }).provision = a.provision;
+    return out;
+  });
+}
+
+/**
+ * Validate the optional `connectionTemplates` declaration (boundary D2).
+ * Light-touch like `events`/`actions` at P1 — the hub only round-trips these
+ * to `/api/connections/catalog`; `filter` rides through opaque (it's the same
+ * shape the connection body's `source.filter` takes).
+ *
+ * `source`/`sink` are OPTIONAL: scribe ships a `kind: "config"` template with
+ * neither (a module-owned config flow, not an event→action preset) — a strict
+ * requirement here would make every real-manifest read throw for scribe.
+ * When present, their inner shapes are validated.
+ */
+function asConnectionTemplates(
+  v: unknown,
+  where: string,
+): readonly ConnectionTemplate[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) {
+    throw new ModuleManifestError(`${where}: "connectionTemplates" must be an array if present`);
+  }
+  return v.map((raw, i) => {
+    const at = `connectionTemplates[${i}]`;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ModuleManifestError(`${where}: "${at}" must be an object`);
+    }
+    const t = raw as Record<string, unknown>;
+    let outSource: NonNullable<ConnectionTemplate["source"]> | undefined;
+    if (t.source !== undefined) {
+      const source = t.source;
+      if (!source || typeof source !== "object" || Array.isArray(source)) {
+        throw new ModuleManifestError(`${where}: "${at}.source" must be an object if present`);
+      }
+      const src = source as Record<string, unknown>;
+      outSource = {
+        module: asString(src.module, where, `${at}.source.module`),
+        event: asString(src.event, where, `${at}.source.event`),
+        ...(src.filter !== undefined ? { filter: src.filter } : {}),
+      };
+    }
+    let outSink: NonNullable<ConnectionTemplate["sink"]> | undefined;
+    if (t.sink !== undefined) {
+      const sink = t.sink;
+      if (!sink || typeof sink !== "object" || Array.isArray(sink)) {
+        throw new ModuleManifestError(`${where}: "${at}.sink" must be an object if present`);
+      }
+      const snk = sink as Record<string, unknown>;
+      outSink = {
+        module: asString(snk.module, where, `${at}.sink.module`),
+        action: asString(snk.action, where, `${at}.sink.action`),
+      };
+    }
+    const out: ConnectionTemplate = {
+      key: asString(t.key, where, `${at}.key`),
+      title: asString(t.title, where, `${at}.title`),
+    };
+    if (outSource !== undefined) {
+      (out as { source?: ConnectionTemplate["source"] }).source = outSource;
+    }
+    if (outSink !== undefined) (out as { sink?: ConnectionTemplate["sink"] }).sink = outSink;
+    const kind = asOptionalString(t.kind, where, `${at}.kind`);
+    if (kind !== undefined) (out as { kind?: string }).kind = kind;
+    const description = asOptionalString(t.description, where, `${at}.description`);
+    if (description !== undefined) (out as { description?: string }).description = description;
+    const requestedBy = asOptionalString(t.requestedBy, where, `${at}.requestedBy`);
+    if (requestedBy !== undefined) (out as { requestedBy?: string }).requestedBy = requestedBy;
+    if (t.parameters !== undefined) {
+      if (!Array.isArray(t.parameters)) {
+        throw new ModuleManifestError(`${where}: "${at}.parameters" must be an array if present`);
+      }
+      const parameters = t.parameters.map((p, j) => {
+        const pat = `${at}.parameters[${j}]`;
+        if (!p || typeof p !== "object" || Array.isArray(p)) {
+          throw new ModuleManifestError(`${where}: "${pat}" must be an object`);
+        }
+        const pr = p as Record<string, unknown>;
+        const param: ConnectionTemplateParameter = {
+          key: asString(pr.key, where, `${pat}.key`),
+          target: asString(pr.target, where, `${pat}.target`),
+        };
+        const title = asOptionalString(pr.title, where, `${pat}.title`);
+        if (title !== undefined) (param as { title?: string }).title = title;
+        const pdesc = asOptionalString(pr.description, where, `${pat}.description`);
+        if (pdesc !== undefined) (param as { description?: string }).description = pdesc;
+        const example = asOptionalString(pr.example, where, `${pat}.example`);
+        if (example !== undefined) (param as { example?: string }).example = example;
+        return param;
+      });
+      (out as { parameters?: readonly ConnectionTemplateParameter[] }).parameters = parameters;
+    }
     return out;
   });
 }
