@@ -31,6 +31,104 @@ describe("validateModuleManifest", () => {
     expect(() => validateModuleManifest([1, 2], "where")).toThrow(/root must be an object/);
   });
 
+  test("parses connectionTemplates (boundary D2 — channel's link-to-vault shape)", () => {
+    const m = validateModuleManifest(
+      {
+        ...VALID,
+        connectionTemplates: [
+          {
+            key: "link-to-vault",
+            title: "Link a channel to a vault",
+            description: "Back a channel with a vault.",
+            requestedBy: "channel",
+            source: {
+              module: "vault",
+              event: "note.created",
+              filter: { tags: ["#channel-message/inbound"] },
+            },
+            sink: { module: "channel", action: "message.deliver" },
+            parameters: [
+              { key: "vault", target: "source.vault", title: "Vault" },
+              { key: "channel", target: "sink.params.channel", example: "eng" },
+            ],
+          },
+        ],
+      },
+      "test",
+    );
+    const t = m.connectionTemplates?.[0];
+    expect(t?.key).toBe("link-to-vault");
+    expect(t?.source).toEqual({
+      module: "vault",
+      event: "note.created",
+      filter: { tags: ["#channel-message/inbound"] },
+    });
+    expect(t?.sink).toEqual({ module: "channel", action: "message.deliver" });
+    expect(t?.parameters?.[1]).toEqual({
+      key: "channel",
+      target: "sink.params.channel",
+      example: "eng",
+    });
+  });
+
+  test('accepts a source/sink-less config template (scribe\'s kind: "config" shape)', () => {
+    // Scribe's real module.json ships a `kind: "config"` template with
+    // provider/target instead of source/sink. The validator must NOT reject
+    // it (a strict source/sink requirement would make every read of scribe's
+    // manifest throw — install, catalog, lifecycle).
+    const m = validateModuleManifest(
+      {
+        ...VALID,
+        connectionTemplates: [
+          {
+            key: "link-to-vault",
+            kind: "config",
+            title: "Auto-transcribe a vault's audio",
+            requestedBy: "demo",
+            provider: { module: "demo", action: "transcribe" },
+            target: { module: "vault", setting: "auto_transcribe.enabled" },
+            parameters: [{ key: "vault", target: "target.vault", title: "Vault" }],
+          },
+        ],
+      },
+      "test",
+    );
+    const t = m.connectionTemplates?.[0];
+    expect(t?.kind).toBe("config");
+    expect(t?.source).toBeUndefined();
+    expect(t?.sink).toBeUndefined();
+    expect(t?.parameters?.[0]?.target).toBe("target.vault");
+  });
+
+  test("rejects malformed connectionTemplates", () => {
+    expect(() => validateModuleManifest({ ...VALID, connectionTemplates: "x" }, "t")).toThrow(
+      /connectionTemplates/,
+    );
+    expect(() =>
+      validateModuleManifest(
+        { ...VALID, connectionTemplates: [{ key: "k", title: "T", source: {}, sink: {} }] },
+        "t",
+      ),
+    ).toThrow(/source\.module/);
+    expect(() =>
+      validateModuleManifest(
+        {
+          ...VALID,
+          connectionTemplates: [
+            {
+              key: "k",
+              title: "T",
+              source: { module: "vault", event: "note.created" },
+              sink: { module: "channel", action: "message.deliver" },
+              parameters: [{ key: "p" }],
+            },
+          ],
+        },
+        "t",
+      ),
+    ).toThrow(/parameters\[0\]\.target/);
+  });
+
   test("rejects missing required fields", () => {
     expect(() => validateModuleManifest({ ...VALID, name: undefined }, "x")).toThrow(/name/);
     expect(() => validateModuleManifest({ ...VALID, port: -1 }, "x")).toThrow(/port/);

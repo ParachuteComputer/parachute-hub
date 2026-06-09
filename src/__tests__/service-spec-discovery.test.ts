@@ -33,8 +33,11 @@ describe("discoverableShorts", () => {
 
   test("FIRST_PARTY_FALLBACKS shorts lead KNOWN_MODULES shorts (registry order)", () => {
     const shorts = discoverableShorts();
-    // channel (FALLBACK) appears before vault (KNOWN_MODULES) in the union.
-    expect(shorts.indexOf("channel")).toBeLessThan(shorts.indexOf("vault"));
+    // notes (the remaining FALLBACK — channel moved to KNOWN_MODULES in
+    // boundary D3) appears before vault (KNOWN_MODULES) in the union.
+    expect(shorts.indexOf("notes")).toBeLessThan(shorts.indexOf("vault"));
+    // channel rides in KNOWN_MODULES now but is still discoverable.
+    expect(shorts).toContain("channel");
   });
 });
 

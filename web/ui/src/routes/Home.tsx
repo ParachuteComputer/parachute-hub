@@ -261,8 +261,9 @@ export function Home() {
  * react-router `<Link>`) because we're LEAVING the shell; the `↗` mark +
  * owner caption make that boundary explicit.
  *
- * A module that declares neither URL (scribe, runner today; a vault whose
- * manifest predates the vault wave AND resolves no management URL) renders
+ * A module that declares neither URL (none of the first-party set today —
+ * scribe and runner both ship config UIs; a vault whose manifest predates
+ * the vault wave AND resolves no management URL still hits this) renders
  * as a disabled card with a "no admin UI yet" note rather than a dead
  * click — the operator still sees it's installed. The pre-B5 in-shell
  * `/vaults` special-case (hub#635) is gone; nothing in this component

@@ -352,12 +352,14 @@ async function authorize(req: Request, deps: ApiModulesOpsDeps): Promise<Respons
  * reach the same spec the API handlers use without duplicating the
  * curated-table lookup.
  *
- * Two source paths (hub#310, post-FALLBACK-retirement for vault/scribe/runner):
+ * Two source paths (post-FALLBACK-retirement: vault/scribe/runner in
+ * hub#310, channel in boundary D3):
  *
- *   - **FIRST_PARTY_FALLBACKS** (notes / channel): vendored manifest is
+ *   - **FIRST_PARTY_FALLBACKS** (notes): vendored manifest is
  *     authoritative pre-install — the embedded `manifest.startCmd` /
  *     `manifest.paths` / etc. drive the install + spawn flow.
- *   - **KNOWN_MODULES** (vault / scribe / runner): no vendored manifest.
+ *   - **KNOWN_MODULES** (vault / scribe / runner / channel / surface): no
+ *     vendored manifest.
  *     Pre-install we know only the npm package + manifestName + canonical
  *     port + imperative `extras` (init, postInstallFooter, urlForEntry,
  *     hasAuth). Post-install, `runInstall` reads `<installDir>/.parachute/module.json`
@@ -816,13 +818,13 @@ export async function runInstall(
     });
   }
 
-  // KNOWN_MODULES shorts (vault / scribe / runner — hub#310): module.json
-  // is the canonical source for startCmd. Re-resolve the spec from
-  // `<installDir>/.parachute/module.json` when installDir is stamped so the
-  // module is authoritative for its own spawn cmd. Falls back to the
+  // KNOWN_MODULES shorts (vault / scribe / runner / channel / surface):
+  // module.json is the canonical source for startCmd. Re-resolve the spec
+  // from `<installDir>/.parachute/module.json` when installDir is stamped so
+  // the module is authoritative for its own spawn cmd. Falls back to the
   // imperative `extras.startCmd` carried by `spec` (from `specFor`) when
   // installDir is absent or module.json is unreadable. FIRST_PARTY_FALLBACKS
-  // shorts (notes / channel) don't take this path — they're already in
+  // shorts (notes) don't take this path — they're already in
   // KNOWN_MODULES[short] === undefined so the short-circuit applies.
   let spawnSpec: ServiceSpec = spec;
   if (installDir && KNOWN_MODULES[short]) {

@@ -1,9 +1,10 @@
 /**
  * `GET /api/connections/catalog` + `GET/POST/DELETE /admin/connections` — the
  * general module event→action Connections engine (2026-06-09 modular-UI
- * architecture, P5). Generalizes the channel-specific `admin-channels.ts`
- * (hub#624): "add a vault-backed channel" is just the first connection,
- * `vault.note.created (filter #channel-message/inbound) → channel.message.deliver`.
+ * architecture, P5). Generalizes the channel-specific `/admin/channels`
+ * endpoint (hub#624 era; retired in boundary D1): "add a vault-backed channel"
+ * is just the first connection, `vault.note.created (filter
+ * #channel-message/inbound) → channel.message.deliver`.
  *
  * THE CONCEPT. A connection wires "when [EVENT] in [source module] (filter) →
  * do [ACTION] in [sink module]". The sink is ALWAYS an action. Modules declare
@@ -30,9 +31,9 @@
  * engine — it runs only for `sink.module === "channel"` and is clearly fenced
  * (`prepareChannelSink`). Everything else is declaration-driven.
  *
- * AUTH. Same gate as `/admin/channels`: a cookie-gated operator session pinned
- * to the first admin. The catalog (`/api/connections/catalog`) is operator-only
- * metadata; it uses the same session gate.
+ * AUTH. Same gate as the admin-token mints: a cookie-gated operator session
+ * pinned to the first admin. The catalog (`/api/connections/catalog`) is
+ * operator-only metadata; it uses the same session gate.
  */
 import type { Database } from "bun:sqlite";
 import {
@@ -66,9 +67,9 @@ const PROVISION_CLIENT_ID = "parachute-hub-spa";
 const CONNECTION_ID_RE = /^[a-z0-9][a-z0-9_-]*$/i;
 
 /**
- * Channel-name charset (mirrors `admin-channels.CHANNEL_NAME_RE`). A channel
- * name lands in a services.json key, a URL path segment, and an MCP server name
- * — keep it a conservative slug to close injection across all of them.
+ * Channel-name charset. A channel name lands in a services.json key, a URL
+ * path segment, and an MCP server name — keep it a conservative slug to close
+ * injection across all of them.
  */
 const CHANNEL_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/i;
 
@@ -140,18 +141,44 @@ interface CatalogAction {
   /** The provision descriptor (e.g. `{ type: "vault-trigger" }`), opaque to the SPA. */
   provision: unknown;
 }
+/**
+ * A connection preset declared in a module's `module.json`
+ * `connectionTemplates` (boundary D2). Drives the SPA builder's one-click
+ * preset buttons — declaration-driven, replacing the SPA's hardcoded
+ * channel preset (the charter's per-module-view test).
+ */
+interface CatalogTemplate {
+  /** Short of the DECLARING module (the template can wire other modules). */
+  module: string;
+  key: string;
+  title: string;
+  description: string | null;
+  requestedBy: string | null;
+  source: { module: string; event: string; filter: unknown };
+  sink: { module: string; action: string };
+  parameters: {
+    key: string;
+    target: string;
+    title: string | null;
+    description: string | null;
+    example: string | null;
+  }[];
+}
 
 /**
- * Build the catalog from the installed modules' declared events/actions. Drives
- * the SPA builder's source/sink dropdowns. NO tokens, NO secrets — pure
- * declaration metadata read from each `module.json`.
+ * Build the catalog from the installed modules' declared
+ * events/actions/templates. Drives the SPA builder's source/sink dropdowns +
+ * preset buttons. NO tokens, NO secrets — pure declaration metadata read from
+ * each `module.json`.
  */
 export function buildCatalog(modules: InstalledModuleInfo[]): {
   events: CatalogEvent[];
   actions: CatalogAction[];
+  templates: CatalogTemplate[];
 } {
   const events: CatalogEvent[] = [];
   const actions: CatalogAction[] = [];
+  const templates: CatalogTemplate[] = [];
   for (const { short, manifest } of modules) {
     for (const e of manifest.events ?? []) {
       events.push({
@@ -170,8 +197,30 @@ export function buildCatalog(modules: InstalledModuleInfo[]): {
         provision: a.provision ?? null,
       });
     }
+    for (const t of manifest.connectionTemplates ?? []) {
+      // Only event→action presets surface here — a template without BOTH
+      // source and sink (e.g. scribe's `kind: "config"` link, consumed by
+      // scribe's own UI) isn't something the hub builder can pre-fill.
+      if (!t.source || !t.sink) continue;
+      templates.push({
+        module: short,
+        key: t.key,
+        title: t.title,
+        description: t.description ?? null,
+        requestedBy: t.requestedBy ?? null,
+        source: { module: t.source.module, event: t.source.event, filter: t.source.filter ?? null },
+        sink: { module: t.sink.module, action: t.sink.action },
+        parameters: (t.parameters ?? []).map((p) => ({
+          key: p.key,
+          target: p.target,
+          title: p.title ?? null,
+          description: p.description ?? null,
+          example: p.example ?? null,
+        })),
+      });
+    }
   }
-  return { events, actions };
+  return { events, actions, templates };
 }
 
 export async function handleConnectionsCatalog(
@@ -812,7 +861,7 @@ function channelConnectLines(
   };
 }
 
-// --- Auth gate (mirrors admin-channels) ------------------------------------
+// --- Auth gate (mirrors the admin-token mints) ------------------------------
 
 /** Returns an error Response when the operator gate fails, else `null`. */
 function operatorGate(req: Request, deps: ConnectionsDeps): Response | null {

@@ -184,8 +184,9 @@ const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
  *     (connection provision/teardown — the seam's canonical consumers are
  *     channel's admin page and the hub SPA, both same-origin `fetch()` with
  *     `credentials: "include"`)
- *   - `POST /admin/channels` + `DELETE /admin/channels/<name>`
- *     (legacy vault-channel provision/teardown, hub SPA)
+ *
+ * (The legacy `POST/DELETE /admin/channels` pair was belted here until
+ * boundary D1 retired the endpoint — superseded by `/admin/connections`.)
  *
  * NOT belted, and why:
  *   - GET/HEAD/OPTIONS — read-shaped; the mint GETs

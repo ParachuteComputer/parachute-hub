@@ -40,7 +40,12 @@
  */
 import type { Database } from "bun:sqlite";
 import { signAccessToken } from "./jwt-sign.ts";
-import { isKnownModuleShort } from "./service-spec.ts";
+import {
+  type ModuleManifest,
+  readModuleManifest as defaultReadModuleManifest,
+} from "./module-manifest.ts";
+import { findServiceByShort, isKnownModuleShort } from "./service-spec.ts";
+import type { ServiceEntry } from "./services-manifest.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
 
@@ -55,6 +60,47 @@ export interface MintModuleTokenDeps {
   db: Database;
   /** Hub origin — written into JWT `iss`. */
   issuer: string;
+  /**
+   * Snapshot of services.json rows, read at request time so a module that
+   * self-registered since hub boot is mintable without a restart. Used by the
+   * self-registration gate (boundary C5) — see {@link isSelfRegisteredModule}.
+   */
+  readServices: () => readonly ServiceEntry[];
+  /** Test seam — defaults to the real `readModuleManifest` (disk read). */
+  readModuleManifest?: (installDir: string) => Promise<ModuleManifest | null>;
+}
+
+/**
+ * The self-registration gate (C5 of the 2026-06-09 hub-module-boundary
+ * migration): a short is mintable when it resolves to a services.json row
+ * whose `installDir` carries a readable `.parachute/module.json`.
+ *
+ * Resolution mirrors the rest of the hub (`/api/modules`,
+ * `collectInstalledModules`): first-party rows resolve through
+ * `findServiceByShort` (manifest name ↔ short map); a genuinely third-party
+ * row matches by its literal services.json `name` — the same
+ * `shortNameForManifest(name) ?? name` convention the catalog uses.
+ *
+ * Why this is enough against a forged short: services.json is written only by
+ * same-disk modules, which the charter's trust statement already covers — an
+ * installed module runs a daemon on the operator's machine, strictly more
+ * power than an admin Bearer. Requiring the registered row AND a readable
+ * manifest still keeps a typo'd short from minting `<anything>:admin` and
+ * masquerading as a real (but unusable) credential.
+ */
+async function isSelfRegisteredModule(short: string, deps: MintModuleTokenDeps): Promise<boolean> {
+  const services = deps.readServices();
+  const row =
+    findServiceByShort(services, short) ?? services.find((s): boolean => s.name === short);
+  if (!row?.installDir) return false;
+  const readManifest = deps.readModuleManifest ?? defaultReadModuleManifest;
+  try {
+    const manifest = await readManifest(row.installDir);
+    return manifest !== null;
+  } catch {
+    // Malformed manifest — treat as not-a-module rather than 500ing the mint.
+    return false;
+  }
 }
 
 export async function handleModuleToken(
@@ -78,11 +124,21 @@ export async function handleModuleToken(
       "vault admin tokens are per-instance — use GET /admin/vault-admin-token/<name>",
     );
   }
-  // Only mint for modules the hub recognizes — keeps a forged short from
-  // minting `<anything>:admin` and masking a typo as a real (but unusable)
-  // credential. A genuinely third-party module that wants this mint must be in
-  // the hub's known registries (KNOWN_MODULES ∪ FIRST_PARTY_FALLBACKS).
-  if (!isKnownModuleShort(short)) {
+  // Only mint for modules the hub can verify exist. Two paths (boundary C5 —
+  // closes the charter's third-party-test gap, where this endpoint used to
+  // require bootstrap-registry presence):
+  //   1. SELF-REGISTERED: the short resolves to a services.json row whose
+  //      installDir carries a readable module.json. This is the canonical
+  //      gate — any module (first- or third-party) that completed
+  //      self-registration mints with zero hub code changes, per
+  //      `parachute-patterns/patterns/hub-module-boundary.md` (the seam,
+  //      mechanism 1).
+  //   2. KNOWN bootstrap short (KNOWN_MODULES ∪ FIRST_PARTY_FALLBACKS): kept
+  //      as a fallback so a first-party module mid-install (row not yet
+  //      written) still mints.
+  // Either way a forged/typo'd short can't mint `<anything>:admin` and mask
+  // itself as a real (but unusable) credential.
+  if (!isKnownModuleShort(short) && !(await isSelfRegisteredModule(short, deps))) {
     return jsonError(404, "not_found", `no module "${short}" known to this hub`);
   }
   const sid = parseSessionCookie(req.headers.get("cookie"));

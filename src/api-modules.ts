@@ -69,8 +69,8 @@ import type { ModuleStartError, ModuleState, Supervisor } from "./supervisor.ts"
 
 /**
  * Resolve a known module to the display + install bootstrap data the admin SPA
- * renders. Reads from FIRST_PARTY_FALLBACKS (notes / channel) first,
- * KNOWN_MODULES (vault / scribe / runner / surface) second.
+ * renders. Reads from FIRST_PARTY_FALLBACKS (notes) first,
+ * KNOWN_MODULES (vault / scribe / runner / channel / surface) second.
  *
  * Returns `undefined` if the short is in neither table — a genuinely
  * third-party module discovered only via services.json / the supervisor. The
@@ -251,9 +251,9 @@ interface ModuleWireShape {
    *      declared surface — for modules where the user-facing UI IS
    *      the operator UI (App today).
    *   3. Null when the module hasn't declared either field — the SPA
-   *      renders a disabled "Open" tooltip ("module hasn't shipped an
-   *      admin UI yet"). Tracked as follow-up issues per module
-   *      (scribe#53, runner#8 today).
+   *      renders a disabled "Open" tooltip (pointing at Configure when
+   *      `config_ui_url` is set — runner's shape today — or "module
+   *      hasn't shipped an admin UI yet" otherwise).
    *
    * Always an absolute path on the hub origin (leading `/`) — the SPA
    * navigates same-origin, no need to worry about cross-origin

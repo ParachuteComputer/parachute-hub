@@ -177,6 +177,26 @@ const CHANNEL_MANIFEST: ModuleManifest = {
       provision: { type: "vault-trigger" },
     },
   ],
+  // Mirrors the declaration channel ships in its real module.json (boundary
+  // D2) — drives the catalog `templates` round-trip pin below.
+  connectionTemplates: [
+    {
+      key: "link-to-vault",
+      title: "Link a channel to a vault",
+      description: "Back a channel with a Parachute vault.",
+      requestedBy: "channel",
+      source: {
+        module: "vault",
+        event: "note.created",
+        filter: { tags: ["#channel-message/inbound"] },
+      },
+      sink: { module: "channel", action: "message.deliver" },
+      parameters: [
+        { key: "vault", target: "source.vault", title: "Vault" },
+        { key: "channel", target: "sink.params.channel", title: "Channel name" },
+      ],
+    },
+  ],
 };
 
 /** A synthetic sink module that proves the engine is NOT channel-hardcoded. */
@@ -281,6 +301,57 @@ describe("GET /api/connections/catalog", () => {
       inputSchema: null,
       provision: { type: "vault-trigger" },
     });
+  });
+
+  test("round-trips declared connectionTemplates as `templates` (boundary D2)", () => {
+    const cat = buildCatalog(modulesOf(VAULT_MANIFEST, CHANNEL_MANIFEST));
+    expect(cat.templates).toEqual([
+      {
+        module: "channel",
+        key: "link-to-vault",
+        title: "Link a channel to a vault",
+        description: "Back a channel with a Parachute vault.",
+        requestedBy: "channel",
+        source: {
+          module: "vault",
+          event: "note.created",
+          filter: { tags: ["#channel-message/inbound"] },
+        },
+        sink: { module: "channel", action: "message.deliver" },
+        parameters: [
+          {
+            key: "vault",
+            target: "source.vault",
+            title: "Vault",
+            description: null,
+            example: null,
+          },
+          {
+            key: "channel",
+            target: "sink.params.channel",
+            title: "Channel name",
+            description: null,
+            example: null,
+          },
+        ],
+      },
+    ]);
+    // Modules that declare none contribute none.
+    expect(buildCatalog(modulesOf(VAULT_MANIFEST)).templates).toEqual([]);
+  });
+
+  test("config-kind templates (no source/sink — scribe's shape) are not builder presets", () => {
+    const scribeish: ModuleManifest = {
+      name: "demo",
+      manifestName: "demo",
+      port: 1956,
+      paths: ["/demo"],
+      health: "/health",
+      connectionTemplates: [
+        { key: "link-to-vault", kind: "config", title: "Auto-transcribe a vault's audio" },
+      ],
+    };
+    expect(buildCatalog(modulesOf(scribeish)).templates).toEqual([]);
   });
 
   test("catalog endpoint is operator-gated (401 with no session)", async () => {

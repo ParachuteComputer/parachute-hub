@@ -1409,175 +1409,9 @@ export async function getHubUpgradeStatus(): Promise<HubUpgradeStatus | null> {
   return (await res.json()) as HubUpgradeStatus;
 }
 
-// ---------------------------------------------------------------------------
-// Channels (vault-backed chat channels). cookie-gated `/admin/channels`
-// orchestration endpoint (src/admin-channels.ts) — provisions a channel +
-// vault trigger + tokens in one POST. First-admin only, same operator-session
-// gate as the vault-admin-token mint, so these go through the session cookie
-// rather than the host-admin Bearer.
-// ---------------------------------------------------------------------------
-
-/** One row from `GET /admin/channels` — the operator-visible channel metadata (never tokens). */
-export interface ChannelListing {
-  name: string;
-  /** Channel transport — `vault` for a vault-backed channel. */
-  transport: string;
-  /** Vault the channel is bound to. */
-  vault: string;
-}
-
-/**
- * Copy-paste connect lines returned by `POST /admin/channels`. The operator
- * runs these where their Claude Code session will live; the launch line is
- * the one-shot that joins the freshly-provisioned channel.
- */
-export interface ChannelConnect {
-  mcpAdd: string;
-  launch: string;
-}
-
-/** `POST /admin/channels` success body. */
-export interface ProvisionedChannel {
-  channel: string;
-  vault: string;
-  connect: ChannelConnect;
-}
-
-/**
- * GET /admin/channels — list provisioned channels. The hub now PROJECTS each
- * channel to only `{name, transport, vault}` at its own layer and returns the
- * flat `{ ok, channels: [...] }` shape (hub-layer field projection — a future
- * channel version that leaks a token/secret in its list can never be proxied
- * through). We still unwrap defensively (tolerating the older
- * `{ channels: { channels: [...] } }` nesting) and drop any malformed entry,
- * so an SPA built against either hub version keeps working.
- *
- * Unlike the `/api/*` admin endpoints, this is session-cookie-gated (no Bearer);
- * a 401 means the operator's session is gone — we redirect to login and hang the
- * promise, same shape as `mintVaultAdminToken`.
- */
-export async function listChannels(): Promise<ChannelListing[]> {
-  const res = await fetch("/admin/channels", {
-    method: "GET",
-    headers: { accept: "application/json" },
-    credentials: "same-origin",
-  });
-  if (res.status === 401) {
-    return redirectToLoginAndHang<ChannelListing[]>();
-  }
-  if (!res.ok) {
-    throw new HttpError(res.status, await readError(res));
-  }
-  const body = (await res.json()) as {
-    channels?: unknown;
-  };
-  // Unwrap the proxied nesting: hub returns `{ ok, channels: { channels: [...] } }`,
-  // but tolerate a flat `{ channels: [...] }` too.
-  const outer = body.channels;
-  let rows: unknown[] = [];
-  if (Array.isArray(outer)) {
-    rows = outer;
-  } else if (
-    outer &&
-    typeof outer === "object" &&
-    Array.isArray((outer as { channels?: unknown }).channels)
-  ) {
-    rows = (outer as { channels: unknown[] }).channels;
-  }
-  return rows.flatMap((row) => {
-    if (!row || typeof row !== "object") return [];
-    const r = row as { name?: unknown; transport?: unknown; vault?: unknown };
-    if (typeof r.name !== "string" || typeof r.vault !== "string") return [];
-    return [
-      {
-        name: r.name,
-        transport: typeof r.transport === "string" ? r.transport : "vault",
-        vault: r.vault,
-      } satisfies ChannelListing,
-    ];
-  });
-}
-
-/**
- * POST /admin/channels — provision a vault-backed channel. The hub mints every
- * token, writes the channel config, and registers the vault trigger; the
- * response carries the copy-paste connect lines (never the tokens themselves).
- *
- * Session-cookie-gated like `listChannels`. A 4xx surfaces the server's
- * `error_description` verbatim (unknown vault, invalid name, provision step
- * failure) so the form can render it; 401 redirects to login.
- */
-export async function provisionChannel(input: {
-  channelName: string;
-  vault: string;
-}): Promise<ProvisionedChannel> {
-  const res = await fetch("/admin/channels", {
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify(input),
-  });
-  if (res.status === 401) {
-    return redirectToLoginAndHang<ProvisionedChannel>();
-  }
-  if (!res.ok) {
-    throw new HttpError(res.status, await readError(res));
-  }
-  const body = (await res.json()) as {
-    channel?: string;
-    vault?: string;
-    connect?: { mcpAdd?: string; launch?: string };
-  };
-  if (
-    typeof body.channel !== "string" ||
-    typeof body.vault !== "string" ||
-    !body.connect ||
-    typeof body.connect.mcpAdd !== "string" ||
-    typeof body.connect.launch !== "string"
-  ) {
-    throw new HttpError(500, "/admin/channels returned a malformed provision body");
-  }
-  return {
-    channel: body.channel,
-    vault: body.vault,
-    connect: { mcpAdd: body.connect.mcpAdd, launch: body.connect.launch },
-  };
-}
-
-/**
- * DELETE /admin/channels/:name — tear down a channel (best-effort, both the
- * channel config + the vault trigger). The hub returns 207 with `partial: true`
- * when one side fails; we surface that as an HttpError so the caller can show
- * the operator the residue needs manual cleanup. 401 redirects to login.
- */
-export async function deleteChannel(name: string): Promise<void> {
-  const res = await fetch(`/admin/channels/${encodeURIComponent(name)}`, {
-    method: "DELETE",
-    headers: { accept: "application/json" },
-    credentials: "same-origin",
-  });
-  if (res.status === 401) {
-    await redirectToLoginAndHang<void>();
-    return;
-  }
-  // 207 (multi-status) = partial teardown; treat as an error so the caller
-  // can surface which side lingered. The body carries `errors[]`.
-  if (res.status === 207) {
-    let detail = "channel teardown partially failed";
-    try {
-      const body = (await res.json()) as { errors?: Array<{ step?: string; detail?: string }> };
-      if (Array.isArray(body.errors) && body.errors.length > 0) {
-        detail = body.errors.map((e) => `${e.step ?? "step"}: ${e.detail ?? "failed"}`).join("; ");
-      }
-    } catch {
-      // not JSON — keep the generic message
-    }
-    throw new HttpError(207, detail);
-  }
-  if (!res.ok) {
-    throw new HttpError(res.status, await readError(res));
-  }
-}
+// (The Channels api helpers — listChannels / provisionChannel / deleteChannel
+// against the bespoke `/admin/channels` endpoint — were retired in boundary D1
+// along with the endpoint; the Connections helpers below are the successor.)
 
 async function readError(res: Response): Promise<string> {
   try {
@@ -1618,9 +1452,42 @@ export interface CatalogAction {
   provision: unknown;
 }
 
+/**
+ * One declared parameter of a connection preset — the operator-chosen blank
+ * (e.g. WHICH vault, the channel name).
+ */
+export interface CatalogTemplateParameter {
+  key: string;
+  /** Where the value lands: `source.vault` or `sink.params.<key>` today. */
+  target: string;
+  title: string | null;
+  description: string | null;
+  /** Optional pre-fill example for the builder. */
+  example: string | null;
+}
+
+/**
+ * A connection preset a module declares in its `module.json`
+ * `connectionTemplates` (boundary D2). The builder renders one preset button
+ * per template — declaration-driven; nothing module-specific lives in the SPA.
+ */
+export interface CatalogTemplate {
+  /** Short of the declaring module. */
+  module: string;
+  key: string;
+  title: string;
+  description: string | null;
+  requestedBy: string | null;
+  source: { module: string; event: string; filter: unknown };
+  sink: { module: string; action: string };
+  parameters: CatalogTemplateParameter[];
+}
+
 export interface ConnectionsCatalog {
   events: CatalogEvent[];
   actions: CatalogAction[];
+  /** Declared presets. Empty on hubs/modules predating connectionTemplates. */
+  templates: CatalogTemplate[];
 }
 
 /** A provisioned connection (the list/wire shape from `/admin/connections`). */
@@ -1670,10 +1537,12 @@ export async function getConnectionsCatalog(): Promise<ConnectionsCatalog> {
   });
   if (res.status === 401) return redirectToLoginAndHang<ConnectionsCatalog>();
   if (!res.ok) throw new HttpError(res.status, await readError(res));
-  const body = (await res.json()) as { events?: unknown; actions?: unknown };
+  const body = (await res.json()) as { events?: unknown; actions?: unknown; templates?: unknown };
   const events = Array.isArray(body.events) ? (body.events as CatalogEvent[]) : [];
   const actions = Array.isArray(body.actions) ? (body.actions as CatalogAction[]) : [];
-  return { events, actions };
+  // Tolerant default — a hub predating connectionTemplates omits the field.
+  const templates = Array.isArray(body.templates) ? (body.templates as CatalogTemplate[]) : [];
+  return { events, actions, templates };
 }
 
 /** GET /admin/connections — list provisioned connections. */

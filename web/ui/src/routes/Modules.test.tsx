@@ -279,7 +279,7 @@ describe("Modules — Open button (hub#342)", () => {
     expect(open.getAttribute("href")).toBe("/vault/default/admin");
   });
 
-  it("renders a disabled button with a follow-up tooltip when management_url is null", async () => {
+  it("renders a disabled button with a generic tooltip when neither URL is declared", async () => {
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [
         moduleRow("scribe", {
@@ -298,7 +298,34 @@ describe("Modules — Open button (hub#342)", () => {
     const open = screen.getByTestId("open-scribe");
     expect(open.tagName).toBe("BUTTON");
     expect(open).toBeDisabled();
-    expect(open.getAttribute("title")).toContain("scribe#53");
+    expect(open.getAttribute("title")).toContain("hasn't shipped an admin UI yet");
+  });
+
+  it("disabled Open points at Configure when only config_ui_url is declared (runner's shape)", async () => {
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        moduleRow("runner", {
+          installed: true,
+          installed_version: "0.1.0",
+          latest_version: "0.1.0",
+          supervisor_status: "running",
+          management_url: null,
+          config_ui_url: "/runner/admin",
+        }),
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Runner")).toBeInTheDocument());
+    const open = screen.getByTestId("open-runner");
+    expect(open.tagName).toBe("BUTTON");
+    expect(open).toBeDisabled();
+    expect(open.getAttribute("title")).toContain("use Configure");
+    // ...and the Configure affordance itself is live.
+    const configure = screen.getByTestId("configure-runner");
+    expect(configure.tagName).toBe("A");
+    expect(configure.getAttribute("href")).toBe("/runner/admin");
   });
 
   it("omits the Configure action when config_ui_url is null", async () => {
