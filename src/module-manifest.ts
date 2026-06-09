@@ -696,6 +696,19 @@ function asPathOrUrl(v: unknown, where: string, field: string): string | undefin
       `${where}: "${field}" relative form must not contain ".." segments`,
     );
   }
+  // Forbid backslashes anywhere in the relative form — the simplest closure
+  // of the backslash-traversal quirk: WHATWG URL parsing treats `\` as `/`
+  // in special (http/https) schemes, so `a\..\b` joined under a mount would
+  // normalize to `a/../b` and pop a segment, escaping the `..`-segment check
+  // above. Percent-encoded forms (`..%2f`) need no equivalent guard:
+  // `new URL()` does NOT decode percent-escapes during base-join, so a
+  // `..%2f` stays a literal three-char segment and never traverses (pinned
+  // in module-manifest.test.ts).
+  if (v.includes("\\")) {
+    throw new ModuleManifestError(
+      `${where}: "${field}" relative form must not contain backslashes`,
+    );
+  }
   return v;
 }
 

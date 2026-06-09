@@ -726,6 +726,16 @@ export async function handleDeleteVault(
   // --- 1. Registry sweep: revoke every tokens row naming the vault. --------
   summary.tokens_revoked = revokeTokensNamingVault(deps.db, name, now);
 
+  // NOTE on `auth_codes.scopes` — the one identity-artifact column from the
+  // charter's enumeration deliberately NOT swept here. Authorization codes
+  // are transient by construction: AUTH_CODE_TTL_SECONDS = 60 (auth-codes.ts)
+  // and single-use. A code naming the deleted vault either (a) expires
+  // unredeemed within the minute, or (b) redeems into tokens whose registry
+  // rows the sweep above already governs — and whose requests the evicted
+  // daemon no longer serves. Sweeping a 60-second-lived table adds a step
+  // with no security delta; same class as the documented ≤10-min
+  // unregistered interactive-mint bound.
+
   // --- 2. Grants rewrite (drop rows only when emptied). ---------------------
   const grants = rewriteGrantsRemovingVault(deps.db, name);
   summary.grants_rewritten = grants.rewritten;
@@ -783,6 +793,9 @@ export async function handleDeleteVault(
   if (deps.channelOrigin !== null) {
     try {
       const fetchImpl = deps.fetchImpl ?? fetch;
+      // Short-lived (60s) — stays below the registered-mint threshold by
+      // design (the documented ≤10-min interactive bound; see B0's
+      // REGISTERED_MINT_TTL_THRESHOLD_SECONDS in admin-connections.ts).
       const scanToken = (
         await signAccessToken(deps.db, {
           sub: adminSub,

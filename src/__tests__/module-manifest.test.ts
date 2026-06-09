@@ -157,6 +157,23 @@ describe("validateModuleManifest", () => {
     expect(() =>
       validateModuleManifest({ ...VALID, managementUrl: "../other/admin" }, "x"),
     ).toThrow(/\.\./);
+    // Backslash-traversal closure: WHATWG URL parsing treats `\` as `/` in
+    // http(s) schemes, so `a\..\b` would normalize to `a/../b` post-join and
+    // pop a segment past the `..`-segment check. Any backslash → invalid.
+    expect(() => validateModuleManifest({ ...VALID, managementUrl: "a\\..\\b" }, "x")).toThrow(
+      /backslash/,
+    );
+  });
+
+  test("percent-encoded ..%2f is inert in the relative form (URL base-join doesn't decode)", () => {
+    // The validator ACCEPTS `..%2f...` — it isn't a literal ".." segment and
+    // needs no guard, because `new URL()` does not decode percent-escapes
+    // during base-join: the segment stays the literal "..%2fadmin" and never
+    // traverses. Pin the resolution behavior the safety argument rests on.
+    const m = validateModuleManifest({ ...VALID, managementUrl: "..%2fadmin" }, "x");
+    expect(m.managementUrl).toBe("..%2fadmin");
+    const joined = new URL("/vault/default/..%2fadmin", "https://x.example/");
+    expect(joined.pathname).toBe("/vault/default/..%2fadmin"); // no segment popped
   });
 
   // --- 2026-06-09 modular-UI architecture P1 fields: focus / configUiUrl /

@@ -5253,6 +5253,50 @@ describe("force-change-password per-request gate (#469)", () => {
     }
   });
 
+  test("(a) pre-rotation browser GET /vault/admin/ is 302'd to change-password (B-route gate parity)", async () => {
+    // The daemon-level /vault/admin mount applies the SAME per-request
+    // force-change-password gate as the per-vault proxy — a pre-rotation
+    // session can't reach the multi-vault admin surface on an un-rotated
+    // temp password either.
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              // Canonical row name so findServiceByShort would resolve it if
+              // the request ever got past the gate.
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/work"],
+              health: "/vault/work/health",
+              version: "0.5.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/vault/admin/", { headers: { cookie, accept: "text/html" } }),
+        );
+        // Gated BEFORE proxyToVaultAdmin ever runs — the gate's 302, not a
+        // proxy 404/502.
+        expect(res.status).toBe(302);
+        expect(res.headers.get("location")).toBe("/account/change-password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("(b) pre-rotation user CAN still reach /account/change-password (GET)", async () => {
     const h = makeHarness();
     try {

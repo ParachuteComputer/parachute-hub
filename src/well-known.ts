@@ -169,12 +169,17 @@ export interface BuildWellKnownOpts {
   /**
    * Optional resolver mapping a `ServiceEntry` to its `module.json:uiUrl`,
    * if any. Same shape as `managementUrlFor`. Returning `undefined` means
-   * "no user-facing UI" and discovery omits the Services tile. For vault
-   * entries, the declared `uiUrl` is the per-instance path (e.g. "/admin/")
-   * — `buildWellKnown` prefixes it with the per-instance mount path on
-   * emission, yielding one tile per vault instance pointing at
-   * `<origin>/vault/<name>/admin/`. See patterns#96
-   * `module-ui-declaration.md` §"Multi-instance services (vault)".
+   * "no user-facing UI" and discovery omits the Services tile.
+   *
+   * Resolution follows the B4 unified semantics (2026-06-09
+   * hub-module-boundary): http(s):// → verbatim; leading-`/` →
+   * ORIGIN-ABSOLUTE against the canonical origin (vault's daemon-level
+   * `/vault/admin/` emits as-is, once per row); RELATIVE (no leading slash,
+   * e.g. `"admin/"`) → the per-instance form, mount-joined per emitted path
+   * — for a multi-path vault entry that yields one tile per instance at
+   * `<origin>/vault/<name>/admin/`. The literal legacy `"/admin/"` on a
+   * vault entry rides the one-release compat shim (mount-join + deprecation
+   * log). See `buildWellKnown`'s uiUrl branch.
    */
   uiUrlFor?: (entry: ServiceEntry) => string | undefined;
   /**
