@@ -3,6 +3,7 @@ import {
   FIRST_PARTY_FALLBACKS,
   KNOWN_MODULES,
   discoverableShorts,
+  findServiceByShort,
   focusForShort,
   isKnownModuleShort,
 } from "../service-spec.ts";
@@ -69,5 +70,37 @@ describe("isKnownModuleShort", () => {
   test("false for the hub itself + genuinely third-party shorts", () => {
     expect(isKnownModuleShort("hub")).toBe(false);
     expect(isKnownModuleShort("random")).toBe(false);
+  });
+});
+
+// Regression: services.json rows carry the MANIFEST name (`parachute-channel`),
+// not the bare short (`channel`). The connection/channels wiring used to do
+// `services.find((s) => s.name === "channel")`, which never matched the on-disk
+// row → channelOrigin null → a spurious "channel module is not installed" when
+// linking a vault-backed channel. findServiceByShort resolves through the
+// short↔manifest map so the lookup hits the real row.
+describe("findServiceByShort", () => {
+  const services = [
+    { name: "parachute-vault-default", port: 1940 },
+    { name: "parachute-channel", port: 1941 },
+    { name: "parachute-scribe", port: 1943 },
+  ];
+
+  test("matches a row by its manifest name via the short↔manifest map", () => {
+    const found = findServiceByShort(services, "channel");
+    expect(found?.name).toBe("parachute-channel");
+    expect(found?.port).toBe(1941);
+  });
+
+  test("the naive `name === short` comparison would have missed it (the bug)", () => {
+    // The exact pre-fix predicate: a bare short never matches a manifest-named row.
+    expect(services.find((s) => s.name === "channel")).toBeUndefined();
+    // The fix finds it.
+    expect(findServiceByShort(services, "channel")).toBeDefined();
+  });
+
+  test("resolves scribe too, and returns undefined for an absent module", () => {
+    expect(findServiceByShort(services, "scribe")?.port).toBe(1943);
+    expect(findServiceByShort(services, "runner")).toBeUndefined();
   });
 });

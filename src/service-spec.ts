@@ -834,6 +834,30 @@ export function shortNameForManifest(manifestName: string): string | undefined {
 }
 
 /**
+ * Find a services.json row by its SHORT name (e.g. `"channel"`), resolving each
+ * row's manifest name (`parachute-channel`) back through `shortNameForManifest`.
+ *
+ * services.json rows carry the MANIFEST name, not the bare short — so a direct
+ * `s.name === short` comparison silently misses every first-party module. That
+ * exact mismatch (`s.name === "channel"` vs a `parachute-channel` row) is what
+ * surfaced a spurious "channel module is not installed" when wiring the channel
+ * connection sink. Resolve through the short↔manifest map instead. Returns the
+ * first match, or undefined when no installed row maps to `short`.
+ *
+ * NOTE: multi-instance vault rows (`parachute-vault-<name>`) are NOT resolvable
+ * here — `shortNameForManifest` only knows the canonical `parachute-vault`, so
+ * `findServiceByShort(services, "vault")` returns undefined even when a vault is
+ * installed. Vault rows are resolved by mount path via `findVaultUpstream`; this
+ * helper is for single-instance modules (channel / scribe / runner / surface).
+ */
+export function findServiceByShort<T extends { name: string }>(
+  services: readonly T[],
+  short: string,
+): T | undefined {
+  return services.find((s) => shortNameForManifest(s.name) === short);
+}
+
+/**
  * Compose a `ServiceSpec` from a `KNOWN_MODULES` entry plus the static
  * manifest data the caller has on hand (typically read from
  * `<installDir>/.parachute/module.json`).
