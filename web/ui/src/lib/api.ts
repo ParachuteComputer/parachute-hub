@@ -1657,3 +1657,143 @@ async function readError(res: Response): Promise<string> {
   }
   return `${res.status} ${res.statusText}`;
 }
+
+// ---------------------------------------------------------------------------
+// Connections (the general module event→action engine, modular-UI P5).
+// `/api/connections/catalog` lists available events/actions across installed
+// modules; `/admin/connections` builds/lists/removes connections. All
+// session-cookie-gated (first-admin), same posture as Channels above.
+// ---------------------------------------------------------------------------
+
+/** One event a module emits (catalog left-hand side). */
+export interface CatalogEvent {
+  module: string;
+  key: string;
+  title: string;
+  /** Optional JSON Schema describing the per-event filter the operator may set. */
+  filterSchema: unknown;
+}
+
+/** One action a module accepts (catalog right-hand side — the sink). */
+export interface CatalogAction {
+  module: string;
+  key: string;
+  title: string;
+  inputSchema: unknown;
+  /** Opaque provision descriptor, e.g. `{ type: "vault-trigger" }`. */
+  provision: unknown;
+}
+
+export interface ConnectionsCatalog {
+  events: CatalogEvent[];
+  actions: CatalogAction[];
+}
+
+/** A provisioned connection (the list/wire shape from `/admin/connections`). */
+export interface ConnectionListing {
+  id: string;
+  source: {
+    module: string;
+    vault?: string;
+    event: string;
+    filter?: Record<string, unknown>;
+  };
+  sink: {
+    module: string;
+    action: string;
+    params?: Record<string, unknown>;
+  };
+  provisioned: { type: string; vault?: string; triggerName?: string };
+  created_at: string;
+}
+
+/** Connect lines returned when the sink is a channel-deliver action. */
+export interface ConnectionConnect {
+  mcpAdd: string;
+  launch: string;
+}
+
+/** `POST /admin/connections` success body. */
+export interface CreatedConnection {
+  connection: ConnectionListing;
+  connect?: ConnectionConnect;
+}
+
+/** GET /api/connections/catalog — events + actions across installed modules. */
+export async function getConnectionsCatalog(): Promise<ConnectionsCatalog> {
+  const res = await fetch("/api/connections/catalog", {
+    method: "GET",
+    headers: { accept: "application/json" },
+    credentials: "same-origin",
+  });
+  if (res.status === 401) return redirectToLoginAndHang<ConnectionsCatalog>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { events?: unknown; actions?: unknown };
+  const events = Array.isArray(body.events) ? (body.events as CatalogEvent[]) : [];
+  const actions = Array.isArray(body.actions) ? (body.actions as CatalogAction[]) : [];
+  return { events, actions };
+}
+
+/** GET /admin/connections — list provisioned connections. */
+export async function listConnections(): Promise<ConnectionListing[]> {
+  const res = await fetch("/admin/connections", {
+    method: "GET",
+    headers: { accept: "application/json" },
+    credentials: "same-origin",
+  });
+  if (res.status === 401) return redirectToLoginAndHang<ConnectionListing[]>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { connections?: unknown };
+  return Array.isArray(body.connections) ? (body.connections as ConnectionListing[]) : [];
+}
+
+/** POST /admin/connections — build a connection. */
+export async function createConnection(input: {
+  id?: string;
+  source: { module: string; vault?: string; event: string; filter?: Record<string, unknown> };
+  sink: { module: string; action: string; params?: Record<string, unknown> };
+}): Promise<CreatedConnection> {
+  const res = await fetch("/admin/connections", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify(input),
+  });
+  if (res.status === 401) return redirectToLoginAndHang<CreatedConnection>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as {
+    connection?: ConnectionListing;
+    connect?: ConnectionConnect;
+  };
+  if (!body.connection || typeof body.connection.id !== "string") {
+    throw new HttpError(500, "/admin/connections returned a malformed connection body");
+  }
+  return { connection: body.connection, ...(body.connect ? { connect: body.connect } : {}) };
+}
+
+/** DELETE /admin/connections/:id — tear a connection down (best-effort). */
+export async function deleteConnection(id: string): Promise<void> {
+  const res = await fetch(`/admin/connections/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { accept: "application/json" },
+    credentials: "same-origin",
+  });
+  if (res.status === 401) {
+    await redirectToLoginAndHang<void>();
+    return;
+  }
+  // 207 = partial teardown; surface the residue so the operator knows.
+  if (res.status === 207) {
+    let detail = "connection teardown partially failed";
+    try {
+      const body = (await res.json()) as { errors?: Array<{ step?: string; detail?: string }> };
+      if (Array.isArray(body.errors) && body.errors.length > 0) {
+        detail = body.errors.map((e) => `${e.step ?? "step"}: ${e.detail ?? "failed"}`).join("; ");
+      }
+    } catch {
+      // keep the generic message
+    }
+    throw new HttpError(207, detail);
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}

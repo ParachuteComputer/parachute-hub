@@ -110,6 +110,23 @@ export interface ModuleAction {
   readonly title: string;
   /** Optional JSON-Schema for the action's input. */
   readonly inputSchema?: unknown;
+  /**
+   * The module-relative HTTP endpoint the hub's Connections engine calls when
+   * this action fires (P5). For a `vault-trigger` provision, this becomes the
+   * vault trigger's `action.webhook`, hub-proxied under the module's mount:
+   * `<hub-origin>/<mount><endpoint>`. Declaring it here — rather than
+   * hardcoding a per-module path in the hub — is what makes the engine general.
+   * Channel ships `"/api/vault/inbound"`.
+   */
+  readonly endpoint?: string;
+  /**
+   * The OAuth scope the hub mints into the action webhook's `Authorization:
+   * Bearer` (P5). For a `vault-trigger`, this is persisted as the trigger's
+   * long-lived `action.auth.bearer` scope — the credential the sink module
+   * validates on every callback. Sourced from the action declaration so the
+   * hub never hardcodes a per-module scope. Channel ships `"channel:send"`.
+   */
+  readonly scope?: string;
   /** Opaque (P1) descriptor of how the hub provisions this action. */
   readonly provision?: unknown;
 }
@@ -476,7 +493,7 @@ export function validateModuleManifest(
       ? undefined
       : asStringArray(m.adminCapabilities, where, "adminCapabilities");
   const events = asEvents(m.events, where);
-  const actions = asActions(m.actions, where);
+  const actions = asActions(m.actions, where, name);
   let stripPrefix: boolean | undefined;
   if (m.stripPrefix !== undefined) {
     if (typeof m.stripPrefix !== "boolean") {
@@ -547,7 +564,12 @@ function asEvents(v: unknown, where: string): readonly ModuleEvent[] | undefined
   });
 }
 
-function asActions(v: unknown, where: string): readonly ModuleAction[] | undefined {
+function asActions(
+  v: unknown,
+  where: string,
+  /** Declaring module's name — enforces the `action.scope` namespace rule. */
+  name: string,
+): readonly ModuleAction[] | undefined {
   if (v === undefined) return undefined;
   if (!Array.isArray(v)) {
     throw new ModuleManifestError(`${where}: "actions" must be an array if present`);
@@ -563,6 +585,40 @@ function asActions(v: unknown, where: string): readonly ModuleAction[] | undefin
       title: asString(a.title, where, `${at}.title`),
     };
     if (a.inputSchema !== undefined) (out as { inputSchema?: unknown }).inputSchema = a.inputSchema;
+    if (a.endpoint !== undefined) {
+      const ep = asString(a.endpoint, where, `${at}.endpoint`);
+      if (!ep.startsWith("/")) {
+        throw new ModuleManifestError(`${where}: "${at}.endpoint" must start with "/"`);
+      }
+      (out as { endpoint?: string }).endpoint = ep;
+    }
+    if (a.scope !== undefined) {
+      const scope = asString(a.scope, where, `${at}.scope`);
+      // Scope-namespace rule (mirrors `scopes.defines` above): an action's
+      // `scope` is minted by the hub into a 90-day webhook bearer presented to
+      // THIS module's own endpoint, which validates `aud:<name>` + a scope in
+      // its own namespace. A legitimate `action.scope` is therefore always in
+      // the declaring module's namespace (channel.message.deliver → channel:send).
+      // Enforcing `<ns> === name` blocks a malicious module declaring e.g.
+      // `vault:default:admin` and tricking the hub into minting a cross-module
+      // privilege-escalating token when an operator wires a Connection to it.
+      // Cross-module tokens a sink legitimately needs for OTHER purposes (e.g.
+      // channel's reply path needs `vault:write`) are minted separately by the
+      // engine, NOT declared here.
+      const colon = scope.indexOf(":");
+      if (colon <= 0) {
+        throw new ModuleManifestError(
+          `${where}: "${at}.scope" "${scope}" must be namespaced as "<name>:<verb>"`,
+        );
+      }
+      const ns = scope.slice(0, colon);
+      if (ns !== name) {
+        throw new ModuleManifestError(
+          `${where}: "${at}.scope" "${scope}" namespace "${ns}" does not match module name "${name}"`,
+        );
+      }
+      (out as { scope?: string }).scope = scope;
+    }
     if (a.provision !== undefined) (out as { provision?: unknown }).provision = a.provision;
     return out;
   });
