@@ -234,6 +234,7 @@ import {
   FIRST_PARTY_FALLBACKS,
   KNOWN_MODULES,
   effectivePublicExposure,
+  findServiceByShort,
   shortNameForManifest,
 } from "./service-spec.ts";
 import { type ServiceEntry, readManifest, readManifestLenient } from "./services-manifest.ts";
@@ -2198,8 +2199,11 @@ export function hubFetch(
         if (!getDb) return dbNotConfigured();
         const subPath = pathname.slice("/admin/channels".length);
         const services = readManifestLenient(manifestPath).services;
-        // Channel's services.json row is `name: "channel"` on its loopback port.
-        const channelEntry = services.find((s) => s.name === "channel");
+        // Channel's services.json row carries its MANIFEST name (`parachute-channel`),
+        // not the bare short `channel` — resolve via findServiceByShort so the
+        // lookup matches the on-disk row. (A bare `s.name === "channel"` never
+        // matched, leaving channelOrigin null → "channel not installed".)
+        const channelEntry = findServiceByShort(services, "channel");
         const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
         const resolveVaultOrigin = (vaultName: string): string | null => {
           const match = findVaultUpstream(
@@ -2232,7 +2236,9 @@ export function hubFetch(
       ) {
         if (!getDb) return dbNotConfigured();
         const services = readManifestLenient(manifestPath).services;
-        const channelEntry = services.find((s) => s.name === "channel");
+        // See the `/admin/channels` note above: match the manifest name via
+        // findServiceByShort, not the bare short `channel`.
+        const channelEntry = findServiceByShort(services, "channel");
         const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
         const resolveVaultOrigin = (vaultName: string): string | null => {
           const match = findVaultUpstream(
