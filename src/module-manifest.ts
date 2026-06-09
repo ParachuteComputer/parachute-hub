@@ -65,6 +65,55 @@ export interface ConfigSchema {
   readonly required?: readonly string[];
 }
 
+/**
+ * Discovery tier (2026-06-09 modular-UI architecture). `core` modules are the
+ * product surface (vault / scribe / hub / surface); `experimental` modules
+ * (channel / runner / others) render in a de-emphasized group on the Modules
+ * screen. **Show all; never hide** — `focus` only sorts + labels.
+ *
+ * Absent in a `module.json` ⇒ the hub falls back to its default map (see
+ * `service-spec.focusForShort`), which defaults unlisted modules to
+ * `experimental`.
+ */
+export type ModuleFocus = "core" | "experimental";
+
+/**
+ * An event a module EMITS — the left-hand side of a Connection (2026-06-09
+ * modular-UI architecture, P5). Declared in `module.json`; the hub's
+ * Connections surface lists these so an operator can wire
+ * "when [event] in [module] → do [action] in [module]". `filterSchema` is an
+ * optional JSON-Schema describing the per-event filter an operator can set
+ * (e.g. a tag filter on `vault.note.created`). Minimal at P1 — the hub only
+ * needs to round-trip the declaration; richer typing lands with P5.
+ */
+export interface ModuleEvent {
+  /** Event identifier within the module, e.g. `note.created`. */
+  readonly key: string;
+  /** Operator-facing label. */
+  readonly title: string;
+  /** Optional JSON-Schema for the per-event filter an operator may set. */
+  readonly filterSchema?: unknown;
+}
+
+/**
+ * An action a module ACCEPTS — the right-hand side of a Connection (2026-06-09
+ * modular-UI architecture, P5). `inputSchema` is an optional JSON-Schema for
+ * the action's input; `provision` is an opaque (at P1) descriptor of how the
+ * hub wires the action when a Connection is created (e.g. register a vault
+ * trigger). Both are passed through untyped here — the hub only round-trips
+ * the declaration at P1; P5 gives them structure.
+ */
+export interface ModuleAction {
+  /** Action identifier within the module, e.g. `message.send`. */
+  readonly key: string;
+  /** Operator-facing label. */
+  readonly title: string;
+  /** Optional JSON-Schema for the action's input. */
+  readonly inputSchema?: unknown;
+  /** Opaque (P1) descriptor of how the hub provisions this action. */
+  readonly provision?: unknown;
+}
+
 export interface ModuleManifest {
   /** Stable ecosystem identifier — `[a-z][a-z0-9-]*`, also the services.json key. */
   readonly name: string;
@@ -140,6 +189,31 @@ export interface ModuleManifest {
    * per-module rationale.
    */
   readonly stripPrefix?: boolean;
+  /**
+   * Discovery tier (2026-06-09 modular-UI architecture). When a module
+   * declares `focus`, the hub's Modules screen uses it verbatim; otherwise it
+   * falls back to `service-spec.focusForShort` (vault/scribe/hub/surface →
+   * `core`, everything else → `experimental`). **Show all; never hide** —
+   * `focus` only groups + de-emphasizes. Additive + back-compatible.
+   */
+  readonly focus?: ModuleFocus;
+  /**
+   * Where the module's OWN config/admin surface lives — the module renders it,
+   * the hub frames/links it (2026-06-09 modular-UI architecture, P3). Same
+   * path-or-absolute-URL shape as `managementUrl` (distinct field: `managementUrl`
+   * predates this; `configUiUrl` is the canonical config-surface declaration the
+   * config shell consumes). Optional + back-compatible.
+   */
+  readonly configUiUrl?: string;
+  /**
+   * Free-form capability hints for the config shell, e.g. `["config",
+   * "credentials", "logs"]`. Metadata only at P1 — the hub round-trips it.
+   */
+  readonly adminCapabilities?: readonly string[];
+  /** Events this module EMITS — Connections left-hand side (P5). */
+  readonly events?: readonly ModuleEvent[];
+  /** Actions this module ACCEPTS — Connections right-hand side (P5). */
+  readonly actions?: readonly ModuleAction[];
 }
 
 export class ModuleManifestError extends Error {
@@ -395,6 +469,14 @@ export function validateModuleManifest(
   const configSchema = asConfigSchema(m.configSchema, where);
   const managementUrl = asManagementUrl(m.managementUrl, where);
   const uiUrl = asUiUrl(m.uiUrl, where);
+  const focus = asFocus(m.focus, where);
+  const configUiUrl = asPathOrUrl(m.configUiUrl, where, "configUiUrl");
+  const adminCapabilities =
+    m.adminCapabilities === undefined
+      ? undefined
+      : asStringArray(m.adminCapabilities, where, "adminCapabilities");
+  const events = asEvents(m.events, where);
+  const actions = asActions(m.actions, where);
   let stripPrefix: boolean | undefined;
   if (m.stripPrefix !== undefined) {
     if (typeof m.stripPrefix !== "boolean") {
@@ -423,7 +505,67 @@ export function validateModuleManifest(
   if (stripPrefix !== undefined) {
     (out as { stripPrefix?: boolean }).stripPrefix = stripPrefix;
   }
+  if (focus !== undefined) (out as { focus?: ModuleFocus }).focus = focus;
+  if (configUiUrl !== undefined) (out as { configUiUrl?: string }).configUiUrl = configUiUrl;
+  if (adminCapabilities !== undefined) {
+    (out as { adminCapabilities?: readonly string[] }).adminCapabilities = adminCapabilities;
+  }
+  if (events !== undefined) (out as { events?: readonly ModuleEvent[] }).events = events;
+  if (actions !== undefined) (out as { actions?: readonly ModuleAction[] }).actions = actions;
   return out;
+}
+
+const MODULE_FOCUS_VALUES = new Set<ModuleFocus>(["core", "experimental"]);
+
+function asFocus(v: unknown, where: string): ModuleFocus | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "string" || !MODULE_FOCUS_VALUES.has(v as ModuleFocus)) {
+    throw new ModuleManifestError(`${where}: "focus" must be "core" | "experimental" if present`);
+  }
+  return v as ModuleFocus;
+}
+
+function asEvents(v: unknown, where: string): readonly ModuleEvent[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) {
+    throw new ModuleManifestError(`${where}: "events" must be an array if present`);
+  }
+  return v.map((raw, i) => {
+    const at = `events[${i}]`;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ModuleManifestError(`${where}: "${at}" must be an object`);
+    }
+    const e = raw as Record<string, unknown>;
+    const out: ModuleEvent = {
+      key: asString(e.key, where, `${at}.key`),
+      title: asString(e.title, where, `${at}.title`),
+    };
+    if (e.filterSchema !== undefined) {
+      (out as { filterSchema?: unknown }).filterSchema = e.filterSchema;
+    }
+    return out;
+  });
+}
+
+function asActions(v: unknown, where: string): readonly ModuleAction[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) {
+    throw new ModuleManifestError(`${where}: "actions" must be an array if present`);
+  }
+  return v.map((raw, i) => {
+    const at = `actions[${i}]`;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ModuleManifestError(`${where}: "${at}" must be an object`);
+    }
+    const a = raw as Record<string, unknown>;
+    const out: ModuleAction = {
+      key: asString(a.key, where, `${at}.key`),
+      title: asString(a.title, where, `${at}.title`),
+    };
+    if (a.inputSchema !== undefined) (out as { inputSchema?: unknown }).inputSchema = a.inputSchema;
+    if (a.provision !== undefined) (out as { provision?: unknown }).provision = a.provision;
+    return out;
+  });
 }
 
 function asManagementUrl(v: unknown, where: string): string | undefined {

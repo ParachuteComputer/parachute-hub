@@ -740,11 +740,21 @@ export interface ModuleUiSubUnit {
  * One row from `GET /api/modules`. Mirrors the snake_case wire shape
  * from `src/api-modules.ts`.
  */
+/** Discovery tier — `core` (headline group) or `experimental` (de-emphasized). */
+export type ModuleFocus = "core" | "experimental";
+
 export interface ModuleListing {
   short: string;
   package: string;
   display_name: string;
   tagline: string;
+  /**
+   * Discovery tier (2026-06-09 modular-UI architecture). `core` modules render
+   * in the headline group; `experimental` modules render de-emphasized in a
+   * separate group — never hidden. Resolved server-side from the module's
+   * `module.json` `focus` (when declared) else hub's default tier map.
+   */
+  focus: ModuleFocus;
   available: boolean;
   installed: boolean;
   installed_version: string | null;

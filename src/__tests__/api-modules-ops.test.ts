@@ -208,11 +208,27 @@ describe("parseModulesPath", () => {
     });
   });
 
-  test("rejects non-curated shorts (no marketplace yet)", () => {
-    // Channel exists in FIRST_PARTY_FALLBACKS but is exploration, not
-    // in CURATED_MODULES — the v0.6 surface refuses to drive it via
-    // /api/modules.
-    expect(parseModulesPath("/api/modules/channel/install")).toBeUndefined();
+  test("accepts any KNOWN module short — channel install now resolves (was the bug)", () => {
+    // Post-2026-06-09 (modular-UI architecture, P2) the install-path gate is
+    // `isKnownModuleShort` (KNOWN_MODULES ∪ FIRST_PARTY_FALLBACKS), NOT the old
+    // CURATED_MODULES whitelist. channel is in FIRST_PARTY_FALLBACKS, so its
+    // install path now resolves — fixing the running-but-uninstallable bug.
+    expect(parseModulesPath("/api/modules/channel/install")).toEqual({
+      short: "channel",
+      rest: "install",
+    });
+    // Other known modules (runner / surface) resolve too.
+    expect(parseModulesPath("/api/modules/runner/install")).toEqual({
+      short: "runner",
+      rest: "install",
+    });
+  });
+
+  test("rejects unknown shorts (the hub itself + genuinely third-party rows)", () => {
+    // `hub` isn't a supervised module (no registry entry) and a random short
+    // has no install package — both still fall through to undefined so the
+    // module-ops switch never acts on them.
+    expect(parseModulesPath("/api/modules/hub/install")).toBeUndefined();
     expect(parseModulesPath("/api/modules/random/install")).toBeUndefined();
   });
 

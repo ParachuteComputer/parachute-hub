@@ -880,6 +880,37 @@ form .field-error {
 }
 
 /*
+ * Experimental tier (2026-06-09 modular-UI architecture). Exploration modules
+ * (channel / runner / …) are grouped + de-emphasized below the core surface —
+ * NEVER hidden. The wrapper drops opacity slightly and adds a top rule so the
+ * boundary reads as "still here, just not the headline." Hover restores full
+ * opacity so the group is fully usable.
+ */
+.modules-experimental {
+  margin-top: 1.25rem;
+  padding-top: 0.75rem;
+  border-top: 1px dashed var(--border, #d0d0d0);
+  opacity: 0.78;
+  transition: opacity 0.15s ease;
+}
+.modules-experimental:hover,
+.modules-experimental:focus-within {
+  opacity: 1;
+}
+.experimental-heading {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.experimental-heading > span.muted {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+}
+
+/*
  * "Install a module" catalog row — visually lighter than the heavier
  * `.module-row` (no status badge, no meta grid, just name + tagline +
  * package + Install). The card lays out as body+actions side by side

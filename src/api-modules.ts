@@ -1,18 +1,25 @@
 /**
  * `GET /api/modules` — admin SPA's module-management surface.
  *
- * Combines three sources into a single per-module row:
+ * Discovery is driven by SELF-REGISTRATION, not a whitelist (2026-06-09
+ * modular-UI architecture, P2). The catalog is the UNION of three sources,
+ * deduped by short name, each row carrying a `focus` tier:
  *
- *   - **Curated availability** — vault, scribe (the launch focus per
- *     Aaron 2026-05-27). The list was previously broader; trimmed for
- *     the launch arc. The Phase-2 marketplace will broaden this; for
- *     now it's hardcoded so the admin UI has a stable "what can I
- *     install?" list even on a fresh container where services.json is
- *     empty.
- *   - **Installed state** — services.json reads (version, installDir).
+ *   - **Known/discoverable registry** — `discoverableShorts()` (KNOWN_MODULES ∪
+ *     FIRST_PARTY_FALLBACKS): every module the hub can resolve a package +
+ *     manifest for, so a fresh container shows the full "what can I install?"
+ *     catalog even with an empty services.json.
+ *   - **Installed state** — services.json reads (version, installDir). Any
+ *     self-registered row surfaces here even if it isn't in the known registry.
  *   - **Supervisor state** — per-module run status (`running` / `stopped`
  *     / `crashed` / `starting` / `restarting`) + pid. Absent when the
  *     hub is in CLI mode (no supervisor injected through HubFetchDeps).
+ *
+ * `focus` ("core" | "experimental") comes from each module's `module.json`
+ * when declared, else `focusForShort`'s default map. The SPA groups core first
+ * + de-emphasizes experimental — it NEVER hides a module. This is what makes a
+ * running, self-registered module (channel) visible + installable; the old
+ * `CURATED_MODULES = ["vault","scribe"]` whitelist made it invisible.
  *
  * Bearer-gated on `parachute:host:auth` to match the rest of `/api/auth/*`
  * and `/api/grants` — the admin SPA mints this scope via
@@ -37,12 +44,21 @@ import {
   type ModuleManifest,
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
-import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES } from "./service-spec.ts";
+import type { ModuleFocus } from "./module-manifest.ts";
+import {
+  FIRST_PARTY_FALLBACKS,
+  KNOWN_MODULES,
+  discoverableShorts,
+  focusForShort,
+  shortNameForManifest,
+} from "./service-spec.ts";
 // `FIRST_PARTY_FALLBACKS` and `KNOWN_MODULES` are both consulted by
 // `lookupModule` below — the former for notes/channel (vendored manifests
 // still required) and the latter for vault/scribe/runner (post-FALLBACK
 // retirement, hub#310). The local helper hides the split from the rest of
-// this file.
+// this file. `discoverableShorts` enumerates their UNION — the
+// self-registration-driven discovery surface that replaced the old
+// `CURATED_MODULES` whitelist (2026-06-09 modular-UI architecture, P2).
 import {
   type UiSubUnit,
   type UiSubUnitStatus,
@@ -52,13 +68,14 @@ import {
 import type { ModuleStartError, ModuleState, Supervisor } from "./supervisor.ts";
 
 /**
- * Resolve a curated module to the display + install bootstrap data the
- * admin SPA renders. Reads from FIRST_PARTY_FALLBACKS (notes / channel)
- * first, KNOWN_MODULES (vault / scribe / runner) second.
+ * Resolve a known module to the display + install bootstrap data the admin SPA
+ * renders. Reads from FIRST_PARTY_FALLBACKS (notes / channel) first,
+ * KNOWN_MODULES (vault / scribe / runner / surface) second.
  *
- * Returns `undefined` if the short isn't curated — `CURATED_MODULES` is a
- * const tuple intersected with both tables, so undefined here is a programmer
- * error (caught by the type system in practice).
+ * Returns `undefined` if the short is in neither table — a genuinely
+ * third-party module discovered only via services.json / the supervisor. The
+ * discovery handler synthesizes a minimal row for those rather than dropping
+ * them (2026-06-09 modular-UI architecture — show all self-registered modules).
  */
 function lookupModule(
   short: string,
@@ -88,31 +105,26 @@ function lookupModule(
 export const API_MODULES_REQUIRED_SCOPE = "parachute:host:auth";
 
 /**
- * Curated module short-names. The admin UI offers exactly these for install
- * + management. Order is the recommended install order (vault first, scribe
- * second).
+ * Recommended fresh-install ORDER for the `core`-tier modules. NO LONGER a
+ * discovery/install whitelist (2026-06-09 modular-UI architecture, P2 —
+ * retired the gating role). Discovery now enumerates the UNION of
+ * `services.json` ∪ `discoverableShorts()` (KNOWN_MODULES ∪
+ * FIRST_PARTY_FALLBACKS) ∪ supervisor, so every self-registered/known
+ * module appears — the channel-not-installed bug (running but invisible)
+ * is gone.
  *
- * Trimmed 2026-05-27 (Aaron-directed launch focus) from the prior set of
- * `["vault", "surface", "notes", "scribe", "runner"]`. The dropped modules
- * are still published on npm and still work — they're just not the focus:
+ * This constant survives only as a sort hint: shorts listed here float to the
+ * top of the `core` group in the given order (vault first, scribe second).
+ * Any `core`-tier module not named here still appears, sorted after these.
+ * The install-path gate (`parseModulesPath`) now accepts any known short via
+ * `isKnownModuleShort`, NOT membership in this tuple.
  *
- *   - `notes` (notes-daemon): retired. Notes-UI now lives at
- *     `notes.parachute.computer` as a hosted SPA — operators don't install
- *     a notes daemon anymore. The npm package `@openparachute/notes-ui`
- *     is a library imported by `parachute-surface` and by custom-surface
- *     builders.
- *   - `surface` (host module): de-emphasized. `@openparachute/surface-client`
- *     remains the canonical library for folks building their own UIs
- *     against a Parachute hub; running the surface-host module on your
- *     own box is no longer the headline path (use notes.parachute.computer
- *     or build your own).
- *   - `runner`: experimental, not in the focus set for launch.
- *
- * Re-adding any of these is one line — keep the list small until use
- * cases demand otherwise.
+ * `CuratedModuleShort` is retained as a loose typed-string key for the
+ * lookup helpers (`getSpec`, `lookupModule`) that consume a short name — it
+ * is no longer a closed enum of the only installable modules.
  */
 export const CURATED_MODULES = ["vault", "scribe"] as const;
-export type CuratedModuleShort = (typeof CURATED_MODULES)[number];
+export type CuratedModuleShort = string;
 
 export interface ApiModulesDeps {
   db: Database;
@@ -186,6 +198,14 @@ interface ModuleWireShape {
   package: string;
   display_name: string;
   tagline: string;
+  /**
+   * Discovery tier (2026-06-09 modular-UI architecture). `core` modules render
+   * in the headline group; `experimental` modules render in a de-emphasized
+   * "Experimental" group below — never hidden. Resolved from the module's
+   * `module.json` `focus` when declared, else `focusForShort`'s default map
+   * (vault/scribe/hub/surface → core, channel/runner/others → experimental).
+   */
+  focus: ModuleFocus;
   available: boolean;
   installed: boolean;
   installed_version: string | null;
@@ -395,34 +415,33 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
     }
   >();
   for (const entry of manifest.services) {
-    // Join services.json rows to CURATED_MODULES by manifestName. The
-    // mapping table lives in lookupModule (which consults both
-    // FIRST_PARTY_FALLBACKS and KNOWN_MODULES) — so a row written by a
-    // self-registered vault / scribe / runner matches even though those
-    // shorts no longer have FALLBACK entries (hub#310).
-    for (const short of CURATED_MODULES) {
-      const m = lookupModule(short);
-      if (m?.manifestName === entry.name) {
-        const value: {
-          version: string;
-          installDir?: string;
-          uis?: Record<string, UiSubUnit>;
-          mountPath?: string;
-        } = { version: entry.version };
-        if (entry.installDir !== undefined) value.installDir = entry.installDir;
-        if (entry.uis !== undefined) value.uis = entry.uis;
-        // First non-`.parachute` path is the module's user-facing mount
-        // (`/app`, `/scribe`, `/vault/<name>`). Used below to resolve
-        // a relative `managementUrl` to a full hub-origin path. Skips
-        // `.parachute` entries because those are protocol mounts, not
-        // user surfaces — every module declares one.
-        const userPath = (entry.paths ?? []).find(
-          (p) => p !== "/.parachute" && !p.startsWith("/.parachute/"),
-        );
-        if (userPath !== undefined) value.mountPath = userPath;
-        installedByShort.set(short, value);
-      }
-    }
+    // Join services.json rows to a short via `shortNameForManifest` — covers
+    // every known module (FIRST_PARTY_FALLBACKS ∪ KNOWN_MODULES ∪ legacy
+    // aliases), so a self-registered channel / runner / surface row matches
+    // and becomes discoverable. Rows whose manifestName resolves to no known
+    // short (genuinely third-party) fall back to the row's own name as the
+    // short — they still surface as installed, de-emphasized (2026-06-09
+    // modular-UI architecture, P2 — discovery from self-registration, not the
+    // CURATED_MODULES whitelist).
+    const short = shortNameForManifest(entry.name) ?? entry.name;
+    const value: {
+      version: string;
+      installDir?: string;
+      uis?: Record<string, UiSubUnit>;
+      mountPath?: string;
+    } = { version: entry.version };
+    if (entry.installDir !== undefined) value.installDir = entry.installDir;
+    if (entry.uis !== undefined) value.uis = entry.uis;
+    // First non-`.parachute` path is the module's user-facing mount
+    // (`/surface`, `/scribe`, `/vault/<name>`). Used below to resolve a
+    // relative `managementUrl` to a full hub-origin path. Skips `.parachute`
+    // entries because those are protocol mounts, not user surfaces — every
+    // module declares one.
+    const userPath = (entry.paths ?? []).find(
+      (p) => p !== "/.parachute" && !p.startsWith("/.parachute/"),
+    );
+    if (userPath !== undefined) value.mountPath = userPath;
+    installedByShort.set(short, value);
   }
 
   // Read each installed module's `.parachute/module.json` so we can
@@ -432,12 +451,16 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   // management_url and the SPA shows the disabled "Open" tooltip.
   const readModuleManifestFn = deps.readModuleManifest ?? defaultReadModuleManifest;
   const managementUrlByShort = new Map<string, string>();
+  // Manifest-declared `focus` per installed short. Prefer this over the default
+  // map when composing the wire shape (2026-06-09 modular-UI architecture).
+  const declaredFocusByShort = new Map<string, ModuleFocus>();
   await Promise.all(
     Array.from(installedByShort.entries()).map(async ([short, value]) => {
       if (!value.installDir) return;
       try {
         const m = await readModuleManifestFn(value.installDir);
         if (!m) return;
+        if (m.focus !== undefined) declaredFocusByShort.set(short, m.focus);
         // Resolution per the module-ui-declaration.md hierarchy:
         // managementUrl > uiUrl. Both are EITHER an absolute
         // http(s) URL OR a relative path. Relative paths are joined
@@ -488,6 +511,17 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
     }
   }
 
+  // Discovery short list = UNION of the bootstrap registries (KNOWN_MODULES ∪
+  // FIRST_PARTY_FALLBACKS via `discoverableShorts`), every services.json row's
+  // short, and every supervised module's short — deduped, preserving registry
+  // order first so the canonical modules lead (2026-06-09 modular-UI
+  // architecture, P2). Every self-registered/known module appears; the
+  // running-but-invisible class (channel) is gone.
+  const discoverySet = new Set<string>(discoverableShorts());
+  for (const short of installedByShort.keys()) discoverySet.add(short);
+  for (const short of stateByShort.keys()) discoverySet.add(short);
+  const discoveryShorts = Array.from(discoverySet);
+
   // Resolve npm dist-tag in parallel — short timeout per request, cache
   // shared across requests so a fast UI poll doesn't slam the registry.
   // Channel-aware: an operator on @rc sees the rc-tagged version as the
@@ -500,9 +534,11 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
 
   const latestByShort = new Map<string, string | null>();
   await Promise.all(
-    CURATED_MODULES.map(async (short) => {
+    discoveryShorts.map(async (short) => {
       const m = lookupModule(short);
       if (!m) {
+        // Third-party module known only from services.json / supervisor — no
+        // npm package to probe.
         latestByShort.set(short, null);
         return;
       }
@@ -519,21 +555,33 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
     }),
   );
 
-  // Compose the wire shape. Curated order is the recommended install order;
-  // installed modules outside the curated list (uncommon — only third-party)
-  // are appended at the end with `available: false`.
-  const modules: ModuleWireShape[] = [];
-  for (const short of CURATED_MODULES) {
+  // Compose one wire row per discovered short. `focus` resolution: the
+  // module's manifest-declared `focus` (when installed + declared) wins; else
+  // the `focusForShort` default map. Sort: `core` group first (with the
+  // CURATED_MODULES recommended-install order floated to the top of that
+  // group), then `experimental` — the SPA renders the two groups; `focus`
+  // never hides a module.
+  const recommendedOrder = new Map<string, number>(
+    (CURATED_MODULES as readonly string[]).map((s, i) => [s, i]),
+  );
+  const rows = discoveryShorts.map((short) => {
     const m = lookupModule(short);
-    if (!m) continue;
     const installed = installedByShort.get(short);
     const state = stateByShort.get(short);
-    modules.push({
+    const focus = focusForShort(short, declaredFocusByShort.get(short));
+    const row: ModuleWireShape = {
       short,
-      package: m.package,
-      display_name: m.displayName,
-      tagline: m.tagline,
-      available: true,
+      // Third-party (no known table entry) → fall back to the short as the
+      // package label + the row's own display fields.
+      package: m?.package ?? short,
+      display_name: m?.displayName ?? short,
+      tagline: m?.tagline ?? "",
+      focus,
+      // `available` historically meant "in the curated install catalog". Every
+      // discovered short is now installable/managed, so it's always true for
+      // known modules; a purely third-party services.json row (no install
+      // package) is not hub-installable → false.
+      available: m !== undefined,
       installed: installed !== undefined,
       installed_version: installed?.version ?? null,
       latest_version: latestByShort.get(short) ?? null,
@@ -543,8 +591,18 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
       install_dir: installed?.installDir ?? null,
       uis: toUisWireShape(installed?.uis),
       management_url: managementUrlByShort.get(short) ?? null,
-    });
-  }
+    };
+    return row;
+  });
+  const focusRank = (f: ModuleFocus): number => (f === "core" ? 0 : 1);
+  rows.sort((a, b) => {
+    if (a.focus !== b.focus) return focusRank(a.focus) - focusRank(b.focus);
+    const ai = recommendedOrder.get(a.short) ?? Number.POSITIVE_INFINITY;
+    const bi = recommendedOrder.get(b.short) ?? Number.POSITIVE_INFINITY;
+    if (ai !== bi) return ai - bi;
+    return a.short.localeCompare(b.short);
+  });
+  const modules: ModuleWireShape[] = rows;
 
   // Every supervised module's run-state — curated AND non-curated (hub#539).
   // Built from the same supervisor.list() snapshot already in `stateByShort`.

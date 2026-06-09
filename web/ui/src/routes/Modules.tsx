@@ -26,7 +26,7 @@
  * serve`). Actions get disabled and a small banner tells the operator
  * to use `parachute install/upgrade/restart` from their shell instead.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type ReactElement, useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { HubUpgradeCard } from "../components/HubUpgradeCard.tsx";
 import { renderOperationError } from "../components/MissingDependencyCard.tsx";
@@ -380,20 +380,26 @@ export function Modules() {
             started.
           </p>
         ) : (
-          <ul className="module-list">
-            {installedModules.map((mod) => (
-              <ModuleRow
-                key={mod.short}
-                module={mod}
-                supervisorAvailable={supervisor_available}
-                syncBusy={Boolean(syncBusy[mod.short])}
-                errorMessage={syncError[mod.short]}
-                onUpgrade={() => void onUpgrade(mod.short)}
-                onRestart={() => void onRestart(mod.short)}
-                onUninstall={() => void onUninstall(mod.short)}
-              />
-            ))}
-          </ul>
+          renderFocusGroups(
+            installedModules,
+            (group) => (
+              <ul className="module-list">
+                {group.map((mod) => (
+                  <ModuleRow
+                    key={mod.short}
+                    module={mod}
+                    supervisorAvailable={supervisor_available}
+                    syncBusy={Boolean(syncBusy[mod.short])}
+                    errorMessage={syncError[mod.short]}
+                    onUpgrade={() => void onUpgrade(mod.short)}
+                    onRestart={() => void onRestart(mod.short)}
+                    onUninstall={() => void onUninstall(mod.short)}
+                  />
+                ))}
+              </ul>
+            ),
+            "installed",
+          )
         )}
       </section>
 
@@ -406,21 +412,62 @@ export function Modules() {
               : "All available modules are installed."}
           </p>
         ) : (
-          <ul className="install-list">
-            {visibleInstallable.map((mod) => (
-              <InstallableCard
-                key={mod.short}
-                module={mod}
-                supervisorAvailable={supervisor_available}
-                installing={installingShorts.has(mod.short)}
-                errorMessage={syncError[mod.short]}
-                onInstall={() => void onInstall(mod.short)}
-              />
-            ))}
-          </ul>
+          renderFocusGroups(
+            visibleInstallable,
+            (group) => (
+              <ul className="install-list">
+                {group.map((mod) => (
+                  <InstallableCard
+                    key={mod.short}
+                    module={mod}
+                    supervisorAvailable={supervisor_available}
+                    installing={installingShorts.has(mod.short)}
+                    errorMessage={syncError[mod.short]}
+                    onInstall={() => void onInstall(mod.short)}
+                  />
+                ))}
+              </ul>
+            ),
+            "installable",
+          )
         )}
       </section>
     </section>
+  );
+}
+
+/**
+ * Split a module list into the `core` group then the `experimental` group,
+ * rendering each via `renderList`. The experimental group gets a subtle
+ * "Experimental" subheading + a de-emphasizing wrapper class — it's grouped
+ * and visually backgrounded, NEVER hidden (2026-06-09 modular-UI architecture:
+ * show all; focus only sorts + de-emphasizes). The server already sorts
+ * core-first, so we just partition.
+ *
+ * `keyPrefix` namespaces the per-group `data-testid` so the installed and
+ * installable sections don't collide (`installed-experimental-group`,
+ * `installable-experimental-group`).
+ */
+function renderFocusGroups(
+  modules: ModuleListing[],
+  renderList: (group: ModuleListing[]) => ReactElement,
+  keyPrefix: string,
+): ReactElement {
+  const core = modules.filter((m) => m.focus !== "experimental");
+  const experimental = modules.filter((m) => m.focus === "experimental");
+  return (
+    <>
+      {core.length > 0 && <div data-testid={`${keyPrefix}-core-group`}>{renderList(core)}</div>}
+      {experimental.length > 0 && (
+        <div className="modules-experimental" data-testid={`${keyPrefix}-experimental-group`}>
+          <h3 className="muted experimental-heading">
+            Experimental{" "}
+            <span className="muted">— exploration modules; not part of the core surface</span>
+          </h3>
+          {renderList(experimental)}
+        </div>
+      )}
+    </>
   );
 }
 

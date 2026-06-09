@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { type ModuleManifest, readModuleManifest } from "./module-manifest.ts";
+import { type ModuleFocus, type ModuleManifest, readModuleManifest } from "./module-manifest.ts";
 import type { ServiceEntry } from "./services-manifest.ts";
 
 /**
@@ -623,6 +623,66 @@ export function effectivePublicExposure(
 
 export function knownServices(): string[] {
   return [...Object.keys(FIRST_PARTY_FALLBACKS), ...Object.keys(KNOWN_MODULES)];
+}
+
+/**
+ * Default discovery tier per short name (2026-06-09 modular-UI architecture).
+ * The hub PREFERS a module's manifest-declared `focus`; this map is the
+ * fallback when `module.json` omits it (and the bootstrap value before a
+ * module is installed). vault / scribe / hub / surface are `core`; everything
+ * else (channel / runner / notes / unknown third-party) defaults to
+ * `experimental`. **Show all; never hide** — `focus` only groups + labels.
+ */
+const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
+  vault: "core",
+  scribe: "core",
+  hub: "core",
+  surface: "core",
+  channel: "experimental",
+  runner: "experimental",
+  notes: "experimental",
+};
+
+/**
+ * Resolve a short name's discovery tier. When `declared` (the module's
+ * `module.json` `focus`) is present it wins; otherwise fall back to
+ * `FOCUS_DEFAULTS`, defaulting any unlisted short to `experimental`. Never
+ * returns undefined — the Modules screen always has a tier to group by.
+ */
+export function focusForShort(short: string, declared?: ModuleFocus): ModuleFocus {
+  if (declared !== undefined) return declared;
+  return FOCUS_DEFAULTS[short] ?? "experimental";
+}
+
+/**
+ * The set of short names the hub knows how to discover, display, and install
+ * from its bootstrap registries — `KNOWN_MODULES` ∪ `FIRST_PARTY_FALLBACKS`.
+ * This is the SELF-REGISTRATION-driven discovery surface that replaces the old
+ * `CURATED_MODULES` whitelist (2026-06-09 modular-UI architecture, P2): every
+ * module the hub can resolve a package/manifest for is discoverable + installable,
+ * regardless of `focus` tier. Deduped, with FIRST_PARTY_FALLBACKS shorts first
+ * (notes / channel) then KNOWN_MODULES (vault / scribe / runner / surface).
+ *
+ * `notes` is intentionally included — it's still resolvable (vendored fallback)
+ * for legacy installs; it surfaces as `experimental` and isn't pushed as a
+ * fresh install. Callers that want only the "recommended fresh-install" subset
+ * can filter by `focus === "core"`.
+ */
+export function discoverableShorts(): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const short of [...Object.keys(FIRST_PARTY_FALLBACKS), ...Object.keys(KNOWN_MODULES)]) {
+    if (seen.has(short)) continue;
+    seen.add(short);
+    out.push(short);
+  }
+  return out;
+}
+
+/** True iff `short` is a module the hub can resolve a package/manifest for
+ *  (the install-path gate, replacing the `CURATED_MODULES` whitelist). */
+export function isKnownModuleShort(short: string): boolean {
+  return short in FIRST_PARTY_FALLBACKS || short in KNOWN_MODULES;
 }
 
 /**

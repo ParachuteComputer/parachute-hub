@@ -59,6 +59,7 @@ function moduleRow(short: string, overrides: Partial<api.ModuleListing> = {}): a
     package: `@openparachute/${short}`,
     display_name: short.charAt(0).toUpperCase() + short.slice(1),
     tagline: `the ${short} module`,
+    focus: "core",
     available: true,
     installed: false,
     installed_version: null,
@@ -107,6 +108,60 @@ describe("Modules — catalog rendering", () => {
     // Cross-pollination check — taglines from the installable section
     // surface verbatim on the card.
     expect(within(installable).getByText("the notes module")).toBeInTheDocument();
+  });
+
+  it("groups by focus: core leads, experimental is a de-emphasized group (channel installed+experimental)", async () => {
+    // 2026-06-09 modular-UI architecture (P2). channel is the regression case:
+    // running + self-registered, so it arrives installed=true with
+    // focus=experimental — it must render, in the experimental group, with its
+    // lifecycle actions. core modules (vault) lead in their own group.
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        moduleRow("vault", {
+          focus: "core",
+          installed: true,
+          installed_version: "0.4.5",
+          latest_version: "0.4.5",
+          supervisor_status: "running",
+        }),
+        moduleRow("channel", {
+          focus: "experimental",
+          installed: true,
+          installed_version: "0.3.1",
+          latest_version: "0.3.1",
+          supervisor_status: "running",
+        }),
+        moduleRow("runner", { focus: "experimental" }),
+        moduleRow("scribe", { focus: "core" }),
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+
+    const installed = screen.getByTestId("installed-section");
+    const installable = screen.getByTestId("installable-section");
+
+    // Installed section: vault in the core group, channel in the experimental group.
+    const installedCore = within(installed).getByTestId("installed-core-group");
+    const installedExperimental = within(installed).getByTestId("installed-experimental-group");
+    expect(within(installedCore).getByText("Vault")).toBeInTheDocument();
+    expect(within(installedExperimental).getByText("Channel")).toBeInTheDocument();
+    // channel renders with its lifecycle actions (Restart present).
+    expect(
+      within(installedExperimental).getByRole("button", { name: /restart/i }),
+    ).toBeInTheDocument();
+    // The de-emphasized "Experimental" label is visible.
+    expect(within(installed).getAllByText(/experimental/i).length).toBeGreaterThan(0);
+
+    // Installable section: scribe core, runner experimental.
+    const installableCore = within(installable).getByTestId("installable-core-group");
+    const installableExperimental = within(installable).getByTestId(
+      "installable-experimental-group",
+    );
+    expect(within(installableCore).getByText("Scribe")).toBeInTheDocument();
+    expect(within(installableExperimental).getByText("Runner")).toBeInTheDocument();
   });
 
   it("renders the 'no modules installed' empty state when nothing is installed", async () => {

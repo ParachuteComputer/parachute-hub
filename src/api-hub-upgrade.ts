@@ -4,9 +4,10 @@
  *
  * ── WHY A DEDICATED ENDPOINT (not /api/modules/hub/*) ──────────────────────
  *
- * The hub is NOT a supervised module — `CURATED_MODULES` rejects `hub`, so
- * `parseModulesPath("/api/modules/hub/upgrade")` returns undefined and the
- * module-ops switch never reaches a hub case. The hub needs its OWN endpoint
+ * The hub is NOT a supervised module — `parseModulesPath` rejects `hub`
+ * (`isKnownModuleShort("hub")` is false: hub isn't in KNOWN_MODULES /
+ * FIRST_PARTY_FALLBACKS), so `parseModulesPath("/api/modules/hub/upgrade")`
+ * returns undefined and the module-ops switch never reaches a hub case. The hub needs its OWN endpoint
  * because the constraint is unique: the hub can't restart itself synchronously
  * (the request dies with the old process before it can report success). So:
  *

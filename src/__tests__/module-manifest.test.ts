@@ -142,6 +142,92 @@ describe("validateModuleManifest", () => {
     ).toThrow(/http:.*https:/);
   });
 
+  // --- 2026-06-09 modular-UI architecture P1 fields: focus / configUiUrl /
+  //     adminCapabilities / events / actions. All optional + additive. ---
+
+  test("focus accepts core / experimental and rejects anything else", () => {
+    expect(validateModuleManifest({ ...VALID, focus: "core" }, "x").focus).toBe("core");
+    expect(validateModuleManifest({ ...VALID, focus: "experimental" }, "x").focus).toBe(
+      "experimental",
+    );
+    // Absent stays absent (hub falls back to its default map downstream).
+    expect(validateModuleManifest(VALID, "x").focus).toBeUndefined();
+    expect(() => validateModuleManifest({ ...VALID, focus: "headline" }, "x")).toThrow(/focus/);
+    expect(() => validateModuleManifest({ ...VALID, focus: 1 }, "x")).toThrow(/focus/);
+  });
+
+  test("configUiUrl follows the path-or-url shape", () => {
+    expect(
+      validateModuleManifest({ ...VALID, configUiUrl: "/scribe/admin" }, "x").configUiUrl,
+    ).toBe("/scribe/admin");
+    expect(
+      validateModuleManifest({ ...VALID, configUiUrl: "https://cfg.example.com/" }, "x")
+        .configUiUrl,
+    ).toBe("https://cfg.example.com/");
+    expect(() => validateModuleManifest({ ...VALID, configUiUrl: "nope" }, "x")).toThrow(
+      /configUiUrl/,
+    );
+    expect(() => validateModuleManifest({ ...VALID, configUiUrl: "//evil.com" }, "x")).toThrow(
+      /configUiUrl/,
+    );
+  });
+
+  test("adminCapabilities accepts a string array, rejects non-arrays", () => {
+    expect(
+      validateModuleManifest({ ...VALID, adminCapabilities: ["config", "logs"] }, "x")
+        .adminCapabilities,
+    ).toEqual(["config", "logs"]);
+    expect(() => validateModuleManifest({ ...VALID, adminCapabilities: "config" }, "x")).toThrow(
+      /adminCapabilities/,
+    );
+    expect(() => validateModuleManifest({ ...VALID, adminCapabilities: [1, 2] }, "x")).toThrow(
+      /adminCapabilities/,
+    );
+  });
+
+  test("events parse key + title (+ optional filterSchema), reject malformed entries", () => {
+    const m = validateModuleManifest(
+      {
+        ...VALID,
+        events: [
+          { key: "note.created", title: "Note created", filterSchema: { type: "object" } },
+          { key: "note.deleted", title: "Note deleted" },
+        ],
+      },
+      "x",
+    );
+    expect(m.events?.map((e) => e.key)).toEqual(["note.created", "note.deleted"]);
+    expect(m.events?.[0]?.filterSchema).toEqual({ type: "object" });
+    expect(m.events?.[1]?.filterSchema).toBeUndefined();
+    expect(() => validateModuleManifest({ ...VALID, events: "nope" }, "x")).toThrow(/events/);
+    expect(() => validateModuleManifest({ ...VALID, events: [{ title: "no key" }] }, "x")).toThrow(
+      /events\[0\]\.key/,
+    );
+  });
+
+  test("actions parse key + title (+ optional inputSchema / provision), reject malformed entries", () => {
+    const m = validateModuleManifest(
+      {
+        ...VALID,
+        actions: [
+          {
+            key: "message.send",
+            title: "Send message",
+            inputSchema: { type: "object" },
+            provision: { kind: "vault-trigger" },
+          },
+        ],
+      },
+      "x",
+    );
+    expect(m.actions?.[0]?.key).toBe("message.send");
+    expect(m.actions?.[0]?.inputSchema).toEqual({ type: "object" });
+    expect(m.actions?.[0]?.provision).toEqual({ kind: "vault-trigger" });
+    expect(() => validateModuleManifest({ ...VALID, actions: [{ key: "x" }] }, "x")).toThrow(
+      /actions\[0\]\.title/,
+    );
+  });
+
   test("uiUrl accepts a leading-slash path (Phase D)", () => {
     const m = validateModuleManifest({ ...VALID, uiUrl: "/notes" }, "x");
     expect(m.uiUrl).toBe("/notes");
