@@ -43,7 +43,7 @@ import {
   readConnections,
   removeConnection,
 } from "./connections-store.ts";
-import { signAccessToken } from "./jwt-sign.ts";
+import { recordTokenMint, revokeTokenByJti, signAccessToken } from "./jwt-sign.ts";
 import type { ModuleAction, ModuleEvent, ModuleManifest } from "./module-manifest.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
@@ -227,8 +227,17 @@ function listConnections(deps: ConnectionsDeps): Response {
     // Provenance (modular-UI R2). Records written before R2 carry no
     // `requestedBy`; project them as the default so the SPA grouping is total.
     requested_by: c.requestedBy ?? DEFAULT_REQUESTED_BY,
+    // Records provisioned before the registered-mint rule (B0) carry no
+    // mintedJtis — their long-lived tokens were never registered, so teardown
+    // can't revoke them (they ride to their original ~90d expiry).
+    ...(isLegacyRecord(c) ? { legacy: true } : {}),
   }));
   return json(200, { ok: true, connections });
+}
+
+/** A record minted before B0 — no registered jtis, tokens unrevocable. */
+function isLegacyRecord(c: ConnectionRecord): boolean {
+  return (c.provisioned?.mintedJtis?.length ?? 0) === 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +400,10 @@ async function createConnection(
     return jsonError(400, "invalid_request", `connection id "${id}" is not a valid identifier`);
   }
 
+  // jtis of the long-lived tokens minted for this connection — persisted on
+  // the record so teardown can revoke them (registered-mint rule).
+  const mintedJtis: string[] = [];
+
   // --- Sink prerequisite (channel reply path), fenced to the channel sink. --
   // Everything below this is general; THIS block is the only sink-specific step.
   // The channel name comes from the action params (`sink.params.channel`) — it
@@ -405,20 +418,21 @@ async function createConnection(
       );
     }
     const prep = await prepareChannelSink(channelName, vault, vaultOrigin, userId, deps);
-    if (prep) return prep; // an error response
+    if (prep.error) return prep.error;
+    mintedJtis.push(prep.replyTokenJti);
   }
 
   // --- Mint the webhook bearer at the action's DECLARED scope. -------------
   let webhookBearer: string;
   try {
-    webhookBearer = (
-      await mint(deps, userId, {
-        scopes: [action.scope],
-        audience: audienceForScope(action.scope, sinkModule),
-        vaultScope: [],
-        ttlSeconds: WEBHOOK_BEARER_TTL_SECONDS,
-      })
-    ).token;
+    const signed = await mint(deps, userId, {
+      scopes: [action.scope],
+      audience: audienceForScope(action.scope, sinkModule),
+      vaultScope: [],
+      ttlSeconds: WEBHOOK_BEARER_TTL_SECONDS,
+    });
+    webhookBearer = signed.token;
+    mintedJtis.push(signed.jti);
   } catch (err) {
     return stepError("mint_webhook_bearer", err);
   }
@@ -457,7 +471,7 @@ async function createConnection(
     id,
     source: sourceRec,
     sink: sinkRec,
-    provisioned: { type: "vault-trigger", vault, triggerName },
+    provisioned: { type: "vault-trigger", vault, triggerName, mintedJtis },
     createdAt: (deps.now?.() ?? new Date()).toISOString(),
     requestedBy,
   };
@@ -481,7 +495,9 @@ async function createConnection(
  * `vault:<v>:write` for the channel + writes the `channels.json` entry on the
  * channel daemon so the session can reply. Fenced to `sink.module === "channel"`
  * — this is sink-specific config, not part of the general vault-trigger engine.
- * Returns an error Response on failure, or `null` on success.
+ * Returns `{ error }` on failure, or `{ error: null, replyTokenJti }` on
+ * success — the jti of the long-lived reply token, so the caller can persist
+ * it for teardown revocation.
  */
 async function prepareChannelSink(
   channelName: string,
@@ -489,20 +505,24 @@ async function prepareChannelSink(
   vaultOrigin: string,
   userId: string,
   deps: ConnectionsDeps,
-): Promise<Response | null> {
+): Promise<{ error: Response } | { error: null; replyTokenJti: string }> {
   if (deps.channelOrigin === null) {
-    return jsonError(503, "channel_unavailable", "the channel module is not installed on this hub");
+    return {
+      error: jsonError(
+        503,
+        "channel_unavailable",
+        "the channel module is not installed on this hub",
+      ),
+    };
   }
   const fetchImpl = deps.fetchImpl ?? fetch;
   try {
-    const vaultWriteToken = (
-      await mint(deps, userId, {
-        scopes: [`vault:${vault}:write`],
-        audience: `vault.${vault}`,
-        vaultScope: [vault],
-        ttlSeconds: WEBHOOK_BEARER_TTL_SECONDS, // channel keeps it for its lifetime
-      })
-    ).token;
+    const vaultWriteSigned = await mint(deps, userId, {
+      scopes: [`vault:${vault}:write`],
+      audience: `vault.${vault}`,
+      vaultScope: [vault],
+      ttlSeconds: WEBHOOK_BEARER_TTL_SECONDS, // channel keeps it for its lifetime
+    });
     const channelAdminToken = (
       await mint(deps, userId, {
         scopes: ["channel:admin"],
@@ -520,21 +540,28 @@ async function prepareChannelSink(
       body: JSON.stringify({
         name: channelName,
         transport: "vault",
-        config: { vault, vaultUrl: vaultOrigin, token: vaultWriteToken },
+        config: { vault, vaultUrl: vaultOrigin, token: vaultWriteSigned.token },
       }),
     });
-    if (!res.ok) return stepError("channel_config", await describeRemote(res));
+    if (!res.ok) return { error: stepError("channel_config", await describeRemote(res)) };
+    return { error: null, replyTokenJti: vaultWriteSigned.jti };
   } catch (err) {
-    return stepError("channel_config", err);
+    return { error: stepError("channel_config", err) };
   }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
 // DELETE — teardown
 // ---------------------------------------------------------------------------
 
-async function teardownConnection(
+/**
+ * Tear down one connection by id: deregister the vault trigger, delete the
+ * channel-config entry (channel sinks), revoke the registered long-lived
+ * mints (B0), remove the record. Exported for the vault-delete cascade (B1)
+ * — `admin-vaults.handleDeleteVault` reuses this per matching record so the
+ * cascade and the operator-facing DELETE behave identically.
+ */
+export async function teardownConnection(
   id: string,
   userId: string,
   deps: ConnectionsDeps,
@@ -602,6 +629,29 @@ async function teardownConnection(
       }
     } catch (err) {
       errors.push({ step: "channel_config", detail: errMsg(err) });
+    }
+  }
+
+  // --- Revoke the registered long-lived mints (B0, registered-mint rule). ---
+  // Marks each tokens-registry row revoked → the revocation list at
+  // `/.well-known/parachute-revocation.json` advertises the jtis, and every
+  // resource server (vault, channel) rejects the credential from its next
+  // poll. Runs regardless of remote-teardown outcome — revocation is the safe
+  // direction. Legacy records (provisioned before B0) carry no jtis: teardown
+  // proceeds, but their tokens were never registered and ride to expiry.
+  const mintedJtis = record.provisioned?.mintedJtis ?? [];
+  if (mintedJtis.length === 0) {
+    console.warn(
+      `[connections] connection "${id}" predates registered mints — its provisioned tokens were never registered and ride to their original expiry`,
+    );
+  } else {
+    const now = deps.now?.() ?? new Date();
+    for (const jti of mintedJtis) {
+      try {
+        revokeTokenByJti(deps.db, jti, now);
+      } catch (err) {
+        errors.push({ step: "revoke_mints", detail: `jti ${jti}: ${errMsg(err)}` });
+      }
     }
   }
 
@@ -789,6 +839,17 @@ function sessionUser(req: Request, deps: ConnectionsDeps): { userId: string } {
 
 // --- Mint -------------------------------------------------------------------
 
+/**
+ * TTL boundary between "interactive" mints (used immediately, ride to expiry
+ * by design — the documented ≤10-min unregistered bound) and LONG-LIVED mints,
+ * which MUST be registered in the tokens table so they stay revocable
+ * (hub-module-boundary charter, registered-mint rule). The audit that produced
+ * the rule found this engine minting ~90-day tokens with no registry row — an
+ * unrevocable-by-construction credential (`api-revoke-token` 404s unknown
+ * jtis; the revocation list only carries registered jtis).
+ */
+const REGISTERED_MINT_TTL_THRESHOLD_SECONDS = 10 * 60;
+
 interface MintSpec {
   scopes: string[];
   audience: string;
@@ -798,7 +859,7 @@ interface MintSpec {
 
 async function mint(deps: ConnectionsDeps, userId: string, spec: MintSpec) {
   const sign = deps.signToken ?? signAccessToken;
-  return sign(deps.db, {
+  const signed = await sign(deps.db, {
     sub: userId,
     scopes: spec.scopes,
     audience: spec.audience,
@@ -808,6 +869,21 @@ async function mint(deps: ConnectionsDeps, userId: string, spec: MintSpec) {
     vaultScope: spec.vaultScope,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
+  // Register long-lived mints so they're revocable on teardown. Short-lived
+  // provisioning tokens (60s, consumed inline) stay unregistered by design.
+  if (spec.ttlSeconds > REGISTERED_MINT_TTL_THRESHOLD_SECONDS) {
+    recordTokenMint(deps.db, {
+      jti: signed.jti,
+      createdVia: "connection_provision",
+      subject: "connection",
+      userId,
+      clientId: PROVISION_CLIENT_ID,
+      scopes: spec.scopes,
+      expiresAt: signed.expiresAt,
+      ...(deps.now !== undefined ? { now: deps.now } : {}),
+    });
+  }
+  return signed;
 }
 
 // --- Response helpers -------------------------------------------------------

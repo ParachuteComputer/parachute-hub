@@ -77,10 +77,12 @@ export interface AccountVaultAdminTokenDeps {
   hubOrigin: string;
   /**
    * The vault's declared `managementUrl` (from its `.parachute/module.json`),
-   * resolved by the route handler at request time. Either an absolute URL or a
-   * path relative to the vault's mounted URL. Defaults to `/admin/` (vault's
-   * canonical value) when the handler can't resolve one — that's where the
-   * admin sibling's deep-link lands too.
+   * resolved by the route handler at request time. Resolved per the B4
+   * unified semantics (http(s):// verbatim · leading-`/` origin-absolute ·
+   * relative joined under the vault's mounted URL; the literal legacy
+   * `"/admin/"` mount-joins via the one-release compat shim). Defaults to
+   * `"admin/"` (vault's canonical per-instance value) when the handler can't
+   * resolve one — that's where the admin sibling's deep-link lands too.
    */
   managementUrl?: string;
   /** Test seam for the clock (mint). */
@@ -94,17 +96,43 @@ function htmlResponse(body: string, status = 200, extra: Record<string, string> 
   });
 }
 
+/** One-time deprecation log for the legacy `"/admin/"` managementUrl (B4 compat shim). */
+let warnedLegacyManagementUrl = false;
+
 /**
  * Resolve a vault's `managementUrl` against the vault's hub-mounted URL.
- * Absolute URL → returned verbatim; path → joined onto the vault URL after
- * trimming a trailing slash. Mirrors `resolveManagementUrl` in the SPA's
- * `web/ui/src/lib/api.ts` so hub-server and SPA deep-links agree.
+ * Unified URL-resolution semantics (B4 of the 2026-06-09 hub-module-boundary
+ * migration) — mirrors `resolveManagementUrl` in the SPA's
+ * `web/ui/src/lib/api.ts` so hub-server and SPA deep-links agree:
+ *
+ *   - Absolute http(s) URL → verbatim.
+ *   - Leading-`/` path → ORIGIN-ABSOLUTE: resolved against the vault URL's
+ *     origin (not joined under the vault mount).
+ *   - Relative path (no leading slash, e.g. `"admin/"`) → the PER-INSTANCE
+ *     form: joined under the vault's mounted URL
+ *     (`<origin>/vault/<name>/admin/`).
+ *
+ * COMPAT SHIM (one release — remove once vault's new manifest reaches
+ * @latest): the literal legacy `"/admin"`/`"/admin/"` is the OLD per-instance
+ * relative declaration deployed vaults still ship; it joins under the vault
+ * URL (the pre-B4 behavior) with a one-time deprecation log.
  */
 function resolveManagementUrl(vaultUrl: string, managementUrl: string): string {
   if (/^https?:\/\//i.test(managementUrl)) return managementUrl;
   const base = vaultUrl.replace(/\/+$/, "");
-  const tail = managementUrl.startsWith("/") ? managementUrl : `/${managementUrl}`;
-  return `${base}${tail}`;
+  if (managementUrl === "/admin" || managementUrl === "/admin/") {
+    if (!warnedLegacyManagementUrl) {
+      warnedLegacyManagementUrl = true;
+      console.warn(
+        `account-vault-admin-token: vault declares the legacy per-instance managementUrl ${JSON.stringify(managementUrl)}; joining under the vault URL for one release. New semantics: relative ("admin/") = per-instance join, leading-"/" = origin-absolute. Upgrade the vault module to clear this.`,
+      );
+    }
+    return `${base}${managementUrl}`;
+  }
+  if (managementUrl.startsWith("/")) {
+    return new URL(managementUrl, `${base}/`).toString();
+  }
+  return `${base}/${managementUrl}`;
 }
 
 export async function handleAccountVaultAdminTokenPost(
@@ -224,14 +252,15 @@ export async function handleAccountVaultAdminTokenPost(
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
 
-  // Build the redirect target: <vault-url><managementUrl>#token=<jwt>. The
+  // Build the redirect target: <vault-url>/<managementUrl>#token=<jwt>. The
   // vault URL is the hub-mounted path (`<hubOrigin>/vault/<name>`); the
-  // managementUrl (default `/admin/`) is the vault admin SPA entry point. The
-  // JWT rides the URL fragment — never sent to the server — exactly as the hub
-  // SPA's "Manage" button does (vault PR #219).
+  // managementUrl (default `"admin/"` — the per-instance relative form under
+  // the B4 semantics) is the vault admin SPA entry point. The JWT rides the
+  // URL fragment — never sent to the server — exactly as the hub SPA's
+  // "Manage" button does (vault PR #219).
   const trimmedOrigin = deps.hubOrigin.replace(/\/+$/, "");
   const vaultUrl = `${trimmedOrigin}/vault/${vaultName}`;
-  const target = resolveManagementUrl(vaultUrl, deps.managementUrl ?? "/admin/");
+  const target = resolveManagementUrl(vaultUrl, deps.managementUrl ?? "admin/");
   const sep = target.includes("#") ? "&" : "#";
   const location = `${target}${sep}token=${minted.token}`;
 

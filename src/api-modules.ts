@@ -483,18 +483,20 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
         if (!m) return;
         if (m.focus !== undefined) declaredFocusByShort.set(short, m.focus);
         // Resolution per the module-ui-declaration.md hierarchy:
-        // managementUrl > uiUrl. Both are EITHER an absolute
-        // http(s) URL OR a relative path. Relative paths are joined
-        // against the module's mount path (entry.paths[0]) since both
-        // surfaces conventionally live under it (vault's `/admin`,
-        // app's `/admin`). Absolute URLs pass through verbatim.
-        const resolvedManagement = resolveModuleUrl(m.managementUrl ?? m.uiUrl, value.mountPath);
+        // managementUrl > uiUrl. Unified semantics (B4): http(s):// verbatim ·
+        // leading-"/" = origin-absolute verbatim · relative = joined under the
+        // module's mount path (entry.paths[0]) — the per-instance form.
+        const resolvedManagement = resolveModuleUrl(
+          m.managementUrl ?? m.uiUrl,
+          value.mountPath,
+          short,
+        );
         if (resolvedManagement !== undefined) managementUrlByShort.set(short, resolvedManagement);
         // The config surface resolves with the SAME rule. A module may declare
         // `configUiUrl` independently of `managementUrl` — channel ships
-        // `configUiUrl: "/channel/admin"` (single-instance, already
-        // mount-prefixed) alongside a separate `uiUrl`.
-        const resolvedConfig = resolveModuleUrl(m.configUiUrl, value.mountPath);
+        // `configUiUrl: "/channel/admin"` (single-instance, origin-absolute)
+        // alongside a separate `uiUrl`.
+        const resolvedConfig = resolveModuleUrl(m.configUiUrl, value.mountPath, short);
         if (resolvedConfig !== undefined) configUiUrlByShort.set(short, resolvedConfig);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -724,23 +726,37 @@ function jsonError(status: number, code: string, description: string): Response 
 }
 
 /**
+ * The literal legacy per-instance candidates the COMPAT SHIM recognizes on a
+ * vault entry (see `resolveModuleUrl`). One-release shim — remove once vault's
+ * new manifest (`managementUrl: "admin/"`) reaches @latest.
+ */
+const LEGACY_VAULT_ADMIN_CANDIDATES = new Set(["/admin", "/admin/"]);
+let warnedLegacyVaultAdminCandidate = false;
+
+/**
  * Resolve a module-declared "path or http(s) URL" surface field (`managementUrl`,
  * `uiUrl`, `configUiUrl`) to a full hub-origin path the SPA can navigate to.
  *
+ * Unified URL-resolution semantics (B4 of the 2026-06-09 hub-module-boundary
+ * migration — same doctrine as `buildWellKnown`'s uiUrl branch and the
+ * `resolveManagementUrl` pair):
+ *
  *   - `undefined` candidate → `undefined` (the module didn't declare it).
  *   - Absolute http(s) URL → returned verbatim (off-origin escape hatch).
- *   - Relative path + no mount → `undefined` (can't resolve; the SPA renders
- *     the disabled/omitted state rather than guessing).
- *   - Relative path + mount → joined per the module-ui-declaration.md rule:
- *       · Multi-instance modules (vault) declare a per-instance relative path
- *         (`/admin/`); hub prepends the mount (`/vault/default` + `/admin/`
- *         → `/vault/default/admin/`).
- *       · Single-instance modules (surface, scribe, runner, channel) declare a
- *         full hub-origin path that ALREADY includes the mount (`/surface/admin/`,
- *         `/scribe/admin`, `/channel/admin`); the mount must NOT be prepended
- *         again or the result double-prefixes (the audit bug caught 2026-05-25
- *         on the SPA's Services dropdown). Detected by checking if the candidate
- *         is already mount-prefixed.
+ *   - Leading-`/` path → ORIGIN-ABSOLUTE, returned verbatim. Single-instance
+ *     modules (surface, scribe, runner, channel) declare their full hub-origin
+ *     path this way (`/surface/admin/`, `/scribe/admin`, `/channel/admin`);
+ *     vault's daemon-level surface is `/vault/admin/`.
+ *   - Relative path (no leading slash) → MOUNT-JOINED: the per-instance form
+ *     (`admin/` on a `/vault/default` mount → `/vault/default/admin/`). With
+ *     no mount to join → `undefined` (can't resolve; the SPA renders the
+ *     disabled/omitted state rather than guessing).
+ *
+ * COMPAT SHIM (one release): the literal legacy `"/admin"`/`"/admin/"` on a
+ * VAULT entry is the OLD per-instance relative declaration — deployed vaults
+ * still ship it until the vault wave's manifest lands — and mount-joins with
+ * a one-time deprecation log instead of resolving origin-absolute (which
+ * would point at the daemon-level `/vault/admin` mount, not the instance).
  *
  * Shared by `managementUrl`/`uiUrl` (the Open action) and `configUiUrl` (the
  * Configure action, 2026-06-09 modular-UI architecture P3) so the two resolve
@@ -749,13 +765,24 @@ function jsonError(status: number, code: string, description: string): Response 
 function resolveModuleUrl(
   candidate: string | undefined,
   mount: string | undefined,
+  short: string,
 ): string | undefined {
   if (candidate === undefined) return undefined;
   if (/^https?:\/\//i.test(candidate)) return candidate;
-  if (mount === undefined) return undefined;
-  const tail = candidate.startsWith("/") ? candidate : `/${candidate}`;
-  const alreadyMountPrefixed = tail === mount || tail.startsWith(`${mount}/`);
-  return alreadyMountPrefixed ? tail : `${mount}${tail}`;
+  const mountBase = mount?.replace(/\/+$/, "");
+  if (short === "vault" && LEGACY_VAULT_ADMIN_CANDIDATES.has(candidate)) {
+    if (!warnedLegacyVaultAdminCandidate) {
+      warnedLegacyVaultAdminCandidate = true;
+      console.warn(
+        `api-modules: vault declares the legacy per-instance form ${JSON.stringify(candidate)}; mount-joining for one release. New semantics: relative ("admin/") = per-instance mount-join, leading-"/" = origin-absolute. Upgrade the vault module to clear this.`,
+      );
+    }
+    if (mountBase === undefined) return undefined;
+    return `${mountBase}${candidate}`;
+  }
+  if (candidate.startsWith("/")) return candidate;
+  if (mountBase === undefined) return undefined;
+  return `${mountBase}/${candidate}`;
 }
 
 /**

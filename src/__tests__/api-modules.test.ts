@@ -527,10 +527,12 @@ describe("GET /api/modules", () => {
     expect(scribe?.supervisor_start_error).toBeNull();
   });
 
-  test("populates management_url from a relative managementUrl + module mount (hub#342)", async () => {
-    // Vault declares `managementUrl: "/admin"` in its module.json — hub
-    // resolves that against the entry's mount path (`/vault/default`)
-    // to produce the absolute admin URL the SPA's "Open" button targets.
+  test("populates management_url from a RELATIVE managementUrl + module mount (B4 per-instance form)", async () => {
+    // Vault's new manifest declares `managementUrl: "admin/"` — relative, no
+    // leading slash: the per-instance form under the B4 unified semantics
+    // (2026-06-09 hub-module-boundary). Hub joins it under the entry's mount
+    // path (`/vault/default`) to produce the absolute admin URL the SPA's
+    // "Open" button targets.
     writeManifest(h.manifestPath, [
       {
         name: "parachute-vault",
@@ -561,6 +563,55 @@ describe("GET /api/modules", () => {
             port: 1940,
             paths: ["/vault/default"],
             health: "/health",
+            managementUrl: "admin/",
+          } as unknown as Awaited<
+            ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
+          >;
+        }
+        return null;
+      },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      modules: Array<{ short: string; management_url: string | null }>;
+    };
+    const vault = body.modules.find((m) => m.short === "vault");
+    expect(vault?.management_url).toBe("/vault/default/admin/");
+  });
+
+  test('COMPAT SHIM: the literal legacy "/admin" on a VAULT entry still mount-joins (one release)', async () => {
+    // Deployed vaults still declare `managementUrl: "/admin"` — the OLD
+    // per-instance relative form. Under the new semantics a leading-"/" is
+    // origin-absolute (which would point at the daemon-level /vault/admin
+    // mount, not the instance), so the literal "/admin"/"/admin/" on a vault
+    // entry keeps the old mount-join behavior for one release, with a
+    // deprecation log. Remove the shim once vault's new manifest is @latest.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.4.5",
+        installDir: "/install/dir/vault",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+      readModuleManifest: async (installDir) => {
+        if (installDir === "/install/dir/vault") {
+          return {
+            name: "parachute-vault",
+            manifestName: "parachute-vault",
+            displayName: "Vault",
+            tagline: "",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/health",
             managementUrl: "/admin",
           } as unknown as Awaited<
             ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
@@ -574,15 +625,16 @@ describe("GET /api/modules", () => {
       modules: Array<{ short: string; management_url: string | null }>;
     };
     const vault = body.modules.find((m) => m.short === "vault");
+    // Mount-joined (legacy behavior preserved), NOT origin-absolute "/admin".
     expect(vault?.management_url).toBe("/vault/default/admin");
   });
 
   test("populates config_ui_url from a module's configUiUrl (2026-06-09 modular-UI P3)", async () => {
     // Channel declares `configUiUrl: "/channel/admin"` (a single-instance,
-    // already-mount-prefixed path) + `uiUrl: "/channel/ui"`. The hub surfaces
+    // origin-absolute path) + `uiUrl: "/channel/ui"`. The hub surfaces
     // both: `config_ui_url` drives the Modules page Configure action,
     // `management_url` drives Open. configUiUrl resolves identically to
-    // managementUrl (same path-or-URL + mount-join rule).
+    // managementUrl (same B4 unified semantics).
     writeManifest(h.manifestPath, [
       {
         name: "channel",
@@ -627,7 +679,7 @@ describe("GET /api/modules", () => {
       }>;
     };
     const channel = body.modules.find((m) => m.short === "channel");
-    // Already mount-prefixed — must NOT double-prepend `/channel`.
+    // Origin-absolute — verbatim, never double-prepends `/channel`.
     expect(channel?.config_ui_url).toBe("/channel/admin");
     // uiUrl (no managementUrl) drives the Open action's management_url.
     expect(channel?.management_url).toBe("/channel/ui");
@@ -676,21 +728,14 @@ describe("GET /api/modules", () => {
     expect(vault?.config_ui_url).toBeNull();
   });
 
-  test("management_url does not double-prepend mount when managementUrl is already mount-prefixed (hub#380)", async () => {
-    // Audit caught 2026-05-25: surface declared `managementUrl: "/surface/admin/"`
-    // (full hub-origin path) and `paths: ["/surface", "/.parachute"]`. The
-    // SPA's Services dropdown was navigating to `/surface/surface/admin/`
-    // (404) because api-modules unconditionally prepended the mount onto
-    // the candidate. Fix: detect already-mount-prefixed paths and pass
-    // through.
-    //
-    // Single-instance modules conventionally declare the full path; only
-    // multi-instance modules (vault) use the per-instance relative form.
-    // Post 2026-05-27 CURATED trim the canonical single-instance example
-    // is scribe (when scribe ships a managementUrl — scribe#53). For now
-    // we exercise the same code path with vault declaring an
-    // already-mount-prefixed managementUrl: any module whose declared
-    // URL starts with its mount must pass through unchanged.
+  test("management_url passes a leading-slash path through verbatim (origin-absolute, B4)", async () => {
+    // Historical context (hub#380): surface declared `managementUrl:
+    // "/surface/admin/"` (full hub-origin path) and the resolver
+    // double-prepended the mount (`/surface/surface/admin/` → 404), patched
+    // then by an already-mount-prefixed heuristic. Under the B4 unified
+    // semantics the heuristic is gone: ANY leading-"/" path is
+    // ORIGIN-ABSOLUTE and passes through verbatim (except the vault "/admin"
+    // compat shim) — same result here, simpler rule.
     writeManifest(h.manifestPath, [
       {
         name: "parachute-vault",
@@ -717,8 +762,8 @@ describe("GET /api/modules", () => {
             port: 1940,
             paths: ["/vault/default"],
             health: "/vault/default/health",
-            // Already-mount-prefixed managementUrl — must NOT have the
-            // mount prepended again.
+            // Origin-absolute managementUrl — passes through verbatim,
+            // never gets the mount prepended.
             managementUrl: "/vault/default/admin/",
           } as unknown as Awaited<
             ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
@@ -736,14 +781,12 @@ describe("GET /api/modules", () => {
     expect(vault?.management_url).toBe("/vault/default/admin/");
   });
 
-  test("management_url prefix-ish names don't collide (hub#380 — /app vs /app-foo)", async () => {
-    // The detection uses `tail.startsWith(\`${mount}/\`)` with the trailing
-    // slash specifically to avoid a false positive when a candidate
-    // path looks like a sibling name (e.g. `/app-foo/admin` shouldn't be
-    // treated as "already prefixed by /app"). Without the slash gate,
-    // a future module named `app-foo` would silently inherit the
-    // pass-through behavior and `/app` mount would skip its prepend.
-    // Tests the trailing-slash discriminator stays load-bearing.
+  test("management_url: a leading-slash path NOT under the mount is still origin-absolute (B4 inverts hub#380)", async () => {
+    // INVERTED PIN (B4). Pre-B4 the resolver prepended the mount onto any
+    // leading-"/" candidate that didn't look already-mount-prefixed:
+    // mount=/surface + "/app-foo/admin" → "/surface/app-foo/admin". Under
+    // the unified semantics a leading-"/" is ORIGIN-ABSOLUTE, verbatim —
+    // the module says exactly where its surface lives on the origin.
     writeManifest(h.manifestPath, [
       {
         name: "parachute-vault",
@@ -770,8 +813,8 @@ describe("GET /api/modules", () => {
             port: 1940,
             paths: ["/surface"],
             health: "/surface/health",
-            // candidate looks like a sibling-name prefix but is NOT a
-            // mount-prefix of /app — should still get prepended.
+            // Origin-absolute path outside this module's own mount —
+            // verbatim under B4 (pre-B4 this was mount-prepended).
             managementUrl: "/app-foo/admin",
           } as unknown as Awaited<
             ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
@@ -785,14 +828,13 @@ describe("GET /api/modules", () => {
       modules: Array<{ short: string; management_url: string | null }>;
     };
     const vault = body.modules.find((m) => m.short === "vault");
-    // /surface + /app-foo/admin → /surface/app-foo/admin (prepend fires; not
-    // treated as already-mount-prefixed because /app-foo/ doesn't start with /surface/).
-    expect(vault?.management_url).toBe("/surface/app-foo/admin");
+    // Origin-absolute, verbatim — NOT /surface/app-foo/admin.
+    expect(vault?.management_url).toBe("/app-foo/admin");
   });
 
-  test("management_url equality edge: tail equals mount exactly (hub#380)", async () => {
-    // mount=/foo, candidate=/foo → tail === mount → pass through unchanged.
-    // Not a "real" config but pins the equality branch of the detection.
+  test("management_url equality edge: candidate equals mount exactly", async () => {
+    // mount=/foo, candidate=/foo → origin-absolute, verbatim — same output
+    // as the pre-B4 equality branch, simpler rule.
     writeManifest(h.manifestPath, [
       {
         name: "parachute-vault",

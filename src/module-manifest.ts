@@ -165,12 +165,18 @@ export interface ModuleManifest {
    * Where the module's admin UI lives. Hub renders a "Manage" link when set
    * (see `parachute-patterns/patterns/module-json-extensibility.md`).
    *
-   * Two shapes:
-   *   - A relative path (e.g. `"/admin"`) — hub resolves against the module's
-   *     mounted URL: `<module-url><managementUrl>`. Most first-party modules
-   *     take this path so the admin UI rides the same Tailscale Funnel cap.
-   *   - A full absolute URL — hub uses verbatim. Escape hatch for modules
-   *     whose admin UI is hosted off-origin.
+   * Three shapes (unified URL-resolution semantics — B4 of the 2026-06-09
+   * hub-module-boundary migration):
+   *   - A full http(s) URL — used verbatim. Escape hatch for modules whose
+   *     admin UI is hosted off-origin.
+   *   - A leading-`/` path (e.g. `"/scribe/admin"`) — ORIGIN-ABSOLUTE, used
+   *     verbatim against the hub origin.
+   *   - A relative path (e.g. `"admin/"`) — the PER-INSTANCE form; hub joins
+   *     it under the module's mounted URL: `<module-url>/<managementUrl>`.
+   *
+   * COMPAT SHIM (one release): the literal legacy `"/admin"`/`"/admin/"` on a
+   * vault entry is treated as the old per-instance relative form (mount-join)
+   * — deployed vaults still declare it until the vault wave ships.
    *
    * Absent = no link rendered (CLI-only management). Same back-compat rule
    * as `hasAuth` / `init` / `urlForEntry`.
@@ -633,33 +639,77 @@ function asUiUrl(v: unknown, where: string): string | undefined {
 }
 
 /**
- * Validate a "path or http(s) URL" field. Both `managementUrl` and `uiUrl`
- * follow the same shape per the module-json-extensibility pattern doc;
- * factored so the next URL-shaped field doesn't have to copy-paste.
+ * Validate a "path or http(s) URL" field. `managementUrl`, `uiUrl`, and
+ * `configUiUrl` follow the same shape per the module-json-extensibility
+ * pattern doc; factored so the next URL-shaped field doesn't have to
+ * copy-paste.
+ *
+ * Three valid shapes (unified URL-resolution semantics, B4 of the 2026-06-09
+ * hub-module-boundary migration):
+ *   - a full http(s) URL — resolvers use it verbatim;
+ *   - an origin-absolute path starting with a single "/" — resolvers use it
+ *     verbatim against the hub origin;
+ *   - a RELATIVE path (no leading slash, e.g. `"admin/"`) — the per-instance
+ *     form; resolvers join it under the module's mount. Constrained so it can
+ *     only deepen its mount: no `..` segments, no URL scheme.
+ *
+ * Rejected: protocol-relative forms like `"//evil.com"` — they start with "/"
+ * but `new URL("//evil.com", base)` resolves to the foreign origin, which
+ * would let a malicious module render an off-origin tile and turn the
+ * discovery page into an open-redirect surface.
  */
 function asPathOrUrl(v: unknown, where: string, field: string): string | undefined {
   if (v === undefined) return undefined;
   if (typeof v !== "string" || v.length === 0) {
     throw new ModuleManifestError(`${where}: "${field}" must be a non-empty string if present`);
   }
-  // Two valid shapes: an absolute path starting with a single "/" or a full
-  // http(s) URL. Reject protocol-relative forms like "//evil.com" — they
-  // start with "/" but `new URL("//evil.com", base)` resolves to the foreign
-  // origin, which would let a malicious module render an off-origin tile and
-  // turn the discovery page into an open-redirect surface.
-  if (v.startsWith("/") && !v.startsWith("//")) return v;
-  try {
-    const u = new URL(v);
-    if (u.protocol !== "http:" && u.protocol !== "https:") {
-      throw new ModuleManifestError(`${where}: "${field}" absolute form must use http: or https:`);
-    }
-    return v;
-  } catch (err) {
-    if (err instanceof ModuleManifestError) throw err;
+  if (v.startsWith("//")) {
     throw new ModuleManifestError(
-      `${where}: "${field}" must be a path starting with "/" or a full http(s) URL`,
+      `${where}: "${field}" must not be protocol-relative ("//..." resolves off-origin)`,
     );
   }
+  // Origin-absolute path — verbatim.
+  if (v.startsWith("/")) return v;
+  // Scheme-bearing string — must be a well-formed http(s) URL. Anything else
+  // ("ftp://...", "javascript:...") is rejected rather than smuggled through
+  // as a "relative path".
+  if (/^[a-z][a-z0-9+.-]*:/i.test(v)) {
+    try {
+      const u = new URL(v);
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        throw new ModuleManifestError(
+          `${where}: "${field}" absolute form must use http: or https:`,
+        );
+      }
+      return v;
+    } catch (err) {
+      if (err instanceof ModuleManifestError) throw err;
+      throw new ModuleManifestError(
+        `${where}: "${field}" must be a relative path, a path starting with "/", or a full http(s) URL`,
+      );
+    }
+  }
+  // Relative (per-instance, mount-joined) form. Forbid `..` traversal so a
+  // declared value can only deepen the module's own mount, never escape it.
+  if (v.split("/").some((segment) => segment === "..")) {
+    throw new ModuleManifestError(
+      `${where}: "${field}" relative form must not contain ".." segments`,
+    );
+  }
+  // Forbid backslashes anywhere in the relative form — the simplest closure
+  // of the backslash-traversal quirk: WHATWG URL parsing treats `\` as `/`
+  // in special (http/https) schemes, so `a\..\b` joined under a mount would
+  // normalize to `a/../b` and pop a segment, escaping the `..`-segment check
+  // above. Percent-encoded forms (`..%2f`) need no equivalent guard:
+  // `new URL()` does NOT decode percent-escapes during base-join, so a
+  // `..%2f` stays a literal three-char segment and never traverses (pinned
+  // in module-manifest.test.ts).
+  if (v.includes("\\")) {
+    throw new ModuleManifestError(
+      `${where}: "${field}" relative form must not contain backslashes`,
+    );
+  }
+  return v;
 }
 
 /**

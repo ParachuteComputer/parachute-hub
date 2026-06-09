@@ -27,6 +27,7 @@ import {
   issueInvite,
   listInvites,
   revokeInvite,
+  revokeInvitesForVault,
 } from "../invites.ts";
 import { createUser } from "../users.ts";
 
@@ -177,6 +178,32 @@ describe("revokeInvite", () => {
       const b = issueInvite(db, { createdBy: adminId });
       consumeInvite(db, b.invite.tokenHash, adminId);
       expect(revokeInvite(db, b.invite.tokenHash)).toBe(false); // already used
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("revokeInvitesForVault (B1 cascade step)", () => {
+  test("a NULL-vault_name invite (redeemer-named flow) is NOT revoked by any vault's cascade", async () => {
+    // The cascade invalidates invites PINNED to the deleted vault — an
+    // unpinned invite (vault_name NULL: the redeemer names their own vault)
+    // can't resurrect a specific name, so it must survive every vault's
+    // delete. SQL `vault_name = ?` never matches NULL; pin that boundary.
+    const { db, adminId, cleanup } = await makeDb();
+    try {
+      const unpinned = issueInvite(db, { createdBy: adminId }); // vault_name NULL
+      const pinned = issueInvite(db, { createdBy: adminId, vaultName: "work" });
+
+      expect(revokeInvitesForVault(db, "work")).toBe(1);
+      // The pinned invite is revoked; the unpinned one rides on untouched.
+      expect(findInviteByRawToken(db, pinned.rawToken)?.revokedAt).not.toBeNull();
+      expect(findInviteByRawToken(db, unpinned.rawToken)?.revokedAt).toBeNull();
+
+      // A second sweep (or another vault's sweep) finds nothing more.
+      expect(revokeInvitesForVault(db, "work")).toBe(0);
+      expect(revokeInvitesForVault(db, "other")).toBe(0);
+      expect(findInviteByRawToken(db, unpinned.rawToken)?.revokedAt).toBeNull();
     } finally {
       cleanup();
     }

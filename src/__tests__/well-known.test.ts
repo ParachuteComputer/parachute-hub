@@ -361,21 +361,41 @@ describe("buildWellKnown", () => {
     expect(notesSvc?.uiUrl).toBe("https://x.example/notes");
   });
 
-  // Workstream C (patterns#96): vault declares `uiUrl: "/admin/"` as a
-  // per-instance path. buildWellKnown applies the per-instance mount-path
-  // prefix on emission, yielding one tile per vault instance pointing at
-  // `<origin>/vault/<name>/admin/`. Non-vault uiUrl behavior is unchanged.
-  test("vault uiUrl is prefixed with the per-instance mount path (single instance)", () => {
+  // B4 unified semantics (2026-06-09 hub-module-boundary): relative
+  // (no leading slash) = the per-instance form, mount-joined per vault
+  // instance; leading-"/" = origin-absolute pass-through. The literal legacy
+  // `"/admin/"` on a vault entry rides the one-release COMPAT SHIM
+  // (mount-join + deprecation log) because deployed vaults still declare it.
+  test("vault RELATIVE uiUrl mount-joins per instance (B4 per-instance form)", () => {
     const doc = buildWellKnown({
       services: [vault],
       canonicalOrigin: "https://x.example",
-      uiUrlFor: () => "/admin/",
+      uiUrlFor: () => "admin/",
     });
     const svc = doc.services.find((s) => s.name === "parachute-vault");
     expect(svc?.uiUrl).toBe("https://x.example/vault/default/admin/");
   });
 
-  test("vault uiUrl is prefixed per-instance for multi-path vault entries", () => {
+  test("vault RELATIVE uiUrl mount-joins per instance for multi-path vault entries", () => {
+    const multi: ServiceEntry = { ...vault, paths: ["/vault/default", "/vault/techne"] };
+    const doc = buildWellKnown({
+      services: [multi],
+      canonicalOrigin: "https://x.example",
+      uiUrlFor: () => "admin/",
+    });
+    const rows = doc.services.filter((s) => s.name === "parachute-vault");
+    expect(rows.length).toBe(2);
+    const uiUrls = rows.map((r) => r.uiUrl).sort();
+    expect(uiUrls[0]).toBe("https://x.example/vault/default/admin/");
+    expect(uiUrls[1]).toBe("https://x.example/vault/techne/admin/");
+  });
+
+  test('COMPAT SHIM: vault legacy "/admin/" uiUrl still mount-joins per instance (one release)', () => {
+    // Deployed vaults declare `uiUrl: "/admin/"` (the OLD per-instance form).
+    // Origin-absolute resolution would point every tile at the daemon-level
+    // /vault/admin mount — so the literal "/admin"/"/admin/" keeps the old
+    // mount-join for one release, with a deprecation log. Remove the shim
+    // once vault's new manifest ("admin/") reaches @latest.
     const multi: ServiceEntry = { ...vault, paths: ["/vault/default", "/vault/techne"] };
     const doc = buildWellKnown({
       services: [multi],
@@ -383,10 +403,26 @@ describe("buildWellKnown", () => {
       uiUrlFor: () => "/admin/",
     });
     const rows = doc.services.filter((s) => s.name === "parachute-vault");
-    expect(rows.length).toBe(2);
     const uiUrls = rows.map((r) => r.uiUrl).sort();
     expect(uiUrls[0]).toBe("https://x.example/vault/default/admin/");
     expect(uiUrls[1]).toBe("https://x.example/vault/techne/admin/");
+  });
+
+  test("vault LEADING-SLASH uiUrl (non-shim) is origin-absolute pass-through (B4)", () => {
+    // The daemon-level surface form: `/vault/admin/` resolves against the
+    // origin — NOT per-instance — so a multi-path vault emits the same
+    // daemon-level URL on each row.
+    const multi: ServiceEntry = { ...vault, paths: ["/vault/default", "/vault/techne"] };
+    const doc = buildWellKnown({
+      services: [multi],
+      canonicalOrigin: "https://x.example",
+      uiUrlFor: () => "/vault/admin/",
+    });
+    const rows = doc.services.filter((s) => s.name === "parachute-vault");
+    expect(rows.length).toBe(2);
+    for (const r of rows) {
+      expect(r.uiUrl).toBe("https://x.example/vault/admin/");
+    }
   });
 
   test("vault uiUrl absolute URL still passes through verbatim (no prefix)", () => {

@@ -4098,6 +4098,208 @@ describe("hubFetch publicExposure layer-gate (proxyToVault)", () => {
   });
 });
 
+describe("hubFetch /vault/admin daemon-level mount (B-route, hub-module-boundary)", () => {
+  // /vault/admin + /vault/admin/* route to the vault MODULE's daemon
+  // (resolved via findServiceByShort, not findVaultUpstream) — the
+  // daemon-level multi-vault admin surface, not an instance path. "admin"
+  // is a reserved vault name (B2h) so no instance can ever claim the mount.
+
+  /** Upstream that ECHOES the request path, so the tests can pin both which
+   * daemon got the request and that the FULL path was forwarded (vault's
+   * row declares no stripPrefix). */
+  function startEchoUpstream(tag: string): { port: number; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (r) =>
+        new Response(JSON.stringify({ tag, path: new URL(r.url).pathname }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    return { port: server.port as number, stop: () => server.stop(true) };
+  }
+
+  const fakeServer = (address: string) => ({ requestIP: () => ({ address }) });
+
+  test("/vault/admin and /vault/admin/* route to the vault module's daemon port with the FULL path", async () => {
+    const h = makeHarness();
+    const upstream = startEchoUpstream("vault-daemon");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              // The canonical self-registered row name — findServiceByShort
+              // resolves `parachute-vault` → short "vault".
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.5.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      for (const path of ["/vault/admin", "/vault/admin/", "/vault/admin/assets/app.js"]) {
+        const res = await fetcher(req(path));
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { tag: string; path: string };
+        expect(body.tag).toBe("vault-daemon");
+        // Full path forwarded — no prefix strip (vault routes /vault/admin itself).
+        expect(body.path).toBe(path);
+      }
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("/vault/admin is NOT captured by a per-instance mount — daemon-level route wins", async () => {
+    // A pathological vault row mounted at the bare `/vault` would prefix-match
+    // `/vault/admin` in findVaultUpstream; the daemon-level branch runs FIRST
+    // so the per-vault proxy never sees the path (and no consumer can
+    // fabricate a phantom instance named "admin"). With distinct upstream
+    // ports we can tell exactly which one served the request.
+    const h = makeHarness();
+    const daemonUpstream = startEchoUpstream("vault-daemon");
+    const instanceUpstream = startEchoUpstream("vault-instance");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: daemonUpstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.5.0",
+            },
+            {
+              // Pathological-but-representable bare mount on a second row.
+              name: "parachute-vault-bare",
+              port: instanceUpstream.port,
+              paths: ["/vault"],
+              health: "/vault/health",
+              version: "0.5.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/vault/admin/"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string };
+      expect(body.tag).toBe("vault-daemon");
+    } finally {
+      daemonUpstream.stop();
+      instanceUpstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test('a vault instance named "adminx" still routes per-instance (exact-segment match only)', async () => {
+    const h = makeHarness();
+    const upstream = startEchoUpstream("vault-daemon");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/adminx"],
+              health: "/vault/adminx/health",
+              version: "0.5.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      // Per-instance path — proxied through the per-vault dispatch (full
+      // path forwarded; vault rows don't strip).
+      const res = await fetcher(req("/vault/adminx/health"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { path: string };
+      expect(body.path).toBe("/vault/adminx/health");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("404 cleanly when no vault module is installed", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              // Some other module installed — must not capture /vault/admin.
+              name: "parachute-scribe",
+              port: 1942,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/vault/admin/"));
+      expect(res.status).toBe(404);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test('publicExposure: "loopback" on the vault row cloaks /vault/admin from tailnet/public (same gate as proxyToVault)', async () => {
+    const h = makeHarness();
+    const upstream = startEchoUpstream("vault-daemon");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.5.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      // Tailnet caller → cloaked.
+      const tailnet = await fetcher(
+        req("/vault/admin/", { headers: { "Tailscale-User-Login": "alice@example.com" } }),
+      );
+      expect(tailnet.status).toBe(404);
+      // Public caller → cloaked.
+      const pub = await fetcher(req("/vault/admin/", { headers: { "CF-Ray": "abc123" } }));
+      expect(pub.status).toBe(404);
+      // Header-absent NON-loopback peer (0.0.0.0 bind) → cloaked (#526 posture).
+      const direct = await fetcher(req("/vault/admin/"), fakeServer("198.51.100.4"));
+      expect(direct.status).toBe(404);
+      // Loopback peer → reaches the daemon.
+      const loop = await fetcher(req("/vault/admin/"), fakeServer("127.0.0.1"));
+      expect(loop.status).toBe(200);
+      expect(((await loop.json()) as { tag: string }).tag).toBe("vault-daemon");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+});
+
 /** Find a port that no one is listening on by binding briefly and releasing. */
 async function pickClosedPort(): Promise<number> {
   const s = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("x") });
@@ -5040,6 +5242,50 @@ describe("force-change-password per-request gate (#469)", () => {
           req("/vault/work/notes/abc", { headers: { cookie, accept: "text/html" } }),
         );
         // Gated BEFORE the proxy ever runs — so this is the gate's 302, not a
+        // proxy 404/502.
+        expect(res.status).toBe(302);
+        expect(res.headers.get("location")).toBe("/account/change-password");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(a) pre-rotation browser GET /vault/admin/ is 302'd to change-password (B-route gate parity)", async () => {
+    // The daemon-level /vault/admin mount applies the SAME per-request
+    // force-change-password gate as the per-vault proxy — a pre-rotation
+    // session can't reach the multi-vault admin surface on an un-rotated
+    // temp password either.
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              // Canonical row name so findServiceByShort would resolve it if
+              // the request ever got past the gate.
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/work"],
+              health: "/vault/work/health",
+              version: "0.5.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const { cookie } = await seedUser(h, db, {
+          passwordChanged: false,
+          assignedVaults: ["work"],
+        });
+        const res = await hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath })(
+          req("/vault/admin/", { headers: { cookie, accept: "text/html" } }),
+        );
+        // Gated BEFORE proxyToVaultAdmin ever runs — the gate's 302, not a
         // proxy 404/502.
         expect(res.status).toBe(302);
         expect(res.headers.get("location")).toBe("/account/change-password");

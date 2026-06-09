@@ -467,6 +467,17 @@ export function setUserVaults(
 }
 
 /**
+ * Vault-delete cascade step (B1, 2026-06-09 hub-module-boundary): drop every
+ * `user_vaults` assignment row for the deleted vault, across all users.
+ * Exact `=` comparison on `vault_name` — no pattern matching. Returns the
+ * number of rows deleted.
+ */
+export function removeVaultAssignments(db: Database, vaultName: string): number {
+  const res = db.prepare("DELETE FROM user_vaults WHERE vault_name = ?").run(vaultName);
+  return Number(res.changes);
+}
+
+/**
  * Updates the password for an existing user. Throws `UserNotFoundError` if
  * the id has no row. Single-user-mode flows look up by username first and
  * pass the resolved id here.

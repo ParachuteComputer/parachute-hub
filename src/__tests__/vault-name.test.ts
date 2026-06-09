@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_VAULT_NAME, validateVaultName } from "../vault-name.ts";
+import { DEFAULT_VAULT_NAME, RESERVED_VAULT_NAMES, validateVaultName } from "../vault-name.ts";
 
 describe("validateVaultName", () => {
   test("accepts lowercase alphanumeric + hyphens/underscores", () => {
@@ -64,10 +64,25 @@ describe("validateVaultName", () => {
     expect(validateVaultName("   ").ok).toBe(false);
   });
 
-  test("rejects the reserved name 'list' (matches vault's reservation)", () => {
-    const result = validateVaultName("list");
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toContain("reserved");
+  test("rejects every consolidated reserved name (B2h: list, new, assets, admin)", () => {
+    // One set for every hub edge — wizard, invite redemption, POST /vaults.
+    // `list` mirrors vault's CLI reservation; `new`/`assets` shadow SPA
+    // routes; `admin` shadows the daemon-level /vault/admin mount (B-route).
+    for (const name of ["list", "new", "assets", "admin"]) {
+      const result = validateVaultName(name);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("reserved");
+    }
+  });
+
+  test("near-miss names of the reserved set still pass (admins, listing, my-admin)", () => {
+    for (const name of ["admins", "listing", "my-admin", "assets2", "newer"]) {
+      expect(validateVaultName(name).ok).toBe(true);
+    }
+  });
+
+  test("RESERVED_VAULT_NAMES is the consolidated four-name set", () => {
+    expect([...RESERVED_VAULT_NAMES].sort()).toEqual(["admin", "assets", "list", "new"]);
   });
 
   test("DEFAULT_VAULT_NAME is 'default'", () => {

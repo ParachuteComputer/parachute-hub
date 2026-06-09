@@ -1,5 +1,7 @@
 /**
  * `POST /vaults` — provision a new vault on the host.
+ * `DELETE /vaults/<name>` — destroy a vault WITH the identity cascade
+ * (B1, 2026-06-09 hub-module-boundary migration — see `handleDeleteVault`).
  *
  * The hub's first authenticated, mutating endpoint. Until now the hub has
  * been a pure issuer; Phase 1 of the vault-config-and-scopes design (D1)
@@ -57,30 +59,29 @@
  */
 import type { Database } from "bun:sqlite";
 import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
+import { type ConnectionsDeps, teardownConnection } from "./admin-connections.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
+import { readConnections } from "./connections-store.ts";
+import { rewriteGrantsRemovingVault } from "./grants.ts";
+import { revokeInvitesForVault } from "./invites.ts";
+import { revokeTokensNamingVault, signAccessToken } from "./jwt-sign.ts";
 import { findService, type readManifest, readManifestLenient } from "./services-manifest.ts";
 import { enrichedPath } from "./spawn-path.ts";
-import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
+import { removeVaultAssignments } from "./users.ts";
+import { RESERVED_VAULT_NAMES, VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 import { type WellKnownVaultEntry, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 /** Scope required to call POST /vaults. */
 export const HOST_ADMIN_SCOPE = "parachute:host:admin";
 
-/**
- * Mirror parachute-vault's `cmdCreate` validation rules, plus hub-only
- * reservations for SPA-route shadowing. `list` matches the CLI; `new` and
- * `assets` would collide with `/vault/new` (the SPA's create-vault route)
- * and `/vault/assets/*` (the SPA's static asset bundle) respectively, so
- * the hub rejects them at the API edge before a vault under those names
- * can register and capture the proxy path.
- */
 // Lowercase-only (item I) — single source of truth in vault-name.ts. Vault's
 // init enforces `[a-z0-9_-]`; a hub-side `[a-zA-Z0-9_-]` superset let an
 // uppercased name through that vault would then lowercase or reject, drifting
-// the hub's idea of the vault from vault's. The hub-only reservations (`new`,
-// `assets`) shadow SPA routes and stay on top of vault's `list`.
+// the hub's idea of the vault from vault's. The reserved set is the ONE
+// consolidated `RESERVED_VAULT_NAMES` from vault-name.ts (B2h) — this file
+// used to carry its own `{list, new, assets}` copy that drifted from the
+// `{list}`-only set gating the wizard + invite redemption.
 const VAULT_NAME_PATTERN = VAULT_NAME_CHARSET_RE;
-const RESERVED_VAULT_NAMES = new Set(["list", "new", "assets"]);
 
 export interface CreateVaultRequest {
   name: string;
@@ -503,4 +504,381 @@ export async function handleCreateVault(req: Request, deps: CreateVaultDeps): Pr
     status: 201,
     headers: { "content-type": "application/json" },
   });
+}
+
+// ===========================================================================
+// DELETE /vaults/<name> — the identity cascade (B1, 2026-06-09
+// hub-module-boundary migration: lifecycle symmetry)
+// ===========================================================================
+//
+// "Every provision flow must have a deprovision flow that cascades the
+// identity artifacts it created." Mechanics deletion without identity
+// cascade is a security hole: before B1, vault deletion was CLI-only
+// (`parachute-vault remove`) and left every hub-side identity artifact
+// naming the vault alive — scoped tokens, grants, user assignments, pinned
+// invites, connections. This handler enumerates the full artifact list and
+// handles every entry.
+//
+// Documented bound: short-lived (≤10-min) unregistered interactive mints
+// ride to expiry by design — the cascade revokes persisted registry rows
+// and publishes the revocation list; it does not claim instant revocation
+// of in-flight interactive JWTs.
+
+/** Client id stamped on the short-lived channel-scan mint. */
+const DELETE_VAULT_CLIENT_ID = "parachute-hub-spa";
+/** TTL for the cascade's interactive provisioning mints (channel scan). */
+const DELETE_VAULT_PROVISION_TTL_SECONDS = 60;
+
+export interface DeleteVaultDeps {
+  db: Database;
+  /** Hub origin — JWT `iss` validation + cascade mint issuer. */
+  issuer: string;
+  /** Override the services.json path. Defaults to `~/.parachute/services.json`. */
+  manifestPath?: string;
+  /** Absolute path to `connections.json` in the hub state dir. */
+  connectionsStorePath: string;
+  /** Loopback origin for the channel daemon, or `null` when not installed. */
+  channelOrigin: string | null;
+  /** Resolve a vault's loopback origin from services.json (trigger teardown). */
+  resolveVaultOrigin: (vaultName: string) => string | null;
+  /** Test seam: run `parachute-vault remove` — same Runner seam as create. */
+  runCommand?: CreateVaultDeps["runCommand"];
+  /**
+   * Supervisor-restart the vault module — the daemon-eviction cascade step.
+   * The running daemon caches open store handles, so rmSync alone leaves the
+   * deleted vault SERVING from the open fd; and vault's boot `selfRegister`
+   * rebuilds services.json paths from `listVaults()`, dropping the deleted
+   * path. Wired to the same supervisor machinery the lifecycle verbs use.
+   * Absent (no supervisor — CLI-mode hub, tests) → recorded as a warning in
+   * the response, not silently skipped. (The boundary-conformant per-daemon
+   * store-eviction endpoint is tracked as E9.)
+   */
+  restartVaultModule?: () => Promise<void>;
+  /** Test seam — `globalThis.fetch` in production. */
+  fetchImpl?: typeof fetch;
+  /** Test seam for the clock. */
+  now?: () => Date;
+}
+
+interface DeleteVaultBody {
+  confirm?: unknown;
+}
+
+/** Wire shape of the cascade summary in the 200/500 response. */
+interface CascadeSummary {
+  tokens_revoked: number;
+  grants_rewritten: number;
+  grants_dropped: number;
+  user_vaults_removed: number;
+  invites_invalidated: number;
+  connections_torn_down: number;
+  /**
+   * Vault-backed channel-daemon entries still referencing the deleted vault
+   * AFTER connection teardown (legacy pre-Connections wiring). Surfaced for
+   * the operator — the hub does NOT silently delete channel's config; remove
+   * them from channel's own UI.
+   */
+  orphaned_channels: string[];
+  vault_removed: boolean;
+  module_restarted: boolean;
+}
+
+function emptyCascadeSummary(): CascadeSummary {
+  return {
+    tokens_revoked: 0,
+    grants_rewritten: 0,
+    grants_dropped: 0,
+    user_vaults_removed: 0,
+    invites_invalidated: 0,
+    connections_torn_down: 0,
+    orphaned_channels: [],
+    vault_removed: false,
+    module_restarted: false,
+  };
+}
+
+/** Every vault instance name currently registered in services.json. */
+function listVaultInstanceNames(manifestPath: string): Set<string> {
+  const names = new Set<string>();
+  let manifest: ReturnType<typeof readManifest>;
+  try {
+    manifest = readManifestLenient(manifestPath);
+  } catch {
+    return names;
+  }
+  for (const svc of manifest.services) {
+    if (!isVaultEntry(svc)) continue;
+    if (svc.paths.length === 0) {
+      names.add(vaultInstanceNameFor(svc.name, undefined));
+      continue;
+    }
+    for (const path of svc.paths) names.add(vaultInstanceNameFor(svc.name, path));
+  }
+  return names;
+}
+
+/**
+ * `DELETE /vaults/<name>` — destroy a vault with the full identity cascade.
+ *
+ * Gate: Bearer `parachute:host:admin` (same gate as create). Body MUST carry
+ * `{"confirm": "<name>"}` — a deliberate retype-the-name guard against
+ * fat-finger disasters (mismatch → 400).
+ *
+ * Refusals:
+ *   - unknown vault → 404;
+ *   - LAST remaining vault → 409. Vault's boot auto-creates `default` at
+ *     zero vaults, so deleting the last one would silently resurrect a fresh
+ *     `default` (with a fresh global API key) — refusing sidesteps the
+ *     resurrection class entirely. The CLI (`parachute-vault remove`) is the
+ *     escape hatch for an operator who really means it.
+ *   - RESERVED names are deliberately ALLOWED (no reserved-name gate): a
+ *     squatted `admin`/`new`/`assets` vault created before the B2h
+ *     reservation must be removable through this endpoint.
+ *
+ * Cascade, in order (identity first, mechanics last — revocation is the safe
+ * direction if a later step fails):
+ *   1. tokens-registry sweep (exact scope-segment match — never SQL LIKE);
+ *   2. grants rewrite (drop `vault:<name>:*` entries; drop the row only when
+ *      it empties — a (user,client) grant can span multiple vaults);
+ *   3. `user_vaults` rows;
+ *   4. unredeemed invites pinned to the vault (redemption would resurrect
+ *      the name);
+ *   5. connections whose source/provisioned vault is the deleted vault
+ *      (via `teardownConnection`, which post-B0 also revokes the registered
+ *      long-lived mints) + a report-only scan of channel's `/api/channels`
+ *      for legacy vault-backed entries (`orphaned_channels`);
+ *   6. mechanics: shell to `parachute-vault remove <name> --yes` (the module
+ *      CLI stays the single source of truth for vault destruction,
+ *      mirroring create);
+ *   7. daemon eviction: supervisor-restart the vault module (open
+ *      store-handle eviction + `selfRegister` services.json path rebuild).
+ *
+ * Response: 200 with a structured per-step summary (counts +
+ * `orphaned_channels` + warnings). A mechanics failure responds 500 with
+ * the partial summary — the identity artifacts already revoked stay revoked.
+ */
+export async function handleDeleteVault(
+  req: Request,
+  rawName: string,
+  deps: DeleteVaultDeps,
+): Promise<Response> {
+  if (req.method !== "DELETE") {
+    return new Response("method not allowed", { status: 405 });
+  }
+  const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
+  const runCommand = deps.runCommand ?? defaultRunCommand;
+  const now = deps.now?.() ?? new Date();
+
+  // Auth gate: parachute:host:admin — the same gate as POST /vaults.
+  let adminSub: string;
+  try {
+    const auth = await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+    adminSub = auth.sub;
+  } catch (err) {
+    return adminAuthErrorResponse(err as AdminAuthError);
+  }
+
+  // Name shape guard. NOTE: no reserved-name check — see docstring.
+  const name = rawName.trim();
+  if (!VAULT_NAME_PATTERN.test(name)) {
+    return jsonError(
+      400,
+      "invalid_request",
+      "vault name must contain only lowercase letters, numbers, hyphens, and underscores",
+    );
+  }
+
+  // Confirm body — the retype-the-name guard.
+  let body: DeleteVaultBody;
+  try {
+    body = (await req.json()) as DeleteVaultBody;
+  } catch {
+    return jsonError(400, "confirm_mismatch", `body must be JSON: {"confirm": "${name}"}`);
+  }
+  if (!body || typeof body !== "object" || body.confirm !== name) {
+    return jsonError(
+      400,
+      "confirm_mismatch",
+      `deleting a vault requires the body {"confirm": "${name}"} (retype the vault name)`,
+    );
+  }
+
+  // Existence.
+  const existing = findExistingVault(manifestPath, name);
+  if (!existing) {
+    return jsonError(404, "not_found", `no vault named "${name}" on this hub`);
+  }
+
+  // Last-vault refusal (resurrection guard).
+  const instanceNames = listVaultInstanceNames(manifestPath);
+  instanceNames.delete(name);
+  if (instanceNames.size === 0) {
+    return jsonError(
+      409,
+      "last_vault",
+      `"${name}" is the last vault on this hub. Vault's boot auto-creates "default" at zero vaults, so deleting the last one would silently resurrect it with fresh credentials. Create another vault first, or use the CLI (parachute-vault remove ${name} --yes) if you really mean to empty the hub.`,
+    );
+  }
+
+  const summary = emptyCascadeSummary();
+  const warnings: { step: string; detail: string }[] = [];
+
+  // --- 1. Registry sweep: revoke every tokens row naming the vault. --------
+  summary.tokens_revoked = revokeTokensNamingVault(deps.db, name, now);
+
+  // NOTE on `auth_codes.scopes` — the one identity-artifact column from the
+  // charter's enumeration deliberately NOT swept here. Authorization codes
+  // are transient by construction: AUTH_CODE_TTL_SECONDS = 60 (auth-codes.ts)
+  // and single-use. A code naming the deleted vault either (a) expires
+  // unredeemed within the minute, or (b) redeems into tokens whose registry
+  // rows the sweep above already governs — and whose requests the evicted
+  // daemon no longer serves. Sweeping a 60-second-lived table adds a step
+  // with no security delta; same class as the documented ≤10-min
+  // unregistered interactive-mint bound.
+
+  // --- 2. Grants rewrite (drop rows only when emptied). ---------------------
+  const grants = rewriteGrantsRemovingVault(deps.db, name);
+  summary.grants_rewritten = grants.rewritten;
+  summary.grants_dropped = grants.dropped;
+
+  // --- 3. user_vaults assignments. ------------------------------------------
+  summary.user_vaults_removed = removeVaultAssignments(deps.db, name);
+
+  // --- 4. Unredeemed invites pinned to the vault. ----------------------------
+  summary.invites_invalidated = revokeInvitesForVault(deps.db, name, now);
+
+  // --- 5. Connections teardown (+ legacy channel scan, report-only). --------
+  // Runs BEFORE the CLI remove so the vault daemon is still alive to accept
+  // the trigger-deregister calls.
+  const connectionsDeps: ConnectionsDeps = {
+    db: deps.db,
+    hubOrigin: deps.issuer,
+    modules: [], // teardown never consults the catalog
+    resolveVaultOrigin: deps.resolveVaultOrigin,
+    channelOrigin: deps.channelOrigin,
+    storePath: deps.connectionsStorePath,
+    ...(deps.fetchImpl !== undefined ? { fetchImpl: deps.fetchImpl } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  };
+  const records = readConnections(deps.connectionsStorePath).filter(
+    (r) => r.source.vault === name || r.provisioned?.vault === name,
+  );
+  for (const record of records) {
+    try {
+      const res = await teardownConnection(record.id, adminSub, connectionsDeps);
+      if (res.status === 200) {
+        summary.connections_torn_down++;
+      } else {
+        // 207 partial — the record is removed + mints revoked; remote steps
+        // failed. Surface as warnings, count as torn down (the identity side
+        // is done; the operator can clean the remote residue).
+        summary.connections_torn_down++;
+        const out = (await res.json()) as { errors?: { step: string; detail: string }[] };
+        for (const e of out.errors ?? []) {
+          warnings.push({ step: `connection_${record.id}_${e.step}`, detail: e.detail });
+        }
+      }
+    } catch (err) {
+      warnings.push({
+        step: `connection_${record.id}`,
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Legacy channel scan — vault-backed channel entries still referencing the
+  // vault after connection teardown (pre-Connections wiring). REPORT ONLY:
+  // channel's config is the channel module's domain; the operator removes
+  // them from channel's own UI.
+  if (deps.channelOrigin !== null) {
+    try {
+      const fetchImpl = deps.fetchImpl ?? fetch;
+      // Short-lived (60s) — stays below the registered-mint threshold by
+      // design (the documented ≤10-min interactive bound; see B0's
+      // REGISTERED_MINT_TTL_THRESHOLD_SECONDS in admin-connections.ts).
+      const scanToken = (
+        await signAccessToken(deps.db, {
+          sub: adminSub,
+          scopes: ["channel:admin"],
+          audience: "channel",
+          clientId: DELETE_VAULT_CLIENT_ID,
+          issuer: deps.issuer,
+          ttlSeconds: DELETE_VAULT_PROVISION_TTL_SECONDS,
+          vaultScope: [],
+          ...(deps.now !== undefined ? { now: deps.now } : {}),
+        })
+      ).token;
+      const res = await fetchImpl(`${deps.channelOrigin}/api/channels`, {
+        headers: { authorization: `Bearer ${scanToken}`, accept: "application/json" },
+      });
+      if (res.ok) {
+        const listed = (await res.json()) as { channels?: unknown };
+        const rawList = Array.isArray(listed?.channels) ? listed.channels : [];
+        for (const c of rawList) {
+          const row = (c ?? {}) as Record<string, unknown>;
+          if (row.transport === "vault" && row.vault === name && typeof row.name === "string") {
+            summary.orphaned_channels.push(row.name);
+          }
+        }
+      } else {
+        warnings.push({ step: "channel_scan", detail: `channel list returned ${res.status}` });
+      }
+    } catch (err) {
+      warnings.push({
+        step: "channel_scan",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // --- 6. Mechanics: the module CLI is the source of truth for destruction. -
+  try {
+    const result = await runCommand(["parachute-vault", "remove", name, "--yes"]);
+    if (result.exitCode !== 0) {
+      const stderrTail = result.stderr.trim();
+      const tailSuffix = stderrTail ? `: ${stderrTail.slice(-500)}` : "";
+      return jsonError(
+        500,
+        "server_error",
+        `parachute-vault remove ${name} --yes exited with code ${result.exitCode}${tailSuffix} — identity artifacts already revoked (summary: ${JSON.stringify(summary)})`,
+      );
+    }
+    summary.vault_removed = true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return jsonError(
+      500,
+      "server_error",
+      `orchestration failed: ${msg} — identity artifacts already revoked (summary: ${JSON.stringify(summary)})`,
+    );
+  }
+
+  // --- 7. Daemon eviction: supervisor-restart the vault module. -------------
+  if (deps.restartVaultModule) {
+    try {
+      await deps.restartVaultModule();
+      summary.module_restarted = true;
+    } catch (err) {
+      warnings.push({
+        step: "module_restart",
+        detail: `vault module restart failed: ${err instanceof Error ? err.message : String(err)} — the running daemon may still serve the deleted vault from its open store handle until restarted (parachute restart vault)`,
+      });
+    }
+  } else {
+    warnings.push({
+      step: "module_restart",
+      detail:
+        "no supervisor available — restart the vault module (parachute restart vault) to evict the deleted vault's open store handle and refresh services.json",
+    });
+  }
+
+  return new Response(
+    JSON.stringify({
+      ok: true,
+      name,
+      cascade: summary,
+      ...(warnings.length > 0 ? { warnings } : {}),
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
 }

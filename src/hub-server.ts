@@ -43,6 +43,11 @@
  *
  *   # Admin API + bearer-mint surfaces (must precede /admin/* SPA mount).
  *   /vaults                       (POST)       → create vault
+ *   /vaults/<name>                (DELETE)     → destroy vault + identity cascade
+ *                                                 (B1: confirm body, host:admin,
+ *                                                 tokens/grants/user_vaults/invites/
+ *                                                 connections sweep, CLI remove,
+ *                                                 supervisor restart)
  *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /admin/channel-token          (GET)        → channel UI bearer mint (cookie-gated)
@@ -101,6 +106,11 @@
  *   /admin/config*                             → 301 → /admin/vaults (legacy
  *                                                portal retired post-SPA-rework)
  *
+ *   # Vault MODULE daemon-level admin surface (B-route, 2026-06-09
+ *   # hub-module-boundary). Runs BEFORE the per-vault proxy; "admin" is a
+ *   # reserved vault name so no instance can claim the mount.
+ *   /vault/admin, /vault/admin/*               → proxy to the vault module's daemon
+ *
  *   # Per-vault content proxy (user-facing vault data: Notes PWA, MCP, etc.).
  *   /vault/<name>/*                            → proxy to the vault backend
  *
@@ -155,7 +165,7 @@ import {
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleModuleToken } from "./admin-module-token.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
-import { handleCreateVault } from "./admin-vaults.ts";
+import { handleCreateVault, handleDeleteVault } from "./admin-vaults.ts";
 import {
   handleAccountChangePasswordGet,
   handleAccountChangePasswordPost,
@@ -750,6 +760,50 @@ async function proxyToVault(
   // single-vault-per-hub model; if multi-vault-per-hub ever ships, the
   // classifier will need a per-instance key.
   return proxyRequest(req, match.port, "vault", "vault", supervisor, targetPath);
+}
+
+/**
+ * Reverse-proxy `/vault/admin` + `/vault/admin/*` to the vault MODULE's
+ * daemon — the daemon-level multi-vault admin surface (B-route, 2026-06-09
+ * hub-module-boundary migration), NOT a per-instance path.
+ *
+ * Resolution is via `findServiceByShort(services, "vault")` (the canonical
+ * self-registered `parachute-vault` row — same shape as the channelEntry
+ * lookup in the Connections deps), deliberately NOT `findVaultUpstream`:
+ * vault must NOT self-register `/vault/admin` in `paths[]`, because every
+ * consumer that derives instance names from paths (`vaultInstanceNameFor`,
+ * the well-known vaults[] fan-out, `findExistingVault`, the mint
+ * allowlists, the users vault-picker) would fabricate a phantom vault named
+ * "admin". The mount is hub-owned and gated on the B2h `admin` name
+ * reservation, so no real instance can ever claim it.
+ *
+ * Applies the SAME `publicExposure: "loopback"` 404-cloak as `proxyToVault`
+ * (the per-vault proxy's only layer-gate; "allowed"/"auth-required" pass
+ * through and the daemon self-gates). Vault's row declares no `stripPrefix`
+ * — the FULL path forwards, so the daemon's own `/vault/admin` routing
+ * branch (vault wave, B3) serves it.
+ *
+ * Returns `undefined` when no vault module is installed (caller 404s).
+ * NOTE: legacy per-instance rows named `parachute-vault-<name>` don't
+ * resolve through `findServiceByShort` (it only knows the canonical
+ * manifest name) — on such an install this surface 404s until vault's boot
+ * selfRegister rewrites the canonical row, which is the documented
+ * old-install degradation, not a routing hole.
+ */
+async function proxyToVaultAdmin(
+  req: Request,
+  manifestPath: string,
+  supervisor: Supervisor | undefined,
+  peerAddr: string | null,
+): Promise<Response | undefined> {
+  // Lenient — see hub#406 (same posture as proxyToVault).
+  const services = readManifestLenient(manifestPath).services;
+  const entry = findServiceByShort(services, "vault");
+  if (!entry) return undefined;
+  if (effectivePublicExposure(entry) === "loopback" && layerOf(req, peerAddr) !== "loopback") {
+    return new Response("not found", { status: 404 });
+  }
+  return proxyRequest(req, entry.port, "vault", "vault", supervisor);
 }
 
 /**
@@ -2150,6 +2204,46 @@ export function hubFetch(
         });
       }
 
+      // DELETE /vaults/<name> — destroy a vault with the full identity
+      // cascade (B1, 2026-06-09 hub-module-boundary: lifecycle symmetry).
+      // Bearer parachute:host:admin + {"confirm": "<name>"} body. See
+      // admin-vaults.handleDeleteVault for the enumerated cascade.
+      if (pathname.startsWith("/vaults/")) {
+        if (!getDb) return dbNotConfigured();
+        const name = decodeURIComponent(pathname.slice("/vaults/".length));
+        const services = readManifestLenient(manifestPath).services;
+        // Channel's row carries its MANIFEST name — resolve via
+        // findServiceByShort (see the /admin/channels note above).
+        const channelEntry = findServiceByShort(services, "channel");
+        const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
+        const resolveVaultOrigin = (vaultName: string): string | null => {
+          const match = findVaultUpstream(
+            readManifestLenient(manifestPath).services,
+            `/vault/${vaultName}`,
+          );
+          return match ? `http://127.0.0.1:${match.port}` : null;
+        };
+        const supervisor = deps?.supervisor;
+        return handleDeleteVault(req, name, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          manifestPath,
+          connectionsStorePath: deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
+          channelOrigin,
+          resolveVaultOrigin,
+          // Daemon eviction — the same in-process supervisor the lifecycle
+          // verbs drive (module-ops API); restarting vault evicts the open
+          // store handle + re-runs selfRegister (services.json path rebuild).
+          ...(supervisor
+            ? {
+                restartVaultModule: async () => {
+                  await supervisor.restart("vault");
+                },
+              }
+            : {}),
+        });
+      }
+
       // Note: the old `/hub/*` SPA mount has been retired. Known prefixes
       // (`/hub`, `/hub/vaults*`, `/hub/permissions`, `/hub/tokens`) are
       // 301-redirected at the top of dispatch. Any other `/hub/*` path falls
@@ -2850,6 +2944,27 @@ export function hubFetch(
           status: 301,
           headers: { location: "/admin/vaults" },
         });
+      }
+
+      // /vault/admin + /vault/admin/* — the vault MODULE's daemon-level
+      // admin surface (B-route, 2026-06-09 hub-module-boundary). MUST run
+      // BEFORE the per-vault proxy dispatch below: this is a module-level
+      // mount, not an instance path. "admin" is a reserved vault name (B2h)
+      // so no instance can claim it, and `findVaultUpstream` never sees it —
+      // no consumer fabricates a phantom vault named "admin". Exact-segment
+      // match only: a vault instance named e.g. "adminx" still routes
+      // per-instance through the branch below.
+      if (pathname === "/vault/admin" || pathname.startsWith("/vault/admin/")) {
+        // Same per-request force-change-password gate as the per-vault proxy
+        // (P0-1 / hub#469) — a pre-rotation signed-in user can't reach the
+        // multi-vault admin surface on an un-rotated temp password either.
+        if (getDb) {
+          const gate = forceChangePasswordGate(getDb(), req);
+          if (gate) return gate;
+        }
+        const proxied = await proxyToVaultAdmin(req, manifestPath, deps?.supervisor, peerAddr);
+        if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
+        return new Response("not found", { status: 404 });
       }
 
       // /vault/<name>/* — per-vault content proxy. Stays as user-facing
