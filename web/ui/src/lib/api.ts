@@ -1624,10 +1624,13 @@ export interface ProvisionedChannel {
 }
 
 /**
- * GET /admin/channels — list provisioned channels. The hub wraps the channel
- * daemon's own listing as `{ ok, channels: <proxied> }`, and the proxied body
- * is itself `{ channels: [...] }` — so the rows live at `body.channels.channels`.
- * We unwrap defensively (tolerate either nesting) and drop any malformed entry.
+ * GET /admin/channels — list provisioned channels. The hub now PROJECTS each
+ * channel to only `{name, transport, vault}` at its own layer and returns the
+ * flat `{ ok, channels: [...] }` shape (hub-layer field projection — a future
+ * channel version that leaks a token/secret in its list can never be proxied
+ * through). We still unwrap defensively (tolerating the older
+ * `{ channels: { channels: [...] } }` nesting) and drop any malformed entry,
+ * so an SPA built against either hub version keeps working.
  *
  * Unlike the `/api/*` admin endpoints, this is session-cookie-gated (no Bearer);
  * a 401 means the operator's session is gone — we redirect to login and hang the

@@ -463,6 +463,11 @@ function ConnectPanel({
           <code data-testid="channel-launch">{result.connect.launch}</code>
           <CopyButton value={result.connect.launch} />
         </div>
+        <p className="muted" data-testid="channel-launch-warning" style={{ marginTop: "0.4rem" }}>
+          ⚠ This launches Claude Code with unrestricted tool access (
+          <code>--dangerously-skip-permissions</code>) — run it only on a machine/environment you
+          trust for that session.
+        </p>
       </div>
 
       <div style={{ marginTop: "0.75rem" }}>

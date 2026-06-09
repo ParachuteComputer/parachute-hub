@@ -139,7 +139,7 @@ export async function handleChannels(
   const itemName = subPath.startsWith("/") ? decodeURIComponent(subPath.slice(1)) : "";
 
   if (itemName === "" && method === "GET") {
-    return listChannels(deps);
+    return listChannels(deps, session.userId);
   }
   if (itemName === "" && method === "POST") {
     return provisionChannel(req, session.userId, deps);
@@ -168,15 +168,26 @@ async function provisionChannel(
   } catch {
     return jsonError(400, "invalid_request", "request body must be JSON");
   }
-  const channelName = typeof body.channelName === "string" ? body.channelName.trim() : "";
+  const rawChannelName = typeof body.channelName === "string" ? body.channelName.trim() : "";
   const vault = typeof body.vault === "string" ? body.vault.trim() : "";
 
-  if (!CHANNEL_NAME_RE.test(channelName)) {
-    return jsonError(400, "invalid_request", `channelName "${channelName}" is not a valid identifier`);
+  if (!CHANNEL_NAME_RE.test(rawChannelName)) {
+    return jsonError(
+      400,
+      "invalid_request",
+      `channelName "${rawChannelName}" is not a valid identifier`,
+    );
   }
   if (!VAULT_NAME_CHARSET_RE.test(vault)) {
     return jsonError(400, "invalid_request", `vault "${vault}" is not a valid identifier`);
   }
+  // Canonicalize to lowercase AFTER validation. `CHANNEL_NAME_RE` carries the
+  // `i` flag, so mixed-case input is accepted — but the name then becomes a
+  // services.json key, the `channel_inbound_<name>` trigger name, an MCP server
+  // name, and a DELETE-path segment. Case-drift there ("Eng" created, "eng"
+  // deleted) silently desyncs create/delete/connect. Lowercasing once here and
+  // using the normalized value EVERYWHERE keeps all four in lockstep.
+  const channelName = rawChannelName.toLowerCase();
 
   // Step 1 — vault must exist in services.json.
   const vaultOrigin = deps.resolveVaultOrigin(vault);
@@ -309,11 +320,15 @@ export function substituteTrigger(
 
   // Deep-walk strings, substituting placeholders. Keeps the channel as the
   // owner of the trigger SHAPE — the hub only fills the placeholders + bearer.
+  // Constructed objects use a null prototype (`Object.create(null)`) so an
+  // adversarial template carrying a `"__proto__"` (or `"constructor"`) key sets
+  // it as a plain own property rather than invoking the prototype setter — no
+  // prototype pollution even though the channel is currently trusted local code.
   const walk = (v: unknown): unknown => {
     if (typeof v === "string") return replace(v);
     if (Array.isArray(v)) return v.map(walk);
     if (v && typeof v === "object") {
-      const out: Record<string, unknown> = {};
+      const out: Record<string, unknown> = Object.create(null);
       for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = walk(val);
       return out;
     }
@@ -322,12 +337,13 @@ export function substituteTrigger(
 
   const substituted = walk(template) as TriggerTemplate;
   // Fill the inbound webhook URL with the hub-proxied path + the channel:send
-  // bearer the vault re-presents on each inbound callback.
-  substituted.action = {
-    ...substituted.action,
+  // bearer the vault re-presents on each inbound callback. Rebuild `action` on a
+  // null prototype too (same anti-pollution posture) before pinning the two
+  // hub-owned fields.
+  substituted.action = Object.assign(Object.create(null), substituted.action, {
     webhook: `${origin}/channel/api/vault/inbound`,
-    auth: { ...(substituted.action.auth ?? {}), bearer: sendBearer },
-  };
+    auth: Object.assign(Object.create(null), substituted.action.auth ?? {}, { bearer: sendBearer }),
+  });
   return substituted;
 }
 
@@ -335,7 +351,7 @@ export function substituteTrigger(
 // GET — list (proxy channel config API; never tokens)
 // ---------------------------------------------------------------------------
 
-async function listChannels(deps: ChannelsDeps): Promise<Response> {
+async function listChannels(deps: ChannelsDeps, userId: string): Promise<Response> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const channelOrigin = deps.channelOrigin as string;
   // List is operator-only metadata; mint a short channel:admin to read it.
@@ -343,7 +359,7 @@ async function listChannels(deps: ChannelsDeps): Promise<Response> {
   // secrets — see parachute-channel daemon-config-api.)
   let adminToken: string;
   try {
-    adminToken = (await mintAdminListToken(deps)).token;
+    adminToken = (await mintAdminListToken(deps, userId)).token;
   } catch (err) {
     return stepError("mint_tokens", err);
   }
@@ -354,8 +370,22 @@ async function listChannels(deps: ChannelsDeps): Promise<Response> {
     if (!res.ok) {
       return stepError("channel_config", await describeRemote(res));
     }
-    const listed = (await res.json()) as unknown;
-    return json(200, { ok: true, channels: listed });
+    const listed = (await res.json()) as { channels?: unknown };
+    // Belt-and-suspenders projection at the HUB layer: re-shape every listed
+    // channel to ONLY {name, transport, vault}, so a future channel version that
+    // adds a token/secret field to its list response can NEVER be proxied to the
+    // SPA. The channel today never returns secrets here — this guards against a
+    // downstream regression independent of the SPA-side filtering.
+    const rawList = Array.isArray(listed?.channels) ? listed.channels : [];
+    const channels = rawList.map((c) => {
+      const row = (c ?? {}) as Record<string, unknown>;
+      return {
+        name: typeof row.name === "string" ? row.name : null,
+        transport: typeof row.transport === "string" ? row.transport : null,
+        vault: typeof row.vault === "string" ? row.vault : null,
+      };
+    });
+    return json(200, { ok: true, channels });
   } catch (err) {
     return stepError("channel_config", err);
   }
@@ -366,16 +396,24 @@ async function listChannels(deps: ChannelsDeps): Promise<Response> {
 // ---------------------------------------------------------------------------
 
 async function teardownChannel(
-  channelName: string,
+  rawChannelName: string,
   userId: string,
   deps: ChannelsDeps,
 ): Promise<Response> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const channelOrigin = deps.channelOrigin as string;
 
-  if (!CHANNEL_NAME_RE.test(channelName)) {
-    return jsonError(400, "invalid_request", `channel name "${channelName}" is not a valid identifier`);
+  if (!CHANNEL_NAME_RE.test(rawChannelName)) {
+    return jsonError(
+      400,
+      "invalid_request",
+      `channel name "${rawChannelName}" is not a valid identifier`,
+    );
   }
+  // Canonicalize to lowercase — matches the create-side normalization so the
+  // `channel_inbound_<name>` trigger formula + the channel-config key target
+  // exactly what provisioning wrote, regardless of the casing the caller used.
+  const channelName = rawChannelName.toLowerCase();
 
   const errors: { step: string; detail: string }[] = [];
 
@@ -402,7 +440,7 @@ async function teardownChannel(
   // Vault side — DELETE the inbound trigger. We don't know which vault the
   // channel was bound to from the name alone, so derive it from the channel
   // listing (best-effort) and delete `channel_inbound_<name>` on that vault.
-  const vault = await resolveChannelVault(channelName, deps).catch(() => null);
+  const vault = await resolveChannelVault(channelName, deps, userId).catch(() => null);
   if (vault) {
     const vaultOrigin = deps.resolveVaultOrigin(vault);
     if (vaultOrigin) {
@@ -446,10 +484,14 @@ async function teardownChannel(
  * Best-effort: read the channel listing to find which vault `channelName` is
  * bound to. Returns null when the channel isn't listed or carries no vault.
  */
-async function resolveChannelVault(channelName: string, deps: ChannelsDeps): Promise<string | null> {
+async function resolveChannelVault(
+  channelName: string,
+  deps: ChannelsDeps,
+  userId: string,
+): Promise<string | null> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const channelOrigin = deps.channelOrigin as string;
-  const adminToken = (await mintAdminListToken(deps)).token;
+  const adminToken = (await mintAdminListToken(deps, userId)).token;
   const res = await fetchImpl(`${channelOrigin}/api/channels`, {
     headers: { authorization: `Bearer ${adminToken}`, accept: "application/json" },
   });
@@ -485,13 +527,16 @@ async function mint(deps: ChannelsDeps, userId: string, spec: MintSpec) {
   });
 }
 
-/** A short channel:admin token, used for the read-only list/lookup paths. */
-async function mintAdminListToken(deps: ChannelsDeps) {
+/**
+ * A short channel:admin token for the read-only list/lookup paths. `sub` is the
+ * operator's session userId — same subject the POST/DELETE mints use, so every
+ * token this endpoint issues attributes back to the authenticated operator in
+ * the registry (rather than a synthetic "operator" subject).
+ */
+async function mintAdminListToken(deps: ChannelsDeps, userId: string) {
   const sign = deps.signToken ?? signAccessToken;
-  // List/lookup happens with no per-request user in scope beyond the gate; use
-  // a fixed operator subject. The session gate already authorized the caller.
   return sign(deps.db, {
-    sub: "operator",
+    sub: userId,
     scopes: ["channel:admin"],
     audience: CHANNEL_AUDIENCE,
     clientId: PROVISION_CLIENT_ID,

@@ -286,6 +286,69 @@ describe("POST /admin/channels — provision", () => {
     expect((decodeJwt(cfgBody.config.token) as { sub?: string }).sub).toBe(userId);
   });
 
+  test("mixed-case channelName is canonicalized to lowercase EVERYWHERE", async () => {
+    const { cookie } = await adminCookie();
+    const { fetchImpl, calls } = mockFetch({
+      "POST /api/channels": () => ok({ ok: true, name: "eng", transport: "vault", live: true }),
+      "GET /.parachute/config": () => ok({ channels: [], triggerTemplate: TRIGGER_TEMPLATE }),
+      "POST /vault/default/api/triggers": () => ok({ ok: true, name: "channel_inbound_eng" }),
+    });
+    const req = new Request(`${HUB_ORIGIN}/admin/channels`, {
+      method: "POST",
+      headers: { cookie },
+      // Mixed-case input — accepted (the `i`-flag regex passes), then lowercased.
+      body: JSON.stringify({ channelName: "Eng", vault: "default" }),
+    });
+    const res = await handleChannels(req, "", baseDeps(fetchImpl));
+    expect(res.status).toBe(200);
+    const out = (await res.json()) as {
+      channel: string;
+      connect: { mcpAdd: string; launch: string };
+    };
+    // Response channel is lowercased.
+    expect(out.channel).toBe("eng");
+    // Connect lines use the lowercased name.
+    expect(out.connect.mcpAdd).toContain("channel-eng");
+    expect(out.connect.mcpAdd).not.toContain("Eng");
+    expect(out.connect.launch).toContain("server:channel-eng");
+    expect(out.connect.launch).not.toContain("Eng");
+
+    // Channel-config POST writes the lowercased name.
+    const cfgCall = calls.find((c) => c.method === "POST" && c.url.endsWith("/api/channels"));
+    expect((cfgCall!.body as { name: string }).name).toBe("eng");
+
+    // Trigger name is lowercased — so a later DELETE (which reconstructs
+    // `channel_inbound_<lowercased>`) targets exactly this trigger.
+    const trigCall = calls.find(
+      (c) => c.method === "POST" && c.url.endsWith("/vault/default/api/triggers"),
+    );
+    expect((trigCall!.body as { name: string }).name).toBe("channel_inbound_eng");
+  });
+
+  test("mixed-case DELETE targets the lowercased trigger name", async () => {
+    const { cookie } = await adminCookie();
+    const { fetchImpl, calls } = mockFetch({
+      "GET /api/channels": () =>
+        ok({ channels: [{ name: "eng", transport: "vault", vault: "default" }] }),
+      "DELETE /api/channels/eng": () => ok({ ok: true }),
+      "DELETE /vault/default/api/triggers/channel_inbound_eng": () => ok({ ok: true }),
+    });
+    // Caller passes mixed-case "Eng" in the URL segment.
+    const req = new Request(`${HUB_ORIGIN}/admin/channels/Eng`, {
+      method: "DELETE",
+      headers: { cookie },
+    });
+    const res = await handleChannels(req, "/Eng", baseDeps(fetchImpl));
+    expect(res.status).toBe(200);
+    // The channel DELETE + the trigger DELETE both hit the lowercased name.
+    expect(calls.some((c) => c.url.endsWith("/api/channels/eng"))).toBe(true);
+    expect(
+      calls.some((c) =>
+        c.url.endsWith("/vault/default/api/triggers/channel_inbound_eng"),
+      ),
+    ).toBe(true);
+  });
+
   test("unknown vault → 400", async () => {
     const { cookie } = await adminCookie();
     const { fetchImpl, calls } = mockFetch({});
@@ -381,7 +444,7 @@ describe("POST /admin/channels — provision", () => {
 // ---------------------------------------------------------------------------
 
 describe("GET /admin/channels — list", () => {
-  test("proxies the channel listing; never tokens", async () => {
+  test("returns the flat projected listing; never tokens", async () => {
     const { cookie } = await adminCookie();
     const { fetchImpl, calls } = mockFetch({
       "GET /api/channels": () =>
@@ -393,13 +456,68 @@ describe("GET /admin/channels — list", () => {
     });
     const res = await handleChannels(req, "", baseDeps(fetchImpl));
     expect(res.status).toBe(200);
-    const out = (await res.json()) as { ok: boolean; channels: { channels: unknown[] } };
+    // Flat shape: `{ ok, channels: [{name,transport,vault}] }`.
+    const out = (await res.json()) as {
+      ok: boolean;
+      channels: { name: string; transport: string; vault: string }[];
+    };
     expect(out.ok).toBe(true);
+    expect(out.channels).toEqual([{ name: "eng", transport: "vault", vault: "default" }]);
     // The list bearer is channel:admin; the channel GET never returns secrets.
     const getCall = calls.find((c) => c.method === "GET" && c.url.endsWith("/api/channels"));
     expect(scopeOf(getCall!.bearer!)).toEqual(["channel:admin"]);
     expect(JSON.stringify(out)).not.toContain("token");
     expect(JSON.stringify(out)).not.toContain("webhookSecret");
+  });
+
+  test("hub-layer projection strips any extra/secret field a future channel might add", async () => {
+    const { cookie } = await adminCookie();
+    // A hypothetical future channel version leaks a token + webhookSecret in its
+    // list response. The hub must project them OUT before reaching the SPA.
+    const { fetchImpl } = mockFetch({
+      "GET /api/channels": () =>
+        ok({
+          channels: [
+            {
+              name: "eng",
+              transport: "vault",
+              vault: "default",
+              token: "LEAKED-WRITE-JWT",
+              config: { webhookSecret: "LEAKED-SECRET", token: "ALSO-LEAKED" },
+            },
+          ],
+        }),
+    });
+    const req = new Request(`${HUB_ORIGIN}/admin/channels`, {
+      method: "GET",
+      headers: { cookie },
+    });
+    const res = await handleChannels(req, "", baseDeps(fetchImpl));
+    expect(res.status).toBe(200);
+    const out = (await res.json()) as {
+      channels: Record<string, unknown>[];
+    };
+    // Only the three projected keys survive.
+    expect(Object.keys(out.channels[0]!).sort()).toEqual(["name", "transport", "vault"]);
+    const serialized = JSON.stringify(out);
+    expect(serialized).not.toContain("LEAKED-WRITE-JWT");
+    expect(serialized).not.toContain("LEAKED-SECRET");
+    expect(serialized).not.toContain("ALSO-LEAKED");
+    expect(serialized).not.toContain("webhookSecret");
+  });
+
+  test("mintAdminListToken carries the operator's session userId as sub", async () => {
+    const { cookie, userId } = await adminCookie();
+    const { fetchImpl, calls } = mockFetch({
+      "GET /api/channels": () => ok({ channels: [] }),
+    });
+    const req = new Request(`${HUB_ORIGIN}/admin/channels`, {
+      method: "GET",
+      headers: { cookie },
+    });
+    await handleChannels(req, "", baseDeps(fetchImpl));
+    const getCall = calls.find((c) => c.method === "GET" && c.url.endsWith("/api/channels"));
+    expect((decodeJwt(getCall!.bearer!) as { sub?: string }).sub).toBe(userId);
   });
 });
 
@@ -507,5 +625,49 @@ describe("substituteTrigger", () => {
     expect(out.action.send).toBe("json");
     // when-clause is preserved untouched (no placeholders in it here).
     expect(out.when.tags).toEqual(["#channel-message/inbound"]);
+  });
+
+  test("an adversarial template with a __proto__ key does NOT pollute Object.prototype, and the pinned action survives", async () => {
+    const before = ({} as Record<string, unknown>).polluted;
+    expect(before).toBeUndefined();
+
+    // A template carrying a `__proto__` key (both at the top level and nested
+    // inside `action`) that, with a naive `out[k] = ...` over a `{}` object,
+    // would invoke the prototype setter and pollute Object.prototype globally.
+    const adversarial = JSON.parse(
+      JSON.stringify({
+        name: "channel_inbound_<channel>",
+        events: ["created"],
+        when: { tags: ["x"] },
+        action: {
+          webhook: "<hub-origin>/evil",
+          __proto__: { polluted: "yes" },
+        },
+        __proto__: { polluted: "yes" },
+      }),
+      // reviver keeps `__proto__` as an OWN enumerable key (JSON.parse otherwise
+      // also has its own __proto__ handling) — build it explicitly to be safe.
+    ) as Record<string, unknown>;
+    // Force an explicit own `__proto__` data property regardless of parser.
+    Object.defineProperty(adversarial, "__proto__", {
+      value: { polluted: "yes" },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+
+    const out = substituteTrigger(
+      adversarial as never,
+      "eng",
+      HUB_ORIGIN,
+      "SEND_BEARER",
+    );
+
+    // No global pollution — a fresh object still has no `polluted` key.
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    // The hub still pins the webhook + bearer regardless of the malicious input.
+    expect(out.action.webhook).toBe(`${HUB_ORIGIN}/channel/api/vault/inbound`);
+    expect(out.action.auth?.bearer).toBe("SEND_BEARER");
+    expect(out.name).toBe("channel_inbound_eng");
   });
 });

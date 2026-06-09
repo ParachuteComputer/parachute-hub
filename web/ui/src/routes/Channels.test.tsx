@@ -132,6 +132,14 @@ describe("Channels — add a channel", () => {
     expect(screen.getByTestId("channel-launch")).toHaveTextContent(
       "--dangerously-load-development-channels=server:channel-eng",
     );
+    // The launch line carries `--dangerously-skip-permissions`, so a caution
+    // note must render alongside it warning the operator about unrestricted
+    // tool access.
+    const warning = screen.getByTestId("channel-launch-warning");
+    expect(warning).toBeInTheDocument();
+    expect(warning).toHaveTextContent(/unrestricted tool access/i);
+    expect(warning).toHaveTextContent(/--dangerously-skip-permissions/);
+    expect(warning).toHaveTextContent(/trust/i);
   });
 
   it("shows the server error message when provisioning fails", async () => {
