@@ -2279,18 +2279,24 @@ export function hubFetch(
       }
 
       // Generic per-module config-UI bearer mint (2026-06-09 modular-UI
-      // architecture, P3). `<short>:admin` for any known single-audience
-      // module (scribe / runner / surface / channel) — the admin scope each
-      // module-owned config UI needs to call its own endpoints. Cookie-gated
-      // to the first-admin operator, exactly like /admin/channel-token +
-      // /admin/vault-admin-token. Vault is per-instance and routed to
-      // /admin/vault-admin-token/<name> instead.
+      // architecture, P3). `<short>:admin` for any single-audience module —
+      // the admin scope each module-owned config UI needs to call its own
+      // endpoints. Cookie-gated to the first-admin operator, exactly like
+      // /admin/channel-token + /admin/vault-admin-token. Gated on
+      // self-registration (services.json row + readable module.json) with the
+      // bootstrap registries as a fallback (boundary C5) — a genuinely
+      // third-party module mints here with zero hub code changes. Vault is
+      // per-instance and routed to /admin/vault-admin-token/<name> instead.
       if (pathname.startsWith("/admin/module-token/")) {
         if (!getDb) return dbNotConfigured();
         const short = decodeURIComponent(pathname.slice("/admin/module-token/".length));
         return handleModuleToken(req, short, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          // Lenient + per-request — a module that self-registered since hub
+          // boot is mintable without a restart (see hub#406 for lenient).
+          readServices: () => readManifestLenient(manifestPath).services,
+          ...(deps?.readModuleManifest ? { readModuleManifest: deps.readModuleManifest } : {}),
         });
       }
 

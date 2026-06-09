@@ -11,15 +11,19 @@
  *   - 400 for `vault` (per-instance — points at /admin/vault-admin-token/<name>).
  *   - 404 for an unknown short.
  *   - First-admin gate: 403 for a signed-in non-first-admin (friend).
+ *   - Self-registration gate (boundary C5): a genuinely third-party module
+ *     with a services.json row + readable module.json mints; a registered row
+ *     WITHOUT a readable manifest 404s.
  */
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MODULE_TOKEN_TTL_SECONDS, handleModuleToken } from "../admin-module-token.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { validateAccessToken } from "../jwt-sign.ts";
+import type { ServiceEntry } from "../services-manifest.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession, deleteSession } from "../sessions.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { createUser } from "../users.ts";
@@ -72,10 +76,19 @@ function urlFor(short: string): string {
   return `${ISSUER}/admin/module-token/${short}`;
 }
 
+/** Default deps — no services.json rows (registry-only resolution). */
+function depsWith(services: ServiceEntry[] = []): {
+  db: Database;
+  issuer: string;
+  readServices: () => readonly ServiceEntry[];
+} {
+  return { db: harness.db, issuer: ISSUER, readServices: () => services };
+}
+
 describe("handleModuleToken", () => {
   test("401 when no session cookie is present", async () => {
     const req = new Request(urlFor("scribe"));
-    const res = await handleModuleToken(req, "scribe", { db: harness.db, issuer: ISSUER });
+    const res = await handleModuleToken(req, "scribe", depsWith());
     expect(res.status).toBe(401);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("unauthenticated");
@@ -86,14 +99,14 @@ describe("handleModuleToken", () => {
     const sid = cookie.match(/parachute_hub_session=([^;]+)/)?.[1] ?? "";
     deleteSession(harness.db, sid);
     const req = new Request(urlFor("scribe"), { headers: { cookie } });
-    const res = await handleModuleToken(req, "scribe", { db: harness.db, issuer: ISSUER });
+    const res = await handleModuleToken(req, "scribe", depsWith());
     expect(res.status).toBe(401);
   });
 
   test("405 on POST", async () => {
     const { cookie } = await withSession();
     const req = new Request(urlFor("scribe"), { method: "POST", headers: { cookie } });
-    const res = await handleModuleToken(req, "scribe", { db: harness.db, issuer: ISSUER });
+    const res = await handleModuleToken(req, "scribe", depsWith());
     expect(res.status).toBe(405);
   });
 
@@ -104,7 +117,7 @@ describe("handleModuleToken", () => {
       const { cookie, userId } = await withSession();
       rotateSigningKey(harness.db);
       const req = new Request(urlFor(short), { headers: { cookie } });
-      const res = await handleModuleToken(req, short, { db: harness.db, issuer: ISSUER });
+      const res = await handleModuleToken(req, short, depsWith());
       expect(res.status).toBe(200);
       expect(res.headers.get("cache-control")).toBe("no-store");
 
@@ -130,7 +143,7 @@ describe("handleModuleToken", () => {
   test("400 use_vault_admin_token for vault (per-instance)", async () => {
     const { cookie } = await withSession();
     const req = new Request(urlFor("vault"), { headers: { cookie } });
-    const res = await handleModuleToken(req, "vault", { db: harness.db, issuer: ISSUER });
+    const res = await handleModuleToken(req, "vault", depsWith());
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("use_vault_admin_token");
@@ -139,10 +152,7 @@ describe("handleModuleToken", () => {
   test("404 for an unknown short", async () => {
     const { cookie } = await withSession();
     const req = new Request(urlFor("totally-made-up"), { headers: { cookie } });
-    const res = await handleModuleToken(req, "totally-made-up", {
-      db: harness.db,
-      issuer: ISSUER,
-    });
+    const res = await handleModuleToken(req, "totally-made-up", depsWith());
     expect(res.status).toBe(404);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("not_found");
@@ -151,7 +161,7 @@ describe("handleModuleToken", () => {
   test("400 for an invalid identifier", async () => {
     const { cookie } = await withSession();
     const req = new Request(`${ISSUER}/admin/module-token/Not%20Valid`, { headers: { cookie } });
-    const res = await handleModuleToken(req, "Not Valid", { db: harness.db, issuer: ISSUER });
+    const res = await handleModuleToken(req, "Not Valid", depsWith());
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("invalid_request");
@@ -161,9 +171,141 @@ describe("handleModuleToken", () => {
     const { friendCookie } = await withAdminAndFriend();
     rotateSigningKey(harness.db);
     const req = new Request(urlFor("scribe"), { headers: { cookie: friendCookie } });
-    const res = await handleModuleToken(req, "scribe", { db: harness.db, issuer: ISSUER });
+    const res = await handleModuleToken(req, "scribe", depsWith());
     expect(res.status).toBe(403);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("not_admin");
+  });
+
+  // -------------------------------------------------------------------------
+  // Self-registration gate (boundary C5). A genuinely third-party module —
+  // NOT in KNOWN_MODULES / FIRST_PARTY_FALLBACKS — mints when its
+  // services.json row's installDir carries a readable module.json. This is
+  // the charter's third-party test: zero hub code changes to get the mint.
+  // -------------------------------------------------------------------------
+
+  /** Write a real `.parachute/module.json` into a temp install dir. */
+  function writeManifestDir(name: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "phub-module-token-installdir-"));
+    mkdirSync(join(dir, ".parachute"), { recursive: true });
+    writeFileSync(
+      join(dir, ".parachute", "module.json"),
+      JSON.stringify({
+        name,
+        manifestName: name,
+        port: 1947,
+        paths: [`/${name}`],
+        health: `/${name}/health`,
+      }),
+    );
+    return dir;
+  }
+
+  test("200 mints for a self-registered third-party module (row + readable module.json)", async () => {
+    const { cookie, userId } = await withSession();
+    rotateSigningKey(harness.db);
+    const installDir = writeManifestDir("widgets");
+    try {
+      const services: ServiceEntry[] = [
+        {
+          name: "widgets",
+          port: 1947,
+          paths: ["/widgets"],
+          health: "/widgets/health",
+          version: "1.0.0",
+          installDir,
+        },
+      ];
+      const req = new Request(urlFor("widgets"), { headers: { cookie } });
+      const res = await handleModuleToken(req, "widgets", depsWith(services));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { token: string; scopes: string[] };
+      expect(body.scopes).toEqual(["widgets:admin"]);
+      const validated = await validateAccessToken(harness.db, body.token, ISSUER);
+      expect(validated.payload.sub).toBe(userId);
+      expect(validated.payload.aud).toBe("widgets");
+    } finally {
+      rmSync(installDir, { recursive: true, force: true });
+    }
+  });
+
+  test("404 for a registered row whose installDir has NO readable module.json", async () => {
+    const { cookie } = await withSession();
+    rotateSigningKey(harness.db);
+    const emptyDir = mkdtempSync(join(tmpdir(), "phub-module-token-nomanifest-"));
+    try {
+      const services: ServiceEntry[] = [
+        {
+          name: "widgets",
+          port: 1947,
+          paths: ["/widgets"],
+          health: "/widgets/health",
+          version: "1.0.0",
+          installDir: emptyDir,
+        },
+      ];
+      const req = new Request(urlFor("widgets"), { headers: { cookie } });
+      const res = await handleModuleToken(req, "widgets", depsWith(services));
+      expect(res.status).toBe(404);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("not_found");
+    } finally {
+      rmSync(emptyDir, { recursive: true, force: true });
+    }
+  });
+
+  test("404 for a registered row with no installDir at all", async () => {
+    const { cookie } = await withSession();
+    rotateSigningKey(harness.db);
+    const services: ServiceEntry[] = [
+      { name: "widgets", port: 1947, paths: ["/widgets"], health: "/widgets/health", version: "1" },
+    ];
+    const req = new Request(urlFor("widgets"), { headers: { cookie } });
+    const res = await handleModuleToken(req, "widgets", depsWith(services));
+    expect(res.status).toBe(404);
+  });
+
+  test("vault still 400-redirects even when a vault row is registered", async () => {
+    const { cookie } = await withSession();
+    const services: ServiceEntry[] = [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.5.0",
+        installDir: "/tmp/nope",
+      },
+    ];
+    const req = new Request(urlFor("vault"), { headers: { cookie } });
+    const res = await handleModuleToken(req, "vault", depsWith(services));
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("use_vault_admin_token");
+  });
+
+  test("first-party row resolves through the manifest-name map (parachute-channel ↔ channel)", async () => {
+    const { cookie } = await withSession();
+    rotateSigningKey(harness.db);
+    const installDir = writeManifestDir("channel");
+    try {
+      const services: ServiceEntry[] = [
+        {
+          name: "parachute-channel",
+          port: 1941,
+          paths: ["/channel"],
+          health: "/health",
+          version: "0.1.0",
+          installDir,
+        },
+      ];
+      const req = new Request(urlFor("channel"), { headers: { cookie } });
+      const res = await handleModuleToken(req, "channel", depsWith(services));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { scopes: string[] };
+      expect(body.scopes).toEqual(["channel:admin"]);
+    } finally {
+      rmSync(installDir, { recursive: true, force: true });
+    }
   });
 });
