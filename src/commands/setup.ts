@@ -74,7 +74,7 @@ interface ServiceChoice {
   manifestName: string;
   /** Per-service URL composer used in the final-summary banner. Optional. */
   urlForEntry?: (entry: ServiceEntry) => string | undefined;
-  /** Full spec when available (FIRST_PARTY_FALLBACKS shorts: notes / channel). */
+  /** Full spec when available (FIRST_PARTY_FALLBACKS shorts: notes). */
   spec?: ServiceSpec;
 }
 
@@ -114,9 +114,9 @@ function defaultAvailability(): InteractiveAvailability {
  * the service has a row in services.json.
  *
  * The full ServiceSpec is only available pre-install for FIRST_PARTY_FALLBACKS
- * shorts (notes / channel — they carry a vendored manifest). KNOWN_MODULES
- * shorts (vault / scribe / runner) ship `.parachute/module.json` and
- * self-register; pre-install we know manifestName + the urlForEntry quirk
+ * shorts (notes — it carries a vendored manifest). KNOWN_MODULES shorts
+ * (vault / scribe / runner / channel / surface) ship `.parachute/module.json`
+ * and self-register; pre-install we know manifestName + the urlForEntry quirk
  * from `KNOWN_MODULES[short].extras`, which is all the survey/summary needs.
  */
 function surveyServices(manifestPath: string): ServiceChoice[] {

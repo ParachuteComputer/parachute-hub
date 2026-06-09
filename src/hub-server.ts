@@ -894,15 +894,15 @@ async function proxyToService(
   ) {
     return new Response("not found", { status: 404 });
   }
-  // Consult FIRST_PARTY_FALLBACKS as a fallback for `stripPrefix` (#196).
-  // Pre-hub#310, scribe's `stripPrefix: true` lived only in hub's vendored
-  // fallback; post-#310 scribe self-registers with `stripPrefix: true` on
-  // its row, so the entry-based path is authoritative for scribe. The
-  // fallback consultation now matters only for notes / channel
-  // (FIRST_PARTY_FALLBACKS shorts that haven't yet self-registered with
-  // the canonical declaration). Explicit-on-entry still wins; absent →
-  // fallback → false (preserving the keep-prefix default for unknown
-  // services).
+  // Consult FIRST_PARTY_FALLBACKS / KNOWN_MODULES as a fallback for
+  // `stripPrefix` (#196). Pre-hub#310, scribe's `stripPrefix: true` lived
+  // only in hub's vendored fallback; post-#310 scribe (and post-D3 channel)
+  // self-register with `stripPrefix: true` on their rows, so the entry-based
+  // path is authoritative. The registry consultation now matters only for
+  // notes (the remaining FALLBACK short) and legacy rows written before the
+  // module emitted the field (KNOWN_MODULES canonicalStripPrefix).
+  // Explicit-on-entry still wins; absent → fallback → false (preserving the
+  // keep-prefix default for unknown services).
   const stripPrefix = stripPrefixFor(match.entry);
   const targetPath = stripPrefix ? url.pathname.slice(match.mount.length) || "/" : undefined;
   // Resolve canonical short for classification — falls back to the
@@ -917,14 +917,15 @@ async function proxyToService(
 /**
  * Resolve effective `stripPrefix` for a service entry. Explicit on-entry
  * wins; otherwise consult `FIRST_PARTY_FALLBACKS` keyed by short name (for
- * notes / channel — vault/scribe/runner retired their FALLBACK entries in
- * hub#310 and self-register with the canonical `stripPrefix` declaration on
- * their services.json row). `KNOWN_MODULES[short]?.canonicalStripPrefix`
- * is the next fallback — covers the edge case where a self-registering
- * module wrote its row before the `stripPrefix` field was being emitted
- * (e.g. pre-scribe#50 services.json rows). Defaults to `false` — keep the
- * prefix — matching the pre-#196 dispatch behavior for unknown / third-
- * party services.
+ * notes — vault/scribe/runner retired their FALLBACK entries in hub#310,
+ * channel in boundary D3; all self-register with the canonical `stripPrefix`
+ * declaration on their services.json row).
+ * `KNOWN_MODULES[short]?.canonicalStripPrefix` is the next fallback — covers
+ * the edge case where a self-registering module wrote its row before the
+ * `stripPrefix` field was being emitted (e.g. pre-scribe#50 or pre-D3
+ * channel services.json rows). Defaults to `false` — keep the prefix —
+ * matching the pre-#196 dispatch behavior for unknown / third-party
+ * services.
  *
  * For a self-registering KNOWN_MODULES short whose row is missing entirely
  * (uninstalled, never booted), the request never reaches this code path —

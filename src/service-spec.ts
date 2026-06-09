@@ -126,8 +126,8 @@ export interface FirstPartyExtras {
  * The CLI prefers the installed module's own `.parachute/module.json` when
  * present and falls back to this embedded manifest otherwise. The plan is
  * to delete each fallback as its upstream module starts shipping the real
- * file — see the `// FALLBACK: Delete when ...` markers below for the
- * specific upstream reference per entry.
+ * file — see the `// FALLBACK: Delete when ...` marker below for the
+ * specific upstream reference.
  *
  * Third-party modules never have a fallback; they ship `module.json` or
  * the install hard-errors.
@@ -260,7 +260,10 @@ export function composeServiceSpec(opts: {
 //
 // As of 2026-05-21 (hub#310), vault / scribe / runner have all retired their
 // FALLBACK entries: each ships `module.json` AND self-registers its
-// services.json row at boot (vault#356, scribe#50, runner#3). Hub reads the
+// services.json row at boot (vault#356, scribe#50, runner#3). Channel
+// followed in the 2026-06-09 hub-module-boundary migration (D3) — it ships
+// `.parachute/module.json` and self-registers (channel#34 era), so its
+// vendored manifest retired to a KNOWN_MODULES row. Hub reads the
 // canonical fields from services.json (operator-authoritative) and falls
 // through to `<installDir>/.parachute/module.json` when a lifecycle command
 // needs a static manifest. The `KNOWN_MODULES` registry below carries just
@@ -272,11 +275,10 @@ export function composeServiceSpec(opts: {
 // What remains in FIRST_PARTY_FALLBACKS:
 //   - notes: still a frontend with a hub-side static-serve shim (`notes-serve.ts`)
 //     — its startCmd is composed from the services.json entry's port + mount,
-//     which is hub-side logic, not something notes itself runs.
-//   - channel: exploration tier; may retire before it ever ships module.json,
-//     so the vendored fallback is fine.
+//     which is hub-side logic, not something notes itself runs. (The archive
+//     isn't done — notes-daemon Phase 3 retirement hasn't landed.)
 //
-// Both remaining entries keep their "FALLBACK: Delete when …" markers so the
+// The remaining entry keeps its "FALLBACK: Delete when …" marker so the
 // next cleanup pass is a one-grep operation.
 // ---------------------------------------------------------------------------
 
@@ -314,44 +316,24 @@ const NOTES_FALLBACK: FirstPartyFallback = {
   },
 };
 
-// FALLBACK: Delete when @openparachute/channel ships .parachute/module.json
-// (parachute-channel repo: file follow-up after parachute-hub#56 lands;
-// channel is exploration tier — may be retired before module.json ships).
-const CHANNEL_FALLBACK: FirstPartyFallback = {
-  package: "@openparachute/channel",
-  manifest: {
-    name: "channel",
-    manifestName: "parachute-channel",
-    displayName: "Channel",
-    tagline: "Notification fan-out across modules.",
-    port: 1941,
-    paths: ["/channel"],
-    health: "/channel/health",
-    startCmd: ["parachute-channel", "daemon"],
-  },
-  extras: {
-    hasAuth: true,
-  },
-};
-
 /**
  * Vendored manifests + extras for first-party modules that still need them.
  * Indexed by short name (the `parachute install <X>` token).
  *
- * Only notes + channel remain — see the block comment above for the rationale
- * (vault/scribe/runner now self-register and ship their own module.json).
- * Other code paths consult both this table AND `KNOWN_MODULES` (which carries
- * the post-self-register-retirement entries) via the helpers in this file
- * (`shortNameForManifest`, `knownServices`, …).
+ * Only notes remains — see the block comment above for the rationale
+ * (vault/scribe/runner/channel now self-register and ship their own
+ * module.json). Other code paths consult both this table AND `KNOWN_MODULES`
+ * (which carries the post-self-register-retirement entries) via the helpers
+ * in this file (`shortNameForManifest`, `knownServices`, …).
  */
 export const FIRST_PARTY_FALLBACKS: Record<string, FirstPartyFallback> = {
   notes: NOTES_FALLBACK,
-  channel: CHANNEL_FALLBACK,
 };
 
 /**
  * Minimal install-time registry for first-party modules whose FALLBACK has
- * retired (vault / scribe / runner as of hub#310). Hub uses this for:
+ * retired (vault / scribe / runner as of hub#310; channel as of the
+ * 2026-06-09 hub-module-boundary migration, D3). Hub uses this for:
  *
  *   1. **Install bootstrap**: mapping `parachute install <short>` to the npm
  *      package to `bun add -g`. Pre-install there's no module.json on disk
@@ -472,6 +454,31 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
       // hub-issued JWT carrying `runner:admin` scope (see runner's
       // `src/auth.ts`). Surfaces in `parachute status` as auth-required by
       // default, same posture as vault.
+      hasAuth: true,
+    },
+  },
+  channel: {
+    short: "channel",
+    package: "@openparachute/channel",
+    manifestName: "parachute-channel",
+    canonicalPort: 1941,
+    displayName: "Channel",
+    // Mirrors channel's own module.json (the canonical fields below do too —
+    // keep in sync if channel's declaration changes). The retired FALLBACK's
+    // copy ("Notification fan-out across modules.", health "/channel/health",
+    // startCmd ["parachute-channel", "daemon"]) predated channel's
+    // module.json + self-registration and had drifted on all three.
+    tagline: "Chat with your Claude Code sessions — a channel per session.",
+    canonicalPaths: ["/channel"],
+    canonicalHealth: "/health",
+    canonicalStripPrefix: true,
+    extras: {
+      // Backward-compat startCmd for rows without installDir — same rationale
+      // as scribe / vault / runner. The bare binary IS the daemon (channel's
+      // package.json bin maps `parachute-channel` → src/daemon.ts); the old
+      // vendored `["parachute-channel", "daemon"]` subcommand is stale.
+      startCmd: () => ["parachute-channel"],
+      // Channel gates its endpoints behind hub-issued JWTs (channel:* scopes).
       hasAuth: true,
     },
   },
@@ -661,7 +668,7 @@ export function focusForShort(short: string, declared?: ModuleFocus): ModuleFocu
  * `CURATED_MODULES` whitelist (2026-06-09 modular-UI architecture, P2): every
  * module the hub can resolve a package/manifest for is discoverable + installable,
  * regardless of `focus` tier. Deduped, with FIRST_PARTY_FALLBACKS shorts first
- * (notes / channel) then KNOWN_MODULES (vault / scribe / runner / surface).
+ * (notes) then KNOWN_MODULES (vault / scribe / runner / channel / surface).
  *
  * `notes` is intentionally included — it's still resolvable (vendored fallback)
  * for legacy installs; it surfaces as `experimental` and isn't pushed as a
@@ -716,12 +723,12 @@ export function canonicalPortForManifest(manifestName: string): number | undefin
 /**
  * Resolve the runtime spec for a known short name.
  *
- * FIRST_PARTY_FALLBACKS shorts (notes / channel) return a fully-composed
+ * FIRST_PARTY_FALLBACKS shorts (notes) return a fully-composed
  * spec with embedded manifest + extras — the vendored manifest is the
  * source of truth pre-install and the install path preserves it through.
  *
- * KNOWN_MODULES shorts (vault / scribe / runner — post hub#310 FALLBACK
- * retirement) return a **minimal** spec carrying `package`, `manifestName`,
+ * KNOWN_MODULES shorts (vault / scribe / runner / channel / surface — post
+ * FALLBACK retirement) return a **minimal** spec carrying `package`, `manifestName`,
  * and the imperative `extras` fields
  * (`init`, `hasAuth`, `urlForEntry`, `postInstallFooter`). They do NOT carry
  * `startCmd` or `seedEntry` — those come from `<installDir>/.parachute/module.json`
@@ -820,9 +827,9 @@ const LEGACY_MANIFEST_ALIASES: Record<string, string> = {
 };
 
 /** Short name for a given manifest name, e.g. `parachute-vault` → `vault`.
- *  Consults both FIRST_PARTY_FALLBACKS (notes / channel) and KNOWN_MODULES
- *  (vault / scribe / runner — post-FALLBACK-retirement). Returns undefined
- *  for unknown manifests. */
+ *  Consults both FIRST_PARTY_FALLBACKS (notes) and KNOWN_MODULES
+ *  (vault / scribe / runner / channel / surface — post-FALLBACK-retirement).
+ *  Returns undefined for unknown manifests. */
 export function shortNameForManifest(manifestName: string): string | undefined {
   for (const [short, fb] of Object.entries(FIRST_PARTY_FALLBACKS)) {
     if (fb.manifest.manifestName === manifestName) return short;
