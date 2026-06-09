@@ -1,17 +1,32 @@
 /**
  * `GET /admin/channel-token` — exchange a valid admin session cookie for a
- * short-lived JWT carrying `channel:read channel:send`.
+ * short-lived JWT carrying `channel:read channel:send channel:admin`.
  *
- * Why this exists: the Channel chat UI (served behind hub's proxy to a
- * logged-in portal operator) needs a Bearer to talk to channel's API the
- * same way the vault-management and scribe-config SPAs do — receive replies
- * over SSE (`channel:read`) and post a message (`channel:send`). This local
- * session-cookie mint path is the UI's way to acquire that Bearer without
- * running the public `/oauth/authorize` flow.
+ * Why this exists: two channel-owned UIs, both served behind hub's proxy to a
+ * logged-in portal operator, need a Bearer to talk to channel's API the same
+ * way the vault-management and scribe-config SPAs do, without running the
+ * public `/oauth/authorize` flow:
+ *   - The **chat UI** (`/channel/ui`) receives replies over SSE
+ *     (`channel:read`) and posts a message (`channel:send`).
+ *   - The **config/admin UI** (`/channel/admin`, the 2026-06-09 modular-UI
+ *     architecture P3/P4 config surface) lists + edits configured channels via
+ *     `channel:admin`-gated endpoints (`requireScope(SCOPE_ADMIN)` in channel's
+ *     daemon).
  *
- * Scope choice — `channel:read channel:send`, deliberately NOT `channel:write`:
+ * Both UIs fetch this single endpoint (`fetchToken()` against
+ * `/admin/channel-token`), so the minted token carries the union of the scopes
+ * either UI needs. The chat UI simply ignores the extra `channel:admin` scope;
+ * `requireScope` checks for the *presence* of a specific scope, so extra
+ * scopes never break a read/send call. This is what makes the channel config
+ * UI work without re-touching the channel repo — the hub endpoint the config
+ * UI already calls now mints the admin scope it needs (2026-06-09 modular-UI
+ * architecture, P3).
+ *
+ * Scope choice — `channel:read channel:send channel:admin`, deliberately NOT
+ * `channel:write`:
  *   - `channel:read`  — receive replies over SSE.
  *   - `channel:send`  — post a message into the channel.
+ *   - `channel:admin` — list + edit channel config (the config UI).
  *   - `channel:write` is the *session-reply* scope (a connected Claude Code
  *     session replying on a channel). A UI token must not be able to
  *     impersonate a session, so we never mint `channel:write` here.
@@ -42,11 +57,15 @@ export const CHANNEL_TOKEN_TTL_SECONDS = 10 * 60;
 const CHANNEL_AUDIENCE = "channel";
 const CHANNEL_CLIENT_ID = "parachute-hub-spa";
 /**
- * `channel:read` (SSE replies) + `channel:send` (post a message). Deliberately
+ * `channel:read` (SSE replies) + `channel:send` (post a message) +
+ * `channel:admin` (list + edit channel config — the config UI). Deliberately
  * NOT `channel:write` — that's the session-reply scope, and a UI token must
- * not be able to impersonate a connected session.
+ * not be able to impersonate a connected session. The chat UI ignores the
+ * extra `channel:admin`; the config UI needs it (2026-06-09 modular-UI
+ * architecture, P3 — the hub endpoint the channel config UI already calls
+ * mints the admin scope so the channel repo doesn't have to change).
  */
-export const CHANNEL_TOKEN_SCOPES = ["channel:read", "channel:send"] as const;
+export const CHANNEL_TOKEN_SCOPES = ["channel:read", "channel:send", "channel:admin"] as const;
 
 export interface MintChannelTokenDeps {
   db: Database;

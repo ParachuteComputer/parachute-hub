@@ -577,6 +577,105 @@ describe("GET /api/modules", () => {
     expect(vault?.management_url).toBe("/vault/default/admin");
   });
 
+  test("populates config_ui_url from a module's configUiUrl (2026-06-09 modular-UI P3)", async () => {
+    // Channel declares `configUiUrl: "/channel/admin"` (a single-instance,
+    // already-mount-prefixed path) + `uiUrl: "/channel/ui"`. The hub surfaces
+    // both: `config_ui_url` drives the Modules page Configure action,
+    // `management_url` drives Open. configUiUrl resolves identically to
+    // managementUrl (same path-or-URL + mount-join rule).
+    writeManifest(h.manifestPath, [
+      {
+        name: "channel",
+        port: 1941,
+        paths: ["/channel"],
+        health: "/health",
+        version: "0.1.0",
+        installDir: "/install/dir/channel",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+      readModuleManifest: async (installDir) => {
+        if (installDir === "/install/dir/channel") {
+          return {
+            name: "channel",
+            manifestName: "parachute-channel",
+            displayName: "Channel",
+            tagline: "",
+            port: 1941,
+            paths: ["/channel"],
+            health: "/health",
+            uiUrl: "/channel/ui",
+            configUiUrl: "/channel/admin",
+          } as unknown as Awaited<
+            ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
+          >;
+        }
+        return null;
+      },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      modules: Array<{
+        short: string;
+        config_ui_url: string | null;
+        management_url: string | null;
+      }>;
+    };
+    const channel = body.modules.find((m) => m.short === "channel");
+    // Already mount-prefixed — must NOT double-prepend `/channel`.
+    expect(channel?.config_ui_url).toBe("/channel/admin");
+    // uiUrl (no managementUrl) drives the Open action's management_url.
+    expect(channel?.management_url).toBe("/channel/ui");
+  });
+
+  test("config_ui_url is null when the module declares no configUiUrl", async () => {
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: "0.4.5",
+        installDir: "/install/dir/vault",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+      readModuleManifest: async (installDir) => {
+        if (installDir === "/install/dir/vault") {
+          return {
+            name: "parachute-vault",
+            manifestName: "parachute-vault",
+            displayName: "Vault",
+            tagline: "",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/health",
+            managementUrl: "/admin",
+          } as unknown as Awaited<
+            ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
+          >;
+        }
+        return null;
+      },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      modules: Array<{ short: string; config_ui_url: string | null }>;
+    };
+    const vault = body.modules.find((m) => m.short === "vault");
+    expect(vault?.config_ui_url).toBeNull();
+  });
+
   test("management_url does not double-prepend mount when managementUrl is already mount-prefixed (hub#380)", async () => {
     // Audit caught 2026-05-25: surface declared `managementUrl: "/surface/admin/"`
     // (full hub-origin path) and `paths: ["/surface", "/.parachute"]`. The

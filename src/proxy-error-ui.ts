@@ -47,7 +47,7 @@ export const TRANSIENT_MAX_ATTEMPTS = 5;
 export const ADMIN_MODULES_URL = "/admin/modules";
 
 /** JSON error vocabulary. Matches the snake_case shape used elsewhere
- * in the hub's API (`api-modules-config.ts` etc.) for consistency. */
+ * in the hub's API (`api-modules.ts` etc.) for consistency. */
 export const ERROR_TYPE_TRANSIENT = "upstream_starting";
 export const ERROR_TYPE_PERSISTENT = "upstream_unreachable";
 
