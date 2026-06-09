@@ -148,11 +148,12 @@ export function Home() {
         </div>
       </section>
 
-      {/* 2. Modules — each opens the MODULE's OWN admin/config UI (off-shell). */}
+      {/* 2. Modules — most open the MODULE's OWN admin/config UI (off-shell);
+          vault is the exception (hub-rendered, opens /vaults in-shell). */}
       <section className="home-group" data-testid="home-modules">
         <div className="home-group-head">
           <h2>Modules</h2>
-          <span className="home-group-tag home-group-tag-module">module-owned</span>
+          <span className="home-group-tag home-group-tag-module">modules</span>
         </div>
         <p className="muted home-group-sub">
           Installed modules. Vault opens here in the shell; other modules open their own admin
