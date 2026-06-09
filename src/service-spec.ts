@@ -843,6 +843,12 @@ export function shortNameForManifest(manifestName: string): string | undefined {
  * surfaced a spurious "channel module is not installed" when wiring the channel
  * connection sink. Resolve through the short↔manifest map instead. Returns the
  * first match, or undefined when no installed row maps to `short`.
+ *
+ * NOTE: multi-instance vault rows (`parachute-vault-<name>`) are NOT resolvable
+ * here — `shortNameForManifest` only knows the canonical `parachute-vault`, so
+ * `findServiceByShort(services, "vault")` returns undefined even when a vault is
+ * installed. Vault rows are resolved by mount path via `findVaultUpstream`; this
+ * helper is for single-instance modules (channel / scribe / runner / surface).
  */
 export function findServiceByShort<T extends { name: string }>(
   services: readonly T[],
