@@ -1853,7 +1853,35 @@ export function hubFetch(
         );
       }
 
-      if (pathname === "/" || pathname === "/hub.html") {
+      // Bare `/` → `/admin` (admin-shell IA, R1). The home page and the admin
+      // SPA used to be two disconnected surfaces; `/` now funnels straight into
+      // the single coherent admin shell, whose Home/Overview carries the
+      // discovery content (hub-native sections, modules, user surfaces) that
+      // used to live here.
+      //
+      // Ordering matters: this sits AFTER the fresh-hub wizard funnel above
+      // (so a brand-new operator still lands on `/admin/setup`, not a 404 inside
+      // the shell) and AFTER the pre-admin lockout (so an admin-less hub still
+      // 503s API callers correctly). 302 (not 301) — `/` is reclaimed for
+      // future use, but a permanent redirect would get cached and we may want
+      // `/` back later.
+      //
+      // The signed-out path is preserved: a signed-out visitor lands on
+      // `/admin`, where the SPA's AuthIndicator shows a "Sign in" link that
+      // round-trips through `/login?next=/admin/...` and back. We don't pin the
+      // redirect on session state — the shell handles both auth states itself.
+      //
+      // `/hub.html` is INTENTIONALLY excluded: it still renders the discovery
+      // page (used by the static `parachute expose --set-path=/` disk file and
+      // any bookmark to the explicit `.html`). Only the bare `/` redirects.
+      if (pathname === "/") {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "/admin" },
+        });
+      }
+
+      if (pathname === "/hub.html") {
         // When a DB is configured, render the discovery page dynamically so
         // the header carries a "Signed in as <name>" affordance for the
         // active session. Without a DB, fall back to the static disk file

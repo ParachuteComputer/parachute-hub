@@ -75,14 +75,14 @@ describe("App — brand subtitle (route-derived)", () => {
     expect(screen.getByText(/modules/i, { selector: ".sub" })).toBeInTheDocument();
   });
 
-  it("origin root (/) falls back to 'vaults' (the SPA's home)", () => {
+  it("origin root (/) renders 'home' (the admin-shell overview)", () => {
     renderAt("/");
-    expect(screen.getByText(/vaults/i, { selector: ".sub" })).toBeInTheDocument();
+    expect(screen.getByText(/home/i, { selector: ".sub" })).toBeInTheDocument();
   });
 });
 
 describe("App — nav structure", () => {
-  it("renders all nav links in order: brand, Vaults, Modules, Users, Connections, Permissions, Tokens, Settings, Discovery (signed-out)", async () => {
+  it("renders all hub-native nav links in order: brand, Home, Connections, Modules, Users, Vaults, Tokens, Permissions, Settings, Discovery (signed-out)", async () => {
     renderAt("/vaults");
     // Wait for /api/me to resolve so AuthIndicator's "Sign in" link
     // appears in the nav before we snapshot the link order.
@@ -97,28 +97,64 @@ describe("App — nav structure", () => {
       // route's name, e.g. "vaults"). The mark renders as an svg child
       // with no text, so textContent is just wordmark + subtitle.
       expect.stringMatching(/parachute/i),
-      "Sign in", // AuthIndicator slot, sits between brand and Vaults
-      "Vaults",
+      "Sign in", // AuthIndicator slot, sits between brand and Home
+      // Hub-native sections — all reachable in one click, every section
+      // exposed (admin-shell IA, R1). Home first, then cross-cutting admin.
+      "Home",
+      "Connections",
       "Modules",
       "Users",
-      "Connections",
-      "Permissions",
+      "Vaults",
       "Tokens",
+      "Permissions",
       "Settings",
+      // Past the divider: the off-shell Discovery escape hatch.
       "Discovery",
     ]);
   });
 
-  it("renders one visual divider between SPA-internal links and Discovery", () => {
-    // Single mount = single SPA section. The remaining divider separates
-    // in-SPA `<Link>` nav from the cross-mount Discovery `<a href>` (which
-    // leaves the SPA basename).
+  it("renders one visual divider marking the hub-native ↔ module-owned boundary", () => {
+    // The divider separates the in-shell hub-native `<Link>` sections from the
+    // module-owned affordances (Surfaces dropdown + the cross-mount Discovery
+    // `<a href>` that leaves the SPA basename).
     const { container } = renderAt("/vaults");
     const dividers = container.querySelectorAll(".nav-divider");
     expect(dividers).toHaveLength(1);
     for (const d of dividers) {
       expect(d.getAttribute("aria-hidden")).toBe("true");
     }
+  });
+
+  it("exposes every hub-native section in the nav (one click from anywhere)", async () => {
+    renderAt("/tokens");
+    const nav = screen.getByRole("navigation");
+    for (const label of [
+      "Home",
+      "Vaults",
+      "Modules",
+      "Connections",
+      "Users",
+      "Tokens",
+      "Permissions",
+      "Settings",
+    ]) {
+      expect(
+        within(nav).getByRole("link", { name: new RegExp(`^${label}$`, "i") }),
+      ).toBeInTheDocument();
+    }
+  });
+
+  it("Discovery link points at /hub.html (the explicit discovery page; / now redirects to the shell)", () => {
+    renderAt("/vaults");
+    const nav = screen.getByRole("navigation");
+    const discovery = within(nav).getByRole("link", { name: /^discovery$/i });
+    expect(discovery).toHaveAttribute("href", "/hub.html");
+  });
+
+  it("brand links to Home (/), not Vaults", () => {
+    renderAt("/vaults");
+    const brand = screen.getByRole("link", { name: /parachute/i });
+    expect(brand).toHaveAttribute("href", "/");
   });
 
   it("brand cluster renders the canonical wordmark + route subtitle", () => {
@@ -151,13 +187,24 @@ describe("App — active nav indicator", () => {
     expect(container.querySelectorAll(".nav .nav-link-active")).toHaveLength(1);
   });
 
-  it("lights up Vaults on the index route (/) via the alsoActiveAt alias", () => {
-    renderAt("/");
-    const vaults = within(screen.getByRole("navigation")).getByRole("link", {
-      name: /^vaults$/i,
+  it("lights up Home on the index route (/) — and ONLY Home (exact match)", () => {
+    const { container } = renderAt("/");
+    const home = within(screen.getByRole("navigation")).getByRole("link", {
+      name: /^home$/i,
     });
-    expect(vaults).toHaveClass("nav-link-active");
-    expect(vaults).toHaveAttribute("aria-current", "page");
+    expect(home).toHaveClass("nav-link-active");
+    expect(home).toHaveAttribute("aria-current", "page");
+    // Home is exact-match only — a prefix match on `/` would light it on
+    // every route, and would also light it alongside other sections here.
+    expect(container.querySelectorAll(".nav .nav-link-active")).toHaveLength(1);
+  });
+
+  it("does NOT light up Home on a non-index route (exact-match guard)", () => {
+    renderAt("/tokens");
+    const home = within(screen.getByRole("navigation")).getByRole("link", {
+      name: /^home$/i,
+    });
+    expect(home).not.toHaveClass("nav-link-active");
   });
 
   it("keeps Vaults active on the /vaults/new sub-route", () => {
@@ -183,9 +230,9 @@ describe("App — document title", () => {
     await waitFor(() => expect(document.title).toBe("Approve App · Parachute"));
   });
 
-  it("falls back to Vaults on the index route", async () => {
+  it("titles the index route Home", async () => {
     renderAt("/");
-    await waitFor(() => expect(document.title).toBe("Vaults · Parachute"));
+    await waitFor(() => expect(document.title).toBe("Home · Parachute"));
   });
 });
 
@@ -378,18 +425,23 @@ describe("App — route rendering", () => {
     expect(await screen.findByRole("heading", { name: /^modules$/i })).toBeInTheDocument();
   });
 
-  it("origin root (/) renders VaultsList (the SPA's home)", async () => {
+  it("origin root (/) renders the Home overview (heading 'Hub')", async () => {
     renderAt("/");
-    expect(await screen.findByRole("heading", { name: /^vaults/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /^hub$/i })).toBeInTheDocument();
   });
 
-  it("unknown path renders 404 with link back to vaults", () => {
+  it("/channels redirects to Connections (retired pre-P5 view)", async () => {
+    renderAt("/channels");
+    // The Channels view is retired — its route is a redirect to Connections,
+    // so we land on the Connections heading, not a dead Channels page.
+    expect(await screen.findByRole("heading", { name: /^connections$/i })).toBeInTheDocument();
+  });
+
+  it("unknown path renders 404 with link back to Home", () => {
     renderAt("/this-does-not-exist");
     const empty = screen.getByText(/404/).closest(".empty");
     expect(empty).not.toBeNull();
-    // Scope the link query to the 404 body — the brand link in the nav
-    // also matches /vaults/i and would otherwise multi-match.
-    const backLink = within(empty as HTMLElement).getByRole("link", { name: /vaults/i });
-    expect(backLink).toHaveAttribute("href", "/vaults");
+    const backLink = within(empty as HTMLElement).getByRole("link", { name: /home/i });
+    expect(backLink).toHaveAttribute("href", "/");
   });
 });

@@ -257,7 +257,7 @@ describe("setup gate (admin exists)", () => {
     }
   });
 
-  test("/ renders the discovery page when admin + vault both exist", async () => {
+  test("/ redirects to the admin shell (NOT the setup funnel) when admin + vault both exist", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       await createUser(db, "owner", "pw");
@@ -275,14 +275,20 @@ describe("setup gate (admin exists)", () => {
         },
         join(h.dir, "services.json"),
       );
-      const res = await hubFetch(h.dir, {
+      const handler = hubFetch(h.dir, {
         getDb: () => db,
         manifestPath: join(h.dir, "services.json"),
-      })(req("/"));
-      // 200 (the dynamic discovery page) — NOT 302 to /admin/setup. The
-      // wizard's work is done.
-      expect(res.status).toBe(200);
-      expect(res.headers.get("content-type")).toContain("text/html");
+      });
+      // Setup complete: bare `/` lands on the admin shell (302 → /admin), NOT
+      // the wizard funnel (302 → /admin/setup) and NOT the old 200-discovery.
+      // The discovery content moved into the shell's Home overview (R1).
+      const res = await handler(req("/"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin");
+      // The discovery page itself still lives at /hub.html.
+      const hubHtmlRes = await handler(req("/hub.html"));
+      expect(hubHtmlRes.status).toBe(200);
+      expect(hubHtmlRes.headers.get("content-type")).toContain("text/html");
     } finally {
       db.close();
     }
