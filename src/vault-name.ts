@@ -10,7 +10,9 @@
  *
  *   * lowercase alphanumeric + hyphens or underscores
  *   * 2–32 chars
- *   * `list` is reserved
+ *   * `list` / `new` / `assets` / `admin` are reserved (see
+ *     `RESERVED_VAULT_NAMES` below — one consolidated set for every hub
+ *     edge, per the 2026-06-09 hub-module-boundary migration B2)
  *
  * If vault's validator changes (e.g. additional reserved name, length
  * relaxation), the two must move in lockstep — hub passing the typed
@@ -41,12 +43,30 @@ const VAULT_NAME_RE = VAULT_NAME_CHARSET_RE;
 const VAULT_NAME_MIN_LEN = 2;
 const VAULT_NAME_MAX_LEN = 32;
 
-const RESERVED_NAMES = new Set([
-  // Mirrors vault's reservation. Collides with the legacy `/vaults/list`
-  // discovery endpoint; the routes have moved under `/vault/<name>/` but
-  // vault's `cmdCreate` still rejects "list" and cross-repo consistency
-  // is cheap.
+/**
+ * THE reserved vault-name set — single source of truth for every hub edge
+ * that names a vault (B2h of the 2026-06-09 hub-module-boundary migration).
+ * Before the consolidation hub carried TWO drifted sets: this file held only
+ * `list` (gating the setup wizard + invite redemption via `validateVaultName`)
+ * while `admin-vaults.ts` held `{list, new, assets}` (gating POST /vaults
+ * only) — so a non-admin invite redeemer could squat names an admin couldn't.
+ *
+ *   - `list`   — mirrors vault's own `cmdCreate` reservation (legacy
+ *     `/vaults/list` discovery endpoint; cross-repo consistency is cheap).
+ *   - `new`    — collides with `/vault/new`, the SPA's create-vault route.
+ *   - `assets` — collides with `/vault/assets/*`, the SPA's static bundle.
+ *   - `admin`  — collides with `/vault/admin`, the daemon-level mount for
+ *     vault's own multi-vault admin surface (B-route). A vault named `admin`
+ *     would capture the mount.
+ *
+ * DELETE /vaults/<name> deliberately does NOT consult this set — a squatted
+ * reserved-name vault (created before the reservation) must be removable.
+ */
+export const RESERVED_VAULT_NAMES: ReadonlySet<string> = new Set([
   "list",
+  "new",
+  "assets",
+  "admin",
 ]);
 
 export type VaultNameValidation = { ok: true; name: string } | { ok: false; error: string };
@@ -73,7 +93,7 @@ export function validateVaultName(raw: string): VaultNameValidation {
       error: "vault names must be lowercase alphanumeric with hyphens or underscores.",
     };
   }
-  if (RESERVED_NAMES.has(name)) {
+  if (RESERVED_VAULT_NAMES.has(name)) {
     return { ok: false, error: `"${name}" is a reserved vault name.` };
   }
   return { ok: true, name };

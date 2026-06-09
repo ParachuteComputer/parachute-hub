@@ -301,6 +301,28 @@ describe("POST /vaults — body validation", () => {
       h.cleanup();
     }
   });
+
+  test('400 when name is "admin" (would shadow the /vault/admin daemon-level mount — B2h)', async () => {
+    // A vault named "admin" would capture `/vault/admin`, the daemon-level
+    // mount for vault's own multi-vault admin surface (B-route). The reserved
+    // set is now the consolidated RESERVED_VAULT_NAMES in vault-name.ts, so
+    // the wizard + invite redemption reject it too.
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const res = await call({ db, manifestPath: h.manifestPath, body: { name: "admin" } });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error_description: string };
+        expect(body.error_description).toMatch(/reserved/i);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 describe("POST /vaults — orchestration", () => {

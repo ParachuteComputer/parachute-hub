@@ -60,27 +60,20 @@ import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./adm
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { findService, type readManifest, readManifestLenient } from "./services-manifest.ts";
 import { enrichedPath } from "./spawn-path.ts";
-import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
+import { RESERVED_VAULT_NAMES, VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 import { type WellKnownVaultEntry, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
 /** Scope required to call POST /vaults. */
 export const HOST_ADMIN_SCOPE = "parachute:host:admin";
 
-/**
- * Mirror parachute-vault's `cmdCreate` validation rules, plus hub-only
- * reservations for SPA-route shadowing. `list` matches the CLI; `new` and
- * `assets` would collide with `/vault/new` (the SPA's create-vault route)
- * and `/vault/assets/*` (the SPA's static asset bundle) respectively, so
- * the hub rejects them at the API edge before a vault under those names
- * can register and capture the proxy path.
- */
 // Lowercase-only (item I) — single source of truth in vault-name.ts. Vault's
 // init enforces `[a-z0-9_-]`; a hub-side `[a-zA-Z0-9_-]` superset let an
 // uppercased name through that vault would then lowercase or reject, drifting
-// the hub's idea of the vault from vault's. The hub-only reservations (`new`,
-// `assets`) shadow SPA routes and stay on top of vault's `list`.
+// the hub's idea of the vault from vault's. The reserved set is the ONE
+// consolidated `RESERVED_VAULT_NAMES` from vault-name.ts (B2h) — this file
+// used to carry its own `{list, new, assets}` copy that drifted from the
+// `{list}`-only set gating the wizard + invite redemption.
 const VAULT_NAME_PATTERN = VAULT_NAME_CHARSET_RE;
-const RESERVED_VAULT_NAMES = new Set(["list", "new", "assets"]);
 
 export interface CreateVaultRequest {
   name: string;

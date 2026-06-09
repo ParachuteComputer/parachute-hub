@@ -3158,6 +3158,54 @@ describe("typed vault name (hub#267)", () => {
     }
   });
 
+  test("vault POST rejects every consolidated reserved name (B2h: list, new, assets, admin)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      for (const name of ["list", "new", "assets", "admin"]) {
+        const post = await handleSetupVaultPost(
+          req("/admin/setup/vault", {
+            method: "POST",
+            body: new URLSearchParams({
+              [CSRF_FIELD_NAME]: csrf,
+              vault_name: name,
+            }).toString(),
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+            },
+          }),
+          {
+            db,
+            manifestPath: h.manifestPath,
+            configDir: h.dir,
+            readExposeStateFn: h.readExposeStateFn,
+            issuer: "https://hub.example",
+            supervisor: makeSupervisor(),
+            registry: getDefaultOperationsRegistry(),
+          },
+        );
+        expect(post.status).toBe(400);
+        const html = await post.text();
+        expect(html).toContain("reserved");
+        expect(getSetting(db, "setup_vault_name")).toBeUndefined();
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   test("vault POST with empty name falls back to 'default' + omits the env override", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {

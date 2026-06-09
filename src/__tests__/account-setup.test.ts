@@ -527,6 +527,40 @@ describe("POST /account/setup/<token> — vault-name validation (N1)", () => {
     // No account created.
     expect(getUserByUsernameCI(harness.db, "sam")).toBeNull();
   });
+
+  test("an invitee-chosen RESERVED vault name (list/new/assets/admin) → 400, never provisioned (B2h)", async () => {
+    // Pre-consolidation, the invite path's validator reserved only "list" —
+    // a non-admin invite redeemer could squat "admin" and capture the
+    // daemon-level /vault/admin mount. One consolidated set closes that.
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    for (const name of ["list", "new", "assets", "admin"]) {
+      // vault_name null → the redeemer names their own vault.
+      const { rawToken } = issueInvite(harness.db, { createdBy: admin.id });
+      const { token: csrfToken, cookieFragment } = csrfPair();
+      const stub = makeStubRunCommand();
+      const res = await handleAccountSetupPost(
+        postReq(
+          rawToken,
+          {
+            [CSRF_FIELD_NAME]: csrfToken,
+            username: "sam",
+            password: "sam-strong-password-12",
+            password_confirm: "sam-strong-password-12",
+            vault_name: name,
+          },
+          cookieFragment,
+        ),
+        rawToken,
+        deps(stub.run),
+      );
+      expect(res.status).toBe(400);
+      const html = await res.text();
+      expect(html).toContain("reserved");
+      // The vault CLI is never reached; no account created.
+      expect(stub.calls.length).toBe(0);
+      expect(getUserByUsernameCI(harness.db, "sam")).toBeNull();
+    }
+  });
 });
 
 describe("POST /account/setup/<token> — concurrent redeem (N2)", () => {
