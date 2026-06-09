@@ -29,6 +29,7 @@
  * case. CSRF + session gates upstream are the real auth defense — this is
  * a belt for browser flows where the legitimate Origin/Referer got dropped.
  */
+import { parseSessionCookie } from "./sessions.ts";
 
 /**
  * Build the bound-origin set from the hub's configuration. Returns
@@ -160,4 +161,108 @@ export function isSameOriginRequest(req: Request, boundOrigins: readonly string[
     return boundHosts.has(host);
   }
   return false;
+}
+
+// ===========================================================================
+// CSRF belt for cookie-gated /admin/* JSON mutation endpoints (hub#632,
+// 2026-06-09 hub-module-boundary Phase C1)
+// ===========================================================================
+
+/** Methods the belt gates. GET/HEAD/OPTIONS are read-shaped and pass. */
+const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+/**
+ * Strict same-origin belt for cookie-authenticated JSON mutations — the
+ * defense-in-depth layer over `SameSite=Lax` on the hub's cookie-gated JSON
+ * mutation endpoints (hub#632; hub-module-boundary charter, trust statement).
+ *
+ * BELTED ENDPOINTS (the explicit enumeration — every cookie-gated JSON
+ * mutation under `/admin/*`; keep this list in sync with the dispatch in
+ * `hub-server.ts`):
+ *
+ *   - `POST /admin/connections` + `DELETE /admin/connections/<id>`
+ *     (connection provision/teardown — the seam's canonical consumers are
+ *     channel's admin page and the hub SPA, both same-origin `fetch()` with
+ *     `credentials: "include"`)
+ *   - `POST /admin/channels` + `DELETE /admin/channels/<name>`
+ *     (legacy vault-channel provision/teardown, hub SPA)
+ *
+ * NOT belted, and why:
+ *   - GET/HEAD/OPTIONS — read-shaped; the mint GETs
+ *     (`/admin/host-admin-token`, `/admin/channel-token`,
+ *     `/admin/module-token/<short>`, `/admin/vault-admin-token/<name>`)
+ *     enforce GET-only with a 405 and their response bodies are unreadable
+ *     cross-origin (no CORS on these routes).
+ *   - Bearer-authed requests — a cross-site page cannot attach an
+ *     `Authorization` header without a CORS preflight these routes never
+ *     approve, so a request carrying one is not a browser CSRF. The
+ *     downstream auth gate still validates the credential; this belt sits
+ *     only on the cookie path.
+ *   - Server-rendered form posts (`/login`, `/logout`, `/admin/setup/*`,
+ *     `/oauth/authorize` approve) — already carry the double-submit CSRF
+ *     token (`csrf.ts`) and/or `isSameOriginRequest`; not double-gated here.
+ *   - `/vaults` (POST) + `/vaults/<name>` (DELETE) — Bearer
+ *     `parachute:host:admin` gated, CSRF-immune.
+ *   - `/api/*` — Bearer-gated. `/oauth/*` — spec-shaped, own protections.
+ *
+ * Stricter than `isSameOriginRequest` ON PURPOSE: no Referer fallback and —
+ * critically — no Host-header fallback. The Host fallback exists for
+ * server-rendered form flows where the double-submit token is the real
+ * defense and headers got proxy-stripped (#245). These JSON endpoints carry
+ * NO token, so a Host fallback would be a genuine bypass: an attacker form
+ * post under `referrer-policy: no-referrer` arrives with `Origin: null` and
+ * no Referer, and the Host header always names the target. Browsers send a
+ * real `Origin` on every non-GET `fetch()` (same-origin included — default
+ * `mode: "cors"` is exempt from referrer-policy Origin masking), so every
+ * legitimate consumer of these endpoints passes tier 1. `Origin: null` and
+ * malformed values are affirmative mismatches; a missing header on a
+ * cookie-authed mutation is rejected with its own error code
+ * (`csrf_origin_required`) naming the fix (send Origin, or use a Bearer).
+ *
+ * Returns `null` when the request may proceed, or a 403 JSON `Response`
+ * when the belt rejects. Rejections are logged (method, path, origin — no
+ * cookies, no tokens).
+ */
+export function assertSameOriginForCookieMutation(
+  req: Request,
+  boundOrigins: readonly string[],
+): Response | null {
+  if (!MUTATION_METHODS.has(req.method.toUpperCase())) return null;
+  // Authorization present → not a browser CSRF (custom headers require a
+  // CORS preflight no /admin/* route approves). The endpoint's own gate
+  // validates the credential — API clients with Bearers never see the belt.
+  if (req.headers.get("authorization")) return null;
+  // No session cookie → no ambient credential to ride; the endpoint's own
+  // gate returns its usual 401. Presence is enough here — a forged/stale
+  // session id fails downstream regardless of what the belt decides.
+  if (!parseSessionCookie(req.headers.get("cookie"))) return null;
+
+  const pathname = new URL(req.url).pathname;
+  const origin = req.headers.get("origin");
+  if (!origin) {
+    console.warn(`csrf belt: rejected cookie-authed ${req.method} ${pathname} — no Origin header`);
+    return csrfBeltError(
+      "csrf_origin_required",
+      "cookie-authenticated mutations require an Origin header matching the hub origin; browser fetch() sends it automatically — non-browser clients should authenticate with a Bearer token instead",
+    );
+  }
+  if (origin !== "null") {
+    try {
+      if (new Set(boundOrigins).has(new URL(origin).origin)) return null;
+    } catch {
+      // Malformed Origin — fall through to the mismatch rejection.
+    }
+  }
+  console.warn(`csrf belt: rejected cookie-authed ${req.method} ${pathname} — origin=${origin}`);
+  return csrfBeltError(
+    "csrf_origin_mismatch",
+    "request Origin does not match this hub's origin — cross-site mutations are not allowed on cookie-authenticated endpoints",
+  );
+}
+
+function csrfBeltError(code: string, description: string): Response {
+  return new Response(JSON.stringify({ error: code, error_description: description }), {
+    status: 403,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
 }

@@ -52,11 +52,15 @@
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /admin/channel-token          (GET)        → channel UI bearer mint (cookie-gated)
  *   /admin/module-token/<short>   (GET)        → generic module config-UI bearer mint <short>:admin (cookie-gated)
- *   /admin/channels               (POST/GET)   → vault-channel provision/list (cookie-gated)
- *   /admin/channels/<name>        (DELETE)     → vault-channel teardown (cookie-gated)
+ *   /admin/channels               (POST/GET)   → vault-channel provision/list (cookie-gated; POST CSRF-belted)
+ *   /admin/channels/<name>        (DELETE)     → vault-channel teardown (cookie-gated; CSRF-belted)
  *   /api/connections/catalog      (GET)        → events/actions across installed modules (cookie-gated)
- *   /admin/connections            (POST/GET)   → connection provision/list (cookie-gated)
- *   /admin/connections/<id>       (DELETE)     → connection teardown (cookie-gated)
+ *   /admin/connections            (POST/GET)   → connection provision/list (cookie-gated; POST CSRF-belted)
+ *   /admin/connections/<id>       (DELETE)     → connection teardown (cookie-gated; CSRF-belted)
+ *
+ *   # "CSRF-belted" = strict same-origin Origin check on cookie-authed
+ *   # mutations (hub#632, boundary C1) — origin-check.ts
+ *   # `assertSameOriginForCookieMutation` carries the canonical enumeration.
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
  *   /api/hub                      (GET)        → hub version + uptime + install-source (host:admin)
  *   /api/hub/upgrade              (POST)       → SPA-driven hub self-upgrade → 202 + detached helper (host:admin, §5.3/D4)
@@ -235,7 +239,7 @@ import {
   protectedResourceMetadata,
 } from "./oauth-handlers.ts";
 import { renderNotFoundPage } from "./oauth-ui.ts";
-import { buildHubBoundOrigins } from "./origin-check.ts";
+import { assertSameOriginForCookieMutation, buildHubBoundOrigins } from "./origin-check.ts";
 import { clearPid, writePid } from "./process-state.ts";
 import { toResponse as proxyErrorToResponse, renderProxyError } from "./proxy-error-ui.ts";
 import { classifyUpstream } from "./proxy-state.ts";
@@ -2291,6 +2295,14 @@ export function hubFetch(
       // only for the webhook URL + the copy-paste connect lines.
       if (pathname === "/admin/channels" || pathname.startsWith("/admin/channels/")) {
         if (!getDb) return dbNotConfigured();
+        // CSRF belt (hub#632, boundary C1): cookie-authed POST/DELETE must
+        // carry a matching Origin. Same-origin pages (hub SPA + proxied
+        // module pages) pass automatically; see the enumeration in
+        // origin-check.ts `assertSameOriginForCookieMutation`.
+        {
+          const rejected = assertSameOriginForCookieMutation(req, oauthDeps(req).hubBoundOrigins());
+          if (rejected) return rejected;
+        }
         const subPath = pathname.slice("/admin/channels".length);
         const services = readManifestLenient(manifestPath).services;
         // Channel's services.json row carries its MANIFEST name (`parachute-channel`),
@@ -2353,6 +2365,16 @@ export function hubFetch(
         };
         if (pathname === "/api/connections/catalog") {
           return handleConnectionsCatalog(req, connectionsDeps);
+        }
+        // CSRF belt (hub#632, boundary C1): cookie-authed POST/DELETE must
+        // carry a matching Origin. The seam's canonical consumer — channel's
+        // admin page POSTing link-vault with `credentials: "include"` — is a
+        // same-origin fetch() and passes; see origin-check.ts
+        // `assertSameOriginForCookieMutation` for the belted-endpoint
+        // enumeration.
+        {
+          const rejected = assertSameOriginForCookieMutation(req, oauthDeps(req).hubBoundOrigins());
+          if (rejected) return rejected;
         }
         const subPath = pathname.slice("/admin/connections".length);
         return handleConnections(req, subPath, connectionsDeps);
