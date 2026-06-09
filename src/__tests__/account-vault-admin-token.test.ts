@@ -128,7 +128,8 @@ describe("handleAccountVaultAdminTokenPost — happy path (assigned vault)", () 
     expect(res.status).toBe(303);
     expect(res.headers.get("cache-control")).toBe("no-store");
     const location = res.headers.get("location") ?? "";
-    // Default managementUrl is /admin/ → lands on the vault admin SPA home.
+    // Default managementUrl is the relative "admin/" (B4 per-instance form)
+    // → lands on the vault admin SPA home under the vault's mount.
     expect(location.startsWith(`${ISSUER}/vault/work/admin/#token=`)).toBe(true);
 
     const token = tokenFromLocation(location);
@@ -151,7 +152,21 @@ describe("handleAccountVaultAdminTokenPost — happy path (assigned vault)", () 
     expect(rows?.n).toBe(1);
   });
 
-  test("honors a vault-declared managementUrl (e.g. a custom admin path)", async () => {
+  test("honors a vault-declared RELATIVE managementUrl (B4 per-instance form)", async () => {
+    const { cookie, csrfToken } = await seedFriend(["work"]);
+    const res = await handleAccountVaultAdminTokenPost(
+      mintReq("work", { cookie, csrfToken }),
+      "work",
+      deps({ managementUrl: "manage/" }),
+    );
+    expect(res.status).toBe(303);
+    const location = res.headers.get("location") ?? "";
+    expect(location.startsWith(`${ISSUER}/vault/work/manage/#token=`)).toBe(true);
+  });
+
+  test("a LEADING-SLASH managementUrl resolves origin-absolute (B4 inverted pin)", async () => {
+    // Pre-B4 "/manage/" joined under the vault mount (/vault/work/manage/).
+    // Under the unified semantics a leading-"/" is origin-absolute.
     const { cookie, csrfToken } = await seedFriend(["work"]);
     const res = await handleAccountVaultAdminTokenPost(
       mintReq("work", { cookie, csrfToken }),
@@ -160,7 +175,24 @@ describe("handleAccountVaultAdminTokenPost — happy path (assigned vault)", () 
     );
     expect(res.status).toBe(303);
     const location = res.headers.get("location") ?? "";
-    expect(location.startsWith(`${ISSUER}/vault/work/manage/#token=`)).toBe(true);
+    expect(location.startsWith(`${ISSUER}/manage/#token=`)).toBe(true);
+  });
+
+  test('COMPAT SHIM: the literal legacy "/admin/" managementUrl still joins under the vault (one release)', async () => {
+    // Deployed vaults declare managementUrl "/admin/" — the OLD per-instance
+    // form. Origin-absolute resolution would deep-link the daemon-level
+    // /vault/admin mount instead of the instance SPA, so the literal
+    // "/admin"/"/admin/" keeps the old vault-join for one release with a
+    // deprecation log.
+    const { cookie, csrfToken } = await seedFriend(["work"]);
+    const res = await handleAccountVaultAdminTokenPost(
+      mintReq("work", { cookie, csrfToken }),
+      "work",
+      deps({ managementUrl: "/admin/" }),
+    );
+    expect(res.status).toBe(303);
+    const location = res.headers.get("location") ?? "";
+    expect(location.startsWith(`${ISSUER}/vault/work/admin/#token=`)).toBe(true);
   });
 
   test("a friend assigned to multiple vaults can deep-link each, never cross-vault", async () => {

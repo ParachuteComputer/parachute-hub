@@ -440,18 +440,44 @@ export async function signOut(csrfToken: string): Promise<void> {
   throw new HttpError(res.status, await readError(res));
 }
 
+/** One-time deprecation log for the legacy `"/admin/"` managementUrl (B4 compat shim). */
+let warnedLegacyManagementUrl = false;
+
 /**
  * Resolve a vault's `managementUrl` against the vault's mounted URL.
- * Absolute URL → returned verbatim. Path → joined onto `vaultUrl` after
- * stripping the trailing slash so we don't double-slash.
+ * Unified URL-resolution semantics (B4 of the 2026-06-09 hub-module-boundary
+ * migration) — mirrors `resolveManagementUrl` in the hub's
+ * `src/account-vault-admin-token.ts` so SPA and hub-server deep-links agree:
+ *
+ *   - Absolute http(s) URL → verbatim.
+ *   - Leading-`/` path → ORIGIN-ABSOLUTE: resolved against the vault URL's
+ *     origin (not joined under the vault mount).
+ *   - Relative path (no leading slash, e.g. `"admin/"`) → the PER-INSTANCE
+ *     form: joined onto `vaultUrl` after stripping the trailing slash.
+ *
+ * COMPAT SHIM (one release — remove once vault's new manifest reaches
+ * @latest): the literal legacy `"/admin"`/`"/admin/"` is the OLD per-instance
+ * relative declaration deployed vaults still ship; it joins under the vault
+ * URL (the pre-B4 behavior) with a one-time deprecation log.
  *
  * Exported for direct testing; `VaultsList` calls it before redirecting.
  */
 export function resolveManagementUrl(vaultUrl: string, managementUrl: string): string {
   if (/^https?:\/\//i.test(managementUrl)) return managementUrl;
   const base = vaultUrl.replace(/\/+$/, "");
-  const tail = managementUrl.startsWith("/") ? managementUrl : `/${managementUrl}`;
-  return `${base}${tail}`;
+  if (managementUrl === "/admin" || managementUrl === "/admin/") {
+    if (!warnedLegacyManagementUrl) {
+      warnedLegacyManagementUrl = true;
+      console.warn(
+        `resolveManagementUrl: vault declares the legacy per-instance managementUrl ${JSON.stringify(managementUrl)}; joining under the vault URL for one release. New semantics: relative ("admin/") = per-instance join, leading-"/" = origin-absolute.`,
+      );
+    }
+    return `${base}${managementUrl}`;
+  }
+  if (managementUrl.startsWith("/")) {
+    return new URL(managementUrl, `${base}/`).toString();
+  }
+  return `${base}/${managementUrl}`;
 }
 
 /**

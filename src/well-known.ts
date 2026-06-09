@@ -227,6 +227,9 @@ function buildUisArray(uis: Record<string, UiSubUnit>, base: string): WellKnownU
   });
 }
 
+/** One-time deprecation log for the legacy vault `"/admin/"` uiUrl (B4 compat shim). */
+let warnedLegacyVaultUiUrl = false;
+
 export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
   const base = opts.canonicalOrigin.replace(/\/$/, "");
   const doc: WellKnownDocument = { vaults: [], services: [] };
@@ -257,43 +260,43 @@ export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
       // entry — no installDir round-trip needed since it's already
       // persisted server-side and reasonably stable across reboots.
       if (s.tagline !== undefined) entry.tagline = s.tagline;
-      // Resolve uiUrl. Three forms (per patterns#96
-      // `module-ui-declaration.md` §"Shape"):
+      // Resolve uiUrl. Unified URL-resolution semantics (B4 of the 2026-06-09
+      // hub-module-boundary migration — same doctrine as api-modules.ts
+      // `resolveModuleUrl` and the `resolveManagementUrl` pair):
       //   - Absolute http(s) URL → verbatim.
-      //   - Path on a non-vault entry → joined onto `base` directly.
-      //   - Path on a vault entry → joined onto `base` AFTER prefixing
-      //     with the per-instance mount path. Vault is the only
-      //     multi-instance service today; its declared `uiUrl: "/admin/"`
-      //     resolves to `<base>/vault/<name>/admin/` (one tile per
-      //     instance). The mount path is whichever `path` we're iterating
-      //     this loop turn (vault's `pathsToEmit` is its `paths[]`,
-      //     fanning one row per instance).
+      //   - Leading-`/` path → ORIGIN-ABSOLUTE: resolved against `base`
+      //     directly (`/scribe/admin` → `<base>/scribe/admin`; vault's
+      //     daemon-level `/vault/admin/` → `<base>/vault/admin/`, once,
+      //     NOT per instance).
+      //   - Relative path (no leading slash) → MOUNT-JOINED: the
+      //     per-instance form. Vault is the only multi-instance service
+      //     today; a declared `uiUrl: "admin/"` resolves to
+      //     `<base>/vault/<name>/admin/` (one tile per instance). The mount
+      //     is whichever `path` we're iterating this loop turn (vault's
+      //     `pathsToEmit` is its `paths[]`, fanning one row per instance).
       //
-      // Path concatenation: `path` is the canonical per-instance mount
-      // ("/vault/default", no trailing slash from services.json). `uiUrlRaw`
-      // starts with "/" per pattern rule. Direct concatenation yields the
-      // correct join ("/vault/default" + "/admin/" → "/vault/default/admin/").
+      // COMPAT SHIM (one release — remove once vault's new manifest reaches
+      // @latest): the literal legacy `"/admin"`/`"/admin/"` on a VAULT entry
+      // is the OLD per-instance relative declaration that deployed vaults
+      // still ship; it mount-joins (the pre-B4 behavior) with a deprecation
+      // log instead of resolving origin-absolute.
       const uiUrlRaw = opts.uiUrlFor?.(s);
       if (uiUrlRaw !== undefined) {
+        const mount = path.replace(/\/+$/, "");
         if (/^https?:\/\//i.test(uiUrlRaw)) {
           entry.uiUrl = uiUrlRaw;
-        } else if (isVault) {
-          // Defensive guard: vault uiUrl MUST start with "/" per the
-          // multi-instance pattern (see module-ui-declaration.md). A bare
-          // "admin/" (no leading slash) would concatenate into
-          // "/vault/defaultadmin/" — a silent malformed URL that 404s.
-          // Warn loudly instead of emitting garbage; the entry just
-          // omits its uiUrl rather than poisoning the well-known doc.
-          if (!uiUrlRaw.startsWith("/")) {
+        } else if (isVault && (uiUrlRaw === "/admin" || uiUrlRaw === "/admin/")) {
+          if (!warnedLegacyVaultUiUrl) {
+            warnedLegacyVaultUiUrl = true;
             console.warn(
-              `[well-known] vault entry "${s.name}" declares uiUrl=${JSON.stringify(uiUrlRaw)} without a leading slash; skipping uiUrl emission. Per module-ui-declaration.md, multi-instance uiUrl must be a path-form starting with "/".`,
+              `[well-known] vault entry "${s.name}" declares the legacy per-instance uiUrl ${JSON.stringify(uiUrlRaw)}; mount-joining for one release. New semantics: relative ("admin/") = per-instance mount-join, leading-"/" = origin-absolute. Upgrade the vault module to clear this.`,
             );
-          } else {
-            const mount = path.replace(/\/$/, "");
-            entry.uiUrl = new URL(`${mount}${uiUrlRaw}`, `${base}/`).toString();
           }
-        } else {
+          entry.uiUrl = new URL(`${mount}${uiUrlRaw}`, `${base}/`).toString();
+        } else if (uiUrlRaw.startsWith("/")) {
           entry.uiUrl = new URL(uiUrlRaw, `${base}/`).toString();
+        } else {
+          entry.uiUrl = new URL(`${mount}/${uiUrlRaw}`, `${base}/`).toString();
         }
       }
       // Hierarchical sub-units (hub#313 / parachute-app design doc §12). The

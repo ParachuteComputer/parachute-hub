@@ -127,7 +127,19 @@ describe("validateModuleManifest", () => {
     expect(m.managementUrl).toBe("https://admin.example.com/");
   });
 
-  test("managementUrl rejects empty / non-string / non-url-or-path", () => {
+  test("managementUrl accepts the relative (per-instance) form — B4", () => {
+    // Unified URL semantics (2026-06-09 hub-module-boundary, B4): a relative
+    // path (no leading slash) is the per-instance form resolvers join under
+    // the module's mount. Vault's new manifest declares `"admin/"`.
+    expect(validateModuleManifest({ ...VALID, managementUrl: "admin/" }, "x").managementUrl).toBe(
+      "admin/",
+    );
+    expect(
+      validateModuleManifest({ ...VALID, managementUrl: "deep/admin" }, "x").managementUrl,
+    ).toBe("deep/admin");
+  });
+
+  test("managementUrl rejects empty / non-string / bad-scheme / traversal", () => {
     expect(() => validateModuleManifest({ ...VALID, managementUrl: "" }, "x")).toThrow(
       /managementUrl/,
     );
@@ -135,11 +147,16 @@ describe("validateModuleManifest", () => {
       /managementUrl/,
     );
     expect(() =>
-      validateModuleManifest({ ...VALID, managementUrl: "no-leading-slash" }, "x"),
-    ).toThrow(/path starting with "\/" or a full http\(s\) URL/);
-    expect(() =>
       validateModuleManifest({ ...VALID, managementUrl: "ftp://example.com" }, "x"),
     ).toThrow(/http:.*https:/);
+    // Scheme-bearing non-URL strings must not smuggle through as "relative".
+    expect(() =>
+      validateModuleManifest({ ...VALID, managementUrl: "javascript:alert(1)" }, "x"),
+    ).toThrow(/managementUrl/);
+    // The relative form can only deepen its mount — no `..` traversal.
+    expect(() =>
+      validateModuleManifest({ ...VALID, managementUrl: "../other/admin" }, "x"),
+    ).toThrow(/\.\./);
   });
 
   // --- 2026-06-09 modular-UI architecture P1 fields: focus / configUiUrl /
@@ -156,7 +173,7 @@ describe("validateModuleManifest", () => {
     expect(() => validateModuleManifest({ ...VALID, focus: 1 }, "x")).toThrow(/focus/);
   });
 
-  test("configUiUrl follows the path-or-url shape", () => {
+  test("configUiUrl follows the path-or-url shape (incl. the B4 relative form)", () => {
     expect(
       validateModuleManifest({ ...VALID, configUiUrl: "/scribe/admin" }, "x").configUiUrl,
     ).toBe("/scribe/admin");
@@ -164,8 +181,9 @@ describe("validateModuleManifest", () => {
       validateModuleManifest({ ...VALID, configUiUrl: "https://cfg.example.com/" }, "x")
         .configUiUrl,
     ).toBe("https://cfg.example.com/");
-    expect(() => validateModuleManifest({ ...VALID, configUiUrl: "nope" }, "x")).toThrow(
-      /configUiUrl/,
+    // Relative = the per-instance mount-joined form (B4) — valid.
+    expect(validateModuleManifest({ ...VALID, configUiUrl: "admin/" }, "x").configUiUrl).toBe(
+      "admin/",
     );
     expect(() => validateModuleManifest({ ...VALID, configUiUrl: "//evil.com" }, "x")).toThrow(
       /configUiUrl/,
@@ -314,15 +332,17 @@ describe("validateModuleManifest", () => {
     expect(m.uiUrl).toBe("https://app.example.com/");
   });
 
-  test("uiUrl rejects empty / non-string / non-url-or-path (mirrors managementUrl)", () => {
+  test("uiUrl accepts the relative (per-instance) form — B4 (mirrors managementUrl)", () => {
+    expect(validateModuleManifest({ ...VALID, uiUrl: "admin/" }, "x").uiUrl).toBe("admin/");
+  });
+
+  test("uiUrl rejects empty / non-string / bad-scheme / traversal (mirrors managementUrl)", () => {
     expect(() => validateModuleManifest({ ...VALID, uiUrl: "" }, "x")).toThrow(/uiUrl/);
     expect(() => validateModuleManifest({ ...VALID, uiUrl: 7 }, "x")).toThrow(/uiUrl/);
-    expect(() => validateModuleManifest({ ...VALID, uiUrl: "no-slash" }, "x")).toThrow(
-      /path starting with "\/" or a full http\(s\) URL/,
-    );
     expect(() => validateModuleManifest({ ...VALID, uiUrl: "ftp://example.com" }, "x")).toThrow(
       /http:.*https:/,
     );
+    expect(() => validateModuleManifest({ ...VALID, uiUrl: "../sneaky" }, "x")).toThrow(/\.\./);
   });
 
   test("uiUrl absent stays absent", () => {

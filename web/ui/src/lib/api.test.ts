@@ -561,15 +561,38 @@ describe("revokeGrant", () => {
 });
 
 describe("resolveManagementUrl", () => {
-  // Note: the manifest validator (`asManagementUrl` in module-manifest.ts)
-  // rejects paths that don't start with `/`, so the bare-relative branch
-  // inside `resolveManagementUrl` is defensive-only — never exercised by a
-  // valid managementUrl reaching the SPA. We don't test that branch here.
+  // B4 unified semantics (2026-06-09 hub-module-boundary): http(s)://
+  // verbatim · leading-"/" = origin-absolute · relative = joined under the
+  // vault's mounted URL (the per-instance form). The literal legacy
+  // "/admin"/"/admin/" rides the one-release COMPAT SHIM (vault-join +
+  // deprecation log) because deployed vaults still declare it.
 
-  it("joins a leading-slash path onto the vault URL after stripping trailing slash", async () => {
+  it("joins a RELATIVE path under the vault URL (B4 per-instance form)", async () => {
+    const api = await import("./api.ts");
+    expect(api.resolveManagementUrl("http://hub.local/vault/work/", "admin/")).toBe(
+      "http://hub.local/vault/work/admin/",
+    );
+    expect(api.resolveManagementUrl("http://hub.local/vault/work", "manage")).toBe(
+      "http://hub.local/vault/work/manage",
+    );
+  });
+
+  it('COMPAT SHIM: the literal legacy "/admin" still joins under the vault URL (one release)', async () => {
     const api = await import("./api.ts");
     expect(api.resolveManagementUrl("http://hub.local/vault/work/", "/admin")).toBe(
       "http://hub.local/vault/work/admin",
+    );
+    expect(api.resolveManagementUrl("http://hub.local/vault/work/", "/admin/")).toBe(
+      "http://hub.local/vault/work/admin/",
+    );
+  });
+
+  it("resolves a non-shim leading-slash path origin-absolute (B4 inverted pin)", async () => {
+    const api = await import("./api.ts");
+    // Pre-B4 this joined under the vault mount; under the unified semantics
+    // a leading-"/" names the full origin path verbatim.
+    expect(api.resolveManagementUrl("http://hub.local/vault/work/", "/vault/admin/")).toBe(
+      "http://hub.local/vault/admin/",
     );
   });
 
