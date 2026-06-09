@@ -101,6 +101,11 @@
  *   /admin/config*                             → 301 → /admin/vaults (legacy
  *                                                portal retired post-SPA-rework)
  *
+ *   # Vault MODULE daemon-level admin surface (B-route, 2026-06-09
+ *   # hub-module-boundary). Runs BEFORE the per-vault proxy; "admin" is a
+ *   # reserved vault name so no instance can claim the mount.
+ *   /vault/admin, /vault/admin/*               → proxy to the vault module's daemon
+ *
  *   # Per-vault content proxy (user-facing vault data: Notes PWA, MCP, etc.).
  *   /vault/<name>/*                            → proxy to the vault backend
  *
@@ -750,6 +755,50 @@ async function proxyToVault(
   // single-vault-per-hub model; if multi-vault-per-hub ever ships, the
   // classifier will need a per-instance key.
   return proxyRequest(req, match.port, "vault", "vault", supervisor, targetPath);
+}
+
+/**
+ * Reverse-proxy `/vault/admin` + `/vault/admin/*` to the vault MODULE's
+ * daemon — the daemon-level multi-vault admin surface (B-route, 2026-06-09
+ * hub-module-boundary migration), NOT a per-instance path.
+ *
+ * Resolution is via `findServiceByShort(services, "vault")` (the canonical
+ * self-registered `parachute-vault` row — same shape as the channelEntry
+ * lookup in the Connections deps), deliberately NOT `findVaultUpstream`:
+ * vault must NOT self-register `/vault/admin` in `paths[]`, because every
+ * consumer that derives instance names from paths (`vaultInstanceNameFor`,
+ * the well-known vaults[] fan-out, `findExistingVault`, the mint
+ * allowlists, the users vault-picker) would fabricate a phantom vault named
+ * "admin". The mount is hub-owned and gated on the B2h `admin` name
+ * reservation, so no real instance can ever claim it.
+ *
+ * Applies the SAME `publicExposure: "loopback"` 404-cloak as `proxyToVault`
+ * (the per-vault proxy's only layer-gate; "allowed"/"auth-required" pass
+ * through and the daemon self-gates). Vault's row declares no `stripPrefix`
+ * — the FULL path forwards, so the daemon's own `/vault/admin` routing
+ * branch (vault wave, B3) serves it.
+ *
+ * Returns `undefined` when no vault module is installed (caller 404s).
+ * NOTE: legacy per-instance rows named `parachute-vault-<name>` don't
+ * resolve through `findServiceByShort` (it only knows the canonical
+ * manifest name) — on such an install this surface 404s until vault's boot
+ * selfRegister rewrites the canonical row, which is the documented
+ * old-install degradation, not a routing hole.
+ */
+async function proxyToVaultAdmin(
+  req: Request,
+  manifestPath: string,
+  supervisor: Supervisor | undefined,
+  peerAddr: string | null,
+): Promise<Response | undefined> {
+  // Lenient — see hub#406 (same posture as proxyToVault).
+  const services = readManifestLenient(manifestPath).services;
+  const entry = findServiceByShort(services, "vault");
+  if (!entry) return undefined;
+  if (effectivePublicExposure(entry) === "loopback" && layerOf(req, peerAddr) !== "loopback") {
+    return new Response("not found", { status: 404 });
+  }
+  return proxyRequest(req, entry.port, "vault", "vault", supervisor);
 }
 
 /**
@@ -2850,6 +2899,27 @@ export function hubFetch(
           status: 301,
           headers: { location: "/admin/vaults" },
         });
+      }
+
+      // /vault/admin + /vault/admin/* — the vault MODULE's daemon-level
+      // admin surface (B-route, 2026-06-09 hub-module-boundary). MUST run
+      // BEFORE the per-vault proxy dispatch below: this is a module-level
+      // mount, not an instance path. "admin" is a reserved vault name (B2h)
+      // so no instance can claim it, and `findVaultUpstream` never sees it —
+      // no consumer fabricates a phantom vault named "admin". Exact-segment
+      // match only: a vault instance named e.g. "adminx" still routes
+      // per-instance through the branch below.
+      if (pathname === "/vault/admin" || pathname.startsWith("/vault/admin/")) {
+        // Same per-request force-change-password gate as the per-vault proxy
+        // (P0-1 / hub#469) — a pre-rotation signed-in user can't reach the
+        // multi-vault admin surface on an un-rotated temp password either.
+        if (getDb) {
+          const gate = forceChangePasswordGate(getDb(), req);
+          if (gate) return gate;
+        }
+        const proxied = await proxyToVaultAdmin(req, manifestPath, deps?.supervisor, peerAddr);
+        if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
+        return new Response("not found", { status: 404 });
       }
 
       // /vault/<name>/* — per-vault content proxy. Stays as user-facing
