@@ -27,6 +27,7 @@ import { BrandMark, WORDMARK_TEXT } from "./components/BrandMark.tsx";
 import { HubVersionBadge } from "./components/HubVersionBadge.tsx";
 import { type MeResponse, type ModuleListing, getMe, listModules, signOut } from "./lib/api.ts";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
+import { Channels } from "./routes/Channels.tsx";
 import { ModuleConfig } from "./routes/ModuleConfig.tsx";
 import { Modules } from "./routes/Modules.tsx";
 import { NewVault } from "./routes/NewVault.tsx";
@@ -57,6 +58,9 @@ function subtitleFor(pathname: string): string {
   }
   if (pathname === "/users" || pathname.startsWith("/users/")) {
     return "users";
+  }
+  if (pathname === "/channels" || pathname.startsWith("/channels/")) {
+    return "channels";
   }
   if (pathname === "/settings" || pathname.startsWith("/settings/")) {
     return "settings";
@@ -172,6 +176,7 @@ export function App() {
         <NavSection to="/modules" label="Modules" />
         <InstalledServicesDropdown services={installedServices} />
         <NavSection to="/users" label="Users" />
+        <NavSection to="/channels" label="Channels" />
         <NavSection to="/permissions" label="Permissions" />
         <NavSection to="/tokens" label="Tokens" />
         <NavSection to="/settings" label="Settings" />
@@ -188,6 +193,7 @@ export function App() {
         <Route path="/modules" element={<Modules />} />
         <Route path="/modules/:short/config" element={<ModuleConfig />} />
         <Route path="/users" element={<Users />} />
+        <Route path="/channels" element={<Channels />} />
         <Route path="/permissions" element={<Permissions />} />
         <Route path="/tokens" element={<Tokens />} />
         <Route path="/settings" element={<Settings />} />
