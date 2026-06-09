@@ -281,6 +281,39 @@ function renderList(
   );
 }
 
+/**
+ * Provenance label for the group header (modular-UI R2). `"custom"` →
+ * connections wired by hand in this builder; any module short name →
+ * connections a module-owned config UI initiated on the operator's behalf.
+ */
+function provenanceOf(c: ConnectionListing): string {
+  return c.requested_by && c.requested_by.length > 0 ? c.requested_by : "custom";
+}
+
+function provenanceHeading(provenance: string): string {
+  return provenance === "custom" ? "Custom (built here)" : `Added from ${provenance}`;
+}
+
+/**
+ * Group connections by provenance for display. "custom" sorts last so
+ * module-initiated connections lead; within a group, insertion order is kept.
+ */
+function groupByProvenance(connections: ConnectionListing[]): [string, ConnectionListing[]][] {
+  const groups = new Map<string, ConnectionListing[]>();
+  for (const c of connections) {
+    const key = provenanceOf(c);
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(c);
+    else groups.set(key, [c]);
+  }
+  return Array.from(groups.entries()).sort(([a], [b]) => {
+    if (a === b) return 0;
+    if (a === "custom") return 1;
+    if (b === "custom") return -1;
+    return a.localeCompare(b);
+  });
+}
+
 function ConnectionsTable({
   connections,
   removeSt,
@@ -292,96 +325,124 @@ function ConnectionsTable({
   setRemoveSt: (s: RemoveState) => void;
   onConfirmRemove: (id: string) => Promise<void>;
 }): React.ReactNode {
+  const groups = groupByProvenance(connections);
   return (
-    <div className="channel-list" style={{ marginTop: "1rem" }}>
-      <div className="table-scroll">
-        <table className="channel-table">
-          <thead>
-            <tr>
-              <th scope="col">Connection</th>
-              <th scope="col">When</th>
-              <th scope="col">Do</th>
-              <th scope="col">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {connections.map((c) => {
-              const isConfirming = removeSt.kind === "confirming" && removeSt.id === c.id;
-              const isRemoving = removeSt.kind === "removing" && removeSt.id === c.id;
-              const rowError =
-                removeSt.kind === "error" && removeSt.id === c.id ? removeSt.message : null;
-              const when = `${c.source.module}.${c.source.event}${
-                c.source.vault ? ` (${c.source.vault})` : ""
-              }`;
-              const doStr = `${c.sink.module}.${c.sink.action}`;
-              return (
-                <tr key={c.id} data-connection-id={c.id}>
-                  <td>
-                    <code>{c.id}</code>
-                  </td>
-                  <td>
-                    <code>{when}</code>
-                  </td>
-                  <td>
-                    <code>{doStr}</code>
-                  </td>
-                  <td>
-                    {isConfirming ? (
-                      <dialog
-                        open
-                        className="error-banner"
-                        style={{ marginTop: "0.25rem", background: "var(--bg-warn, #fffbe6)" }}
-                        aria-label={`Confirm remove ${c.id}`}
-                      >
-                        <p>
-                          Remove connection <code>{c.id}</code>? This tears down the provisioned
-                          trigger (and channel config, if any).
-                        </p>
-                        <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
-                          <button
-                            type="button"
-                            className="destructive"
-                            onClick={() => {
-                              void onConfirmRemove(c.id);
-                            }}
-                            disabled={isRemoving}
-                          >
-                            {isRemoving ? "Removing…" : "Remove"}
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary"
-                            onClick={() => setRemoveSt({ kind: "idle" })}
-                            disabled={isRemoving}
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </dialog>
-                    ) : (
-                      <button
-                        type="button"
-                        className="secondary"
-                        disabled={isRemoving}
-                        onClick={() => setRemoveSt({ kind: "confirming", id: c.id })}
-                        aria-label={`Remove ${c.id}`}
-                      >
-                        {isRemoving ? "Removing…" : "Remove"}
-                      </button>
-                    )}
-                    {rowError && (
-                      <div className="error-banner" style={{ marginTop: "0.25rem" }}>
-                        <code>{rowError}</code>
-                      </div>
-                    )}
-                  </td>
+    <>
+      {groups.map(([provenance, rows]) => (
+        <div
+          key={provenance}
+          className="channel-list"
+          style={{ marginTop: "1rem" }}
+          data-provenance-group={provenance}
+        >
+          <h3 style={{ marginBottom: "0.25rem" }}>{provenanceHeading(provenance)}</h3>
+          <div className="table-scroll">
+            <table className="channel-table">
+              <thead>
+                <tr>
+                  <th scope="col">Connection</th>
+                  <th scope="col">When</th>
+                  <th scope="col">Do</th>
+                  <th scope="col">Source</th>
+                  <th scope="col">Actions</th>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
+              </thead>
+              <tbody>
+                {rows.map((c) => renderConnectionRow(c, removeSt, setRemoveSt, onConfirmRemove))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function renderConnectionRow(
+  c: ConnectionListing,
+  removeSt: RemoveState,
+  setRemoveSt: (s: RemoveState) => void,
+  onConfirmRemove: (id: string) => Promise<void>,
+): React.ReactNode {
+  const isConfirming = removeSt.kind === "confirming" && removeSt.id === c.id;
+  const isRemoving = removeSt.kind === "removing" && removeSt.id === c.id;
+  const rowError = removeSt.kind === "error" && removeSt.id === c.id ? removeSt.message : null;
+  const when = `${c.source.module}.${c.source.event}${
+    c.source.vault ? ` (${c.source.vault})` : ""
+  }`;
+  const doStr = `${c.sink.module}.${c.sink.action}`;
+  const provenance = provenanceOf(c);
+  return (
+    <tr key={c.id} data-connection-id={c.id} data-requested-by={provenance}>
+      <td>
+        <code>{c.id}</code>
+      </td>
+      <td>
+        <code>{when}</code>
+      </td>
+      <td>
+        <code>{doStr}</code>
+      </td>
+      <td>
+        {provenance === "custom" ? (
+          <span className="muted">custom</span>
+        ) : (
+          <span className="tag" data-testid="provenance-badge">
+            {provenance}
+          </span>
+        )}
+      </td>
+      <td>
+        {isConfirming ? (
+          <dialog
+            open
+            className="error-banner"
+            style={{ marginTop: "0.25rem", background: "var(--bg-warn, #fffbe6)" }}
+            aria-label={`Confirm remove ${c.id}`}
+          >
+            <p>
+              Remove connection <code>{c.id}</code>? This tears down the provisioned trigger (and
+              channel config, if any).
+            </p>
+            <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+              <button
+                type="button"
+                className="destructive"
+                onClick={() => {
+                  void onConfirmRemove(c.id);
+                }}
+                disabled={isRemoving}
+              >
+                {isRemoving ? "Removing…" : "Remove"}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setRemoveSt({ kind: "idle" })}
+                disabled={isRemoving}
+              >
+                Cancel
+              </button>
+            </div>
+          </dialog>
+        ) : (
+          <button
+            type="button"
+            className="secondary"
+            disabled={isRemoving}
+            onClick={() => setRemoveSt({ kind: "confirming", id: c.id })}
+            aria-label={`Remove ${c.id}`}
+          >
+            {isRemoving ? "Removing…" : "Remove"}
+          </button>
+        )}
+        {rowError && (
+          <div className="error-banner" style={{ marginTop: "0.25rem" }}>
+            <code>{rowError}</code>
+          </div>
+        )}
+      </td>
+    </tr>
   );
 }
 

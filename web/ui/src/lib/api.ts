@@ -1705,6 +1705,14 @@ export interface ConnectionListing {
   };
   provisioned: { type: string; vault?: string; triggerName?: string };
   created_at: string;
+  /**
+   * Provenance — WHO requested this connection (modular-UI R2). `"custom"` for a
+   * connection built by hand in this builder; a module short name (e.g.
+   * `"channel"`) when a module-owned config UI created it on the operator's
+   * behalf. Always present on the GET wire shape (the server defaults pre-R2
+   * records to `"custom"`); optional here for resilience to older responses.
+   */
+  requested_by?: string;
 }
 
 /** Connect lines returned when the sink is a channel-deliver action. */
