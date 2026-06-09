@@ -22,11 +22,12 @@ import { HUB_ORIGIN_ENV } from "../hub-origin.ts";
 import { ModuleManifestError } from "../module-manifest.ts";
 import {
   type ServiceSpec,
+  canonicalPortForManifest,
   getSpec,
   getSpecFromInstallDir,
   shortNameForManifest,
 } from "../service-spec.ts";
-import { type ServiceEntry, readManifestLenient } from "../services-manifest.ts";
+import { type ServiceEntry, readManifestLenient, upsertService } from "../services-manifest.ts";
 import { enrichedPath } from "../spawn-path.ts";
 import type { Supervisor } from "../supervisor.ts";
 
@@ -67,6 +68,77 @@ export interface BuildSpawnRequestOpts {
    * boot path.
    */
   readonly extraEnv?: Record<string, string>;
+}
+
+/**
+ * Snap a fixed-port first-party module's services.json `port` back to its
+ * compiled-in canonical value when it has DRIFTED, and persist the correction.
+ * Returns the entry to spawn with — reconciled when a drift was repaired, the
+ * original otherwise.
+ *
+ * Why (channel#41): the hub is the port authority, and a first-party module
+ * with a compiled-in canonical port (`canonicalPortForManifest` ≠ undefined —
+ * vault / scribe / surface / channel / notes / runner) has exactly ONE correct
+ * port: its canonical one. The injected `PORT`, the supervisor's readiness
+ * probe, and the reverse-proxy target are ALL derived from the services.json
+ * row's `port`. So once a transiently-wrong port lands in that row (the channel
+ * row was observed live carrying `19415` instead of `1941`), it self-perpetuates:
+ * the supervisor probes/proxies the wrong port forever and `/channel/*` routes
+ * to a dead port. The canonical port is authoritative, so we reconcile the row
+ * before spawn rather than honoring the drift.
+ *
+ * Safety for the other fixed-port modules (vault / scribe / surface): the
+ * canonical value is exactly what each ALREADY self-registers, so on the
+ * common path `entry.port === canonical` and this is a no-op. There is no
+ * legitimate "first-party module intentionally on a non-canonical port" case —
+ * install-time `assignPort` only walks off canonical on a genuine collision,
+ * and that's a same-range fallback for a DIFFERENT module, never a steady state
+ * for the canonical owner. If another row genuinely already owns the canonical
+ * port we DON'T rewrite (it would trip the write-side duplicate-port guard and
+ * isn't ours to take) — we leave the drift in place and let the supervisor's
+ * port-squatter detection surface it. Third-party modules (no canonical) are
+ * never touched.
+ */
+export function reconcilePortToCanonical(
+  entry: ServiceEntry,
+  manifestPath: string,
+  log: (line: string) => void = () => {},
+): ServiceEntry {
+  const canonical = canonicalPortForManifest(entry.name);
+  if (canonical === undefined || entry.port === canonical) return entry;
+
+  // Don't steal a canonical port another row legitimately holds — that would
+  // trip `upsertService`'s duplicate-port guard. Re-read live so we see the
+  // current on-disk state (another module may have just registered).
+  const others = readManifestLenient(manifestPath).services.filter((s) => s.name !== entry.name);
+  if (others.some((s) => s.port === canonical)) {
+    log(
+      `[supervisor] ${entry.name}: services.json port ${entry.port} ≠ canonical ${canonical}, ` +
+        `but ${canonical} is held by another row — not reconciling; surfacing the drift.`,
+    );
+    return entry;
+  }
+
+  const reconciled: ServiceEntry = { ...entry, port: canonical };
+  try {
+    upsertService(reconciled, manifestPath);
+    log(
+      `[supervisor] ${entry.name}: reconciled drifted services.json port ${entry.port} → canonical ${canonical} (channel#41).`,
+    );
+    return reconciled;
+  } catch (err) {
+    // Best-effort: a failed reconcile must not block the boot. The write can
+    // fail for an I/O reason (permissions, races against an external writer) OR
+    // because `upsertService`'s duplicate-port guard tripped — e.g. another row
+    // raced onto the canonical port between the check above and this write.
+    // Either way, spawn with the canonical port in-memory so at least the child
+    // binds + the probe checks the right port this run; the proxy still reads
+    // the (stale) row until the next reconcile succeeds.
+    log(
+      `[supervisor] ${entry.name}: could not reconcile services.json port to canonical (${entry.port} → ${canonical}; write failed or canonical held): ${err} — spawning with canonical in-memory.`,
+    );
+    return reconciled;
+  }
 }
 
 /**
@@ -166,7 +238,12 @@ export async function bootSupervisedModules(
       continue;
     }
 
-    const cmd = spec.startCmd?.(entry);
+    // Snap a drifted fixed-port row back to canonical before we derive PORT /
+    // probe / proxy from it (channel#41). No-op on the common path where the
+    // module already sits on its canonical port.
+    const spawnEntry = reconcilePortToCanonical(entry, opts.manifestPath, log);
+
+    const cmd = spec.startCmd?.(spawnEntry);
     if (!cmd || cmd.length === 0) {
       log(`[supervisor] ${short}: spec resolved but no startCmd — skipping (CLI-only module).`);
       results.push({
@@ -182,7 +259,7 @@ export async function bootSupervisedModules(
     // .env merge, and PARACHUTE_HUB_ORIGIN propagation (hub#365) all live in the
     // shared `buildModuleSpawnRequest` so the `POST /api/modules/:short/start`
     // handler builds an identical request (design 2026-06-01 §3.3).
-    const req = buildModuleSpawnRequest(short, entry, cmd, {
+    const req = buildModuleSpawnRequest(short, spawnEntry, cmd, {
       configDir: opts.configDir,
       ...(opts.hubOrigin !== undefined ? { hubOrigin: opts.hubOrigin } : {}),
     });

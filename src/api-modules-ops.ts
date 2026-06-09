@@ -39,7 +39,7 @@ import { MissingDependencyError, type MissingDependencyWire } from "@openparachu
 import type { CuratedModuleShort } from "./api-modules.ts";
 import { isLinked as defaultIsLinked } from "./bun-link.ts";
 import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
-import { buildModuleSpawnRequest } from "./commands/serve-boot.ts";
+import { buildModuleSpawnRequest, reconcilePortToCanonical } from "./commands/serve-boot.ts";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import { getModuleInstallChannel } from "./hub-settings.ts";
 import { readModuleManifest } from "./module-manifest.ts";
@@ -264,6 +264,15 @@ export interface ApiModulesOpsDeps {
    * per-request HTTP build stay aligned.
    */
   readModuleManifest?: Parameters<typeof regenerateWellKnown>[0]["readModuleManifest"];
+  /**
+   * Diagnostic log sink for spawn-path events that aren't tied to an op-log
+   * (e.g. the canonical-port reconcile in `resolveSpawnRequest`: a drift fixed,
+   * a held-canonical decline, or a persist failure). Without this, those events
+   * are swallowed on an operator-triggered start/restart while the boot path
+   * logs them. Defaults to `console.error` (stderr — same destination as the
+   * serve-boot path's logger). Tests inject a collector to assert the events.
+   */
+  log?: (line: string) => void;
 }
 
 interface PathMatch {
@@ -447,7 +456,14 @@ async function resolveSpawnRequest(
     if (resolved) spawnSpec = resolved;
   }
 
-  const cmd = spawnSpec.startCmd?.(entry);
+  // Snap a drifted fixed-port row back to canonical before deriving startCmd
+  // (notes' startCmd embeds the port) / PORT / probe / proxy from it
+  // (channel#41). No-op on the common path. Mirror of the serve-boot path so a
+  // module started from the admin SPA gets the same canonical-port reconciliation
+  // — including the same diagnostic logging (deps.log, default stderr).
+  const spawnEntry = reconcilePortToCanonical(entry, deps.manifestPath, deps.log ?? console.error);
+
+  const cmd = spawnSpec.startCmd?.(spawnEntry);
   if (!cmd || cmd.length === 0) {
     return {
       ok: false,
@@ -462,7 +478,7 @@ async function resolveSpawnRequest(
   // / live HUB_ORIGIN / enriched PATH). The test-seam / first-boot `spawnEnv`
   // rides the shared helper's `extraEnv` and wins last, matching
   // `spawnSupervised`'s precedence.
-  const req = buildModuleSpawnRequest(short, entry, cmd, {
+  const req = buildModuleSpawnRequest(short, spawnEntry, cmd, {
     configDir: deps.configDir,
     ...(deps.issuer ? { hubOrigin: deps.issuer } : {}),
     ...(deps.spawnEnv ? { extraEnv: deps.spawnEnv } : {}),
