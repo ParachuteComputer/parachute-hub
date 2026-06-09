@@ -45,9 +45,9 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
+import type { CuratedModuleShort } from "./api-modules.ts";
 import { signAccessToken, validateAccessToken } from "./jwt-sign.ts";
-import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES } from "./service-spec.ts";
+import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES, isKnownModuleShort } from "./service-spec.ts";
 import { readManifestLenient } from "./services-manifest.ts";
 
 /**
@@ -119,7 +119,7 @@ export function parseModulesConfigPath(pathname: string): PathMatch | undefined 
   const m = tail.match(/^([a-z][a-z0-9-]*)\/config(\/schema)?$/);
   if (!m) return undefined;
   const short = m[1];
-  if (!CURATED_MODULES.includes(short as CuratedModuleShort)) return undefined;
+  if (short === undefined || !isKnownModuleShort(short)) return undefined;
   return {
     short: short as CuratedModuleShort,
     suffix: m[2] ? "schema" : "",

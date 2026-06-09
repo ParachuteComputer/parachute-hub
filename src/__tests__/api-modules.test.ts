@@ -214,14 +214,14 @@ describe("GET /api/modules", () => {
     expect(res.status).toBe(401);
   });
 
-  test("200 + curated list on fresh container (empty services.json)", async () => {
+  test("200 + full self-registration catalog on fresh container (empty services.json)", async () => {
     // The v0.6 hot path: brand-new Render container, no services.json
-    // yet. UI must render "install vault / scribe" cards even though
-    // nothing's installed. Trimmed 2026-05-27 (Aaron-directed launch
-    // focus): notes (notes-daemon), surface (host module), and runner
-    // (experimental) are no longer curated — notes.parachute.computer
-    // is the hosted PWA, surface-client is the library for custom UI
-    // builders, and runner isn't in the launch focus set.
+    // yet. Post-2026-06-09 (modular-UI architecture, P2) discovery is driven
+    // by the UNION of the bootstrap registries (KNOWN_MODULES ∪
+    // FIRST_PARTY_FALLBACKS), NOT a curated whitelist. Every known module
+    // surfaces — core (vault/scribe/surface) in the headline tier, the rest
+    // (channel/runner/notes) as `experimental` — so the channel-not-installed
+    // class (running but invisible) can't recur.
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
@@ -233,16 +233,32 @@ describe("GET /api/modules", () => {
     const body = (await res.json()) as {
       modules: Array<{
         short: string;
+        focus: "core" | "experimental";
         available: boolean;
         installed: boolean;
         latest_version: string | null;
       }>;
       supervisor_available: boolean;
     };
-    // Curated order is preserved: vault → scribe (vault first per the
-    // recommended install order — the wizard's vault step already runs
-    // before this catalog surfaces).
-    expect(body.modules.map((m) => m.short)).toEqual(["vault", "scribe"]);
+    const shorts = body.modules.map((m) => m.short);
+    // The core tier leads, in the recommended install order (vault → scribe),
+    // ahead of every experimental module.
+    expect(shorts.indexOf("vault")).toBeLessThan(shorts.indexOf("scribe"));
+    expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("channel"));
+    expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("runner"));
+    // Every known module is discoverable — vault/scribe/surface (core) +
+    // channel/runner/notes (experimental).
+    for (const s of ["vault", "scribe", "surface", "channel", "runner", "notes"]) {
+      expect(shorts).toContain(s);
+    }
+    // Focus tier resolves from the default map.
+    const byShort = new Map(body.modules.map((m) => [m.short, m]));
+    expect(byShort.get("vault")?.focus).toBe("core");
+    expect(byShort.get("scribe")?.focus).toBe("core");
+    expect(byShort.get("surface")?.focus).toBe("core");
+    expect(byShort.get("channel")?.focus).toBe("experimental");
+    expect(byShort.get("runner")?.focus).toBe("experimental");
+    expect(byShort.get("notes")?.focus).toBe("experimental");
     expect(body.modules.every((m) => m.available)).toBe(true);
     expect(body.modules.every((m) => !m.installed)).toBe(true);
     expect(body.modules.every((m) => m.latest_version === "0.9.9")).toBe(true);
@@ -288,39 +304,56 @@ describe("GET /api/modules", () => {
     expect(scribe?.available).toBe(true);
   });
 
-  test("uncurated modules (notes / runner / surface) are NOT returned by GET /api/modules", async () => {
-    // CURATED_MODULES was trimmed 2026-05-27 to [vault, scribe]. The
-    // KNOWN_MODULES + FIRST_PARTY_FALLBACKS registries still carry
-    // entries for notes / runner (install-bootstrap path), but
-    // /api/modules only returns CURATED rows. Pins the boundary so a
-    // future re-curation has to be intentional, not a stale registry
-    // leak.
+  test("channel (running + self-registered) appears as installed + experimental — regression for the channel-not-installed bug", async () => {
+    // THE bug this PR fixes (2026-06-09 modular-UI architecture, P2): channel
+    // was running, proxied, supervised, and self-registered in services.json
+    // yet invisible on the Modules screen — because the old CURATED_MODULES =
+    // ["vault","scribe"] whitelist gated discovery. Now discovery is driven by
+    // self-registration ∪ the known registries, so a self-registered channel
+    // row surfaces as installed, in the experimental tier, with its run-state.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-channel",
+        port: 1941,
+        paths: ["/channel"],
+        health: "/channel/health",
+        version: "0.3.1",
+      },
+    ]);
+    const { supervisor } = makeIdleSupervisor();
+    await supervisor.start({ short: "channel", cmd: ["parachute-channel", "daemon"] });
+
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
       issuer: ISSUER,
       manifestPath: h.manifestPath,
+      supervisor,
       fetchLatestVersion: async () => null,
     });
-    const body = (await res.json()) as { modules: Array<{ short: string }> };
-    const shorts = body.modules.map((m) => m.short);
-    // Positive shape assertion — stronger than `not.toContain` because
-    // it also catches "we accidentally added a new uncurated entry"
-    // and "we accidentally removed an existing curated entry." Update
-    // this assertion intentionally when CURATED_MODULES changes.
-    expect(shorts).toEqual(["vault", "scribe"]);
-    // Belt + suspenders: explicit negatives for the modules dropped
-    // 2026-05-27, so a developer regressing the curated list sees both
-    // the shape failure AND the named-module failure messages.
-    expect(shorts).not.toContain("notes");
-    expect(shorts).not.toContain("runner");
-    expect(shorts).not.toContain("surface");
+    const body = (await res.json()) as {
+      modules: Array<{
+        short: string;
+        focus: "core" | "experimental";
+        installed: boolean;
+        installed_version: string | null;
+        supervisor_status: string | null;
+      }>;
+    };
+    const channel = body.modules.find((m) => m.short === "channel");
+    expect(channel).toBeDefined();
+    expect(channel?.installed).toBe(true);
+    expect(channel?.installed_version).toBe("0.3.1");
+    expect(channel?.focus).toBe("experimental");
+    expect(channel?.supervisor_status).toBe("running");
   });
 
-  test("non-curated supervised modules appear in `supervised` (not `modules`) — hub#539", async () => {
-    // surface (the UI host) is supervised but not curated. Its run-state must
-    // surface in `supervised` so `parachute status` reads it `active`, while it
-    // stays OUT of the curated `modules` catalog (which drives the install UI).
+  test("every self-registered + known module appears in `modules` — no running-but-invisible class", async () => {
+    // The two-registry-disagreement (services.json says installed, the curated
+    // whitelist says invisible) is gone: a self-registered surface row + a
+    // supervised channel both surface in `modules` (2026-06-09 modular-UI
+    // architecture). `supervised` still mirrors the run-state for every
+    // tracked module (hub#539) — consumers dedupe by short.
     writeManifest(h.manifestPath, [
       {
         name: "parachute-vault",
@@ -328,6 +361,13 @@ describe("GET /api/modules", () => {
         paths: ["/vault/default"],
         health: "/vault/default/health",
         version: "0.4.5",
+      },
+      {
+        name: "parachute-surface",
+        port: 1946,
+        paths: ["/surface"],
+        health: "/surface/healthz",
+        version: "0.2.0",
       },
     ]);
     const { supervisor } = makeIdleSupervisor();
@@ -343,15 +383,17 @@ describe("GET /api/modules", () => {
       fetchLatestVersion: async () => null,
     });
     const body = (await res.json()) as {
-      modules: Array<{ short: string }>;
+      modules: Array<{ short: string; installed: boolean }>;
       supervised: Array<{ short: string; supervisor_status: string | null; pid: number | null }>;
     };
-    // surface stays out of the curated catalog…
-    expect(body.modules.map((m) => m.short)).not.toContain("surface");
-    // …but its run-state is in `supervised`, marked running with a pid.
-    const surf = body.supervised.find((m) => m.short === "surface");
-    expect(surf?.supervisor_status).toBe("running");
-    expect(typeof surf?.pid).toBe("number");
+    // surface is now IN the catalog (it was excluded under the whitelist), and
+    // reflects installed:true from its services.json row.
+    const surf = body.modules.find((m) => m.short === "surface");
+    expect(surf?.installed).toBe(true);
+    // …and its run-state is still in `supervised`, marked running with a pid.
+    const surfSup = body.supervised.find((m) => m.short === "surface");
+    expect(surfSup?.supervisor_status).toBe("running");
+    expect(typeof surfSup?.pid).toBe("number");
     // Curated modules appear in `supervised` too (consumers dedupe by short).
     expect(body.supervised.find((m) => m.short === "vault")?.supervisor_status).toBe("running");
   });

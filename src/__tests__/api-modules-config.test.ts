@@ -23,13 +23,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeJwt } from "jose";
-import type { CuratedModuleShort } from "../api-modules.ts";
 import {
   API_MODULES_CONFIG_REQUIRED_SCOPE,
   MODULE_CONFIG_PROXY_CLIENT_ID,
   handleApiModulesConfig,
   parseModulesConfigPath,
 } from "../api-modules-config.ts";
+import type { CuratedModuleShort } from "../api-modules.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
@@ -158,14 +158,20 @@ describe("parseModulesConfigPath", () => {
     expect(parseModulesConfigPath("/api/modules/scribe/config/schema")?.short).toBe("scribe");
   });
 
-  test("rejects unknown short (non-curated)", () => {
+  test("accepts any KNOWN module short (channel / notes / runner / surface)", () => {
+    // Post-2026-06-09 (modular-UI architecture, P2) the config-path gate is
+    // `isKnownModuleShort` (KNOWN_MODULES ∪ FIRST_PARTY_FALLBACKS), not the old
+    // CURATED_MODULES whitelist — so a config surface resolves for every known
+    // module, matching the discovery + install gates.
+    expect(parseModulesConfigPath("/api/modules/channel/config")?.short).toBe("channel");
+    expect(parseModulesConfigPath("/api/modules/notes/config")?.short).toBe("notes");
+    expect(parseModulesConfigPath("/api/modules/runner/config")?.short).toBe("runner");
+    expect(parseModulesConfigPath("/api/modules/surface/config")?.short).toBe("surface");
+  });
+
+  test("rejects genuinely unknown shorts", () => {
     expect(parseModulesConfigPath("/api/modules/unknown/config")).toBeUndefined();
-    expect(parseModulesConfigPath("/api/modules/channel/config")).toBeUndefined();
-    // Curated list trimmed 2026-05-27: notes / runner / surface are no
-    // longer curated and reject at the parse boundary.
-    expect(parseModulesConfigPath("/api/modules/notes/config")).toBeUndefined();
-    expect(parseModulesConfigPath("/api/modules/runner/config")).toBeUndefined();
-    expect(parseModulesConfigPath("/api/modules/surface/config")).toBeUndefined();
+    expect(parseModulesConfigPath("/api/modules/hub/config")).toBeUndefined();
   });
 
   test("rejects non-config suffix shapes", () => {

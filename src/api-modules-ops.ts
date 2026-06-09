@@ -36,7 +36,7 @@ import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { MissingDependencyError, type MissingDependencyWire } from "@openparachute/depcheck";
-import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
+import type { CuratedModuleShort } from "./api-modules.ts";
 import { isLinked as defaultIsLinked } from "./bun-link.ts";
 import { PARACHUTE_INSTALL_CHANNEL_ENV } from "./commands/install.ts";
 import { buildModuleSpawnRequest } from "./commands/serve-boot.ts";
@@ -49,6 +49,7 @@ import {
   type ServiceSpec,
   composeKnownModuleSpec,
   getSpec,
+  isKnownModuleShort,
   synthesizeManifestForKnownModule,
 } from "./service-spec.ts";
 import { findService, readManifestLenient, removeService } from "./services-manifest.ts";
@@ -272,9 +273,15 @@ interface PathMatch {
 
 /**
  * Parse `/api/modules/<short>/<rest>` into the canonical short name +
- * the action suffix. Rejects unknown shorts to keep arbitrary
- * services.json names from driving the install pathway (curated-only
- * for v0.6).
+ * the action suffix. Rejects shorts the hub can't resolve a package/manifest
+ * for — but the gate is now "is this a KNOWN module" (`isKnownModuleShort`:
+ * KNOWN_MODULES ∪ FIRST_PARTY_FALLBACKS), NOT the old `CURATED_MODULES`
+ * whitelist (2026-06-09 modular-UI architecture, P2). This is what makes
+ * `POST /api/modules/channel/install` resolve — channel was discoverable +
+ * running yet un-installable because it sat outside the whitelist.
+ *
+ * The hub (`hub`) and genuinely third-party services.json rows still fall
+ * through to undefined: there's no install package to act on.
  */
 export function parseModulesPath(pathname: string): PathMatch | undefined {
   const prefix = "/api/modules/";
@@ -284,7 +291,7 @@ export function parseModulesPath(pathname: string): PathMatch | undefined {
   if (slash <= 0) return undefined;
   const short = tail.slice(0, slash);
   const rest = tail.slice(slash + 1);
-  if (!CURATED_MODULES.includes(short as CuratedModuleShort)) return undefined;
+  if (!isKnownModuleShort(short)) return undefined;
   return { short: short as CuratedModuleShort, rest };
 }
 
