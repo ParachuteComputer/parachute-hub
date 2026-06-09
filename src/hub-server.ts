@@ -53,8 +53,6 @@
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /admin/channel-token          (GET)        → channel UI bearer mint (cookie-gated)
  *   /admin/module-token/<short>   (GET)        → generic module config-UI bearer mint <short>:admin (cookie-gated)
- *   /admin/channels               (POST/GET)   → vault-channel provision/list (cookie-gated; POST CSRF-belted)
- *   /admin/channels/<name>        (DELETE)     → vault-channel teardown (cookie-gated; CSRF-belted)
  *   /api/connections/catalog      (GET)        → events/actions across installed modules (cookie-gated)
  *   /admin/connections            (POST/GET)   → connection provision/list (cookie-gated; POST CSRF-belted)
  *   /admin/connections/<id>       (DELETE)     → connection teardown (cookie-gated; CSRF-belted)
@@ -153,7 +151,6 @@ import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.t
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
 import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
 import { handleChannelToken } from "./admin-channel-token.ts";
-import { handleChannels } from "./admin-channels.ts";
 import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
 import {
   type ConnectionsDeps,
@@ -2226,7 +2223,7 @@ export function hubFetch(
         const name = decodeURIComponent(pathname.slice("/vaults/".length));
         const services = readManifestLenient(manifestPath).services;
         // Channel's row carries its MANIFEST name — resolve via
-        // findServiceByShort (see the /admin/channels note above).
+        // findServiceByShort (see the /admin/connections note below).
         const channelEntry = findServiceByShort(services, "channel");
         const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
         const resolveVaultOrigin = (vaultName: string): string | null => {
@@ -2300,56 +2297,19 @@ export function hubFetch(
         });
       }
 
-      // /admin/channels — one-action vault-channel provisioning (frictionless
-      // channel setup PR 3). Cookie-gated operator session (first-admin),
-      // exactly like /admin/channel-token above. POST provisions everything
-      // (mint vault:write + channel:admin + channel:send, write the channel
-      // config, register the vault inbound trigger); GET lists; DELETE tears
-      // down both sides. Internal channel/vault calls go over loopback (origins
-      // resolved from services.json at request time); the public origin is used
-      // only for the webhook URL + the copy-paste connect lines.
-      if (pathname === "/admin/channels" || pathname.startsWith("/admin/channels/")) {
-        if (!getDb) return dbNotConfigured();
-        // CSRF belt (hub#632, boundary C1): cookie-authed POST/DELETE must
-        // carry a matching Origin. Same-origin pages (hub SPA + proxied
-        // module pages) pass automatically; see the enumeration in
-        // origin-check.ts `assertSameOriginForCookieMutation`.
-        {
-          const rejected = assertSameOriginForCookieMutation(req, oauthDeps(req).hubBoundOrigins());
-          if (rejected) return rejected;
-        }
-        const subPath = pathname.slice("/admin/channels".length);
-        const services = readManifestLenient(manifestPath).services;
-        // Channel's services.json row carries its MANIFEST name (`parachute-channel`),
-        // not the bare short `channel` — resolve via findServiceByShort so the
-        // lookup matches the on-disk row. (A bare `s.name === "channel"` never
-        // matched, leaving channelOrigin null → "channel not installed".)
-        const channelEntry = findServiceByShort(services, "channel");
-        const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
-        const resolveVaultOrigin = (vaultName: string): string | null => {
-          const match = findVaultUpstream(
-            readManifestLenient(manifestPath).services,
-            `/vault/${vaultName}`,
-          );
-          return match ? `http://127.0.0.1:${match.port}` : null;
-        };
-        return handleChannels(req, subPath, {
-          db: getDb(),
-          // Public origin — webhook URL + connect lines + minted-token `iss`.
-          hubOrigin: oauthDeps(req).issuer,
-          channelOrigin,
-          resolveVaultOrigin,
-        });
-      }
+      // Note: the legacy `/admin/channels` bespoke vault-channel orchestration
+      // endpoint (pre-Connections, hub#624 era) was retired in boundary D1 —
+      // superseded by the general engine below. Channel's own admin page
+      // drives `/admin/connections` + `/admin/channel-token`.
 
       // Connections — the GENERAL module event→action engine (2026-06-09
       // modular-UI architecture, P5). `/api/connections/catalog` (GET) returns
       // the available events/actions read from each installed module's
       // `module.json`; `/admin/connections` (GET/POST) lists + provisions;
-      // `/admin/connections/:id` (DELETE) tears down. Same cookie-gated
-      // first-admin operator gate as `/admin/channels`. The provisioning engine
-      // derives the vault trigger's webhook + scope from the SINK action's
-      // declaration — nothing is channel-hardcoded.
+      // `/admin/connections/:id` (DELETE) tears down. Cookie-gated to the
+      // first-admin operator. The provisioning engine derives the vault
+      // trigger's webhook + scope from the SINK action's declaration —
+      // nothing is channel-hardcoded.
       if (
         pathname === "/api/connections/catalog" ||
         pathname === "/admin/connections" ||
@@ -2357,8 +2317,11 @@ export function hubFetch(
       ) {
         if (!getDb) return dbNotConfigured();
         const services = readManifestLenient(manifestPath).services;
-        // See the `/admin/channels` note above: match the manifest name via
-        // findServiceByShort, not the bare short `channel`.
+        // Channel's services.json row carries its MANIFEST name
+        // (`parachute-channel`), not the bare short `channel` — resolve via
+        // findServiceByShort so the lookup matches the on-disk row. (A bare
+        // `s.name === "channel"` never matched, leaving channelOrigin null →
+        // "channel not installed".)
         const channelEntry = findServiceByShort(services, "channel");
         const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
         const resolveVaultOrigin = (vaultName: string): string | null => {

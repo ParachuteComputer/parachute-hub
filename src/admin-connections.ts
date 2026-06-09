@@ -1,9 +1,10 @@
 /**
  * `GET /api/connections/catalog` + `GET/POST/DELETE /admin/connections` — the
  * general module event→action Connections engine (2026-06-09 modular-UI
- * architecture, P5). Generalizes the channel-specific `admin-channels.ts`
- * (hub#624): "add a vault-backed channel" is just the first connection,
- * `vault.note.created (filter #channel-message/inbound) → channel.message.deliver`.
+ * architecture, P5). Generalizes the channel-specific `/admin/channels`
+ * endpoint (hub#624 era; retired in boundary D1): "add a vault-backed channel"
+ * is just the first connection, `vault.note.created (filter
+ * #channel-message/inbound) → channel.message.deliver`.
  *
  * THE CONCEPT. A connection wires "when [EVENT] in [source module] (filter) →
  * do [ACTION] in [sink module]". The sink is ALWAYS an action. Modules declare
@@ -30,9 +31,9 @@
  * engine — it runs only for `sink.module === "channel"` and is clearly fenced
  * (`prepareChannelSink`). Everything else is declaration-driven.
  *
- * AUTH. Same gate as `/admin/channels`: a cookie-gated operator session pinned
- * to the first admin. The catalog (`/api/connections/catalog`) is operator-only
- * metadata; it uses the same session gate.
+ * AUTH. Same gate as the admin-token mints: a cookie-gated operator session
+ * pinned to the first admin. The catalog (`/api/connections/catalog`) is
+ * operator-only metadata; it uses the same session gate.
  */
 import type { Database } from "bun:sqlite";
 import {
@@ -66,9 +67,9 @@ const PROVISION_CLIENT_ID = "parachute-hub-spa";
 const CONNECTION_ID_RE = /^[a-z0-9][a-z0-9_-]*$/i;
 
 /**
- * Channel-name charset (mirrors `admin-channels.CHANNEL_NAME_RE`). A channel
- * name lands in a services.json key, a URL path segment, and an MCP server name
- * — keep it a conservative slug to close injection across all of them.
+ * Channel-name charset. A channel name lands in a services.json key, a URL
+ * path segment, and an MCP server name — keep it a conservative slug to close
+ * injection across all of them.
  */
 const CHANNEL_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/i;
 
@@ -812,7 +813,7 @@ function channelConnectLines(
   };
 }
 
-// --- Auth gate (mirrors admin-channels) ------------------------------------
+// --- Auth gate (mirrors the admin-token mints) ------------------------------
 
 /** Returns an error Response when the operator gate fails, else `null`. */
 function operatorGate(req: Request, deps: ConnectionsDeps): Response | null {

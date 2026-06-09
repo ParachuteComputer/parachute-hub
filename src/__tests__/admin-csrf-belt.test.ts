@@ -9,10 +9,11 @@
  *      (reads, Bearer-authed, cookie-less), and the two rejection codes
  *      (`csrf_origin_required` / `csrf_origin_mismatch`).
  *   2. Integration — the wiring in hub-server.ts dispatch for
- *      `/admin/connections` + `/admin/channels`: cross-origin cookie
- *      mutations 403 BEFORE the operator gate; same-origin mutations reach
- *      the handler; GETs are unaffected; Bearer-authed mutations skip the
- *      belt and land on the endpoint's own gate.
+ *      `/admin/connections`: cross-origin cookie mutations 403 BEFORE the
+ *      operator gate; same-origin mutations reach the handler; GETs are
+ *      unaffected; Bearer-authed mutations skip the belt and land on the
+ *      endpoint's own gate. (The legacy `/admin/channels` wiring was belted
+ *      here too until boundary D1 retired the endpoint.)
  *
  * The canonical seam consumer is pinned here: channel's admin page POSTs
  * `/admin/connections` as a same-origin `fetch()` with
@@ -218,7 +219,7 @@ function adminReq(
   });
 }
 
-describe("CSRF belt wiring — /admin/connections + /admin/channels", () => {
+describe("CSRF belt wiring — /admin/connections", () => {
   test("cross-origin cookie POST /admin/connections → 403 csrf_origin_mismatch (even with a valid admin session)", async () => {
     const res = await handler()(
       adminReq("/admin/connections", {
@@ -327,34 +328,19 @@ describe("CSRF belt wiring — /admin/connections + /admin/channels", () => {
     expect(await errorCode(res)).toBe("csrf_origin_mismatch");
   });
 
-  test("cross-origin cookie POST /admin/channels → 403 csrf_origin_mismatch", async () => {
+  // The legacy `/admin/channels` cases lived here until boundary D1 retired
+  // the endpoint (superseded by /admin/connections, covered above). A POST
+  // there now falls through dispatch to the generic `/admin/*` SPA mount,
+  // which rejects non-GET (405) — the pin here is "no provisioning handler
+  // answers anymore", not the precise fallthrough status.
+  test("retired /admin/channels no longer provisions (D1) — falls through dispatch", async () => {
     const res = await handler()(
       adminReq("/admin/channels", {
         cookie: h.cookie,
-        origin: "https://evil.example",
+        origin: ORIGIN,
         body: { channelName: "x", vault: "main" },
       }),
     );
-    expect(res.status).toBe(403);
-    expect(await errorCode(res)).toBe("csrf_origin_mismatch");
-  });
-
-  test("missing-Origin cookie DELETE /admin/channels/<name> → 403 csrf_origin_required", async () => {
-    const res = await handler()(
-      adminReq("/admin/channels/tg", { method: "DELETE", cookie: h.cookie }),
-    );
-    expect(res.status).toBe(403);
-    expect(await errorCode(res)).toBe("csrf_origin_required");
-  });
-
-  test("same-origin cookie DELETE /admin/channels/<name> passes the belt (handler answers)", async () => {
-    const res = await handler()(
-      adminReq("/admin/channels/tg", { method: "DELETE", cookie: h.cookie, origin: ORIGIN }),
-    );
-    // channel isn't installed in this harness — the handler (not the belt)
-    // answers with its own error, proving the belt passed it through.
-    expect(res.status).not.toBe(403);
-    const body = (await res.json()) as { error?: string };
-    expect(body.error ?? "").not.toStartWith("csrf_");
+    expect([404, 405]).toContain(res.status);
   });
 });
