@@ -228,6 +228,82 @@ describe("validateModuleManifest", () => {
     );
   });
 
+  test("actions parse endpoint + scope (the connection-wiring fields, P5)", () => {
+    // The scope namespace must match the module name (VALID is "demo"), so use
+    // a demo-namespaced scope here; the cross-namespace rejection is exercised
+    // in the namespace-guard test below.
+    const m = validateModuleManifest(
+      {
+        ...VALID,
+        actions: [
+          {
+            key: "message.deliver",
+            title: "Deliver",
+            endpoint: "/api/vault/inbound",
+            scope: "demo:send",
+            provision: { type: "vault-trigger" },
+          },
+        ],
+      },
+      "x",
+    );
+    expect(m.actions?.[0]?.endpoint).toBe("/api/vault/inbound");
+    expect(m.actions?.[0]?.scope).toBe("demo:send");
+    // endpoint must be a leading-slash path.
+    expect(() =>
+      validateModuleManifest(
+        { ...VALID, actions: [{ key: "a", title: "A", endpoint: "no-slash" }] },
+        "x",
+      ),
+    ).toThrow(/actions\[0\]\.endpoint/);
+    // scope must be a non-empty string.
+    expect(() =>
+      validateModuleManifest({ ...VALID, actions: [{ key: "a", title: "A", scope: 7 }] }, "x"),
+    ).toThrow(/actions\[0\]\.scope/);
+  });
+
+  test("action.scope namespace MUST match the declaring module name (privilege-escalation guard)", () => {
+    // A malicious manifest named "widget" declaring an action scoped to ANOTHER
+    // module's namespace (vault:default:admin) would trick the hub into minting a
+    // 90-day cross-module bearer when an operator wires a Connection to it.
+    // Reject it at validation, mirroring the `scopes.defines` namespace rule.
+    expect(() =>
+      validateModuleManifest(
+        {
+          ...VALID,
+          name: "widget",
+          actions: [{ key: "thing.do", title: "Do", scope: "vault:default:admin" }],
+        },
+        "x",
+      ),
+    ).toThrow(/namespace "vault" does not match module name "widget"/);
+    // An un-namespaced scope is rejected too.
+    expect(() =>
+      validateModuleManifest(
+        { ...VALID, name: "widget", actions: [{ key: "a", title: "A", scope: "bare" }] },
+        "x",
+      ),
+    ).toThrow(/must be namespaced as "<name>:<verb>"/);
+    // A matching-namespace scope still validates — the real channel case
+    // (channel.message.deliver → channel:send).
+    const okm = validateModuleManifest(
+      {
+        ...VALID,
+        name: "channel",
+        actions: [
+          {
+            key: "message.deliver",
+            title: "Deliver",
+            endpoint: "/api/vault/inbound",
+            scope: "channel:send",
+          },
+        ],
+      },
+      "x",
+    );
+    expect(okm.actions?.[0]?.scope).toBe("channel:send");
+  });
+
   test("uiUrl accepts a leading-slash path (Phase D)", () => {
     const m = validateModuleManifest({ ...VALID, uiUrl: "/notes" }, "x");
     expect(m.uiUrl).toBe("/notes");

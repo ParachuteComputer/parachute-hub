@@ -1,0 +1,139 @@
+/**
+ * `connections.json` — the persisted registry of operator-created Connections
+ * (2026-06-09 modular-UI architecture, P5).
+ *
+ * A **connection** wires "when [EVENT] in [source module] (filter) → do [ACTION]
+ * in [sink module]". The hub is the only thing with cross-module authority
+ * (mint tokens, register vault triggers), so connections are hub-native + the
+ * record of what got provisioned lives here, in the hub state dir.
+ *
+ * One file, a flat array of records. Each record carries enough to (a) render
+ * the Connections list and (b) tear down what was provisioned — notably the
+ * `provisioned.triggerName` + `provisioned.vault` so DELETE can remove the exact
+ * vault trigger that was registered. We keep the store deliberately small +
+ * synchronous (Bun file I/O); the cardinality is "a handful of connections per
+ * hub", not a hot path.
+ */
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+
+/** The source side — an event a module emits, with an operator-set filter. */
+export interface ConnectionSource {
+  /** Source module short name, e.g. `vault`. */
+  readonly module: string;
+  /** For vault events, which vault instance the event is scoped to. */
+  readonly vault?: string;
+  /** Event key declared in the source module's `module.json`, e.g. `note.created`. */
+  readonly event: string;
+  /**
+   * Operator-set filter, shaped by the event's `filterSchema`. For a vault
+   * event this maps to the trigger predicate (`tags` / `has_metadata` /
+   * `missing_metadata` / `has_content`).
+   */
+  readonly filter?: Record<string, unknown>;
+}
+
+/** The sink side — an action a module accepts (the sink is ALWAYS an action). */
+export interface ConnectionSink {
+  /** Sink module short name, e.g. `channel`. */
+  readonly module: string;
+  /** Action key declared in the sink module's `module.json`, e.g. `message.deliver`. */
+  readonly action: string;
+  /** Action params, shaped by the action's `inputSchema` (e.g. `{ channel }`). */
+  readonly params?: Record<string, unknown>;
+}
+
+/** What the provisioning engine actually wired, for teardown + display. */
+export interface ConnectionProvisioned {
+  /** How the action was provisioned, e.g. `vault-trigger`. */
+  readonly type: string;
+  /** The vault instance the trigger was registered on (vault-trigger). */
+  readonly vault?: string;
+  /** The exact vault trigger name registered — DELETE removes this. */
+  readonly triggerName?: string;
+}
+
+export interface ConnectionRecord {
+  readonly id: string;
+  readonly source: ConnectionSource;
+  readonly sink: ConnectionSink;
+  readonly provisioned: ConnectionProvisioned;
+  readonly createdAt: string;
+}
+
+interface ConnectionsFile {
+  connections: ConnectionRecord[];
+}
+
+function emptyFile(): ConnectionsFile {
+  return { connections: [] };
+}
+
+/** Read the store. A missing/garbage file reads as empty (fresh hub). */
+export function readConnections(storePath: string): ConnectionRecord[] {
+  let buf: string;
+  try {
+    buf = readFileSync(storePath, "utf8");
+  } catch {
+    return [];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(buf);
+  } catch {
+    return [];
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  const arr = (parsed as { connections?: unknown }).connections;
+  if (!Array.isArray(arr)) return [];
+  // Lenient: drop any malformed row rather than failing the whole read, so one
+  // bad hand-edit doesn't take down the Connections view (mirrors the
+  // services.json lenient-read posture).
+  return arr.filter((r): r is ConnectionRecord => {
+    if (!r || typeof r !== "object") return false;
+    const rec = r as Record<string, unknown>;
+    return (
+      typeof rec.id === "string" &&
+      !!rec.source &&
+      typeof rec.source === "object" &&
+      !!rec.sink &&
+      typeof rec.sink === "object"
+    );
+  });
+}
+
+function writeAll(storePath: string, records: ConnectionRecord[]): void {
+  mkdirSync(dirname(storePath), { recursive: true });
+  const file: ConnectionsFile = { connections: records };
+  // Written WITHOUT 0o600 because this file holds NO secrets — the provisioned
+  // webhook bearer lives only in the vault trigger's row, never here; records
+  // carry source/sink/trigger-name metadata only. Consistent with the default
+  // perms on services.json / expose-state.json.
+  writeFileSync(storePath, `${JSON.stringify(file, null, 2)}\n`);
+}
+
+/** Upsert by id (replace an existing record with the same id, else append). */
+export function putConnection(storePath: string, record: ConnectionRecord): void {
+  const records = readConnections(storePath);
+  const idx = records.findIndex((r) => r.id === record.id);
+  if (idx >= 0) records[idx] = record;
+  else records.push(record);
+  writeAll(storePath, records);
+}
+
+/** Remove a connection by id. Returns the removed record, or null if absent. */
+export function removeConnection(storePath: string, id: string): ConnectionRecord | null {
+  const records = readConnections(storePath);
+  const idx = records.findIndex((r) => r.id === id);
+  if (idx < 0) return null;
+  const [removed] = records.splice(idx, 1);
+  writeAll(storePath, records);
+  return removed ?? null;
+}
+
+export function getConnection(storePath: string, id: string): ConnectionRecord | null {
+  return readConnections(storePath).find((r) => r.id === id) ?? null;
+}
+
+/** Re-export for the unused-import linter when only the type is consumed. */
+export const _emptyConnectionsFile = emptyFile;

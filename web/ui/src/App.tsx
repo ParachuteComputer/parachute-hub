@@ -28,6 +28,7 @@ import { HubVersionBadge } from "./components/HubVersionBadge.tsx";
 import { type MeResponse, type ModuleListing, getMe, listModules, signOut } from "./lib/api.ts";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
 import { Channels } from "./routes/Channels.tsx";
+import { Connections } from "./routes/Connections.tsx";
 import { Modules } from "./routes/Modules.tsx";
 import { NewVault } from "./routes/NewVault.tsx";
 import { Permissions } from "./routes/Permissions.tsx";
@@ -53,6 +54,9 @@ function subtitleFor(pathname: string): string {
   }
   if (pathname === "/users" || pathname.startsWith("/users/")) {
     return "users";
+  }
+  if (pathname === "/connections" || pathname.startsWith("/connections/")) {
+    return "connections";
   }
   if (pathname === "/channels" || pathname.startsWith("/channels/")) {
     return "channels";
@@ -171,7 +175,7 @@ export function App() {
         <NavSection to="/modules" label="Modules" />
         <InstalledServicesDropdown services={installedServices} />
         <NavSection to="/users" label="Users" />
-        <NavSection to="/channels" label="Channels" />
+        <NavSection to="/connections" label="Connections" />
         <NavSection to="/permissions" label="Permissions" />
         <NavSection to="/tokens" label="Tokens" />
         <NavSection to="/settings" label="Settings" />
@@ -187,6 +191,8 @@ export function App() {
         <Route path="/vaults/new" element={<NewVault />} />
         <Route path="/modules" element={<Modules />} />
         <Route path="/users" element={<Users />} />
+        <Route path="/connections" element={<Connections />} />
+        {/* Back-compat: the pre-P5 Channels view stays routable for bookmarks. */}
         <Route path="/channels" element={<Channels />} />
         <Route path="/permissions" element={<Permissions />} />
         <Route path="/tokens" element={<Tokens />} />

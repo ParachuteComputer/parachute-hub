@@ -49,6 +49,9 @@
  *   /admin/module-token/<short>   (GET)        → generic module config-UI bearer mint <short>:admin (cookie-gated)
  *   /admin/channels               (POST/GET)   → vault-channel provision/list (cookie-gated)
  *   /admin/channels/<name>        (DELETE)     → vault-channel teardown (cookie-gated)
+ *   /api/connections/catalog      (GET)        → events/actions across installed modules (cookie-gated)
+ *   /admin/connections            (POST/GET)   → connection provision/list (cookie-gated)
+ *   /admin/connections/<id>       (DELETE)     → connection teardown (cookie-gated)
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
  *   /api/hub                      (GET)        → hub version + uptime + install-source (host:admin)
  *   /api/hub/upgrade              (POST)       → SPA-driven hub self-upgrade → 202 + detached helper (host:admin, §5.3/D4)
@@ -137,6 +140,11 @@ import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
 import { handleChannelToken } from "./admin-channel-token.ts";
 import { handleChannels } from "./admin-channels.ts";
 import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
+import {
+  type ConnectionsDeps,
+  handleConnections,
+  handleConnectionsCatalog,
+} from "./admin-connections.ts";
 import { handleListGrants, handleRevokeGrant } from "./admin-grants.ts";
 import {
   handleAdminLoginGet,
@@ -416,6 +424,45 @@ function hasVaultInstalled(manifestPath: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Snapshot of every installed module's `.parachute/module.json` + its
+ * user-facing mount path, for the Connections engine (2026-06-09 modular-UI
+ * architecture, P5). Read at request time so a freshly-installed module's
+ * declared events/actions surface without a hub restart. A malformed manifest
+ * on one module is skipped (logged), never 500s the whole catalog — same
+ * posture as `/api/modules`.
+ *
+ * `mount` is the first non-`.parachute` services.json path (the proxied
+ * user-facing prefix, e.g. `/channel`), which the engine joins with a sink
+ * action's `endpoint` to build the hub-proxied webhook.
+ */
+async function collectInstalledModules(
+  manifestPath: string,
+  readManifestFn: (installDir: string) => Promise<ModuleManifest | null>,
+): Promise<import("./admin-connections.ts").InstalledModuleInfo[]> {
+  // Lenient — see hub#406.
+  const services = readManifestLenient(manifestPath).services;
+  const out: import("./admin-connections.ts").InstalledModuleInfo[] = [];
+  await Promise.all(
+    services.map(async (entry) => {
+      if (!entry.installDir) return;
+      const short = shortNameForManifest(entry.name) ?? entry.name;
+      const userPath = (entry.paths ?? []).find(
+        (p) => p !== "/.parachute" && !p.startsWith("/.parachute/"),
+      );
+      try {
+        const manifest = await readManifestFn(entry.installDir);
+        if (!manifest) return;
+        out.push({ short, manifest, mount: userPath ?? null });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`connections: skipping module ${short}: ${msg}`);
+      }
+    }),
+  );
+  return out;
 }
 
 /**
@@ -879,6 +926,11 @@ export interface HubFetchDeps {
    * the doc reflect `parachute vault create` etc. without re-running expose.
    */
   manifestPath?: string;
+  /**
+   * Path to `connections.json` (the Connections store, P5). Tests point this
+   * at a tmpdir; production defaults to `<CONFIG_DIR>/connections.json`.
+   */
+  connectionsStorePath?: string;
   /**
    * Directory containing the built SPA bundle (`index.html` + `assets/`). When
    * absent, the hub auto-resolves to `<repo>/web/ui/dist/` — handy for the
@@ -2135,6 +2187,47 @@ export function hubFetch(
           channelOrigin,
           resolveVaultOrigin,
         });
+      }
+
+      // Connections — the GENERAL module event→action engine (2026-06-09
+      // modular-UI architecture, P5). `/api/connections/catalog` (GET) returns
+      // the available events/actions read from each installed module's
+      // `module.json`; `/admin/connections` (GET/POST) lists + provisions;
+      // `/admin/connections/:id` (DELETE) tears down. Same cookie-gated
+      // first-admin operator gate as `/admin/channels`. The provisioning engine
+      // derives the vault trigger's webhook + scope from the SINK action's
+      // declaration — nothing is channel-hardcoded.
+      if (
+        pathname === "/api/connections/catalog" ||
+        pathname === "/admin/connections" ||
+        pathname.startsWith("/admin/connections/")
+      ) {
+        if (!getDb) return dbNotConfigured();
+        const services = readManifestLenient(manifestPath).services;
+        const channelEntry = services.find((s) => s.name === "channel");
+        const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
+        const resolveVaultOrigin = (vaultName: string): string | null => {
+          const match = findVaultUpstream(
+            readManifestLenient(manifestPath).services,
+            `/vault/${vaultName}`,
+          );
+          return match ? `http://127.0.0.1:${match.port}` : null;
+        };
+        const readManifestFn = deps?.readModuleManifest ?? defaultReadModuleManifest;
+        const modules = await collectInstalledModules(manifestPath, readManifestFn);
+        const connectionsDeps: ConnectionsDeps = {
+          db: getDb(),
+          hubOrigin: oauthDeps(req).issuer,
+          modules,
+          resolveVaultOrigin,
+          channelOrigin,
+          storePath: deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
+        };
+        if (pathname === "/api/connections/catalog") {
+          return handleConnectionsCatalog(req, connectionsDeps);
+        }
+        const subPath = pathname.slice("/admin/connections".length);
+        return handleConnections(req, subPath, connectionsDeps);
       }
 
       if (pathname.startsWith("/admin/vault-admin-token/")) {
