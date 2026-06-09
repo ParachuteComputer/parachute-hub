@@ -27,6 +27,7 @@ import {
   importSPKI,
   jwtVerify,
 } from "jose";
+import { vaultScopeName } from "./scope-explanations.ts";
 import { getActiveSigningKey, getAllPublicKeys } from "./signing-keys.ts";
 
 export const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
@@ -274,6 +275,36 @@ export function revokeTokenByJti(db: Database, jti: string, now: Date): boolean 
     .prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL")
     .run(now.toISOString(), jti);
   return Number(res.changes) > 0;
+}
+
+/**
+ * Revoke every un-revoked tokens row whose recorded scopes NAME the given
+ * vault (`vault:<name>:<verb>`) — the B1 vault-delete registry sweep
+ * (2026-06-09 hub-module-boundary migration, lifecycle symmetry).
+ *
+ * Matching is EXACT scope-segment comparison via `vaultScopeName` — NEVER
+ * SQL `LIKE`: `_` in a vault name is a LIKE single-char wildcard, so a
+ * `LIKE '%vault:my_vault:%'` sweep for vault `my_vault` would also revoke
+ * `myxvault`-scoped tokens. We read candidate rows and match in JS instead.
+ * Unnamed scopes (`vault:read`) don't name an instance and are untouched.
+ *
+ * Returns the number of rows newly revoked. Idempotent (already-revoked
+ * rows are filtered by the WHERE and by `revokeTokenByJti`).
+ */
+export function revokeTokensNamingVault(db: Database, vaultName: string, now: Date): number {
+  const rows = db
+    .query<{ jti: string; scopes: string }, []>(
+      "SELECT jti, scopes FROM tokens WHERE revoked_at IS NULL",
+    )
+    .all();
+  let revoked = 0;
+  for (const row of rows) {
+    const scopes = row.scopes.split(" ").filter((s) => s.length > 0);
+    if (scopes.some((s) => vaultScopeName(s) === vaultName)) {
+      if (revokeTokenByJti(db, row.jti, now)) revoked++;
+    }
+  }
+  return revoked;
 }
 
 /**

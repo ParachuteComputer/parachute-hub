@@ -289,3 +289,25 @@ export function revokeInvite(db: Database, tokenHash: string, now: Date = new Da
     .run(now.toISOString(), tokenHash);
   return res.changes > 0;
 }
+
+/**
+ * Vault-delete cascade step (B1, 2026-06-09 hub-module-boundary): invalidate
+ * every UNREDEEMED invite pinned to the deleted vault. An un-revoked pending
+ * invite carrying `vault_name = <deleted>` would re-provision (resurrect)
+ * the name on redemption — the cascade must close that door. Used/already-
+ * revoked invites are untouched (terminal states). `vault_name` is an exact
+ * `=` comparison — no pattern matching. Returns the number of invites
+ * newly revoked.
+ */
+export function revokeInvitesForVault(
+  db: Database,
+  vaultName: string,
+  now: Date = new Date(),
+): number {
+  const res = db
+    .prepare(
+      "UPDATE invites SET revoked_at = ? WHERE vault_name = ? AND used_at IS NULL AND revoked_at IS NULL",
+    )
+    .run(now.toISOString(), vaultName);
+  return Number(res.changes);
+}

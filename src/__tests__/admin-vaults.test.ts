@@ -721,3 +721,571 @@ describe("POST /vaults — method gating", () => {
     }
   });
 });
+
+// ===========================================================================
+// DELETE /vaults/<name> — the identity cascade (B1, hub-module-boundary)
+// ===========================================================================
+
+import { handleDeleteVault } from "../admin-vaults.ts";
+import { registerClient } from "../clients.ts";
+import { putConnection, readConnections } from "../connections-store.ts";
+import { findGrant, recordGrant } from "../grants.ts";
+import { findInviteByHash, issueInvite } from "../invites.ts";
+import { findTokenRowByJti, listActiveRevocations, recordTokenMint } from "../jwt-sign.ts";
+import { createUser, setUserVaults } from "../users.ts";
+
+const VAULT_ORIGIN = "http://127.0.0.1:19400";
+const CHANNEL_ORIGIN = "http://127.0.0.1:19410";
+
+/** Successful no-op runner — records the commands it was asked to run. */
+function stubRun(
+  exitCode = 0,
+  stderr = "",
+): {
+  run: (cmd: readonly string[]) => Promise<RunResult>;
+  calls: (readonly string[])[];
+} {
+  const calls: (readonly string[])[] = [];
+  return {
+    calls,
+    run: async (cmd) => {
+      calls.push(cmd);
+      return { exitCode, stdout: "", stderr };
+    },
+  };
+}
+
+/** Recording fetch mock keyed by `METHOD <pathname>` (mirrors admin-connections.test). */
+function mockFetch(routes: Record<string, () => Response>): {
+  fetchImpl: typeof fetch;
+  calls: { method: string; url: string }[];
+} {
+  const calls: { method: string; url: string }[] = [];
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.toString();
+    const method = (init?.method ?? "GET").toUpperCase();
+    calls.push({ method, url });
+    const responder = routes[`${method} ${new URL(url).pathname}`];
+    if (!responder) return new Response("no route", { status: 599 });
+    return responder();
+  }) as typeof fetch;
+  return { fetchImpl, calls };
+}
+
+function okJson(payload: unknown): Response {
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+interface DeleteCallOpts {
+  name: string;
+  body?: unknown;
+  authHeader?: string | null;
+  db: ReturnType<typeof openHubDb>;
+  manifestPath: string;
+  connectionsStorePath: string;
+  runCommand?: (cmd: readonly string[]) => Promise<RunResult>;
+  restartVaultModule?: () => Promise<void>;
+  channelOrigin?: string | null;
+  fetchImpl?: typeof fetch;
+  resolveVaultOrigin?: (v: string) => string | null;
+}
+
+async function callDelete(opts: DeleteCallOpts): Promise<Response> {
+  const headers = new Headers({ "content-type": "application/json" });
+  if (opts.authHeader === undefined) {
+    headers.set("authorization", `Bearer ${await adminToken(opts.db)}`);
+  } else if (opts.authHeader !== null) {
+    headers.set("authorization", opts.authHeader);
+  }
+  const req = new Request(`${ISSUER}/vaults/${opts.name}`, {
+    method: "DELETE",
+    headers,
+    body: JSON.stringify(opts.body ?? { confirm: opts.name }),
+  });
+  return handleDeleteVault(req, opts.name, {
+    db: opts.db,
+    issuer: ISSUER,
+    manifestPath: opts.manifestPath,
+    connectionsStorePath: opts.connectionsStorePath,
+    channelOrigin: opts.channelOrigin ?? null,
+    resolveVaultOrigin: opts.resolveVaultOrigin ?? (() => VAULT_ORIGIN),
+    runCommand: opts.runCommand ?? stubRun().run,
+    ...(opts.restartVaultModule ? { restartVaultModule: opts.restartVaultModule } : {}),
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+  });
+}
+
+/** services.json with one multi-path vault row (the canonical Q5 shape). */
+function writeVaults(manifestPath: string, instanceNames: string[]): void {
+  writeManifest(
+    {
+      services: [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: instanceNames.map((n) => `/vault/${n}`),
+          health: `/vault/${instanceNames[0]}/health`,
+          version: "0.5.0",
+        },
+      ],
+    },
+    manifestPath,
+  );
+}
+
+function registryRow(db: ReturnType<typeof openHubDb>, jti: string, scopes: string[]): void {
+  recordTokenMint(db, {
+    jti,
+    createdVia: "cli_mint",
+    subject: "user-admin",
+    clientId: "test-client",
+    scopes,
+    expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+  });
+}
+
+describe("DELETE /vaults/<name> — gates", () => {
+  test("401 without a bearer; 403 without host:admin", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        writeVaults(h.manifestPath, ["default", "work"]);
+        const store = join(h.dir, "connections.json");
+        const noAuth = await callDelete({
+          name: "work",
+          db,
+          manifestPath: h.manifestPath,
+          connectionsStorePath: store,
+          authHeader: null,
+        });
+        expect(noAuth.status).toBe(401);
+        const readOnly = await callDelete({
+          name: "work",
+          db,
+          manifestPath: h.manifestPath,
+          connectionsStorePath: store,
+          authHeader: `Bearer ${await readOnlyToken(db)}`,
+        });
+        expect(readOnly.status).toBe(403);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("400 confirm_mismatch when the body doesn't retype the name (nothing revoked, CLI never runs)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        writeVaults(h.manifestPath, ["default", "work"]);
+        registryRow(db, "jti-confirm-guard", ["vault:work:write"]);
+        const runner = stubRun();
+        for (const body of [{ confirm: "wrong" }, {}, { confirm: "" }]) {
+          const res = await callDelete({
+            name: "work",
+            body,
+            db,
+            manifestPath: h.manifestPath,
+            connectionsStorePath: join(h.dir, "connections.json"),
+            runCommand: runner.run,
+          });
+          expect(res.status).toBe(400);
+          expect(((await res.json()) as { error: string }).error).toBe("confirm_mismatch");
+        }
+        expect(runner.calls.length).toBe(0);
+        expect(findTokenRowByJti(db, "jti-confirm-guard")?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("404 on an unknown vault", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        writeVaults(h.manifestPath, ["default", "work"]);
+        const res = await callDelete({
+          name: "ghost",
+          db,
+          manifestPath: h.manifestPath,
+          connectionsStorePath: join(h.dir, "connections.json"),
+        });
+        expect(res.status).toBe(404);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("409 last_vault on the only remaining vault (CLI never runs)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        writeVaults(h.manifestPath, ["default"]);
+        const runner = stubRun();
+        const res = await callDelete({
+          name: "default",
+          db,
+          manifestPath: h.manifestPath,
+          connectionsStorePath: join(h.dir, "connections.json"),
+          runCommand: runner.run,
+        });
+        expect(res.status).toBe(409);
+        const out = (await res.json()) as { error: string; error_description: string };
+        expect(out.error).toBe("last_vault");
+        // Guidance names the CLI escape hatch + the resurrection reason.
+        expect(out.error_description).toContain("parachute-vault remove");
+        expect(runner.calls.length).toBe(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("reserved names are deletable (a squatted `admin` vault can be removed)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        // A vault squatted on "admin" BEFORE the B2h reservation existed.
+        writeVaults(h.manifestPath, ["default", "admin"]);
+        const runner = stubRun();
+        const res = await callDelete({
+          name: "admin",
+          db,
+          manifestPath: h.manifestPath,
+          connectionsStorePath: join(h.dir, "connections.json"),
+          runCommand: runner.run,
+        });
+        expect(res.status).toBe(200);
+        expect(runner.calls).toContainEqual(["parachute-vault", "remove", "admin", "--yes"]);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("DELETE /vaults/<name> — the identity cascade", () => {
+  test("full cascade: tokens, grants, user_vaults, invites, connections, mechanics, restart", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        writeVaults(h.manifestPath, ["default", "work"]);
+        const store = join(h.dir, "connections.json");
+
+        // 1. Registry rows: two naming "work" (one standalone + the
+        //    connection's registered mint below), one naming "default".
+        registryRow(db, "jti-work-1", ["vault:work:write"]);
+        registryRow(db, "jti-conn-1", ["channel:send"]); // connection webhook bearer (non-vault scope)
+        registryRow(db, "jti-default-1", ["vault:default:read"]);
+
+        // 2. Grants: one spanning both vaults (rewrite), one work-only (drop).
+        const alice = await createUser(db, "alice", "alice-passphrase-123");
+        const clientSpan = registerClient(db, { redirectUris: ["https://a.example/cb"] }).client
+          .clientId;
+        const clientWorkOnly = registerClient(db, { redirectUris: ["https://b.example/cb"] }).client
+          .clientId;
+        recordGrant(db, alice.id, clientSpan, [
+          "vault:work:read",
+          "vault:default:read",
+          "offline_access",
+        ]);
+        recordGrant(db, alice.id, clientWorkOnly, ["vault:work:admin"]);
+
+        // 3. user_vaults: alice assigned to both.
+        setUserVaults(db, alice.id, ["work", "default"]);
+
+        // 4. Invites: pending pinned to work (invalidate), pending pinned to
+        //    default (keep), already-redeemed work invite (terminal, keep).
+        const pendingWork = issueInvite(db, { createdBy: alice.id, vaultName: "work" });
+        const pendingDefault = issueInvite(db, { createdBy: alice.id, vaultName: "default" });
+        const redeemedWork = issueInvite(db, { createdBy: alice.id, vaultName: "work" });
+        db.prepare("UPDATE invites SET used_at = ?, redeemed_user_id = ? WHERE token = ?").run(
+          new Date().toISOString(),
+          alice.id,
+          redeemedWork.invite.tokenHash,
+        );
+
+        // 5. Connections: one sourced on work (torn down), one on default (kept).
+        putConnection(store, {
+          id: "conn-work",
+          source: { module: "vault", vault: "work", event: "note.created" },
+          sink: { module: "channel", action: "message.deliver", params: { channel: "eng" } },
+          provisioned: {
+            type: "vault-trigger",
+            vault: "work",
+            triggerName: "conn_conn-work",
+            mintedJtis: ["jti-conn-1"],
+          },
+          createdAt: new Date().toISOString(),
+        });
+        putConnection(store, {
+          id: "conn-default",
+          source: { module: "vault", vault: "default", event: "note.created" },
+          sink: { module: "channel", action: "message.deliver", params: { channel: "ops" } },
+          provisioned: { type: "vault-trigger", vault: "default", triggerName: "conn_d" },
+          createdAt: new Date().toISOString(),
+        });
+
+        const { fetchImpl, calls } = mockFetch({
+          "DELETE /vault/work/api/triggers/conn_conn-work": () => okJson({ ok: true }),
+          "DELETE /api/channels/eng": () => okJson({ ok: true }),
+          // Channel scan: one legacy vault-backed entry still references work.
+          "GET /api/channels": () =>
+            okJson({
+              channels: [
+                { name: "legacy-chan", transport: "vault", vault: "work" },
+                { name: "other-chan", transport: "vault", vault: "default" },
+                { name: "tg", transport: "telegram", vault: null },
+              ],
+            }),
+        });
+
+        const runner = stubRun();
+        let restarted = false;
+        const res = await callDelete({
+          name: "work",
+          db,
+          manifestPath: h.manifestPath,
+          connectionsStorePath: store,
+          runCommand: runner.run,
+          restartVaultModule: async () => {
+            restarted = true;
+          },
+          channelOrigin: CHANNEL_ORIGIN,
+          fetchImpl,
+          resolveVaultOrigin: (v) => (v === "work" ? VAULT_ORIGIN : null),
+        });
+        expect(res.status).toBe(200);
+        const out = (await res.json()) as {
+          ok: boolean;
+          name: string;
+          cascade: {
+            tokens_revoked: number;
+            grants_rewritten: number;
+            grants_dropped: number;
+            user_vaults_removed: number;
+            invites_invalidated: number;
+            connections_torn_down: number;
+            orphaned_channels: string[];
+            vault_removed: boolean;
+            module_restarted: boolean;
+          };
+        };
+        expect(out.ok).toBe(true);
+        expect(out.name).toBe("work");
+
+        // 1. Registry sweep: the work-scoped row revoked; default untouched.
+        //    The connection's webhook-bearer row (channel:send — names no
+        //    vault) is revoked by the CONNECTION teardown, not the sweep.
+        expect(out.cascade.tokens_revoked).toBe(1);
+        expect(findTokenRowByJti(db, "jti-work-1")?.revokedAt).not.toBeNull();
+        expect(findTokenRowByJti(db, "jti-conn-1")?.revokedAt).not.toBeNull();
+        expect(findTokenRowByJti(db, "jti-default-1")?.revokedAt).toBeNull();
+        expect(listActiveRevocations(db, new Date())).toContain("jti-work-1");
+
+        // 2. Grants: span-rewritten (kept, minus work scopes); work-only dropped.
+        expect(out.cascade.grants_rewritten).toBe(1);
+        expect(out.cascade.grants_dropped).toBe(1);
+        const span = findGrant(db, alice.id, clientSpan);
+        expect(span?.scopes.sort()).toEqual(["offline_access", "vault:default:read"]);
+        expect(findGrant(db, alice.id, clientWorkOnly)).toBeNull();
+
+        // 3. user_vaults: work row gone, default row stays.
+        expect(out.cascade.user_vaults_removed).toBe(1);
+        const remaining = db
+          .query<{ vault_name: string }, [string]>(
+            "SELECT vault_name FROM user_vaults WHERE user_id = ?",
+          )
+          .all(alice.id)
+          .map((r) => r.vault_name);
+        expect(remaining).toEqual(["default"]);
+
+        // 4. Invites: pending-work revoked; pending-default + redeemed-work untouched.
+        expect(out.cascade.invites_invalidated).toBe(1);
+        expect(findInviteByHash(db, pendingWork.invite.tokenHash)?.revokedAt).not.toBeNull();
+        expect(findInviteByHash(db, pendingDefault.invite.tokenHash)?.revokedAt).toBeNull();
+        expect(findInviteByHash(db, redeemedWork.invite.tokenHash)?.usedAt).not.toBeNull();
+        expect(findInviteByHash(db, redeemedWork.invite.tokenHash)?.revokedAt).toBeNull();
+
+        // 5. Connections: work connection torn down (trigger deregistered +
+        //    channel entry deleted + record removed); default connection kept.
+        expect(out.cascade.connections_torn_down).toBe(1);
+        expect(
+          calls.some(
+            (c) =>
+              c.method === "DELETE" && c.url.endsWith("/vault/work/api/triggers/conn_conn-work"),
+          ),
+        ).toBe(true);
+        expect(
+          calls.some((c) => c.method === "DELETE" && c.url.endsWith("/api/channels/eng")),
+        ).toBe(true);
+        const records = readConnections(store);
+        expect(records.map((r) => r.id)).toEqual(["conn-default"]);
+
+        // Channel scan: legacy entry surfaced, NOT deleted (report-only —
+        // no DELETE call for it), and the default-vault entry not flagged.
+        expect(out.cascade.orphaned_channels).toEqual(["legacy-chan"]);
+        expect(calls.some((c) => c.method === "DELETE" && c.url.includes("legacy-chan"))).toBe(
+          false,
+        );
+
+        // 6 + 7. Mechanics + eviction.
+        expect(runner.calls).toContainEqual(["parachute-vault", "remove", "work", "--yes"]);
+        expect(out.cascade.vault_removed).toBe(true);
+        expect(restarted).toBe(true);
+        expect(out.cascade.module_restarted).toBe(true);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("registry sweep is EXACT-match — `_` in vault names is not a LIKE wildcard", async () => {
+    // Vault `my_vault` must not revoke `myxvault` tokens: under SQL LIKE,
+    // `_` matches any single character, so a LIKE-based sweep for
+    // `%vault:my_vault:%` would catch `vault:myxvault:write` too. The sweep
+    // splits + exact-matches scope segments instead.
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        writeVaults(h.manifestPath, ["my_vault", "myxvault"]);
+        registryRow(db, "jti-underscore", ["vault:my_vault:write"]);
+        registryRow(db, "jti-lookalike", ["vault:myxvault:write"]);
+        const res = await callDelete({
+          name: "my_vault",
+          db,
+          manifestPath: h.manifestPath,
+          connectionsStorePath: join(h.dir, "connections.json"),
+        });
+        expect(res.status).toBe(200);
+        const out = (await res.json()) as { cascade: { tokens_revoked: number } };
+        expect(out.cascade.tokens_revoked).toBe(1);
+        expect(findTokenRowByJti(db, "jti-underscore")?.revokedAt).not.toBeNull();
+        // The lookalike vault's token is NOT revoked.
+        expect(findTokenRowByJti(db, "jti-lookalike")?.revokedAt).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a multi-vault grant is REWRITTEN, not dropped (dropping over-revokes)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        writeVaults(h.manifestPath, ["default", "work"]);
+        const bob = await createUser(db, "bob", "bob-passphrase-12345");
+        const claude = registerClient(db, { redirectUris: ["https://c.example/cb"] }).client
+          .clientId;
+        recordGrant(db, bob.id, claude, ["vault:work:write", "vault:default:write"]);
+        const res = await callDelete({
+          name: "work",
+          db,
+          manifestPath: h.manifestPath,
+          connectionsStorePath: join(h.dir, "connections.json"),
+        });
+        expect(res.status).toBe(200);
+        const grant = findGrant(db, bob.id, claude);
+        // Row survives with the other vault's scope intact.
+        expect(grant).not.toBeNull();
+        expect(grant?.scopes).toEqual(["vault:default:write"]);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("mechanics failure → 500, identity artifacts stay revoked", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        writeVaults(h.manifestPath, ["default", "work"]);
+        registryRow(db, "jti-pre-fail", ["vault:work:write"]);
+        const res = await callDelete({
+          name: "work",
+          db,
+          manifestPath: h.manifestPath,
+          connectionsStorePath: join(h.dir, "connections.json"),
+          runCommand: stubRun(1, "disk on fire").run,
+        });
+        expect(res.status).toBe(500);
+        const out = (await res.json()) as { error: string; error_description: string };
+        expect(out.error).toBe("server_error");
+        expect(out.error_description).toContain("disk on fire");
+        // Revocation is the safe direction — the sweep is NOT rolled back.
+        expect(findTokenRowByJti(db, "jti-pre-fail")?.revokedAt).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("no supervisor → 200 with a module_restart warning (not silent)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        writeVaults(h.manifestPath, ["default", "work"]);
+        const res = await callDelete({
+          name: "work",
+          db,
+          manifestPath: h.manifestPath,
+          connectionsStorePath: join(h.dir, "connections.json"),
+        });
+        expect(res.status).toBe(200);
+        const out = (await res.json()) as {
+          cascade: { module_restarted: boolean };
+          warnings?: { step: string; detail: string }[];
+        };
+        expect(out.cascade.module_restarted).toBe(false);
+        expect(out.warnings?.some((w) => w.step === "module_restart")).toBe(true);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});

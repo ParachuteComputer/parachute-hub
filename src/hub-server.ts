@@ -43,6 +43,11 @@
  *
  *   # Admin API + bearer-mint surfaces (must precede /admin/* SPA mount).
  *   /vaults                       (POST)       → create vault
+ *   /vaults/<name>                (DELETE)     → destroy vault + identity cascade
+ *                                                 (B1: confirm body, host:admin,
+ *                                                 tokens/grants/user_vaults/invites/
+ *                                                 connections sweep, CLI remove,
+ *                                                 supervisor restart)
  *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /admin/channel-token          (GET)        → channel UI bearer mint (cookie-gated)
@@ -160,7 +165,7 @@ import {
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleModuleToken } from "./admin-module-token.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
-import { handleCreateVault } from "./admin-vaults.ts";
+import { handleCreateVault, handleDeleteVault } from "./admin-vaults.ts";
 import {
   handleAccountChangePasswordGet,
   handleAccountChangePasswordPost,
@@ -2196,6 +2201,46 @@ export function hubFetch(
         return handleCreateVault(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+        });
+      }
+
+      // DELETE /vaults/<name> — destroy a vault with the full identity
+      // cascade (B1, 2026-06-09 hub-module-boundary: lifecycle symmetry).
+      // Bearer parachute:host:admin + {"confirm": "<name>"} body. See
+      // admin-vaults.handleDeleteVault for the enumerated cascade.
+      if (pathname.startsWith("/vaults/")) {
+        if (!getDb) return dbNotConfigured();
+        const name = decodeURIComponent(pathname.slice("/vaults/".length));
+        const services = readManifestLenient(manifestPath).services;
+        // Channel's row carries its MANIFEST name — resolve via
+        // findServiceByShort (see the /admin/channels note above).
+        const channelEntry = findServiceByShort(services, "channel");
+        const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
+        const resolveVaultOrigin = (vaultName: string): string | null => {
+          const match = findVaultUpstream(
+            readManifestLenient(manifestPath).services,
+            `/vault/${vaultName}`,
+          );
+          return match ? `http://127.0.0.1:${match.port}` : null;
+        };
+        const supervisor = deps?.supervisor;
+        return handleDeleteVault(req, name, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          manifestPath,
+          connectionsStorePath: deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
+          channelOrigin,
+          resolveVaultOrigin,
+          // Daemon eviction — the same in-process supervisor the lifecycle
+          // verbs drive (module-ops API); restarting vault evicts the open
+          // store handle + re-runs selfRegister (services.json path rebuild).
+          ...(supervisor
+            ? {
+                restartVaultModule: async () => {
+                  await supervisor.restart("vault");
+                },
+              }
+            : {}),
         });
       }
 

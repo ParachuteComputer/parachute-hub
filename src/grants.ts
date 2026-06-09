@@ -26,6 +26,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { vaultScopeName } from "./scope-explanations.ts";
 
 export interface Grant {
   userId: string;
@@ -323,4 +324,53 @@ export function revokeGrant(db: Database, userId: string, clientId: string): boo
     .prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?")
     .run(userId, clientId);
   return res.changes > 0;
+}
+
+/**
+ * Vault-delete cascade step (B1, 2026-06-09 hub-module-boundary): REWRITE
+ * every grant whose scope list names the deleted vault, removing the
+ * `vault:<name>:<verb>` entries; DROP the row only when the rewrite leaves
+ * it empty.
+ *
+ * Rewrite-not-drop matters: a grant row is keyed (user, client) and its
+ * scope set spans every vault the user ever approved for that client —
+ * dropping the whole row over a single vault would silently revoke the
+ * client's consent on the user's OTHER vaults (over-revocation).
+ *
+ * Matching is the exact `vaultScopeName` segment comparison (regex on the
+ * `vault:<name>:<read|write|admin>` shape), never SQL LIKE — `_` in a vault
+ * name is a LIKE wildcard. Unnamed scopes (`vault:read`) and non-vault
+ * scopes are preserved.
+ */
+export function rewriteGrantsRemovingVault(
+  db: Database,
+  vaultName: string,
+): { rewritten: number; dropped: number } {
+  return db.transaction(() => {
+    const rows = db
+      .prepare("SELECT user_id, client_id, scopes, granted_at FROM grants")
+      .all() as GrantRow[];
+    let rewritten = 0;
+    let dropped = 0;
+    for (const row of rows) {
+      const scopes = row.scopes.split(" ").filter((s) => s.length > 0);
+      const kept = scopes.filter((s) => vaultScopeName(s) !== vaultName);
+      if (kept.length === scopes.length) continue; // doesn't name the vault
+      if (kept.length === 0) {
+        db.prepare("DELETE FROM grants WHERE user_id = ? AND client_id = ?").run(
+          row.user_id,
+          row.client_id,
+        );
+        dropped++;
+      } else {
+        db.prepare("UPDATE grants SET scopes = ? WHERE user_id = ? AND client_id = ?").run(
+          kept.join(" "),
+          row.user_id,
+          row.client_id,
+        );
+        rewritten++;
+      }
+    }
+    return { rewritten, dropped };
+  })();
 }

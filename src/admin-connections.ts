@@ -554,7 +554,14 @@ async function prepareChannelSink(
 // DELETE — teardown
 // ---------------------------------------------------------------------------
 
-async function teardownConnection(
+/**
+ * Tear down one connection by id: deregister the vault trigger, delete the
+ * channel-config entry (channel sinks), revoke the registered long-lived
+ * mints (B0), remove the record. Exported for the vault-delete cascade (B1)
+ * — `admin-vaults.handleDeleteVault` reuses this per matching record so the
+ * cascade and the operator-facing DELETE behave identically.
+ */
+export async function teardownConnection(
   id: string,
   userId: string,
   deps: ConnectionsDeps,
