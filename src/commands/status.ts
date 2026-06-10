@@ -19,8 +19,8 @@ import {
 } from "../install-source.ts";
 import {
   type DriveModuleOpDeps,
-  type ModuleStateSnapshot,
   type ModuleStatesResult,
+  type ModuleStateSnapshot,
   NoOperatorTokenError,
   OperatorTokenExpiredError,
   fetchModuleStates as fetchModuleStatesImpl,
