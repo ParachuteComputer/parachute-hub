@@ -5712,6 +5712,34 @@ describe("substrate trust headers — X-Parachute-Layer / X-Parachute-Client-IP 
     }
   });
 
+  test("direct caller injecting CF-Connecting-IP: layer stamp stays sound (public), client IP is best-effort attribution", async () => {
+    // Pins the documented property (resolveClientIp's "Known limitation"):
+    // a DIRECT caller can spoof the forwarded-IP headers and misattribute
+    // its own address — X-Parachute-Client-IP reflects the injected value —
+    // but it CANNOT spoof the LAYER: the CF header's presence classifies the
+    // request "public" regardless of the peer (here even a loopback one),
+    // so spoofing only ever moves the trust signal DOWN. Layer is the
+    // security signal; client IP is attribution.
+    const h = makeHarness();
+    const upstream = startEchoUpstream();
+    try {
+      writeEchoService(h, upstream.port);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(
+        req("/echo-svc/x", {
+          headers: { "cf-connecting-ip": "203.0.113.50" },
+        }),
+        fakeServer("127.0.0.1"),
+      );
+      const body = (await res.json()) as { layer: string; clientIp: string };
+      expect(body.layer).toBe("public"); // CF header presence → public, not loopback
+      expect(body.clientIp).toBe("203.0.113.50"); // injected value — best-effort by design
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
   test("unknown peer (no Server threaded) → fail-closed public, header for client IP omitted", async () => {
     const h = makeHarness();
     const upstream = startEchoUpstream();

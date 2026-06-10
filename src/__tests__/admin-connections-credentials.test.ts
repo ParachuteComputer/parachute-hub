@@ -642,9 +642,6 @@ describe("credential connection — renewal (proof of possession)", () => {
     const noBearer = await handleConnections(renewReq("cred-x"), "/cred-x/renew", deps);
     expect(noBearer.status).toBe(404); // no such connection (checked first)
 
-    // Seed a record id that exists but isn't credential-kind: still 404.
-    const { cookie } = await adminCookie();
-    void cookie;
     const unknown = await handleConnections(renewReq("ghost"), "/ghost/renew", deps);
     expect(unknown.status).toBe(404);
   });

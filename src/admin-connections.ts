@@ -1043,6 +1043,12 @@ async function renewCredentialConnection(
   const bearer = auth.slice("Bearer ".length).trim();
   let presentedJti: string;
   try {
+    // Deliberately NO expectedIssuer pin here — unlike the audience gate's
+    // Bearer branch (audience-gate.ts → validateHostAdminToken, iss ∈ the
+    // hub's bound-origin set). See the fn docstring: the JWKS signature
+    // proves local issuance, and the jti binding below makes a foreign
+    // replay structurally impossible — an iss check would add nothing but
+    // the #516 loopback-vs-public false-reject class.
     const validated = await validateAccessToken(deps.db, bearer);
     presentedJti = typeof validated.payload.jti === "string" ? validated.payload.jti : "";
   } catch (err) {
@@ -1083,7 +1089,14 @@ async function renewCredentialConnection(
     return stepError("mint_credential", err);
   }
 
-  // Revoke the old credential, persist the new jti.
+  // Revoke the old credential, persist the new jti. The ORDERING (mint new →
+  // revoke old → write record → respond) is a deliberate trade-off: a
+  // connection drop after the record write but before the response leaves
+  // the module holding NEITHER credential (old revoked, new never received)
+  // → operator re-approval required. We fail toward lockout, never toward
+  // two live credentials. If that window ever bites in practice, the future
+  // option is a retrieve-current-by-jti endpoint (present the revoked-but-
+  // recorded predecessor, fetch its successor) — not reordering the steps.
   const now = deps.now?.() ?? new Date();
   for (const jti of currentJtis) {
     try {
