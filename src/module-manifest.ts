@@ -272,6 +272,16 @@ export interface ModuleManifest {
    */
   readonly stripPrefix?: boolean;
   /**
+   * When `true`, the module's daemon accepts WebSocket upgrades and the hub's
+   * Bun-native upgrade bridge (H1, surface-runtime design) forwards
+   * `Upgrade: websocket` requests on the module's mounts. DENY BY DEFAULT:
+   * absent/false refuses upgrades (426) before they reach the daemon. The
+   * canonical capability declaration; modules also carry it onto their
+   * self-registered services.json row (`ServiceEntry.websocket`), and the hub
+   * honors either source.
+   */
+  readonly websocket?: boolean;
+  /**
    * Discovery tier (2026-06-09 modular-UI architecture). When a module
    * declares `focus`, the hub's Modules screen uses it verbatim; otherwise it
    * falls back to `service-spec.focusForShort` (vault/scribe/hub/surface →
@@ -569,6 +579,13 @@ export function validateModuleManifest(
     }
     stripPrefix = m.stripPrefix;
   }
+  let websocket: boolean | undefined;
+  if (m.websocket !== undefined) {
+    if (typeof m.websocket !== "boolean") {
+      throw new ModuleManifestError(`${where}: "websocket" must be a boolean if present`);
+    }
+    websocket = m.websocket;
+  }
 
   const out: ModuleManifest = { name, manifestName, port, paths, health };
   if (displayName !== undefined) (out as { displayName?: string }).displayName = displayName;
@@ -589,6 +606,9 @@ export function validateModuleManifest(
   }
   if (stripPrefix !== undefined) {
     (out as { stripPrefix?: boolean }).stripPrefix = stripPrefix;
+  }
+  if (websocket !== undefined) {
+    (out as { websocket?: boolean }).websocket = websocket;
   }
   if (focus !== undefined) (out as { focus?: ModuleFocus }).focus = focus;
   if (configUiUrl !== undefined) (out as { configUiUrl?: string }).configUiUrl = configUiUrl;

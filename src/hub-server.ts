@@ -270,6 +270,7 @@ import {
   isVaultEntry,
   vaultInstanceNameFor,
 } from "./well-known.ts";
+import { type WsBridgeData, createWsBridgeHandlers } from "./ws-bridge.ts";
 
 interface Args {
   port: number;
@@ -670,10 +671,13 @@ export function stampSubstrateTrustHeaders(
  * the substrate trust headers (below) classify the layer the same way the
  * `publicExposure` cloak does — fail-closed to `public` when unknown.
  *
- * Hop-by-hop notes: WebSocket upgrades and HTTP/2 trailers don't traverse
- * fetch-based proxies cleanly. No on-box service uses either today; if one
- * eventually needs them, switch to a Node http.IncomingMessage / http.request
- * pair.
+ * Hop-by-hop notes: HTTP/2 trailers don't traverse fetch-based proxies
+ * cleanly; no on-box service uses them today. WebSocket upgrades CANNOT
+ * traverse this fetch-based path either — they're handled BEFORE dispatch by
+ * the Bun-native upgrade bridge (H1: `maybeUpgradeWebSocket` +
+ * `src/ws-bridge.ts`) for modules that declare the capability; an upgrade
+ * request reaching this function belongs to a non-declaring mount and the
+ * upstream sees a plain GET.
  */
 async function proxyRequest(
   req: Request,
@@ -1526,15 +1530,184 @@ export function resolveIssuerSource(
 
 /**
  * Minimal structural type for the Bun `Server` handle the fetch callback
- * receives as its 2nd argument. We only need `requestIP` (item E / #526) to
- * resolve the peer address for `layerOf`. Typed structurally (rather than
+ * receives as its 2nd argument. We need `requestIP` (item E / #526) to
+ * resolve the peer address for `layerOf`, and `upgrade` (H1) to hand a
+ * gated WebSocket upgrade to the bridge. Typed structurally (rather than
  * importing Bun's full `Server`) so tests can pass a tiny fake and so the
  * signature stays robust to Bun type-shape churn. Optional in the callback
  * because a direct unit call to the returned fetch fn may omit it — in which
- * case `peerAddr` is null and `layerOf` fails closed to `public`.
+ * case `peerAddr` is null and `layerOf` fails closed to `public`, and a
+ * WebSocket upgrade is refused (503 — no server to upgrade on).
  */
 interface PeerIpResolver {
   requestIP(req: Request): { address: string } | null;
+  /**
+   * Bun `Server.upgrade` — present on the real server, optional on fakes.
+   * Typed with the bridge's data payload (Bun's own signature takes
+   * `data: unknown`; method bivariance keeps the real Server assignable).
+   */
+  upgrade?(req: Request, options: { data: WsBridgeData }): boolean;
+}
+
+/**
+ * True when the request is a WebSocket upgrade. The `Upgrade` header is the
+ * discriminator (RFC 6455 §4.1 requires it; Bun's `server.upgrade` re-checks
+ * the full handshake — key, version, Connection token — so this only needs
+ * to be a cheap router predicate, not a validator).
+ */
+export function isWebSocketUpgrade(req: Request): boolean {
+  return (req.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
+}
+
+/**
+ * Hop-by-hop + WS-handshake headers never forwarded on the upstream connect:
+ * the Bun WebSocket client re-mints its own handshake (key/version/
+ * extensions), and forwarding the originals would corrupt it.
+ */
+const WS_HOP_BY_HOP_HEADERS = [
+  "host",
+  "connection",
+  "upgrade",
+  "keep-alive",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "sec-websocket-key",
+  "sec-websocket-version",
+  "sec-websocket-extensions",
+  "sec-websocket-accept",
+  // Subprotocol negotiation is NOT forwarded in v1 (see ws-bridge.ts header).
+  "sec-websocket-protocol",
+] as const;
+
+/** The verdict of {@link maybeUpgradeWebSocket}. */
+type WsUpgradeVerdict =
+  | { kind: "upgraded" }
+  | { kind: "response"; response: Response }
+  | { kind: "pass" };
+
+/**
+ * H1 — the WebSocket upgrade bridge's routing + gating half (the frame
+ * piping lives in `src/ws-bridge.ts`).
+ *
+ * For an `Upgrade: websocket` request:
+ *
+ *   1. Resolve the service mount (generic longest-prefix, then vault mounts —
+ *      same resolution as the HTTP proxies). No mount → `pass` (normal
+ *      dispatch 404s / handles it).
+ *   2. Gate BEFORE upgrading — same posture as the HTTP path:
+ *      `publicExposure: "loopback"` cloak (404, indistinguishable from
+ *      not-installed) and the per-UI audience gate (H3).
+ *   3. Capability check, DENY BY DEFAULT: the module must declare
+ *      `websocket: true` on its services.json row OR its
+ *      `.parachute/module.json`. No declaration → 426 (the route exists but
+ *      doesn't speak WebSocket; the fetch-based proxy can't forward upgrades
+ *      and the daemon never sees the request).
+ *   4. `server.upgrade(req, { data })` with the upstream URL + headers
+ *      (client headers minus hop-by-hop/handshake, plus the H2 substrate
+ *      trust stamps). The ws-bridge handlers take over from there.
+ */
+async function maybeUpgradeWebSocket(
+  req: Request,
+  server: PeerIpResolver | undefined,
+  deps: {
+    manifestPath: string;
+    peerAddr: string | null;
+    readModuleManifestFn: (installDir: string) => Promise<ModuleManifest | null>;
+    /** H3 — gate the upgrade on the mount's audience BEFORE upgrading. */
+    gateAudience?: (pathname: string) => Promise<Response | null>;
+  },
+): Promise<WsUpgradeVerdict> {
+  const services = readManifestLenient(deps.manifestPath).services;
+  const url = new URL(req.url);
+  const match =
+    findServiceUpstream(services, url.pathname) ?? findVaultUpstream(services, url.pathname);
+  if (!match) return { kind: "pass" };
+
+  // Layer cloak first — a loopback-only module must look not-installed from
+  // tailnet/public, for upgrades exactly as for HTTP.
+  if (
+    effectivePublicExposure(match.entry) === "loopback" &&
+    layerOf(req, deps.peerAddr) !== "loopback"
+  ) {
+    return { kind: "response", response: new Response("not found", { status: 404 }) };
+  }
+
+  // Audience gate (H3) — runs BEFORE the upgrade so an unauthorized client
+  // never gets a socket. Threaded from dispatch (needs db + issuer).
+  if (deps.gateAudience) {
+    const gated = await deps.gateAudience(url.pathname);
+    if (gated) return { kind: "response", response: gated };
+  }
+
+  // Capability — deny by default. services.json row wins; module.json is the
+  // canonical declaration source for modules that haven't re-registered yet.
+  let declared = match.entry.websocket === true;
+  if (!declared && match.entry.installDir) {
+    try {
+      const manifest = await deps.readModuleManifestFn(match.entry.installDir);
+      declared = manifest?.websocket === true;
+    } catch {
+      declared = false; // malformed manifest → deny (fail closed)
+    }
+  }
+  if (!declared) {
+    return {
+      kind: "response",
+      response: new Response(
+        JSON.stringify({
+          error: "websocket_not_supported",
+          error_description: `module "${match.entry.name}" does not declare WebSocket support`,
+        }),
+        { status: 426, headers: { "content-type": "application/json", upgrade: "websocket" } },
+      ),
+    };
+  }
+
+  if (!server?.upgrade) {
+    return {
+      kind: "response",
+      response: new Response(
+        JSON.stringify({
+          error: "service_unavailable",
+          error_description: "websocket upgrade unavailable on this server",
+        }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      ),
+    };
+  }
+
+  // Upstream URL — same path semantics as the HTTP proxy (stripPrefix honored).
+  const stripPrefix = stripPrefixFor(match.entry);
+  const targetPath = stripPrefix ? url.pathname.slice(match.mount.length) || "/" : url.pathname;
+  const upstreamUrl = `ws://127.0.0.1:${match.port}${targetPath}${url.search}`;
+
+  // Upstream headers: the client's own (cookie / authorization ride through
+  // so the daemon authenticates the connection) minus hop-by-hop + handshake
+  // headers, plus the H2 substrate trust stamps.
+  const headers = new Headers(req.headers);
+  for (const h of WS_HOP_BY_HOP_HEADERS) headers.delete(h);
+  stampSubstrateTrustHeaders(headers, req, deps.peerAddr);
+  const upstreamHeaders: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    upstreamHeaders[key] = value;
+  });
+
+  const upgraded = server.upgrade(req, {
+    data: { upstreamUrl, upstreamHeaders },
+  });
+  if (upgraded) return { kind: "upgraded" };
+  return {
+    kind: "response",
+    response: new Response(
+      JSON.stringify({
+        error: "upgrade_failed",
+        error_description: "WebSocket handshake was malformed or could not be completed",
+      }),
+      { status: 400, headers: { "content-type": "application/json" } },
+    ),
+  };
 }
 
 /**
@@ -1665,6 +1838,30 @@ export function hubFetch(
     // error detail"). A transient SQLITE_BUSY is classified non-fatal and just
     // surfaces a 503 the next request clears — it never kills the hub.
     try {
+      // H1 — WebSocket upgrade bridge. Runs before normal dispatch: an
+      // `Upgrade: websocket` request targeting a declared service mount is
+      // gated (publicExposure cloak + audience gate) and, if it passes,
+      // upgraded into the Bun-native bridge (src/ws-bridge.ts) instead of
+      // the fetch-based proxy (which cannot forward upgrades). Upgrade
+      // requests that match no service mount fall through to normal dispatch
+      // unchanged — no hub-owned route speaks WebSocket.
+      if (isWebSocketUpgrade(req)) {
+        const verdict = await maybeUpgradeWebSocket(req, server, {
+          manifestPath,
+          peerAddr,
+          readModuleManifestFn: deps?.readModuleManifest ?? defaultReadModuleManifest,
+        });
+        if (verdict.kind === "upgraded") {
+          // Bun's contract after a successful `server.upgrade()` is to
+          // return undefined from fetch — the socket now belongs to the
+          // websocket handlers. The public signature stays Response-typed
+          // for the many direct (non-WS) call sites; this cast is the one
+          // deliberate exception, observed only by Bun's runtime.
+          return undefined as unknown as Response;
+        }
+        if (verdict.kind === "response") return verdict.response;
+        // kind === "pass" — fall through to normal dispatch.
+      }
       return await dispatch();
     } catch (err) {
       const klass = classifyDbError(err);
@@ -3233,6 +3430,9 @@ if (import.meta.main) {
       issuer,
       loopbackPort: port,
     }),
+    // H1 — the WebSocket upgrade bridge's frame-piping handlers. Connections
+    // land here only after `maybeUpgradeWebSocket` gated + upgraded them.
+    websocket: createWsBridgeHandlers(),
   });
   // Register PID + port from the running hub itself so any startup path
   // (spawn-via-`ensureHubRunning` or a direct `bun src/hub-server.ts` from

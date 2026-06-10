@@ -171,6 +171,16 @@ export interface ServiceEntry {
    */
   stripPrefix?: boolean;
   /**
+   * When `true`, the module's daemon accepts WebSocket upgrades and the hub's
+   * Bun-native upgrade bridge (H1, surface-runtime design) will forward
+   * `Upgrade: websocket` requests on this module's mounts to it. DENY BY
+   * DEFAULT: absent/false means an upgrade request to this mount is refused
+   * (426) without ever reaching the daemon. Modules declare this on their
+   * `.parachute/module.json` (the install-time contract) and carry it onto
+   * their self-registered services.json row; the hub honors either source.
+   */
+  websocket?: boolean;
+  /**
    * Sub-units hosted under this module — parachute-app's bag of UIs, and
    * the shape vault is expected to adopt for per-instance metadata in a
    * follow-up. Empty or absent → flat row, the legacy shape. See
@@ -282,6 +292,10 @@ function validateEntry(raw: unknown, where: string): ServiceEntry {
   if (stripPrefix !== undefined && typeof stripPrefix !== "boolean") {
     throw new ServicesManifestError(`${where}: "stripPrefix" must be a boolean if present`);
   }
+  const websocket = e.websocket;
+  if (websocket !== undefined && typeof websocket !== "boolean") {
+    throw new ServicesManifestError(`${where}: "websocket" must be a boolean if present`);
+  }
   const uis = e.uis;
   const validatedUis = validateUis(uis, where);
   const validatedStartError = validateStartError(e.lastStartError, where);
@@ -291,6 +305,7 @@ function validateEntry(raw: unknown, where: string): ServiceEntry {
   if (publicExposure !== undefined) entry.publicExposure = publicExposure as PublicExposure;
   if (installDir !== undefined) entry.installDir = installDir;
   if (stripPrefix !== undefined) entry.stripPrefix = stripPrefix;
+  if (websocket !== undefined) entry.websocket = websocket;
   if (validatedUis !== undefined) entry.uis = validatedUis;
   if (validatedStartError !== undefined) entry.lastStartError = validatedStartError;
   return entry;
