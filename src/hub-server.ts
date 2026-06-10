@@ -204,6 +204,7 @@ import {
   handleResetUserPassword,
   handleUpdateUserVaults,
 } from "./api-users.ts";
+import { gateUiAudience, resolveUiMount } from "./audience-gate.ts";
 import { buildChromeForRequest, injectChromeIntoResponse } from "./chrome-strip.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
 import { applyCorsHeaders, corsPreflightResponse, isCorsAllowedRoute } from "./cors.ts";
@@ -1867,6 +1868,21 @@ export function hubFetch(
           manifestPath,
           peerAddr,
           readModuleManifestFn: deps?.readModuleManifest ?? defaultReadModuleManifest,
+          // H3 — the audience gate runs BEFORE the upgrade, same posture as
+          // the HTTP dispatch below: a WS endpoint under a hub-users surface
+          // never hands a socket to an anonymous caller. (The publicExposure
+          // cloak already ran inside maybeUpgradeWebSocket before this hook.)
+          gateAudience: async (wsPathname) => {
+            const wsUiMatch = resolveUiMount(
+              readManifestLenient(manifestPath).services,
+              wsPathname,
+            );
+            if (!wsUiMatch) return null;
+            return gateUiAudience(req, wsUiMatch.audience, wsUiMatch.ui, {
+              db: getDb?.(),
+              knownIssuers: () => oauthDeps(req).hubBoundOrigins(),
+            });
+          },
         });
         if (verdict.kind === "upgraded") {
           // Bun's contract after a successful `server.upgrade()` is to
@@ -3315,6 +3331,30 @@ export function hubFetch(
       // here only after every hub-owned prefix above has had its turn — so
       // `/`, `/admin/*`, `/oauth/*`, `/.well-known/*`, `/hub/*`, `/vault/*`,
       // `/api/*` are excluded by ordering, not by an explicit denylist (#182).
+      //
+      // H3 — per-UI audience gate. When the path falls under a declared UI
+      // sub-unit (a `uis{}` entry on the matched service row — surface-hosted
+      // UI mounts like /surface/<name>/*), the sub-unit's audience is
+      // enforced BEFORE forwarding: 'public' passes, 'hub-users' requires a
+      // session or a scope-satisfying Bearer, 'operator' requires the first
+      // admin. Module API paths outside any uis entry are NOT gated here —
+      // modules keep their own auth. Ordering nuance: when the row's
+      // publicExposure cloak would fire (loopback-only, non-loopback layer),
+      // the gate is SKIPPED so the 404 cloak stays indistinguishable from
+      // not-installed (a 401 here would leak the route's existence).
+      const uiMatch = resolveUiMount(readManifestLenient(manifestPath).services, pathname);
+      if (uiMatch) {
+        const cloaked =
+          effectivePublicExposure(uiMatch.entry) === "loopback" &&
+          layerOf(req, peerAddr) !== "loopback";
+        if (!cloaked) {
+          const denied = await gateUiAudience(req, uiMatch.audience, uiMatch.ui, {
+            db: getDb?.(),
+            knownIssuers: () => oauthDeps(req).hubBoundOrigins(),
+          });
+          if (denied) return denied;
+        }
+      }
       const proxied = await proxyToService(req, manifestPath, deps?.supervisor, peerAddr);
       if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
 
