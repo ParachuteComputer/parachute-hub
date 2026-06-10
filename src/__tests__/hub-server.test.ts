@@ -13,6 +13,7 @@ import {
   hubFetch,
   layerOf,
   parseArgs,
+  resolveClientIp,
 } from "../hub-server.ts";
 import { setNotesRedirectDisabled } from "../hub-settings.ts";
 import { clearNotesRedirectLogState } from "../notes-redirect.ts";
@@ -5578,5 +5579,270 @@ describe("force-change-password per-request gate (#469)", () => {
     } finally {
       h.cleanup();
     }
+  });
+});
+
+describe("substrate trust headers — X-Parachute-Layer / X-Parachute-Client-IP (H2)", () => {
+  // The hub stamps the layerOf classification + resolved client IP on every
+  // request it forwards to a module upstream, STRIPPING any inbound
+  // occurrences first (a public client must not be able to inject a forged
+  // "loopback" trust signal past the proxy). Surface-runtime design §10.
+
+  function startEchoUpstream(): { port: number; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (req) =>
+        new Response(
+          JSON.stringify({
+            layer: req.headers.get("x-parachute-layer"),
+            clientIp: req.headers.get("x-parachute-client-ip"),
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    });
+    return { port: server.port as number, stop: () => server.stop(true) };
+  }
+
+  const fakeServer = (address: string) => ({ requestIP: () => ({ address }) });
+
+  function writeEchoService(h: Harness, port: number): void {
+    writeManifest(
+      {
+        services: [
+          {
+            name: "echo-svc",
+            port,
+            paths: ["/echo-svc"],
+            health: "/echo-svc/health",
+            version: "0.1.0",
+          },
+        ],
+      },
+      h.manifestPath,
+    );
+  }
+
+  test("loopback direct-to-hub → stamped loopback + peer IP (generic proxy)", async () => {
+    const h = makeHarness();
+    const upstream = startEchoUpstream();
+    try {
+      writeEchoService(h, upstream.port);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/echo-svc/x"), fakeServer("127.0.0.1"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { layer: string; clientIp: string };
+      expect(body.layer).toBe("loopback");
+      expect(body.clientIp).toBe("127.0.0.1");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("tailnet request → stamped tailnet + X-Forwarded-For client IP", async () => {
+    const h = makeHarness();
+    const upstream = startEchoUpstream();
+    try {
+      writeEchoService(h, upstream.port);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(
+        req("/echo-svc/x", {
+          headers: {
+            "tailscale-user-login": "aaron@example.com",
+            "x-forwarded-for": "100.64.0.7",
+          },
+        }),
+        fakeServer("127.0.0.1"),
+      );
+      const body = (await res.json()) as { layer: string; clientIp: string };
+      expect(body.layer).toBe("tailnet");
+      expect(body.clientIp).toBe("100.64.0.7");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("public (cloudflared) request → stamped public + CF-Connecting-IP", async () => {
+    const h = makeHarness();
+    const upstream = startEchoUpstream();
+    try {
+      writeEchoService(h, upstream.port);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(
+        req("/echo-svc/x", {
+          headers: { "cf-ray": "8abc123", "cf-connecting-ip": "203.0.113.9" },
+        }),
+        fakeServer("127.0.0.1"),
+      );
+      const body = (await res.json()) as { layer: string; clientIp: string };
+      expect(body.layer).toBe("public");
+      expect(body.clientIp).toBe("203.0.113.9");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("inbound spoof is STRIPPED — public peer injecting loopback headers gets re-stamped", async () => {
+    // The attack H2's strip exists for: a direct network peer (0.0.0.0 bind)
+    // sends X-Parachute-Layer: loopback + a forged client IP. The hub must
+    // strip both and stamp its own fail-closed classification.
+    const h = makeHarness();
+    const upstream = startEchoUpstream();
+    try {
+      writeEchoService(h, upstream.port);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(
+        req("/echo-svc/x", {
+          headers: {
+            "x-parachute-layer": "loopback",
+            "x-parachute-client-ip": "127.0.0.1",
+          },
+        }),
+        fakeServer("198.51.100.20"),
+      );
+      const body = (await res.json()) as { layer: string; clientIp: string };
+      expect(body.layer).toBe("public"); // header-absent non-loopback peer → public
+      expect(body.clientIp).toBe("198.51.100.20"); // peer address, not the forgery
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("direct caller injecting CF-Connecting-IP: layer stamp stays sound (public), client IP is best-effort attribution", async () => {
+    // Pins the documented property (resolveClientIp's "Known limitation"):
+    // a DIRECT caller can spoof the forwarded-IP headers and misattribute
+    // its own address — X-Parachute-Client-IP reflects the injected value —
+    // but it CANNOT spoof the LAYER: the CF header's presence classifies the
+    // request "public" regardless of the peer (here even a loopback one),
+    // so spoofing only ever moves the trust signal DOWN. Layer is the
+    // security signal; client IP is attribution.
+    const h = makeHarness();
+    const upstream = startEchoUpstream();
+    try {
+      writeEchoService(h, upstream.port);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(
+        req("/echo-svc/x", {
+          headers: { "cf-connecting-ip": "203.0.113.50" },
+        }),
+        fakeServer("127.0.0.1"),
+      );
+      const body = (await res.json()) as { layer: string; clientIp: string };
+      expect(body.layer).toBe("public"); // CF header presence → public, not loopback
+      expect(body.clientIp).toBe("203.0.113.50"); // injected value — best-effort by design
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("unknown peer (no Server threaded) → fail-closed public, header for client IP omitted", async () => {
+    const h = makeHarness();
+    const upstream = startEchoUpstream();
+    try {
+      writeEchoService(h, upstream.port);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      // No second arg — peerAddr resolves null; layer fails closed to public.
+      const res = await fetcher(req("/echo-svc/x"));
+      const body = (await res.json()) as { layer: string; clientIp: string | null };
+      expect(body.layer).toBe("public");
+      expect(body.clientIp).toBeNull();
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("per-vault proxy stamps the same headers (shared proxyRequest path)", async () => {
+    const h = makeHarness();
+    const upstream = startEchoUpstream();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault-default",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/vault/default/api/notes"), fakeServer("127.0.0.1"));
+      const body = (await res.json()) as { layer: string; clientIp: string };
+      expect(body.layer).toBe("loopback");
+      expect(body.clientIp).toBe("127.0.0.1");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("/vault/admin route stamps the same headers (proxyToVaultAdmin path)", async () => {
+    const h = makeHarness();
+    const upstream = startEchoUpstream();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/health",
+              version: "0.5.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(
+        req("/vault/admin/", {
+          headers: { "tailscale-user-login": "aaron@example.com" },
+        }),
+        fakeServer("127.0.0.1"),
+      );
+      const body = (await res.json()) as { layer: string };
+      expect(body.layer).toBe("tailnet");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+});
+
+describe("resolveClientIp (H2)", () => {
+  test("CF-Connecting-IP wins over X-Forwarded-For and peer", () => {
+    const r = req("/", {
+      headers: { "cf-connecting-ip": "203.0.113.1", "x-forwarded-for": "10.0.0.1" },
+    });
+    expect(resolveClientIp(r, "127.0.0.1")).toBe("203.0.113.1");
+  });
+
+  test("X-Forwarded-For first hop wins over peer", () => {
+    const r = req("/", { headers: { "x-forwarded-for": "10.0.0.1, 10.0.0.2" } });
+    expect(resolveClientIp(r, "127.0.0.1")).toBe("10.0.0.1");
+  });
+
+  test("falls back to the peer address", () => {
+    expect(resolveClientIp(req("/"), "198.51.100.7")).toBe("198.51.100.7");
+  });
+
+  test("null when nothing resolves", () => {
+    expect(resolveClientIp(req("/"), null)).toBeNull();
+  });
+
+  test("whitespace-only header values are treated as absent", () => {
+    const r = req("/", { headers: { "x-forwarded-for": "   " } });
+    expect(resolveClientIp(r, null)).toBeNull();
   });
 });

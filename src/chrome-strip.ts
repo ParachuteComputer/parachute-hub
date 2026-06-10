@@ -19,6 +19,13 @@
  * application, looks distinctively Notes, reads as Parachute because the
  * tokens are continuous").
  *
+ * H5 (surface-runtime design): the opt-out generalized — when a UI
+ * sub-unit's declared `audience` resolves `public` at the proxy's audience
+ * gate (H3), the dispatch passes that mount as an extra opt-out prefix
+ * (hub-server `decorateWithChrome`). Public readers aren't hub users; the
+ * identity chrome never rides their pages. The static list below remains
+ * for hub-users surfaces that own their own chrome (Notes).
+ *
  * Why path-based and not module-declared:
  *   - Notes is a `uis[]` sub-unit of parachute-app, not its own module —
  *     adding `chrome: "off"` to parachute-app's module.json would suppress
@@ -38,7 +45,7 @@
  * defense is cheap and protects future refactors).
  */
 
-import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
+import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken } from "./csrf.ts";
 
 /**

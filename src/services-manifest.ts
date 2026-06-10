@@ -72,6 +72,27 @@ function normalizeUiSubUnitStatus(value: string): UiSubUnitStatus | undefined {
 }
 
 /**
+ * Who may load a UI sub-unit through the hub proxy (H3, surface-runtime
+ * design §12 — fixes parachute-surface#88, where `public` was declared but
+ * never enforced):
+ *
+ *   "public"    — anyone; no hub identity required (chrome strip off — H5).
+ *   "hub-users" — a valid hub session cookie OR a hub-issued Bearer whose
+ *                 scopes satisfy the surface's `scopes_required` (the OR
+ *                 keeps installed PWAs working). THE DEFAULT when absent.
+ *   "operator"  — the first-admin session only.
+ *
+ * Enforced at the hub proxy BEFORE forwarding (`src/audience-gate.ts`).
+ * Legacy boolean `public` on the wire is accepted one alias window:
+ * `public: true` → `"public"`, `public: false` → default. Fail-closed: an
+ * unrecognized `audience` value rejects the row (the lenient manifest read
+ * then drops it — unroutable beats accidentally public).
+ */
+export type UiAudience = "public" | "hub-users" | "operator";
+
+const UI_AUDIENCE_VALUES: readonly UiAudience[] = ["public", "hub-users", "operator"];
+
+/**
  * A sub-unit beneath a module — used today by parachute-app to surface each
  * hosted UI as its own discoverable row under the App module, and the shape
  * vault is expected to adopt in a follow-up so per-vault display metadata
@@ -129,6 +150,20 @@ export interface UiSubUnit {
   oauthClientId?: string;
   /** UI sub-unit lifecycle state. Absent → discovery treats as "active". */
   status?: UiSubUnitStatus;
+  /**
+   * Audience exposure (H3). Absent → "hub-users". The legacy boolean
+   * `public` field is normalized into this on read (true → "public") for
+   * one alias window. See {@link UiAudience}.
+   */
+  audience?: UiAudience;
+  /**
+   * OAuth scopes the UI declares as required (surface-host stamps these from
+   * the surface's meta.json `scopes_required`, e.g. `["vault:*:read"]` —
+   * `*` is a single-segment wildcard). The audience gate's Bearer branch
+   * checks a presented token's scopes against these. Snake_case to match
+   * the wire shape surface already writes.
+   */
+  scopes_required?: string[];
 }
 
 export interface ServiceEntry {
@@ -170,6 +205,16 @@ export interface ServiceEntry {
    *     bridges the gap. Tracked in parachute-scribe (separate issue).
    */
   stripPrefix?: boolean;
+  /**
+   * When `true`, the module's daemon accepts WebSocket upgrades and the hub's
+   * Bun-native upgrade bridge (H1, surface-runtime design) will forward
+   * `Upgrade: websocket` requests on this module's mounts to it. DENY BY
+   * DEFAULT: absent/false means an upgrade request to this mount is refused
+   * (426) without ever reaching the daemon. Modules declare this on their
+   * `.parachute/module.json` (the install-time contract) and carry it onto
+   * their self-registered services.json row; the hub honors either source.
+   */
+  websocket?: boolean;
   /**
    * Sub-units hosted under this module — parachute-app's bag of UIs, and
    * the shape vault is expected to adopt for per-instance metadata in a
@@ -282,6 +327,10 @@ function validateEntry(raw: unknown, where: string): ServiceEntry {
   if (stripPrefix !== undefined && typeof stripPrefix !== "boolean") {
     throw new ServicesManifestError(`${where}: "stripPrefix" must be a boolean if present`);
   }
+  const websocket = e.websocket;
+  if (websocket !== undefined && typeof websocket !== "boolean") {
+    throw new ServicesManifestError(`${where}: "websocket" must be a boolean if present`);
+  }
   const uis = e.uis;
   const validatedUis = validateUis(uis, where);
   const validatedStartError = validateStartError(e.lastStartError, where);
@@ -291,6 +340,7 @@ function validateEntry(raw: unknown, where: string): ServiceEntry {
   if (publicExposure !== undefined) entry.publicExposure = publicExposure as PublicExposure;
   if (installDir !== undefined) entry.installDir = installDir;
   if (stripPrefix !== undefined) entry.stripPrefix = stripPrefix;
+  if (websocket !== undefined) entry.websocket = websocket;
   if (validatedUis !== undefined) entry.uis = validatedUis;
   if (validatedStartError !== undefined) entry.lastStartError = validatedStartError;
   return entry;
@@ -405,12 +455,48 @@ function validateUiSubUnit(raw: unknown, where: string): UiSubUnit {
     }
     normalizedStatus = norm;
   }
+  // Audience (H3). Explicit `audience` wins; the legacy boolean `public` is
+  // accepted as an alias for one release window (true → "public"; false →
+  // the default, i.e. no field). FAIL-CLOSED on malformed values: throwing
+  // here makes the lenient manifest read drop the whole row — an unroutable
+  // surface beats one that silently falls open to the wrong audience.
+  let audience: UiAudience | undefined;
+  if (u.audience !== undefined) {
+    if (
+      typeof u.audience !== "string" ||
+      !(UI_AUDIENCE_VALUES as readonly string[]).includes(u.audience)
+    ) {
+      throw new ServicesManifestError(
+        `${where}: "audience" must be "public" | "hub-users" | "operator" if present (got ${JSON.stringify(u.audience)})`,
+      );
+    }
+    audience = u.audience as UiAudience;
+  } else if (u.public !== undefined) {
+    if (typeof u.public !== "boolean") {
+      throw new ServicesManifestError(`${where}: legacy "public" must be a boolean if present`);
+    }
+    if (u.public) audience = "public";
+  }
+  let scopesRequired: string[] | undefined;
+  if (u.scopes_required !== undefined) {
+    if (
+      !Array.isArray(u.scopes_required) ||
+      u.scopes_required.some((s) => typeof s !== "string" || s.length === 0)
+    ) {
+      throw new ServicesManifestError(
+        `${where}: "scopes_required" must be an array of non-empty strings if present`,
+      );
+    }
+    scopesRequired = u.scopes_required as string[];
+  }
   const out: UiSubUnit = { displayName, path };
   if (tagline !== undefined) out.tagline = tagline;
   if (iconUrl !== undefined) out.iconUrl = iconUrl;
   if (version !== undefined) out.version = version;
   if (oauthClientId !== undefined) out.oauthClientId = oauthClientId;
   if (normalizedStatus !== undefined) out.status = normalizedStatus;
+  if (audience !== undefined) out.audience = audience;
+  if (scopesRequired !== undefined) out.scopes_required = scopesRequired;
   return out;
 }
 

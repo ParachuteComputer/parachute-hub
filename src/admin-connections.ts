@@ -33,7 +33,25 @@
  *
  * AUTH. Same gate as the admin-token mints: a cookie-gated operator session
  * pinned to the first admin. The catalog (`/api/connections/catalog`) is
- * operator-only metadata; it uses the same session gate.
+ * operator-only metadata; it uses the same session gate. ONE exception:
+ * `POST /admin/connections/:id/renew` (H4 credential renewal) authenticates
+ * by PROOF OF POSSESSION of the connection's current still-valid credential
+ * as Bearer — no operator click; an expired credential cannot renew itself
+ * (the operator re-approves in the UI).
+ *
+ * THE SECOND KIND — `kind: "credential"` (H4, surface-runtime design). A
+ * module declares `credentials` in module.json (scope TEMPLATE
+ * `vault:{vault}:read|write` — never admin, never another namespace; both
+ * the manifest validator and this engine enforce it). The operator approves
+ * granting <module> a standing tag-scoped credential on <vault>: the hub
+ * mints a REGISTERED 90-day JWT carrying `permissions.scoped_tags`, delivers
+ * it to the module's declared endpoint over loopback (authenticated with a
+ * short-lived `<module>:admin` bearer — the channel-config delivery shape),
+ * and persists the jti + scope + tags on the ConnectionRecord. Teardown
+ * revokes the jtis + best-effort notifies the endpoint with a removal
+ * payload. Tags are REQUIRED for write scopes (tags are the sharing scope);
+ * read may be tag-scoped or vault-wide per the operator's choice (the
+ * approval UI defaults to tag-scoped).
  */
 import type { Database } from "bun:sqlite";
 import {
@@ -44,8 +62,19 @@ import {
   readConnections,
   removeConnection,
 } from "./connections-store.ts";
-import { recordTokenMint, revokeTokenByJti, signAccessToken } from "./jwt-sign.ts";
-import type { ModuleAction, ModuleEvent, ModuleManifest } from "./module-manifest.ts";
+import {
+  recordTokenMint,
+  revokeTokenByJti,
+  signAccessToken,
+  validateAccessToken,
+} from "./jwt-sign.ts";
+import {
+  CREDENTIAL_SCOPE_TEMPLATE_RE,
+  type ModuleAction,
+  type ModuleCredential,
+  type ModuleEvent,
+  type ModuleManifest,
+} from "./module-manifest.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
@@ -111,6 +140,16 @@ export interface ConnectionsDeps {
    * services.json, or `null` when no vault by that name is installed.
    */
   resolveVaultOrigin: (vaultName: string) => string | null;
+  /**
+   * Resolve a module's loopback origin (e.g. `http://127.0.0.1:1946`) by
+   * short name, or `null` when not installed (H4 — credential delivery +
+   * removal notification go direct to the daemon, not through the hub
+   * proxy). Optional: callers that never touch credential connections (and
+   * the vault-delete cascade on a hub without H4 consumers) may omit it;
+   * delivery then fails with a clear `module_unreachable` step error and
+   * teardown logs the skipped notification.
+   */
+  resolveModuleOrigin?: (short: string) => string | null;
   /** Loopback origin for the channel daemon, or `null` when not installed. */
   channelOrigin: string | null;
   /** Absolute path to `connections.json` in the hub state dir. */
@@ -140,6 +179,21 @@ interface CatalogAction {
   inputSchema: unknown;
   /** The provision descriptor (e.g. `{ type: "vault-trigger" }`), opaque to the SPA. */
   provision: unknown;
+}
+/**
+ * A credential declaration (H4) surfaced through the catalog so module UIs
+ * can render the link flow (which vaults to offer, which tags to suggest).
+ * NO tokens, NO secrets — declaration metadata only, like everything else
+ * in the catalog.
+ */
+interface CatalogCredential {
+  module: string;
+  key: string;
+  title: string;
+  description: string | null;
+  /** The scope TEMPLATE, e.g. `vault:{vault}:read`. */
+  scope: string;
+  endpoint: string;
 }
 /**
  * A connection preset declared in a module's `module.json`
@@ -175,10 +229,12 @@ export function buildCatalog(modules: InstalledModuleInfo[]): {
   events: CatalogEvent[];
   actions: CatalogAction[];
   templates: CatalogTemplate[];
+  credentials: CatalogCredential[];
 } {
   const events: CatalogEvent[] = [];
   const actions: CatalogAction[] = [];
   const templates: CatalogTemplate[] = [];
+  const credentials: CatalogCredential[] = [];
   for (const { short, manifest } of modules) {
     for (const e of manifest.events ?? []) {
       events.push({
@@ -195,6 +251,16 @@ export function buildCatalog(modules: InstalledModuleInfo[]): {
         title: a.title,
         inputSchema: a.inputSchema ?? null,
         provision: a.provision ?? null,
+      });
+    }
+    for (const c of manifest.credentials ?? []) {
+      credentials.push({
+        module: short,
+        key: c.key,
+        title: c.title,
+        description: c.description ?? null,
+        scope: c.scope,
+        endpoint: c.endpoint,
       });
     }
     for (const t of manifest.connectionTemplates ?? []) {
@@ -220,7 +286,7 @@ export function buildCatalog(modules: InstalledModuleInfo[]): {
       });
     }
   }
-  return { events, actions, templates };
+  return { events, actions, templates, credentials };
 }
 
 export async function handleConnectionsCatalog(
@@ -238,24 +304,44 @@ export async function handleConnectionsCatalog(
 
 export async function handleConnections(
   req: Request,
-  /** Path after `/admin/connections` — `""` for the collection, `/<id>` for an item. */
+  /** Path after `/admin/connections` — `""` for the collection, `/<id>` for
+   *  an item, `/<id>/renew` for credential renewal (H4). */
   subPath: string,
   deps: ConnectionsDeps,
 ): Promise<Response> {
+  const method = req.method;
+  const segments = subPath.startsWith("/")
+    ? subPath
+        .slice(1)
+        .split("/")
+        .map((s) => decodeURIComponent(s))
+    : [];
+
+  // H4 — credential renewal. Routed BEFORE the operator gate: the renew
+  // endpoint authenticates by proof of possession of the connection's
+  // current still-valid credential (Bearer), not by an operator session —
+  // a headless module daemon renews without a click. Everything else below
+  // stays operator-gated.
+  if (segments.length === 2 && segments[1] === "renew") {
+    if (method !== "POST") {
+      return jsonError(405, "method_not_allowed", "use POST on /admin/connections/:id/renew");
+    }
+    return renewCredentialConnection(req, segments[0] ?? "", deps);
+  }
+
   const gate = operatorGate(req, deps);
   if (gate) return gate;
   const { userId } = sessionUser(req, deps);
 
-  const method = req.method;
-  const itemId = subPath.startsWith("/") ? decodeURIComponent(subPath.slice(1)) : "";
+  const itemId = segments.length === 1 ? (segments[0] ?? "") : "";
 
-  if (itemId === "" && method === "GET") return listConnections(deps);
-  if (itemId === "" && method === "POST") return createConnection(req, userId, deps);
+  if (segments.length === 0 && method === "GET") return listConnections(deps);
+  if (segments.length === 0 && method === "POST") return createConnection(req, userId, deps);
   if (itemId !== "" && method === "DELETE") return teardownConnection(itemId, userId, deps);
   return jsonError(
     405,
     "method_not_allowed",
-    "use GET/POST on /admin/connections or DELETE on /admin/connections/:id",
+    "use GET/POST on /admin/connections, DELETE on /admin/connections/:id, or POST on /admin/connections/:id/renew",
   );
 }
 
@@ -269,6 +355,10 @@ function listConnections(deps: ConnectionsDeps): Response {
   // the response is stable regardless of the on-disk record shape.
   const connections = readConnections(deps.storePath).map((c) => ({
     id: c.id,
+    // Kind discriminator (H4): absent = event→action; "credential" = a
+    // standing module credential. Projected so the SPA can render the two
+    // shapes distinctly.
+    ...(c.kind !== undefined ? { kind: c.kind } : {}),
     source: c.source,
     sink: c.sink,
     provisioned: c.provisioned,
@@ -294,6 +384,8 @@ function isLegacyRecord(c: ConnectionRecord): boolean {
 // ---------------------------------------------------------------------------
 
 interface CreateBody {
+  /** `"credential"` routes to the H4 flow; absent/anything-else = event→action. */
+  kind?: unknown;
   source?: {
     module?: unknown;
     vault?: unknown;
@@ -304,6 +396,13 @@ interface CreateBody {
     module?: unknown;
     action?: unknown;
     params?: unknown;
+  };
+  /** H4 — the credential request: which module/key, which vault, which tags. */
+  credential?: {
+    module?: unknown;
+    key?: unknown;
+    vault?: unknown;
+    tags?: unknown;
   };
   /** Optional operator-supplied id; otherwise derived from source/sink. */
   id?: unknown;
@@ -325,6 +424,12 @@ async function createConnection(
     body = (await req.json()) as CreateBody;
   } catch {
     return jsonError(400, "invalid_request", "request body must be JSON");
+  }
+
+  // H4 — the second kind. Routed by an explicit discriminator so the two
+  // body shapes never ambiguously overlap.
+  if (str(body.kind) === "credential") {
+    return createCredentialConnection(body, userId, deps);
   }
 
   const sourceModule = str(body.source?.module);
@@ -599,6 +704,436 @@ async function prepareChannelSink(
   }
 }
 
+// ===========================================================================
+// kind: "credential" — provision / renew / deliver (H4)
+// ===========================================================================
+
+/** TTL of the standing credential (matches the engine's webhook bearer). */
+const CREDENTIAL_TTL_SECONDS = WEBHOOK_BEARER_TTL_SECONDS;
+
+/**
+ * The payload POSTed to the module's declared endpoint over loopback. One
+ * shape for all three lifecycle moments, discriminated by `op`:
+ * `"provisioned"` and `"renewed"` carry the token; `"removed"` carries only
+ * the identity fields (the module drops its stored credential).
+ */
+interface CredentialPayload {
+  kind: "credential";
+  op: "provisioned" | "renewed" | "removed";
+  connection_id: string;
+  key: string;
+  vault: string;
+  scope: string;
+  /** Tag allowlist. Empty = vault-wide (read scopes only). */
+  scoped_tags: string[];
+  token?: string;
+  jti?: string;
+  expires_at?: string;
+  /** Hub path the module POSTs (Bearer = this token) to renew before expiry. */
+  renew_path?: string;
+}
+
+/**
+ * Mint the standing credential for a credential connection: a REGISTERED
+ * (created_via "connection_credential") 90-day JWT at `vault:<v>:<verb>`,
+ * audience-bound + vault_scope-pinned to the vault, carrying
+ * `permissions.scoped_tags` when tags were chosen (the claim path vault's
+ * tag-scope enforcement reads — vault/src/auth.ts `scoped_tags`).
+ */
+async function mintCredential(
+  deps: ConnectionsDeps,
+  userId: string,
+  vault: string,
+  scope: string,
+  scopedTags: readonly string[],
+): Promise<{ token: string; jti: string; expiresAt: string }> {
+  const signed = await mint(deps, userId, {
+    scopes: [scope],
+    audience: `vault.${vault}`,
+    vaultScope: [vault],
+    ttlSeconds: CREDENTIAL_TTL_SECONDS,
+    createdVia: "connection_credential",
+    ...(scopedTags.length > 0 ? { permissions: { scoped_tags: [...scopedTags] } } : {}),
+  });
+  return { token: signed.token, jti: signed.jti, expiresAt: signed.expiresAt };
+}
+
+/**
+ * POST a credential payload to the module's declared endpoint over loopback,
+ * authenticated with a short-lived `<module>:admin` bearer (the engine's
+ * channel-config delivery shape — the module's endpoint gates on its own
+ * admin scope, so a random on-box process can't plant a forged credential).
+ */
+async function deliverCredentialPayload(
+  deps: ConnectionsDeps,
+  userId: string,
+  moduleShort: string,
+  endpoint: string,
+  payload: CredentialPayload,
+): Promise<{ ok: true } | { ok: false; detail: string }> {
+  const moduleOrigin = deps.resolveModuleOrigin?.(moduleShort) ?? null;
+  if (moduleOrigin === null) {
+    return { ok: false, detail: `module "${moduleShort}" has no resolvable loopback origin` };
+  }
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  try {
+    const adminBearer = (
+      await mint(deps, userId, {
+        scopes: [`${moduleShort}:admin`],
+        audience: moduleShort,
+        vaultScope: [],
+        ttlSeconds: PROVISION_TOKEN_TTL_SECONDS,
+      })
+    ).token;
+    const res = await fetchImpl(`${moduleOrigin}${endpoint}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${adminBearer}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return { ok: false, detail: await remoteDetail(res) };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, detail: errMsg(err) };
+  }
+}
+
+/**
+ * POST /admin/connections with `kind: "credential"` — the operator approves
+ * granting <module> a standing tag-scoped credential on <vault>.
+ *
+ * Validation (the privilege-escalation guard's runtime half):
+ *   - the module must be installed AND must DECLARE the credential key;
+ *   - the declared scope template must (still) be `vault:{vault}:read|write`
+ *     — re-checked here even though the manifest validator enforces it, so a
+ *     manifest read through a non-validating path can't widen the grant;
+ *   - the vault must exist; tags must be non-empty strings;
+ *   - WRITE scopes require non-empty tags (tags are the sharing scope —
+ *     an untagged write credential would be a vault-wide write). Read may be
+ *     vault-wide per operator choice (the UI defaults to tag-scoped).
+ *
+ * Provision order: mint (registered) → deliver to the module's endpoint →
+ * persist. A failed delivery revokes the fresh mint — an undelivered live
+ * credential must not outlive the request.
+ *
+ * Re-approval: POSTing the same module/key/vault again (the expired-renewal
+ * path) upserts by the derived id; the prior record's jtis are revoked first
+ * so exactly one live credential exists per connection.
+ */
+async function createCredentialConnection(
+  body: CreateBody,
+  userId: string,
+  deps: ConnectionsDeps,
+): Promise<Response> {
+  const moduleShort = str(body.credential?.module);
+  const key = str(body.credential?.key);
+  const vault = str(body.credential?.vault);
+  if (!moduleShort || !key || !vault) {
+    return jsonError(
+      400,
+      "invalid_request",
+      "credential.module, credential.key, credential.vault are all required",
+    );
+  }
+
+  const requestedByRaw = str(body.requestedBy);
+  const requestedBy = requestedByRaw === "" ? DEFAULT_REQUESTED_BY : requestedByRaw.toLowerCase();
+  if (!REQUESTED_BY_RE.test(requestedBy)) {
+    return jsonError(
+      400,
+      "invalid_request",
+      `requestedBy "${requestedByRaw}" is not a valid label (letters, numbers, dash, underscore)`,
+    );
+  }
+
+  // --- Declaration check: installed module, declared key, sane template. ---
+  const mod = deps.modules.find((m) => m.short === moduleShort);
+  if (!mod) return jsonError(400, "unknown_module", `no installed module "${moduleShort}"`);
+  const decl = findCredentialDecl(mod.manifest, key);
+  if (!decl) {
+    return jsonError(
+      400,
+      "unknown_credential",
+      `module "${moduleShort}" declares no credential "${key}"`,
+    );
+  }
+  // Escalation guard, runtime half: ONLY vault:{vault}:read|write. A module
+  // requesting vault:{vault}:admin, scribe:{vault}:read, or a literal vault
+  // name is refused regardless of what its manifest says.
+  if (!CREDENTIAL_SCOPE_TEMPLATE_RE.test(decl.scope)) {
+    return jsonError(
+      400,
+      "invalid_scope",
+      `credential "${moduleShort}.${key}" declares scope "${decl.scope}" — only "vault:{vault}:read" or "vault:{vault}:write" are grantable (never admin, never another namespace)`,
+    );
+  }
+  if (!decl.endpoint || !decl.endpoint.startsWith("/")) {
+    return jsonError(
+      400,
+      "credential_underdeclared",
+      `credential "${moduleShort}.${key}" declares no delivery endpoint`,
+    );
+  }
+
+  // --- Vault + tags. ---------------------------------------------------------
+  if (!VAULT_NAME_CHARSET_RE.test(vault)) {
+    return jsonError(
+      400,
+      "invalid_request",
+      `credential.vault "${vault}" is not a valid identifier`,
+    );
+  }
+  if (deps.resolveVaultOrigin(vault) === null) {
+    return jsonError(400, "unknown_vault", `no vault named "${vault}" in this hub`);
+  }
+  const rawTags = body.credential?.tags;
+  if (rawTags !== undefined && !Array.isArray(rawTags)) {
+    return jsonError(400, "invalid_request", "credential.tags must be an array of tag names");
+  }
+  const tags: string[] = [];
+  for (const t of (rawTags as unknown[] | undefined) ?? []) {
+    if (typeof t !== "string" || t.trim().length === 0) {
+      return jsonError(400, "invalid_request", "credential.tags entries must be non-empty strings");
+    }
+    tags.push(t.trim());
+  }
+  const verb = decl.scope.endsWith(":write") ? "write" : "read";
+  if (verb === "write" && tags.length === 0) {
+    return jsonError(
+      400,
+      "invalid_request",
+      "a write credential requires a non-empty tag scope — tags are the sharing scope; vault-wide write is not grantable here",
+    );
+  }
+  const scope = `vault:${vault}:${verb}`;
+
+  // --- Id (stable per module/key/vault → re-approve upserts). ----------------
+  const suppliedId = str(body.id);
+  const id = (suppliedId || `cred-${moduleShort}-${key}-${vault}`).toLowerCase();
+  if (!CONNECTION_ID_RE.test(id)) {
+    return jsonError(400, "invalid_request", `connection id "${id}" is not a valid identifier`);
+  }
+
+  // Re-approval path: revoke the prior record's still-registered jtis BEFORE
+  // minting the replacement, so exactly one live credential exists per
+  // connection (idempotent for already-revoked/expired rows).
+  const prior = readConnections(deps.storePath).find((r) => r.id === id);
+  if (prior) {
+    const now = deps.now?.() ?? new Date();
+    for (const jti of prior.provisioned?.mintedJtis ?? []) {
+      try {
+        revokeTokenByJti(deps.db, jti, now);
+      } catch {
+        // Best-effort — a missing registry row leaves nothing to revoke.
+      }
+    }
+  }
+
+  // --- Mint (registered) → deliver → persist. --------------------------------
+  let minted: { token: string; jti: string; expiresAt: string };
+  try {
+    minted = await mintCredential(deps, userId, vault, scope, tags);
+  } catch (err) {
+    return stepError("mint_credential", err);
+  }
+
+  const payload: CredentialPayload = {
+    kind: "credential",
+    op: "provisioned",
+    connection_id: id,
+    key,
+    vault,
+    scope,
+    scoped_tags: tags,
+    token: minted.token,
+    jti: minted.jti,
+    expires_at: minted.expiresAt,
+    renew_path: `/admin/connections/${id}/renew`,
+  };
+  const delivered = await deliverCredentialPayload(
+    deps,
+    userId,
+    moduleShort,
+    decl.endpoint,
+    payload,
+  );
+  if (!delivered.ok) {
+    // An undelivered live credential must not outlive the request.
+    try {
+      revokeTokenByJti(deps.db, minted.jti, deps.now?.() ?? new Date());
+    } catch {
+      // Registry row just written by mint() — failure here is exotic; the
+      // step error below still surfaces the delivery fault.
+    }
+    return stepError("credential_delivery", delivered.detail);
+  }
+
+  const record: ConnectionRecord = {
+    id,
+    kind: "credential",
+    // The source of authority is the granting vault; the sink is the module
+    // holding the credential. Populating both keeps the store filter, the
+    // list projection, and the vault-delete cascade (`source.vault === name
+    // || provisioned.vault === name`) uniform across both kinds.
+    source: { module: "vault", vault, event: "credential" },
+    sink: {
+      module: moduleShort,
+      action: `credential.${key}`,
+      ...(tags.length > 0 ? { params: { tags } } : {}),
+    },
+    provisioned: {
+      type: "credential",
+      vault,
+      mintedJtis: [minted.jti],
+      scope,
+      scopedTags: tags,
+      credentialKey: key,
+      endpoint: decl.endpoint,
+    },
+    createdAt: (deps.now?.() ?? new Date()).toISOString(),
+    requestedBy,
+  };
+  putConnection(deps.storePath, record);
+
+  return json(200, { ok: true, connection: record, expires_at: minted.expiresAt });
+}
+
+/**
+ * POST /admin/connections/:id/renew — credential renewal by PROOF OF
+ * POSSESSION: the caller presents the connection's CURRENT still-valid
+ * credential as Bearer. No operator click — a headless module daemon renews
+ * before expiry.
+ *
+ * The possession check is the load-bearing gate: the presented token must
+ * (a) verify against the hub's JWKS (signature, expiry, revocation — via
+ * `validateAccessToken` WITHOUT an issuer pin; the signature proves the hub
+ * minted it, and the jti binding below makes a foreign-issuer replay
+ * structurally impossible), and (b) carry the EXACT jti recorded on this
+ * connection. An expired or revoked credential fails (a) → 401 → the
+ * operator re-approves in the UI (the upsert path in create).
+ *
+ * Renewal re-mints the SAME scope + tags from the record (never request
+ * input), delivers the fresh credential in the RESPONSE BODY (the caller is
+ * the proven credential holder — that's the delivery; no second loopback
+ * POST), revokes the old jti, and updates the record.
+ */
+async function renewCredentialConnection(
+  req: Request,
+  id: string,
+  deps: ConnectionsDeps,
+): Promise<Response> {
+  if (!CONNECTION_ID_RE.test(id)) {
+    return jsonError(400, "invalid_request", `connection id "${id}" is not a valid identifier`);
+  }
+  const record = readConnections(deps.storePath).find((r) => r.id === id);
+  if (!record || record.kind !== "credential") {
+    return jsonError(404, "not_found", `no credential connection "${id}"`);
+  }
+
+  const auth = req.headers.get("authorization");
+  if (!auth || !auth.startsWith("Bearer ")) {
+    return jsonError(
+      401,
+      "unauthenticated",
+      "renewal requires the connection's current credential as Authorization: Bearer",
+    );
+  }
+  const bearer = auth.slice("Bearer ".length).trim();
+  let presentedJti: string;
+  try {
+    // Deliberately NO expectedIssuer pin here — unlike the audience gate's
+    // Bearer branch (audience-gate.ts → validateHostAdminToken, iss ∈ the
+    // hub's bound-origin set). See the fn docstring: the JWKS signature
+    // proves local issuance, and the jti binding below makes a foreign
+    // replay structurally impossible — an iss check would add nothing but
+    // the #516 loopback-vs-public false-reject class.
+    const validated = await validateAccessToken(deps.db, bearer);
+    presentedJti = typeof validated.payload.jti === "string" ? validated.payload.jti : "";
+  } catch (err) {
+    // Signature/expiry/revocation failure — including the EXPIRED case the
+    // design calls out: an expired credential cannot renew itself; the
+    // operator re-approves in the UI.
+    return jsonError(
+      401,
+      "invalid_credential",
+      `credential is not valid (expired credentials require operator re-approval in the hub UI): ${errMsg(err)}`,
+    );
+  }
+  const currentJtis = record.provisioned?.mintedJtis ?? [];
+  if (!presentedJti || !currentJtis.includes(presentedJti)) {
+    return jsonError(
+      403,
+      "not_credential_holder",
+      "the presented token is not this connection's current credential",
+    );
+  }
+
+  const vault = record.provisioned?.vault ?? "";
+  const scope = record.provisioned?.scope ?? "";
+  const scopedTags = record.provisioned?.scopedTags ?? [];
+  const key = record.provisioned?.credentialKey ?? "";
+  if (!vault || !scope) {
+    return jsonError(500, "record_corrupt", `credential connection "${id}" has no minted shape`);
+  }
+
+  // Renewal authority is the connection itself (operator approved the
+  // standing grant; renewal extends it without escalation — same scope, same
+  // tags). No operator user is in the loop, so the registry row carries the
+  // provenance subject only (empty userId → mint() omits user_id).
+  let minted: { token: string; jti: string; expiresAt: string };
+  try {
+    minted = await mintCredential(deps, "", vault, scope, scopedTags);
+  } catch (err) {
+    return stepError("mint_credential", err);
+  }
+
+  // Revoke the old credential, persist the new jti. The ORDERING (mint new →
+  // revoke old → write record → respond) is a deliberate trade-off: a
+  // connection drop after the record write but before the response leaves
+  // the module holding NEITHER credential (old revoked, new never received)
+  // → operator re-approval required. We fail toward lockout, never toward
+  // two live credentials. If that window ever bites in practice, the future
+  // option is a retrieve-current-by-jti endpoint (present the revoked-but-
+  // recorded predecessor, fetch its successor) — not reordering the steps.
+  const now = deps.now?.() ?? new Date();
+  for (const jti of currentJtis) {
+    try {
+      revokeTokenByJti(deps.db, jti, now);
+    } catch {
+      // Best-effort; the new mint is already the only one the record names.
+    }
+  }
+  const updated: ConnectionRecord = {
+    ...record,
+    provisioned: {
+      ...record.provisioned,
+      mintedJtis: [minted.jti],
+    },
+  };
+  putConnection(deps.storePath, updated);
+
+  const payload: CredentialPayload = {
+    kind: "credential",
+    op: "renewed",
+    connection_id: id,
+    key,
+    vault,
+    scope,
+    scoped_tags: [...scopedTags],
+    token: minted.token,
+    jti: minted.jti,
+    expires_at: minted.expiresAt,
+    renew_path: `/admin/connections/${id}/renew`,
+  };
+  return json(200, { ok: true, credential: payload });
+}
+
+function findCredentialDecl(m: ModuleManifest, key: string): ModuleCredential | undefined {
+  return (m.credentials ?? []).find((c) => c.key === key);
+}
+
 // ---------------------------------------------------------------------------
 // DELETE — teardown
 // ---------------------------------------------------------------------------
@@ -656,8 +1191,43 @@ export async function teardownConnection(
     }
   }
 
+  // --- Credential removal notification (H4, best-effort). -------------------
+  // The module holding the credential gets a removal payload at its declared
+  // endpoint so it can drop the stored token. Best-effort by design: the jti
+  // revocation below is the authoritative kill (the revocation list reaches
+  // every resource server); a missed notification only leaves the module
+  // holding a dead credential it will discover on first use.
+  if (record.kind === "credential") {
+    const endpoint = record.provisioned?.endpoint;
+    const key = record.provisioned?.credentialKey ?? "";
+    const credVault = record.provisioned?.vault ?? "";
+    if (endpoint) {
+      const removal: CredentialPayload = {
+        kind: "credential",
+        op: "removed",
+        connection_id: record.id,
+        key,
+        vault: credVault,
+        scope: record.provisioned?.scope ?? "",
+        scoped_tags: [...(record.provisioned?.scopedTags ?? [])],
+      };
+      const notified = await deliverCredentialPayload(
+        deps,
+        userId,
+        record.sink.module,
+        endpoint,
+        removal,
+      );
+      if (!notified.ok) {
+        errors.push({ step: "credential_notify", detail: notified.detail });
+      }
+    }
+  }
+
   // --- Channel-sink teardown (remove the channel config entry). ------------
-  if (record.sink.module === "channel" && deps.channelOrigin) {
+  // Fenced to event→action records: a credential connection whose HOLDER is
+  // the channel module must not delete an unrelated channel config entry.
+  if (record.kind !== "credential" && record.sink.module === "channel" && deps.channelOrigin) {
     const channelName =
       typeof record.sink.params?.channel === "string" ? record.sink.params.channel : record.id;
     try {
@@ -904,18 +1474,33 @@ interface MintSpec {
   audience: string;
   vaultScope: string[];
   ttlSeconds: number;
+  /**
+   * Registry provenance for long-lived mints. Defaults to the engine's
+   * original `connection_provision`; credential connections (H4) pass
+   * `connection_credential` so the registry distinguishes the two grants.
+   */
+  createdVia?: "connection_provision" | "connection_credential";
+  /**
+   * Extra `permissions` claim (H4 — `{ scoped_tags: [...] }`, the claim path
+   * vault's tag-scope enforcement reads). Embedded in the JWT AND persisted
+   * (JSON) on the registry row.
+   */
+  permissions?: Record<string, unknown>;
 }
 
 async function mint(deps: ConnectionsDeps, userId: string, spec: MintSpec) {
   const sign = deps.signToken ?? signAccessToken;
   const signed = await sign(deps.db, {
-    sub: userId,
+    // `sub` falls back to the provenance subject when no operator user is in
+    // the loop (H4 renewal is module-initiated — no session, no user row).
+    sub: userId || "connection",
     scopes: spec.scopes,
     audience: spec.audience,
     clientId: PROVISION_CLIENT_ID,
     issuer: deps.hubOrigin,
     ttlSeconds: spec.ttlSeconds,
     vaultScope: spec.vaultScope,
+    ...(spec.permissions !== undefined ? { extraClaims: { permissions: spec.permissions } } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
   // Register long-lived mints so they're revocable on teardown. Short-lived
@@ -923,12 +1508,15 @@ async function mint(deps: ConnectionsDeps, userId: string, spec: MintSpec) {
   if (spec.ttlSeconds > REGISTERED_MINT_TTL_THRESHOLD_SECONDS) {
     recordTokenMint(deps.db, {
       jti: signed.jti,
-      createdVia: "connection_provision",
+      createdVia: spec.createdVia ?? "connection_provision",
       subject: "connection",
-      userId,
+      // tokens.user_id carries an FK to users(id) — only write it when a
+      // real operator user is in the loop (empty = renewal, no session).
+      ...(userId ? { userId } : {}),
       clientId: PROVISION_CLIENT_ID,
       scopes: spec.scopes,
       expiresAt: signed.expiresAt,
+      ...(spec.permissions !== undefined ? { permissions: JSON.stringify(spec.permissions) } : {}),
       ...(deps.now !== undefined ? { now: deps.now } : {}),
     });
   }

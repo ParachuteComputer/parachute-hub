@@ -204,7 +204,12 @@ import {
   handleResetUserPassword,
   handleUpdateUserVaults,
 } from "./api-users.ts";
-import { buildChromeForRequest, injectChromeIntoResponse } from "./chrome-strip.ts";
+import { gateUiAudience, resolveUiMount } from "./audience-gate.ts";
+import {
+  CHROME_OPT_OUT_PREFIXES,
+  buildChromeForRequest,
+  injectChromeIntoResponse,
+} from "./chrome-strip.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
 import { applyCorsHeaders, corsPreflightResponse, isCorsAllowedRoute } from "./cors.ts";
 import { ensureCsrfToken } from "./csrf.ts";
@@ -270,6 +275,7 @@ import {
   isVaultEntry,
   vaultInstanceNameFor,
 } from "./well-known.ts";
+import { type WsBridgeData, createWsBridgeHandlers } from "./ws-bridge.ts";
 
 interface Args {
   port: number;
@@ -479,6 +485,23 @@ async function collectInstalledModules(
 }
 
 /**
+ * Resolve a module's loopback origin by SHORT name from services.json — the
+ * H4 credential-delivery seam (the Connections engine POSTs minted
+ * credentials + removal payloads direct to the daemon, not through the hub
+ * proxy). Short derivation mirrors `collectInstalledModules`:
+ * `shortNameForManifest(name) ?? name`, so third-party modules (whose row
+ * name IS their short) resolve too. Read per-request — a module installed
+ * seconds ago is deliverable without a hub restart.
+ */
+function makeResolveModuleOrigin(manifestPath: string): (short: string) => string | null {
+  return (short) => {
+    const services = readManifestLenient(manifestPath).services;
+    const entry = services.find((s) => (shortNameForManifest(s.name) ?? s.name) === short);
+    return entry ? `http://127.0.0.1:${entry.port}` : null;
+  };
+}
+
+/**
  * The trust layer a request arrived through. Hub binds `127.0.0.1:1939`, so
  * every request reaches it via one of three trusted forwarders (or directly
  * over loopback). The forwarder injects characteristic headers that we use to
@@ -565,6 +588,77 @@ function isLoopbackPeer(peerAddr: string | null | undefined): boolean {
 }
 
 /**
+ * The two substrate trust headers the hub stamps on every forwarded request
+ * (H2, surface-runtime-primitives design §10):
+ *
+ *   X-Parachute-Layer     — the `layerOf` classification ("loopback" |
+ *                           "tailnet" | "public"), fail-closed to "public"
+ *                           when the peer address is unknown.
+ *   X-Parachute-Client-IP — the resolved client IP (CF-Connecting-IP →
+ *                           X-Forwarded-For first hop → peer address; same
+ *                           precedence as rate-limit.ts `clientIpFromRequest`,
+ *                           with the peer address as the direct-caller floor).
+ *
+ * Backends (surface-host's `ctx.layer` / `ctx.clientIp`, any module reading
+ * trust signals) consume THESE, never raw forwarder headers — the hub is the
+ * only component that can see the actual peer socket, so it's the only place
+ * the classification can be made fail-closed.
+ */
+export const PARACHUTE_LAYER_HEADER = "x-parachute-layer";
+export const PARACHUTE_CLIENT_IP_HEADER = "x-parachute-client-ip";
+
+/**
+ * Resolve the client IP for the X-Parachute-Client-IP stamp. Precedence:
+ *
+ *   1. `CF-Connecting-IP` — cloudflared stamps the actual client IP on every
+ *      forwarded request (authoritative on cloudflare-fronted hubs).
+ *   2. `X-Forwarded-For` first hop — tailscale serve/funnel and generic
+ *      reverse proxies set it; the leftmost entry is the original client.
+ *   3. The peer address itself — the direct caller (loopback CLI, or a
+ *      direct network peer on a 0.0.0.0 bind).
+ *
+ * Returns null when nothing resolves (no forwarder headers AND no peer
+ * address — e.g. a unit test calling the fetch fn without a Server). The
+ * caller omits the header in that case; backends treat absence as null.
+ *
+ * Known limitation (same as the rate-limiter's keying): a DIRECT caller can
+ * spoof the forwarded-IP headers and misattribute its own address. It cannot
+ * spoof the LAYER (layerOf classifies direct non-loopback peers as "public"
+ * regardless of injected headers), so the trust signal stays sound — only
+ * the attribution string is best-effort for direct callers.
+ */
+export function resolveClientIp(req: Request, peerAddr: string | null): string | null {
+  const cf = req.headers.get("cf-connecting-ip")?.trim();
+  if (cf) return cf;
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) {
+    const first = xff.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  const peer = peerAddr?.trim();
+  return peer ? peer : null;
+}
+
+/**
+ * Strip any inbound occurrences of the substrate trust headers, then stamp
+ * the hub's own classification. The strip is load-bearing: a public client
+ * sending `X-Parachute-Layer: loopback` (or a forged client IP) must never
+ * ride that injection past the proxy into a module that keys trust off it.
+ * Mutates `headers` in place (the proxy's outgoing header bag).
+ */
+export function stampSubstrateTrustHeaders(
+  headers: Headers,
+  req: Request,
+  peerAddr: string | null,
+): void {
+  headers.delete(PARACHUTE_LAYER_HEADER);
+  headers.delete(PARACHUTE_CLIENT_IP_HEADER);
+  headers.set(PARACHUTE_LAYER_HEADER, layerOf(req, peerAddr));
+  const clientIp = resolveClientIp(req, peerAddr);
+  if (clientIp) headers.set(PARACHUTE_CLIENT_IP_HEADER, clientIp);
+}
+
+/**
  * Forward a request to a loopback service on `127.0.0.1:<port>`. By default
  * the incoming pathname + query are preserved verbatim; pass `targetPath` to
  * rewrite the path (e.g. when the caller has stripped a mount prefix because
@@ -595,10 +689,17 @@ function isLoopbackPeer(peerAddr: string | null | undefined): boolean {
  * `short` is the canonical short (`vault`/`scribe`/`notes`) — used as
  * the supervisor map key + pidfile directory key for classification.
  *
- * Hop-by-hop notes: WebSocket upgrades and HTTP/2 trailers don't traverse
- * fetch-based proxies cleanly. No on-box service uses either today; if one
- * eventually needs them, switch to a Node http.IncomingMessage / http.request
- * pair.
+ * `peerAddr` is the resolved peer address (`server.requestIP`), threaded so
+ * the substrate trust headers (below) classify the layer the same way the
+ * `publicExposure` cloak does — fail-closed to `public` when unknown.
+ *
+ * Hop-by-hop notes: HTTP/2 trailers don't traverse fetch-based proxies
+ * cleanly; no on-box service uses them today. WebSocket upgrades CANNOT
+ * traverse this fetch-based path either — they're handled BEFORE dispatch by
+ * the Bun-native upgrade bridge (H1: `maybeUpgradeWebSocket` +
+ * `src/ws-bridge.ts`) for modules that declare the capability; an upgrade
+ * request reaching this function belongs to a non-declaring mount and the
+ * upstream sees a plain GET.
  */
 async function proxyRequest(
   req: Request,
@@ -606,6 +707,7 @@ async function proxyRequest(
   serviceLabel: string,
   short: string,
   supervisor: Supervisor | undefined,
+  peerAddr: string | null,
   targetPath?: string,
 ): Promise<Response> {
   const url = new URL(req.url);
@@ -651,6 +753,11 @@ async function proxyRequest(
   if (!headers.has("x-forwarded-proto")) {
     headers.set("x-forwarded-proto", isHttpsRequest(req) ? "https" : "http");
   }
+  // Substrate trust headers (H2, surface-runtime design §10): stamped on
+  // EVERY forwarded request so module backends read trust signals from the
+  // substrate instead of re-deriving them from raw forwarder headers (the
+  // "header-absence = local trust" anti-pattern the design rejects).
+  stampSubstrateTrustHeaders(headers, req, peerAddr);
 
   const init: RequestInit & { duplex?: "half" } = {
     method: req.method,
@@ -761,7 +868,7 @@ async function proxyToVault(
   // vault instances share the same supervisor key under hub's current
   // single-vault-per-hub model; if multi-vault-per-hub ever ships, the
   // classifier will need a per-instance key.
-  return proxyRequest(req, match.port, "vault", "vault", supervisor, targetPath);
+  return proxyRequest(req, match.port, "vault", "vault", supervisor, peerAddr, targetPath);
 }
 
 /**
@@ -805,7 +912,7 @@ async function proxyToVaultAdmin(
   if (effectivePublicExposure(entry) === "loopback" && layerOf(req, peerAddr) !== "loopback") {
     return new Response("not found", { status: 404 });
   }
-  return proxyRequest(req, entry.port, "vault", "vault", supervisor);
+  return proxyRequest(req, entry.port, "vault", "vault", supervisor, peerAddr);
 }
 
 /**
@@ -911,7 +1018,7 @@ async function proxyToService(
   // will land in "persistent" by default which is the safer choice for
   // unknown lifecycle).
   const short = shortNameForManifest(match.entry.name) ?? match.entry.name;
-  return proxyRequest(req, match.port, match.entry.name, short, supervisor, targetPath);
+  return proxyRequest(req, match.port, match.entry.name, short, supervisor, peerAddr, targetPath);
 }
 
 /**
@@ -1445,15 +1552,184 @@ export function resolveIssuerSource(
 
 /**
  * Minimal structural type for the Bun `Server` handle the fetch callback
- * receives as its 2nd argument. We only need `requestIP` (item E / #526) to
- * resolve the peer address for `layerOf`. Typed structurally (rather than
+ * receives as its 2nd argument. We need `requestIP` (item E / #526) to
+ * resolve the peer address for `layerOf`, and `upgrade` (H1) to hand a
+ * gated WebSocket upgrade to the bridge. Typed structurally (rather than
  * importing Bun's full `Server`) so tests can pass a tiny fake and so the
  * signature stays robust to Bun type-shape churn. Optional in the callback
  * because a direct unit call to the returned fetch fn may omit it — in which
- * case `peerAddr` is null and `layerOf` fails closed to `public`.
+ * case `peerAddr` is null and `layerOf` fails closed to `public`, and a
+ * WebSocket upgrade is refused (503 — no server to upgrade on).
  */
 interface PeerIpResolver {
   requestIP(req: Request): { address: string } | null;
+  /**
+   * Bun `Server.upgrade` — present on the real server, optional on fakes.
+   * Typed with the bridge's data payload (Bun's own signature takes
+   * `data: unknown`; method bivariance keeps the real Server assignable).
+   */
+  upgrade?(req: Request, options: { data: WsBridgeData }): boolean;
+}
+
+/**
+ * True when the request is a WebSocket upgrade. The `Upgrade` header is the
+ * discriminator (RFC 6455 §4.1 requires it; Bun's `server.upgrade` re-checks
+ * the full handshake — key, version, Connection token — so this only needs
+ * to be a cheap router predicate, not a validator).
+ */
+export function isWebSocketUpgrade(req: Request): boolean {
+  return (req.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
+}
+
+/**
+ * Hop-by-hop + WS-handshake headers never forwarded on the upstream connect:
+ * the Bun WebSocket client re-mints its own handshake (key/version/
+ * extensions), and forwarding the originals would corrupt it.
+ */
+const WS_HOP_BY_HOP_HEADERS = [
+  "host",
+  "connection",
+  "upgrade",
+  "keep-alive",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "sec-websocket-key",
+  "sec-websocket-version",
+  "sec-websocket-extensions",
+  "sec-websocket-accept",
+  // Subprotocol negotiation is NOT forwarded in v1 (see ws-bridge.ts header).
+  "sec-websocket-protocol",
+] as const;
+
+/** The verdict of {@link maybeUpgradeWebSocket}. */
+type WsUpgradeVerdict =
+  | { kind: "upgraded" }
+  | { kind: "response"; response: Response }
+  | { kind: "pass" };
+
+/**
+ * H1 — the WebSocket upgrade bridge's routing + gating half (the frame
+ * piping lives in `src/ws-bridge.ts`).
+ *
+ * For an `Upgrade: websocket` request:
+ *
+ *   1. Resolve the service mount (generic longest-prefix, then vault mounts —
+ *      same resolution as the HTTP proxies). No mount → `pass` (normal
+ *      dispatch 404s / handles it).
+ *   2. Gate BEFORE upgrading — same posture as the HTTP path:
+ *      `publicExposure: "loopback"` cloak (404, indistinguishable from
+ *      not-installed) and the per-UI audience gate (H3).
+ *   3. Capability check, DENY BY DEFAULT: the module must declare
+ *      `websocket: true` on its services.json row OR its
+ *      `.parachute/module.json`. No declaration → 426 (the route exists but
+ *      doesn't speak WebSocket; the fetch-based proxy can't forward upgrades
+ *      and the daemon never sees the request).
+ *   4. `server.upgrade(req, { data })` with the upstream URL + headers
+ *      (client headers minus hop-by-hop/handshake, plus the H2 substrate
+ *      trust stamps). The ws-bridge handlers take over from there.
+ */
+async function maybeUpgradeWebSocket(
+  req: Request,
+  server: PeerIpResolver | undefined,
+  deps: {
+    manifestPath: string;
+    peerAddr: string | null;
+    readModuleManifestFn: (installDir: string) => Promise<ModuleManifest | null>;
+    /** H3 — gate the upgrade on the mount's audience BEFORE upgrading. */
+    gateAudience?: (pathname: string) => Promise<Response | null>;
+  },
+): Promise<WsUpgradeVerdict> {
+  const services = readManifestLenient(deps.manifestPath).services;
+  const url = new URL(req.url);
+  const match =
+    findServiceUpstream(services, url.pathname) ?? findVaultUpstream(services, url.pathname);
+  if (!match) return { kind: "pass" };
+
+  // Layer cloak first — a loopback-only module must look not-installed from
+  // tailnet/public, for upgrades exactly as for HTTP.
+  if (
+    effectivePublicExposure(match.entry) === "loopback" &&
+    layerOf(req, deps.peerAddr) !== "loopback"
+  ) {
+    return { kind: "response", response: new Response("not found", { status: 404 }) };
+  }
+
+  // Audience gate (H3) — runs BEFORE the upgrade so an unauthorized client
+  // never gets a socket. Threaded from dispatch (needs db + issuer).
+  if (deps.gateAudience) {
+    const gated = await deps.gateAudience(url.pathname);
+    if (gated) return { kind: "response", response: gated };
+  }
+
+  // Capability — deny by default. services.json row wins; module.json is the
+  // canonical declaration source for modules that haven't re-registered yet.
+  let declared = match.entry.websocket === true;
+  if (!declared && match.entry.installDir) {
+    try {
+      const manifest = await deps.readModuleManifestFn(match.entry.installDir);
+      declared = manifest?.websocket === true;
+    } catch {
+      declared = false; // malformed manifest → deny (fail closed)
+    }
+  }
+  if (!declared) {
+    return {
+      kind: "response",
+      response: new Response(
+        JSON.stringify({
+          error: "websocket_not_supported",
+          error_description: `module "${match.entry.name}" does not declare WebSocket support`,
+        }),
+        { status: 426, headers: { "content-type": "application/json", upgrade: "websocket" } },
+      ),
+    };
+  }
+
+  if (!server?.upgrade) {
+    return {
+      kind: "response",
+      response: new Response(
+        JSON.stringify({
+          error: "service_unavailable",
+          error_description: "websocket upgrade unavailable on this server",
+        }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      ),
+    };
+  }
+
+  // Upstream URL — same path semantics as the HTTP proxy (stripPrefix honored).
+  const stripPrefix = stripPrefixFor(match.entry);
+  const targetPath = stripPrefix ? url.pathname.slice(match.mount.length) || "/" : url.pathname;
+  const upstreamUrl = `ws://127.0.0.1:${match.port}${targetPath}${url.search}`;
+
+  // Upstream headers: the client's own (cookie / authorization ride through
+  // so the daemon authenticates the connection) minus hop-by-hop + handshake
+  // headers, plus the H2 substrate trust stamps.
+  const headers = new Headers(req.headers);
+  for (const h of WS_HOP_BY_HOP_HEADERS) headers.delete(h);
+  stampSubstrateTrustHeaders(headers, req, deps.peerAddr);
+  const upstreamHeaders: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    upstreamHeaders[key] = value;
+  });
+
+  const upgraded = server.upgrade(req, {
+    data: { upstreamUrl, upstreamHeaders },
+  });
+  if (upgraded) return { kind: "upgraded" };
+  return {
+    kind: "response",
+    response: new Response(
+      JSON.stringify({
+        error: "upgrade_failed",
+        error_description: "WebSocket handshake was malformed or could not be completed",
+      }),
+      { status: 400, headers: { "content-type": "application/json" } },
+    ),
+  };
 }
 
 /**
@@ -1584,6 +1860,45 @@ export function hubFetch(
     // error detail"). A transient SQLITE_BUSY is classified non-fatal and just
     // surfaces a 503 the next request clears — it never kills the hub.
     try {
+      // H1 — WebSocket upgrade bridge. Runs before normal dispatch: an
+      // `Upgrade: websocket` request targeting a declared service mount is
+      // gated (publicExposure cloak + audience gate) and, if it passes,
+      // upgraded into the Bun-native bridge (src/ws-bridge.ts) instead of
+      // the fetch-based proxy (which cannot forward upgrades). Upgrade
+      // requests that match no service mount fall through to normal dispatch
+      // unchanged — no hub-owned route speaks WebSocket.
+      if (isWebSocketUpgrade(req)) {
+        const verdict = await maybeUpgradeWebSocket(req, server, {
+          manifestPath,
+          peerAddr,
+          readModuleManifestFn: deps?.readModuleManifest ?? defaultReadModuleManifest,
+          // H3 — the audience gate runs BEFORE the upgrade, same posture as
+          // the HTTP dispatch below: a WS endpoint under a hub-users surface
+          // never hands a socket to an anonymous caller. (The publicExposure
+          // cloak already ran inside maybeUpgradeWebSocket before this hook.)
+          gateAudience: async (wsPathname) => {
+            const wsUiMatch = resolveUiMount(
+              readManifestLenient(manifestPath).services,
+              wsPathname,
+            );
+            if (!wsUiMatch) return null;
+            return gateUiAudience(req, wsUiMatch.audience, wsUiMatch.ui, {
+              db: getDb?.(),
+              knownIssuers: () => oauthDeps(req).hubBoundOrigins(),
+            });
+          },
+        });
+        if (verdict.kind === "upgraded") {
+          // Bun's contract after a successful `server.upgrade()` is to
+          // return undefined from fetch — the socket now belongs to the
+          // websocket handlers. The public signature stays Response-typed
+          // for the many direct (non-WS) call sites; this cast is the one
+          // deliberate exception, observed only by Bun's runtime.
+          return undefined as unknown as Response;
+        }
+        if (verdict.kind === "response") return verdict.response;
+        // kind === "pass" — fall through to normal dispatch.
+      }
       return await dispatch();
     } catch (err) {
       const klass = classifyDbError(err);
@@ -2242,6 +2557,7 @@ export function hubFetch(
           connectionsStorePath: deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
           channelOrigin,
           resolveVaultOrigin,
+          resolveModuleOrigin: makeResolveModuleOrigin(manifestPath),
           // Daemon eviction — the same in-process supervisor the lifecycle
           // verbs drive (module-ops API); restarting vault evicts the open
           // store handle + re-runs selfRegister (services.json path rebuild).
@@ -2339,6 +2655,7 @@ export function hubFetch(
           hubOrigin: oauthDeps(req).issuer,
           modules,
           resolveVaultOrigin,
+          resolveModuleOrigin: makeResolveModuleOrigin(manifestPath),
           channelOrigin,
           storePath: deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
         };
@@ -3018,8 +3335,45 @@ export function hubFetch(
       // here only after every hub-owned prefix above has had its turn — so
       // `/`, `/admin/*`, `/oauth/*`, `/.well-known/*`, `/hub/*`, `/vault/*`,
       // `/api/*` are excluded by ordering, not by an explicit denylist (#182).
+      //
+      // H3 — per-UI audience gate. When the path falls under a declared UI
+      // sub-unit (a `uis{}` entry on the matched service row — surface-hosted
+      // UI mounts like /surface/<name>/*), the sub-unit's audience is
+      // enforced BEFORE forwarding: 'public' passes, 'hub-users' requires a
+      // session or a scope-satisfying Bearer, 'operator' requires the first
+      // admin. Module API paths outside any uis entry are NOT gated here —
+      // modules keep their own auth. Ordering nuance: when the row's
+      // publicExposure cloak would fire (loopback-only, non-loopback layer),
+      // the gate is SKIPPED so the 404 cloak stays indistinguishable from
+      // not-installed (a 401 here would leak the route's existence).
+      const uiMatch = resolveUiMount(readManifestLenient(manifestPath).services, pathname);
+      if (uiMatch) {
+        const cloaked =
+          effectivePublicExposure(uiMatch.entry) === "loopback" &&
+          layerOf(req, peerAddr) !== "loopback";
+        if (!cloaked) {
+          const denied = await gateUiAudience(req, uiMatch.audience, uiMatch.ui, {
+            db: getDb?.(),
+            knownIssuers: () => oauthDeps(req).hubBoundOrigins(),
+          });
+          if (denied) return denied;
+        }
+      }
       const proxied = await proxyToService(req, manifestPath, deps?.supervisor, peerAddr);
-      if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
+      if (proxied) {
+        // H5 — chrome-strip rides the gate: where the audience resolved
+        // `public`, the identity chrome is disabled for that mount (public
+        // readers aren't hub users). Reuses the per-path opt-out mechanism
+        // the /surface/notes/ precedent established, generalized to the
+        // declared audience.
+        return decorateWithChrome(
+          proxied,
+          req,
+          pathname,
+          getDb,
+          uiMatch !== undefined && uiMatch.audience === "public" ? [uiMatch.mount] : undefined,
+        );
+      }
 
       // Branded fall-through 404 (closes hub#392) — the operator who mistyped
       // a URL sees a clear "not found" page with a path back home, not the
@@ -3047,6 +3401,13 @@ export function hubFetch(
  * wrapper threads in the session-aware chrome HTML and a `set-cookie`
  * append when a fresh CSRF cookie was minted.
  *
+ * `extraOptOutPrefixes` (H5) generalizes the static opt-out list: the
+ * dispatch passes the matched UI mount when the audience gate resolved
+ * `public` — public readers aren't hub users, so the identity chrome
+ * ("Signed in as…", Sign in link) must not ride their pages. Same
+ * mechanism as the hardcoded `/surface/notes/` precedent, now driven by
+ * the sub-unit's declared audience instead of a hub-side path list.
+ *
  * When `getDb` isn't wired (hubFetch instantiated without state — tests,
  * cold-start hub minus DB), we still inject — the signed-out variant.
  */
@@ -3055,6 +3416,7 @@ async function decorateWithChrome(
   req: Request,
   pathname: string,
   getDb: HubFetchDeps["getDb"],
+  extraOptOutPrefixes?: readonly string[],
 ): Promise<Response> {
   // Build chrome HTML lazily — `buildChromeForRequest` already opens the DB
   // for the session lookup; calling it on a response that won't be rewritten
@@ -3075,6 +3437,9 @@ async function decorateWithChrome(
   const out = await injectChromeIntoResponse(res, {
     chromeHtml,
     pathname,
+    ...(extraOptOutPrefixes !== undefined && extraOptOutPrefixes.length > 0
+      ? { optOutPrefixes: [...CHROME_OPT_OUT_PREFIXES, ...extraOptOutPrefixes] }
+      : {}),
   });
   // Append set-cookie if a CSRF was minted AND the chrome was actually
   // injected (we know that by checking out !== res — pass-through preserves
@@ -3152,6 +3517,9 @@ if (import.meta.main) {
       issuer,
       loopbackPort: port,
     }),
+    // H1 — the WebSocket upgrade bridge's frame-piping handlers. Connections
+    // land here only after `maybeUpgradeWebSocket` gated + upgraded them.
+    websocket: createWsBridgeHandlers(),
   });
   // Register PID + port from the running hub itself so any startup path
   // (spawn-via-`ensureHubRunning` or a direct `bun src/hub-server.ts` from

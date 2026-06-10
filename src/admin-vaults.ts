@@ -541,6 +541,12 @@ export interface DeleteVaultDeps {
   channelOrigin: string | null;
   /** Resolve a vault's loopback origin from services.json (trigger teardown). */
   resolveVaultOrigin: (vaultName: string) => string | null;
+  /**
+   * Resolve a module's loopback origin by short name (H4 — best-effort
+   * credential-removal notification during connection teardown). Optional:
+   * absent → the notification step records a warning, revocation still runs.
+   */
+  resolveModuleOrigin?: (short: string) => string | null;
   /** Test seam: run `parachute-vault remove` — same Runner seam as create. */
   runCommand?: CreateVaultDeps["runCommand"];
   /**
@@ -755,6 +761,9 @@ export async function handleDeleteVault(
     hubOrigin: deps.issuer,
     modules: [], // teardown never consults the catalog
     resolveVaultOrigin: deps.resolveVaultOrigin,
+    ...(deps.resolveModuleOrigin !== undefined
+      ? { resolveModuleOrigin: deps.resolveModuleOrigin }
+      : {}),
     channelOrigin: deps.channelOrigin,
     storePath: deps.connectionsStorePath,
     ...(deps.fetchImpl !== undefined ? { fetchImpl: deps.fetchImpl } : {}),

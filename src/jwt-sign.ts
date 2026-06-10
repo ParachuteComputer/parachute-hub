@@ -141,12 +141,18 @@ export interface SignRefreshTokenOpts {
  * when provisioning a connection (the webhook bearer + the channel reply
  * token). Registered so connection teardown can revoke them
  * (hub-module-boundary charter, registered-mint rule).
+ *
+ * `connection_credential` — standing tag-scoped vault credentials minted by
+ * a `kind: "credential"` connection (H4, surface-runtime design). Registered
+ * for the same reason; renewal revokes the prior jti and registers the new
+ * one, so exactly one live row exists per credential connection.
  */
 export type TokenCreatedVia =
   | "oauth_refresh"
   | "cli_mint"
   | "operator_mint"
-  | "connection_provision";
+  | "connection_provision"
+  | "connection_credential";
 
 export interface SignedRefreshToken {
   /** Opaque token to return to the client. NOT recoverable from the DB. */

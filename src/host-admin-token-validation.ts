@@ -40,11 +40,15 @@
  * OAuth / access-token validation (vault / MCP tokens, `aud: "vault.<name>"`)
  * stays STRICT per-request-issuer and lives on entirely separate code paths
  * (the resource servers' own validators, hub's `/api/auth/*`, etc.). This
- * helper is invoked ONLY from the two loopback host-admin module surfaces
+ * helper is invoked from the two loopback host-admin module surfaces
  * (`/api/modules` GET — the `status` read; `/api/modules/:short/*` POST — the
  * lifecycle ops), both of which already gate on the non-requestable
  * `parachute:host:admin` / `parachute:host:auth` scopes that no OAuth token
- * can carry. The relaxation cannot reach an OAuth token's validation.
+ * can carry, and from the per-UI audience gate's Bearer branch
+ * (`src/audience-gate.ts`, H3) — same self-issued-token shape, same
+ * iss-∈-bound-origins need (a PWA's token carries the public origin while
+ * the proxied request resolves the loopback issuer), with the surface's
+ * declared `scopes_required` enforced by the gate on top.
  */
 import type { Database } from "bun:sqlite";
 import { type ValidatedAccessToken, validateAccessToken } from "./jwt-sign.ts";
