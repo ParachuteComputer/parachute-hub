@@ -38,7 +38,7 @@
  * defense is cheap and protects future refactors).
  */
 
-import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
+import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken } from "./csrf.ts";
 
 /**

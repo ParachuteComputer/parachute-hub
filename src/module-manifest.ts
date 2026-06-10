@@ -132,6 +132,45 @@ export interface ModuleAction {
 }
 
 /**
+ * A standing CREDENTIAL a module declares it can hold (H4, surface-runtime
+ * design / credential connections). Where an action's `scope` is a scope in
+ * the module's OWN namespace (minted for callbacks INTO the module), a
+ * credential declaration asks the hub to mint the module a standing
+ * tag-scoped token on a VAULT — operator-approved via
+ * `POST /admin/connections` with `kind: "credential"`.
+ *
+ * The `scope` field is a TEMPLATE, not a literal: `vault:{vault}:read` or
+ * `vault:{vault}:write` — the `{vault}` placeholder is filled by the
+ * operator's approval (which vault, which tags). Validation enforces the
+ * privilege-escalation guard at declaration time: ONLY the `vault` namespace,
+ * ONLY `read`/`write` verbs — never `admin`, never another module's
+ * namespace. (The POST handler re-checks the same rule, so a manifest read
+ * through a non-validating path can't smuggle a broader template.)
+ */
+export interface ModuleCredential {
+  /** Credential identifier within the module, e.g. `vault`. */
+  readonly key: string;
+  /** Operator-facing label. */
+  readonly title: string;
+  readonly description?: string;
+  /**
+   * Scope template: `vault:{vault}:read` | `vault:{vault}:write`. The
+   * operator approval fills `{vault}` and supplies the tag scope.
+   */
+  readonly scope: string;
+  /**
+   * Daemon-root-relative HTTP endpoint (leading `/`) the hub POSTs the
+   * minted credential to over loopback (like the engine's channel-config
+   * delivery), authenticated with a short-lived `<module>:admin` bearer.
+   * Also receives the best-effort removal payload on teardown.
+   */
+  readonly endpoint: string;
+}
+
+/** The validated shape of a credential scope template. */
+export const CREDENTIAL_SCOPE_TEMPLATE_RE = /^vault:\{vault\}:(read|write)$/;
+
+/**
  * One declared parameter of a {@link ConnectionTemplate} — the operator-chosen
  * blank in the template (e.g. WHICH vault, the channel name).
  */
@@ -308,6 +347,8 @@ export interface ModuleManifest {
   readonly actions?: readonly ModuleAction[];
   /** Connection presets this module declares — see {@link ConnectionTemplate}. */
   readonly connectionTemplates?: readonly ConnectionTemplate[];
+  /** Standing vault credentials this module can hold — see {@link ModuleCredential} (H4). */
+  readonly credentials?: readonly ModuleCredential[];
 }
 
 export class ModuleManifestError extends Error {
@@ -572,6 +613,7 @@ export function validateModuleManifest(
   const events = asEvents(m.events, where);
   const actions = asActions(m.actions, where, name);
   const connectionTemplates = asConnectionTemplates(m.connectionTemplates, where);
+  const credentials = asCredentials(m.credentials, where);
   let stripPrefix: boolean | undefined;
   if (m.stripPrefix !== undefined) {
     if (typeof m.stripPrefix !== "boolean") {
@@ -621,7 +663,52 @@ export function validateModuleManifest(
     (out as { connectionTemplates?: readonly ConnectionTemplate[] }).connectionTemplates =
       connectionTemplates;
   }
+  if (credentials !== undefined) {
+    (out as { credentials?: readonly ModuleCredential[] }).credentials = credentials;
+  }
   return out;
+}
+
+/**
+ * Validate the optional `credentials` declaration (H4). The scope template
+ * is the privilege-escalation guard's declaration-time half: ONLY
+ * `vault:{vault}:read` / `vault:{vault}:write` — a module can never declare
+ * its way to `admin`, to a literal vault name (the operator picks the vault
+ * at approval), or to another module's namespace. The POST handler re-checks
+ * the same rule (defense in depth for manifests read through paths that skip
+ * this validator).
+ */
+function asCredentials(v: unknown, where: string): readonly ModuleCredential[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) {
+    throw new ModuleManifestError(`${where}: "credentials" must be an array if present`);
+  }
+  return v.map((raw, i) => {
+    const at = `credentials[${i}]`;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ModuleManifestError(`${where}: "${at}" must be an object`);
+    }
+    const c = raw as Record<string, unknown>;
+    const scope = asString(c.scope, where, `${at}.scope`);
+    if (!CREDENTIAL_SCOPE_TEMPLATE_RE.test(scope)) {
+      throw new ModuleManifestError(
+        `${where}: "${at}.scope" "${scope}" must be "vault:{vault}:read" or "vault:{vault}:write" — credential connections never grant admin or another namespace`,
+      );
+    }
+    const endpoint = asString(c.endpoint, where, `${at}.endpoint`);
+    if (!endpoint.startsWith("/")) {
+      throw new ModuleManifestError(`${where}: "${at}.endpoint" must start with "/"`);
+    }
+    const out: ModuleCredential = {
+      key: asString(c.key, where, `${at}.key`),
+      title: asString(c.title, where, `${at}.title`),
+      scope,
+      endpoint,
+    };
+    const description = asOptionalString(c.description, where, `${at}.description`);
+    if (description !== undefined) (out as { description?: string }).description = description;
+    return out;
+  });
 }
 
 const MODULE_FOCUS_VALUES = new Set<ModuleFocus>(["core", "experimental"]);

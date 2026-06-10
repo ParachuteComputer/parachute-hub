@@ -45,12 +45,26 @@ export interface ConnectionSink {
 
 /** What the provisioning engine actually wired, for teardown + display. */
 export interface ConnectionProvisioned {
-  /** How the action was provisioned, e.g. `vault-trigger`. */
+  /** How the action was provisioned, e.g. `vault-trigger` or `credential`. */
   readonly type: string;
-  /** The vault instance the trigger was registered on (vault-trigger). */
+  /** The vault instance the trigger was registered on (vault-trigger), or
+   *  the vault a credential connection grants access to (credential). Either
+   *  way it's the field the vault-delete cascade matches on. */
   readonly vault?: string;
   /** The exact vault trigger name registered — DELETE removes this. */
   readonly triggerName?: string;
+  /** Credential connections (H4): the exact scope minted, e.g.
+   *  `vault:default:read` — renewal re-mints THIS, never request input. */
+  readonly scope?: string;
+  /** Credential connections (H4): the tag allowlist baked into the minted
+   *  token's `permissions.scoped_tags`. Empty/absent = vault-wide (read
+   *  scopes only — writes always carry tags). */
+  readonly scopedTags?: readonly string[];
+  /** Credential connections (H4): the declared credential key. */
+  readonly credentialKey?: string;
+  /** Credential connections (H4): the module's daemon-root-relative delivery
+   *  endpoint — also the best-effort removal-notification target. */
+  readonly endpoint?: string;
   /**
    * jtis of the LONG-LIVED tokens minted for this connection (the webhook
    * bearer, and for a channel sink the vault-write reply token). Each is
@@ -66,6 +80,13 @@ export interface ConnectionProvisioned {
 
 export interface ConnectionRecord {
   readonly id: string;
+  /**
+   * Connection kind discriminator (H4). Absent = the original event→action
+   * shape; `"credential"` = a standing tag-scoped vault credential held by a
+   * module (the source is the granting vault, the sink is the holding
+   * module). Optional for back-compat: pre-H4 records read back undefined.
+   */
+  readonly kind?: "credential";
   readonly source: ConnectionSource;
   readonly sink: ConnectionSink;
   readonly provisioned: ConnectionProvisioned;

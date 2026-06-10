@@ -480,6 +480,23 @@ async function collectInstalledModules(
 }
 
 /**
+ * Resolve a module's loopback origin by SHORT name from services.json — the
+ * H4 credential-delivery seam (the Connections engine POSTs minted
+ * credentials + removal payloads direct to the daemon, not through the hub
+ * proxy). Short derivation mirrors `collectInstalledModules`:
+ * `shortNameForManifest(name) ?? name`, so third-party modules (whose row
+ * name IS their short) resolve too. Read per-request — a module installed
+ * seconds ago is deliverable without a hub restart.
+ */
+function makeResolveModuleOrigin(manifestPath: string): (short: string) => string | null {
+  return (short) => {
+    const services = readManifestLenient(manifestPath).services;
+    const entry = services.find((s) => (shortNameForManifest(s.name) ?? s.name) === short);
+    return entry ? `http://127.0.0.1:${entry.port}` : null;
+  };
+}
+
+/**
  * The trust layer a request arrived through. Hub binds `127.0.0.1:1939`, so
  * every request reaches it via one of three trusted forwarders (or directly
  * over loopback). The forwarder injects characteristic headers that we use to
@@ -2520,6 +2537,7 @@ export function hubFetch(
           connectionsStorePath: deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
           channelOrigin,
           resolveVaultOrigin,
+          resolveModuleOrigin: makeResolveModuleOrigin(manifestPath),
           // Daemon eviction — the same in-process supervisor the lifecycle
           // verbs drive (module-ops API); restarting vault evicts the open
           // store handle + re-runs selfRegister (services.json path rebuild).
@@ -2617,6 +2635,7 @@ export function hubFetch(
           hubOrigin: oauthDeps(req).issuer,
           modules,
           resolveVaultOrigin,
+          resolveModuleOrigin: makeResolveModuleOrigin(manifestPath),
           channelOrigin,
           storePath: deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
         };

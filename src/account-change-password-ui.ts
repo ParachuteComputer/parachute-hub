@@ -22,7 +22,7 @@
  * client-side validation is a fast-feedback layer on top of the server-
  * side `validatePassword` + match-confirm + current-≠-new checks.
  */
-import { brandMarkSvg, WORDMARK_TEXT } from "./brand.ts";
+import { WORDMARK_TEXT, brandMarkSvg } from "./brand.ts";
 import { renderCsrfHiddenInput } from "./csrf.ts";
 import { escapeHtml } from "./oauth-ui.ts";
 import { PASSWORD_MIN_LEN } from "./users.ts";

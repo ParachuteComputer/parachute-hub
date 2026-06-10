@@ -356,9 +356,9 @@ describe("hub-settings — module install channel bootstrap", () => {
       // First read with env=rc — env wins, returns "rc". DB stays empty
       // (no auto-write to DB when env is set, per the design that
       // preserves the SPA's last-write as the env-unset fallback).
-      expect(
-        getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } }),
-      ).toBe("rc");
+      expect(getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } })).toBe(
+        "rc",
+      );
       // Second read with env=latest — env wins again (would have returned
       // "rc" under the old DB-after-first-seed behavior).
       expect(
@@ -379,9 +379,9 @@ describe("hub-settings — module install channel bootstrap", () => {
     const db = openHubDb(hubDbPath(dir));
     try {
       // PARACHUTE_INSTALL_CHANNEL — canonical name (matches install.ts).
-      expect(
-        getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } }),
-      ).toBe("rc");
+      expect(getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } })).toBe(
+        "rc",
+      );
       // PARACHUTE_MODULE_CHANNEL — legacy alias, still recognized.
       const db2 = openHubDb(join(mkdtempSync(join(tmpdir(), "phub-hsalt-")), "hub.db"));
       try {
