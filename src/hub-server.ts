@@ -565,6 +565,77 @@ function isLoopbackPeer(peerAddr: string | null | undefined): boolean {
 }
 
 /**
+ * The two substrate trust headers the hub stamps on every forwarded request
+ * (H2, surface-runtime-primitives design §10):
+ *
+ *   X-Parachute-Layer     — the `layerOf` classification ("loopback" |
+ *                           "tailnet" | "public"), fail-closed to "public"
+ *                           when the peer address is unknown.
+ *   X-Parachute-Client-IP — the resolved client IP (CF-Connecting-IP →
+ *                           X-Forwarded-For first hop → peer address; same
+ *                           precedence as rate-limit.ts `clientIpFromRequest`,
+ *                           with the peer address as the direct-caller floor).
+ *
+ * Backends (surface-host's `ctx.layer` / `ctx.clientIp`, any module reading
+ * trust signals) consume THESE, never raw forwarder headers — the hub is the
+ * only component that can see the actual peer socket, so it's the only place
+ * the classification can be made fail-closed.
+ */
+export const PARACHUTE_LAYER_HEADER = "x-parachute-layer";
+export const PARACHUTE_CLIENT_IP_HEADER = "x-parachute-client-ip";
+
+/**
+ * Resolve the client IP for the X-Parachute-Client-IP stamp. Precedence:
+ *
+ *   1. `CF-Connecting-IP` — cloudflared stamps the actual client IP on every
+ *      forwarded request (authoritative on cloudflare-fronted hubs).
+ *   2. `X-Forwarded-For` first hop — tailscale serve/funnel and generic
+ *      reverse proxies set it; the leftmost entry is the original client.
+ *   3. The peer address itself — the direct caller (loopback CLI, or a
+ *      direct network peer on a 0.0.0.0 bind).
+ *
+ * Returns null when nothing resolves (no forwarder headers AND no peer
+ * address — e.g. a unit test calling the fetch fn without a Server). The
+ * caller omits the header in that case; backends treat absence as null.
+ *
+ * Known limitation (same as the rate-limiter's keying): a DIRECT caller can
+ * spoof the forwarded-IP headers and misattribute its own address. It cannot
+ * spoof the LAYER (layerOf classifies direct non-loopback peers as "public"
+ * regardless of injected headers), so the trust signal stays sound — only
+ * the attribution string is best-effort for direct callers.
+ */
+export function resolveClientIp(req: Request, peerAddr: string | null): string | null {
+  const cf = req.headers.get("cf-connecting-ip")?.trim();
+  if (cf) return cf;
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) {
+    const first = xff.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  const peer = peerAddr?.trim();
+  return peer ? peer : null;
+}
+
+/**
+ * Strip any inbound occurrences of the substrate trust headers, then stamp
+ * the hub's own classification. The strip is load-bearing: a public client
+ * sending `X-Parachute-Layer: loopback` (or a forged client IP) must never
+ * ride that injection past the proxy into a module that keys trust off it.
+ * Mutates `headers` in place (the proxy's outgoing header bag).
+ */
+export function stampSubstrateTrustHeaders(
+  headers: Headers,
+  req: Request,
+  peerAddr: string | null,
+): void {
+  headers.delete(PARACHUTE_LAYER_HEADER);
+  headers.delete(PARACHUTE_CLIENT_IP_HEADER);
+  headers.set(PARACHUTE_LAYER_HEADER, layerOf(req, peerAddr));
+  const clientIp = resolveClientIp(req, peerAddr);
+  if (clientIp) headers.set(PARACHUTE_CLIENT_IP_HEADER, clientIp);
+}
+
+/**
  * Forward a request to a loopback service on `127.0.0.1:<port>`. By default
  * the incoming pathname + query are preserved verbatim; pass `targetPath` to
  * rewrite the path (e.g. when the caller has stripped a mount prefix because
@@ -595,6 +666,10 @@ function isLoopbackPeer(peerAddr: string | null | undefined): boolean {
  * `short` is the canonical short (`vault`/`scribe`/`notes`) — used as
  * the supervisor map key + pidfile directory key for classification.
  *
+ * `peerAddr` is the resolved peer address (`server.requestIP`), threaded so
+ * the substrate trust headers (below) classify the layer the same way the
+ * `publicExposure` cloak does — fail-closed to `public` when unknown.
+ *
  * Hop-by-hop notes: WebSocket upgrades and HTTP/2 trailers don't traverse
  * fetch-based proxies cleanly. No on-box service uses either today; if one
  * eventually needs them, switch to a Node http.IncomingMessage / http.request
@@ -606,6 +681,7 @@ async function proxyRequest(
   serviceLabel: string,
   short: string,
   supervisor: Supervisor | undefined,
+  peerAddr: string | null,
   targetPath?: string,
 ): Promise<Response> {
   const url = new URL(req.url);
@@ -651,6 +727,11 @@ async function proxyRequest(
   if (!headers.has("x-forwarded-proto")) {
     headers.set("x-forwarded-proto", isHttpsRequest(req) ? "https" : "http");
   }
+  // Substrate trust headers (H2, surface-runtime design §10): stamped on
+  // EVERY forwarded request so module backends read trust signals from the
+  // substrate instead of re-deriving them from raw forwarder headers (the
+  // "header-absence = local trust" anti-pattern the design rejects).
+  stampSubstrateTrustHeaders(headers, req, peerAddr);
 
   const init: RequestInit & { duplex?: "half" } = {
     method: req.method,
@@ -761,7 +842,7 @@ async function proxyToVault(
   // vault instances share the same supervisor key under hub's current
   // single-vault-per-hub model; if multi-vault-per-hub ever ships, the
   // classifier will need a per-instance key.
-  return proxyRequest(req, match.port, "vault", "vault", supervisor, targetPath);
+  return proxyRequest(req, match.port, "vault", "vault", supervisor, peerAddr, targetPath);
 }
 
 /**
@@ -805,7 +886,7 @@ async function proxyToVaultAdmin(
   if (effectivePublicExposure(entry) === "loopback" && layerOf(req, peerAddr) !== "loopback") {
     return new Response("not found", { status: 404 });
   }
-  return proxyRequest(req, entry.port, "vault", "vault", supervisor);
+  return proxyRequest(req, entry.port, "vault", "vault", supervisor, peerAddr);
 }
 
 /**
@@ -911,7 +992,7 @@ async function proxyToService(
   // will land in "persistent" by default which is the safer choice for
   // unknown lifecycle).
   const short = shortNameForManifest(match.entry.name) ?? match.entry.name;
-  return proxyRequest(req, match.port, match.entry.name, short, supervisor, targetPath);
+  return proxyRequest(req, match.port, match.entry.name, short, supervisor, peerAddr, targetPath);
 }
 
 /**
