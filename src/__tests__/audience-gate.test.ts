@@ -503,3 +503,93 @@ describe("resolveUiMount", () => {
     }
   });
 });
+
+// ===========================================================================
+// H5 — chrome-strip rides the gate
+// ===========================================================================
+
+describe("chrome strip × audience (H5)", () => {
+  function startHtmlUpstream(): { port: number; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () =>
+        new Response("<html><head></head><body><h1>surface page</h1></body></html>", {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+    });
+    return { port: server.port as number, stop: () => server.stop(true) };
+  }
+
+  test("audience: public → NO injected chrome on the HTML response", async () => {
+    const upstream = startHtmlUpstream();
+    try {
+      writeServices(surfaceEntry(upstream.port, { audience: "public" }));
+      const res = await fetcher()(
+        req("/surface/notes/", { headers: { accept: "text/html" } }),
+        fakeServer("127.0.0.1"),
+      );
+      expect(res?.status).toBe(200);
+      const html = await res?.text();
+      expect(html).toContain("surface page"); // upstream body intact
+      expect(html).not.toContain("pc-chrome"); // identity chrome absent
+    } finally {
+      upstream.stop();
+    }
+  });
+
+  test("audience: hub-users (session) → chrome injected as before", async () => {
+    const upstream = startHtmlUpstream();
+    try {
+      // Mount OUTSIDE the static /surface/notes/ opt-out so the audience
+      // mechanism (not the legacy hardcoded prefix) is what's exercised.
+      writeServices({
+        name: "parachute-surface",
+        port: upstream.port,
+        paths: ["/surface"],
+        health: "/surface/healthz",
+        version: "0.3.0",
+        uis: {
+          tasks: { displayName: "Tasks", path: "/surface/tasks", audience: "hub-users" },
+        },
+      });
+      const cookie = await adminSession();
+      const res = await fetcher()(
+        req("/surface/tasks/", { headers: { accept: "text/html", cookie } }),
+        fakeServer("127.0.0.1"),
+      );
+      expect(res?.status).toBe(200);
+      const html = await res?.text();
+      expect(html).toContain("pc-chrome"); // identity chrome present
+      expect(html).toContain("surface page");
+    } finally {
+      upstream.stop();
+    }
+  });
+
+  test("a PUBLIC mount outside the static opt-out list also strips chrome (the generalization)", async () => {
+    const upstream = startHtmlUpstream();
+    try {
+      writeServices({
+        name: "parachute-surface",
+        port: upstream.port,
+        paths: ["/surface"],
+        health: "/surface/healthz",
+        version: "0.3.0",
+        uis: {
+          blog: { displayName: "Blog", path: "/surface/blog", audience: "public" },
+        },
+      });
+      const res = await fetcher()(
+        req("/surface/blog/post-1", { headers: { accept: "text/html" } }),
+        fakeServer("127.0.0.1"),
+      );
+      expect(res?.status).toBe(200);
+      const html = await res?.text();
+      expect(html).not.toContain("pc-chrome");
+    } finally {
+      upstream.stop();
+    }
+  });
+});

@@ -205,7 +205,11 @@ import {
   handleUpdateUserVaults,
 } from "./api-users.ts";
 import { gateUiAudience, resolveUiMount } from "./audience-gate.ts";
-import { buildChromeForRequest, injectChromeIntoResponse } from "./chrome-strip.ts";
+import {
+  CHROME_OPT_OUT_PREFIXES,
+  buildChromeForRequest,
+  injectChromeIntoResponse,
+} from "./chrome-strip.ts";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
 import { applyCorsHeaders, corsPreflightResponse, isCorsAllowedRoute } from "./cors.ts";
 import { ensureCsrfToken } from "./csrf.ts";
@@ -3356,7 +3360,20 @@ export function hubFetch(
         }
       }
       const proxied = await proxyToService(req, manifestPath, deps?.supervisor, peerAddr);
-      if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
+      if (proxied) {
+        // H5 — chrome-strip rides the gate: where the audience resolved
+        // `public`, the identity chrome is disabled for that mount (public
+        // readers aren't hub users). Reuses the per-path opt-out mechanism
+        // the /surface/notes/ precedent established, generalized to the
+        // declared audience.
+        return decorateWithChrome(
+          proxied,
+          req,
+          pathname,
+          getDb,
+          uiMatch !== undefined && uiMatch.audience === "public" ? [uiMatch.mount] : undefined,
+        );
+      }
 
       // Branded fall-through 404 (closes hub#392) — the operator who mistyped
       // a URL sees a clear "not found" page with a path back home, not the
@@ -3384,6 +3401,13 @@ export function hubFetch(
  * wrapper threads in the session-aware chrome HTML and a `set-cookie`
  * append when a fresh CSRF cookie was minted.
  *
+ * `extraOptOutPrefixes` (H5) generalizes the static opt-out list: the
+ * dispatch passes the matched UI mount when the audience gate resolved
+ * `public` — public readers aren't hub users, so the identity chrome
+ * ("Signed in as…", Sign in link) must not ride their pages. Same
+ * mechanism as the hardcoded `/surface/notes/` precedent, now driven by
+ * the sub-unit's declared audience instead of a hub-side path list.
+ *
  * When `getDb` isn't wired (hubFetch instantiated without state — tests,
  * cold-start hub minus DB), we still inject — the signed-out variant.
  */
@@ -3392,6 +3416,7 @@ async function decorateWithChrome(
   req: Request,
   pathname: string,
   getDb: HubFetchDeps["getDb"],
+  extraOptOutPrefixes?: readonly string[],
 ): Promise<Response> {
   // Build chrome HTML lazily — `buildChromeForRequest` already opens the DB
   // for the session lookup; calling it on a response that won't be rewritten
@@ -3412,6 +3437,9 @@ async function decorateWithChrome(
   const out = await injectChromeIntoResponse(res, {
     chromeHtml,
     pathname,
+    ...(extraOptOutPrefixes !== undefined && extraOptOutPrefixes.length > 0
+      ? { optOutPrefixes: [...CHROME_OPT_OUT_PREFIXES, ...extraOptOutPrefixes] }
+      : {}),
   });
   // Append set-cookie if a CSRF was minted AND the chrome was actually
   // injected (we know that by checking out !== res — pass-through preserves
