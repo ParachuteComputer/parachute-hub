@@ -1294,6 +1294,11 @@ async function claimCredentialConnection(
   // unrevocable by construction and not reconcilable here).
   const registryRow = findTokenRowByJti(deps.db, jti);
   if (!registryRow) return reject("jti is not in the token registry");
+  // NOTE: created_via is deliberately NOT filtered here. A claim grandfathers
+  // a token that already exists and is already registered — provenance
+  // (cli_mint, connection_credential, …) adds no authority either way, and
+  // a connection_credential jti with an active record is already refused by
+  // the existing-record check below.
 
   // Declaration half — the same checks create performs, so a claim can't
   // smuggle past anything the operator-initiated path would refuse.

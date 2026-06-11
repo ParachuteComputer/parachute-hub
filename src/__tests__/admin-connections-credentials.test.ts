@@ -1109,6 +1109,10 @@ describe("credential connection — claim/reconcile (surface#113)", () => {
     expect(records[0]!.status).toBe("pending");
     expect(records[0]!.provisioned.mintedJtis).toEqual([b.jti]);
     expect(records[0]!.provisioned.scopedTags).toEqual(["y"]);
+    // The displaced jti is orphaned (can no longer renew — the record names
+    // only b) but NOT revoked: a's holder keeps a valid token. Pinned so a
+    // future "cleanup" doesn't add revocation here and punish the holder.
+    expect(findTokenRowByJti(harness.db, a.jti)!.revokedAt).toBeNull();
   });
 
   test("no mutation without approval: a pending renewal attempt mints nothing, revokes nothing, rewrites nothing", async () => {
