@@ -21,11 +21,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { hasScope } from "../../packages/scope-guard/src/scope.ts";
 import { handleAccountSetupGet, handleAccountSetupPost } from "../account-setup.ts";
+import { handleAccountVaultTokenPost } from "../account-vault-token.ts";
 import type { RunResult } from "../admin-vaults.ts";
 import { CSRF_FIELD_NAME, buildCsrfCookie, generateCsrfToken } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { consumeInvite, findInviteByRawToken, issueInvite, revokeInvite } from "../invites.ts";
+import { validateAccessToken } from "../jwt-sign.ts";
 import { __resetForTests } from "../rate-limit.ts";
 import { findActiveSession } from "../sessions.ts";
 import { createUser, getUserByUsernameCI, userCount, vaultVerbsForUserVault } from "../users.ts";
@@ -783,9 +786,10 @@ describe("POST /account/setup/<token> — cross-tenant: existing-vault rejection
     expect(userCount(harness.db) - before).toBe(1);
   });
 
-  test("shared-vault invite that slipped through (provision_vault=false + pinned name) → rejected at redeem", async () => {
-    // Defense in depth: the admin API rejects creating this shape, but if one
-    // exists in the DB the redeem must still refuse to assign the existing vault.
+  test("shared-vault invite (provision_vault=false + pinned EXISTING name) → assigns at the invite's role, NO provisioning", async () => {
+    // The supported shared-vault shape: host:admin minted this invite, the
+    // same authority that can assign any user to any vault via POST
+    // /api/users — the invite just packages that assignment as a link.
     await createUser(harness.db, "owner", "owner-strong-password-1", {
       assignedVaults: ["legacy"],
       role: "write",
@@ -798,6 +802,46 @@ describe("POST /account/setup/<token> — cross-tenant: existing-vault rejection
       createdBy: admin.id,
       vaultName: "legacy",
       provisionVault: false,
+      role: "write",
+    });
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username: "guest",
+          password: "guest-strong-password-11",
+          password_confirm: "guest-strong-password-11",
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+    expect(res.status).toBe(302);
+    // NO provisioning shell-out — the vault already exists.
+    expect(stub.calls.length).toBe(0);
+    const user = getUserByUsernameCI(harness.db, "guest");
+    expect(user?.assignedVaults).toEqual(["legacy"]);
+    expect(vaultVerbsForUserVault(harness.db, user?.id ?? "", "legacy")).toEqual([
+      "read",
+      "write",
+      "admin",
+    ]);
+    expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).not.toBeNull();
+  });
+
+  test("shared-vault invite whose vault VANISHED from services.json → 400, invite unconsumed", async () => {
+    // The vault-delete cascade revokes pending invites, so this is the
+    // defense-in-depth path (manual manifest edits / restored DB).
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    const { rawToken } = issueInvite(harness.db, {
+      createdBy: admin.id,
+      vaultName: "ghost",
+      provisionVault: false,
+      role: "read",
     });
     const before = userCount(harness.db);
     const { token: csrfToken, cookieFragment } = csrfPair();
@@ -819,10 +863,192 @@ describe("POST /account/setup/<token> — cross-tenant: existing-vault rejection
     expect(res.status).toBe(400);
     expect(getUserByUsernameCI(harness.db, "wouldbe")).toBeNull();
     expect(userCount(harness.db) - before).toBe(0);
-    // No vault shell-out — rejected before provisioning.
     expect(stub.calls.length).toBe(0);
-    // Invite NOT consumed.
     expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).toBeNull();
+  });
+});
+
+describe("POST /account/setup/<token> — the Adam/Jonathan read-only shared-vault e2e", () => {
+  test("redeem read-role shared invite → read mints, write/admin/cross-vault REFUSED, vault-side scope check refuses writes", async () => {
+    // End-to-end pin of the read-role enforcement chain:
+    //   invite(role=read, existing vault) → redeem → user_vaults row role=read
+    //   → /account/vault-token mint caps to vaultVerbsForRole ('read' only)
+    //   → the minted JWT carries vault:<name>:read + the vault_scope pin
+    //   → scope-guard (what the vault runs per request) refuses write/admin.
+    await createUser(harness.db, "adam", "adams-strong-password-1", {
+      assignedVaults: ["jonathan-vault", "adams-vault"],
+      role: "write",
+    });
+    seedExistingVault("jonathan-vault");
+    seedExistingVault("adams-vault");
+    const admin = getUserByUsernameCI(harness.db, "adam");
+    const { rawToken } = issueInvite(harness.db, {
+      createdBy: admin?.id ?? "",
+      vaultName: "jonathan-vault",
+      username: "jonathan",
+      provisionVault: false,
+      role: "read",
+    });
+
+    // Redeem (the form's username field is absent — pre-named).
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          password: "jonathans-strong-pass-1",
+          password_confirm: "jonathans-strong-pass-1",
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+    expect(res.status).toBe(302);
+    const jonathan = getUserByUsernameCI(harness.db, "jonathan");
+    expect(jonathan).not.toBeNull();
+    // (1) The user_vaults row is read.
+    const row = harness.db
+      .query<{ role: string }, [string]>(
+        "SELECT role FROM user_vaults WHERE user_id = ? AND vault_name = 'jonathan-vault'",
+      )
+      .get(jonathan?.id ?? "");
+    expect(row?.role).toBe("read");
+    expect(vaultVerbsForUserVault(harness.db, jonathan?.id ?? "", "jonathan-vault")).toEqual([
+      "read",
+    ]);
+
+    // (2) Enforcement at the mint surface — drive the REAL /account mint
+    // handler with the session the redeem just created.
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    const sessionFragment = setCookie.split(";")[0] ?? "";
+    const { token: mintCsrf, cookieFragment: mintCsrfCookie } = csrfPair();
+    const cookie = `${sessionFragment}; ${mintCsrfCookie}`;
+    const mint = (vault: string, verb: string) =>
+      handleAccountVaultTokenPost(
+        new Request(`${ISSUER}/account/vault-token/${vault}`, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded", cookie },
+          body: new URLSearchParams({ [CSRF_FIELD_NAME]: mintCsrf, verb }).toString(),
+        }),
+        vault,
+        { db: harness.db, hubOrigin: ISSUER },
+      );
+    expect((await mint("jonathan-vault", "write")).status).toBe(403);
+    expect((await mint("jonathan-vault", "admin")).status).toBe(403);
+    // (3) Cannot touch the OTHER vault at all.
+    expect((await mint("adams-vault", "read")).status).toBe(403);
+
+    const readRes = await mint("jonathan-vault", "read");
+    expect(readRes.status).toBe(200);
+    const html = await readRes.text();
+    const m = html.match(/data-testid="minted-token-value">([^<]+)</);
+    expect(m).not.toBeNull();
+    const validated = await validateAccessToken(harness.db, m?.[1] ?? "", ISSUER);
+    const scopes = ((validated.payload as { scope?: string }).scope ?? "").split(/\s+/);
+    expect(scopes).toEqual(["vault:jonathan-vault:read"]);
+    expect((validated.payload as { vault_scope?: string[] }).vault_scope).toEqual([
+      "jonathan-vault",
+    ]);
+
+    // (4) The resource-server side: scope-guard (what the vault runs) refuses
+    // writes for this token and refuses the other vault entirely. Hub never
+    // imports scope-guard at runtime (issuer vs validator boundary); the test
+    // crosses it deliberately to pin the cross-system contract.
+    expect(hasScope(scopes, "vault:jonathan-vault:write")).toBe(false);
+    expect(hasScope(scopes, "vault:jonathan-vault:admin")).toBe(false);
+    expect(hasScope(scopes, "vault:jonathan-vault:read")).toBe(true);
+    expect(hasScope(scopes, "vault:adams-vault:read")).toBe(false);
+  });
+});
+
+describe("POST /account/setup/<token> — pre-named username (ENFORCED)", () => {
+  test("the invite's username wins — a different submitted username is ignored", async () => {
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    const { rawToken } = issueInvite(harness.db, {
+      createdBy: admin.id,
+      username: "jonathan",
+      vaultName: "maya",
+    });
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          // Submitted name must NOT be honored — the invite is a named deliverable.
+          username: "imposter",
+          password: "jonathans-strong-pass-1",
+          password_confirm: "jonathans-strong-pass-1",
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+    expect(res.status).toBe(302);
+    expect(getUserByUsernameCI(harness.db, "imposter")).toBeNull();
+    expect(getUserByUsernameCI(harness.db, "jonathan")).not.toBeNull();
+  });
+
+  test("pre-named username TAKEN at redeem time → 409 'ask your operator', invite stays re-usable", async () => {
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    const { rawToken } = issueInvite(harness.db, {
+      createdBy: admin.id,
+      username: "jonathan",
+      vaultName: "maya",
+    });
+    // Someone takes the name between mint and redeem.
+    await createUser(harness.db, "jonathan", "squatter-strong-pass-1", { allowMulti: true });
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          password: "jonathans-strong-pass-1",
+          password_confirm: "jonathans-strong-pass-1",
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+    expect(res.status).toBe(409);
+    const html = await res.text();
+    expect(html).toContain("Ask your hub operator");
+    // No vault provisioned, invite NOT consumed — operator can revoke + re-mint.
+    expect(stub.calls.length).toBe(0);
+    expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).toBeNull();
+  });
+
+  test("GET renders the pre-named username read-only (no editable username field)", async () => {
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    const { rawToken } = issueInvite(harness.db, {
+      createdBy: admin.id,
+      username: "jonathan",
+      vaultName: "shared",
+      provisionVault: false,
+      role: "read",
+    });
+    seedExistingVault("shared");
+    const res = handleAccountSetupGet(
+      new Request(`${ISSUER}/account/setup/${rawToken}`),
+      rawToken,
+      deps(),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("jonathan");
+    expect(html).toContain("Your hub operator chose this username for you.");
+    // No editable username input on a pre-named form.
+    expect(html).not.toContain('name="username"');
+    // Shared-vault invites surface the role.
+    expect(html).toContain("read-only");
   });
 });
 

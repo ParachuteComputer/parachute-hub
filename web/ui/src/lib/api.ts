@@ -1200,6 +1200,8 @@ export interface InviteListing {
   id: string;
   status: InviteStatus;
   vault_name: string | null;
+  /** Pre-named username the redeemer's account gets (enforced), or null. */
+  username: string | null;
   role: string;
   provision_vault: boolean;
   default_mirror: string | null;
@@ -1213,6 +1215,9 @@ export interface InviteListing {
 /** Body for `POST /api/invites`. Every field is optional (server defaults apply). */
 export interface CreateInviteInput {
   vault_name?: string | null;
+  /** Pre-name the redeemer's username (enforced at redemption). */
+  username?: string | null;
+  /** `'write'` (owner) | `'read'` (read-only; shared-vault invites only). */
   role?: string;
   provision_vault?: boolean;
   default_mirror?: "internal" | "off" | null;

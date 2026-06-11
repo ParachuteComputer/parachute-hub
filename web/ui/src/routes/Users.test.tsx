@@ -306,7 +306,9 @@ describe("Users — create form", () => {
     vi.mocked(api.listUserVaults).mockResolvedValue(["home", "work"]);
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
-    expect(await screen.findByLabelText(/username/i)).toBeInTheDocument();
+    expect(
+      await screen.findByLabelText(/username/i, { selector: "#new-user-username" }),
+    ).toBeInTheDocument();
     const select = screen.getByLabelText(/assigned vaults/i) as HTMLSelectElement;
     expect(select.multiple).toBe(true);
     const optionTexts = Array.from(select.options).map((o) => o.text);
@@ -328,7 +330,9 @@ describe("Users — create form", () => {
     );
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
-    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/username/i, { selector: "#new-user-username" }), {
+      target: { value: "alice" },
+    });
     fireEvent.change(screen.getByLabelText(/^password/i), {
       target: { value: "alice-strong-passphrase" },
     });
@@ -361,7 +365,9 @@ describe("Users — create form", () => {
     vi.mocked(api.listUserVaults).mockResolvedValue([]);
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
-    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/username/i, { selector: "#new-user-username" }), {
+      target: { value: "alice" },
+    });
     // 11 chars — under the floor.
     fireEvent.change(screen.getByLabelText(/^password/i), { target: { value: "tooshortpw1" } });
     // Submit via form submit handler (the input minLength HTML attribute
@@ -381,7 +387,9 @@ describe("Users — create form", () => {
     );
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
-    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/username/i, { selector: "#new-user-username" }), {
+      target: { value: "alice" },
+    });
     fireEvent.change(screen.getByLabelText(/^password/i), {
       target: { value: "alice-strong-passphrase" },
     });
@@ -519,7 +527,9 @@ describe("Users — sign-in handoff URL (onboarding discoverability)", () => {
     );
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
-    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/username/i, { selector: "#new-user-username" }), {
+      target: { value: "alice" },
+    });
     fireEvent.change(screen.getByLabelText(/^password/i), {
       target: { value: "alice-strong-passphrase" },
     });
@@ -578,7 +588,9 @@ describe("Users — sign-in handoff URL (onboarding discoverability)", () => {
     vi.mocked(api.createUser).mockResolvedValue(user("alice", { password_changed: false }));
     renderRoute();
     fireEvent.click(await screen.findByRole("button", { name: /create user/i }));
-    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/username/i, { selector: "#new-user-username" }), {
+      target: { value: "alice" },
+    });
     fireEvent.change(screen.getByLabelText(/^password/i), {
       target: { value: "alice-strong-passphrase" },
     });

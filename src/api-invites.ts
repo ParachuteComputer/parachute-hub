@@ -19,6 +19,7 @@
 import type { Database } from "bun:sqlite";
 import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
+import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import {
   DEFAULT_INVITE_TTL_SECONDS,
   type Invite,
@@ -28,8 +29,11 @@ import {
   issueInvite,
   listInvites,
   revokeInvite,
+  usernameReservedByPendingInvite,
 } from "./invites.ts";
+import { getUserByUsernameCI, validateUsername } from "./users.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
+import { listVaultNamesFromPath } from "./vault-names.ts";
 
 export interface ApiInvitesDeps {
   db: Database;
@@ -49,6 +53,7 @@ interface InviteWireShape {
   id: string;
   status: InviteStatus;
   vault_name: string | null;
+  username: string | null;
   role: string;
   provision_vault: boolean;
   default_mirror: string | null;
@@ -64,6 +69,7 @@ function toWire(invite: Invite, status: InviteStatus): InviteWireShape {
     id: invite.tokenHash,
     status,
     vault_name: invite.vaultName,
+    username: invite.username,
     role: invite.role,
     provision_vault: invite.provisionVault,
     default_mirror: invite.defaultMirror,
@@ -89,6 +95,7 @@ function redeemUrl(issuer: string, rawToken: string): string {
 
 interface CreateInviteBody {
   vaultName: string | null;
+  username: string | null;
   role: string;
   provisionVault: boolean;
   defaultMirror: string | null;
@@ -160,6 +167,37 @@ async function parseCreateBody(
       };
     }
     vaultName = rawVault;
+  }
+
+  // username — optional. null/omitted = redeemer picks their own. Validated
+  // with the SAME vocabulary as /api/users (charset + length + reserved).
+  let username: string | null = null;
+  const rawUsername =
+    Object.hasOwn(obj, "username") && obj.username !== undefined ? obj.username : undefined;
+  if (rawUsername !== undefined && rawUsername !== null) {
+    if (typeof rawUsername !== "string" || rawUsername.length === 0) {
+      return {
+        ok: false,
+        status: 400,
+        error: "invalid_request",
+        description: '"username" must be a non-empty string or null',
+      };
+    }
+    const u = validateUsername(rawUsername);
+    if (!u.valid) {
+      return {
+        ok: false,
+        status: 400,
+        error: "invalid_username",
+        description:
+          u.reason === "length"
+            ? "username must be 2-32 characters long"
+            : u.reason === "reserved"
+              ? "username is reserved (admin, root, system, setup, parachute, hub)"
+              : "username must contain only lowercase letters, digits, hyphens, and underscores ([a-z0-9_-])",
+      };
+    }
+    username = u.name;
   }
 
   // role — default 'write' (owner).
@@ -245,7 +283,10 @@ async function parseCreateBody(
     expiresInSeconds = Math.floor(rawExpiry);
   }
 
-  return { ok: true, body: { vaultName, role, provisionVault, defaultMirror, expiresInSeconds } };
+  return {
+    ok: true,
+    body: { vaultName, username, role, provisionVault, defaultMirror, expiresInSeconds },
+  };
 }
 
 /** POST /api/invites — create an invite, return the single-emit URL + token. */
@@ -262,33 +303,72 @@ export async function handleCreateInvite(req: Request, deps: ApiInvitesDeps): Pr
   }
   const parsed = await parseCreateBody(req);
   if (!parsed.ok) return jsonError(parsed.status, parsed.error, parsed.description);
-  const { vaultName, role, provisionVault, defaultMirror, expiresInSeconds } = parsed.body;
+  const { vaultName, username, role, provisionVault, defaultMirror, expiresInSeconds } =
+    parsed.body;
+  const now = (deps.now ?? (() => new Date()))();
 
-  // SECURITY: a pinned vault_name with provision_vault=false would assign the
-  // redeeming user to a PRE-EXISTING vault as owner-admin — a cross-tenant
-  // breach, since the owner-vs-shared role split isn't built. Shared-vault
-  // invites aren't supported yet, so reject this combination outright (defense
-  // in depth — the redeem path rejects it too). The supported shapes are:
-  // provision_vault=true (+ optional pinned name → provisions THAT name), or
-  // provision_vault=false with NO name (account-only, assignedVaults=[]).
-  if (vaultName !== null && !provisionVault) {
+  // Shape gates over the three supported invite shapes:
+  //
+  //   1. provision_vault=true (+ optional pinned NEW name) — redemption
+  //      provisions a fresh vault for the redeemer. Role must be 'write':
+  //      the redeemer is the vault's ONLY user, so a read-only sole user
+  //      would leave the new vault permanently un-writable.
+  //   2. provision_vault=false + vault_name — SHARED-VAULT invite: redemption
+  //      assigns the redeemer to the admin's EXISTING vault at `role` ('read'
+  //      or 'write'). The vault must exist NOW (services.json) — pinning a
+  //      nonexistent name is a typo, not a future reservation. Issuing is
+  //      host:admin-gated, the same authority that can already assign any
+  //      user to any vault via POST /api/users — the invite only packages
+  //      that assignment as a deliverable link. The vault-delete cascade
+  //      (`revokeInvitesForVault`) revokes pending shared invites when the
+  //      pinned vault is deleted, and the redeem path re-checks existence.
+  //   3. provision_vault=false with NO name — account-only (assignedVaults=[]).
+  if (provisionVault && role !== "write") {
     return jsonError(
       400,
       "invalid_request",
-      "shared-vault invites (provision_vault=false with a vault_name) aren't supported yet — omit vault_name for an account-only invite, or set provision_vault=true to provision a new vault",
+      'a provisioned vault\'s sole user must hold write — use role "write", or share an existing vault (provision_vault=false + vault_name) for read-only access',
     );
+  }
+  if (vaultName !== null && !provisionVault) {
+    const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
+    const known = new Set(listVaultNamesFromPath(manifestPath));
+    if (!known.has(vaultName)) {
+      return jsonError(
+        400,
+        "vault_not_found",
+        `vault "${vaultName}" is not registered on this hub — shared-vault invites must name an existing vault`,
+      );
+    }
+  }
+
+  // Pre-named username: catch collisions at MINT time (the redeem-time check
+  // stays authoritative, but an enforced name that's already taken makes the
+  // link dead-on-arrival — fail fast for the admin instead).
+  if (username !== null) {
+    if (getUserByUsernameCI(deps.db, username) !== null) {
+      return jsonError(409, "username_taken", `username "${username}" is already in use`);
+    }
+    if (usernameReservedByPendingInvite(deps.db, username, now)) {
+      return jsonError(
+        409,
+        "username_reserved",
+        `username "${username}" is already reserved by another pending invite — revoke that invite first or pick a different name`,
+      );
+    }
   }
 
   const issued = issueInvite(deps.db, {
     createdBy: authUserId,
     vaultName,
+    username,
     role,
     provisionVault,
     defaultMirror,
     expiresInSeconds,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
-  const status = inviteStatus(issued.invite, (deps.now ?? (() => new Date()))());
+  const status = inviteStatus(issued.invite, now);
   return new Response(
     JSON.stringify({
       invite: toWire(issued.invite, status),

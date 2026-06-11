@@ -161,8 +161,18 @@ export interface InviteSetupProps {
   /**
    * When the invite pins a vault name the redeemer can't choose one — we show
    * it read-only. When null the redeemer names their own vault (a text field).
+   * With `provisionVault: false` a pinned name is a SHARED-VAULT invite: the
+   * redeemer is being given `role` access to the operator's existing vault.
    */
   pinnedVaultName: string | null;
+  /**
+   * When the invite pre-names the account, the username is shown read-only
+   * and ENFORCED server-side (the redeem handler ignores the form field).
+   * Null = the redeemer picks their own.
+   */
+  pinnedUsername: string | null;
+  /** The `user_vaults` role redemption grants ('read' | 'write') — shown on the shared-vault row. */
+  role: string;
   /** Whether redemption provisions a vault at all (shows the vault row iff true). */
   provisionVault: boolean;
   username?: string;
@@ -177,15 +187,55 @@ export interface InviteSetupProps {
  * same `/account/setup/<token>` path. Reuses the shared login chrome.
  */
 export function renderInviteSetup(props: InviteSetupProps): string {
-  const { token, csrfToken, pinnedVaultName, provisionVault, username, vaultName, errorMessage } =
-    props;
+  const {
+    token,
+    csrfToken,
+    pinnedVaultName,
+    pinnedUsername,
+    role,
+    provisionVault,
+    username,
+    vaultName,
+    errorMessage,
+  } = props;
   const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
   const usernameAttr = username ? ` value="${escapeAttr(username)}"` : "";
 
-  // Vault row: shown only when the invite provisions a vault. Pinned → a
-  // read-only display of the name the admin chose (redeemer can't squat names).
-  // Unpinned → a text field the redeemer fills.
+  // Username row: pre-named → read-only display (the server ENFORCES the
+  // invite's username; the disabled input never submits and the handler
+  // ignores the field anyway). Unpinned → the normal pick-a-name field.
+  const usernameRow =
+    pinnedUsername !== null
+      ? `
+        <label class="field">
+          <span class="field-label">Username</span>
+          <input type="text" value="${escapeAttr(pinnedUsername)}" readonly disabled />
+          <span class="field-hint">Your hub operator chose this username for you.</span>
+        </label>`
+      : `
+        <label class="field">
+          <span class="field-label">Username</span>
+          <input type="text" name="username" id="username" autocomplete="username" autofocus
+            required minlength="2" maxlength="32"
+            pattern="[a-z0-9_-]+" title="lowercase letters, digits, _ - (2–32 chars)"
+            spellcheck="false" autocapitalize="off"${usernameAttr} />
+          <span class="field-hint">lowercase letters, digits, <code>_</code>, <code>-</code></span>
+        </label>`;
+
+  // Vault row. Provisioning invites show the new vault's name (pinned →
+  // read-only; unpinned → a text field the redeemer fills). A shared-vault
+  // invite (no provisioning + a pinned name) shows what the redeemer is
+  // being given access to, including the role.
   let vaultRow = "";
+  if (!provisionVault && pinnedVaultName !== null) {
+    const roleLabel = role === "read" ? "read-only" : "read &amp; write";
+    vaultRow = `
+        <label class="field">
+          <span class="field-label">Shared vault</span>
+          <input type="text" value="${escapeAttr(pinnedVaultName)}" readonly disabled />
+          <span class="field-hint">You're being given ${roleLabel} access to this existing vault.</span>
+        </label>`;
+  }
   if (provisionVault) {
     if (pinnedVaultName !== null) {
       vaultRow = `
@@ -240,21 +290,20 @@ export function renderInviteSetup(props: InviteSetupProps): string {
       <div class="card-header">
         ${header()}
         <h1>Claim your invite</h1>
-        <p class="subtitle">Pick a username and password to create your Parachute account${
-          provisionVault ? " and your own vault" : ""
+        <p class="subtitle">${
+          pinnedUsername !== null ? "Pick a password" : "Pick a username and password"
+        } to create your Parachute account${
+          provisionVault
+            ? " and your own vault"
+            : pinnedVaultName !== null
+              ? " with access to a shared vault"
+              : ""
         }.</p>
       </div>
       ${error}
       <form method="POST" action="/account/setup/${escapeAttr(token)}" class="auth-form">
         ${renderCsrfHiddenInput(csrfToken)}
-        <label class="field">
-          <span class="field-label">Username</span>
-          <input type="text" name="username" id="username" autocomplete="username" autofocus
-            required minlength="2" maxlength="32"
-            pattern="[a-z0-9_-]+" title="lowercase letters, digits, _ - (2–32 chars)"
-            spellcheck="false" autocapitalize="off"${usernameAttr} />
-          <span class="field-hint">lowercase letters, digits, <code>_</code>, <code>-</code></span>
-        </label>
+        ${usernameRow}
         <label class="field">
           <span class="field-label">Password</span>
           <input type="password" name="password" autocomplete="new-password"

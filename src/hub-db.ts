@@ -4,7 +4,7 @@
  * issuer — signing keys (v1), users + opaque refresh tokens (v2), OAuth
  * clients + auth-codes + grants + browser sessions (v3), TOTP 2FA
  * enrollment on the users row (v11, hub#473), and one-time invite links
- * (v12, the `invites` table).
+ * (v12, the `invites` table; v13 adds the pre-named `username` column).
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -424,6 +424,31 @@ const MIGRATIONS: readonly Migration[] = [
         created_at TEXT NOT NULL
       );
       CREATE INDEX invites_created_at ON invites (created_at);
+    `,
+  },
+  {
+    version: 13,
+    sql: `
+      -- Pre-named invites (Adam/Jonathan scenario). Adds an optional
+      -- \`username\` column to \`invites\`: when set, the invite pre-names
+      -- the account the redeemer gets — the redemption form shows the name
+      -- read-only and the redeem handler ENFORCES it (the form's username
+      -- field is ignored). NULL = the redeemer picks their own username
+      -- (every pre-v13 invite, and the default for new ones).
+      --
+      -- Enforced (not just pre-filled) because a pre-named invite is a
+      -- *named deliverable*: the admin mints "Jonathan's link" and hands it
+      -- to Jonathan; if the redeemer could pick a different name, the
+      -- link's identity binding would be decorative — the admin's audit
+      -- expectation ("this link = jonathan") and any vault assignment
+      -- story told against that name would silently break.
+      --
+      -- Stored as plain TEXT (already-validated lowercase [a-z0-9_-], the
+      -- users.username vocabulary). Mint-time validation rejects names
+      -- taken by an existing user or reserved by another pending invite;
+      -- the redeem path re-checks authoritatively. No backfill — every
+      -- existing invite predates pre-naming and keeps NULL.
+      ALTER TABLE invites ADD COLUMN username TEXT;
     `,
   },
 ];
