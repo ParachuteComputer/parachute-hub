@@ -583,12 +583,18 @@ export function logsHelp(): string {
 Usage:
   parachute logs <service>          print the last 200 lines
   parachute logs <service> -f       tail the log (like \`tail -f\`)
-  parachute logs hub                logs for the internal hub
+  parachute logs hub                the full hub log (every module interleaved)
 
-Log file:
-  ~/.parachute/<service>/logs/<service>.log
+Where logs live:
+  Supervised modules (the normal shape — hub-as-supervisor) write through
+  the hub: the supervisor multiplexes each child's output into
+  ~/.parachute/hub/logs/hub.log with a \`[<service>]\` line prefix.
+  \`parachute logs <service>\` reads that stream filtered to the service's
+  lines, prefix stripped. A legacy per-service file
+  (~/.parachute/<service>/logs/<service>.log) is read instead when it is
+  fresher than the hub log — the pre-supervised install shape.
 
-If no log file exists yet, prints a hint to \`parachute start <service>\`.
+If no log lines exist yet, prints a hint to \`parachute start <service>\`.
 `;
 }
 

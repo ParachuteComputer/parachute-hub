@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { rethrowIfMissing } from "@openparachute/depcheck";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
@@ -609,6 +609,74 @@ export interface LogsOpts {
    * Defaults to the group-aware `defaultAlive` (hub#88).
    */
   alive?: AliveFn;
+  /**
+   * Filtered-follow source seam (hub#652) — the byte stream of lines appended
+   * to the hub log from attach onward. The production default spawns
+   * `tail -n 0 -f <hub.log>` with piped stdout so the `[<svc>] ` filter runs
+   * in-process; tests inject a deterministic stream.
+   */
+  followStream?: (path: string) => ReadableStream<Uint8Array>;
+}
+
+/** Default `followStream`: tail the file from its end, stdout piped to us. */
+function defaultFollowStream(path: string): ReadableStream<Uint8Array> {
+  try {
+    // Inherit env so `tail` sees PATH, etc. Bun.spawn defaults to empty
+    // env — see api-modules-ops.ts:defaultRun.
+    const proc = Bun.spawn(["tail", "-n", "0", "-f", path], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "inherit",
+      env: process.env,
+    });
+    return proc.stdout;
+  } catch (err) {
+    // A missing `tail` (minimal container without coreutils) surfaces the
+    // friendly install UX instead of a raw spawn throw (cli.ts top-level
+    // catch renders the MissingDependencyError).
+    rethrowIfMissing(err, "tail");
+    throw err;
+  }
+}
+
+/**
+ * Pump a byte stream line-by-line, emitting only lines that carry `prefix`
+ * (stripped). Line-buffered the same way the supervisor's `pumpLines` is, so
+ * chunk boundaries inside a line don't drop or split matches.
+ */
+async function pumpFilteredLines(
+  stream: ReadableStream<Uint8Array>,
+  prefix: string,
+  output: (line: string) => void,
+): Promise<void> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const emit = (line: string): void => {
+    if (line.startsWith(prefix)) output(line.slice(prefix.length));
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl = buf.indexOf("\n");
+      while (nl !== -1) {
+        emit(buf.slice(0, nl));
+        buf = buf.slice(nl + 1);
+        nl = buf.indexOf("\n");
+      }
+    }
+    if (buf.length > 0) emit(buf);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/** Split a log file's content into lines, dropping the trailing newline. */
+function splitLogLines(content: string): string[] {
+  const trimmed = content.replace(/\n$/, "");
+  return trimmed === "" ? [] : trimmed.split("\n");
 }
 
 export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
@@ -620,11 +688,12 @@ export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
   const alive = opts.alive ?? defaultAlive;
 
   // logs only needs a valid short name to find the log file. First-party
-  // wins via the spec lookup; third-party rows match by `entry.name`; the
-  // internal hub is a known short outside of services.json. installDir is
-  // irrelevant here — the log file is keyed by short name and exists once
-  // the service has run, regardless of how it was registered. We just need
-  // to confirm the name maps to something the CLI manages.
+  // wins via the spec lookup; third-party rows match by `entry.name` (the
+  // same token the supervisor uses as its log prefix); the internal hub is
+  // a known short outside of services.json. installDir is irrelevant here —
+  // the log file is keyed by short name and exists once the service has
+  // run, regardless of how it was registered. We just need to confirm the
+  // name maps to something the CLI manages.
   const isFirstParty = getSpec(svc) !== undefined;
   if (!isFirstParty && svc !== HUB_SVC) {
     const entry = readManifest(manifestPath).services.find((s) => s.name === svc);
@@ -634,19 +703,111 @@ export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
     }
   }
 
-  const path = logPathFor(svc, configDir);
-  if (!existsSync(path)) {
-    // Distinguish "daemon never started" from "daemon is running but the
-    // log file is missing" (hub#335). The latter shape surfaces when a
-    // module self-registers + spawns its own logger without going through
-    // `parachute start <svc>` (no hub-managed log file), or when an
-    // operator deletes the log mid-run. Previously both shapes printed the
-    // same `parachute start ${svc}` hint, leading operators to think their
-    // running daemon hadn't started.
+  // Per-file plain reader (the pre-#652 behavior): tail/print one log file.
+  const readPlain = async (path: string): Promise<number> => {
+    if (follow) {
+      const spawner = opts.tailSpawner ?? {
+        spawn(cmd) {
+          // Inherit env so `tail` sees PATH, etc. Bun.spawn defaults to empty
+          // env — see api-modules-ops.ts:defaultRun.
+          try {
+            const proc = Bun.spawn([...cmd], {
+              stdio: ["ignore", "inherit", "inherit"],
+              env: process.env,
+            });
+            return proc.pid;
+          } catch (err) {
+            // A missing `tail` (minimal container without coreutils) surfaces
+            // the friendly install UX instead of a raw spawn throw. The CLI
+            // top-level catch in cli.ts renders the MissingDependencyError.
+            rethrowIfMissing(err, "tail");
+            throw err;
+          }
+        },
+      };
+      spawner.spawn(["tail", "-n", String(lines), "-f", path], path);
+      // tail runs until user Ctrl-C; block this process until it exits.
+      // When called from the real CLI, process.exit wraps us; in tests a
+      // stub spawner returns immediately and we fall through.
+      return 0;
+    }
+    // Non-follow path: read last N lines synchronously for a clean one-shot.
+    const tail = splitLogLines(await Bun.file(path).text()).slice(-lines);
+    for (const line of tail) log(line);
+    return 0;
+  };
+
+  const legacyPath = logPathFor(svc, configDir);
+  const hubLogPath = logPathFor(HUB_SVC, configDir);
+  const legacyExists = svc !== HUB_SVC && existsSync(legacyPath);
+  const hubLogExists = existsSync(hubLogPath);
+
+  // Source selection (hub#652): under hub-as-supervisor (Phase 5b) a module's
+  // stdout/stderr is multiplexed into the HUB log with a `[<svc>] ` line
+  // prefix (supervisor.ts pipeOutput) — the per-service file stops advancing
+  // at the cutover. Prefer whichever file is fresher: a pre-supervised
+  // install is still actively writing the per-service file (it wins); on a
+  // supervised box the hub log is the live stream and the per-service file
+  // is a stale remnant (it loses). `logs hub` always reads the hub log
+  // unfiltered — the interleaved prefixed stream IS the hub's own log.
+  const useHubStream =
+    svc !== HUB_SVC &&
+    hubLogExists &&
+    (!legacyExists || statSync(hubLogPath).mtimeMs >= statSync(legacyPath).mtimeMs);
+
+  if (!useHubStream) {
+    if (!existsSync(legacyPath)) {
+      // Distinguish "daemon never started" from "daemon is running but the
+      // log file is missing" (hub#335). The latter shape surfaces when a
+      // module self-registers + spawns its own logger without going through
+      // the hub (no hub-managed log file), or when an operator deletes the
+      // log mid-run. Previously both shapes printed the same
+      // `parachute start ${svc}` hint, leading operators to think their
+      // running daemon hadn't started.
+      const state = processState(svc, configDir, alive);
+      if (state.status === "running") {
+        const whereabouts =
+          svc === HUB_SVC
+            ? `no log file at ${legacyPath}`
+            : `no log file at ${legacyPath} and no hub log at ${hubLogPath}`;
+        log(
+          `${svc} is running (pid ${state.pid}) but ${whereabouts}. The daemon may be writing logs elsewhere — check its stdout/stderr or its own log destination.`,
+        );
+        return 0;
+      }
+      log(`no logs yet for ${svc}. \`parachute start ${svc}\` to begin.`);
+      return 0;
+    }
+    return readPlain(legacyPath);
+  }
+
+  // Supervised path (hub#652): the service's lines in the hub log, prefix
+  // stripped. Stripped rather than kept: every line would otherwise repeat
+  // the name the operator just typed, while the module's own output shape
+  // (e.g. surface's `[app-dcr]` sub-prefixes) stays intact — the same shape
+  // its per-service file had pre-cutover.
+  const prefix = `[${svc}] `;
+  const matched = splitLogLines(await Bun.file(hubLogPath).text())
+    .filter((l) => l.startsWith(prefix))
+    .map((l) => l.slice(prefix.length));
+
+  if (matched.length === 0 && !follow) {
+    if (legacyExists) {
+      // Transitional shape: nothing for this service in the hub log, but a
+      // (staler) per-service file exists — e.g. the module last ran detached,
+      // pre-cutover. Show it, with a note so a stale file isn't mistaken for
+      // the live stream (the exact hub#652 trap).
+      log(
+        `note: no ${svc} lines in the hub log (${hubLogPath}); showing the per-service log at ${legacyPath}.`,
+      );
+      return readPlain(legacyPath);
+    }
+    // Keep the hub#335 shapes coherent with the hub-stream source: a live
+    // pidfile here means a daemon the hub isn't logging for.
     const state = processState(svc, configDir, alive);
     if (state.status === "running") {
       log(
-        `${svc} is running (pid ${state.pid}) but no log file at ${path}. The daemon may be writing logs elsewhere — check its stdout/stderr or its own log destination.`,
+        `${svc} is running (pid ${state.pid}) but has no lines in the hub log (${hubLogPath}) and no log file at ${legacyPath}. The daemon may be writing logs elsewhere — check its stdout/stderr or its own log destination.`,
       );
       return 0;
     }
@@ -654,38 +815,14 @@ export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
     return 0;
   }
 
-  if (follow) {
-    const spawner = opts.tailSpawner ?? {
-      spawn(cmd) {
-        // Inherit env so `tail` sees PATH, etc. Bun.spawn defaults to empty
-        // env — see api-modules-ops.ts:defaultRun.
-        try {
-          const proc = Bun.spawn([...cmd], {
-            stdio: ["ignore", "inherit", "inherit"],
-            env: process.env,
-          });
-          return proc.pid;
-        } catch (err) {
-          // A missing `tail` (minimal container without coreutils) surfaces
-          // the friendly install UX instead of a raw spawn throw. The CLI
-          // top-level catch in cli.ts renders the MissingDependencyError.
-          rethrowIfMissing(err, "tail");
-          throw err;
-        }
-      },
-    };
-    spawner.spawn(["tail", "-n", String(lines), "-f", path], path);
-    // tail runs until user Ctrl-C; block this process until it exits.
-    // When called from the real CLI, process.exit wraps us; in tests a
-    // stub spawner returns immediately and we fall through.
-    return 0;
-  }
+  for (const line of matched.slice(-lines)) log(line);
 
-  // Non-follow path: read last N lines synchronously for a clean one-shot.
-  const content = await Bun.file(path).text();
-  const trimmed = content.replace(/\n$/, "");
-  const allLines = trimmed === "" ? [] : trimmed.split("\n");
-  const tail = allLines.slice(-lines);
-  for (const line of tail) log(line);
+  if (follow) {
+    // Print the filtered backlog above, then follow new hub-log lines through
+    // the same filter. Runs until the tail is killed (Ctrl-C takes down the
+    // whole foreground process group); in tests the injected stream closes.
+    const source = opts.followStream ?? defaultFollowStream;
+    await pumpFilteredLines(source(hubLogPath), prefix, log);
+  }
   return 0;
 }

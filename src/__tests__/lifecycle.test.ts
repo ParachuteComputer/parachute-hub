@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, openSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -678,9 +678,36 @@ describe("group-aware kill / liveness (hub#88)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// `parachute logs <svc>` — unchanged by Phase 5b. Reads the per-service logfile
-// keyed by short name (the readers §7.5 keeps). Includes the internal `hub`.
+// `parachute logs <svc>`. Under hub-as-supervisor (Phase 5b) a module's output
+// is multiplexed into the HUB log with a `[<svc>] ` line prefix, so `logs <svc>`
+// reads that stream filtered to the service (hub#652). The per-service logfile
+// keyed by short name (the readers §7.5 keeps) survives as the legacy source
+// when it's fresher than the hub log (pre-supervised installs). `logs hub`
+// reads the hub log unfiltered.
 // ---------------------------------------------------------------------------
+
+/** The supervisor's multiplexed hub-log shape (supervisor.ts pipeOutput). */
+const INTERLEAVED_HUB_LOG =
+  "[vault] vault boot\n" +
+  "[scribe] scribe boot\n" +
+  "[vault] GET /vault/default/api/notes 200 7ms\n" +
+  "[surface] [app-dcr] client registered\n" +
+  "[vaultx] not vault's line\n" +
+  "[vault] sync ok\n";
+
+const VAULT_LINES_STRIPPED = ["vault boot", "GET /vault/default/api/notes 200 7ms", "sync ok"];
+
+function writeHubLog(configDir: string, content: string): string {
+  const path = ensureLogPath("hub", configDir);
+  writeFileSync(path, content);
+  return path;
+}
+
+/** Backdate a file's mtime so freshness comparisons are deterministic. */
+function backdate(path: string, secondsAgo: number): void {
+  const t = new Date(Date.now() - secondsAgo * 1000);
+  utimesSync(path, t, t);
+}
 
 describe("parachute logs", () => {
   test("hint when no log file exists", async () => {
@@ -825,6 +852,214 @@ describe("parachute logs", () => {
       });
       expect(code).toBe(0);
       expect(log).toEqual(["hub line one", "hub line two"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  // ---- hub#652: supervised modules read the hub log's [svc]-prefixed stream ----
+
+  test("supervised module: reads the hub log filtered to its prefix, stripped (hub#652)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writeHubLog(h.configDir, INTERLEAVED_HUB_LOG);
+      // No per-service vault.log — the supervised steady state.
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      // Exact-prefix match: `[vaultx]` noise excluded; `[vault] ` stripped.
+      expect(log).toEqual(VAULT_LINES_STRIPPED);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("stale per-service file + fresher hub log: the hub stream wins (the live hub#652 shape)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const legacy = ensureLogPath("vault", h.configDir);
+      writeFileSync(legacy, "stale pre-cutover line\n");
+      backdate(legacy, 3600);
+      writeHubLog(h.configDir, INTERLEAVED_HUB_LOG);
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log).toEqual(VAULT_LINES_STRIPPED);
+      expect(log.join("\n")).not.toContain("stale pre-cutover line");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("per-service file fresher than the hub log: legacy file wins (pre-supervised install)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const hubLog = writeHubLog(h.configDir, "[vault] old supervised line\n");
+      backdate(hubLog, 3600);
+      const legacy = ensureLogPath("vault", h.configDir);
+      writeFileSync(legacy, "live detached line\n");
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log).toEqual(["live detached line"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("lines cap applies to the FILTERED set, not raw hub-log lines", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writeHubLog(h.configDir, INTERLEAVED_HUB_LOG);
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        lines: 2,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log).toEqual(VAULT_LINES_STRIPPED.slice(-2));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub log has no lines for the service + no per-service file: start hint", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writeHubLog(h.configDir, "[scribe] scribe boot\n");
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log.join("\n")).toMatch(/no logs yet for vault/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("hub log has no lines for the service + per-service file exists: legacy shown with a note", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const legacy = ensureLogPath("vault", h.configDir);
+      writeFileSync(legacy, "old detached line\n");
+      backdate(legacy, 3600);
+      writeHubLog(h.configDir, "[scribe] scribe boot\n");
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      // The note distinguishes the stale per-service file from the live
+      // stream — the exact "stale logs presented as current" trap in hub#652.
+      expect(log[0]).toMatch(/no vault lines in the hub log/);
+      expect(log).toContain("old detached line");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("follow mode filters the hub stream and strips the prefix (hub#652)", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      writeHubLog(h.configDir, INTERLEAVED_HUB_LOG);
+      const encoder = new TextEncoder();
+      let streamedPath: string | undefined;
+      const followStream = (path: string): ReadableStream<Uint8Array> => {
+        streamedPath = path;
+        return new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode("[vault] live one\n[scribe] noise\n"));
+            // Split a line across chunks to exercise the line buffer.
+            controller.enqueue(encoder.encode("[vault] live "));
+            controller.enqueue(encoder.encode("two\n"));
+            controller.close();
+          },
+        });
+      };
+      const log: string[] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        follow: true,
+        followStream,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(streamedPath).toContain("hub.log");
+      expect(log).toEqual([...VAULT_LINES_STRIPPED, "live one", "live two"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("follow mode with a fresher per-service file tails THAT file via tail -f", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const hubLog = writeHubLog(h.configDir, "[vault] old supervised line\n");
+      backdate(hubLog, 3600);
+      const legacy = ensureLogPath("vault", h.configDir);
+      writeFileSync(legacy, "live detached line\n");
+      const spawned: string[][] = [];
+      const code = await logs("vault", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        follow: true,
+        tailSpawner: {
+          spawn(cmd) {
+            spawned.push([...cmd]);
+            return 12345;
+          },
+        },
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      expect(spawned).toHaveLength(1);
+      expect(spawned[0]?.[0]).toBe("tail");
+      expect(spawned[0]?.at(-1)).toBe(legacy);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("logs hub: stays unfiltered — module-prefixed lines included", async () => {
+    const h = makeHarness();
+    try {
+      writeHubLog(h.configDir, INTERLEAVED_HUB_LOG);
+      const log: string[] = [];
+      const code = await logs("hub", {
+        configDir: h.configDir,
+        manifestPath: h.manifestPath,
+        log: (l) => log.push(l),
+      });
+      expect(code).toBe(0);
+      expect(log).toEqual(INTERLEAVED_HUB_LOG.replace(/\n$/, "").split("\n"));
     } finally {
       h.cleanup();
     }
