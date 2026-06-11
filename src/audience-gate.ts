@@ -155,7 +155,8 @@ export function scopesSatisfyRequirement(
 }
 
 export interface AudienceGateDeps {
-  /** Hub DB — absent (stateless boot) denies every non-public audience. */
+  /** Hub DB — absent (stateless boot) denies every hub-gated audience
+   *  (`hub-users` / `operator`); `public` and `surface` pass without it. */
   db: Database | undefined;
   /**
    * The hub's bound-origin set for Bearer `iss` validation (the hub#516
