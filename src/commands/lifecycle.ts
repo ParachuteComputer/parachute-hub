@@ -821,6 +821,9 @@ export async function logs(svc: string, opts: LogsOpts = {}): Promise<number> {
     // Print the filtered backlog above, then follow new hub-log lines through
     // the same filter. Runs until the tail is killed (Ctrl-C takes down the
     // whole foreground process group); in tests the injected stream closes.
+    if (matched.length === 0) {
+      log(`(no prior ${svc} lines — waiting for new output…)`);
+    }
     const source = opts.followStream ?? defaultFollowStream;
     await pumpFilteredLines(source(hubLogPath), prefix, log);
   }

@@ -590,7 +590,8 @@ Where logs live:
   the hub: the supervisor multiplexes each child's output into
   ~/.parachute/hub/logs/hub.log with a \`[<service>]\` line prefix.
   \`parachute logs <service>\` reads that stream filtered to the service's
-  lines, prefix stripped. A legacy per-service file
+  lines, prefix stripped (-n caps the MATCHING lines, not raw hub-log
+  lines; \`logs hub\` is unfiltered). A legacy per-service file
   (~/.parachute/<service>/logs/<service>.log) is read instead when it is
   fresher than the hub log — the pre-supervised install shape.
 
