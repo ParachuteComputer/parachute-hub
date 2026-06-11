@@ -800,6 +800,9 @@ async function mintDirectDelivered(opts: {
   tags?: string[];
   /** Skip the tokens-registry row (the unregistered-jti refusal case). */
   register?: boolean;
+  /** Mint the CLI shape: vault_scope [] — the pin rides scope + aud only
+   *  (the live surface#113 credentials; see the claim's vault_scope note). */
+  emptyVaultScope?: boolean;
   now?: () => Date;
 }): Promise<{ token: string; jti: string }> {
   const scope = `vault:${opts.vault}:${opts.verb}`;
@@ -811,7 +814,7 @@ async function mintDirectDelivered(opts: {
     clientId: "parachute-hub",
     issuer: HUB_ORIGIN,
     ttlSeconds: DIRECT_TTL_SECONDS,
-    vaultScope: [opts.vault],
+    vaultScope: opts.emptyVaultScope ? [] : [opts.vault],
     ...(tags.length > 0 ? { extraClaims: { permissions: { scoped_tags: tags } } } : {}),
     ...(opts.now ? { now: opts.now } : {}),
   });
@@ -1113,6 +1116,53 @@ describe("credential connection — claim/reconcile (surface#113)", () => {
     // only b) but NOT revoked: a's holder keeps a valid token. Pinned so a
     // future "cleanup" doesn't add revocation here and punish the holder.
     expect(findTokenRowByJti(harness.db, a.jti)!.revokedAt).toBeNull();
+  });
+
+  test("CLI-shape claim: vault_scope [] accepted when scope+aud pin the vault (the live surface#113 credentials)", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const cli = await mintDirectDelivered({ vault: "default", verb: "read", emptyVaultScope: true });
+    const res = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, cli.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(res.status).toBe(202);
+    const records = readConnections(harness.storePath);
+    expect(records.length).toBe(1);
+    expect(records[0]!.status).toBe("pending");
+  });
+
+  test("a NON-empty vault_scope that omits the claimed vault is still refused (pinned elsewhere)", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    // Same scope/aud text would never pass for another vault, so forge the
+    // mismatch the only way it can occur: vault_scope pinning a different
+    // vault than scope/aud (defense-in-depth pin disagreement).
+    const signed = await signAccessToken(harness.db, {
+      sub: "operator-user",
+      scopes: ["vault:default:read"],
+      audience: "vault.default",
+      clientId: "parachute-hub",
+      issuer: HUB_ORIGIN,
+      ttlSeconds: DIRECT_TTL_SECONDS,
+      vaultScope: ["boulder"],
+    });
+    recordTokenMint(harness.db, {
+      jti: signed.jti,
+      createdVia: "cli_mint",
+      subject: "operator",
+      clientId: "parachute-hub",
+      scopes: ["vault:default:read"],
+      expiresAt: signed.expiresAt,
+    });
+    const res = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, signed.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(res.status).toBe(403);
+    expect(readConnections(harness.storePath).length).toBe(0);
   });
 
   test("no mutation without approval: a pending renewal attempt mints nothing, revokes nothing, rewrites nothing", async () => {

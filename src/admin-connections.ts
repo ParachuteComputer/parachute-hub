@@ -1333,8 +1333,16 @@ async function claimCredentialConnection(
   const aud = payload.aud;
   const audOk = aud === `vault.${vault}` || (Array.isArray(aud) && aud.includes(`vault.${vault}`));
   if (!audOk) return reject(`token aud is not "vault.${vault}"`);
+  // vault_scope: connection-minted tokens pin the vault here; CLI-minted
+  // tokens (the very population claims reconcile — surface#113's live case)
+  // carry vault_scope: [] and pin the vault via scope + aud instead, both
+  // already exact-matched above. An EMPTY vault_scope is therefore accepted;
+  // a NON-empty one that omits this vault is a genuine mismatch (the token
+  // was pinned elsewhere) and is refused.
   const vaultScopePin = Array.isArray(payload.vault_scope) ? payload.vault_scope : [];
-  if (!vaultScopePin.includes(vault)) return reject(`token vault_scope does not pin "${vault}"`);
+  if (vaultScopePin.length > 0 && !vaultScopePin.includes(vault)) {
+    return reject(`token vault_scope does not pin "${vault}"`);
+  }
   if (!registryRow.scopes.includes(scope)) return reject("registry row scope mismatch");
 
   // Tags ride along verbatim from the SIGNED token (never request input) —
