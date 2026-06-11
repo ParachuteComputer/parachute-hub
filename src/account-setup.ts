@@ -13,9 +13,20 @@
  *
  * Redeem ORDERING (the re-usability guarantee, mirroring the wizard):
  *   1. lookup + validate the invite (not-found/expired/used/revoked)
- *   2. validate username/password (+ vault name)
- *   3. provision the vault (must FRESHLY CREATE — reject a pre-existing name;
- *      attaching the new user to someone else's vault is a cross-tenant breach)
+ *   2. validate username/password (+ vault name). A pre-named invite
+ *      (invite.username set) ENFORCES the username — the form field is
+ *      ignored and the invite's name is used; if it's been taken since
+ *      mint, the invitee is told to ask the operator for a new link
+ *      (the invite stays unconsumed so the operator can revoke + re-mint).
+ *   3. resolve the vault:
+ *      - provision_vault=1 → provision (must FRESHLY CREATE — reject a
+ *        pre-existing name; silently attaching the new user to someone
+ *        else's vault would be a cross-tenant breach)
+ *      - provision_vault=0 + vault_name → SHARED-VAULT invite: assign the
+ *        admin's EXISTING vault at the invite's role (no provisioning).
+ *        The vault must still exist in services.json (the vault-delete
+ *        cascade revokes pending invites, so this re-check is defense in
+ *        depth against manual manifest edits).
  *   4. createUser (the commit point)
  *   5. consumeInvite — stamp used_at + redeemed_user_id ONLY AFTER (4) commits
  *   6. createSession + cookie + 302
@@ -25,15 +36,21 @@
  * invite re-usable — the invitee can simply retry. `consumeInvite`'s
  * `used_at IS NULL` guard makes the stamp itself single-use / race-free.
  *
- * What an invite pre-authorizes: EXACTLY one account + the one named/created
- * vault at the baked-in role — NEVER host:admin, NEVER another vault. The new
- * user gets `assignedVaults:[that vault]` with the invite's role; nothing
- * grants admin posture (the first-admin-by-earliest-row heuristic is
- * untouched — an invited user is never the earliest row).
+ * What an invite pre-authorizes: EXACTLY one account + the one named/created/
+ * shared vault at the baked-in role — NEVER host:admin, NEVER another vault.
+ * The new user gets `assignedVaults:[that vault]` with the invite's role;
+ * nothing grants admin posture (the first-admin-by-earliest-row heuristic is
+ * untouched — an invited user is never the earliest row). The shared-vault
+ * shape is admin-authorized by construction: only a host:admin bearer can
+ * mint an invite, and that same authority can already assign any user to any
+ * vault via POST /api/users. The role ('read' or 'write') is enforced at
+ * every mint chokepoint via `vaultVerbsForRole` and at the vault by
+ * scope-guard.
  */
 import type { Database } from "bun:sqlite";
 import { renderAdminError, renderInviteSetup } from "./admin-login-ui.ts";
 import { type RunResult, provisionVault } from "./admin-vaults.ts";
+import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import {
   InviteExpiredError,
@@ -55,6 +72,7 @@ import {
   validateUsername,
 } from "./users.ts";
 import { validateVaultName } from "./vault-name.ts";
+import { listVaultNamesFromPath } from "./vault-names.ts";
 
 export interface AccountSetupDeps {
   db: Database;
@@ -145,6 +163,8 @@ export function handleAccountSetupGet(
       token: rawToken,
       csrfToken: csrf.token,
       pinnedVaultName: invite.vaultName,
+      pinnedUsername: invite.username,
+      role: invite.role,
       provisionVault: invite.provisionVault,
     }),
     200,
@@ -196,7 +216,11 @@ export async function handleAccountSetupPost(
     );
   }
 
-  const username = String(form.get("username") ?? "").trim();
+  // Pre-named invite → the invite's username is ENFORCED (the form renders it
+  // read-only and any submitted value is ignored — server is the source of
+  // truth, same posture as the pinned vault name).
+  const username =
+    invite.username !== null ? invite.username : String(form.get("username") ?? "").trim();
   const password = String(form.get("password") ?? "");
   const confirm = String(form.get("password_confirm") ?? "");
 
@@ -209,6 +233,8 @@ export async function handleAccountSetupPost(
         token: rawToken,
         csrfToken: csrf.token,
         pinnedVaultName: invite.vaultName,
+        pinnedUsername: invite.username,
+        role: invite.role,
         provisionVault: invite.provisionVault,
         username,
         ...(vaultNameEcho !== undefined ? { vaultName: vaultNameEcho } : {}),
@@ -218,12 +244,16 @@ export async function handleAccountSetupPost(
       setCookie,
     );
 
-  // (2) Validate credentials with the SAME validators as /api/users.
+  // (2) Validate credentials with the SAME validators as /api/users. Runs for
+  // the pre-named case too — defense in depth against a hand-edited invites
+  // row carrying a name the vocabulary forbids.
   const u = validateUsername(username);
   if (!u.valid) {
     return rerender(
       400,
-      "Username must be 2–32 lowercase letters, digits, _ or - (and not a reserved word).",
+      invite.username !== null
+        ? "This invite's pre-set username is not valid. Ask your hub operator for a new invite."
+        : "Username must be 2–32 lowercase letters, digits, _ or - (and not a reserved word).",
     );
   }
   if (password.length > PASSWORD_MAX_LEN) {
@@ -236,9 +266,25 @@ export async function handleAccountSetupPost(
   if (password !== confirm) {
     return rerender(400, "The two passwords don't match.");
   }
-  // Case-insensitive uniqueness — same gate as /api/users.
+  // Case-insensitive uniqueness — same gate as /api/users. For a pre-named
+  // invite the name can't be changed by the invitee, so a collision (someone
+  // took the name between mint and redeem) needs the operator to revoke +
+  // re-mint; the invite stays unconsumed either way.
+  //
+  // Username-existence oracle, accepted trade-off: a 409 here confirms to the
+  // bearer that a given name is taken. The probe is gated behind a single-use,
+  // unexpired invite token (256-bit, sha256-at-rest) — not an open endpoint —
+  // and for the pre-named case the probed name was chosen by the ADMIN at
+  // mint (where it was already validated against existing users), not
+  // attacker-supplied. The same disclosure already exists for the (more
+  // privileged) callers of /api/users and the setup wizard.
   if (getUserByUsernameCI(deps.db, username) !== null) {
-    return rerender(409, `The username "${username}" is already taken. Pick another.`);
+    return rerender(
+      409,
+      invite.username !== null
+        ? `The username "${username}" chosen for this invite is already taken. Ask your hub operator for a new invite.`
+        : `The username "${username}" is already taken. Pick another.`,
+    );
   }
 
   // Resolve the vault name: pinned by the invite, or chosen by the invitee.
@@ -248,6 +294,18 @@ export async function handleAccountSetupPost(
   // at the vault CLI with a generic provision error.
   let vaultName: string | null = null;
   if (invite.provisionVault) {
+    // Defense in depth against a hand-edited invites row: the API refuses to
+    // MINT provision_vault=1 with role != 'write' (a fresh vault's SOLE user
+    // must hold write — a read-only owner would leave the new vault
+    // permanently un-writable). Honor the same invariant at redeem so a row
+    // that bypassed the API can't create that dead-end. The invite stays
+    // unconsumed; the operator re-mints a valid one.
+    if (invite.role !== "write") {
+      return rerender(
+        400,
+        "This invite is not valid (a new vault's owner must have write access). Ask your hub operator for a new invite.",
+      );
+    }
     if (invite.vaultName !== null) {
       vaultName = invite.vaultName;
     } else {
@@ -268,16 +326,29 @@ export async function handleAccountSetupPost(
       vaultName = v.name;
     }
   } else if (invite.vaultName !== null) {
-    // UNSUPPORTED shared-vault case: an account-only invite (provision_vault
-    // =false) that pins an EXISTING vault would assign the new user owner-
-    // admin on a pre-existing vault — a cross-tenant breach, and the owner-
-    // vs-shared role split isn't built. The admin API rejects creating such
-    // an invite (defense in depth); reject here too in case one slipped
-    // through. The legit account-only invite (vaultName === null) is unaffected.
-    return rerender(
-      400,
-      "This invite is not supported (shared-vault invites aren't available yet). Ask your hub operator for a new one.",
-    );
+    // SHARED-VAULT invite: assign the redeemer to the admin's EXISTING vault
+    // at the invite's baked-in role ('read' or 'write') — no provisioning.
+    // Admin-authorized by construction: only a host:admin bearer can mint an
+    // invite, and that same authority can already assign any user to any
+    // vault via POST /api/users; the invite packages that assignment as a
+    // deliverable link. The role is enforced downstream at every mint
+    // chokepoint (`vaultVerbsForRole`: read → ["read"]) and at the vault by
+    // scope-guard — a read-role redeemer can never obtain a write-capable
+    // token for this (or any other) vault.
+    //
+    // The vault must still exist: the vault-delete cascade
+    // (`revokeInvitesForVault`) revokes pending invites pinned to a deleted
+    // vault, so this re-check is defense in depth (manual services.json
+    // edits, restored DB). The invite stays unconsumed on this rejection.
+    const manifestPath = deps.manifestPath ?? SERVICES_MANIFEST_PATH;
+    const known = new Set(listVaultNamesFromPath(manifestPath));
+    if (!known.has(invite.vaultName)) {
+      return rerender(
+        400,
+        "The vault this invite shares no longer exists on this hub. Ask your hub operator for a new invite.",
+      );
+    }
+    vaultName = invite.vaultName;
   }
 
   // (3) Provision the vault — must FRESHLY CREATE it (see the security

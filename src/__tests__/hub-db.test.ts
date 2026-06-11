@@ -380,6 +380,42 @@ describe("openHubDb + migrate", () => {
     }
   });
 
+  test("v13 adds invites.username; pre-existing invite rows keep NULL (no backfill)", () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(h.dbPath);
+      try {
+        // Simulate a real v12 install: strip the v13 column, mark v13
+        // unapplied, and seed an invite row that pre-dates pre-naming.
+        db.exec(`
+          ALTER TABLE invites DROP COLUMN username;
+          INSERT INTO invites (token, created_by, vault_name, role, provision_vault,
+                               default_mirror, expires_at, created_at)
+          VALUES ('hash-v12', NULL, 'maya', 'write', 1, NULL,
+                  '2099-01-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z');
+        `);
+        db.exec("DELETE FROM schema_version WHERE version = 13");
+        migrate(db);
+        const cols = db
+          .query<{ name: string }, []>("SELECT name FROM pragma_table_info('invites')")
+          .all()
+          .map((c) => c.name);
+        expect(cols).toContain("username");
+        // Grandfathered row → NULL (redeemer picks their own name).
+        const row = db
+          .query<{ username: string | null }, [string]>(
+            "SELECT username FROM invites WHERE token = ?",
+          )
+          .get("hash-v12");
+        expect(row?.username).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("v10 FK cascade: deleting a user drops their user_vaults rows", () => {
     const h = makeHarness();
     try {

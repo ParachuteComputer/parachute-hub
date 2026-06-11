@@ -28,6 +28,7 @@ import {
   listInvites,
   revokeInvite,
   revokeInvitesForVault,
+  usernameReservedByPendingInvite,
 } from "../invites.ts";
 import { createUser } from "../users.ts";
 
@@ -68,7 +69,7 @@ describe("issueInvite", () => {
     }
   });
 
-  test("defaults: role=write, provision_vault=1, 7-day expiry", async () => {
+  test("defaults: role=write, provision_vault=1, 7-day expiry, no pre-named username", async () => {
     const { db, adminId, cleanup } = await makeDb();
     try {
       const now = new Date("2026-06-04T00:00:00Z");
@@ -76,8 +77,70 @@ describe("issueInvite", () => {
       expect(invite.role).toBe("write");
       expect(invite.provisionVault).toBe(true);
       expect(invite.vaultName).toBeNull();
+      expect(invite.username).toBeNull();
       const expiry = new Date(invite.expiresAt).getTime() - now.getTime();
       expect(Math.round(expiry / 1000)).toBe(DEFAULT_INVITE_TTL_SECONDS);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("pre-named username round-trips through the row", async () => {
+    const { db, adminId, cleanup } = await makeDb();
+    try {
+      const { rawToken, invite } = issueInvite(db, {
+        createdBy: adminId,
+        username: "jonathan",
+        vaultName: "shared",
+        provisionVault: false,
+        role: "read",
+      });
+      expect(invite.username).toBe("jonathan");
+      const found = findInviteByRawToken(db, rawToken);
+      expect(found?.username).toBe("jonathan");
+      expect(found?.vaultName).toBe("shared");
+      expect(found?.provisionVault).toBe(false);
+      expect(found?.role).toBe("read");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("usernameReservedByPendingInvite", () => {
+  test("pending reserves; redeemed / revoked / expired / other-name do not", async () => {
+    const { db, adminId, cleanup } = await makeDb();
+    try {
+      const now = new Date("2026-06-10T00:00:00Z");
+      // Pending → reserved.
+      issueInvite(db, { createdBy: adminId, username: "pending-name", now: () => now });
+      expect(usernameReservedByPendingInvite(db, "pending-name", now)).toBe(true);
+      expect(usernameReservedByPendingInvite(db, "other-name", now)).toBe(false);
+      // Redeemed → free.
+      const redeemed = issueInvite(db, {
+        createdBy: adminId,
+        username: "used-name",
+        now: () => now,
+      });
+      consumeInvite(db, redeemed.invite.tokenHash, adminId, now);
+      expect(usernameReservedByPendingInvite(db, "used-name", now)).toBe(false);
+      // Revoked → free.
+      const revoked = issueInvite(db, {
+        createdBy: adminId,
+        username: "gone-name",
+        now: () => now,
+      });
+      revokeInvite(db, revoked.invite.tokenHash, now);
+      expect(usernameReservedByPendingInvite(db, "gone-name", now)).toBe(false);
+      // Expired → free.
+      issueInvite(db, {
+        createdBy: adminId,
+        username: "old-name",
+        expiresInSeconds: 60,
+        now: () => now,
+      });
+      const later = new Date(now.getTime() + 120_000);
+      expect(usernameReservedByPendingInvite(db, "old-name", later)).toBe(false);
     } finally {
       cleanup();
     }

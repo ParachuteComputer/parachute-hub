@@ -19,6 +19,24 @@
  * the createUser-then-stamp ordering so a createUser failure leaves the
  * invite re-usable.
  *
+ * Two invite shapes carry that authorization (plus the account-only shape):
+ *   - provision_vault=1 — redemption provisions a NEW vault (optionally
+ *     pre-named via `vault_name`) and assigns the redeemer at `role`
+ *     (always 'write': the sole user of a fresh vault must hold write).
+ *   - provision_vault=0 + vault_name — a SHARED-VAULT invite: redemption
+ *     assigns the redeemer to the admin's EXISTING vault at `role`
+ *     ('read' or 'write'). Issuing is host:admin-gated — the same
+ *     authority that can already assign any user to any vault via
+ *     `POST /api/users` / `PATCH /api/users/:id/vaults` — so the invite
+ *     is a delivery mechanism for an admin-authorized assignment, not an
+ *     escalation. The read-only role is enforced end-to-end: every mint
+ *     path caps to `vaultVerbsForRole` (users.ts) and the vault's
+ *     scope-guard refuses writes for a `vault:<name>:read` token.
+ *
+ * An invite may also pre-name the redeemer's USERNAME (`username` column,
+ * v13): the redemption form shows it read-only and the redeem handler
+ * enforces it. NULL = redeemer picks their own.
+ *
  * Single-use is enforced by stamping `used_at` on redemption — a replay
  * attempt sees the row with `used_at` set and `redeemInvite` throws
  * `InviteUsedError`. Revocation is a separate `revoked_at` stamp the admin
@@ -41,6 +59,11 @@ export interface Invite {
   createdBy: string | null;
   /** Pinned vault name, or null when the redeemer names their own vault. */
   vaultName: string | null;
+  /**
+   * Pre-named username the redeemer's account gets (ENFORCED at redeem),
+   * or null when the redeemer picks their own. v13.
+   */
+  username: string | null;
   /** `user_vaults.role` granted on redemption (`'write'` = owner). */
   role: string;
   /** Whether redemption provisions a NEW vault for the redeemer. */
@@ -86,6 +109,7 @@ interface Row {
   token: string;
   created_by: string | null;
   vault_name: string | null;
+  username: string | null;
   role: string;
   provision_vault: number;
   default_mirror: string | null;
@@ -101,6 +125,7 @@ function rowToInvite(r: Row): Invite {
     tokenHash: r.token,
     createdBy: r.created_by,
     vaultName: r.vault_name,
+    username: r.username,
     role: r.role,
     provisionVault: r.provision_vault === 1,
     defaultMirror: r.default_mirror,
@@ -130,6 +155,11 @@ export interface IssueInviteOpts {
   createdBy: string;
   /** Pinned vault name; omit/null to let the redeemer name their own. */
   vaultName?: string | null;
+  /**
+   * Pre-named username (ENFORCED at redeem); omit/null to let the redeemer
+   * pick their own. Caller validates the vocabulary + uniqueness.
+   */
+  username?: string | null;
   /** `user_vaults` role granted on redemption. Default `'write'` (owner). */
   role?: string;
   /** Provision a new vault on redemption. Default `true` (the primary flow). */
@@ -165,18 +195,20 @@ export function issueInvite(db: Database, opts: IssueInviteOpts): IssuedInvite {
   const expiresAt = new Date(now.getTime() + ttl * 1000).toISOString();
   const role = opts.role ?? "write";
   const vaultName = opts.vaultName ?? null;
+  const username = opts.username ?? null;
   const provisionVault = opts.provisionVault ?? true;
   const defaultMirror = opts.defaultMirror ?? null;
 
   db.prepare(
     `INSERT INTO invites
-       (token, created_by, vault_name, role, provision_vault, default_mirror,
+       (token, created_by, vault_name, username, role, provision_vault, default_mirror,
         expires_at, used_at, redeemed_user_id, revoked_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`,
   ).run(
     tokenHash,
     opts.createdBy,
     vaultName,
+    username,
     role,
     provisionVault ? 1 : 0,
     defaultMirror,
@@ -190,6 +222,7 @@ export function issueInvite(db: Database, opts: IssueInviteOpts): IssuedInvite {
       tokenHash,
       createdBy: opts.createdBy,
       vaultName,
+      username,
       role,
       provisionVault,
       defaultMirror,
@@ -213,6 +246,40 @@ export function findInviteByRawToken(db: Database, rawToken: string): Invite | n
 export function findInviteByHash(db: Database, tokenHash: string): Invite | null {
   const row = db.query<Row, [string]>("SELECT * FROM invites WHERE token = ?").get(tokenHash);
   return row ? rowToInvite(row) : null;
+}
+
+/**
+ * Is `username` already reserved by a PENDING pre-named invite (unredeemed,
+ * unrevoked, not yet expired)? Two pending invites pre-naming the same
+ * username would make the second one un-redeemable (the redeem path's
+ * uniqueness check fails permanently for an enforced name), so mint-time
+ * rejects the collision.
+ *
+ * Exact `=` comparison, deliberately NOT `COLLATE NOCASE` — an asymmetry
+ * with `getUserByUsernameCI` worth naming. The users-table CI lookup is
+ * defense in depth against legacy/hand-edited `users` rows that might carry
+ * mixed case from before the validator pinned lowercase. `invites.username`
+ * has no such legacy: the column is only ever written through the
+ * `validateUsername`-gated mint path (api-invites.ts), so every stored value
+ * is already lowercase, and the value compared against it went through the
+ * same validator. A hand-edited mixed-case invites row wouldn't reserve —
+ * but it also can't redeem: the redeem path re-runs `validateUsername` on
+ * the pre-named value and rejects it (the hand-edited-row backstop in
+ * account-setup.ts).
+ */
+export function usernameReservedByPendingInvite(
+  db: Database,
+  username: string,
+  now: Date = new Date(),
+): boolean {
+  const row = db
+    .query<{ token: string }, [string, string]>(
+      `SELECT token FROM invites
+       WHERE username = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+       LIMIT 1`,
+    )
+    .get(username, now.toISOString());
+  return row !== null;
 }
 
 /** List every invite, newest first, with derived status. */

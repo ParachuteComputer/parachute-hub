@@ -68,6 +68,24 @@ function deps() {
   return { db: harness.db, issuer: ISSUER, manifestPath: harness.manifestPath };
 }
 
+/** Register an existing vault in the harness manifest (for shared-vault invites). */
+function seedVaultInManifest(name: string) {
+  writeFileSync(
+    harness.manifestPath,
+    JSON.stringify({
+      services: [
+        {
+          name: "parachute-vault",
+          port: 4101,
+          paths: [`/vault/${name}`],
+          health: "/health",
+          version: "0.0.0-test",
+        },
+      ],
+    }),
+  );
+}
+
 function withBearer(path: string, bearer: string, init: RequestInit = {}): Request {
   const headers = new Headers(init.headers ?? {});
   headers.set("authorization", `Bearer ${bearer}`);
@@ -121,23 +139,64 @@ describe("POST /api/invites", () => {
     expect(res.status).toBe(400);
   });
 
-  test("400 rejects a shared-vault invite (provision_vault=false + vault_name)", async () => {
-    // Defense in depth (FIX-1): assigning a redeemer to a PRE-EXISTING vault
-    // as owner-admin is a cross-tenant breach; shared-vault invites aren't
-    // supported yet, so the create handler refuses this combination outright.
+  test("shared-vault invite (provision_vault=false + EXISTING vault_name) → 201 at the given role", async () => {
+    // The Adam/Jonathan shape: read-only access to a vault the admin already
+    // built. Issuing is host:admin-gated — the same authority that can assign
+    // any user to any vault via POST /api/users.
+    seedVaultInManifest("jonathan-vault");
     const bearer = await makeAdminBearer();
     const res = await handleCreateInvite(
       withBearer("/api/invites", bearer, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ provision_vault: false, vault_name: "someoneelse" }),
+        body: JSON.stringify({
+          provision_vault: false,
+          vault_name: "jonathan-vault",
+          role: "read",
+        }),
+      }),
+      deps(),
+    );
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as {
+      invite: { vault_name: string | null; role: string; provision_vault: boolean };
+    };
+    expect(body.invite.vault_name).toBe("jonathan-vault");
+    expect(body.invite.role).toBe("read");
+    expect(body.invite.provision_vault).toBe(false);
+  });
+
+  test("400 vault_not_found when the shared vault doesn't exist on this hub", async () => {
+    // A pinned-but-nonexistent name is a typo, not a future reservation —
+    // fail at mint, not at the invitee's redeem.
+    const bearer = await makeAdminBearer();
+    const res = await handleCreateInvite(
+      withBearer("/api/invites", bearer, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provision_vault: false, vault_name: "nosuchvault", role: "read" }),
+      }),
+      deps(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("vault_not_found");
+  });
+
+  test("400 rejects role=read with provision_vault=true (sole user of a new vault must hold write)", async () => {
+    const bearer = await makeAdminBearer();
+    const res = await handleCreateInvite(
+      withBearer("/api/invites", bearer, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provision_vault: true, role: "read" }),
       }),
       deps(),
     );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string; error_description: string };
     expect(body.error).toBe("invalid_request");
-    expect(body.error_description).toContain("shared-vault");
+    expect(body.error_description).toContain("write");
   });
 
   test("account-only invite (provision_vault=false, NO vault_name) is still allowed", async () => {
@@ -156,6 +215,107 @@ describe("POST /api/invites", () => {
     };
     expect(body.invite.provision_vault).toBe(false);
     expect(body.invite.vault_name).toBeNull();
+  });
+});
+
+describe("POST /api/invites — pre-named username", () => {
+  test("201 carries the username in the wire shape", async () => {
+    seedVaultInManifest("jonathan-vault");
+    const bearer = await makeAdminBearer();
+    const res = await handleCreateInvite(
+      withBearer("/api/invites", bearer, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          username: "jonathan",
+          provision_vault: false,
+          vault_name: "jonathan-vault",
+          role: "read",
+        }),
+      }),
+      deps(),
+    );
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { invite: { username: string | null } };
+    expect(body.invite.username).toBe("jonathan");
+  });
+
+  test("400 invalid_username on a name outside the /api/users vocabulary", async () => {
+    const bearer = await makeAdminBearer();
+    for (const bad of ["A", "Has Spaces", "admin"]) {
+      const res = await handleCreateInvite(
+        withBearer("/api/invites", bearer, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ username: bad }),
+        }),
+        deps(),
+      );
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("invalid_username");
+    }
+  });
+
+  test("409 username_taken when an existing user holds the name (case-insensitive)", async () => {
+    const bearer = await makeAdminBearer(); // creates user "operator"
+    const res = await handleCreateInvite(
+      withBearer("/api/invites", bearer, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: "operator" }),
+      }),
+      deps(),
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("username_taken");
+  });
+
+  test("409 username_reserved when another PENDING invite pre-names the same username", async () => {
+    const bearer = await makeAdminBearer();
+    const make = () =>
+      handleCreateInvite(
+        withBearer("/api/invites", bearer, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ username: "jonathan" }),
+        }),
+        deps(),
+      );
+    const first = await make();
+    expect(first.status).toBe(201);
+    const second = await make();
+    expect(second.status).toBe(409);
+    const body = (await second.json()) as { error: string };
+    expect(body.error).toBe("username_reserved");
+  });
+
+  test("revoking the pending invite frees the reserved username", async () => {
+    const bearer = await makeAdminBearer();
+    const first = await handleCreateInvite(
+      withBearer("/api/invites", bearer, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: "jonathan" }),
+      }),
+      deps(),
+    );
+    const { invite } = (await first.json()) as { invite: { id: string } };
+    await handleRevokeInvite(
+      withBearer(`/api/invites/${invite.id}`, bearer, { method: "DELETE" }),
+      invite.id,
+      deps(),
+    );
+    const second = await handleCreateInvite(
+      withBearer("/api/invites", bearer, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: "jonathan" }),
+      }),
+      deps(),
+    );
+    expect(second.status).toBe(201);
   });
 });
 
