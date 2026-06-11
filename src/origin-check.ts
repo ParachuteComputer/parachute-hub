@@ -180,10 +180,13 @@ const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
  * mutation under `/admin/*`; keep this list in sync with the dispatch in
  * `hub-server.ts`):
  *
- *   - `POST /admin/connections` + `DELETE /admin/connections/<id>`
- *     (connection provision/teardown — the seam's canonical consumers are
- *     channel's admin page and the hub SPA, both same-origin `fetch()` with
- *     `credentials: "include"`)
+ *   - `POST /admin/connections` + `DELETE /admin/connections/<id>` +
+ *     `POST /admin/connections/<id>/approve`
+ *     (connection provision/teardown/claim-approval — the seam's canonical
+ *     consumers are channel's admin page and the hub SPA, both same-origin
+ *     `fetch()` with `credentials: "include"`. The Bearer-authed
+ *     `/<id>/renew` + `/<id>/claim` siblings pass the belt via the
+ *     Authorization carve-out below.)
  *
  * (The legacy `POST/DELETE /admin/channels` pair was belted here until
  * boundary D1 retired the endpoint — superseded by `/admin/connections`.)

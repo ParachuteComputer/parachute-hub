@@ -23,6 +23,7 @@ vi.mock("../lib/api.ts", async (orig) => {
     listVaults: vi.fn(),
     createConnection: vi.fn(),
     deleteConnection: vi.fn(),
+    approveConnection: vi.fn(),
   };
 });
 
@@ -306,5 +307,69 @@ describe("Connections — remove", () => {
     // Confirm dialog → Remove.
     fireEvent.click(screen.getByRole("button", { name: /^remove$/i }));
     await waitFor(() => expect(api.deleteConnection).toHaveBeenCalledWith("channel-eng"));
+  });
+});
+
+describe("Connections — pending credential claims (surface#113)", () => {
+  /** A claimed-but-unapproved credential connection, as the wire projects it. */
+  function pendingCredential(id: string): api.ConnectionListing {
+    return {
+      id,
+      kind: "credential",
+      status: "pending",
+      source: { module: "vault", vault: "default", event: "credential" },
+      sink: { module: "surface", action: "credential.vault" },
+      provisioned: { type: "credential", vault: "default", scope: "vault:default:read" },
+      created_at: "2026-06-10T00:00:00.000Z",
+      requested_by: "surface",
+    };
+  }
+
+  it("renders the pending badge + one-click Approve, which POSTs approve and reloads", async () => {
+    const pending = pendingCredential("cred-surface-vault-default");
+    const { status: _pendingFlag, ...approved } = pending;
+    vi.mocked(api.listConnections)
+      .mockResolvedValueOnce([pending])
+      .mockResolvedValueOnce([approved]);
+    vi.mocked(api.getConnectionsCatalog).mockResolvedValue(catalog());
+    vi.mocked(api.listVaults).mockResolvedValue(vaultsResult("default"));
+    vi.mocked(api.approveConnection).mockResolvedValue(undefined);
+    renderRoute();
+
+    await waitFor(() => expect(screen.getByText("cred-surface-vault-default")).toBeInTheDocument());
+    expect(screen.getByTestId("pending-badge")).toHaveTextContent(/pending approval/i);
+
+    fireEvent.click(screen.getByRole("button", { name: /approve cred-surface-vault-default/i }));
+    await waitFor(() =>
+      expect(api.approveConnection).toHaveBeenCalledWith("cred-surface-vault-default"),
+    );
+    // The reload renders the now-active record: badge + Approve gone.
+    await waitFor(() => expect(screen.queryByTestId("pending-badge")).toBeNull());
+    expect(screen.queryByTestId("approve-connection")).toBeNull();
+  });
+
+  it("active connections render no Approve affordance", async () => {
+    vi.mocked(api.listConnections).mockResolvedValue([connection("channel-eng")]);
+    vi.mocked(api.getConnectionsCatalog).mockResolvedValue(catalog());
+    vi.mocked(api.listVaults).mockResolvedValue(vaultsResult("default"));
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("channel-eng")).toBeInTheDocument());
+    expect(screen.queryByTestId("approve-connection")).toBeNull();
+    expect(screen.queryByTestId("pending-badge")).toBeNull();
+  });
+
+  it("surfaces an approve failure on the row", async () => {
+    vi.mocked(api.listConnections).mockResolvedValue([
+      pendingCredential("cred-surface-vault-default"),
+    ]);
+    vi.mocked(api.getConnectionsCatalog).mockResolvedValue(catalog());
+    vi.mocked(api.listVaults).mockResolvedValue(vaultsResult("default"));
+    vi.mocked(api.approveConnection).mockRejectedValue(new api.HttpError(404, "no connection"));
+    renderRoute();
+    await waitFor(() => expect(screen.getByTestId("approve-connection")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("approve-connection"));
+    await waitFor(() => expect(screen.getByText(/approve failed \(404\)/i)).toBeInTheDocument());
+    // The pending row is still there — nothing was reloaded away.
+    expect(screen.getByTestId("pending-badge")).toBeInTheDocument();
   });
 });

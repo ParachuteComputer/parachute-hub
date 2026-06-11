@@ -28,6 +28,7 @@ import {
   type ConnectionsCatalog,
   HttpError,
   type VaultListing,
+  approveConnection,
   createConnection,
   deleteConnection,
   getConnectionsCatalog,
@@ -75,6 +76,16 @@ type RemoveState =
   | { kind: "removing"; id: string }
   | { kind: "error"; id: string; message: string };
 
+/**
+ * Per-row approve state for pending credential claims (surface#113). One
+ * click — approval mints nothing, it only lets the module's existing
+ * credential renew, so no confirm dialog (Remove stays the destructive path).
+ */
+type ApproveState =
+  | { kind: "idle" }
+  | { kind: "approving"; id: string }
+  | { kind: "error"; id: string; message: string };
+
 function errMessage(err: unknown, verb: string): string {
   if (err instanceof HttpError) return `${verb} failed (${err.status}): ${err.message}`;
   if (err instanceof Error) return err.message;
@@ -106,6 +117,7 @@ export function Connections() {
   const [reload, setReload] = useState(0);
   const [createSt, setCreateSt] = useState<CreateState>({ kind: "idle" });
   const [removeSt, setRemoveSt] = useState<RemoveState>({ kind: "idle" });
+  const [approveSt, setApproveSt] = useState<ApproveState>({ kind: "idle" });
 
   // Builder form fields.
   const [sourceModule, setSourceModule] = useState("");
@@ -201,6 +213,18 @@ export function Connections() {
     }
   }
 
+  async function onApprove(id: string): Promise<void> {
+    if (approveSt.kind === "approving") return;
+    setApproveSt({ kind: "approving", id });
+    try {
+      await approveConnection(id);
+      setApproveSt({ kind: "idle" });
+      setReload((n) => n + 1);
+    } catch (err) {
+      setApproveSt({ kind: "error", id, message: errMessage(err, "Approve") });
+    }
+  }
+
   return (
     <div data-route-content="true">
       <div className="list-header">
@@ -213,7 +237,9 @@ export function Connections() {
         — pick one below to pre-fill the builder.
       </p>
 
-      {renderList(state, removeSt, setRemoveSt, onConfirmRemove, () => setReload((n) => n + 1))}
+      {renderList(state, removeSt, setRemoveSt, onConfirmRemove, approveSt, onApprove, () =>
+        setReload((n) => n + 1),
+      )}
 
       {state.kind === "ok" && (
         <BuilderSection
@@ -248,6 +274,8 @@ function renderList(
   removeSt: RemoveState,
   setRemoveSt: (s: RemoveState) => void,
   onConfirmRemove: (id: string) => Promise<void>,
+  approveSt: ApproveState,
+  onApprove: (id: string) => Promise<void>,
   onRetry: () => void,
 ): React.ReactNode {
   if (state.kind === "loading") return <p className="muted">Loading connections…</p>;
@@ -278,6 +306,8 @@ function renderList(
       removeSt={removeSt}
       setRemoveSt={setRemoveSt}
       onConfirmRemove={onConfirmRemove}
+      approveSt={approveSt}
+      onApprove={onApprove}
     />
   );
 }
@@ -320,11 +350,15 @@ function ConnectionsTable({
   removeSt,
   setRemoveSt,
   onConfirmRemove,
+  approveSt,
+  onApprove,
 }: {
   connections: ConnectionListing[];
   removeSt: RemoveState;
   setRemoveSt: (s: RemoveState) => void;
   onConfirmRemove: (id: string) => Promise<void>;
+  approveSt: ApproveState;
+  onApprove: (id: string) => Promise<void>;
 }): React.ReactNode {
   const groups = groupByProvenance(connections);
   return (
@@ -349,7 +383,16 @@ function ConnectionsTable({
                 </tr>
               </thead>
               <tbody>
-                {rows.map((c) => renderConnectionRow(c, removeSt, setRemoveSt, onConfirmRemove))}
+                {rows.map((c) =>
+                  renderConnectionRow(
+                    c,
+                    removeSt,
+                    setRemoveSt,
+                    onConfirmRemove,
+                    approveSt,
+                    onApprove,
+                  ),
+                )}
               </tbody>
             </table>
           </div>
@@ -364,10 +407,16 @@ function renderConnectionRow(
   removeSt: RemoveState,
   setRemoveSt: (s: RemoveState) => void,
   onConfirmRemove: (id: string) => Promise<void>,
+  approveSt: ApproveState,
+  onApprove: (id: string) => Promise<void>,
 ): React.ReactNode {
   const isConfirming = removeSt.kind === "confirming" && removeSt.id === c.id;
   const isRemoving = removeSt.kind === "removing" && removeSt.id === c.id;
   const rowError = removeSt.kind === "error" && removeSt.id === c.id ? removeSt.message : null;
+  const isPending = c.status === "pending";
+  const isApproving = approveSt.kind === "approving" && approveSt.id === c.id;
+  const approveError =
+    approveSt.kind === "error" && approveSt.id === c.id ? approveSt.message : null;
   const when = `${c.source.module}.${c.source.event}${
     c.source.vault ? ` (${c.source.vault})` : ""
   }`;
@@ -377,6 +426,20 @@ function renderConnectionRow(
     <tr key={c.id} data-connection-id={c.id} data-requested-by={provenance}>
       <td>
         <code>{c.id}</code>
+        {isPending && (
+          <>
+            {" "}
+            <span
+              className="tag"
+              data-testid="pending-badge"
+              title={`A module claimed a credential it already holds${
+                c.provisioned.scope ? ` (${c.provisioned.scope})` : ""
+              } — approving lets it renew before expiry. Nothing new is granted.`}
+            >
+              pending approval
+            </span>
+          </>
+        )}
       </td>
       <td>
         <code>{when}</code>
@@ -394,6 +457,18 @@ function renderConnectionRow(
         )}
       </td>
       <td>
+        {isPending && (
+          <button
+            type="button"
+            disabled={isApproving}
+            onClick={() => void onApprove(c.id)}
+            aria-label={`Approve ${c.id}`}
+            data-testid="approve-connection"
+            style={{ marginRight: "0.5rem" }}
+          >
+            {isApproving ? "Approving…" : "Approve"}
+          </button>
+        )}
         {isConfirming ? (
           <dialog
             open
@@ -440,6 +515,11 @@ function renderConnectionRow(
         {rowError && (
           <div className="error-banner" style={{ marginTop: "0.25rem" }}>
             <code>{rowError}</code>
+          </div>
+        )}
+        {approveError && (
+          <div className="error-banner" style={{ marginTop: "0.25rem" }}>
+            <code>{approveError}</code>
           </div>
         )}
       </td>

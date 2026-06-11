@@ -33,11 +33,12 @@
  *
  * AUTH. Same gate as the admin-token mints: a cookie-gated operator session
  * pinned to the first admin. The catalog (`/api/connections/catalog`) is
- * operator-only metadata; it uses the same session gate. ONE exception:
- * `POST /admin/connections/:id/renew` (H4 credential renewal) authenticates
- * by PROOF OF POSSESSION of the connection's current still-valid credential
- * as Bearer — no operator click; an expired credential cannot renew itself
- * (the operator re-approves in the UI).
+ * operator-only metadata; it uses the same session gate. TWO exceptions:
+ * `POST /admin/connections/:id/renew` (H4 credential renewal) and
+ * `POST /admin/connections/:id/claim` (surface#113 claim/reconcile) both
+ * authenticate by PROOF OF POSSESSION of the connection's current
+ * still-valid credential as Bearer — no operator click; an expired
+ * credential can neither renew nor claim (the operator re-links in the UI).
  *
  * THE SECOND KIND — `kind: "credential"` (H4, surface-runtime design). A
  * module declares `credentials` in module.json (scope TEMPLATE
@@ -52,6 +53,23 @@
  * payload. Tags are REQUIRED for write scopes (tags are the sharing scope);
  * read may be tag-scoped or vault-wide per the operator's choice (the
  * approval UI defaults to tag-scoped).
+ *
+ * CLAIM / RECONCILE (surface#113). A credential delivered to a module
+ * OUTSIDE this engine (e.g. minted via the CLI and POSTed straight to the
+ * module's delivery endpoint) leaves no ConnectionRecord, so jti-bound
+ * renewal 404s at the pre-expiry window. `POST /admin/connections/:id/claim`
+ * lets the module backfill the record: it presents the credential it ALREADY
+ * holds as Bearer (the renew endpoint's proof-of-possession posture), and
+ * the hub — after verifying the jti is REGISTERED in the tokens table and
+ * that the token's scope/aud/vault_scope match what the claimed connection
+ * id implies — writes the record in `status: "pending"`. A claim grants
+ * NOTHING: renewal refuses pending records; only the operator-gated
+ * `POST /admin/connections/:id/approve` flips it active, after which the
+ * existing renewal flow proceeds unchanged. Expired/revoked/unregistered/
+ * mismatched claims are refused with ONE generic error (no oracle on
+ * registry contents); re-linking through the operator flow is the recovery
+ * path. Rejecting a claim = DELETE on the pending record (which revokes the
+ * claimed jti — the safe direction).
  */
 import type { Database } from "bun:sqlite";
 import {
@@ -63,6 +81,7 @@ import {
   removeConnection,
 } from "./connections-store.ts";
 import {
+  findTokenRowByJti,
   recordTokenMint,
   revokeTokenByJti,
   signAccessToken,
@@ -329,11 +348,31 @@ export async function handleConnections(
     return renewCredentialConnection(req, segments[0] ?? "", deps);
   }
 
+  // surface#113 — claim/reconcile. Same auth class as renew (proof of
+  // possession of the credential as Bearer, no operator session), so it's
+  // routed before the gate too. A successful claim only writes a PENDING
+  // record — the operator-gated approve below is what activates it.
+  if (segments.length === 2 && segments[1] === "claim") {
+    if (method !== "POST") {
+      return jsonError(405, "method_not_allowed", "use POST on /admin/connections/:id/claim");
+    }
+    return claimCredentialConnection(req, segments[0] ?? "", deps);
+  }
+
   const gate = operatorGate(req, deps);
   if (gate) return gate;
   const { userId } = sessionUser(req, deps);
 
   const itemId = segments.length === 1 ? (segments[0] ?? "") : "";
+
+  // surface#113 — operator approval of a pending claim. Cookie-gated like
+  // create/teardown (and CSRF-belted by the dispatch in hub-server.ts).
+  if (segments.length === 2 && segments[1] === "approve") {
+    if (method !== "POST") {
+      return jsonError(405, "method_not_allowed", "use POST on /admin/connections/:id/approve");
+    }
+    return approveCredentialConnection(segments[0] ?? "", deps);
+  }
 
   if (segments.length === 0 && method === "GET") return listConnections(deps);
   if (segments.length === 0 && method === "POST") return createConnection(req, userId, deps);
@@ -341,7 +380,7 @@ export async function handleConnections(
   return jsonError(
     405,
     "method_not_allowed",
-    "use GET/POST on /admin/connections, DELETE on /admin/connections/:id, or POST on /admin/connections/:id/renew",
+    "use GET/POST on /admin/connections, DELETE on /admin/connections/:id, or POST on /admin/connections/:id/renew, /claim, /approve",
   );
 }
 
@@ -359,6 +398,10 @@ function listConnections(deps: ConnectionsDeps): Response {
     // standing module credential. Projected so the SPA can render the two
     // shapes distinctly.
     ...(c.kind !== undefined ? { kind: c.kind } : {}),
+    // Approval state (surface#113): "pending" = a module-initiated claim
+    // awaiting the operator's one-click approve in the Connections view.
+    // Absent = active.
+    ...(c.status !== undefined ? { status: c.status } : {}),
     source: c.source,
     sink: c.sink,
     provisioned: c.provisioned,
@@ -1070,6 +1113,17 @@ async function renewCredentialConnection(
     );
   }
 
+  // surface#113 — a CLAIMED record grants nothing until the operator
+  // approves. Checked AFTER the possession proof so the pending state is
+  // revealed only to the actual credential holder (the claimant itself).
+  if (record.status === "pending") {
+    return jsonError(
+      403,
+      "pending_approval",
+      "this connection's claim awaits operator approval in the hub admin Connections view — renewal is enabled after approval",
+    );
+  }
+
   const vault = record.provisioned?.vault ?? "";
   const scope = record.provisioned?.scope ?? "";
   const scopedTags = record.provisioned?.scopedTags ?? [];
@@ -1128,6 +1182,258 @@ async function renewCredentialConnection(
     renew_path: `/admin/connections/${id}/renew`,
   };
   return json(200, { ok: true, credential: payload });
+}
+
+/**
+ * POST /admin/connections/:id/claim — backfill the hub-side record for a
+ * credential that was delivered to a module OUTSIDE this engine (surface#113:
+ * CLI-minted + POSTed straight to the module's delivery endpoint), so the
+ * existing jti-bound renewal flow can find a record instead of 404ing.
+ *
+ * AUTH mirrors renew: proof of possession — the module presents the
+ * credential it ALREADY holds as Bearer; the jti is derived from the
+ * validated token, never from request input. The claim grants NOTHING:
+ *
+ *   - the presented token must verify (signature / expiry / revocation —
+ *     an expired or revoked credential cannot be claimed; re-link via the
+ *     operator flow is the path);
+ *   - its jti must be REGISTERED in the tokens table (the registered-mint
+ *     rule is the precondition for renewal anyway), with the registry row
+ *     recording the same scope;
+ *   - the token's scope / aud / vault_scope must carry EXACTLY the grant the
+ *     claimed connection id implies (`cred-<module>-<key>-<vault>` +
+ *     the module's DECLARED credential template — same declaration checks
+ *     as create);
+ *   - the record is written `status: "pending"`: renewal refuses it until
+ *     the operator's one-click approve in the Connections view.
+ *
+ * So the only thing a claim can ever enable — and only after explicit
+ * operator approval — is renewal of a token the module already holds, at the
+ * scope/tags already baked into that token. NOTE the deliberate asymmetry
+ * with create: a claim ACCEPTS the existing token's shape verbatim,
+ * including an untagged write (create refuses those for NEW grants) — the
+ * operator already granted that shape when they minted + delivered it, and
+ * the approve click is the explicit sanction of carrying it forward.
+ *
+ * All post-authentication mismatches refuse with ONE generic error so the
+ * endpoint is not an oracle on registry contents; the specific reason is
+ * logged server-side (no token material).
+ *
+ * Idempotency: re-claiming with the same credential returns the same pending
+ * record (no dupes). A pending record's claim may be superseded by another
+ * fully-valid claim for the same id (pending grants nothing — last writer
+ * wins until approval). An ACTIVE record is never touched: claiming it with
+ * its own current credential reports "active" (renewal already works);
+ * anything else is refused.
+ */
+async function claimCredentialConnection(
+  req: Request,
+  id: string,
+  deps: ConnectionsDeps,
+): Promise<Response> {
+  if (!CONNECTION_ID_RE.test(id)) {
+    return jsonError(400, "invalid_request", `connection id "${id}" is not a valid identifier`);
+  }
+  let body: { module?: unknown; key?: unknown; vault?: unknown };
+  try {
+    body = (await req.json()) as { module?: unknown; key?: unknown; vault?: unknown };
+  } catch {
+    return jsonError(400, "invalid_request", "request body must be JSON");
+  }
+  const moduleShort = str(body.module);
+  const key = str(body.key);
+  const vault = str(body.vault);
+  if (!moduleShort || !key || !vault) {
+    return jsonError(400, "invalid_request", "module, key, vault are all required");
+  }
+  if (!VAULT_NAME_CHARSET_RE.test(vault)) {
+    return jsonError(400, "invalid_request", `vault "${vault}" is not a valid identifier`);
+  }
+
+  const auth = req.headers.get("authorization");
+  if (!auth || !auth.startsWith("Bearer ")) {
+    return jsonError(
+      401,
+      "unauthenticated",
+      "a claim requires the delivered credential as Authorization: Bearer",
+    );
+  }
+  const bearer = auth.slice("Bearer ".length).trim();
+  let payload: Record<string, unknown>;
+  try {
+    // Same validation posture as renew (and the same deliberate absence of
+    // an issuer pin — see renewCredentialConnection): signature proves local
+    // issuance; the registry + claim-shape binding below does the rest.
+    payload = (await validateAccessToken(deps.db, bearer)).payload as Record<string, unknown>;
+  } catch (err) {
+    // Signature/expiry/revocation failure — an expired or revoked credential
+    // cannot be claimed; the operator re-links through the module's flow.
+    return jsonError(
+      401,
+      "invalid_credential",
+      `credential is not valid (expired or revoked credentials cannot be claimed — re-link via the operator flow): ${errMsg(err)}`,
+    );
+  }
+
+  // Every post-authentication mismatch refuses identically (no oracle on
+  // registry contents); the reason is logged server-side, token-free.
+  const reject = (reason: string): Response => {
+    console.warn(`[connections] claim for "${id}" rejected: ${reason}`);
+    return jsonError(
+      403,
+      "claim_rejected",
+      "the presented credential does not match a claimable connection",
+    );
+  };
+
+  const jti = typeof payload.jti === "string" ? payload.jti : "";
+  if (!jti) return reject("token carries no jti");
+
+  // Registry half: the jti must be a REGISTERED mint (renewal's revocation
+  // lifecycle depends on the row; an unregistered long-lived token is
+  // unrevocable by construction and not reconcilable here).
+  const registryRow = findTokenRowByJti(deps.db, jti);
+  if (!registryRow) return reject("jti is not in the token registry");
+  // NOTE: created_via is deliberately NOT filtered here. A claim grandfathers
+  // a token that already exists and is already registered — provenance
+  // (cli_mint, connection_credential, …) adds no authority either way, and
+  // a connection_credential jti with an active record is already refused by
+  // the existing-record check below.
+
+  // Declaration half — the same checks create performs, so a claim can't
+  // smuggle past anything the operator-initiated path would refuse.
+  const mod = deps.modules.find((m) => m.short === moduleShort);
+  if (!mod) return reject(`no installed module "${moduleShort}"`);
+  const decl = findCredentialDecl(mod.manifest, key);
+  if (!decl) return reject(`module "${moduleShort}" declares no credential "${key}"`);
+  if (!CREDENTIAL_SCOPE_TEMPLATE_RE.test(decl.scope)) {
+    return reject(`declared scope template "${decl.scope}" is not grantable`);
+  }
+  if (!decl.endpoint || !decl.endpoint.startsWith("/")) {
+    return reject(`credential "${moduleShort}.${key}" declares no delivery endpoint`);
+  }
+  if (deps.resolveVaultOrigin(vault) === null) return reject(`no vault named "${vault}"`);
+
+  // Identity half: the claimed id must be EXACTLY the id the hub derives for
+  // this module/key/vault (the same derivation create uses by default) — the
+  // id alone is ambiguous to parse (keys may contain dashes), so the body
+  // names the parts and the derivation closes the loop.
+  const impliedId = `cred-${moduleShort}-${key}-${vault}`.toLowerCase();
+  if (id !== impliedId)
+    return reject(`id does not match module/key/vault (implies "${impliedId}")`);
+
+  // Token-shape half: the presented credential must carry EXACTLY the grant
+  // the connection implies — scope at the declared verb, audience-bound and
+  // vault_scope-pinned to the vault (what makes it usable there at all).
+  const verb = decl.scope.endsWith(":write") ? "write" : "read";
+  const scope = `vault:${vault}:${verb}`;
+  const tokenScopes =
+    typeof payload.scope === "string" ? payload.scope.split(" ").filter((s) => s.length > 0) : [];
+  if (!tokenScopes.includes(scope)) return reject(`token scope does not include "${scope}"`);
+  const aud = payload.aud;
+  const audOk = aud === `vault.${vault}` || (Array.isArray(aud) && aud.includes(`vault.${vault}`));
+  if (!audOk) return reject(`token aud is not "vault.${vault}"`);
+  const vaultScopePin = Array.isArray(payload.vault_scope) ? payload.vault_scope : [];
+  if (!vaultScopePin.includes(vault)) return reject(`token vault_scope does not pin "${vault}"`);
+  if (!registryRow.scopes.includes(scope)) return reject("registry row scope mismatch");
+
+  // Tags ride along verbatim from the SIGNED token (never request input) —
+  // renewal will re-mint exactly this shape.
+  const scopedTags = readScopedTagsClaim(payload);
+
+  const nowIso = (deps.now?.() ?? new Date()).toISOString();
+  const pendingRecord: ConnectionRecord = {
+    id,
+    kind: "credential",
+    status: "pending",
+    source: { module: "vault", vault, event: "credential" },
+    sink: {
+      module: moduleShort,
+      action: `credential.${key}`,
+      ...(scopedTags.length > 0 ? { params: { tags: scopedTags } } : {}),
+    },
+    provisioned: {
+      type: "credential",
+      vault,
+      mintedJtis: [jti],
+      scope,
+      scopedTags,
+      credentialKey: key,
+      endpoint: decl.endpoint,
+    },
+    createdAt: nowIso,
+    requestedBy: moduleShort,
+  };
+
+  const existing = readConnections(deps.storePath).find((r) => r.id === id);
+  if (existing) {
+    if (existing.kind !== "credential") {
+      return reject("id names an existing non-credential connection");
+    }
+    const holdsCurrent = (existing.provisioned?.mintedJtis ?? []).includes(jti);
+    if (existing.status !== "pending") {
+      // ACTIVE record: never mutated by a claim. The current holder learns
+      // renewal already works; anything else is refused generically.
+      if (holdsCurrent) {
+        return json(200, { ok: true, connection_id: id, status: "active" });
+      }
+      return reject("an active connection already exists for this id");
+    }
+    if (holdsCurrent) {
+      // Idempotent re-claim — same pending record, no dupes, no rewrite.
+      return json(202, claimPendingBody(id));
+    }
+    // A different fully-validated credential supersedes the unapproved claim
+    // (pending grants nothing; last writer wins until the operator approves).
+  }
+
+  putConnection(deps.storePath, pendingRecord);
+  return json(202, claimPendingBody(id));
+}
+
+function claimPendingBody(id: string): Record<string, unknown> {
+  return {
+    ok: true,
+    connection_id: id,
+    status: "pending",
+    detail:
+      "claim recorded — awaiting operator approval in the hub admin Connections view; renewal is enabled after approval",
+  };
+}
+
+/** `permissions.scoped_tags` from a validated token payload (strings only). */
+function readScopedTagsClaim(payload: Record<string, unknown>): string[] {
+  const permissions = payload.permissions;
+  if (!permissions || typeof permissions !== "object" || Array.isArray(permissions)) return [];
+  const tags = (permissions as Record<string, unknown>).scoped_tags;
+  if (!Array.isArray(tags)) return [];
+  return tags.filter((t): t is string => typeof t === "string" && t.trim().length > 0);
+}
+
+/**
+ * POST /admin/connections/:id/approve — the operator's one-click activation
+ * of a pending claim (surface#113). Operator-gated by the caller (same
+ * session gate as create/teardown, CSRF-belted in hub-server.ts). Flips
+ * `status: "pending"` → active by dropping the field; mints NOTHING and
+ * delivers NOTHING — the module already holds the credential, approval only
+ * lets the existing renewal flow find the record. Idempotent: approving an
+ * already-active credential record reports active without rewriting it.
+ */
+function approveCredentialConnection(id: string, deps: ConnectionsDeps): Response {
+  if (!CONNECTION_ID_RE.test(id)) {
+    return jsonError(400, "invalid_request", `connection id "${id}" is not a valid identifier`);
+  }
+  const record = readConnections(deps.storePath).find((r) => r.id === id);
+  if (!record) return jsonError(404, "not_found", `no connection "${id}"`);
+  if (record.kind !== "credential") {
+    return jsonError(400, "not_claimable", `connection "${id}" is not a credential connection`);
+  }
+  if (record.status !== "pending") {
+    return json(200, { ok: true, id, status: "active" });
+  }
+  const { status: _pending, ...approved } = record;
+  putConnection(deps.storePath, approved);
+  return json(200, { ok: true, id, status: "active" });
 }
 
 function findCredentialDecl(m: ModuleManifest, key: string): ModuleCredential | undefined {
