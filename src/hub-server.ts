@@ -1874,8 +1874,11 @@ export function hubFetch(
           readModuleManifestFn: deps?.readModuleManifest ?? defaultReadModuleManifest,
           // H3 — the audience gate runs BEFORE the upgrade, same posture as
           // the HTTP dispatch below: a WS endpoint under a hub-users surface
-          // never hands a socket to an anonymous caller. (The publicExposure
-          // cloak already ran inside maybeUpgradeWebSocket before this hook.)
+          // never hands a socket to an anonymous caller, while `surface`
+          // audiences pass through (the backed surface authenticates the
+          // socket itself — e.g. the docs editor's collab WS rides this).
+          // (The publicExposure cloak already ran inside
+          // maybeUpgradeWebSocket before this hook.)
           gateAudience: async (wsPathname) => {
             const wsUiMatch = resolveUiMount(
               readManifestLenient(manifestPath).services,
@@ -3339,13 +3342,17 @@ export function hubFetch(
       // H3 — per-UI audience gate. When the path falls under a declared UI
       // sub-unit (a `uis{}` entry on the matched service row — surface-hosted
       // UI mounts like /surface/<name>/*), the sub-unit's audience is
-      // enforced BEFORE forwarding: 'public' passes, 'hub-users' requires a
-      // session or a scope-satisfying Bearer, 'operator' requires the first
-      // admin. Module API paths outside any uis entry are NOT gated here —
-      // modules keep their own auth. Ordering nuance: when the row's
-      // publicExposure cloak would fire (loopback-only, non-loopback layer),
-      // the gate is SKIPPED so the 404 cloak stays indistinguishable from
-      // not-installed (a 401 here would leak the route's existence).
+      // enforced BEFORE forwarding: 'public' passes, 'surface' passes (the
+      // backed surface authenticates every request itself), 'hub-users'
+      // requires a session or a scope-satisfying Bearer, 'operator' requires
+      // the first admin. Module API paths outside any uis entry are NOT
+      // gated here — modules keep their own auth. Ordering nuance: when the
+      // row's publicExposure cloak would fire (loopback-only, non-loopback
+      // layer), the gate is SKIPPED so the 404 cloak stays indistinguishable
+      // from not-installed (a 401 here would leak the route's existence) —
+      // which also means a 'surface'/'public' mount on a loopback-only row
+      // stays unreachable from tailnet/funnel: exposure is orthogonal to
+      // audience.
       const uiMatch = resolveUiMount(readManifestLenient(manifestPath).services, pathname);
       if (uiMatch) {
         const cloaked =
@@ -3363,15 +3370,20 @@ export function hubFetch(
       if (proxied) {
         // H5 — chrome-strip rides the gate: where the audience resolved
         // `public`, the identity chrome is disabled for that mount (public
-        // readers aren't hub users). Reuses the per-path opt-out mechanism
-        // the /surface/notes/ precedent established, generalized to the
-        // declared audience.
+        // readers aren't hub users). `surface` follows the same precedent —
+        // a backed surface's visitors are mostly capability-link invitees,
+        // NOT hub users, so the "Signed in as…" chrome would be wrong for
+        // them (and the surface owns its whole page anyway). Reuses the
+        // per-path opt-out mechanism the /surface/notes/ precedent
+        // established, generalized to the declared audience.
         return decorateWithChrome(
           proxied,
           req,
           pathname,
           getDb,
-          uiMatch !== undefined && uiMatch.audience === "public" ? [uiMatch.mount] : undefined,
+          uiMatch !== undefined && (uiMatch.audience === "public" || uiMatch.audience === "surface")
+            ? [uiMatch.mount]
+            : undefined,
         );
       }
 
@@ -3403,7 +3415,8 @@ export function hubFetch(
  *
  * `extraOptOutPrefixes` (H5) generalizes the static opt-out list: the
  * dispatch passes the matched UI mount when the audience gate resolved
- * `public` — public readers aren't hub users, so the identity chrome
+ * `public` or `surface` — public readers (and a backed surface's
+ * capability-link invitees) aren't hub users, so the identity chrome
  * ("Signed in as…", Sign in link) must not ride their pages. Same
  * mechanism as the hardcoded `/surface/notes/` precedent, now driven by
  * the sub-unit's declared audience instead of a hub-side path list.

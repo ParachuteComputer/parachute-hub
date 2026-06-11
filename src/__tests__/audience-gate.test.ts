@@ -284,6 +284,98 @@ describe("audience gate matrix (H3)", () => {
     }
   });
 
+  test("audience: surface — anon passes through on document, API, and WS-upgrade shapes (the surface self-auths)", async () => {
+    const upstream = startEchoUpstream();
+    try {
+      writeServices({
+        ...surfaceEntry(upstream.port, { audience: "surface" }),
+        websocket: true,
+      });
+      const f = fetcher();
+
+      // Anonymous document request — NO 302 to /login (this was the concrete
+      // blocker: capability-link invitees aren't hub users by design).
+      const anonDoc = await f(
+        req("/surface/notes/", { headers: { accept: "text/html" } }),
+        fakeServer("127.0.0.1"),
+      );
+      expect(anonDoc?.status).toBe(200);
+
+      // Anonymous API-shaped request — no 401; the surface decides.
+      const anonApi = await f(
+        req("/surface/notes/api/docs", { method: "POST" }),
+        fakeServer("127.0.0.1"),
+      );
+      expect(anonApi?.status).toBe(200);
+
+      // Anonymous WebSocket upgrade — passes the gate and upgrades (the
+      // docs editor's collab WS rides this; the surface auths the socket).
+      let upgradeCalls = 0;
+      const spy = {
+        requestIP: () => ({ address: "127.0.0.1" }),
+        upgrade: () => {
+          upgradeCalls++;
+          return true;
+        },
+      };
+      const ws = await f(
+        req("/surface/notes/ws", {
+          headers: { upgrade: "websocket", connection: "Upgrade" },
+        }),
+        spy,
+      );
+      expect(ws).toBeUndefined();
+      expect(upgradeCalls).toBe(1);
+    } finally {
+      upstream.stop();
+    }
+  });
+
+  test("audience: surface — passes on an ABSENT DB (stateless boot), like public", async () => {
+    // The surface self-auths every request — a hub-side deny on a missing
+    // identity store would break the surface for zero security gain (the
+    // hub's DB plays no part in the surface's admission decision). `public`
+    // passes on absent DB for the same structural reason; pin the parity.
+    const upstream = startEchoUpstream();
+    try {
+      writeServices(surfaceEntry(upstream.port, { audience: "surface" }));
+      const statelessFetcher = hubFetch(h.dir, {
+        // no getDb — the hub booted without a DB
+        manifestPath: h.manifestPath,
+        loadExposeHubOrigin: () => undefined,
+      });
+      const res = await statelessFetcher(req("/surface/notes/x"), fakeServer("127.0.0.1"));
+      expect(res?.status).toBe(200);
+
+      // Contrast: hub-users on the same stateless boot still fails closed.
+      writeServices(surfaceEntry(upstream.port, { audience: "hub-users" }));
+      const denied = await statelessFetcher(req("/surface/notes/x"), fakeServer("127.0.0.1"));
+      expect(denied?.status).toBe(401);
+    } finally {
+      upstream.stop();
+    }
+  });
+
+  test("audience: surface — the loopback cloak still wins (exposure is orthogonal to audience)", async () => {
+    const upstream = startEchoUpstream();
+    try {
+      writeServices({
+        ...surfaceEntry(upstream.port, { audience: "surface" }),
+        publicExposure: "loopback",
+      });
+      // Public-layer caller: a surface-audience mount on a loopback-only row
+      // is unreachable from funnel — same as public; the audience never
+      // bypasses the exposure layer.
+      const res = await fetcher()(
+        req("/surface/notes/x", { headers: { "cf-ray": "1" } }),
+        fakeServer("127.0.0.1"),
+      );
+      expect(res?.status).toBe(404);
+    } finally {
+      upstream.stop();
+    }
+  });
+
   test("absent audience defaults to hub-users (anon denied)", async () => {
     const upstream = startEchoUpstream();
     try {
@@ -502,6 +594,43 @@ describe("resolveUiMount", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // The fourth tier is a valid manifest value: validation accepts it and the
+  // validated write round-trips it (a backed surface registering
+  // `audience: "surface"` must survive a hub-side manifest rewrite).
+  test("manifest validation accepts audience: 'surface' and round-trips it", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pcli-uis-surface-roundtrip-"));
+    const p = join(dir, "services.json");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-surface",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.3.0",
+              uis: {
+                "docs-editor": {
+                  displayName: "Docs Editor",
+                  path: "/surface/docs",
+                  audience: "surface",
+                },
+              },
+            },
+          ],
+        },
+        p,
+      );
+      const raw = JSON.parse(require("node:fs").readFileSync(p, "utf8") as string) as {
+        services: { uis: Record<string, { audience?: string }> }[];
+      };
+      expect(raw.services[0]?.uis["docs-editor"]?.audience).toBe("surface");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ===========================================================================
@@ -563,6 +692,34 @@ describe("chrome strip × audience (H5)", () => {
       const html = await res?.text();
       expect(html).toContain("pc-chrome"); // identity chrome present
       expect(html).toContain("surface page");
+    } finally {
+      upstream.stop();
+    }
+  });
+
+  test("audience: surface → NO injected chrome (capability invitees aren't hub users — follows the public precedent)", async () => {
+    const upstream = startHtmlUpstream();
+    try {
+      // Mount OUTSIDE the static /surface/notes/ opt-out so the audience
+      // mechanism (not the legacy hardcoded prefix) is what's exercised.
+      writeServices({
+        name: "parachute-surface",
+        port: upstream.port,
+        paths: ["/surface"],
+        health: "/surface/healthz",
+        version: "0.3.0",
+        uis: {
+          docs: { displayName: "Docs Editor", path: "/surface/docs", audience: "surface" },
+        },
+      });
+      const res = await fetcher()(
+        req("/surface/docs/some-doc", { headers: { accept: "text/html" } }),
+        fakeServer("127.0.0.1"),
+      );
+      expect(res?.status).toBe(200);
+      const html = await res?.text();
+      expect(html).toContain("surface page"); // upstream body intact
+      expect(html).not.toContain("pc-chrome"); // identity chrome absent
     } finally {
       upstream.stop();
     }
