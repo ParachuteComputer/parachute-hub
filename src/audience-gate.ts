@@ -4,9 +4,9 @@
  *
  * A module's services.json row may carry a `uis{}` map of hosted UI
  * sub-units; each sub-unit now declares an `audience`
- * (`public | hub-users | operator`, default `hub-users`). The HUB PROXY
- * enforces it BEFORE forwarding — surface-host serves whatever the proxy
- * lets through, exactly like the publicExposure cloak.
+ * (`public | hub-users | operator | surface`, default `hub-users`). The HUB
+ * PROXY enforces it BEFORE forwarding — surface-host serves whatever the
+ * proxy lets through, exactly like the publicExposure cloak.
  *
  * Scope discipline: the gate covers the SURFACE UI MOUNTS specifically (the
  * uis sub-unit paths), not every module path — a module's own APIs keep
@@ -14,7 +14,7 @@
  * The gate also runs before WebSocket upgrades on a gated mount (threaded
  * into `maybeUpgradeWebSocket`).
  *
- * The three audiences:
+ * The four audiences:
  *
  *   public    — pass (and the chrome strip is disabled — H5: public readers
  *               aren't hub users).
@@ -29,16 +29,43 @@
  *   operator  — the first-admin session only. A Bearer never satisfies this
  *               tier (operator surfaces are interactive; the session is the
  *               operator's presence).
+ *   surface   — pass: the surface backend owns admission END-TO-END
+ *               (backed surfaces — parachute-surface runtime, surfaces with
+ *               their own server entry, kit-authenticated via
+ *               @openparachute/surface-server: hub JWTs / capability links /
+ *               anon, deny-by-default with a public conformance suite). The
+ *               hub gating these would add a SECOND auth layer that BLOCKS
+ *               the surface's own audience plane — e.g. the docs-editor's
+ *               capability-link invitees are NOT hub users by design, so a
+ *               hub-users gate would 302 them to /login before the surface's
+ *               own auth ever ran. Chrome strip follows the `public`
+ *               precedent (disabled — the visitors are mostly capability
+ *               invitees, not hub users), and WS upgrades pass through too
+ *               (the gate threads into `maybeUpgradeWebSocket`; null = no
+ *               deny = the upgrade proceeds to the capability check).
  *
  * Deny shape: document requests (GET + Accept: text/html, no session) get a
  * 302 to `/login?next=<path>`; everything else gets 401/403 JSON. A
  * signed-in-but-insufficient caller (non-admin on an operator surface, or a
  * Bearer missing the required scopes) gets 403, not a login redirect.
  *
+ * Exposure layers are ORTHOGONAL to the audience: the `publicExposure`
+ * cloak runs at the service-row level BEFORE this gate (dispatch skips the
+ * gate entirely on a cloaked row so the 404 stays indistinguishable from
+ * not-installed). A `surface`-audience mount on a loopback-only row is
+ * therefore still unreachable from tailnet/funnel — exactly like `public`.
+ *
  * Fail-closed posture: malformed `audience` metadata never reaches this
  * module — `services-manifest.ts` validation rejects the row and the lenient
  * read drops it (the mount 404s). An absent DB (hub booted stateless) denies
- * every non-public audience.
+ * every audience that needs an identity store: `hub-users` and `operator`.
+ * `public` and `surface` still pass — neither consults hub identity
+ * (`surface` self-auths every request; denying it on absent DB would break
+ * the surface for zero security gain). Version skew: a surface declaring
+ * `audience: "surface"` registered against an OLDER hub (pre-dating the
+ * value) gets its row rejected by manifest validation — the mount 404s
+ * until the hub upgrades; the surface-side meta-schema ships the value
+ * separately with a hub-version requirement note.
  */
 
 import type { Database } from "bun:sqlite";
@@ -171,8 +198,15 @@ export async function gateUiAudience(
 ): Promise<Response | null> {
   if (audience === "public") return null;
 
+  // `surface` — pass through unconditionally (incl. on an absent DB, below):
+  // the surface backend authenticates EVERY request itself (deny-by-default
+  // kit auth: hub JWTs / capability links / anon). A hub-side deny here
+  // would block the surface's own audience plane — its capability-link
+  // invitees are not hub users by design.
+  if (audience === "surface") return null;
+
   // Fail closed without a DB: no identity store, no way to admit anyone to
-  // a non-public surface.
+  // a hub-gated (`hub-users` / `operator`) surface.
   if (!deps.db) {
     return wantsDocument(req)
       ? loginRedirect(req)

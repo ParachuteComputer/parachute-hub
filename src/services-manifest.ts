@@ -81,16 +81,27 @@ function normalizeUiSubUnitStatus(value: string): UiSubUnitStatus | undefined {
  *                 scopes satisfy the surface's `scopes_required` (the OR
  *                 keeps installed PWAs working). THE DEFAULT when absent.
  *   "operator"  — the first-admin session only.
+ *   "surface"   — the surface backend owns admission END-TO-END; the hub
+ *                 proxy passes every request through (backed surfaces —
+ *                 kit-authenticated via @openparachute/surface-server: hub
+ *                 JWTs / capability links / anon, deny-by-default). Chrome
+ *                 strip off like `public` — capability-link invitees are
+ *                 NOT hub users.
  *
  * Enforced at the hub proxy BEFORE forwarding (`src/audience-gate.ts`).
  * Legacy boolean `public` on the wire is accepted one alias window:
  * `public: true` → `"public"`, `public: false` → default. Fail-closed: an
  * unrecognized `audience` value rejects the row (the lenient manifest read
- * then drops it — unroutable beats accidentally public).
+ * then drops it — unroutable beats accidentally public). Version-skew
+ * corollary: a surface declaring `audience: "surface"` registered against a
+ * hub OLDER than this value's introduction gets its row rejected by that
+ * same fail-closed rule — the mount 404s until the hub is upgraded. The
+ * surface-side meta-schema ships the value with a hub-version requirement
+ * note for exactly this reason.
  */
-export type UiAudience = "public" | "hub-users" | "operator";
+export type UiAudience = "public" | "hub-users" | "operator" | "surface";
 
-const UI_AUDIENCE_VALUES: readonly UiAudience[] = ["public", "hub-users", "operator"];
+const UI_AUDIENCE_VALUES: readonly UiAudience[] = ["public", "hub-users", "operator", "surface"];
 
 /**
  * A sub-unit beneath a module — used today by parachute-app to surface each
@@ -467,7 +478,7 @@ function validateUiSubUnit(raw: unknown, where: string): UiSubUnit {
       !(UI_AUDIENCE_VALUES as readonly string[]).includes(u.audience)
     ) {
       throw new ServicesManifestError(
-        `${where}: "audience" must be "public" | "hub-users" | "operator" if present (got ${JSON.stringify(u.audience)})`,
+        `${where}: "audience" must be "public" | "hub-users" | "operator" | "surface" if present (got ${JSON.stringify(u.audience)})`,
       );
     }
     audience = u.audience as UiAudience;
