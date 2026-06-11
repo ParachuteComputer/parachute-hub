@@ -253,8 +253,19 @@ export function findInviteByHash(db: Database, tokenHash: string): Invite | null
  * unrevoked, not yet expired)? Two pending invites pre-naming the same
  * username would make the second one un-redeemable (the redeem path's
  * uniqueness check fails permanently for an enforced name), so mint-time
- * rejects the collision. Usernames are validator-pinned lowercase, so an
- * exact `=` comparison suffices.
+ * rejects the collision.
+ *
+ * Exact `=` comparison, deliberately NOT `COLLATE NOCASE` — an asymmetry
+ * with `getUserByUsernameCI` worth naming. The users-table CI lookup is
+ * defense in depth against legacy/hand-edited `users` rows that might carry
+ * mixed case from before the validator pinned lowercase. `invites.username`
+ * has no such legacy: the column is only ever written through the
+ * `validateUsername`-gated mint path (api-invites.ts), so every stored value
+ * is already lowercase, and the value compared against it went through the
+ * same validator. A hand-edited mixed-case invites row wouldn't reserve —
+ * but it also can't redeem: the redeem path re-runs `validateUsername` on
+ * the pre-named value and rejects it (the hand-edited-row backstop in
+ * account-setup.ts).
  */
 export function usernameReservedByPendingInvite(
   db: Database,

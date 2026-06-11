@@ -213,10 +213,14 @@ describe("InvitesSection — prefiguration (what will this link do?)", () => {
     fireEvent.click(screen.getByRole("button", { name: /copy message/i }));
     await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
     const message = writeText.mock.calls[0]?.[0] as string;
-    expect(message).toContain("https://hub.example.com/account/setup/raw-token");
-    expect(message).toContain('Your username will be "jonathan".');
-    expect(message).toContain('read-only access to the vault "jonathan-vault"');
-    expect(message).toContain("expires");
+    // Full-content snapshot of the composed message — pins the pre-named
+    // username line, the access phrase, and the link in their exact shape.
+    // The expiry date renders via the same toLocaleDateString the component
+    // uses, so the assertion is locale-stable on any runner.
+    const expires = new Date("2026-06-20T00:00:00.000Z").toLocaleDateString();
+    expect(message).toBe(
+      `You're invited to my Parachute. Open this link to set your password and claim your account. Your username will be "jonathan". You'll get read-only access to the vault "jonathan-vault". The link works once and expires ${expires}: https://hub.example.com/account/setup/raw-token`,
+    );
   });
 });
 

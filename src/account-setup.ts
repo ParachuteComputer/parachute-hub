@@ -270,6 +270,14 @@ export async function handleAccountSetupPost(
   // invite the name can't be changed by the invitee, so a collision (someone
   // took the name between mint and redeem) needs the operator to revoke +
   // re-mint; the invite stays unconsumed either way.
+  //
+  // Username-existence oracle, accepted trade-off: a 409 here confirms to the
+  // bearer that a given name is taken. The probe is gated behind a single-use,
+  // unexpired invite token (256-bit, sha256-at-rest) — not an open endpoint —
+  // and for the pre-named case the probed name was chosen by the ADMIN at
+  // mint (where it was already validated against existing users), not
+  // attacker-supplied. The same disclosure already exists for the (more
+  // privileged) callers of /api/users and the setup wizard.
   if (getUserByUsernameCI(deps.db, username) !== null) {
     return rerender(
       409,
@@ -286,6 +294,18 @@ export async function handleAccountSetupPost(
   // at the vault CLI with a generic provision error.
   let vaultName: string | null = null;
   if (invite.provisionVault) {
+    // Defense in depth against a hand-edited invites row: the API refuses to
+    // MINT provision_vault=1 with role != 'write' (a fresh vault's SOLE user
+    // must hold write — a read-only owner would leave the new vault
+    // permanently un-writable). Honor the same invariant at redeem so a row
+    // that bypassed the API can't create that dead-end. The invite stays
+    // unconsumed; the operator re-mints a valid one.
+    if (invite.role !== "write") {
+      return rerender(
+        400,
+        "This invite is not valid (a new vault's owner must have write access). Ask your hub operator for a new invite.",
+      );
+    }
     if (invite.vaultName !== null) {
       vaultName = invite.vaultName;
     } else {

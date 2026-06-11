@@ -299,11 +299,16 @@ describe("POST /account/setup/<token> — security invariants", () => {
     expect(firstId).not.toBe(id);
   });
 
-  test("a 'read' invite lands a read-only assignment", async () => {
+  test("a 'read' invite (shared-vault shape) lands a read-only assignment", async () => {
+    // read+provision is no longer a redeemable shape (a fresh vault's sole
+    // user must hold write — see the hand-edited-row guard test below), so
+    // the read role rides the shared-vault shape: assign an EXISTING vault.
     const admin = await createUser(harness.db, "operator", "operator-password-1");
+    seedExistingVault("shared");
     const { rawToken } = issueInvite(harness.db, {
       createdBy: admin.id,
       vaultName: "shared",
+      provisionVault: false,
       role: "read",
     });
     const { token: csrfToken, cookieFragment } = csrfPair();
@@ -324,6 +329,45 @@ describe("POST /account/setup/<token> — security invariants", () => {
     );
     const user = getUserByUsernameCI(harness.db, "guest");
     expect(vaultVerbsForUserVault(harness.db, user?.id ?? "", "shared")).toEqual(["read"]);
+  });
+
+  test("hand-edited provision_vault=1 + role='read' row → refused at redeem (no un-writable owner), invite unconsumed", async () => {
+    // The API refuses to MINT this shape (400 invalid_request); this row can
+    // only exist via a hand edit. The redeem-side guard must refuse it too —
+    // honoring it would provision a vault whose ONLY user can never write.
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    const { rawToken } = issueInvite(harness.db, {
+      createdBy: admin.id,
+      vaultName: "deadend",
+      provisionVault: true,
+      role: "read",
+    });
+    const before = userCount(harness.db);
+    const { token: csrfToken, cookieFragment } = csrfPair();
+    const stub = makeStubRunCommand();
+    const res = await handleAccountSetupPost(
+      postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username: "guest",
+          password: "guest-strong-password-1",
+          password_confirm: "guest-strong-password-1",
+        },
+        cookieFragment,
+      ),
+      rawToken,
+      deps(stub.run),
+    );
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain("must have write access");
+    // No account, no vault shell-out, invite re-usable for the operator to
+    // revoke + re-mint correctly.
+    expect(getUserByUsernameCI(harness.db, "guest")).toBeNull();
+    expect(userCount(harness.db) - before).toBe(0);
+    expect(stub.calls.length).toBe(0);
+    expect(findInviteByRawToken(harness.db, rawToken)?.usedAt).toBeNull();
   });
 });
 
