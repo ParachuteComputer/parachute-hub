@@ -1493,6 +1493,14 @@ export interface ConnectionsCatalog {
 /** A provisioned connection (the list/wire shape from `/admin/connections`). */
 export interface ConnectionListing {
   id: string;
+  /** `"credential"` = a standing module credential (H4); absent = event→action. */
+  kind?: string;
+  /**
+   * Approval state (surface#113 claim/reconcile). `"pending"` = a
+   * module-initiated claim for a directly-delivered credential awaiting the
+   * operator's one-click approve; absent = active.
+   */
+  status?: string;
   source: {
     module: string;
     vault?: string;
@@ -1504,7 +1512,7 @@ export interface ConnectionListing {
     action: string;
     params?: Record<string, unknown>;
   };
-  provisioned: { type: string; vault?: string; triggerName?: string };
+  provisioned: { type: string; vault?: string; triggerName?: string; scope?: string };
   created_at: string;
   /**
    * Provenance — WHO requested this connection (modular-UI R2). `"custom"` for a
@@ -1580,6 +1588,24 @@ export async function createConnection(input: {
     throw new HttpError(500, "/admin/connections returned a malformed connection body");
   }
   return { connection: body.connection, ...(body.connect ? { connect: body.connect } : {}) };
+}
+
+/**
+ * POST /admin/connections/:id/approve — activate a pending credential claim
+ * (surface#113). Mints and delivers nothing; the module already holds the
+ * credential — approval only enables its renewal.
+ */
+export async function approveConnection(id: string): Promise<void> {
+  const res = await fetch(`/admin/connections/${encodeURIComponent(id)}/approve`, {
+    method: "POST",
+    headers: { accept: "application/json" },
+    credentials: "same-origin",
+  });
+  if (res.status === 401) {
+    await redirectToLoginAndHang<void>();
+    return;
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
 }
 
 /** DELETE /admin/connections/:id — tear a connection down (best-effort). */

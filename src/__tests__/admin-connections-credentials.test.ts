@@ -20,9 +20,15 @@ import {
   buildCatalog,
   handleConnections,
 } from "../admin-connections.ts";
-import { readConnections } from "../connections-store.ts";
+import { putConnection, readConnections } from "../connections-store.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { findTokenRowByJti, listActiveRevocations } from "../jwt-sign.ts";
+import {
+  findTokenRowByJti,
+  listActiveRevocations,
+  recordTokenMint,
+  revokeTokenByJti,
+  signAccessToken,
+} from "../jwt-sign.ts";
 import {
   type ModuleManifest,
   ModuleManifestError,
@@ -773,5 +779,488 @@ describe("credential connection — catalog", () => {
     );
     expect(validated.credentials?.length).toBe(1);
     expect(validated.credentials?.[0]?.scope).toBe("vault:{vault}:read");
+  });
+});
+
+// ===========================================================================
+// Claim / reconcile (surface#113)
+// ===========================================================================
+
+/**
+ * The live-incident shape (surface#113): a credential minted via the CLI
+ * (`parachute auth mint-token` → created_via "cli_mint") and POSTed straight
+ * to the module's delivery endpoint. Valid, REGISTERED, held by the module —
+ * but no ConnectionRecord exists, so jti-bound renewal 404s.
+ */
+const DIRECT_TTL_SECONDS = 90 * 24 * 60 * 60;
+
+async function mintDirectDelivered(opts: {
+  vault: string;
+  verb: "read" | "write";
+  tags?: string[];
+  /** Skip the tokens-registry row (the unregistered-jti refusal case). */
+  register?: boolean;
+  now?: () => Date;
+}): Promise<{ token: string; jti: string }> {
+  const scope = `vault:${opts.vault}:${opts.verb}`;
+  const tags = opts.tags ?? [];
+  const signed = await signAccessToken(harness.db, {
+    sub: "operator-user",
+    scopes: [scope],
+    audience: `vault.${opts.vault}`,
+    clientId: "parachute-hub",
+    issuer: HUB_ORIGIN,
+    ttlSeconds: DIRECT_TTL_SECONDS,
+    vaultScope: [opts.vault],
+    ...(tags.length > 0 ? { extraClaims: { permissions: { scoped_tags: tags } } } : {}),
+    ...(opts.now ? { now: opts.now } : {}),
+  });
+  if (opts.register !== false) {
+    recordTokenMint(harness.db, {
+      jti: signed.jti,
+      createdVia: "cli_mint",
+      subject: "operator",
+      clientId: "parachute-hub",
+      scopes: [scope],
+      expiresAt: signed.expiresAt,
+      ...(tags.length > 0 ? { permissions: JSON.stringify({ scoped_tags: tags }) } : {}),
+      ...(opts.now ? { now: opts.now } : {}),
+    });
+  }
+  return { token: signed.token, jti: signed.jti };
+}
+
+function claimReq(id: string, body: Record<string, unknown>, bearer?: string): Request {
+  return new Request(`http://127.0.0.1/admin/connections/${id}/claim`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+function approveReq(id: string, cookie?: string): Request {
+  return new Request(`http://127.0.0.1/admin/connections/${id}/approve`, {
+    method: "POST",
+    headers: cookie ? { cookie } : {},
+  });
+}
+
+const SURFACE_CLAIM = { module: "surface", key: "vault", vault: "default" };
+const CLAIM_ID = "cred-surface-vault-default";
+
+describe("credential connection — claim/reconcile (surface#113)", () => {
+  test("headline: directly-delivered credential has no record → renewal 404s (the pre-fix bug); claim → pending → approve → renewal succeeds", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const direct = await mintDirectDelivered({ vault: "default", verb: "read", tags: ["boulder"] });
+
+    // PRE-FIX pin (extends the "unknown connection id → 404" pin above): the
+    // credential is valid + registered, but with no hub-side record the
+    // jti-bound renewal 404s — exactly the surface#113 live failure.
+    const before = await handleConnections(
+      renewReq(CLAIM_ID, direct.token),
+      `/${CLAIM_ID}/renew`,
+      deps,
+    );
+    expect(before.status).toBe(404);
+
+    // Claim by proof of possession → 202 + a PENDING record derived from the
+    // SIGNED token (scope/tags) + the module's declaration (endpoint).
+    const claim = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, direct.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(claim.status).toBe(202);
+    const claimBody = (await claim.json()) as {
+      ok: boolean;
+      status: string;
+      connection_id: string;
+    };
+    expect(claimBody.ok).toBe(true);
+    expect(claimBody.status).toBe("pending");
+    expect(claimBody.connection_id).toBe(CLAIM_ID);
+
+    const rec = readConnections(harness.storePath)[0]!;
+    expect(rec.status).toBe("pending");
+    expect(rec.kind).toBe("credential");
+    expect(rec.provisioned.mintedJtis).toEqual([direct.jti]);
+    expect(rec.provisioned.scope).toBe("vault:default:read");
+    expect(rec.provisioned.scopedTags).toEqual(["boulder"]);
+    expect(rec.provisioned.credentialKey).toBe("vault");
+    expect(rec.provisioned.endpoint).toBe("/api/credential");
+    expect(rec.requestedBy).toBe("surface");
+
+    // A claim grants nothing: renewal still refused while pending (the
+    // pending state is revealed only after the possession proof).
+    const pendingRenew = await handleConnections(
+      renewReq(CLAIM_ID, direct.token),
+      `/${CLAIM_ID}/renew`,
+      deps,
+    );
+    expect(pendingRenew.status).toBe(403);
+    expect(((await pendingRenew.json()) as { error: string }).error).toBe("pending_approval");
+
+    // Approval is operator-gated: no session → 401, record stays pending.
+    const noSession = await handleConnections(approveReq(CLAIM_ID), `/${CLAIM_ID}/approve`, deps);
+    expect(noSession.status).toBe(401);
+    expect(readConnections(harness.storePath)[0]!.status).toBe("pending");
+
+    const { cookie } = await adminCookie();
+    const approved = await handleConnections(
+      approveReq(CLAIM_ID, cookie),
+      `/${CLAIM_ID}/approve`,
+      deps,
+    );
+    expect(approved.status).toBe(200);
+    expect(((await approved.json()) as { status: string }).status).toBe("active");
+    expect(readConnections(harness.storePath)[0]!.status).toBeUndefined();
+
+    // Renewal now proceeds through the UNCHANGED flow: same scope + tags
+    // re-minted, old jti revoked, record updated.
+    const renew = await handleConnections(
+      renewReq(CLAIM_ID, direct.token),
+      `/${CLAIM_ID}/renew`,
+      deps,
+    );
+    expect(renew.status).toBe(200);
+    const out = (await renew.json()) as { ok: boolean; credential: DeliveredCredential };
+    expect(out.credential.op).toBe("renewed");
+    expect(out.credential.scope).toBe("vault:default:read");
+    expect(out.credential.scoped_tags).toEqual(["boulder"]);
+    expect(out.credential.jti).not.toBe(direct.jti);
+    expect(findTokenRowByJti(harness.db, direct.jti)!.revokedAt).not.toBeNull();
+    expect(readConnections(harness.storePath)[0]!.provisioned.mintedJtis).toEqual([
+      out.credential.jti!,
+    ]);
+  });
+
+  test("the live docs shape: an UNTAGGED write credential is claimable verbatim (create's write-requires-tags guards NEW grants; the operator's approve sanctions the existing shape)", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const id = "cred-surface-vault-write-default";
+    const direct = await mintDirectDelivered({ vault: "default", verb: "write" });
+
+    const claim = await handleConnections(
+      claimReq(id, { module: "surface", key: "vault-write", vault: "default" }, direct.token),
+      `/${id}/claim`,
+      deps,
+    );
+    expect(claim.status).toBe(202);
+    const rec = readConnections(harness.storePath)[0]!;
+    expect(rec.provisioned.scope).toBe("vault:default:write");
+    expect(rec.provisioned.scopedTags).toEqual([]);
+
+    const { cookie } = await adminCookie();
+    await handleConnections(approveReq(id, cookie), `/${id}/approve`, deps);
+    const renew = await handleConnections(renewReq(id, direct.token), `/${id}/renew`, deps);
+    expect(renew.status).toBe(200);
+    const out = (await renew.json()) as { credential: DeliveredCredential };
+    expect(out.credential.scope).toBe("vault:default:write");
+    expect(out.credential.scoped_tags).toEqual([]);
+    const claims = decodeJwt(out.credential.token!) as { scope?: string; permissions?: unknown };
+    expect(claims.scope).toBe("vault:default:write");
+    expect(claims.permissions).toBeUndefined();
+  });
+
+  test("refusals are GENERIC and identical across causes — no oracle on registry contents", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const readCred = await mintDirectDelivered({ vault: "default", verb: "read" });
+    const unregistered = await mintDirectDelivered({
+      vault: "default",
+      verb: "read",
+      register: false,
+    });
+
+    const cases: { name: string; req: Request; subPath: string }[] = [
+      {
+        name: "unregistered jti",
+        req: claimReq(CLAIM_ID, SURFACE_CLAIM, unregistered.token),
+        subPath: `/${CLAIM_ID}/claim`,
+      },
+      {
+        name: "verb/scope mismatch (read token against the write key)",
+        req: claimReq(
+          "cred-surface-vault-write-default",
+          { module: "surface", key: "vault-write", vault: "default" },
+          readCred.token,
+        ),
+        subPath: "/cred-surface-vault-write-default/claim",
+      },
+      {
+        name: "id does not match module/key/vault",
+        req: claimReq("cred-surface-vault-other", SURFACE_CLAIM, readCred.token),
+        subPath: "/cred-surface-vault-other/claim",
+      },
+      {
+        name: "unknown module",
+        req: claimReq(
+          "cred-ghost-vault-default",
+          { ...SURFACE_CLAIM, module: "ghost" },
+          readCred.token,
+        ),
+        subPath: "/cred-ghost-vault-default/claim",
+      },
+      {
+        name: "undeclared credential key",
+        req: claimReq(
+          "cred-surface-nope-default",
+          { ...SURFACE_CLAIM, key: "nope" },
+          readCred.token,
+        ),
+        subPath: "/cred-surface-nope-default/claim",
+      },
+      {
+        name: "unknown vault",
+        req: claimReq(
+          "cred-surface-vault-ghost",
+          { ...SURFACE_CLAIM, vault: "ghost" },
+          readCred.token,
+        ),
+        subPath: "/cred-surface-vault-ghost/claim",
+      },
+    ];
+
+    const bodies: string[] = [];
+    for (const c of cases) {
+      const res = await handleConnections(c.req, c.subPath, deps);
+      expect(res.status).toBe(403);
+      bodies.push(await res.text());
+    }
+    // One indistinguishable refusal across every cause.
+    expect(new Set(bodies).size).toBe(1);
+    expect(JSON.parse(bodies[0]!)).toEqual({
+      error: "claim_rejected",
+      error_description: "the presented credential does not match a claimable connection",
+    });
+    // And no record was ever written.
+    expect(readConnections(harness.storePath).length).toBe(0);
+  });
+
+  test("expired or revoked credentials cannot be claimed — 401, no record written (re-link is the path)", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+
+    const past = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000);
+    const expired = await mintDirectDelivered({ vault: "default", verb: "read", now: () => past });
+    const expiredRes = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, expired.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(expiredRes.status).toBe(401);
+    expect(((await expiredRes.json()) as { error: string }).error).toBe("invalid_credential");
+
+    const revoked = await mintDirectDelivered({ vault: "default", verb: "read" });
+    revokeTokenByJti(harness.db, revoked.jti, new Date());
+    const revokedRes = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, revoked.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(revokedRes.status).toBe(401);
+
+    const noBearer = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(noBearer.status).toBe(401);
+
+    expect(readConnections(harness.storePath).length).toBe(0);
+  });
+
+  test("idempotent re-claim → same single pending record, no dupes; a different valid credential supersedes the unapproved claim", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const a = await mintDirectDelivered({ vault: "default", verb: "read", tags: ["x"] });
+
+    const first = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, a.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(first.status).toBe(202);
+    const again = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, a.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(again.status).toBe(202);
+    let records = readConnections(harness.storePath);
+    expect(records.length).toBe(1);
+    expect(records[0]!.provisioned.mintedJtis).toEqual([a.jti]);
+
+    // PENDING grants nothing, so a second fully-validated credential may
+    // supersede it (last writer wins until the operator approves).
+    const b = await mintDirectDelivered({ vault: "default", verb: "read", tags: ["y"] });
+    const supersede = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, b.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(supersede.status).toBe(202);
+    records = readConnections(harness.storePath);
+    expect(records.length).toBe(1);
+    expect(records[0]!.status).toBe("pending");
+    expect(records[0]!.provisioned.mintedJtis).toEqual([b.jti]);
+    expect(records[0]!.provisioned.scopedTags).toEqual(["y"]);
+  });
+
+  test("no mutation without approval: a pending renewal attempt mints nothing, revokes nothing, rewrites nothing", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const direct = await mintDirectDelivered({ vault: "default", verb: "read", tags: ["t"] });
+    await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, direct.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+
+    const tokenCount = () =>
+      (harness.db.query("SELECT COUNT(*) AS c FROM tokens").get() as { c: number }).c;
+    const before = tokenCount();
+    const recordBefore = JSON.stringify(readConnections(harness.storePath));
+
+    const renew = await handleConnections(
+      renewReq(CLAIM_ID, direct.token),
+      `/${CLAIM_ID}/renew`,
+      deps,
+    );
+    expect(renew.status).toBe(403);
+
+    expect(tokenCount()).toBe(before); // no new mint registered
+    expect(findTokenRowByJti(harness.db, direct.jti)!.revokedAt).toBeNull(); // not revoked
+    expect(JSON.stringify(readConnections(harness.storePath))).toBe(recordBefore); // record untouched
+  });
+
+  test("claiming an ACTIVE connection: the current holder learns 'active'; any other credential is refused and the record untouched", async () => {
+    const { fetchImpl, calls } = mockFetch({ "POST /api/credential": () => ok({ ok: true }) });
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const { cookie } = await adminCookie();
+    const res = await postCredential(
+      cookie,
+      { credential: { module: "surface", key: "vault", vault: "default", tags: ["t"] } },
+      deps,
+    );
+    expect(res.status).toBe(200);
+    const cred = calls.find((c) => c.url === `${SURFACE_ORIGIN}/api/credential`)!
+      .body as DeliveredCredential;
+
+    // Current holder re-claims → "active", record unchanged (no pending flip).
+    const holder = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, cred.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(holder.status).toBe(200);
+    expect(((await holder.json()) as { status: string }).status).toBe("active");
+    expect(readConnections(harness.storePath)[0]!.status).toBeUndefined();
+
+    // A DIFFERENT valid registered credential cannot claim over it.
+    const other = await mintDirectDelivered({ vault: "default", verb: "read", tags: ["t"] });
+    const refused = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, other.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(refused.status).toBe(403);
+    expect(((await refused.json()) as { error: string }).error).toBe("claim_rejected");
+    expect(readConnections(harness.storePath)[0]!.provisioned.mintedJtis).toEqual([cred.jti!]);
+  });
+
+  test("claim against an existing event→action connection id is refused generically", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    putConnection(harness.storePath, {
+      id: CLAIM_ID,
+      source: { module: "vault", vault: "default", event: "note.created" },
+      sink: { module: "channel", action: "message.deliver" },
+      provisioned: { type: "vault-trigger", vault: "default", triggerName: "t", mintedJtis: [] },
+      createdAt: new Date().toISOString(),
+    });
+    const direct = await mintDirectDelivered({ vault: "default", verb: "read" });
+    const res = await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, direct.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("claim_rejected");
+    // The event→action record is untouched.
+    expect(readConnections(harness.storePath)[0]!.kind).toBeUndefined();
+  });
+
+  test("approve: unknown id → 404; non-credential record → 400; re-approve is idempotent", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const { cookie } = await adminCookie();
+
+    const unknown = await handleConnections(approveReq("ghost", cookie), "/ghost/approve", deps);
+    expect(unknown.status).toBe(404);
+
+    putConnection(harness.storePath, {
+      id: "ev-conn",
+      source: { module: "vault", vault: "default", event: "note.created" },
+      sink: { module: "channel", action: "message.deliver" },
+      provisioned: { type: "vault-trigger", vault: "default", triggerName: "t", mintedJtis: [] },
+      createdAt: new Date().toISOString(),
+    });
+    const nonCred = await handleConnections(
+      approveReq("ev-conn", cookie),
+      "/ev-conn/approve",
+      deps,
+    );
+    expect(nonCred.status).toBe(400);
+
+    const direct = await mintDirectDelivered({ vault: "default", verb: "read" });
+    await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, direct.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    const once = await handleConnections(
+      approveReq(CLAIM_ID, cookie),
+      `/${CLAIM_ID}/approve`,
+      deps,
+    );
+    expect(once.status).toBe(200);
+    const twice = await handleConnections(
+      approveReq(CLAIM_ID, cookie),
+      `/${CLAIM_ID}/approve`,
+      deps,
+    );
+    expect(twice.status).toBe(200);
+    expect(((await twice.json()) as { status: string }).status).toBe("active");
+  });
+
+  test("list projects status: 'pending' on claimed records (the SPA's approve affordance)", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const { cookie } = await adminCookie();
+    const direct = await mintDirectDelivered({ vault: "default", verb: "read" });
+    await handleConnections(
+      claimReq(CLAIM_ID, SURFACE_CLAIM, direct.token),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+
+    const list = await handleConnections(
+      new Request("http://127.0.0.1/admin/connections", { method: "GET", headers: { cookie } }),
+      "",
+      deps,
+    );
+    expect(list.status).toBe(200);
+    const body = (await list.json()) as {
+      connections: { id: string; kind?: string; status?: string; requested_by?: string }[];
+    };
+    const row = body.connections.find((c) => c.id === CLAIM_ID)!;
+    expect(row.kind).toBe("credential");
+    expect(row.status).toBe("pending");
+    expect(row.requested_by).toBe("surface");
   });
 });

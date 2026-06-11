@@ -87,6 +87,15 @@ export interface ConnectionRecord {
    * module). Optional for back-compat: pre-H4 records read back undefined.
    */
   readonly kind?: "credential";
+  /**
+   * Approval state (surface#113 claim/reconcile). Absent = active (every
+   * operator-provisioned record, and pre-claim records, read back undefined
+   * = active). `"pending"` = a module-initiated CLAIM for a directly-delivered
+   * credential, awaiting operator approval in the hub admin Connections view.
+   * A pending record grants nothing: renewal refuses it, and only the
+   * operator-gated approve endpoint flips it to active.
+   */
+  readonly status?: "pending";
   readonly source: ConnectionSource;
   readonly sink: ConnectionSink;
   readonly provisioned: ConnectionProvisioned;

@@ -56,6 +56,9 @@
  *   /api/connections/catalog      (GET)        → events/actions across installed modules (cookie-gated)
  *   /admin/connections            (POST/GET)   → connection provision/list (cookie-gated; POST CSRF-belted)
  *   /admin/connections/<id>       (DELETE)     → connection teardown (cookie-gated; CSRF-belted)
+ *   /admin/connections/<id>/renew (POST)       → credential renewal (H4; Bearer = the credential itself, proof of possession)
+ *   /admin/connections/<id>/claim (POST)       → claim/reconcile a directly-delivered credential → pending record (surface#113; Bearer = the credential itself)
+ *   /admin/connections/<id>/approve (POST)     → operator approval of a pending claim (cookie-gated; CSRF-belted)
  *
  *   # "CSRF-belted" = strict same-origin Origin check on cookie-authed
  *   # mutations (hub#632, boundary C1) — origin-check.ts
