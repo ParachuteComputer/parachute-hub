@@ -279,6 +279,7 @@ import {
   vaultInstanceNameFor,
 } from "./well-known.ts";
 import { type WsBridgeData, createWsBridgeHandlers } from "./ws-bridge.ts";
+import { type WsConnectionTracker, defaultWsConnectionTracker } from "./ws-connection-caps.ts";
 
 interface Args {
   port: number;
@@ -659,6 +660,54 @@ export function stampSubstrateTrustHeaders(
   headers.set(PARACHUTE_LAYER_HEADER, layerOf(req, peerAddr));
   const clientIp = resolveClientIp(req, peerAddr);
   if (clientIp) headers.set(PARACHUTE_CLIENT_IP_HEADER, clientIp);
+}
+
+/**
+ * Shared bucket for connections whose client IP cannot be derived at all
+ * (no forwarder headers AND no peer address). Fail-closed: they all contend
+ * for one per-IP allotment rather than each minting a fresh bucket — the
+ * same posture as rate-limit.ts's UNKNOWN_IP_SENTINEL.
+ */
+export const WS_CAP_SHARED_BUCKET = "unknown";
+
+/**
+ * Derive the connection-cap bucket key for a WS upgrade (hub#649).
+ *
+ * STRICTER than {@link resolveClientIp} on purpose. The H2 attribution stamp
+ * tolerates a direct caller misattributing itself (documented limitation —
+ * the LAYER stays truthful, only the attribution string is best-effort). A
+ * cap key cannot afford that tolerance: if a direct peer's forged
+ * X-Forwarded-For were believed, rotating the header would mint a fresh
+ * bucket per connection and the per-IP cap would never trip. So forwarded
+ * IP headers are believed ONLY when the peer is loopback — the hub's actual
+ * forwarder topology (cloudflared, tailscale serve/funnel) runs on-box and
+ * dials 127.0.0.1; nothing else legitimately presents those headers from
+ * loopback, and a remote attacker can't BE loopback.
+ *
+ *   - loopback peer:  CF-Connecting-IP → X-Forwarded-For first hop → the
+ *     loopback address itself (direct local callers share one bucket —
+ *     owner-operated, and the cap is configurable).
+ *   - non-loopback peer: the peer address, regardless of injected headers
+ *     (spoofed XFF on an untrusted layer lands in the spoofer's own bucket).
+ *   - no peer derivable: {@link WS_CAP_SHARED_BUCKET} (fail closed).
+ *
+ * Known limitation, container deploys (Render / Fly): the platform edge
+ * dials from a private non-loopback address, so all public clients share
+ * the edge peer's bucket there — the per-IP cap degrades to a coarse shared
+ * cap and the global cap is the operative bound. Raise
+ * PARACHUTE_WS_MAX_PER_IP on such deploys; a trusted-proxy allowlist can
+ * refine this when a cloud WS surface actually ships.
+ */
+export function wsCapBucketKey(req: Request, peerAddr: string | null): string {
+  const peer = peerAddr?.trim() || null;
+  if (peer && isLoopbackPeer(peer)) {
+    const cf = req.headers.get("cf-connecting-ip")?.trim();
+    if (cf) return cf;
+    const xff = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+    if (xff) return xff;
+    return peer;
+  }
+  return peer ?? WS_CAP_SHARED_BUCKET;
 }
 
 /**
@@ -1148,6 +1197,15 @@ export interface HubFetchDeps {
    * CLI commands directly.
    */
   supervisor?: Supervisor;
+  /**
+   * WebSocket connection-cap accounting (hub#649). Production uses the
+   * process-wide {@link defaultWsConnectionTracker} (caps from env at boot);
+   * tests inject their own tracker so they neither consume nor depend on the
+   * shared counters. Release pairing is structural — the acquire site stashes
+   * the release closure on the upgraded socket's `data`, so a mismatched
+   * tracker between fetch fn and bridge handlers is impossible.
+   */
+  wsConnectionTracker?: WsConnectionTracker;
 }
 
 /**
@@ -1629,7 +1687,15 @@ type WsUpgradeVerdict =
  *      `.parachute/module.json`. No declaration → 426 (the route exists but
  *      doesn't speak WebSocket; the fetch-based proxy can't forward upgrades
  *      and the daemon never sees the request).
- *   4. `server.upgrade(req, { data })` with the upstream URL + headers
+ *   4. Connection caps (hub#649): per-client-IP + total concurrent caps,
+ *      checked-and-acquired in the same synchronous block as the upgrade
+ *      (no await between check and commit). Over-cap → generic 429 (no
+ *      count leakage; the hub log carries which cap + bucket), refused
+ *      BEFORE `server.upgrade()` commits a socket or the bridge dials the
+ *      upstream. Keying + trust model: {@link wsCapBucketKey}; defaults +
+ *      env overrides: `ws-connection-caps.ts`. Release rides the bridge's
+ *      close handler via `data.releaseCap`.
+ *   5. `server.upgrade(req, { data })` with the upstream URL + headers
  *      (client headers minus hop-by-hop/handshake, plus the H2 substrate
  *      trust stamps). The ws-bridge handlers take over from there.
  */
@@ -1642,6 +1708,8 @@ async function maybeUpgradeWebSocket(
     readModuleManifestFn: (installDir: string) => Promise<ModuleManifest | null>;
     /** H3 — gate the upgrade on the mount's audience BEFORE upgrading. */
     gateAudience?: (pathname: string) => Promise<Response | null>;
+    /** hub#649 — per-IP + total connection-cap accounting. */
+    wsConnectionTracker: WsConnectionTracker;
   },
 ): Promise<WsUpgradeVerdict> {
   const services = readManifestLenient(deps.manifestPath).services;
@@ -1719,10 +1787,46 @@ async function maybeUpgradeWebSocket(
     upstreamHeaders[key] = value;
   });
 
+  // Connection caps (hub#649) — the LAST gate, synchronous with the upgrade
+  // itself (everything between here and `server.upgrade` must stay
+  // await-free so the check can't race the commit). Last on purpose: the
+  // earlier refusals keep their precise statuses (the 404 cloak stays
+  // indistinguishable from not-installed even under cap pressure), and the
+  // counters only ever hold slots for connections that would actually
+  // bridge.
+  const capKey = wsCapBucketKey(req, deps.peerAddr);
+  const acquired = deps.wsConnectionTracker.tryAcquire(capKey);
+  if (!acquired.ok) {
+    // Operator-facing pressure signal: which cap, which bucket, how full.
+    // None of this reaches the client — the 429 body is deliberately
+    // generic (no counts, no cap identity).
+    console.warn(
+      `[ws-caps] refused upgrade for ${url.pathname}: ${
+        acquired.reason === "per_ip_cap" ? `per-IP cap (ip=${capKey})` : `total cap (ip=${capKey})`
+      }; total=${deps.wsConnectionTracker.totalCount} ip_count=${deps.wsConnectionTracker.countFor(
+        capKey,
+      )}`,
+    );
+    return {
+      kind: "response",
+      response: new Response(
+        JSON.stringify({
+          error: "too_many_connections",
+          error_description: "WebSocket connection limit reached; try again later",
+        }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      ),
+    };
+  }
+
   const upgraded = server.upgrade(req, {
-    data: { upstreamUrl, upstreamHeaders },
+    data: { upstreamUrl, upstreamHeaders, releaseCap: acquired.release },
   });
   if (upgraded) return { kind: "upgraded" };
+  // No socket was created, so the bridge's close handler will never fire —
+  // release the slot inline (the closure latches, so this can't double-count
+  // against a later close).
+  acquired.release();
   return {
     kind: "response",
     response: new Response(
@@ -1875,6 +1979,7 @@ export function hubFetch(
           manifestPath,
           peerAddr,
           readModuleManifestFn: deps?.readModuleManifest ?? defaultReadModuleManifest,
+          wsConnectionTracker: deps?.wsConnectionTracker ?? defaultWsConnectionTracker,
           // H3 — the audience gate runs BEFORE the upgrade, same posture as
           // the HTTP dispatch below: a WS endpoint under a hub-users surface
           // never hands a socket to an anonymous caller, while `surface`

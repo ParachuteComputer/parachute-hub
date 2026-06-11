@@ -28,6 +28,15 @@
  *     buffered amount exceeds {@link DEFAULT_MAX_BUFFERED_BYTES}, the bridge
  *     closes BOTH sides (1011). A slow consumer should reconnect rather than
  *     let the hub buffer unboundedly.
+ *   - Admission control is upstream of this module (hub#649): the gate in
+ *     `maybeUpgradeWebSocket` enforces per-client-IP + total connection caps
+ *     (defaults 32 / 512, env-overridable via PARACHUTE_WS_MAX_PER_IP /
+ *     PARACHUTE_WS_MAX_TOTAL — see `ws-connection-caps.ts`) BEFORE
+ *     `server.upgrade()`. The bridge's part of the contract is release: the
+ *     `close` handler below is the single funnel every accepted socket
+ *     passes through, so it invokes {@link WsBridgeData.releaseCap} first
+ *     thing — whatever the teardown reason — and the counters churn back to
+ *     zero with the sockets.
  *
  * Lifecycle: either side closing tears down the other (close code + reason
  * propagated where the RFC 6455 rules allow), and an upstream connect failure
@@ -59,6 +68,14 @@ export interface WsBridgeData {
    * plus the H2 substrate trust stamps.
    */
   upstreamHeaders: Record<string, string>;
+  /**
+   * Releases this connection's slot in the connection-cap accounting
+   * (hub#649) — attached by the acquire site in `maybeUpgradeWebSocket`,
+   * invoked by the `close` handler. Self-disarming (safe to call more than
+   * once). Optional so handler-level unit tests that fake `ws.data` don't
+   * have to care about caps.
+   */
+  releaseCap?: () => void;
   /** Internal bridge state — attached by `open()`, owned by this module. */
   _bridge?: BridgeState;
 }
@@ -219,6 +236,12 @@ export function createWsBridgeHandlers(opts: WsBridgeOptions = {}): WebSocketHan
     },
 
     close(ws, code, reason) {
+      // Connection-cap release FIRST (hub#649) — before the bridge-state
+      // early-returns, because this callback fires even for sockets whose
+      // upstream connect threw in open() (no `_bridge` attached) and is the
+      // one teardown funnel every accepted socket passes through. The
+      // closure latches, so re-entry is harmless.
+      ws.data.releaseCap?.();
       // Client → upstream close propagation. Note: Bun's server-side close
       // callback delivers the client's close CODE but an empty `reason`
       // (verified on Bun 1.3.13), so only the code propagates upstream in
