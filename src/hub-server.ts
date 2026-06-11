@@ -1802,7 +1802,7 @@ async function maybeUpgradeWebSocket(
     // generic (no counts, no cap identity).
     console.warn(
       `[ws-caps] refused upgrade for ${url.pathname}: ${
-        acquired.reason === "per_ip_cap" ? `per-IP cap (ip=${capKey})` : "total cap"
+        acquired.reason === "per_ip_cap" ? `per-IP cap (ip=${capKey})` : `total cap (ip=${capKey})`
       }; total=${deps.wsConnectionTracker.totalCount} ip_count=${deps.wsConnectionTracker.countFor(
         capKey,
       )}`,
