@@ -44,6 +44,26 @@
  * downgrades: if `npm view <pkg>@<channel> version` resolves to something
  * lower than what's installed, we abort with an actionable message
  * (override with `--allow-downgrade`).
+ *
+ * RC-channel best-of resolution (hub#659). Channel preservation (#332) made
+ * the rc channel sticky — `parachute upgrade` follows `@rc`. But the rc
+ * channel is a *canary*: when a train ships stable-direct without cutting an
+ * rc (the common case under the post-#332 governance where trains start at
+ * stable), `@rc` doesn't advance and the box strands BELOW `@latest` with no
+ * visible path forward (the live case: friends.parachute.computer pinned at
+ * 0.6.5-rc.8 while @latest moved to 0.7.1). The fix: on the rc channel we
+ * resolve the target to the HIGHEST version above installed across BOTH `@rc`
+ * AND `@latest`.
+ *   - mid-chain (a newer rc exists) → take the rc; the canary stays ahead
+ *     (UNCHANGED — this is the #332 behavior).
+ *   - end-of-chain / skipped-rc train (no newer rc, but @latest > installed)
+ *     → CONVERGE to @latest, with a loud log line. The operator stays ON the
+ *     rc channel (the install/config notion of channel is unchanged) — only
+ *     the resolved VERSION changes; they pick up the next rc when it ships.
+ *   - nothing newer anywhere → the existing up-to-date no-op.
+ * The `@latest` (stable) channel path is UNCHANGED — stable never reaches for
+ * `@rc`. `--channel rc|latest` explicit overrides and `--allow-downgrade`
+ * keep working.
  */
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
@@ -689,10 +709,102 @@ function pickChannel(installedVersion: string | null, r: Resolved): string {
   return "latest";
 }
 
+/**
+ * The dist-tag / version `upgradeNpm` will hand to `bun add -g`, after the
+ * rc-channel best-of resolution (hub#659). `installSpec` is what follows the
+ * `@` in `bun add -g <pkg>@<installSpec>` — usually a dist-tag (`rc` /
+ * `latest`), but a pinned concrete version when we converge an rc-channel box
+ * onto stable (so a moving `@latest` can't race the resolution). `channel` is
+ * the dist-tag we resolved against, used by the downgrade-guard messaging.
+ */
+interface ResolvedNpmTarget {
+  installSpec: string;
+  channel: string;
+}
+
+/**
+ * Resolve which version the rc channel should actually move to (hub#659).
+ *
+ * Channel preservation (#332) keeps an rc operator following `@rc`. But `@rc`
+ * is a canary that only advances when a train cuts an rc; a stable-direct
+ * train leaves it stranded below `@latest`. So on the rc channel we look at
+ * BOTH dist-tags and take the highest one that's actually ABOVE installed:
+ *   - a newer `@rc` exists → stay on rc (mid-chain canary; UNCHANGED).
+ *   - no newer rc but `@latest` > installed → converge to `@latest`, pinned to
+ *     the concrete resolved version, with a LOUD log. The operator stays ON
+ *     the rc channel; only this upgrade's resolved version changes.
+ *   - neither tag is above installed → fall through to the rc tag and let the
+ *     normal "already at <v>" no-op fire after `bun add -g`.
+ *
+ * Returns the original `{ installSpec: "rc" }` unchanged whenever we can't read
+ * the installed version or can't resolve a higher stable (fail-open: never
+ * block a legitimate `@rc` upgrade on a flaky probe).
+ */
+async function resolveRcBestOf(
+  target: ResolvedTarget,
+  beforeVersion: string | null,
+  r: Resolved,
+): Promise<ResolvedNpmTarget> {
+  const rcTarget: ResolvedNpmTarget = { installSpec: "rc", channel: "rc" };
+  if (!beforeVersion) return rcTarget;
+
+  const [rcVersion, latestVersion] = await Promise.all([
+    r.resolveChannelVersion(target.packageName, "rc"),
+    r.resolveChannelVersion(target.packageName, "latest"),
+  ]);
+
+  const rcAbove = rcVersion !== null && (compareVersions(rcVersion, beforeVersion) ?? -1) > 0;
+  if (rcAbove) {
+    // A newer rc exists — the canary stays ahead (the #332 mid-chain path).
+    return rcTarget;
+  }
+
+  const latestAbove =
+    latestVersion !== null && (compareVersions(latestVersion, beforeVersion) ?? -1) > 0;
+  // (`latestVersion !== null` already guaranteed by `latestAbove`; the second
+  // term only narrows it for TS.)
+  if (latestAbove && latestVersion) {
+    // End-of-chain / skipped-rc train: nothing newer on @rc, but stable moved
+    // ahead. Converge to @latest — pinned to the concrete version so a moving
+    // dist-tag can't race us — and say so LOUDLY (the hub#659 stranding fix).
+    r.log(
+      `${target.short}: the rc channel has nothing newer than ${beforeVersion}; ` +
+        `converging to stable ${latestVersion} — you'll pick up the next rc when it ships.`,
+    );
+    return { installSpec: latestVersion, channel: "latest" };
+  }
+
+  // Neither tag is above installed — stay on @rc and let the post-install
+  // "already at <v>" no-op fire (handled in upgradeNpm). When both probes
+  // resolved and both are ≤ installed, name that explicitly.
+  if (rcVersion !== null && latestVersion !== null) {
+    r.log(
+      `${target.short}: on the rc channel — @rc (${rcVersion}) and @latest (${latestVersion}) ` +
+        `are both at or below installed ${beforeVersion}.`,
+    );
+  }
+  return rcTarget;
+}
+
 async function upgradeNpm(target: ResolvedTarget, sourceDir: string, r: Resolved): Promise<number> {
   r.log(`${target.short}: npm-installed (${sourceDir})`);
   const beforeVersion = readPackageVersion(join(sourceDir, "package.json"));
-  const channel = pickChannel(beforeVersion, r);
+  const pickedChannel = pickChannel(beforeVersion, r);
+
+  // RC-channel best-of resolution (hub#659). On the rc channel, resolve to the
+  // highest version above installed across @rc AND @latest — so an end-of-chain
+  // box converges to stable instead of stranding below it. The stable channel
+  // and explicit programmatic `--tag` are UNCHANGED: only an *auto-detected or
+  // --channel-rc* resolution reaches for stable. An explicit `--channel rc`
+  // ALSO flows through best-of (a deliberate rc operator still gets converge);
+  // `r.tag` (programmatic pin) and `--channel latest` both leave it untouched.
+  let installSpec = pickedChannel;
+  let channel = pickedChannel;
+  if (pickedChannel === "rc" && !r.tag) {
+    const resolved = await resolveRcBestOf(target, beforeVersion, r);
+    installSpec = resolved.installSpec;
+    channel = resolved.channel;
+  }
 
   // Downgrade guard: refuse to silently move backward. Only applies when
   // we can read both sides — beforeVersion from disk, targetVersion via
@@ -700,6 +812,10 @@ async function upgradeNpm(target: ResolvedTarget, sourceDir: string, r: Resolved
   // behavior: just run `bun add -g`). This is the load-bearing fix for
   // hub#332 — Aaron got `0.5.13-rc.13` → `0.5.10` because the implicit
   // `@latest` resolved to a prior stable while he was on the rc chain.
+  //
+  // After hub#659's best-of resolution `channel` is already the tag we're
+  // actually shipping (rc on the canary path, latest on the converge path), so
+  // the guard checks the version we'll really install.
   if (beforeVersion && !r.allowDowngrade) {
     const targetVersion = await r.resolveChannelVersion(target.packageName, channel);
     if (targetVersion) {
@@ -725,7 +841,7 @@ async function upgradeNpm(target: ResolvedTarget, sourceDir: string, r: Resolved
     }
   }
 
-  const spec = `${target.packageName}@${channel}`;
+  const spec = `${target.packageName}@${installSpec}`;
   r.log(`${target.short}: bun add -g ${spec}`);
   const code = await r.runner.run(["bun", "add", "-g", spec]);
   if (code !== 0) {

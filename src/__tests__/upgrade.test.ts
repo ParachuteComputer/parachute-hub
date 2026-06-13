@@ -1219,6 +1219,282 @@ describe("parachute upgrade", () => {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // hub#659 — rc channel resolves best-of @rc / @latest above installed.
+  // The rc channel is a canary: it must stay ahead when a newer rc exists, but
+  // CONVERGE to stable when a train shipped stable-direct (no rc cut) and the
+  // box would otherwise strand below @latest with no visible path forward.
+  // -------------------------------------------------------------------------
+
+  test("rc channel, newer rc exists → takes @rc (canary stays ahead, #332 unchanged)", async () => {
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.6.5-rc.8" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.6.5-rc.9" });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const logs: string[] = [];
+      const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async () => 0,
+        // A newer rc (rc.9) exists AND @latest moved (0.7.1) — the canary wins.
+        resolveChannelVersion: async (_pkg, channel) => (channel === "rc" ? "0.6.5-rc.9" : "0.7.1"),
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@rc"]);
+      // No "converging to stable" line — we stayed on the canary.
+      expect(logs.join("\n")).not.toMatch(/converging to stable/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("THE hub#659 pin: rc channel, NO newer rc but @latest is higher → converges to @latest with a loud line", async () => {
+    // The live stranding case: friends.parachute.computer on 0.6.5-rc.8. The
+    // @rc dist-tag never advanced (every train since shipped stable-direct), so
+    // pre-fix `parachute upgrade hub` followed @rc and NO-OPPED — the box sat
+    // below @latest (0.7.1) with no visible path. Post-fix: converge to the
+    // concrete stable, pinned, with a loud log naming the channel + the version.
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.6.5-rc.8" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          // Honest registry simulation: `bun add -g @…@rc` resolves to the
+          // installed rc.8 (no change → the pre-fix no-op); only the converged
+          // stable pin rewrites the package.json. This is what makes the test
+          // fail PRE-FIX — pre-fix the verb only ever asks for @rc and no-ops.
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            const spec = cmd[3] ?? "";
+            if (spec.endsWith("@0.7.1") || spec.endsWith("@latest")) {
+              writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.7.1" });
+            }
+            // spec ending in @rc → resolves to installed 0.6.5-rc.8, no rewrite.
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const logs: string[] = [];
+      let restartedShort: string | undefined;
+      const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async (svc) => {
+          restartedShort = svc;
+          return 0;
+        },
+        // @rc stuck at the installed version (no newer rc); @latest moved ahead.
+        resolveChannelVersion: async (_pkg, channel) => (channel === "rc" ? "0.6.5-rc.8" : "0.7.1"),
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      // Converged: pinned to the CONCRETE stable version (not @latest dist-tag),
+      // so a moving tag can't race the resolution.
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@0.7.1"]);
+      // Phase 5b: hub restarts via the manager (okHubUnitSupervisor); the verb
+      // still reaches the restart leg because the version changed.
+      const joined = logs.join("\n");
+      // The LOUD convergence line — names the rc channel, the installed version,
+      // the stable target, and the "next rc" reassurance.
+      expect(joined).toMatch(/the rc channel has nothing newer than 0\.6\.5-rc\.8/);
+      expect(joined).toMatch(/converging to stable 0\.7\.1/);
+      expect(joined).toMatch(/pick up the next rc/);
+      // It actually moved (the no-op would NOT have).
+      expect(joined).toMatch(/0\.6\.5-rc\.8 → 0\.7\.1/);
+      void restartedShort; // hub restarts via the manager seam, not restartFn
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("rc channel, @rc and @latest both ≤ installed → up-to-date no-op (names both)", async () => {
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.7.2-rc.1" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          // bun add -g @rc resolves to the same installed version → no rewrite.
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const logs: string[] = [];
+      let restartCalled = false;
+      const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async () => {
+          restartCalled = true;
+          return 0;
+        },
+        // Nothing newer anywhere: @rc == installed, @latest below installed.
+        resolveChannelVersion: async (_pkg, channel) => (channel === "rc" ? "0.7.2-rc.1" : "0.7.1"),
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      expect(restartCalled).toBe(false);
+      // Stays on @rc (no convergence); the post-install no-op fires.
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@rc"]);
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/@rc \(0\.7\.2-rc\.1\) and @latest \(0\.7\.1\) are both at or below/);
+      expect(joined).toMatch(/already at 0\.7\.2-rc\.1/);
+      expect(joined).not.toMatch(/converging to stable/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("latest channel is unchanged: stable install never reaches for @rc (hub#659 scoped to rc)", async () => {
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.7.1" });
+
+      const seenCmd: string[][] = [];
+      let rcProbed = false;
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          if (cmd[0] === "bun" && cmd[1] === "add" && cmd[2] === "-g") {
+            writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.7.2" });
+          }
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async () => 0,
+        // Track whether the rc tag is ever probed — it must NOT be on the
+        // stable channel (best-of resolution is scoped to rc).
+        resolveChannelVersion: async (_pkg, channel) => {
+          if (channel === "rc") rcProbed = true;
+          return channel === "latest" ? "0.7.2" : "0.8.0-rc.1";
+        },
+        log: () => {},
+      });
+      expect(code).toBe(0);
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@latest"]);
+      // The stable channel never reaches across to @rc.
+      expect(rcProbed).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("rc channel converge still respects the downgrade guard (no @latest below installed sneaks through)", async () => {
+    // Defensive: if @rc is stuck AND @latest is somehow BELOW installed (an
+    // operator on a hand-pinned newer rc than the latest stable), we neither
+    // converge nor downgrade — we stay on @rc and no-op.
+    const h = makeHarness();
+    try {
+      const hubInstallDir = join(h.installRoot, "hub");
+      writePackageJson(hubInstallDir, { name: "@openparachute/hub", version: "0.8.0-rc.1" });
+
+      const seenCmd: string[][] = [];
+      const runner: UpgradeRunner = {
+        async run(cmd) {
+          seenCmd.push([...cmd]);
+          return 0;
+        },
+        async capture(cmd) {
+          if (cmd[1] === "rev-parse" && cmd[2] === "--is-inside-work-tree") {
+            return { code: 128, stdout: "" };
+          }
+          return { code: 0, stdout: "" };
+        },
+      };
+
+      const logs: string[] = [];
+      const code = await upgrade("hub", {
+        supervisor: okHubUnitSupervisor,
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        runner,
+        findGlobalInstall: (pkg) =>
+          pkg === "@openparachute/hub" ? join(hubInstallDir, "package.json") : null,
+        restartFn: async () => 0,
+        // @rc == installed (no newer rc); @latest is a PRIOR stable, below us.
+        resolveChannelVersion: async (_pkg, channel) => (channel === "rc" ? "0.8.0-rc.1" : "0.7.1"),
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(0);
+      // Stayed on @rc — no convergence to a lower stable.
+      const addCall = seenCmd.find((c) => c[0] === "bun" && c[1] === "add");
+      expect(addCall).toEqual(["bun", "add", "-g", "@openparachute/hub@rc"]);
+      expect(logs.join("\n")).not.toMatch(/converging to stable/);
+      expect(logs.join("\n")).not.toMatch(/refusing to downgrade/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("--tag still overrides everything (back-compat for programmatic pin)", async () => {
     const h = makeHarness();
     try {
