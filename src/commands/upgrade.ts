@@ -761,6 +761,8 @@ async function resolveRcBestOf(
 
   const latestAbove =
     latestVersion !== null && (compareVersions(latestVersion, beforeVersion) ?? -1) > 0;
+  // (`latestVersion !== null` already guaranteed by `latestAbove`; the second
+  // term only narrows it for TS.)
   if (latestAbove && latestVersion) {
     // End-of-chain / skipped-rc train: nothing newer on @rc, but stable moved
     // ahead. Converge to @latest — pinned to the concrete version so a moving
@@ -793,8 +795,9 @@ async function upgradeNpm(target: ResolvedTarget, sourceDir: string, r: Resolved
   // highest version above installed across @rc AND @latest — so an end-of-chain
   // box converges to stable instead of stranding below it. The stable channel
   // and explicit programmatic `--tag` are UNCHANGED: only an *auto-detected or
-  // --channel-rc* resolution reaches for stable. `r.tag` (programmatic pin) and
-  // an explicit `--channel latest` both leave the rc best-of untouched.
+  // --channel-rc* resolution reaches for stable. An explicit `--channel rc`
+  // ALSO flows through best-of (a deliberate rc operator still gets converge);
+  // `r.tag` (programmatic pin) and `--channel latest` both leave it untouched.
   let installSpec = pickedChannel;
   let channel = pickedChannel;
   if (pickedChannel === "rc" && !r.tag) {
