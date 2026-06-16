@@ -2,7 +2,7 @@
 
 `@openparachute/hub` — the local hub for the [Parachute](https://parachute.computer) ecosystem. The `parachute` binary is one of its surfaces.
 
-The hub coordinates the modules running on your machine: it installs them, supervises them as child processes (the hub itself runs under your platform's process manager — launchd / systemd / the container runtime), exposes them over Tailscale, serves the discovery document at `/.well-known/parachute.json`, and (soon) issues OAuth tokens. Each module (vault, app, scribe, …) stays a standalone package; the hub stitches them together.
+The hub coordinates the modules running on your machine: it installs them, supervises them as child processes (the hub itself runs under your platform's process manager — launchd / systemd / the container runtime), exposes them over Tailscale, serves the discovery document at `/.well-known/parachute.json`, and (soon) issues OAuth tokens. Each module (vault, surface, scribe, …) stays a standalone package; the hub stitches them together.
 
 > Previously published as `@openparachute/cli`. Renamed 2026-04-26 to better reflect the role — see [parachute-patterns/hub-as-issuer](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/hub-as-issuer.md). The `parachute` binary name is unchanged.
 
@@ -55,7 +55,7 @@ Config in `fly.toml`. CLI-first ops; bring your own `flyctl`.
 
 #### Both platforms
 
-Pre-configured with `PARACHUTE_INSTALL_CHANNEL=latest` so modules you install via the admin SPA (vault, app, scribe, runner) pull stable releases by default. Flip to `rc` in your platform's env vars for the pre-release cascade.
+Pre-configured with `PARACHUTE_INSTALL_CHANNEL=latest` so modules you install via the admin SPA (vault, surface, scribe, runner) pull stable releases by default. Flip to `rc` in your platform's env vars for the pre-release cascade.
 
 Operators who want env-var-driven seeding (CI, scripted deploys) can still set `PARACHUTE_INITIAL_ADMIN_USERNAME` + `PARACHUTE_INITIAL_ADMIN_PASSWORD` manually — hub honors them on both platforms.
 
@@ -292,7 +292,7 @@ Every service mounts under a path on a single canonical hostname. The root `/` i
 ```
 https://parachute.<tailnet>.ts.net/                              → hub (service directory)
 https://parachute.<tailnet>.ts.net/vault/default                 → parachute-vault API
-https://parachute.<tailnet>.ts.net/lens                          → parachute-lens
+https://parachute.<tailnet>.ts.net/surface                       → parachute-surface
 https://parachute.<tailnet>.ts.net/scribe                        → parachute-scribe
 https://parachute.<tailnet>.ts.net/.well-known/parachute.json    ← discovery
 ```
@@ -319,14 +319,13 @@ The `/.well-known/parachute.json` document is an always-present descriptor — f
       "infoUrl": "https://parachute.taildf9ce2.ts.net/vault/default/.parachute/info"
     },
     {
-      "name": "parachute-lens",
-      "url":  "https://parachute.taildf9ce2.ts.net/lens",
-      "path": "/lens",
-      "version": "0.0.1",
-      "infoUrl": "https://parachute.taildf9ce2.ts.net/lens/.parachute/info"
+      "name": "parachute-surface",
+      "url":  "https://parachute.taildf9ce2.ts.net/surface",
+      "path": "/surface",
+      "version": "0.3.2",
+      "infoUrl": "https://parachute.taildf9ce2.ts.net/surface/.parachute/info"
     }
-  ],
-  "lens": { "url": "https://parachute.taildf9ce2.ts.net/lens", "version": "0.0.1" }
+  ]
 }
 ```
 
@@ -344,11 +343,11 @@ Parachute services reserve a block of loopback ports in the canonical range **19
 | 1939 | parachute-hub (internal proxy + static) |
 | 1940 | parachute-vault    |
 | 1941 | parachute-channel  |
-| 1942 | parachute-notes *(deprecating — see [notes#154](https://github.com/ParachuteComputer/parachute-notes/issues/154); folds into parachute-app at 1946)* |
+| 1942 | *parachute-notes (archived 2026-05-24 — notes-daemon retired; Notes now bundled in parachute-surface. Slot reclaimable; see [`parachute-notes/DEPRECATED.md`](https://github.com/ParachuteComputer/parachute-notes/blob/main/DEPRECATED.md))* |
 | 1943 | parachute-scribe   |
 | 1944 | *parachute-agent (retired 2026-05-20; slot held — see [`parachute-agent/DEPRECATED.md`](https://github.com/ParachuteComputer/parachute-agent/blob/main/DEPRECATED.md))* |
 | 1945 | parachute-runner *(shipped; exploration-tier, not committed-core)* |
-| 1946 | parachute-app *(committed core; UI host, ships Notes as canonical first app)* |
+| 1946 | parachute-surface *(committed core; UI host — bundles Notes, hosts custom surfaces)* |
 | 1947–1949 | *unassigned (CLI fallback range)* |
 
 The hub pins 1939 — no fallback. If something else is on 1939 when you run `parachute expose`, the command fails with a pointer to `lsof -iTCP:1939` rather than walking up into another service's slot.
