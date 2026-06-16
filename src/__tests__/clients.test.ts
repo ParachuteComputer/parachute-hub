@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   InvalidRedirectUriError,
   approveClient,
+  expandRedirectUrisForHubOrigins,
   getClient,
   isValidRedirectUri,
   listClientsByStatus,
@@ -138,6 +139,96 @@ describe("requireRegisteredRedirectUri", () => {
       expect(() => requireRegisteredRedirectUri(r.client, "https://evil.com/cb")).toThrow(
         InvalidRedirectUriError,
       );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("expandRedirectUrisForHubOrigins (surface#118 cross-hub-origin DCR expansion)", () => {
+  const LOOPBACK = "http://127.0.0.1:1939";
+  const PUBLIC = "https://box.taildf9ce2.ts.net";
+  const hubOrigins = [LOOPBACK, "http://localhost:1939", PUBLIC];
+
+  test("expands a loopback-rooted URI onto every other hub origin", () => {
+    const out = expandRedirectUrisForHubOrigins([`${LOOPBACK}/surface/notes/oauth/callback`], hubOrigins);
+    // Original is preserved + the public + localhost variants are added.
+    expect(out).toContain(`${LOOPBACK}/surface/notes/oauth/callback`);
+    expect(out).toContain(`${PUBLIC}/surface/notes/oauth/callback`);
+    expect(out).toContain("http://localhost:1939/surface/notes/oauth/callback");
+    // The submitted URI comes first (order-preserving).
+    expect(out[0]).toBe(`${LOOPBACK}/surface/notes/oauth/callback`);
+  });
+
+  test("INVARIANT: a foreign-origin URI is stored verbatim — not expanded, not dropped", () => {
+    const foreign = "https://my-vault-ui.example/oauth/callback";
+    const out = expandRedirectUrisForHubOrigins([foreign], hubOrigins);
+    // Stored exactly as submitted...
+    expect(out).toContain(foreign);
+    // ...and NOTHING was minted on any hub origin from it (no open redirect).
+    expect(out).toEqual([foreign]);
+    for (const o of hubOrigins) {
+      expect(out).not.toContain(`${o}/oauth/callback`);
+    }
+  });
+
+  test("mixed submit: hub-origin URI expands, foreign URI rides verbatim alongside", () => {
+    const foreign = "https://evil.example/cb";
+    const out = expandRedirectUrisForHubOrigins(
+      [`${LOOPBACK}/surface/notes/`, foreign],
+      hubOrigins,
+    );
+    // Hub-origin URI fanned out to the public origin.
+    expect(out).toContain(`${PUBLIC}/surface/notes/`);
+    // Foreign URI present, but no hub-origin variant of it exists.
+    expect(out).toContain(foreign);
+    for (const o of hubOrigins) {
+      expect(out).not.toContain(`${o}/cb`);
+    }
+  });
+
+  test("single known hub origin → no expansion (submitted set returned as-is)", () => {
+    const out = expandRedirectUrisForHubOrigins(
+      [`${LOOPBACK}/surface/notes/`],
+      [LOOPBACK],
+    );
+    expect(out).toEqual([`${LOOPBACK}/surface/notes/`]);
+  });
+
+  test("dedupes — already-public + loopback submit doesn't double-register", () => {
+    const out = expandRedirectUrisForHubOrigins(
+      [`${LOOPBACK}/surface/notes/`, `${PUBLIC}/surface/notes/`],
+      hubOrigins,
+    );
+    const publicCount = out.filter((u) => u === `${PUBLIC}/surface/notes/`).length;
+    expect(publicCount).toBe(1);
+  });
+
+  test("path + query + hash are preserved across origins", () => {
+    const out = expandRedirectUrisForHubOrigins(
+      [`${LOOPBACK}/surface/notes/oauth-callback?foo=bar`],
+      hubOrigins,
+    );
+    expect(out).toContain(`${PUBLIC}/surface/notes/oauth-callback?foo=bar`);
+  });
+
+  test("expanded URIs survive registerClient → requireRegisteredRedirectUri strict match", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const expanded = expandRedirectUrisForHubOrigins(
+        [`${LOOPBACK}/surface/notes/oauth/callback`],
+        hubOrigins,
+      );
+      const r = registerClient(db, { redirectUris: expanded });
+      // The public-origin variant now matches exactly at authorize time — the
+      // off-localhost sign-in that surface#118 broke.
+      expect(
+        requireRegisteredRedirectUri(r.client, `${PUBLIC}/surface/notes/oauth/callback`),
+      ).toBe(`${PUBLIC}/surface/notes/oauth/callback`);
+      // A truly-unregistered URI is still rejected — strict match unchanged.
+      expect(() =>
+        requireRegisteredRedirectUri(r.client, "https://evil.example/surface/notes/oauth/callback"),
+      ).toThrow(InvalidRedirectUriError);
     } finally {
       cleanup();
     }

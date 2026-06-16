@@ -38,6 +38,7 @@ import {
   type OAuthClient,
   type RegisteredClient,
   approveClient,
+  expandRedirectUrisForHubOrigins,
   getClient,
   isValidRedirectUri,
   registerClient,
@@ -2546,10 +2547,26 @@ export async function handleRegister(
   }
   const confidential = body.token_endpoint_auth_method === "client_secret_post";
   const scopes = (body.scope ?? "").split(" ").filter((s) => s.length > 0);
+  // Cross-hub-origin expansion (surface#118). A hub-served module (surface,
+  // notes) registers at install time knowing only the loopback hub origin;
+  // once exposed, the browser computes its redirect_uri from the PUBLIC hub
+  // origin, which strict authorize-time matching would reject. We expand each
+  // submitted URI rooted at one of THIS hub's known origins onto every other
+  // known hub origin, so a loopback-registered hub-served client is valid on
+  // the public origin too. FOREIGN-origin redirect_uris (a separate-origin
+  // surface on its own domain) are stored verbatim — never expanded onto hub
+  // origins, never dropped — preserving the strict anti-open-redirect
+  // invariant. Authorize-time matching stays exact-match
+  // (`requireRegisteredRedirectUri`); this only ever ADDS correct hub-origin
+  // URIs the operator already controls.
+  const expandedRedirectUris = expandRedirectUrisForHubOrigins(
+    redirectUris,
+    resolveBoundOrigins(deps),
+  );
   let registered: RegisteredClient;
   try {
     registered = registerClient(db, {
-      redirectUris,
+      redirectUris: expandedRedirectUris,
       scopes,
       clientName: body.client_name,
       confidential,

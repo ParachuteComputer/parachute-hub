@@ -215,6 +215,94 @@ export function requireRegisteredRedirectUri(client: OAuthClient, candidate: str
   return candidate;
 }
 
+/**
+ * Cross-hub-origin redirect_uri expansion for hub-served DCR clients
+ * (surface#118; the "hub assist" half of the fix).
+ *
+ * THE PROBLEM. A hub-served module (surface-host, notes) registers its OAuth
+ * client at install time, when the only origin it knows is the loopback hub
+ * URL (`http://127.0.0.1:1939`). Once the operator runs `parachute expose`,
+ * the browser loads the surface from the PUBLIC hub origin and the
+ * surface-client runtime computes its `redirect_uri` from `window.location.
+ * origin` (the public one) — which was never registered. Authorize-time
+ * matching is deliberately strict exact-match (`requireRegisteredRedirectUri`,
+ * RFC 8252 anti-open-redirect), so the public-origin redirect_uri is rejected
+ * ("Redirect mismatch") and no off-localhost user can sign in.
+ *
+ * THE FIX. At DCR time, for each submitted redirect_uri WHOSE ORIGIN IS ONE
+ * OF THE HUB'S OWN KNOWN ORIGINS (issuer, expose-state hubOrigin, platform
+ * origin, loopback aliases — i.e. the same set `buildHubBoundOrigins`
+ * produces), ALSO register the same PATH on every OTHER known hub origin. A
+ * loopback-registered hub-served client thus becomes valid on the public hub
+ * origin too, without ever loosening the strict authorize-time match.
+ *
+ * THE INVARIANT (no open redirect). Expansion ONLY ever produces URIs rooted
+ * at the hub's OWN known origins. A submitted redirect_uri whose origin is
+ * FOREIGN — a separate-origin surface on its own domain (e.g. my-vault-ui at
+ * `https://notes.example`), a third-party app — is stored VERBATIM: not
+ * expanded onto any hub origin, and not dropped. Only hub-origin-rooted URIs
+ * receive the cross-origin fan-out. Because authorize-time matching stays
+ * strict exact-match against this stored set, an attacker who registers a
+ * foreign redirect_uri gets back exactly what they submitted (no hub-origin
+ * variant minted for them), and a hub-origin-rooted URI only ever fans out to
+ * other hub origins the operator already controls.
+ *
+ * Order-preserving + de-duplicated: the originally-submitted URIs come first
+ * (preserving caller order), with the synthesized hub-origin variants
+ * appended in a stable order; duplicates are collapsed.
+ */
+export function expandRedirectUrisForHubOrigins(
+  submitted: readonly string[],
+  hubOrigins: readonly string[],
+): string[] {
+  // Parse the hub's known origins into a Set for membership tests. Malformed
+  // entries are skipped — the function fails safe (no expansion) rather than
+  // throwing.
+  const hubOriginSet = new Set<string>();
+  for (const raw of hubOrigins) {
+    try {
+      hubOriginSet.add(new URL(raw).origin);
+    } catch {
+      // Skip malformed hub origin.
+    }
+  }
+
+  // Preserve submitted order + dedupe; append synthesized variants after.
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (uri: string) => {
+    if (seen.has(uri)) return;
+    seen.add(uri);
+    out.push(uri);
+  };
+
+  // 1) Every submitted URI is stored as-is (foreign + hub-origin alike). This
+  //    is what guarantees a foreign redirect_uri is never dropped.
+  for (const uri of submitted) push(uri);
+
+  // 2) For each submitted URI rooted at a hub origin, synthesize the same path
+  //    on every OTHER hub origin. Foreign-origin URIs are skipped here — they
+  //    never spawn a hub-origin variant (the open-redirect guard).
+  if (hubOriginSet.size > 1) {
+    for (const uri of submitted) {
+      let parsed: URL;
+      try {
+        parsed = new URL(uri);
+      } catch {
+        continue;
+      }
+      if (!hubOriginSet.has(parsed.origin)) continue; // foreign → no expansion
+      const pathSuffix = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+      for (const origin of hubOriginSet) {
+        if (origin === parsed.origin) continue;
+        push(`${origin}${pathSuffix}`);
+      }
+    }
+  }
+
+  return out;
+}
+
 export function verifyClientSecret(client: OAuthClient, presented: string): boolean {
   if (!client.clientSecretHash) return false;
   const presentedHash = createHash("sha256").update(presented).digest("hex");

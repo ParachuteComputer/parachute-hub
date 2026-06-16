@@ -3279,6 +3279,103 @@ describe("handleRegister — RFC 7591 DCR", () => {
   });
 });
 
+// surface#118 — a hub-served module (surface, notes) registers at install time
+// knowing only the loopback hub origin; once exposed, the browser computes its
+// redirect_uri from the PUBLIC hub origin, which strict authorize-time matching
+// would reject. handleRegister expands hub-origin-rooted redirect_uris onto
+// every known hub origin (via deps.hubBoundOrigins). Foreign-origin URIs stay
+// verbatim — never expanded onto hub origins, never dropped (open-redirect
+// guard). Authorize-time matching is unchanged (strict exact-match).
+describe("handleRegister — cross-hub-origin redirect_uri expansion (surface#118)", () => {
+  const PUBLIC = "https://box.taildf9ce2.ts.net";
+  const LOOPBACK = "http://127.0.0.1:1939";
+  const boundOrigins = () => [ISSUER, LOOPBACK, "http://localhost:1939", PUBLIC];
+
+  test("loopback-rooted URI is stored WITH the public-origin variant", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const req = new Request(`${ISSUER}/oauth/register`, {
+        method: "POST",
+        body: JSON.stringify({
+          redirect_uris: [`${LOOPBACK}/surface/notes/oauth/callback`],
+          scope: "vault:default:read",
+          client_name: "Notes",
+        }),
+        headers: { "content-type": "application/json" },
+      });
+      const res = await handleRegister(db, req, {
+        issuer: ISSUER,
+        hubBoundOrigins: boundOrigins,
+      });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      const stored = body.redirect_uris as string[];
+      // The submitted loopback URI is preserved...
+      expect(stored).toContain(`${LOOPBACK}/surface/notes/oauth/callback`);
+      // ...and the public-origin variant is now registered — the fix.
+      expect(stored).toContain(`${PUBLIC}/surface/notes/oauth/callback`);
+
+      // The stored set drives authorize-time matching; confirm the public
+      // variant now matches via the real client record.
+      const stored2 = getClient(db, body.client_id as string);
+      expect(stored2?.redirectUris).toContain(`${PUBLIC}/surface/notes/oauth/callback`);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("INVARIANT: a foreign-origin redirect_uri is stored verbatim, NOT expanded onto hub origins", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const foreign = "https://my-vault-ui.example/oauth/callback";
+      const req = new Request(`${ISSUER}/oauth/register`, {
+        method: "POST",
+        body: JSON.stringify({
+          redirect_uris: [foreign],
+          scope: "vault:default:read",
+          client_name: "Off-origin surface",
+        }),
+        headers: { "content-type": "application/json" },
+      });
+      const res = await handleRegister(db, req, {
+        issuer: ISSUER,
+        hubBoundOrigins: boundOrigins,
+      });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      const stored = body.redirect_uris as string[];
+      // Stored exactly as submitted — never dropped.
+      expect(stored).toEqual([foreign]);
+      // No hub-origin variant was minted from the foreign URI (open-redirect guard).
+      for (const o of [ISSUER, LOOPBACK, "http://localhost:1939", PUBLIC]) {
+        expect(stored).not.toContain(`${o}/oauth/callback`);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("no expansion when only one hub origin is known (single-origin hub unaffected)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const req = new Request(`${ISSUER}/oauth/register`, {
+        method: "POST",
+        body: JSON.stringify({
+          redirect_uris: [`${ISSUER}/surface/notes/oauth/callback`],
+        }),
+        headers: { "content-type": "application/json" },
+      });
+      // hubBoundOrigins absent → resolveBoundOrigins falls back to [issuer].
+      const res = await handleRegister(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(201);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.redirect_uris).toEqual([`${ISSUER}/surface/notes/oauth/callback`]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 // closes #74 — DCR is now operator-gated. Self-served registrations land as
 // pending and cannot OAuth; operator-bearer (hub:admin) registrations land
 // as approved and can OAuth immediately. This block covers all four exposed
