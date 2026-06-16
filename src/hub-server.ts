@@ -2314,6 +2314,41 @@ export function hubFetch(
         }
       }
 
+      // Fresh-hub `/login` funnel (hub#644). `/login` is a browser-facing,
+      // server-rendered HTML surface (the sign-in form) — but on a no-admin
+      // box there is no account to sign in as, so the JSON-503 gate below
+      // would render as raw `{"error":"setup_required",...}` text in the
+      // visitor's tab. This is exactly the path a visitor takes when they
+      // load an open module surface (e.g. /vault/admin/) and click its
+      // "Sign in" banner, which links to `/login?next=<surface>`. Funnel the
+      // GET to the wizard instead, mirroring the `/` + `/hub.html` redirect
+      // above (same shape, same justification: never emit a JSON body on an
+      // HTML surface). 302 (not 301) so it disappears the moment setup
+      // completes and the real sign-in form takes over.
+      //
+      // Scoped to `userCount === 0` (the true no-admin state), NOT the
+      // broader `needsWizard`: once an admin exists, that operator must be
+      // able to reach the sign-in form even if no vault is installed yet
+      // (env-seed deploys). Only GET is funneled — a POST to `/login`
+      // pre-admin has no account to authenticate and falls through to the
+      // JSON-503 gate, the right shape for a stray non-browser caller.
+      //
+      // The `?next=<surface>` param is intentionally dropped: there's no
+      // account yet to return the visitor to, and the open surface they came
+      // from likely can't function until setup completes. They land on the
+      // wizard, not back on that surface.
+      //
+      // `cache-control: no-store` (the `/` + `/hub.html` funnel above omits
+      // it) — this 302 reflects transient pre-setup state that flips the
+      // moment an admin is created, so it must never be cached by a CDN or
+      // bfcache and serve a stale "go finish setup" to a now-set-up hub.
+      if (getDb && pathname === "/login" && req.method === "GET" && userCount(getDb()) === 0) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "/admin/setup", "cache-control": "no-store" },
+        });
+      }
+
       // Pre-admin lockout. When the hub has booted with no admin row (the
       // fresh-container case before PARACHUTE_INITIAL_ADMIN_* is set or
       // /admin/setup is walked), every operator-facing surface that requires

@@ -1576,8 +1576,10 @@ describe("hubFetch routing", () => {
   });
 
   // Pre-admin lockout (hub#258). When no admin row exists, operator-
-  // facing surfaces (admin/api/login) 503 with a JSON body pointing at
-  // /admin/setup. Public surfaces (health, well-known, /, oauth, vault,
+  // facing API surfaces (admin/api) 503 with a JSON body pointing at
+  // /admin/setup. The browser-facing `/login` GET 302s to the wizard
+  // instead (hub#644) — a JSON 503 there would render as raw text in the
+  // visitor's tab. Public surfaces (health, well-known, /, oauth, vault,
   // /admin/setup itself) stay open so the container is reachable and
   // OAuth third parties aren't held hostage by admin onboarding.
   test("pre-admin lockout: /admin/vaults returns 503 setup_required", async () => {
@@ -1615,7 +1617,7 @@ describe("hubFetch routing", () => {
     }
   });
 
-  test("pre-admin lockout: /login is gated, /admin/setup + /health + well-known stay open, / funnels to /admin/setup", async () => {
+  test("pre-admin lockout: /login GET funnels to /admin/setup, /admin/setup + /health + well-known stay open, / funnels to /admin/setup", async () => {
     const h = makeHarness();
     try {
       writeFileSync(join(h.dir, "hub.html"), "<html>discovery</html>");
@@ -1623,9 +1625,11 @@ describe("hubFetch routing", () => {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         const handler = hubFetch(h.dir, { getDb: () => db, manifestPath: h.manifestPath });
-        // /login gated
+        // /login GET funnels to the wizard (hub#644) — the browser-facing
+        // sign-in surface 302s to /admin/setup instead of a raw JSON 503.
         const loginRes = await handler(req("/login"));
-        expect(loginRes.status).toBe(503);
+        expect(loginRes.status).toBe(302);
+        expect(loginRes.headers.get("location")).toBe("/admin/setup");
         // /admin/setup open
         const setupRes = await handler(req("/admin/setup"));
         expect(setupRes.status).toBe(200);
