@@ -2332,6 +2332,16 @@ export function hubFetch(
       // (env-seed deploys). Only GET is funneled — a POST to `/login`
       // pre-admin has no account to authenticate and falls through to the
       // JSON-503 gate, the right shape for a stray non-browser caller.
+      //
+      // The `?next=<surface>` param is intentionally dropped: there's no
+      // account yet to return the visitor to, and the open surface they came
+      // from likely can't function until setup completes. They land on the
+      // wizard, not back on that surface.
+      //
+      // `cache-control: no-store` (the `/` + `/hub.html` funnel above omits
+      // it) — this 302 reflects transient pre-setup state that flips the
+      // moment an admin is created, so it must never be cached by a CDN or
+      // bfcache and serve a stale "go finish setup" to a now-set-up hub.
       if (getDb && pathname === "/login" && req.method === "GET" && userCount(getDb()) === 0) {
         return new Response(null, {
           status: 302,
