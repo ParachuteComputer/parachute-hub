@@ -4,8 +4,15 @@
  * with `{error: "setup_required", setup_url: "/admin/setup"}` so
  * callers can branch on the shape rather than scrape an HTML page.
  *
- * Gated routes (require an admin to be useful): `/login`, `/logout`,
- * `/admin/*` (except `/admin/setup`), `/api/*`.
+ * Exception (hub#644): the browser-facing `/login` GET is a server-
+ * rendered HTML surface (the sign-in form), so on a no-admin box it
+ * 302s to `/admin/setup` rather than emitting a raw JSON 503 the
+ * browser would render as text. A `/login` POST still 503s (no account
+ * to authenticate — the right shape for a stray non-browser caller).
+ *
+ * Gated routes (require an admin to be useful): `/login` (GET → 302
+ * wizard; POST → 503), `/logout`, `/admin/*` (except `/admin/setup`),
+ * `/api/*`.
  *
  * Routes that pass through (platform health, public discovery, OAuth
  * third-party flows, content proxies, the setup page itself):
@@ -70,10 +77,33 @@ describe("setup gate (no admin yet)", () => {
     }
   });
 
-  test("503s /login when no admin exists", async () => {
+  // hub#644: `/login` GET is a browser-facing HTML surface (the sign-in
+  // form). On a no-admin box a JSON 503 would render as raw text in the
+  // visitor's tab — exactly what a visitor sees after clicking the "Sign in"
+  // banner on an open module surface. Funnel the GET to the wizard instead,
+  // mirroring the `/` + `/hub.html` redirect.
+  test("/login GET 302s to /admin/setup when no admin exists (hub#644)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const res = await hubFetch(h.dir, { getDb: () => db })(req("/login"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin/setup");
+      // Never a JSON body on the HTML sign-in surface.
+      expect(res.headers.get("content-type") ?? "").not.toContain("application/json");
+    } finally {
+      db.close();
+    }
+  });
+
+  // A POST to `/login` pre-admin has no account to authenticate, so it falls
+  // through to the JSON-503 gate — the right shape for a stray non-browser
+  // caller. Only the browser GET is funneled to the wizard.
+  test("/login POST still 503s setup_required when no admin exists (hub#644)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const res = await hubFetch(h.dir, { getDb: () => db })(
+        req("/login", { method: "POST" }),
+      );
       expect(res.status).toBe(503);
       const body = (await res.json()) as Record<string, unknown>;
       expect(body.error).toBe("setup_required");
@@ -194,6 +224,25 @@ describe("setup gate (admin exists)", () => {
         req("/oauth/token", { method: "GET" }),
       );
       expect(res.status).toBe(405);
+    } finally {
+      db.close();
+    }
+  });
+
+  // hub#644 guard: the no-admin `/login` funnel must NOT fire once an admin
+  // exists — the normal server-rendered sign-in form takes over so operators
+  // (and invited members) can actually sign in.
+  test("/login GET renders the sign-in form (not the setup funnel) once an admin exists (hub#644)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      const res = await hubFetch(h.dir, { getDb: () => db })(req("/login"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const html = await res.text();
+      // The actual sign-in form, posting back to /login.
+      expect(html).toContain('action="/login"');
+      expect(html).toContain('name="password"');
     } finally {
       db.close();
     }
