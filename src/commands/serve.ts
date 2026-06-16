@@ -38,12 +38,42 @@ import { createDbHolder, defaultStatInode, startDbPathLivenessTimer } from "../h
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
 import { writeHubFile } from "../hub.ts";
+import { createWsBridgeHandlers } from "../ws-bridge.ts";
 import { enrichedPath } from "../spawn-path.ts";
 import { Supervisor } from "../supervisor.ts";
 import { createUser, userCount } from "../users.ts";
 import { sanitizePublicOrigin } from "../vault-hub-origin-env.ts";
 import { WELL_KNOWN_DIR } from "../well-known.ts";
 import { bootSupervisedModules } from "./serve-boot.ts";
+
+/**
+ * Build the `Bun.serve` options for the hub listener. Extracted (pure) so the
+ * load-bearing wiring — crucially the `websocket` bridge handler — is unit-
+ * testable and can't silently drift from the other `Bun.serve` in
+ * `hub-server.ts`. That drift is exactly how the in-page-terminal WS upgrade
+ * started 500ing: the bridge was wired into hub-server.ts's serve but NOT this
+ * production `parachute serve` path, so `server.upgrade()` (in `hubFetch`'s
+ * `maybeUpgradeWebSocket`) threw "set the websocket object in Bun.serve({})".
+ */
+export function hubServeOptions(args: {
+  port: number;
+  hostname: string;
+  fetch: ReturnType<typeof hubFetch>;
+}) {
+  return {
+    port: args.port,
+    hostname: args.hostname,
+    // Hold idle keep-alive connections for Bun's maximum 255s so reverse-proxy
+    // edges (Render, Cloudflare, fly.io) don't race us reusing pooled
+    // connections (hub#399).
+    idleTimeout: 255,
+    fetch: args.fetch,
+    // The WebSocket upgrade bridge. `maybeUpgradeWebSocket` (in `hubFetch`) calls
+    // `server.upgrade()`, which THROWS unless the server declares this handler —
+    // so it MUST be present on every Bun.serve that runs `hubFetch`.
+    websocket: createWsBridgeHandlers(),
+  };
+}
 
 export interface ServeOpts {
   /** Override PORT (test-only). Real callers thread env via process.env. */
@@ -456,26 +486,22 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   // fail fast and cleanly, leaving the live hub's children untouched.
   let server: ReturnType<typeof Bun.serve>;
   try {
-    server = Bun.serve({
-      port,
-      hostname,
-      // Hold idle keep-alive connections for Bun's maximum 255s so reverse-
-      // proxy edges (Render, Cloudflare, fly.io) don't race us when reusing
-      // pooled connections. See `src/hub-server.ts` for the full rationale —
-      // this is the active code path for `bun src/cli.ts serve` (the Docker
-      // CMD), so the fix has to land here too. Closes hub#399.
-      idleTimeout: 255,
-      fetch: hubFetch(WELL_KNOWN_DIR, {
-        getDb: () => dbHolder.get(),
-        onDbError: (err) => dbHolder.healOrExit(err),
-        // #610: /health's db check probes the path so monitoring + the #591
-        // adoption probe see a wipe instead of the ghost-fd lie.
-        probeDbPath: () => dbHolder.probePath(),
-        issuer,
-        loopbackPort: port,
-        supervisor,
+    server = Bun.serve(
+      hubServeOptions({
+        port,
+        hostname,
+        fetch: hubFetch(WELL_KNOWN_DIR, {
+          getDb: () => dbHolder.get(),
+          onDbError: (err) => dbHolder.healOrExit(err),
+          // #610: /health's db check probes the path so monitoring + the #591
+          // adoption probe see a wipe instead of the ghost-fd lie.
+          probeDbPath: () => dbHolder.probePath(),
+          issuer,
+          loopbackPort: port,
+          supervisor,
+        }),
       }),
-    });
+    );
   } catch (err) {
     const conflict = hubPortConflictMessage(err, port);
     if (conflict) throw new Error(conflict);

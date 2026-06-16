@@ -8,11 +8,37 @@ import {
   formatBootstrapTokenBanner,
   formatListeningBanner,
   hubPortConflictMessage,
+  hubServeOptions,
   resolveStartupIssuer,
   seedInitialAdminIfNeeded,
 } from "../commands/serve.ts";
 import { openHubDb } from "../hub-db.ts";
 import { getUserByUsername, userCount } from "../users.ts";
+
+describe("hubServeOptions — the production listener wires the WS bridge", () => {
+  // Regression guard: the WS bridge handler was wired into hub-server.ts's
+  // Bun.serve but NOT this production `parachute serve` path, so module WS
+  // upgrades (the channel in-page terminal) 500'd through the hub
+  // ("set the websocket object in Bun.serve({})"). The listener MUST declare a
+  // websocket handler or `server.upgrade()` throws.
+  const fakeFetch = (() => new Response("ok")) as unknown as Parameters<typeof hubServeOptions>[0]["fetch"];
+
+  test("declares a websocket handler set (open/message/close)", () => {
+    const o = hubServeOptions({ port: 0, hostname: "127.0.0.1", fetch: fakeFetch });
+    expect(o.websocket).toBeDefined();
+    expect(typeof o.websocket.open).toBe("function");
+    expect(typeof o.websocket.message).toBe("function");
+    expect(typeof o.websocket.close).toBe("function");
+  });
+
+  test("preserves the port/hostname/idleTimeout + the passed fetch", () => {
+    const o = hubServeOptions({ port: 1939, hostname: "0.0.0.0", fetch: fakeFetch });
+    expect(o.port).toBe(1939);
+    expect(o.hostname).toBe("0.0.0.0");
+    expect(o.idleTimeout).toBe(255);
+    expect(o.fetch).toBe(fakeFetch);
+  });
+});
 
 describe("hubPortConflictMessage (hub#536)", () => {
   test("maps a port-in-use error to a clear duplicate-supervisor message", () => {
