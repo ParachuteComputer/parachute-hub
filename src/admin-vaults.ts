@@ -537,8 +537,8 @@ export interface DeleteVaultDeps {
   manifestPath?: string;
   /** Absolute path to `connections.json` in the hub state dir. */
   connectionsStorePath: string;
-  /** Loopback origin for the channel daemon, or `null` when not installed. */
-  channelOrigin: string | null;
+  /** Loopback origin for the agent daemon, or `null` when not installed. */
+  agentOrigin: string | null;
   /** Resolve a vault's loopback origin from services.json (trigger teardown). */
   resolveVaultOrigin: (vaultName: string) => string | null;
   /**
@@ -651,7 +651,7 @@ function listVaultInstanceNames(manifestPath: string): Set<string> {
  *      the name);
  *   5. connections whose source/provisioned vault is the deleted vault
  *      (via `teardownConnection`, which post-B0 also revokes the registered
- *      long-lived mints) + a report-only scan of channel's `/api/channels`
+ *      long-lived mints) + a report-only scan of the agent's `/api/channels`
  *      for legacy vault-backed entries (`orphaned_channels`);
  *   6. mechanics: shell to `parachute-vault remove <name> --yes` (the module
  *      CLI stays the single source of truth for vault destruction,
@@ -764,7 +764,7 @@ export async function handleDeleteVault(
     ...(deps.resolveModuleOrigin !== undefined
       ? { resolveModuleOrigin: deps.resolveModuleOrigin }
       : {}),
-    channelOrigin: deps.channelOrigin,
+    agentOrigin: deps.agentOrigin,
     storePath: deps.connectionsStorePath,
     ...(deps.fetchImpl !== undefined ? { fetchImpl: deps.fetchImpl } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
@@ -797,9 +797,9 @@ export async function handleDeleteVault(
 
   // Legacy channel scan — vault-backed channel entries still referencing the
   // vault after connection teardown (pre-Connections wiring). REPORT ONLY:
-  // channel's config is the channel module's domain; the operator removes
-  // them from channel's own UI.
-  if (deps.channelOrigin !== null) {
+  // the channel config is the agent module's domain; the operator removes
+  // them from the agent's own UI.
+  if (deps.agentOrigin !== null) {
     try {
       const fetchImpl = deps.fetchImpl ?? fetch;
       // Short-lived (60s) — stays below the registered-mint threshold by
@@ -808,8 +808,8 @@ export async function handleDeleteVault(
       const scanToken = (
         await signAccessToken(deps.db, {
           sub: adminSub,
-          scopes: ["channel:admin"],
-          audience: "channel",
+          scopes: ["agent:admin"],
+          audience: "agent",
           clientId: DELETE_VAULT_CLIENT_ID,
           issuer: deps.issuer,
           ttlSeconds: DELETE_VAULT_PROVISION_TTL_SECONDS,
@@ -817,7 +817,7 @@ export async function handleDeleteVault(
           ...(deps.now !== undefined ? { now: deps.now } : {}),
         })
       ).token;
-      const res = await fetchImpl(`${deps.channelOrigin}/api/channels`, {
+      const res = await fetchImpl(`${deps.agentOrigin}/api/channels`, {
         headers: { authorization: `Bearer ${scanToken}`, accept: "application/json" },
       });
       if (res.ok) {
@@ -830,11 +830,11 @@ export async function handleDeleteVault(
           }
         }
       } else {
-        warnings.push({ step: "channel_scan", detail: `channel list returned ${res.status}` });
+        warnings.push({ step: "agent_scan", detail: `agent channel list returned ${res.status}` });
       }
     } catch (err) {
       warnings.push({
-        step: "channel_scan",
+        step: "agent_scan",
         detail: err instanceof Error ? err.message : String(err),
       });
     }

@@ -1,11 +1,11 @@
 /**
- * Tests for the channel UI session→bearer mint endpoint. Mirrors
- * `admin-host-admin-token.test.ts` shape (channel has a single bare audience,
+ * Tests for the agent UI session→bearer mint endpoint. Mirrors
+ * `admin-host-admin-token.test.ts` shape (agent has a single bare audience,
  * no per-vault name). Covers:
  *   - 401 when no admin session cookie is present.
  *   - 401 when the cookie names a deleted session.
  *   - 405 on POST.
- *   - 200 + JWT carrying `aud: "channel"` and `channel:read channel:send channel:admin`.
+ *   - 200 + JWT carrying `aud: "agent"` and `agent:read agent:send agent:admin`.
  *   - First-admin gate: 403 for a signed-in non-first-admin (friend); the
  *     admin's happy path still mints when a friend exists alongside.
  */
@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CHANNEL_TOKEN_TTL_SECONDS, handleChannelToken } from "../admin-channel-token.ts";
+import { AGENT_TOKEN_TTL_SECONDS, handleAgentToken } from "../admin-agent-token.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { validateAccessToken } from "../jwt-sign.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession, deleteSession } from "../sessions.ts";
@@ -29,7 +29,7 @@ interface Harness {
 }
 
 function makeHarness(): Harness {
-  const dir = mkdtempSync(join(tmpdir(), "phub-channel-token-"));
+  const dir = mkdtempSync(join(tmpdir(), "phub-agent-token-"));
   const db = openHubDb(hubDbPath(dir));
   return {
     db,
@@ -79,10 +79,10 @@ async function withAdminAndFriend(): Promise<{
   };
 }
 
-describe("handleChannelToken", () => {
+describe("handleAgentToken", () => {
   test("401 when no session cookie is present", async () => {
-    const req = new Request(`${ISSUER}/admin/channel-token`);
-    const res = await handleChannelToken(req, { db: harness.db, issuer: ISSUER });
+    const req = new Request(`${ISSUER}/admin/agent-token`);
+    const res = await handleAgentToken(req, { db: harness.db, issuer: ISSUER });
     expect(res.status).toBe(401);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("unauthenticated");
@@ -92,54 +92,54 @@ describe("handleChannelToken", () => {
     const { cookie } = await withSession();
     const sid = cookie.match(/parachute_hub_session=([^;]+)/)?.[1] ?? "";
     deleteSession(harness.db, sid);
-    const req = new Request(`${ISSUER}/admin/channel-token`, { headers: { cookie } });
-    const res = await handleChannelToken(req, { db: harness.db, issuer: ISSUER });
+    const req = new Request(`${ISSUER}/admin/agent-token`, { headers: { cookie } });
+    const res = await handleAgentToken(req, { db: harness.db, issuer: ISSUER });
     expect(res.status).toBe(401);
   });
 
   test("405 on POST", async () => {
     const { cookie } = await withSession();
-    const req = new Request(`${ISSUER}/admin/channel-token`, {
+    const req = new Request(`${ISSUER}/admin/agent-token`, {
       method: "POST",
       headers: { cookie },
     });
-    const res = await handleChannelToken(req, { db: harness.db, issuer: ISSUER });
+    const res = await handleAgentToken(req, { db: harness.db, issuer: ISSUER });
     expect(res.status).toBe(405);
   });
 
-  test("200 mints a JWT carrying aud:channel + channel:read channel:send channel:admin", async () => {
+  test("200 mints a JWT carrying aud:agent + agent:read agent:send agent:admin", async () => {
     const { cookie, userId } = await withSession();
     rotateSigningKey(harness.db);
-    const req = new Request(`${ISSUER}/admin/channel-token`, { headers: { cookie } });
-    const res = await handleChannelToken(req, { db: harness.db, issuer: ISSUER });
+    const req = new Request(`${ISSUER}/admin/agent-token`, { headers: { cookie } });
+    const res = await handleAgentToken(req, { db: harness.db, issuer: ISSUER });
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("no-store");
 
     const body = (await res.json()) as { token: string; expires_at: string; scopes: string[] };
-    // `channel:send` (post) + `channel:read` (SSE replies) + `channel:admin`
+    // `agent:send` (post) + `agent:read` (SSE replies) + `agent:admin`
     // (config UI list/edit — 2026-06-09 modular-UI architecture P3). Deliberately
-    // NOT `channel:write` — that's the session-reply scope a UI token must not hold.
-    expect(body.scopes).toEqual(["channel:read", "channel:send", "channel:admin"]);
-    expect(body.scopes).not.toContain("channel:write");
+    // NOT `agent:write` — that's the session-reply scope a UI token must not hold.
+    expect(body.scopes).toEqual(["agent:read", "agent:send", "agent:admin"]);
+    expect(body.scopes).not.toContain("agent:write");
     expect(body.token.length).toBeGreaterThan(20);
 
     const expMs = new Date(body.expires_at).getTime();
     const skew = expMs - Date.now();
-    expect(skew).toBeGreaterThan((CHANNEL_TOKEN_TTL_SECONDS - 30) * 1000);
-    expect(skew).toBeLessThan((CHANNEL_TOKEN_TTL_SECONDS + 30) * 1000);
+    expect(skew).toBeGreaterThan((AGENT_TOKEN_TTL_SECONDS - 30) * 1000);
+    expect(skew).toBeLessThan((AGENT_TOKEN_TTL_SECONDS + 30) * 1000);
 
     const validated = await validateAccessToken(harness.db, body.token, ISSUER);
     expect(validated.payload.sub).toBe(userId);
     expect(validated.payload.iss).toBe(ISSUER);
-    // Bare service audience — channel validates `aud === "channel"`
-    // (parachute-channel src/hub-jwt.ts CHANNEL_AUDIENCE).
-    expect(validated.payload.aud).toBe("channel");
+    // Bare service audience — agent validates `aud === "agent"`
+    // (parachute-agent src/hub-jwt.ts).
+    expect(validated.payload.aud).toBe("agent");
     const scopeClaim = (validated.payload as { scope?: string }).scope ?? "";
     const scopes = scopeClaim.split(/\s+/);
-    expect(scopes).toContain("channel:read");
-    expect(scopes).toContain("channel:send");
-    expect(scopes).toContain("channel:admin");
-    expect(scopes).not.toContain("channel:write");
+    expect(scopes).toContain("agent:read");
+    expect(scopes).toContain("agent:send");
+    expect(scopes).toContain("agent:admin");
+    expect(scopes).not.toContain("agent:write");
   });
 
   test("403 not_admin when a signed-in non-first-admin (friend) hits the endpoint", async () => {
@@ -148,10 +148,10 @@ describe("handleChannelToken", () => {
     // first-admin row.
     const { friendCookie } = await withAdminAndFriend();
     rotateSigningKey(harness.db);
-    const req = new Request(`${ISSUER}/admin/channel-token`, {
+    const req = new Request(`${ISSUER}/admin/agent-token`, {
       headers: { cookie: friendCookie },
     });
-    const res = await handleChannelToken(req, { db: harness.db, issuer: ISSUER });
+    const res = await handleAgentToken(req, { db: harness.db, issuer: ISSUER });
     expect(res.status).toBe(403);
     const body = (await res.json()) as { error: string; error_description: string };
     expect(body.error).toBe("not_admin");
@@ -161,10 +161,10 @@ describe("handleChannelToken", () => {
   test("first-admin path still succeeds when a friend exists alongside", async () => {
     const { adminCookie, adminId } = await withAdminAndFriend();
     rotateSigningKey(harness.db);
-    const req = new Request(`${ISSUER}/admin/channel-token`, {
+    const req = new Request(`${ISSUER}/admin/agent-token`, {
       headers: { cookie: adminCookie },
     });
-    const res = await handleChannelToken(req, { db: harness.db, issuer: ISSUER });
+    const res = await handleAgentToken(req, { db: harness.db, issuer: ISSUER });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { token: string };
     const validated = await validateAccessToken(harness.db, body.token, ISSUER);

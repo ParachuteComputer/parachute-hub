@@ -272,17 +272,17 @@ describe("Modules group — non-vault module cards", () => {
   it("falls back to management_url when config_ui_url is null", async () => {
     vi.mocked(api.listModules).mockResolvedValue(
       makeCatalog([
-        makeModule("channel", {
+        makeModule("agent", {
           config_ui_url: null,
-          management_url: "http://hub.example.com/channel/manage",
+          management_url: "http://hub.example.com/agent/manage",
         }),
       ]),
     );
     renderRoute();
 
     await screen.findByTestId("home-modules");
-    const card = screen.getByTestId("home-module-channel");
-    expect(card).toHaveAttribute("href", "http://hub.example.com/channel/manage");
+    const card = screen.getByTestId("home-module-agent");
+    expect(card).toHaveAttribute("href", "http://hub.example.com/agent/manage");
   });
 });
 

@@ -111,8 +111,8 @@ describe("Modules — catalog rendering", () => {
     expect(within(installable).getByText("the notes module")).toBeInTheDocument();
   });
 
-  it("groups by focus: core leads, experimental is a de-emphasized group (channel installed+experimental)", async () => {
-    // 2026-06-09 modular-UI architecture (P2). channel is the regression case:
+  it("groups by focus: core leads, experimental is a de-emphasized group (agent installed+experimental)", async () => {
+    // 2026-06-09 modular-UI architecture (P2). agent is the regression case:
     // running + self-registered, so it arrives installed=true with
     // focus=experimental — it must render, in the experimental group, with its
     // lifecycle actions. core modules (vault) lead in their own group.
@@ -125,7 +125,7 @@ describe("Modules — catalog rendering", () => {
           latest_version: "0.4.5",
           supervisor_status: "running",
         }),
-        moduleRow("channel", {
+        moduleRow("agent", {
           focus: "experimental",
           installed: true,
           installed_version: "0.3.1",
@@ -144,12 +144,12 @@ describe("Modules — catalog rendering", () => {
     const installed = screen.getByTestId("installed-section");
     const installable = screen.getByTestId("installable-section");
 
-    // Installed section: vault in the core group, channel in the experimental group.
+    // Installed section: vault in the core group, agent in the experimental group.
     const installedCore = within(installed).getByTestId("installed-core-group");
     const installedExperimental = within(installed).getByTestId("installed-experimental-group");
     expect(within(installedCore).getByText("Vault")).toBeInTheDocument();
-    expect(within(installedExperimental).getByText("Channel")).toBeInTheDocument();
-    // channel renders with its lifecycle actions (Restart present).
+    expect(within(installedExperimental).getByText("Agent")).toBeInTheDocument();
+    // agent renders with its lifecycle actions (Restart present).
     expect(
       within(installedExperimental).getByRole("button", { name: /restart/i }),
     ).toBeInTheDocument();
@@ -356,48 +356,48 @@ describe("Modules — Configure action (2026-06-09 modular-UI architecture, P3)"
   it("renders an active <a> to the module's config UI when config_ui_url is set", async () => {
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [
-        moduleRow("channel", {
+        moduleRow("agent", {
           focus: "experimental",
           installed: true,
           installed_version: "0.1.0",
           latest_version: "0.1.0",
           supervisor_status: "running",
-          management_url: "/channel/ui",
-          config_ui_url: "/channel/admin",
+          management_url: "/agent/ui",
+          config_ui_url: "/agent/admin",
         }),
       ],
       supervisor_available: true,
       module_install_channel: "latest",
     });
     renderRoute();
-    await waitFor(() => expect(screen.getByText("Channel")).toBeInTheDocument());
-    const configure = screen.getByTestId("configure-channel");
+    await waitFor(() => expect(screen.getByText("Agent")).toBeInTheDocument());
+    const configure = screen.getByTestId("configure-agent");
     // Full-page nav (module owns the surface) — an <a href>, not a SPA Link.
     expect(configure.tagName).toBe("A");
-    expect(configure.getAttribute("href")).toBe("/channel/admin");
+    expect(configure.getAttribute("href")).toBe("/agent/admin");
     expect(configure.textContent).toBe("Configure");
   });
 
   it("renders Configure alongside Open when a module declares both", async () => {
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [
-        moduleRow("channel", {
+        moduleRow("agent", {
           focus: "experimental",
           installed: true,
           installed_version: "0.1.0",
           latest_version: "0.1.0",
           supervisor_status: "running",
-          management_url: "/channel/ui",
-          config_ui_url: "/channel/admin",
+          management_url: "/agent/ui",
+          config_ui_url: "/agent/admin",
         }),
       ],
       supervisor_available: true,
       module_install_channel: "latest",
     });
     renderRoute();
-    await waitFor(() => expect(screen.getByText("Channel")).toBeInTheDocument());
-    expect(screen.getByTestId("open-channel").getAttribute("href")).toBe("/channel/ui");
-    expect(screen.getByTestId("configure-channel").getAttribute("href")).toBe("/channel/admin");
+    await waitFor(() => expect(screen.getByText("Agent")).toBeInTheDocument());
+    expect(screen.getByTestId("open-agent").getAttribute("href")).toBe("/agent/ui");
+    expect(screen.getByTestId("configure-agent").getAttribute("href")).toBe("/agent/admin");
   });
 });
 

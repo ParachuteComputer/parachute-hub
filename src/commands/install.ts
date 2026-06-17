@@ -125,9 +125,16 @@ export function resolveInstallChannel(opts: {
  * install lens` during the ~3-day window keeps working. Remove after
  * launch sinks in and `parachute install lens` has stopped appearing
  * in support threads.
+ *
+ * `channel → agent` (2026-06-17): parachute-channel was renamed to
+ * parachute-agent. `parachute install channel` keeps resolving to the
+ * agent module for one release cycle so operators mid-upgrade aren't
+ * stranded. Remove alongside the `parachute-channel → agent` legacy
+ * manifest alias in service-spec.ts.
  */
 const SERVICE_ALIASES: Record<string, string> = {
   lens: "notes",
+  channel: "agent",
 };
 
 export interface InstallOpts {

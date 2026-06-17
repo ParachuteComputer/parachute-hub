@@ -45,7 +45,7 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     label: "Full vault access plus configuration changes (rotate tokens, change settings).",
     level: "admin",
   },
-  // Optional-module scopes (scribe / channel). These are in FIRST_PARTY_SCOPES
+  // Optional-module scopes (scribe / agent). These are in FIRST_PARTY_SCOPES
   // (= Object.keys(this map)) but the modules may not be installed — so they're
   // GATED in `OPTIONAL_MODULE_SCOPES` (oauth-handlers.ts) and only advertised in
   // `scopes_supported` when the service is in services.json. If you add scopes
@@ -59,8 +59,8 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     label: "Manage Scribe configuration (provider keys, models, quotas).",
     level: "admin",
   },
-  "channel:send": {
-    label: "Post messages to your Channel.",
+  "agent:send": {
+    label: "Post messages to your Agent.",
     level: "send",
   },
   "hub:admin": {

@@ -51,7 +51,8 @@
  *                                                 supervisor restart)
  *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
- *   /admin/channel-token          (GET)        → channel UI bearer mint (cookie-gated)
+ *   /admin/agent-token            (GET)        → agent UI bearer mint (cookie-gated)
+ *   /admin/channel-token          (GET)        → 301 → /admin/agent-token (legacy; channel→agent rename 2026-06-17)
  *   /admin/module-token/<short>   (GET)        → generic module config-UI bearer mint <short>:admin (cookie-gated)
  *   /api/connections/catalog      (GET)        → events/actions across installed modules (cookie-gated)
  *   /admin/connections            (POST/GET)   → connection provision/list (cookie-gated; POST CSRF-belted)
@@ -155,7 +156,7 @@ import pkg from "../package.json" with { type: "json" };
 import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.ts";
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
 import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
-import { handleChannelToken } from "./admin-channel-token.ts";
+import { handleAgentToken } from "./admin-agent-token.ts";
 import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
 import {
   type ConnectionsDeps,
@@ -461,7 +462,7 @@ function hasVaultInstalled(manifestPath: string): boolean {
  * posture as `/api/modules`.
  *
  * `mount` is the first non-`.parachute` services.json path (the proxied
- * user-facing prefix, e.g. `/channel`), which the engine joins with a sink
+ * user-facing prefix, e.g. `/agent`), which the engine joins with a sink
  * action's `endpoint` to build the hub-proxied webhook.
  */
 async function collectInstalledModules(
@@ -932,7 +933,7 @@ async function proxyToVault(
  * hub-module-boundary migration), NOT a per-instance path.
  *
  * Resolution is via `findServiceByShort(services, "vault")` (the canonical
- * self-registered `parachute-vault` row — same shape as the channelEntry
+ * self-registered `parachute-vault` row — same shape as the agentEntry
  * lookup in the Connections deps), deliberately NOT `findVaultUpstream`:
  * vault must NOT self-register `/vault/admin` in `paths[]`, because every
  * consumer that derives instance names from paths (`vaultInstanceNameFor`,
@@ -1058,7 +1059,8 @@ async function proxyToService(
   }
   // Consult FIRST_PARTY_FALLBACKS / KNOWN_MODULES as a fallback for
   // `stripPrefix` (#196). Pre-hub#310, scribe's `stripPrefix: true` lived
-  // only in hub's vendored fallback; post-#310 scribe (and post-D3 channel)
+  // only in hub's vendored fallback; post-#310 scribe (and post-D3 agent,
+  // renamed from channel 2026-06-17)
   // self-register with `stripPrefix: true` on their rows, so the entry-based
   // path is authoritative. The registry consultation now matters only for
   // notes (the remaining FALLBACK short) and legacy rows written before the
@@ -1080,12 +1082,12 @@ async function proxyToService(
  * Resolve effective `stripPrefix` for a service entry. Explicit on-entry
  * wins; otherwise consult `FIRST_PARTY_FALLBACKS` keyed by short name (for
  * notes — vault/scribe/runner retired their FALLBACK entries in hub#310,
- * channel in boundary D3; all self-register with the canonical `stripPrefix`
- * declaration on their services.json row).
+ * agent (renamed from channel 2026-06-17) in boundary D3; all self-register
+ * with the canonical `stripPrefix` declaration on their services.json row).
  * `KNOWN_MODULES[short]?.canonicalStripPrefix` is the next fallback — covers
  * the edge case where a self-registering module wrote its row before the
  * `stripPrefix` field was being emitted (e.g. pre-scribe#50 or pre-D3
- * channel services.json rows). Defaults to `false` — keep the prefix —
+ * agent services.json rows). Defaults to `false` — keep the prefix —
  * matching the pre-#196 dispatch behavior for unknown / third-party
  * services.
  *
@@ -2146,6 +2148,27 @@ export function hubFetch(
         }
       }
 
+      // `/channel/*` 301-redirects to `/agent/*` — back-compat for the
+      // 2026-06-17 channel→agent module rename. Operator bookmarks, an
+      // un-upgraded chat/config UI's deep links, and any externally-shared
+      // `/channel/mcp/<name>` URL keep resolving for one release cycle while
+      // the module's canonical mount moves to `/agent`. Method-agnostic, same
+      // shape as the `/notes/*` redirect above (the agent's read-write surface
+      // is its own daemon API, not the hub mount, so a re-issued GET is fine).
+      // Matches `/channel` exactly and any `/channel/...` subpath, but NOT a
+      // longer-prefix module like a hypothetical `/channelthing` — the guard is
+      // exact-or-slash-delimited. Query string is preserved. (The generic
+      // services-proxy fallthrough below would otherwise 404 a `/channel/*`
+      // request once the module self-registers under `/agent`.)
+      if (pathname === "/channel" || pathname.startsWith("/channel/")) {
+        const dest = new URL(req.url);
+        dest.pathname = `/agent${pathname.slice("/channel".length)}`;
+        return new Response("", {
+          status: 301,
+          headers: { location: dest.pathname + dest.search },
+        });
+      }
+
       // CORS preflight for the public OAuth + discovery surface. Browsers
       // issue OPTIONS before any non-simple cross-origin request — third-party
       // SPAs hitting `/oauth/register` (RFC 7591 DCR), `/oauth/token`,
@@ -2687,10 +2710,10 @@ export function hubFetch(
         if (!getDb) return dbNotConfigured();
         const name = decodeURIComponent(pathname.slice("/vaults/".length));
         const services = readManifestLenient(manifestPath).services;
-        // Channel's row carries its MANIFEST name — resolve via
+        // Agent's row carries its MANIFEST name — resolve via
         // findServiceByShort (see the /admin/connections note below).
-        const channelEntry = findServiceByShort(services, "channel");
-        const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
+        const agentEntry = findServiceByShort(services, "agent");
+        const agentOrigin = agentEntry ? `http://127.0.0.1:${agentEntry.port}` : null;
         const resolveVaultOrigin = (vaultName: string): string | null => {
           const match = findVaultUpstream(
             readManifestLenient(manifestPath).services,
@@ -2704,7 +2727,7 @@ export function hubFetch(
           issuer: oauthDeps(req).issuer,
           manifestPath,
           connectionsStorePath: deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
-          channelOrigin,
+          agentOrigin,
           resolveVaultOrigin,
           resolveModuleOrigin: makeResolveModuleOrigin(manifestPath),
           // Daemon eviction — the same in-process supervisor the lifecycle
@@ -2733,9 +2756,19 @@ export function hubFetch(
         });
       }
 
+      // Back-compat: the agent module's admin-token mint moved from
+      // `/admin/channel-token` to `/admin/agent-token` in the 2026-06-17
+      // channel→agent rename. 301-redirect the old path so operator bookmarks
+      // + any un-upgraded UI fallback keep working for one release cycle.
       if (pathname === "/admin/channel-token") {
+        const dest = new URL(req.url);
+        dest.pathname = "/admin/agent-token";
+        return Response.redirect(dest.toString(), 301);
+      }
+
+      if (pathname === "/admin/agent-token") {
         if (!getDb) return dbNotConfigured();
-        return handleChannelToken(req, {
+        return handleAgentToken(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
         });
@@ -2745,7 +2778,7 @@ export function hubFetch(
       // architecture, P3). `<short>:admin` for any single-audience module —
       // the admin scope each module-owned config UI needs to call its own
       // endpoints. Cookie-gated to the first-admin operator, exactly like
-      // /admin/channel-token + /admin/vault-admin-token. Gated on
+      // /admin/agent-token + /admin/vault-admin-token. Gated on
       // self-registration (services.json row + readable module.json) with the
       // bootstrap registries as a fallback (boundary C5) — a genuinely
       // third-party module mints here with zero hub code changes. Vault is
@@ -2765,8 +2798,9 @@ export function hubFetch(
 
       // Note: the legacy `/admin/channels` bespoke vault-channel orchestration
       // endpoint (pre-Connections, hub#624 era) was retired in boundary D1 —
-      // superseded by the general engine below. Channel's own admin page
-      // drives `/admin/connections` + `/admin/channel-token`.
+      // superseded by the general engine below. The agent module's own admin
+      // page (renamed from channel 2026-06-17) drives `/admin/connections` +
+      // `/admin/agent-token`.
 
       // Connections — the GENERAL module event→action engine (2026-06-09
       // modular-UI architecture, P5). `/api/connections/catalog` (GET) returns
@@ -2775,7 +2809,7 @@ export function hubFetch(
       // `/admin/connections/:id` (DELETE) tears down. Cookie-gated to the
       // first-admin operator. The provisioning engine derives the vault
       // trigger's webhook + scope from the SINK action's declaration —
-      // nothing is channel-hardcoded.
+      // nothing is agent-hardcoded.
       if (
         pathname === "/api/connections/catalog" ||
         pathname === "/admin/connections" ||
@@ -2783,13 +2817,14 @@ export function hubFetch(
       ) {
         if (!getDb) return dbNotConfigured();
         const services = readManifestLenient(manifestPath).services;
-        // Channel's services.json row carries its MANIFEST name
-        // (`parachute-channel`), not the bare short `channel` — resolve via
+        // Agent's services.json row carries its MANIFEST name
+        // (`parachute-agent`), not the bare short `agent` — resolve via
         // findServiceByShort so the lookup matches the on-disk row. (A bare
-        // `s.name === "channel"` never matched, leaving channelOrigin null →
-        // "channel not installed".)
-        const channelEntry = findServiceByShort(services, "channel");
-        const channelOrigin = channelEntry ? `http://127.0.0.1:${channelEntry.port}` : null;
+        // `s.name === "agent"` never matched, leaving agentOrigin null →
+        // "agent not installed".) A legacy un-upgraded `parachute-channel` row
+        // still resolves here via the LEGACY_MANIFEST_ALIASES fallback.
+        const agentEntry = findServiceByShort(services, "agent");
+        const agentOrigin = agentEntry ? `http://127.0.0.1:${agentEntry.port}` : null;
         const resolveVaultOrigin = (vaultName: string): string | null => {
           const match = findVaultUpstream(
             readManifestLenient(manifestPath).services,
@@ -2805,15 +2840,15 @@ export function hubFetch(
           modules,
           resolveVaultOrigin,
           resolveModuleOrigin: makeResolveModuleOrigin(manifestPath),
-          channelOrigin,
+          agentOrigin,
           storePath: deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
         };
         if (pathname === "/api/connections/catalog") {
           return handleConnectionsCatalog(req, connectionsDeps);
         }
         // CSRF belt (hub#632, boundary C1): cookie-authed POST/DELETE must
-        // carry a matching Origin. The seam's canonical consumer — channel's
-        // admin page POSTing link-vault with `credentials: "include"` — is a
+        // carry a matching Origin. The seam's canonical consumer — the agent
+        // module's admin page POSTing link-vault with `credentials: "include"` — is a
         // same-origin fetch() and passes; see origin-check.ts
         // `assertSameOriginForCookieMutation` for the belted-endpoint
         // enumeration.
@@ -2991,7 +3026,7 @@ export function hubFetch(
       // the 2026-06-09 modular-UI architecture P3. Config is module-owned +
       // hub-framed now: the Modules page "Configure" action opens the module's
       // OWN config UI (`configUiUrl`), which mints its admin Bearer from the
-      // cookie-gated `/admin/module-token/<short>` (or `/admin/channel-token`).
+      // cookie-gated `/admin/module-token/<short>` (or `/admin/agent-token`).
 
       // Per-module action endpoints: /api/modules/:short/{install,restart,upgrade,uninstall}.
       if (pathname.startsWith("/api/modules/")) {

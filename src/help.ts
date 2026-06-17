@@ -469,7 +469,7 @@ Module start commands (run by the supervisor under \`serve\`):
   vault     parachute-vault serve
   scribe    parachute-scribe serve
   app       parachute-app serve
-  channel   parachute-channel daemon
+  agent     parachute-agent
   notes     bun <cli>/notes-serve.ts --port <configured> --mount <paths[0]>   # back-compat: legacy notes-daemon
 `;
 }

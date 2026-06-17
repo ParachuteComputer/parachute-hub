@@ -183,7 +183,7 @@ const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
  *   - `POST /admin/connections` + `DELETE /admin/connections/<id>` +
  *     `POST /admin/connections/<id>/approve`
  *     (connection provision/teardown/claim-approval — the seam's canonical
- *     consumers are channel's admin page and the hub SPA, both same-origin
+ *     consumers are the agent module's admin page and the hub SPA, both same-origin
  *     `fetch()` with `credentials: "include"`. The Bearer-authed
  *     `/<id>/renew` + `/<id>/claim` siblings pass the belt via the
  *     Authorization carve-out below.)
@@ -193,7 +193,7 @@ const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
  *
  * NOT belted, and why:
  *   - GET/HEAD/OPTIONS — read-shaped; the mint GETs
- *     (`/admin/host-admin-token`, `/admin/channel-token`,
+ *     (`/admin/host-admin-token`, `/admin/agent-token`,
  *     `/admin/module-token/<short>`, `/admin/vault-admin-token/<name>`)
  *     enforce GET-only with a 405 and their response bodies are unreadable
  *     cross-origin (no CORS on these routes).

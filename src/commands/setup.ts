@@ -109,13 +109,13 @@ function defaultAvailability(): InteractiveAvailability {
 
 /**
  * Survey the eligible services. We include the four first-party shortnames
- * (vault / notes / scribe / channel + runner) but flag channel as exploratory
+ * (vault / notes / scribe / agent + runner) but flag agent as exploratory
  * in the blurb so operators don't grab it by reflex. `installed` is true when
  * the service has a row in services.json.
  *
  * The full ServiceSpec is only available pre-install for FIRST_PARTY_FALLBACKS
  * shorts (notes — it carries a vendored manifest). KNOWN_MODULES shorts
- * (vault / scribe / runner / channel / surface) ship `.parachute/module.json`
+ * (vault / scribe / runner / agent / surface) ship `.parachute/module.json`
  * and self-register; pre-install we know manifestName + the urlForEntry quirk
  * from `KNOWN_MODULES[short].extras`, which is all the survey/summary needs.
  */
@@ -155,7 +155,8 @@ const BLURBS: Record<string, string> = {
   notes: "Notes PWA — web/mobile UI on top of vault (notes-daemon; superseded by `app`)",
   scribe: "audio transcription for dictation + recordings",
   runner: "vault-as-job-substrate — scheduled claude -p against vault job notes",
-  channel: "(exploratory — may retire) notification fan-out across modules",
+  agent:
+    "(exploratory) chat with your Claude Code sessions — a channel per session (renamed from channel)",
 };
 
 function blurbFor(choice: ServiceChoice): string {

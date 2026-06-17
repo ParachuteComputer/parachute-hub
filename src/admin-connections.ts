@@ -4,7 +4,7 @@
  * architecture, P5). Generalizes the channel-specific `/admin/channels`
  * endpoint (hub#624 era; retired in boundary D1): "add a vault-backed channel"
  * is just the first connection, `vault.note.created (filter
- * #channel-message/inbound) → channel.message.deliver`.
+ * #agent-message/inbound) → agent.message.deliver`.
  *
  * THE CONCEPT. A connection wires "when [EVENT] in [source module] (filter) →
  * do [ACTION] in [sink module]". The sink is ALWAYS an action. Modules declare
@@ -17,7 +17,7 @@
  *   - the SINK action's `endpoint` → the hub-proxied webhook the vault calls
  *     (`<hub-origin>/<sink-mount><endpoint>`). NOT a hardcoded channel path.
  *   - the SINK action's `scope` → the OAuth scope minted into the webhook's
- *     `Authorization: Bearer`. NOT a hardcoded `channel:send`.
+ *     `Authorization: Bearer`. NOT a hardcoded `agent:send`.
  *   - the SOURCE event key → the vault trigger's `events` (`note.created` →
  *     `["created"]`, `note.updated` → `["updated"]`).
  *   - the SOURCE filter → the vault trigger's `when` predicate (`tags` /
@@ -27,9 +27,9 @@
  *
  * THE ONE SINK-SPECIFIC PREREQUISITE. A vault-backed channel additionally needs
  * its reply path wired: a `vault:<v>:write` token + a `channels.json` entry so
- * the session can reply. That's a property of the channel SINK, not of the
- * engine — it runs only for `sink.module === "channel"` and is clearly fenced
- * (`prepareChannelSink`). Everything else is declaration-driven.
+ * the session can reply. That's a property of the agent SINK, not of the
+ * engine — it runs only for `sink.module === "agent"` and is clearly fenced
+ * (`prepareAgentSink`). Everything else is declaration-driven.
  *
  * AUTH. Same gate as the admin-token mints: a cookie-gated operator session
  * pinned to the first admin. The catalog (`/api/connections/catalog`) is
@@ -137,7 +137,7 @@ export interface InstalledModuleInfo {
   /** Parsed `.parachute/module.json`. */
   readonly manifest: ModuleManifest;
   /**
-   * The module's user-facing mount path under the hub origin (e.g. `/channel`),
+   * The module's user-facing mount path under the hub origin (e.g. `/agent`),
    * used to build a hub-proxied webhook from a sink action's `endpoint`.
    * `null` when the module declares no user-facing mount.
    */
@@ -169,8 +169,8 @@ export interface ConnectionsDeps {
    * teardown logs the skipped notification.
    */
   resolveModuleOrigin?: (short: string) => string | null;
-  /** Loopback origin for the channel daemon, or `null` when not installed. */
-  channelOrigin: string | null;
+  /** Loopback origin for the agent daemon, or `null` when not installed. */
+  agentOrigin: string | null;
   /** Absolute path to `connections.json` in the hub state dir. */
   storePath: string;
   /** Test seam — `globalThis.fetch` in production. */
@@ -452,7 +452,7 @@ interface CreateBody {
   /**
    * Provenance — WHO requested this connection (modular-UI R2). A module-owned
    * config UI calling this endpoint on the operator's behalf labels itself (e.g.
-   * `"channel"`); the hub's own builder omits it and falls back to `"custom"`.
+   * `"agent"`); the hub's own builder omits it and falls back to `"custom"`.
    */
   requestedBy?: unknown;
 }
@@ -601,20 +601,22 @@ async function createConnection(
   // the record so teardown can revoke them (registered-mint rule).
   const mintedJtis: string[] = [];
 
-  // --- Sink prerequisite (channel reply path), fenced to the channel sink. --
+  // --- Sink prerequisite (agent reply path), fenced to the agent sink. ------
   // Everything below this is general; THIS block is the only sink-specific step.
   // The channel name comes from the action params (`sink.params.channel`) — it
   // becomes a services.json key + an MCP server name, so it must be a slug.
-  if (sinkModule === "channel") {
+  // (The session-channel concept is kept; only the MODULE renamed
+  // channel → agent in the 2026-06-17 rename — `sink.module === "agent"`.)
+  if (sinkModule === "agent") {
     const channelName = typeof sinkParams?.channel === "string" ? sinkParams.channel : "";
     if (!CHANNEL_NAME_RE.test(channelName)) {
       return jsonError(
         400,
         "invalid_request",
-        `channel sink requires sink.params.channel as a valid identifier; got "${channelName}"`,
+        `agent sink requires sink.params.channel as a valid identifier; got "${channelName}"`,
       );
     }
-    const prep = await prepareChannelSink(channelName, vault, vaultOrigin, userId, deps);
+    const prep = await prepareAgentSink(channelName, vault, vaultOrigin, userId, deps);
     if (prep.error) return prep.error;
     mintedJtis.push(prep.replyTokenJti);
   }
@@ -681,35 +683,32 @@ async function createConnection(
     connection: typeof record;
     connect?: { mcpAdd: string; launch: string };
   } = { ok: true, connection: record };
-  if (sinkModule === "channel" && typeof sinkParams?.channel === "string") {
+  if (sinkModule === "agent" && typeof sinkParams?.channel === "string") {
     out.connect = channelConnectLines(deps.hubOrigin, sinkParams.channel);
   }
   return json(200, out);
 }
 
 /**
- * The channel sink's reply-path prerequisite (mirrors hub#624). Mints a
+ * The agent sink's reply-path prerequisite (mirrors hub#624). Mints a
  * `vault:<v>:write` for the channel + writes the `channels.json` entry on the
- * channel daemon so the session can reply. Fenced to `sink.module === "channel"`
+ * agent daemon so the session can reply. Fenced to `sink.module === "agent"`
  * — this is sink-specific config, not part of the general vault-trigger engine.
  * Returns `{ error }` on failure, or `{ error: null, replyTokenJti }` on
  * success — the jti of the long-lived reply token, so the caller can persist
- * it for teardown revocation.
+ * it for teardown revocation. (Renamed from `prepareChannelSink` 2026-06-17;
+ * the agent daemon's session-channel CRUD is still `/api/channels`.)
  */
-async function prepareChannelSink(
+async function prepareAgentSink(
   channelName: string,
   vault: string,
   vaultOrigin: string,
   userId: string,
   deps: ConnectionsDeps,
 ): Promise<{ error: Response } | { error: null; replyTokenJti: string }> {
-  if (deps.channelOrigin === null) {
+  if (deps.agentOrigin === null) {
     return {
-      error: jsonError(
-        503,
-        "channel_unavailable",
-        "the channel module is not installed on this hub",
-      ),
+      error: jsonError(503, "agent_unavailable", "the agent module is not installed on this hub"),
     };
   }
   const fetchImpl = deps.fetchImpl ?? fetch;
@@ -718,17 +717,17 @@ async function prepareChannelSink(
       scopes: [`vault:${vault}:write`],
       audience: `vault.${vault}`,
       vaultScope: [vault],
-      ttlSeconds: WEBHOOK_BEARER_TTL_SECONDS, // channel keeps it for its lifetime
+      ttlSeconds: WEBHOOK_BEARER_TTL_SECONDS, // agent keeps it for its lifetime
     });
     const channelAdminToken = (
       await mint(deps, userId, {
-        scopes: ["channel:admin"],
-        audience: "channel",
+        scopes: ["agent:admin"],
+        audience: "agent",
         vaultScope: [],
         ttlSeconds: PROVISION_TOKEN_TTL_SECONDS,
       })
     ).token;
-    const res = await fetchImpl(`${deps.channelOrigin}/api/channels`, {
+    const res = await fetchImpl(`${deps.agentOrigin}/api/channels`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${channelAdminToken}`,
@@ -740,10 +739,10 @@ async function prepareChannelSink(
         config: { vault, vaultUrl: vaultOrigin, token: vaultWriteSigned.token },
       }),
     });
-    if (!res.ok) return { error: stepError("channel_config", await describeRemote(res)) };
+    if (!res.ok) return { error: stepError("agent_config", await describeRemote(res)) };
     return { error: null, replyTokenJti: vaultWriteSigned.jti };
   } catch (err) {
-    return { error: stepError("channel_config", err) };
+    return { error: stepError("agent_config", err) };
   }
 }
 
@@ -1538,37 +1537,37 @@ export async function teardownConnection(
     }
   }
 
-  // --- Channel-sink teardown (remove the channel config entry). ------------
+  // --- Agent-sink teardown (remove the channel config entry). --------------
   // Fenced to event→action records: a credential connection whose HOLDER is
-  // the channel module must not delete an unrelated channel config entry.
-  if (record.kind !== "credential" && record.sink.module === "channel" && deps.channelOrigin) {
+  // the agent module must not delete an unrelated channel config entry.
+  if (record.kind !== "credential" && record.sink.module === "agent" && deps.agentOrigin) {
     const channelName =
       typeof record.sink.params?.channel === "string" ? record.sink.params.channel : record.id;
     try {
       const channelAdminToken = (
         await mint(deps, userId, {
-          scopes: ["channel:admin"],
-          audience: "channel",
+          scopes: ["agent:admin"],
+          audience: "agent",
           vaultScope: [],
           ttlSeconds: PROVISION_TOKEN_TTL_SECONDS,
         })
       ).token;
       const res = await fetchImpl(
-        `${deps.channelOrigin}/api/channels/${encodeURIComponent(channelName)}`,
+        `${deps.agentOrigin}/api/channels/${encodeURIComponent(channelName)}`,
         { method: "DELETE", headers: { authorization: `Bearer ${channelAdminToken}` } },
       );
       if (!res.ok && res.status !== 404) {
-        errors.push({ step: "channel_config", detail: await remoteDetail(res) });
+        errors.push({ step: "agent_config", detail: await remoteDetail(res) });
       }
     } catch (err) {
-      errors.push({ step: "channel_config", detail: errMsg(err) });
+      errors.push({ step: "agent_config", detail: errMsg(err) });
     }
   }
 
   // --- Revoke the registered long-lived mints (B0, registered-mint rule). ---
   // Marks each tokens-registry row revoked → the revocation list at
   // `/.well-known/parachute-revocation.json` advertises the jtis, and every
-  // resource server (vault, channel) rejects the credential from its next
+  // resource server (vault, agent) rejects the credential from its next
   // poll. Runs regardless of remote-teardown outcome — revocation is the safe
   // direction. Legacy records (provisioned before B0) carry no jtis: teardown
   // proceeds, but their tokens were never registered and ride to expiry.
@@ -1695,8 +1694,8 @@ function readProvisionType(provision: unknown): string | null {
 
 /**
  * Audience for a minted sink bearer. A `<module>:<verb>` scope (e.g.
- * `channel:send`) takes the module namespace as its audience — matching how
- * the channel validates `aud: channel`. Falls back to the sink module name.
+ * `agent:send`) takes the module namespace as its audience — matching how
+ * the agent validates `aud: agent`. Falls back to the sink module name.
  */
 function audienceForScope(scope: string, sinkModule: string): string {
   const colon = scope.indexOf(":");
@@ -1717,15 +1716,15 @@ function str(v: unknown): string {
 }
 
 /**
- * Derive the connection id. Operator-supplied wins; else for a channel sink use
+ * Derive the connection id. Operator-supplied wins; else for an agent sink use
  * the channel name (so the trigger + channel-config share a stable key), else a
  * `<srcModule>-<event>-<sinkModule>-<action>` slug.
  */
 function deriveId(rawId: unknown, source: ConnectionSource, sink: ConnectionSink): string {
   const supplied = str(rawId);
   if (supplied) return supplied.toLowerCase();
-  if (sink.module === "channel" && typeof sink.params?.channel === "string") {
-    return `channel-${sink.params.channel}`.toLowerCase();
+  if (sink.module === "agent" && typeof sink.params?.channel === "string") {
+    return `agent-${sink.params.channel}`.toLowerCase();
   }
   const slug = `${source.module}-${source.event}-${sink.module}-${sink.action}`
     .toLowerCase()
@@ -1740,8 +1739,8 @@ function channelConnectLines(
 ): { mcpAdd: string; launch: string } {
   const origin = hubOrigin.replace(/\/+$/, "");
   return {
-    mcpAdd: `claude mcp add --transport http --scope user channel-${channelName} ${origin}/channel/mcp/${channelName}`,
-    launch: `claude --dangerously-load-development-channels=server:channel-${channelName} --dangerously-skip-permissions`,
+    mcpAdd: `claude mcp add --transport http --scope user agent-${channelName} ${origin}/agent/mcp/${channelName}`,
+    launch: `claude --dangerously-load-development-channels=server:agent-${channelName} --dangerously-skip-permissions`,
   };
 }
 

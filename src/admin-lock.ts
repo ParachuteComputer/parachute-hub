@@ -24,7 +24,7 @@
  * The admin SPA + every module config UI get their working Bearer from one of
  * the cookie-gated mint endpoints:
  *   - `GET /admin/host-admin-token`        (the SPA's own Bearer)
- *   - `GET /admin/channel-token`           (channel chat + config UIs)
+ *   - `GET /admin/agent-token`             (agent chat + config UIs)
  *   - `GET /admin/vault-admin-token/<name>`(per-vault admin SPA)
  *   - `GET /admin/module-token/<short>`    (generic module config UI Bearer)
  *

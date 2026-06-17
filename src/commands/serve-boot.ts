@@ -78,12 +78,13 @@ export interface BuildSpawnRequestOpts {
  *
  * Why (channel#41): the hub is the port authority, and a first-party module
  * with a compiled-in canonical port (`canonicalPortForManifest` ≠ undefined —
- * vault / scribe / surface / channel / notes / runner) has exactly ONE correct
+ * vault / scribe / surface / agent / notes / runner) has exactly ONE correct
  * port: its canonical one. The injected `PORT`, the supervisor's readiness
  * probe, and the reverse-proxy target are ALL derived from the services.json
- * row's `port`. So once a transiently-wrong port lands in that row (the channel
- * row was observed live carrying `19415` instead of `1941`), it self-perpetuates:
- * the supervisor probes/proxies the wrong port forever and `/channel/*` routes
+ * row's `port`. So once a transiently-wrong port lands in that row (the agent
+ * row — then named channel — was observed live carrying `19415` instead of
+ * `1941`), it self-perpetuates:
+ * the supervisor probes/proxies the wrong port forever and `/agent/*` routes
  * to a dead port. The canonical port is authoritative, so we reconcile the row
  * before spawn rather than honoring the drift.
  *

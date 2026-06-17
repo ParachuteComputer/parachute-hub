@@ -124,7 +124,7 @@ export interface ModuleAction {
    * Bearer` (P5). For a `vault-trigger`, this is persisted as the trigger's
    * long-lived `action.auth.bearer` scope — the credential the sink module
    * validates on every callback. Sourced from the action declaration so the
-   * hub never hardcodes a per-module scope. Channel ships `"channel:send"`.
+   * hub never hardcodes a per-module scope. Agent ships `"agent:send"`.
    */
   readonly scope?: string;
   /** Opaque (P1) descriptor of how the hub provisions this action. */
@@ -777,7 +777,7 @@ function asActions(
       // `scope` is minted by the hub into a 90-day webhook bearer presented to
       // THIS module's own endpoint, which validates `aud:<name>` + a scope in
       // its own namespace. A legitimate `action.scope` is therefore always in
-      // the declaring module's namespace (channel.message.deliver → channel:send).
+      // the declaring module's namespace (agent.message.deliver → agent:send).
       // Enforcing `<ns> === name` blocks a malicious module declaring e.g.
       // `vault:default:admin` and tricking the hub into minting a cross-module
       // privilege-escalating token when an operator wires a Connection to it.

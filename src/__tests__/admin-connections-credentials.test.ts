@@ -168,7 +168,7 @@ function credDeps(fetchImpl: typeof fetch, modules: InstalledModuleInfo[]): Conn
     modules,
     resolveVaultOrigin: (v) => (v === "default" ? VAULT_ORIGIN : null),
     resolveModuleOrigin: (short) => (short === "surface" ? SURFACE_ORIGIN : null),
-    channelOrigin: null,
+    agentOrigin: null,
     storePath: harness.storePath,
     fetchImpl,
   };
@@ -1121,7 +1121,11 @@ describe("credential connection — claim/reconcile (surface#113)", () => {
   test("CLI-shape claim: vault_scope [] accepted when scope+aud pin the vault (the live surface#113 credentials)", async () => {
     const { fetchImpl } = mockFetch({});
     const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
-    const cli = await mintDirectDelivered({ vault: "default", verb: "read", emptyVaultScope: true });
+    const cli = await mintDirectDelivered({
+      vault: "default",
+      verb: "read",
+      emptyVaultScope: true,
+    });
     const res = await handleConnections(
       claimReq(CLAIM_ID, SURFACE_CLAIM, cli.token),
       `/${CLAIM_ID}/claim`,

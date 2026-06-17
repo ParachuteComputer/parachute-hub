@@ -342,10 +342,10 @@ Parachute services reserve a block of loopback ports in the canonical range **19
 | ---- | ------------------ |
 | 1939 | parachute-hub (internal proxy + static) |
 | 1940 | parachute-vault    |
-| 1941 | parachute-channel  |
+| 1941 | parachute-agent *(renamed from parachute-channel 2026-06-17)* |
 | 1942 | *parachute-notes (archived 2026-05-24 — notes-daemon retired; Notes now bundled in parachute-surface. Slot reclaimable; see [`parachute-notes/DEPRECATED.md`](https://github.com/ParachuteComputer/parachute-notes/blob/main/DEPRECATED.md))* |
 | 1943 | parachute-scribe   |
-| 1944 | *parachute-agent (retired 2026-05-20; slot held — see [`parachute-agent/DEPRECATED.md`](https://github.com/ParachuteComputer/parachute-agent/blob/main/DEPRECATED.md))* |
+| 1944 | *parachute-agent-legacy (the Claude-in-containers module retired 2026-05-20; slot held — NOT the 1941 agent module, which is the renamed channel)* |
 | 1945 | parachute-runner *(shipped; exploration-tier, not committed-core)* |
 | 1946 | parachute-surface *(committed core; UI host — bundles Notes, hosts custom surfaces)* |
 | 1947–1949 | *unassigned (CLI fallback range)* |

@@ -19,7 +19,7 @@ describe("SCOPE_EXPLANATIONS", () => {
       "vault:admin",
       "scribe:transcribe",
       "scribe:admin",
-      "channel:send",
+      "agent:send",
       "hub:admin",
       "parachute:host:admin",
     ];
@@ -96,7 +96,7 @@ describe("scopeIsAdmin", () => {
 
   test("false for non-admin and unknown scopes", () => {
     expect(scopeIsAdmin("vault:read")).toBe(false);
-    expect(scopeIsAdmin("channel:send")).toBe(false);
+    expect(scopeIsAdmin("agent:send")).toBe(false);
     expect(scopeIsAdmin("unknown:anything")).toBe(false);
   });
 
@@ -133,7 +133,7 @@ describe("isRequestableScope", () => {
     expect(isRequestableScope("hub:admin")).toBe(true);
     expect(isRequestableScope("vault:read")).toBe(true);
     expect(isRequestableScope("vault:admin")).toBe(true);
-    expect(isRequestableScope("channel:send")).toBe(true);
+    expect(isRequestableScope("agent:send")).toBe(true);
   });
 
   test("true for unknown scopes (third-party module scopes pass through)", () => {
