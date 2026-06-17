@@ -64,6 +64,8 @@
  *   # mutations (hub#632, boundary C1) — origin-check.ts
  *   # `assertSameOriginForCookieMutation` carries the canonical enumeration.
  *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
+ *   /api/admin-lock               (GET)        → screen-lock status (cookie-gated; first-admin)
+ *   /api/admin-lock/{set,change,remove,unlock,lock,heartbeat} (POST) → manage the optional admin idle PIN lock (cookie-gated; CSRF)
  *   /api/hub                      (GET)        → hub version + uptime + install-source (host:admin)
  *   /api/hub/upgrade              (POST)       → SPA-driven hub self-upgrade → 202 + detached helper (host:admin, §5.3/D4)
  *   /api/hub/upgrade/status       (GET)        → poll the on-disk hub-upgrade status (host:admin)
@@ -176,6 +178,7 @@ import {
   handleAccountChangePasswordPost,
   handleAccountHomeGet,
 } from "./api-account.ts";
+import { handleAdminLock } from "./api-admin-lock.ts";
 import { handleHubUpgrade, handleHubUpgradeStatus } from "./api-hub-upgrade.ts";
 import { handleApiHub } from "./api-hub.ts";
 import { handleCreateInvite, handleListInvites, handleRevokeInvite } from "./api-invites.ts";
@@ -2846,6 +2849,25 @@ export function hubFetch(
       if (pathname === "/api/me") {
         if (!getDb) return dbNotConfigured();
         return handleApiMe(req, { db: getDb() });
+      }
+
+      // Admin screen-lock management (optional idle PIN lock for the admin
+      // UI). Session-cookie-gated to the first admin; these manage the lock
+      // itself so they are NOT behind the lock gate. The lock GATE lives in
+      // the four `/admin/*-token` mint handlers (admin-lock.ts:requireUnlocked)
+      // — it does NOT touch `/oauth/*`, so the OAuth issuer is unaffected.
+      if (pathname === "/api/admin-lock" || pathname.startsWith("/api/admin-lock/")) {
+        if (!getDb) return dbNotConfigured();
+        // CSRF belt (same posture as /admin/connections): these are
+        // cookie-authed JSON mutations. The handler ALSO checks a double-
+        // submit `__csrf` token; the Origin belt is defense-in-depth on the
+        // POST paths (GET status is read-shaped and skips it).
+        {
+          const rejected = assertSameOriginForCookieMutation(req, oauthDeps(req).hubBoundOrigins());
+          if (rejected) return rejected;
+        }
+        const subpath = pathname.slice("/api/admin-lock".length);
+        return handleAdminLock(req, subpath, { db: getDb() });
       }
 
       // SPA-driven hub self-upgrade (design 2026-06-01 §5.3 / D4). Dedicated

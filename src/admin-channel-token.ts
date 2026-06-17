@@ -48,6 +48,7 @@
  * tokens); the UI re-fetches on near-expiry.
  */
 import type { Database } from "bun:sqlite";
+import { lockedResponse, requireUnlocked } from "./admin-lock.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
@@ -82,7 +83,7 @@ export async function handleChannelToken(
   }
   const sid = parseSessionCookie(req.headers.get("cookie"));
   const session = sid ? findSession(deps.db, sid) : null;
-  if (!session) {
+  if (!session || !sid) {
     return jsonError(401, "unauthenticated", "no admin session — sign in at /login first");
   }
   // First-admin gate (mirrors host/vault-admin-token). A friend account
@@ -96,6 +97,12 @@ export async function handleChannelToken(
       "not_admin",
       "channel token mint is restricted to the hub admin — your account home is at /account/",
     );
+  }
+  // Admin screen-lock gate (see admin-host-admin-token.ts). A locked admin
+  // session can't mint a channel Bearer, so channel's config + chat UIs show
+  // the lock screen / fail closed until the operator unlocks. Off by default.
+  if (!requireUnlocked(deps.db, sid).ok) {
+    return lockedResponse();
   }
   const minted = await signAccessToken(deps.db, {
     sub: session.userId,

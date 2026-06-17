@@ -91,7 +91,21 @@ export type HubSettingKey =
   // the deprecation window. Stored as the literal string "true" /
   // "false"; any other value parses as "redirect on" (the migration
   // default — operators must opt out, not opt in).
-  | "notes_redirect_disabled";
+  | "notes_redirect_disabled"
+  // Admin-UI screen-lock PIN (hub admin-lock feature). The argon2id hash of
+  // the operator's lock PIN. Absent row = lock feature OFF (today's behavior
+  // exactly — the admin UI is gated only by the password-login session). When
+  // set, the admin token-mint chokepoints refuse to mint while the operator's
+  // session is "locked" (no fresh unlock, or idle-expired). NEVER plaintext;
+  // the hash sits at the same operator-local trust boundary as the password
+  // hashes + signing keys already in hub.db (see migration v11's note on
+  // at-rest encryption). The "unlocked-until" state is per-session + in-memory
+  // (admin-lock.ts) — never persisted, never in the cookie.
+  | "admin_lock_pin_hash"
+  // Idle timeout for the admin screen-lock, in seconds. Optional override of
+  // the built-in default (DEFAULT_ADMIN_LOCK_IDLE_SECONDS). Stored as a
+  // stringified integer; absent / unparseable falls back to the default.
+  | "admin_lock_idle_seconds";
 
 export type SetupExposeMode = "localhost" | "tailnet" | "public";
 

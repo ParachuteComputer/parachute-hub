@@ -31,7 +31,17 @@ import { type ReactNode, useEffect, useState } from "react";
 import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { BrandMark, WORDMARK_TEXT } from "./components/BrandMark.tsx";
 import { HubVersionBadge } from "./components/HubVersionBadge.tsx";
-import { type MeResponse, type ModuleListing, getMe, listModules, signOut } from "./lib/api.ts";
+import { LockScreen } from "./components/LockScreen.tsx";
+import {
+  type MeResponse,
+  type ModuleListing,
+  getMe,
+  listModules,
+  lockAdminNow,
+  signOut,
+} from "./lib/api.ts";
+import { clearCachedToken } from "./lib/auth.ts";
+import { useAdminLock } from "./lib/useAdminLock.ts";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
 import { Connections } from "./routes/Connections.tsx";
 import { Home } from "./routes/Home.tsx";
@@ -108,6 +118,11 @@ export function App() {
   // just doesn't render).
   const [installedServices, setInstalledServices] = useState<ModuleListing[]>([]);
 
+  // Optional admin screen-lock. Only meaningful once we have a session +
+  // its CSRF token (lock APIs are session-cookie-gated, CSRF-belted).
+  const csrf = me?.hasSession ? me.csrf : null;
+  const lock = useAdminLock(csrf, Boolean(me?.hasSession));
+
   useEffect(() => {
     let cancelled = false;
     getMe()
@@ -151,6 +166,24 @@ export function App() {
     };
   }, [me]);
 
+  // When the surface locks, drop the cached host-admin Bearer so the next
+  // admin call re-mints from scratch (and gets a clean 423) rather than
+  // riding a still-valid in-memory token from before the lock.
+  useEffect(() => {
+    if (lock.locked) clearCachedToken();
+  }, [lock.locked]);
+
+  async function onLockNow(): Promise<void> {
+    if (!csrf) return;
+    try {
+      await lockAdminNow(csrf);
+    } catch {
+      // Even if the POST fails, refresh below pulls the real state.
+    }
+    clearCachedToken();
+    lock.refresh();
+  }
+
   async function onSignOut(csrf: string): Promise<void> {
     setSigningOut(true);
     try {
@@ -166,6 +199,15 @@ export function App() {
       // down, both of which a reload will resolve.
       setSigningOut(false);
     }
+  }
+
+  // Locked → render ONLY the lock screen (one lock over the whole admin
+  // surface, not per-action gating). The admin content + nav are hidden until
+  // the operator unlocks. Requires the CSRF token to unlock; if somehow absent
+  // we fall through to the normal shell (the server still fails admin calls
+  // closed).
+  if (lock.locked && csrf) {
+    return <LockScreen csrf={csrf} onUnlocked={lock.refresh} />;
   }
 
   return (
@@ -186,6 +228,20 @@ export function App() {
           <span className="sub">{subtitle}</span>
         </Link>
         <AuthIndicator me={me} signingOut={signingOut} onSignOut={onSignOut} />
+        {/* "Lock now" — only when an admin-lock PIN is configured. One click
+            re-locks the whole admin surface (phone-style); the idle timer does
+            the same automatically. Configure the PIN under Settings. */}
+        {me?.hasSession && lock.configured ? (
+          <button
+            type="button"
+            className="auth-spa-signout"
+            data-testid="admin-lock-now"
+            title="Lock the admin console now"
+            onClick={() => void onLockNow()}
+          >
+            Lock now
+          </button>
+        ) : null}
         {/* Hub-native sections — open in-shell. Home first, then the cross-
             cutting host-admin surfaces. "Vaults" left this group in B5
             (2026-06-09 hub-module-boundary): vault lifecycle UX is module-

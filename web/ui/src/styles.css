@@ -1375,3 +1375,125 @@ a.btn:hover {
   color: var(--accent);
   font-weight: 600;
 }
+
+/* -------------------------------------------------------------------------
+ * Admin screen-lock (optional idle PIN lock).
+ *
+ * The lock screen replaces the whole admin shell when the session is locked —
+ * a single lock over everything (phone-style), not per-action gating. Tokens
+ * are lifted from the brand palette so it stays continuous with the login →
+ * consent → admin flow the operator just walked through.
+ * ---------------------------------------------------------------------------*/
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.lock-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  padding: 1.5rem;
+}
+
+.lock-card {
+  width: 100%;
+  max-width: 22rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 0.35rem;
+  padding: 2rem 1.75rem;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+}
+
+.lock-brand-mark {
+  margin-bottom: 0.4rem;
+}
+
+.lock-title {
+  font-size: 1.2rem;
+  margin: 0;
+}
+
+.lock-sub {
+  margin: 0 0 0.6rem;
+  font-size: 0.9rem;
+}
+
+.lock-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  width: 100%;
+}
+
+.lock-pin-input {
+  width: 100%;
+  text-align: center;
+  letter-spacing: 0.45em;
+  font-size: 1.3rem;
+  padding: 0.7rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.lock-pin-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.lock-error {
+  margin-top: 0.6rem;
+  color: var(--error);
+  font-size: 0.88rem;
+}
+
+/* Settings: admin-lock block. */
+.lock-settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  max-width: 28rem;
+}
+
+.lock-settings-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+}
+
+.lock-status-pill {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+
+.lock-status-on {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.lock-status-off {
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+}

@@ -39,6 +39,7 @@
  * config UI re-fetches on near-expiry.
  */
 import type { Database } from "bun:sqlite";
+import { lockedResponse, requireUnlocked } from "./admin-lock.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import {
   type ModuleManifest,
@@ -143,7 +144,7 @@ export async function handleModuleToken(
   }
   const sid = parseSessionCookie(req.headers.get("cookie"));
   const session = sid ? findSession(deps.db, sid) : null;
-  if (!session) {
+  if (!session || !sid) {
     return jsonError(401, "unauthenticated", "no admin session — sign in at /login first");
   }
   // First-admin gate (mirrors host/vault/channel-admin-token). A friend account
@@ -155,6 +156,13 @@ export async function handleModuleToken(
       "not_admin",
       "module admin token mint is restricted to the hub admin — your account home is at /account/",
     );
+  }
+  // Admin screen-lock gate (see admin-host-admin-token.ts). A locked admin
+  // session can't mint a module admin Bearer, so every module-owned config UI
+  // fails closed until the operator unlocks. This is what makes the lock
+  // cascade to ALL modules with zero per-module changes. Off by default.
+  if (!requireUnlocked(deps.db, sid).ok) {
+    return lockedResponse();
   }
   const scope = `${short}:admin`;
   const minted = await signAccessToken(deps.db, {

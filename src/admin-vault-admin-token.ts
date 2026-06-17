@@ -25,6 +25,7 @@
  * for their assigned vault; they don't get vault admin via this endpoint.
  */
 import type { Database } from "bun:sqlite";
+import { lockedResponse, requireUnlocked } from "./admin-lock.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
@@ -66,7 +67,7 @@ export async function handleVaultAdminToken(
   }
   const sid = parseSessionCookie(req.headers.get("cookie"));
   const session = sid ? findSession(deps.db, sid) : null;
-  if (!session) {
+  if (!session || !sid) {
     return jsonError(401, "unauthenticated", "no admin session — sign in at /login first");
   }
   // Multi-user Phase 1 privesc gate (mirrors host-admin-token). vault:<name>:admin
@@ -79,6 +80,12 @@ export async function handleVaultAdminToken(
       "not_admin",
       "vault admin token mint is restricted to the hub admin — your account home is at /account/",
     );
+  }
+  // Admin screen-lock gate (see admin-host-admin-token.ts). A locked admin
+  // session can't mint a vault admin Bearer, so the vault admin SPA fails
+  // closed until the operator unlocks. Off by default.
+  if (!requireUnlocked(deps.db, sid).ok) {
+    return lockedResponse();
   }
   const scope = `vault:${vaultName}:admin`;
   // Per-vault audience: vault validates the JWT's `aud` claim against
