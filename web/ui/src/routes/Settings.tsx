@@ -31,9 +31,15 @@
  */
 import { type FormEvent, useCallback, useEffect, useState } from "react";
 import {
+  type AdminLockStatus,
   type HubOriginSetting,
   type IssuerSource,
+  changeAdminLockPin,
+  getAdminLockStatus,
   getHubOriginSetting,
+  getMe,
+  removeAdminLockPin,
+  setAdminLockPin,
   setHubOriginSetting,
 } from "../lib/api.ts";
 
@@ -190,6 +196,288 @@ export function Settings() {
           )}
         </form>
       </section>
+
+      <AdminLockSection />
+    </section>
+  );
+}
+
+/**
+ * Admin screen-lock settings (optional idle PIN lock).
+ *
+ * Off by default. Setting the first PIN is an authenticated admin action;
+ * changing / removing requires the current PIN (or an already-unlocked
+ * session — but this form always asks for it to keep the flow uniform and
+ * safe regardless of unlock state). The PIN locks the WHOLE admin surface
+ * after the idle window; "Lock now" lives in the nav.
+ */
+function AdminLockSection() {
+  const [status, setStatus] = useState<AdminLockStatus | null>(null);
+  const [csrf, setCsrf] = useState<string | null>(null);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+
+  // Form state.
+  const [pin, setPin] = useState("");
+  const [pin2, setPin2] = useState("");
+  const [currentPin, setCurrentPin] = useState("");
+  const [idleMinutes, setIdleMinutes] = useState("15");
+  const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [s, me] = await Promise.all([getAdminLockStatus(), getMe()]);
+      setStatus(s);
+      setCsrf(me.hasSession ? me.csrf : null);
+      setIdleMinutes(String(Math.round(s.idle_seconds / 60)));
+      setLoadErr(null);
+    } catch (err) {
+      setLoadErr(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  function idleSecondsFromForm(): number | undefined {
+    const m = Number.parseInt(idleMinutes, 10);
+    if (!Number.isFinite(m)) return undefined;
+    return Math.max(1, m) * 60;
+  }
+
+  async function onSet(e: FormEvent) {
+    e.preventDefault();
+    if (busy || !csrf) return;
+    setFormErr(null);
+    setNotice(null);
+    if (!/^[0-9]{4,12}$/.test(pin)) {
+      setFormErr("PIN must be 4–12 digits.");
+      return;
+    }
+    if (pin !== pin2) {
+      setFormErr("PINs don't match.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await setAdminLockPin(csrf, pin, idleSecondsFromForm());
+      setPin("");
+      setPin2("");
+      setNotice("Screen lock enabled.");
+      await refresh();
+    } catch (err) {
+      setFormErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onChange(e: FormEvent) {
+    e.preventDefault();
+    if (busy || !csrf) return;
+    setFormErr(null);
+    setNotice(null);
+    if (!/^[0-9]{4,12}$/.test(pin)) {
+      setFormErr("New PIN must be 4–12 digits.");
+      return;
+    }
+    if (pin !== pin2) {
+      setFormErr("PINs don't match.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await changeAdminLockPin(csrf, pin, currentPin || undefined, idleSecondsFromForm());
+      setPin("");
+      setPin2("");
+      setCurrentPin("");
+      setNotice("PIN updated.");
+      await refresh();
+    } catch (err) {
+      setFormErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onRemove() {
+    if (busy || !csrf) return;
+    setFormErr(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      await removeAdminLockPin(csrf, currentPin || undefined);
+      setCurrentPin("");
+      setNotice("Screen lock disabled.");
+      await refresh();
+    } catch (err) {
+      setFormErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const configured = status?.configured ?? false;
+
+  return (
+    <section
+      className="settings-block"
+      aria-labelledby="admin-lock-heading"
+      data-testid="admin-lock-settings"
+    >
+      <h2 id="admin-lock-heading">Admin screen lock</h2>
+      <p className="muted">
+        An optional PIN that locks the whole admin console after a period of inactivity — a
+        phone-style lock for a remotely-exposed hub. Off by default; the OAuth flow for your
+        connected apps is never affected. <strong>Note:</strong> this guards the exposed web portal
+        only — anyone with shell access to the box bypasses it (that's an OS / disk-encryption
+        concern).
+      </p>
+
+      {loadErr ? (
+        <div className="error" data-testid="admin-lock-load-error">
+          Failed to load lock status: {loadErr}.{" "}
+          <button type="button" onClick={() => void refresh()}>
+            Retry
+          </button>
+        </div>
+      ) : (
+        <>
+          <p>
+            Status:{" "}
+            <span
+              className={`lock-status-pill ${configured ? "lock-status-on" : "lock-status-off"}`}
+              data-testid="admin-lock-status-pill"
+            >
+              {configured ? "Enabled" : "Off"}
+            </span>
+          </p>
+
+          {!configured ? (
+            <form onSubmit={(e) => void onSet(e)} className="lock-settings-form">
+              <label>
+                PIN (4–12 digits)
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={pin}
+                  disabled={busy}
+                  onChange={(e) => setPin(e.target.value.replace(/[^0-9]/g, ""))}
+                  data-testid="admin-lock-set-pin"
+                />
+              </label>
+              <label>
+                Confirm PIN
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={pin2}
+                  disabled={busy}
+                  onChange={(e) => setPin2(e.target.value.replace(/[^0-9]/g, ""))}
+                  data-testid="admin-lock-set-pin2"
+                />
+              </label>
+              <label>
+                Lock after (minutes idle)
+                <input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  value={idleMinutes}
+                  disabled={busy}
+                  onChange={(e) => setIdleMinutes(e.target.value)}
+                  data-testid="admin-lock-idle"
+                />
+              </label>
+              <div className="actions">
+                <button type="submit" disabled={busy} data-testid="admin-lock-enable">
+                  {busy ? "Saving…" : "Enable screen lock"}
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form onSubmit={(e) => void onChange(e)} className="lock-settings-form">
+              <label>
+                Current PIN
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={currentPin}
+                  disabled={busy}
+                  onChange={(e) => setCurrentPin(e.target.value.replace(/[^0-9]/g, ""))}
+                  data-testid="admin-lock-current-pin"
+                />
+              </label>
+              <label>
+                New PIN (4–12 digits)
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={pin}
+                  disabled={busy}
+                  onChange={(e) => setPin(e.target.value.replace(/[^0-9]/g, ""))}
+                  data-testid="admin-lock-new-pin"
+                />
+              </label>
+              <label>
+                Confirm new PIN
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={pin2}
+                  disabled={busy}
+                  onChange={(e) => setPin2(e.target.value.replace(/[^0-9]/g, ""))}
+                  data-testid="admin-lock-new-pin2"
+                />
+              </label>
+              <label>
+                Lock after (minutes idle)
+                <input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  value={idleMinutes}
+                  disabled={busy}
+                  onChange={(e) => setIdleMinutes(e.target.value)}
+                  data-testid="admin-lock-idle"
+                />
+              </label>
+              <div className="actions">
+                <button type="submit" disabled={busy} data-testid="admin-lock-change">
+                  {busy ? "Saving…" : "Update PIN"}
+                </button>
+                <button
+                  type="button"
+                  className="destructive"
+                  disabled={busy}
+                  onClick={() => void onRemove()}
+                  data-testid="admin-lock-remove"
+                >
+                  Remove lock
+                </button>
+              </div>
+            </form>
+          )}
+
+          {formErr && (
+            <div className="error" data-testid="admin-lock-form-error">
+              {formErr}
+            </div>
+          )}
+          {notice && (
+            <p className="muted" data-testid="admin-lock-notice">
+              {notice}
+            </p>
+          )}
+        </>
+      )}
     </section>
   );
 }

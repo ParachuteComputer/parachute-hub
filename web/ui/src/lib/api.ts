@@ -1418,6 +1418,108 @@ export async function getHubUpgradeStatus(): Promise<HubUpgradeStatus | null> {
 // against the bespoke `/admin/channels` endpoint — were retired in boundary D1
 // along with the endpoint; the Connections helpers below are the successor.)
 
+// ---------------------------------------------------------------------------
+// Admin screen-lock (optional idle PIN lock for the admin UI).
+//
+// These talk to `/api/admin-lock*` with the session cookie directly (NOT the
+// host-admin Bearer) — the Bearer mint is exactly what the lock blocks, so the
+// lock-management surface must not depend on it. The POSTs carry the CSRF token
+// from `/api/me` and an Origin header (the browser adds it automatically) to
+// pass the server's same-origin belt.
+// ---------------------------------------------------------------------------
+
+/** Status from `GET /api/admin-lock`. */
+export interface AdminLockStatus {
+  /** True when a PIN is set (feature ON). False = today's behavior, no lock. */
+  configured: boolean;
+  /** True when configured AND this session isn't within an unlock window. */
+  locked: boolean;
+  /** Idle window before re-lock, in seconds. */
+  idle_seconds: number;
+  /** Seconds left in the current unlock window (0 when locked). */
+  unlock_seconds_remaining: number;
+}
+
+/** GET /api/admin-lock — read lock state for this session. Session-cookie auth. */
+export async function getAdminLockStatus(): Promise<AdminLockStatus> {
+  const res = await fetch("/api/admin-lock", {
+    method: "GET",
+    headers: { accept: "application/json" },
+    credentials: "same-origin",
+  });
+  if (res.status === 401) return redirectToLoginAndHang<AdminLockStatus>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as AdminLockStatus;
+}
+
+async function postAdminLock(
+  subpath: string,
+  csrf: string,
+  body: Record<string, unknown> = {},
+): Promise<Response> {
+  return await fetch(`/api/admin-lock${subpath}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ __csrf: csrf, ...body }),
+  });
+}
+
+/** POST /api/admin-lock/unlock — verify the PIN, open an unlock window. */
+export async function unlockAdmin(csrf: string, pin: string): Promise<AdminLockStatus> {
+  const res = await postAdminLock("/unlock", csrf, { pin });
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  await res.json().catch(() => ({}));
+  return getAdminLockStatus();
+}
+
+/** POST /api/admin-lock/lock — "Lock now". */
+export async function lockAdminNow(csrf: string): Promise<void> {
+  const res = await postAdminLock("/lock", csrf);
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+/** POST /api/admin-lock/heartbeat — slide the idle window forward on activity. */
+export async function adminLockHeartbeat(csrf: string): Promise<AdminLockStatus> {
+  const res = await postAdminLock("/heartbeat", csrf);
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as AdminLockStatus;
+}
+
+/** POST /api/admin-lock/set — set the FIRST PIN (no PIN configured yet). */
+export async function setAdminLockPin(
+  csrf: string,
+  pin: string,
+  idleSeconds?: number,
+): Promise<void> {
+  const body: Record<string, unknown> = { pin };
+  if (idleSeconds !== undefined) body.idle_seconds = idleSeconds;
+  const res = await postAdminLock("/set", csrf, body);
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+/** POST /api/admin-lock/change — rotate the PIN (current PIN or unlocked session). */
+export async function changeAdminLockPin(
+  csrf: string,
+  newPin: string,
+  currentPin?: string,
+  idleSeconds?: number,
+): Promise<void> {
+  const body: Record<string, unknown> = { new_pin: newPin };
+  if (currentPin) body.current_pin = currentPin;
+  if (idleSeconds !== undefined) body.idle_seconds = idleSeconds;
+  const res = await postAdminLock("/change", csrf, body);
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+/** POST /api/admin-lock/remove — turn the feature OFF (current PIN or unlocked session). */
+export async function removeAdminLockPin(csrf: string, currentPin?: string): Promise<void> {
+  const body: Record<string, unknown> = {};
+  if (currentPin) body.current_pin = currentPin;
+  const res = await postAdminLock("/remove", csrf, body);
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const text = await res.text();

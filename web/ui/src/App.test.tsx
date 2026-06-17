@@ -34,6 +34,28 @@ vi.mock("./lib/api.ts", async (orig) => {
     // than racing on a real fetch. Per-test overrides via mockResolvedValue.
     getMe: vi.fn().mockResolvedValue({ hasSession: false }),
     signOut: vi.fn().mockResolvedValue(undefined),
+    // useAdminLock hits getAdminLockStatus when signed in. Default = no PIN
+    // configured (feature off), so the lock screen never appears in the
+    // existing route tests. The dedicated lock tests override per-case.
+    getAdminLockStatus: vi.fn().mockResolvedValue({
+      configured: false,
+      locked: false,
+      idle_seconds: 900,
+      unlock_seconds_remaining: 0,
+    }),
+    adminLockHeartbeat: vi.fn().mockResolvedValue({
+      configured: false,
+      locked: false,
+      idle_seconds: 900,
+      unlock_seconds_remaining: 0,
+    }),
+    lockAdminNow: vi.fn().mockResolvedValue(undefined),
+    unlockAdmin: vi.fn().mockResolvedValue({
+      configured: true,
+      locked: false,
+      idle_seconds: 900,
+      unlock_seconds_remaining: 900,
+    }),
   };
 });
 
@@ -444,5 +466,89 @@ describe("App — route rendering", () => {
     expect(empty).not.toBeNull();
     const backLink = within(empty as HTMLElement).getByRole("link", { name: /home/i });
     expect(backLink).toHaveAttribute("href", "/");
+  });
+});
+
+describe("App — admin screen lock", () => {
+  it("renders the lock screen (not the admin shell) when the session is locked", async () => {
+    vi.mocked(api.getMe).mockResolvedValue({
+      hasSession: true,
+      user: { id: "u1", displayName: "Op" },
+      csrf: "csrf-1",
+    });
+    vi.mocked(api.getAdminLockStatus).mockResolvedValue({
+      configured: true,
+      locked: true,
+      idle_seconds: 900,
+      unlock_seconds_remaining: 0,
+    });
+    renderAt("/");
+    // The lock screen is shown; the nav (admin shell) is hidden.
+    expect(await screen.findByTestId("admin-lock-screen")).toBeInTheDocument();
+    expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
+  });
+
+  it("shows the admin shell + a 'Lock now' button when configured but unlocked", async () => {
+    vi.mocked(api.getMe).mockResolvedValue({
+      hasSession: true,
+      user: { id: "u1", displayName: "Op" },
+      csrf: "csrf-1",
+    });
+    vi.mocked(api.getAdminLockStatus).mockResolvedValue({
+      configured: true,
+      locked: false,
+      idle_seconds: 900,
+      unlock_seconds_remaining: 900,
+    });
+    renderAt("/");
+    expect(await screen.findByTestId("admin-lock-now")).toBeInTheDocument();
+    // No lock screen — the shell is usable.
+    expect(screen.queryByTestId("admin-lock-screen")).not.toBeInTheDocument();
+  });
+
+  it("does NOT show 'Lock now' when no PIN is configured (feature off)", async () => {
+    vi.mocked(api.getMe).mockResolvedValue({
+      hasSession: true,
+      user: { id: "u1", displayName: "Op" },
+      csrf: "csrf-1",
+    });
+    vi.mocked(api.getAdminLockStatus).mockResolvedValue({
+      configured: false,
+      locked: false,
+      idle_seconds: 900,
+      unlock_seconds_remaining: 0,
+    });
+    renderAt("/");
+    await screen.findByRole("heading", { name: /^hub$/i });
+    expect(screen.queryByTestId("admin-lock-now")).not.toBeInTheDocument();
+  });
+
+  it("unlocking from the lock screen reveals the admin shell", async () => {
+    vi.mocked(api.getMe).mockResolvedValue({
+      hasSession: true,
+      user: { id: "u1", displayName: "Op" },
+      csrf: "csrf-1",
+    });
+    // First call: locked. After unlock, refresh() re-reads → unlocked.
+    vi.mocked(api.getAdminLockStatus)
+      .mockResolvedValueOnce({
+        configured: true,
+        locked: true,
+        idle_seconds: 900,
+        unlock_seconds_remaining: 0,
+      })
+      .mockResolvedValue({
+        configured: true,
+        locked: false,
+        idle_seconds: 900,
+        unlock_seconds_remaining: 900,
+      });
+    renderAt("/");
+    const input = await screen.findByTestId("admin-lock-pin-input");
+    fireEvent.change(input, { target: { value: "4827" } });
+    fireEvent.click(screen.getByTestId("admin-lock-unlock"));
+    await waitFor(() => expect(api.unlockAdmin).toHaveBeenCalledWith("csrf-1", "4827"));
+    // The shell returns (nav present, lock screen gone).
+    await waitFor(() => expect(screen.queryByTestId("admin-lock-screen")).not.toBeInTheDocument());
   });
 });

@@ -47,6 +47,7 @@
  * in line with the admin scope-set semantics from hub#214 / #222.
  */
 import type { Database } from "bun:sqlite";
+import { lockedResponse, requireUnlocked } from "./admin-lock.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
@@ -72,7 +73,7 @@ export async function handleHostAdminToken(
   }
   const sid = parseSessionCookie(req.headers.get("cookie"));
   const session = sid ? findSession(deps.db, sid) : null;
-  if (!session) {
+  if (!session || !sid) {
     return jsonError(401, "unauthenticated", "no admin session — sign in at /login first");
   }
   // First-admin gate. A friend account (non-first-admin user created via
@@ -88,6 +89,15 @@ export async function handleHostAdminToken(
       "not_admin",
       "host-admin token mint is restricted to the hub admin — your account home is at /account/",
     );
+  }
+  // Admin screen-lock gate (optional, off by default). When a lock PIN is set
+  // AND this session isn't within an unlock window, refuse to mint — the SPA
+  // shows the lock screen on the 423. No PIN configured → always allowed
+  // (today's behavior). A successful mint slides the idle window forward.
+  // The OAuth issuer (`/oauth/*`) never reaches this endpoint, so it's
+  // unaffected by the lock.
+  if (!requireUnlocked(deps.db, sid).ok) {
+    return lockedResponse();
   }
   const minted = await signAccessToken(deps.db, {
     sub: session.userId,
