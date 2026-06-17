@@ -40,13 +40,13 @@ describe("validateModuleManifest", () => {
             key: "link-to-vault",
             title: "Link a channel to a vault",
             description: "Back a channel with a vault.",
-            requestedBy: "channel",
+            requestedBy: "agent",
             source: {
               module: "vault",
               event: "note.created",
-              filter: { tags: ["#channel-message/inbound"] },
+              filter: { tags: ["#agent-message/inbound"] },
             },
-            sink: { module: "channel", action: "message.deliver" },
+            sink: { module: "agent", action: "message.deliver" },
             parameters: [
               { key: "vault", target: "source.vault", title: "Vault" },
               { key: "channel", target: "sink.params.channel", example: "eng" },
@@ -61,9 +61,9 @@ describe("validateModuleManifest", () => {
     expect(t?.source).toEqual({
       module: "vault",
       event: "note.created",
-      filter: { tags: ["#channel-message/inbound"] },
+      filter: { tags: ["#agent-message/inbound"] },
     });
-    expect(t?.sink).toEqual({ module: "channel", action: "message.deliver" });
+    expect(t?.sink).toEqual({ module: "agent", action: "message.deliver" });
     expect(t?.parameters?.[1]).toEqual({
       key: "channel",
       target: "sink.params.channel",
@@ -119,7 +119,7 @@ describe("validateModuleManifest", () => {
               key: "k",
               title: "T",
               source: { module: "vault", event: "note.created" },
-              sink: { module: "channel", action: "message.deliver" },
+              sink: { module: "agent", action: "message.deliver" },
               parameters: [{ key: "p" }],
             },
           ],
@@ -417,24 +417,24 @@ describe("validateModuleManifest", () => {
         "x",
       ),
     ).toThrow(/must be namespaced as "<name>:<verb>"/);
-    // A matching-namespace scope still validates — the real channel case
-    // (channel.message.deliver → channel:send).
+    // A matching-namespace scope still validates — the real agent case
+    // (message.deliver → agent:send).
     const okm = validateModuleManifest(
       {
         ...VALID,
-        name: "channel",
+        name: "agent",
         actions: [
           {
             key: "message.deliver",
             title: "Deliver",
             endpoint: "/api/vault/inbound",
-            scope: "channel:send",
+            scope: "agent:send",
           },
         ],
       },
       "x",
     );
-    expect(okm.actions?.[0]?.scope).toBe("channel:send");
+    expect(okm.actions?.[0]?.scope).toBe("agent:send");
   });
 
   test("uiUrl accepts a leading-slash path (Phase D)", () => {

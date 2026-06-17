@@ -1237,7 +1237,7 @@ describe("credential connection — claim/reconcile (surface#113)", () => {
     putConnection(harness.storePath, {
       id: CLAIM_ID,
       source: { module: "vault", vault: "default", event: "note.created" },
-      sink: { module: "channel", action: "message.deliver" },
+      sink: { module: "agent", action: "message.deliver" },
       provisioned: { type: "vault-trigger", vault: "default", triggerName: "t", mintedJtis: [] },
       createdAt: new Date().toISOString(),
     });
@@ -1264,7 +1264,7 @@ describe("credential connection — claim/reconcile (surface#113)", () => {
     putConnection(harness.storePath, {
       id: "ev-conn",
       source: { module: "vault", vault: "default", event: "note.created" },
-      sink: { module: "channel", action: "message.deliver" },
+      sink: { module: "agent", action: "message.deliver" },
       provisioned: { type: "vault-trigger", vault: "default", triggerName: "t", mintedJtis: [] },
       createdAt: new Date().toISOString(),
     });

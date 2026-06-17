@@ -35,7 +35,7 @@ export interface ConnectionSource {
 
 /** The sink side — an action a module accepts (the sink is ALWAYS an action). */
 export interface ConnectionSink {
-  /** Sink module short name, e.g. `channel`. */
+  /** Sink module short name, e.g. `agent`. */
   readonly module: string;
   /** Action key declared in the sink module's `module.json`, e.g. `message.deliver`. */
   readonly action: string;

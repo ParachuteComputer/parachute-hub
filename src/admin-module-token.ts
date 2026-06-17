@@ -16,7 +16,7 @@
  *
  * Scope + audience: `<short>:admin`, audience = `<short>` (the bare service
  * prefix). Modules validate the JWT's `aud` against their literal short name
- * (`scribe`, `runner`, `surface`, `channel`) — the same shape `inferAudience`
+ * (`scribe`, `runner`, `surface`, `agent`) — the same shape `inferAudience`
  * stamps for the public OAuth flow, so a hub-minted and an OAuth-minted admin
  * token are indistinguishable to the module. This mirrors the per-request
  * `<short>:admin` proxy token `api-modules-config.ts` used to mint; the

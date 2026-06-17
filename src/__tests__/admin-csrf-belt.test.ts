@@ -15,9 +15,9 @@
  *      endpoint's own gate. (The legacy `/admin/channels` wiring was belted
  *      here too until boundary D1 retired the endpoint.)
  *
- * The canonical seam consumer is pinned here: channel's admin page POSTs
+ * The canonical seam consumer is pinned here: the agent module's admin page POSTs
  * `/admin/connections` as a same-origin `fetch()` with
- * `credentials: "include"` (parachute-channel src/admin-ui.ts) — i.e.
+ * `credentials: "include"` (parachute-agent src/admin-ui.ts) — i.e.
  * session cookie + browser-sent matching Origin. That shape must keep
  * passing the belt without any token dance.
  */
@@ -248,8 +248,8 @@ describe("CSRF belt wiring — /admin/connections", () => {
     expect(await errorCode(res)).toBe("invalid_request");
   });
 
-  test("seam pin — the channel link-vault shape (cookie + correct Origin, requestedBy: channel) passes the belt", async () => {
-    // parachute-channel/src/admin-ui.ts: fetch(window.location.origin +
+  test("seam pin — the agent link-vault shape (cookie + correct Origin, requestedBy: agent) passes the belt", async () => {
+    // parachute-agent/src/admin-ui.ts: fetch(window.location.origin +
     // "/admin/connections", { method: "POST", credentials: "include" }) —
     // same-origin fetch(), so the browser sends Origin = hub origin on the
     // POST. With no modules installed in this harness the engine answers
@@ -265,10 +265,10 @@ describe("CSRF belt wiring — /admin/connections", () => {
             module: "vault",
             vault: "main",
             event: "note.created",
-            filter: { tags: ["channel-message/inbound"] },
+            filter: { tags: ["agent-message/inbound"] },
           },
-          sink: { module: "channel", action: "message.deliver", params: { channel: "tg" } },
-          requestedBy: "channel",
+          sink: { module: "agent", action: "message.deliver", params: { channel: "tg" } },
+          requestedBy: "agent",
         },
       }),
     );
