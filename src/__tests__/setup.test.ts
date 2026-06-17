@@ -121,7 +121,7 @@ describe("setup", () => {
         { name: "parachute-vault", port: 1940 },
         { name: "parachute-notes", port: 1942 },
         { name: "parachute-scribe", port: 1943 },
-        { name: "parachute-channel", port: 1941 },
+        { name: "parachute-agent", port: 1941 },
         { name: "parachute-runner", port: 1945 },
         { name: "parachute-surface", port: 1946 },
       ];

@@ -1,7 +1,7 @@
 /**
  * Tests for the GENERIC per-module config-UI session→bearer mint endpoint
  * (`GET /admin/module-token/<short>`, 2026-06-09 modular-UI architecture P3).
- * Mirrors `admin-channel-token.test.ts` shape (single bare audience per
+ * Mirrors `admin-agent-token.test.ts` shape (single bare audience per
  * module). Covers:
  *   - 401 when no admin session cookie is present.
  *   - 401 when the cookie names a deleted session.
@@ -112,7 +112,7 @@ describe("handleModuleToken", () => {
 
   // The known single-audience modules the generic mint serves. Each gets
   // `<short>:admin` with `aud: <short>`.
-  for (const short of ["scribe", "runner", "surface", "channel"]) {
+  for (const short of ["scribe", "runner", "surface", "agent"]) {
     test(`200 mints a JWT carrying aud:${short} + ${short}:admin`, async () => {
       const { cookie, userId } = await withSession();
       rotateSigningKey(harness.db);
@@ -284,26 +284,54 @@ describe("handleModuleToken", () => {
     expect(body.error).toBe("use_vault_admin_token");
   });
 
-  test("first-party row resolves through the manifest-name map (parachute-channel ↔ channel)", async () => {
+  test("first-party row resolves through the manifest-name map (parachute-agent ↔ agent)", async () => {
     const { cookie } = await withSession();
     rotateSigningKey(harness.db);
-    const installDir = writeManifestDir("channel");
+    const installDir = writeManifestDir("agent");
     try {
       const services: ServiceEntry[] = [
         {
-          name: "parachute-channel",
+          name: "parachute-agent",
           port: 1941,
-          paths: ["/channel"],
+          paths: ["/agent"],
           health: "/health",
           version: "0.1.0",
           installDir,
         },
       ];
-      const req = new Request(urlFor("channel"), { headers: { cookie } });
-      const res = await handleModuleToken(req, "channel", depsWith(services));
+      const req = new Request(urlFor("agent"), { headers: { cookie } });
+      const res = await handleModuleToken(req, "agent", depsWith(services));
       expect(res.status).toBe(200);
       const body = (await res.json()) as { scopes: string[] };
-      expect(body.scopes).toEqual(["channel:admin"]);
+      expect(body.scopes).toEqual(["agent:admin"]);
+    } finally {
+      rmSync(installDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a legacy parachute-channel row still resolves to short `agent` (rename back-compat)", async () => {
+    // Un-upgraded operators carry a `parachute-channel` services.json row;
+    // LEGACY_MANIFEST_ALIASES maps it to short `agent` so the agent config UI
+    // can still mint its admin Bearer until the daemon re-registers.
+    const { cookie } = await withSession();
+    rotateSigningKey(harness.db);
+    const installDir = writeManifestDir("agent");
+    try {
+      const services: ServiceEntry[] = [
+        {
+          name: "parachute-channel",
+          port: 1941,
+          paths: ["/agent"],
+          health: "/health",
+          version: "0.1.0",
+          installDir,
+        },
+      ];
+      const req = new Request(urlFor("agent"), { headers: { cookie } });
+      const res = await handleModuleToken(req, "agent", depsWith(services));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { scopes: string[] };
+      expect(body.scopes).toEqual(["agent:admin"]);
     } finally {
       rmSync(installDir, { recursive: true, force: true });
     }

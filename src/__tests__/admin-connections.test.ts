@@ -3,11 +3,11 @@
  * P5) — `GET /api/connections/catalog`, `GET/POST /admin/connections`,
  * `DELETE /admin/connections/:id`.
  *
- * The catalog is built from injected module manifests. The vault + channel HTTP
+ * The catalog is built from injected module manifests. The vault + agent HTTP
  * calls are mocked via an injectable `fetchImpl` that records every request
  * (method, URL, decoded bearer, parsed body) and returns scripted responses.
  * Tokens are real (minted by the actual `signAccessToken`), so we can decode the
- * JWT claims (scope/aud) the way channel/vault would.
+ * JWT claims (scope/aud) the way agent/vault would.
  *
  * The whole point of the engine is GENERALITY: the webhook + scope come from the
  * SINK ACTION's declaration, not hardcoded per module. The tests assert that —
@@ -39,7 +39,7 @@ import { rotateSigningKey } from "../signing-keys.ts";
 import { createUser } from "../users.ts";
 
 const HUB_ORIGIN = "https://hub.test";
-const CHANNEL_ORIGIN = "http://127.0.0.1:1941";
+const AGENT_ORIGIN = "http://127.0.0.1:1941";
 const VAULT_ORIGIN = "http://127.0.0.1:1940";
 
 interface Harness {
@@ -162,10 +162,10 @@ const VAULT_MANIFEST: ModuleManifest = {
 };
 
 const CHANNEL_MANIFEST: ModuleManifest = {
-  name: "channel",
-  manifestName: "parachute-channel",
+  name: "agent",
+  manifestName: "parachute-agent",
   port: 1941,
-  paths: ["/channel"],
+  paths: ["/agent"],
   health: "/health",
   events: [{ key: "message.received", title: "A message arrived" }],
   actions: [
@@ -173,24 +173,24 @@ const CHANNEL_MANIFEST: ModuleManifest = {
       key: "message.deliver",
       title: "Deliver an inbound message",
       endpoint: "/api/vault/inbound",
-      scope: "channel:send",
+      scope: "agent:send",
       provision: { type: "vault-trigger" },
     },
   ],
-  // Mirrors the declaration channel ships in its real module.json (boundary
-  // D2) — drives the catalog `templates` round-trip pin below.
+  // Mirrors the declaration the agent module ships in its real module.json
+  // (boundary D2) — drives the catalog `templates` round-trip pin below.
   connectionTemplates: [
     {
       key: "link-to-vault",
       title: "Link a channel to a vault",
       description: "Back a channel with a Parachute vault.",
-      requestedBy: "channel",
+      requestedBy: "agent",
       source: {
         module: "vault",
         event: "note.created",
-        filter: { tags: ["#channel-message/inbound"] },
+        filter: { tags: ["#agent-message/inbound"] },
       },
-      sink: { module: "channel", action: "message.deliver" },
+      sink: { module: "agent", action: "message.deliver" },
       parameters: [
         { key: "vault", target: "source.vault", title: "Vault" },
         { key: "channel", target: "sink.params.channel", title: "Channel name" },
@@ -231,7 +231,7 @@ function baseDeps(fetchImpl: typeof fetch, modules: InstalledModuleInfo[]): Conn
     hubOrigin: HUB_ORIGIN,
     modules,
     resolveVaultOrigin: (v) => (v === "default" ? VAULT_ORIGIN : null),
-    channelOrigin: CHANNEL_ORIGIN,
+    agentOrigin: AGENT_ORIGIN,
     storePath: harness.storePath,
     fetchImpl,
   };
@@ -256,14 +256,14 @@ describe("derivation units", () => {
   test("whenFromFilter maps filter keys 1:1 to the trigger predicate", () => {
     expect(
       whenFromFilter({
-        tags: ["#channel-message/inbound"],
+        tags: ["#agent-message/inbound"],
         has_metadata: ["channel"],
         missing_metadata: ["channel_inbound_rendered_at"],
         has_content: true,
         ignored: "x",
       }),
     ).toEqual({
-      tags: ["#channel-message/inbound"],
+      tags: ["#agent-message/inbound"],
       has_metadata: ["channel"],
       missing_metadata: ["channel_inbound_rendered_at"],
       has_content: true,
@@ -272,8 +272,8 @@ describe("derivation units", () => {
   });
 
   test("buildWebhook joins origin + mount + endpoint, trimming slashes", () => {
-    expect(buildWebhook(`${HUB_ORIGIN}/`, "/channel", "/api/vault/inbound")).toBe(
-      `${HUB_ORIGIN}/channel/api/vault/inbound`,
+    expect(buildWebhook(`${HUB_ORIGIN}/`, "/agent", "/api/vault/inbound")).toBe(
+      `${HUB_ORIGIN}/agent/api/vault/inbound`,
     );
     expect(buildWebhook(HUB_ORIGIN, "widget", "hooks/incoming")).toBe(
       `${HUB_ORIGIN}/widget/hooks/incoming`,
@@ -295,7 +295,7 @@ describe("GET /api/connections/catalog", () => {
       filterSchema: { type: "object", properties: { tags: { type: "array" } } },
     });
     expect(cat.actions).toContainEqual({
-      module: "channel",
+      module: "agent",
       key: "message.deliver",
       title: "Deliver an inbound message",
       inputSchema: null,
@@ -307,17 +307,17 @@ describe("GET /api/connections/catalog", () => {
     const cat = buildCatalog(modulesOf(VAULT_MANIFEST, CHANNEL_MANIFEST));
     expect(cat.templates).toEqual([
       {
-        module: "channel",
+        module: "agent",
         key: "link-to-vault",
         title: "Link a channel to a vault",
         description: "Back a channel with a Parachute vault.",
-        requestedBy: "channel",
+        requestedBy: "agent",
         source: {
           module: "vault",
           event: "note.created",
-          filter: { tags: ["#channel-message/inbound"] },
+          filter: { tags: ["#agent-message/inbound"] },
         },
-        sink: { module: "channel", action: "message.deliver" },
+        sink: { module: "agent", action: "message.deliver" },
         parameters: [
           {
             key: "vault",
@@ -371,7 +371,7 @@ describe("GET /api/connections/catalog", () => {
     );
     expect(res.status).toBe(200);
     const out = (await res.json()) as { events: unknown[]; actions: unknown[] };
-    // vault: 3 events + 1 action; channel: 1 event + 1 action.
+    // vault: 3 events + 1 action; agent: 1 event + 1 action.
     expect(out.events.length).toBe(4);
     expect(out.actions.length).toBe(2);
   });
@@ -418,7 +418,7 @@ describe("POST /admin/connections — validation", () => {
       headers: { cookie },
       body: JSON.stringify({
         source: { module: "vault", vault: "default", event: "note.imaginary" },
-        sink: { module: "channel", action: "message.deliver" },
+        sink: { module: "agent", action: "message.deliver" },
       }),
     });
     const res = await handleConnections(
@@ -462,7 +462,7 @@ describe("POST /admin/connections — validation", () => {
       headers: { cookie },
       body: JSON.stringify({
         source: { module: "vault", vault: "default", event: "note.created" },
-        sink: { module: "channel", action: "message.imaginary" },
+        sink: { module: "agent", action: "message.imaginary" },
       }),
     });
     const res = await handleConnections(
@@ -648,7 +648,7 @@ describe("POST /admin/connections — provenance (R2)", () => {
         headers: { cookie },
         body: JSON.stringify({
           id: "w1",
-          requestedBy: "channel",
+          requestedBy: "agent",
           source: { module: "vault", vault: "default", event: "note.created" },
           sink: { module: "widget", action: "thing.do" },
         }),
@@ -659,7 +659,7 @@ describe("POST /admin/connections — provenance (R2)", () => {
     expect(res.status).toBe(200);
     // Persisted on the record.
     const stored = readConnections(harness.storePath);
-    expect(stored[0]!.requestedBy).toBe("channel");
+    expect(stored[0]!.requestedBy).toBe("agent");
     // Returned (snake_case) on the GET wire shape.
     const list = await handleConnections(
       new Request(`${HUB_ORIGIN}/admin/connections`, { method: "GET", headers: { cookie } }),
@@ -667,7 +667,7 @@ describe("POST /admin/connections — provenance (R2)", () => {
       deps,
     );
     const out = (await list.json()) as { connections: Array<{ requested_by?: string }> };
-    expect(out.connections[0]!.requested_by).toBe("channel");
+    expect(out.connections[0]!.requested_by).toBe("agent");
   });
 
   test("defaults requestedBy to custom when the body omits it", async () => {
@@ -740,12 +740,12 @@ describe("POST /admin/connections — channel-backed (the #624 flow as a connect
           vault: "default",
           event: "note.created",
           filter: {
-            tags: ["#channel-message/inbound"],
+            tags: ["#agent-message/inbound"],
             has_metadata: ["channel"],
             missing_metadata: ["channel_inbound_rendered_at"],
           },
         },
-        sink: { module: "channel", action: "message.deliver", params: { channel: "eng" } },
+        sink: { module: "agent", action: "message.deliver", params: { channel: "eng" } },
       }),
     });
     const res = await handleConnections(
@@ -761,12 +761,12 @@ describe("POST /admin/connections — channel-backed (the #624 flow as a connect
     };
     expect(out.ok).toBe(true);
     // Derived channel id.
-    expect(out.connection.id).toBe("channel-eng");
+    expect(out.connection.id).toBe("agent-eng");
     // Connect lines (parity with #624).
     expect(out.connect?.mcpAdd).toBe(
-      `claude mcp add --transport http --scope user channel-eng ${HUB_ORIGIN}/channel/mcp/eng`,
+      `claude mcp add --transport http --scope user agent-eng ${HUB_ORIGIN}/agent/mcp/eng`,
     );
-    expect(out.connect?.launch).toContain("server:channel-eng");
+    expect(out.connect?.launch).toContain("server:agent-eng");
 
     // Channel config POST: vault transport, loopback vaultUrl, real
     // vault:default:write token, NO webhookSecret.
@@ -780,26 +780,26 @@ describe("POST /admin/connections — channel-backed (the #624 flow as a connect
     expect(cfgBody.name).toBe("eng");
     expect(cfgBody.config.vaultUrl).toBe(VAULT_ORIGIN);
     expect(cfgBody.config).not.toHaveProperty("webhookSecret");
-    expect(scopeOf(cfgCall!.bearer!)).toEqual(["channel:admin"]);
+    expect(scopeOf(cfgCall!.bearer!)).toEqual(["agent:admin"]);
     expect(scopeOf(cfgBody.config.token)).toEqual(["vault:default:write"]);
 
-    // Trigger: webhook from channel mount + message.deliver endpoint; bearer
-    // carries channel:send; predicate from the filter.
+    // Trigger: webhook from agent mount + message.deliver endpoint; bearer
+    // carries agent:send; predicate from the filter.
     const trigCall = calls.find((c) => c.url.endsWith("/vault/default/api/triggers"));
     const trig = trigCall!.body as {
       name: string;
       when: Record<string, unknown>;
       action: { webhook: string; auth: { bearer: string } };
     };
-    expect(trig.action.webhook).toBe(`${HUB_ORIGIN}/channel/api/vault/inbound`);
-    expect(scopeOf(trig.action.auth.bearer)).toEqual(["channel:send"]);
-    expect((decodeJwt(trig.action.auth.bearer) as { aud?: string }).aud).toBe("channel");
+    expect(trig.action.webhook).toBe(`${HUB_ORIGIN}/agent/api/vault/inbound`);
+    expect(scopeOf(trig.action.auth.bearer)).toEqual(["agent:send"]);
+    expect((decodeJwt(trig.action.auth.bearer) as { aud?: string }).aud).toBe("agent");
     expect(trig.when).toEqual({
-      tags: ["#channel-message/inbound"],
+      tags: ["#agent-message/inbound"],
       has_metadata: ["channel"],
       missing_metadata: ["channel_inbound_rendered_at"],
     });
-    expect(trig.name).toBe("conn_channel-eng");
+    expect(trig.name).toBe("conn_agent-eng");
 
     // sub = the operator on every minted token.
     expect((decodeJwt(cfgBody.config.token) as { sub?: string }).sub).toBe(userId);
@@ -809,24 +809,24 @@ describe("POST /admin/connections — channel-backed (the #624 flow as a connect
     expect(serialized).not.toContain(trig.action.auth.bearer);
   });
 
-  test("503 when the channel module is not installed (channelOrigin null)", async () => {
+  test("503 when the agent module is not installed (agentOrigin null)", async () => {
     const { cookie } = await adminCookie();
     const { fetchImpl } = mockFetch({});
     const deps = {
       ...baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, CHANNEL_MANIFEST)),
-      channelOrigin: null,
+      agentOrigin: null,
     };
     const req = new Request(`${HUB_ORIGIN}/admin/connections`, {
       method: "POST",
       headers: { cookie },
       body: JSON.stringify({
         source: { module: "vault", vault: "default", event: "note.created" },
-        sink: { module: "channel", action: "message.deliver", params: { channel: "eng" } },
+        sink: { module: "agent", action: "message.deliver", params: { channel: "eng" } },
       }),
     });
     const res = await handleConnections(req, "", deps);
     expect(res.status).toBe(503);
-    expect(((await res.json()) as { error: string }).error).toBe("channel_unavailable");
+    expect(((await res.json()) as { error: string }).error).toBe("agent_unavailable");
   });
 });
 
@@ -922,7 +922,7 @@ describe("DELETE /admin/connections/:id — teardown", () => {
       "POST /api/channels": () => ok({ ok: true }),
       "POST /vault/default/api/triggers": () => ok({ ok: true }),
       "DELETE /api/channels/eng": () => ok({ ok: true }),
-      "DELETE /vault/default/api/triggers/conn_channel-eng": () => ok({ ok: true }),
+      "DELETE /vault/default/api/triggers/conn_agent-eng": () => ok({ ok: true }),
     });
     const deps = baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, CHANNEL_MANIFEST));
     await handleConnections(
@@ -931,18 +931,18 @@ describe("DELETE /admin/connections/:id — teardown", () => {
         headers: { cookie },
         body: JSON.stringify({
           source: { module: "vault", vault: "default", event: "note.created" },
-          sink: { module: "channel", action: "message.deliver", params: { channel: "eng" } },
+          sink: { module: "agent", action: "message.deliver", params: { channel: "eng" } },
         }),
       }),
       "",
       deps,
     );
     const res = await handleConnections(
-      new Request(`${HUB_ORIGIN}/admin/connections/channel-eng`, {
+      new Request(`${HUB_ORIGIN}/admin/connections/agent-eng`, {
         method: "DELETE",
         headers: { cookie },
       }),
-      "/channel-eng",
+      "/agent-eng",
       deps,
     );
     expect(res.status).toBe(200);
@@ -952,7 +952,7 @@ describe("DELETE /admin/connections/:id — teardown", () => {
     expect(
       calls.some(
         (c) =>
-          c.method === "DELETE" && c.url.endsWith("/vault/default/api/triggers/conn_channel-eng"),
+          c.method === "DELETE" && c.url.endsWith("/vault/default/api/triggers/conn_agent-eng"),
       ),
     ).toBe(true);
   });
@@ -989,7 +989,7 @@ describe("B0 — registered connection mints", () => {
         headers: { cookie },
         body: JSON.stringify({
           source: { module: "vault", vault: "default", event: "note.created" },
-          sink: { module: "channel", action: "message.deliver", params: { channel: "eng" } },
+          sink: { module: "agent", action: "message.deliver", params: { channel: "eng" } },
         }),
       }),
       "",
@@ -1025,10 +1025,10 @@ describe("B0 — registered connection mints", () => {
     const webhookRow = findTokenRowByJti(harness.db, webhookJti);
     expect(webhookRow).not.toBeNull();
     expect(webhookRow!.createdVia).toBe("connection_provision");
-    expect(webhookRow!.scopes).toEqual(["channel:send"]);
+    expect(webhookRow!.scopes).toEqual(["agent:send"]);
 
     // The short-lived (60s) provisioning bearers — vault:<v>:admin on the
-    // trigger POST, channel:admin on the channel-config POST — ride to expiry
+    // trigger POST, agent:admin on the channel-config POST — ride to expiry
     // by design (the documented ≤10-min unregistered bound). NOT registered.
     const trigCall = calls.find((c) => c.url.endsWith("/vault/default/api/triggers"));
     const cfgCall = calls.find((c) => c.url.endsWith("/api/channels"));
@@ -1051,17 +1051,17 @@ describe("B0 — registered connection mints", () => {
       "POST /api/channels": () => ok({ ok: true }),
       "POST /vault/default/api/triggers": () => ok({ ok: true }),
       "DELETE /api/channels/eng": () => ok({ ok: true }),
-      "DELETE /vault/default/api/triggers/conn_channel-eng": () => ok({ ok: true }),
+      "DELETE /vault/default/api/triggers/conn_agent-eng": () => ok({ ok: true }),
     });
     const deps = baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, CHANNEL_MANIFEST));
     const { replyJti, webhookJti } = await createChannelConnection(cookie, deps, calls);
 
     const res = await handleConnections(
-      new Request(`${HUB_ORIGIN}/admin/connections/channel-eng`, {
+      new Request(`${HUB_ORIGIN}/admin/connections/agent-eng`, {
         method: "DELETE",
         headers: { cookie },
       }),
-      "/channel-eng",
+      "/agent-eng",
       deps,
     );
     expect(res.status).toBe(200);

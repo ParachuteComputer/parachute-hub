@@ -654,7 +654,7 @@ function BuilderSection(props: BuilderProps): React.ReactNode {
               rows={4}
               style={{ width: "100%", fontFamily: "monospace" }}
               onChange={(e) => props.setFilterText(e.target.value)}
-              placeholder={'{ "tags": ["#channel-message/inbound"] }'}
+              placeholder={'{ "tags": ["#agent-message/inbound"] }'}
             />
           </p>
         </fieldset>

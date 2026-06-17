@@ -104,7 +104,7 @@ export const OPERATOR_TOKEN_SCOPE_SETS: Readonly<Record<OperatorScopeSet, readon
     "parachute:host:vault",
     "vault:admin",
     "scribe:admin",
-    "channel:send",
+    "agent:send",
   ],
 };
 

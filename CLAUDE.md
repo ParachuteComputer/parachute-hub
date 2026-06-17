@@ -1,6 +1,6 @@
 # Parachute Hub
 
-`@openparachute/hub` — the local hub for the Parachute ecosystem. The `parachute` binary is one of its surfaces; the long-running `parachute serve` process (discovery on `:1939`, soon OAuth issuance) is another — it runs under the platform's process manager (launchd / systemd / container runtime) and supervises every installed module as an attached child. Coordinator, not a service: each Parachute package (`vault`, `notes`, `scribe`, `channel`) stays standalone; the hub stitches them together.
+`@openparachute/hub` — the local hub for the Parachute ecosystem. The `parachute` binary is one of its surfaces; the long-running `parachute serve` process (discovery on `:1939`, soon OAuth issuance) is another — it runs under the platform's process manager (launchd / systemd / container runtime) and supervises every installed module as an attached child. Coordinator, not a service: each Parachute package (`vault`, `notes`, `scribe`, `agent`) stays standalone; the hub stitches them together.
 
 Renamed from `@openparachute/cli` / `parachute-cli` on 2026-04-26 — same binary name (`parachute`), same code, broader role. The "CLI" framing was always partial.
 
@@ -117,7 +117,7 @@ Every PR here is reviewer-gated — no direct-to-main, even for one-line fixes. 
 - Bin name: `parachute`
 - Config root: `~/.parachute/` (override with `PARACHUTE_HOME`)
 - Per-service dirs: `~/.parachute/<short>/` (e.g. `~/.parachute/vault/`)
-- Short names (map to `manifestName` via `SERVICE_SPECS`): `vault`, `notes`, `scribe`, `channel`. `lens` is a transition alias for `notes` on `parachute install` (one release cycle, residue from the brief Notes→Lens→Notes round-trip on 2026-04-19/22); removed post-launch.
+- Short names (map to `manifestName` via `SERVICE_SPECS`): `vault`, `notes`, `scribe`, `agent`. `agent` was renamed from `channel` 2026-06-17 (parachute-channel → parachute-agent); `channel` is a transition install alias for `agent` (one release cycle). `lens` is a transition alias for `notes` on `parachute install` (one release cycle, residue from the brief Notes→Lens→Notes round-trip on 2026-04-19/22); removed post-launch.
 
 ## License
 

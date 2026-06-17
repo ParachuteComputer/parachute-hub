@@ -877,14 +877,14 @@ describe("claw → agent migration", () => {
   // read-time rewrite that aliased legacy `name: "claw"` rows to
   // `name: "agent"` so operators on the old shape kept routing.
   //
-  // As of 2026-05-20, parachute-agent itself is retired (hub#334 added
-  // `agent` to RETIRED_MODULES). The migration still runs — and operators
-  // with claw rows on disk still see them rewritten to `agent` on the
-  // first read — but the retired-module GC then drops the rewritten row
-  // on the next read. The migration is effectively a one-step retirement
-  // path: claw → agent → dropped. The tests below assert the
-  // intermediate rewrite behavior; the retired-module suite asserts the
-  // GC step.
+  // History: parachute-agent (the Claude-in-containers module) was retired
+  // 2026-05-20 (hub#334 added `agent` to RETIRED_MODULES), which briefly made
+  // this a one-step retirement path (claw → agent → GC'd). The 2026-06-17
+  // channel→agent rename RE-ASSIGNED `agent`/`parachute-agent` to the renamed
+  // channel module, so those names left RETIRED_MODULES — `agent` is a live
+  // module again. The claw → agent rewrite still runs; the migrated row now
+  // PERSISTS (it routes to the live agent module). The tests below assert the
+  // rewrite + the persistence.
   const claw: ServiceEntry = {
     name: "claw",
     port: 1944,
@@ -906,10 +906,10 @@ describe("claw → agent migration", () => {
       writeFileSync(path, `${JSON.stringify({ services: [claw] }, null, 2)}\n`);
       const got = readManifest(path);
       // Migration ran in this read (claw → agent on raw entries), then
-      // the row was rewritten to disk. Retired GC won't touch `claw`-
-      // typed rows on the way in, only `agent`-typed rows — so the
-      // first read returns the migrated `agent` shape; the second read
-      // will then GC it (covered below).
+      // the row was rewritten to disk. Post the 2026-06-17 channel→agent
+      // rename, `agent` is once again a LIVE module (the renamed channel
+      // module), so it is NO LONGER GC'd by RETIRED_MODULES — the migrated
+      // row persists and routes to the live agent module's mount.
       expect(got.services).toEqual([agent]);
       const reread = JSON.parse(readFileSync(path, "utf8")) as {
         services: ServiceEntry[];
@@ -922,31 +922,34 @@ describe("claw → agent migration", () => {
     }
   });
 
-  test("retired GC drops the migrated agent row on the next read (post-retirement)", () => {
-    // Confirms the migration's role as an intermediate retirement step:
-    // first read migrates claw → agent and writes back; second read
-    // applies the retired-module GC and drops the row entirely.
+  test("the migrated agent row PERSISTS on the next read (agent is live again post-rename)", () => {
+    // Pre-rename this was a one-step retirement path (claw → agent → GC'd).
+    // After the channel→agent rename (2026-06-17) `agent`/`parachute-agent`
+    // are re-assigned to the live module, so the row is NOT dropped — a
+    // stale paraclaw row now ends up pointing at the live agent module
+    // (harmless / arguably correct, since paraclaw was the original "agent").
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(path, `${JSON.stringify({ services: [claw] }, null, 2)}\n`);
       const first = readManifest(path);
       expect(first.services).toEqual([agent]);
       const second = readManifest(path);
-      expect(second.services).toHaveLength(0);
+      expect(second.services).toEqual([agent]);
     } finally {
       cleanup();
     }
   });
 
-  test("an already-agent entry is dropped by retired GC (was: idempotent migration)", () => {
-    // Pre-hub#334 this test verified the migration was idempotent — an
-    // already-agent row round-tripped unchanged. Post-retirement, the
-    // GC takes over: an agent row is stale and gets removed on read.
+  test("an already-agent entry round-trips unchanged (agent live again post-rename)", () => {
+    // Pre-hub#334 this verified the migration was idempotent; hub#334 made it
+    // GC the agent row (agent was retired). After the channel→agent rename
+    // (2026-06-17) agent is live again, so the row round-trips unchanged —
+    // back to the original idempotent behavior.
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(path, `${JSON.stringify({ services: [agent] }, null, 2)}\n`);
       const got = readManifest(path);
-      expect(got.services).toHaveLength(0);
+      expect(got.services).toEqual([agent]);
     } finally {
       cleanup();
     }
@@ -1228,15 +1231,22 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
 });
 
 // Retired-module row cleanup (hub#334 — Aaron's actual reproducer on
-// 2026-05-22). His services.json carried a stale `agent` row at 1946
-// (left over from parachute-agent's brief committed-core window
-// 2026-05-05 → 2026-05-20) colliding with `parachute-app`'s new
-// canonical slot at 1946. The legacy-short-name de-dupe doesn't help —
-// `agent` isn't the short-name twin of `parachute-app`. The retired-
-// module GC fires unconditionally on rows whose name appears in
-// `RETIRED_MODULES`, regardless of port collision.
+// 2026-05-22). His services.json originally carried a stale `agent` row at
+// 1946 colliding with `parachute-app`'s canonical slot. NOTE: post the
+// 2026-06-17 channel→agent rename, `agent` is a LIVE module again, so these
+// fixtures use the still-retired `app` (parachute-app) name to exercise the
+// same GC. The legacy-short-name de-dupe doesn't help — a retired short
+// isn't the short-name twin of the colliding row. The retired-module GC
+// fires unconditionally on rows whose name appears in `RETIRED_MODULES`,
+// regardless of port collision.
 describe("retired-module row de-dupe (hub#334)", () => {
-  test("drops a row whose name is in RETIRED_MODULES (agent)", () => {
+  // NOTE: the original fixtures used `agent` — which was a RETIRED_MODULES
+  // entry until the 2026-06-17 channel→agent rename re-assigned that name to
+  // the live (renamed-from-channel) module. These tests now use `app`
+  // (parachute-app, retired 2026-05-27 — still in RETIRED_MODULES) so they
+  // keep exercising the retired-module GC mechanism on a name that is still
+  // genuinely retired.
+  test("drops a row whose name is in RETIRED_MODULES (app)", () => {
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1244,10 +1254,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "agent",
+              name: "app",
               port: 1946,
-              paths: ["/agent"],
-              health: "/agent/health",
+              paths: ["/app"],
+              health: "/app/health",
               version: "0.1.4",
             },
           ],
@@ -1265,7 +1275,7 @@ describe("retired-module row de-dupe (hub#334)", () => {
 
   test("retirement is unconditional — no other rows required", () => {
     // Verifies dropRetiredModuleRows doesn't depend on a collision
-    // partner (unlike dropLegacyShortNameRows). An agent row sitting
+    // partner (unlike dropLegacyShortNameRows). An app row sitting
     // alone is still stale.
     const { path, cleanup } = makeTempPath();
     try {
@@ -1274,10 +1284,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "agent",
+              name: "app",
               port: 9999,
-              paths: ["/agent"],
-              health: "/agent/health",
+              paths: ["/app"],
+              health: "/app/health",
               version: "0.1.4",
             },
           ],
@@ -1318,10 +1328,11 @@ describe("retired-module row de-dupe (hub#334)", () => {
     }
   });
 
-  test("Aaron's reproducer — agent + parachute-app at same port resolves cleanly", () => {
-    // The motivating bug for hub#334. With dropRetiredModuleRows
-    // running before validateManifest, the stale agent row is GC'd
-    // and the duplicate-port gate doesn't trip downstream.
+  test("Aaron's reproducer — retired row + parachute-surface at same port resolves cleanly", () => {
+    // The motivating bug for hub#334 (originally an `agent` row; `agent` is
+    // a live module again post-rename, so this uses the still-retired `app`).
+    // With dropRetiredModuleRows running before validateManifest, the stale
+    // retired row is GC'd and the duplicate-port gate doesn't trip downstream.
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1329,10 +1340,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "agent",
+              name: "app",
               port: 1946,
-              paths: ["/agent"],
-              health: "/agent/health",
+              paths: ["/app"],
+              health: "/app/health",
               version: "0.1.4",
             },
             {
@@ -1357,7 +1368,8 @@ describe("retired-module row de-dupe (hub#334)", () => {
     // Drop order matters: retired-module cleanup runs first, then
     // legacy-short-name cleanup. This test ensures both passes
     // compose correctly on a services.json that exercises both
-    // shapes simultaneously. The agent row is unconditional retire;
+    // shapes simultaneously. The `app` row is unconditional retire
+    // (the original `agent` fixture is a live module again post-rename);
     // the parachute-runner + runner pair triggers legacy-short-name
     // dedup at port 1945.
     const { path, cleanup } = makeTempPath();
@@ -1367,10 +1379,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "agent",
+              name: "app",
               port: 1946,
-              paths: ["/agent"],
-              health: "/agent/health",
+              paths: ["/app"],
+              health: "/app/health",
               version: "0.1.4",
             },
             {

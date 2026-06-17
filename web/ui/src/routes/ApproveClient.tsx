@@ -185,7 +185,11 @@ interface RenderBodyProps {
 
 function renderBody({ loadState, action, onApprove, onRetry }: RenderBodyProps) {
   if (loadState.kind === "loading") {
-    return <p className="muted" data-loading="true">Loading…</p>;
+    return (
+      <p className="muted" data-loading="true">
+        Loading…
+      </p>
+    );
   }
   if (loadState.kind === "not_found") {
     return (
@@ -321,7 +325,7 @@ function renderBody({ loadState, action, onApprove, onRetry }: RenderBodyProps) 
  * scope list — clearer than showing the unnamed form which implied
  * vault-wide unrestricted access.
  *
- * Non-vault scopes (`scribe:transcribe`, `channel:send`, …) and
+ * Non-vault scopes (`scribe:transcribe`, `agent:send`, …) and
  * already-named vault scopes (`vault:work:read`) pass through unchanged.
  */
 function resolveScopeForDisplay(scope: string): string {

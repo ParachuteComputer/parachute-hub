@@ -72,6 +72,7 @@ import { isHttpsRequest } from "./request-protocol.ts";
 import { narrowResourceVaultScopes, resolveResourceVault } from "./resource-binding.ts";
 import { isNonRequestableScope, isRequestableScope, scopeIsAdmin } from "./scope-explanations.ts";
 import { findUnknownScopes, loadDeclaredScopes } from "./scope-registry.ts";
+import { shortNameForManifest } from "./service-spec.ts";
 import {
   type ServicesManifest,
   // Hot-path OAuth flows use the lenient reader so a single malformed
@@ -392,13 +393,20 @@ function oauthErrorRedirect(
 
 /**
  * Optional first-party modules whose scopes `FIRST_PARTY_SCOPES` carries
- * statically (it's `Object.keys(SCOPE_EXPLANATIONS)`), paired with the
- * services.json entry that means "installed." Vault + hub are core and always
+ * statically (it's `Object.keys(SCOPE_EXPLANATIONS)`), paired with the module
+ * SHORT name that means "installed." Vault + hub are core and always
  * advertised; these are the modules a hub may not have.
+ *
+ * Keyed on the SHORT name (resolved from each services.json row via
+ * `shortNameForManifest`) rather than the raw manifest name so a row written
+ * under a legacy manifest name still counts as installed — e.g. an un-upgraded
+ * `parachute-channel` row aliases to short `agent` (channel→agent rename
+ * 2026-06-17), so `agent:send` is still correctly advertised until the daemon
+ * re-registers under `parachute-agent`.
  */
-const OPTIONAL_MODULE_SCOPES: ReadonlyArray<readonly [prefix: string, service: string]> = [
-  ["scribe:", "parachute-scribe"],
-  ["channel:", "parachute-channel"],
+const OPTIONAL_MODULE_SCOPES: ReadonlyArray<readonly [prefix: string, short: string]> = [
+  ["scribe:", "scribe"],
+  ["agent:", "agent"],
 ];
 
 /**
@@ -407,20 +415,22 @@ const OPTIONAL_MODULE_SCOPES: ReadonlyArray<readonly [prefix: string, service: s
  * module isn't installed.
  *
  * Why: `FIRST_PARTY_SCOPES` is static, so a vault-only hub still advertised
- * `scribe:*` + `channel:send`. Discovery clients list the advertised catalog
+ * `scribe:*` + `agent:send`. Discovery clients list the advertised catalog
  * verbatim — claude.ai's connector UI showed a friend connecting ONE vault a
- * request for Scribe + Channel access the hub can't even honor. So advertise an
+ * request for Scribe + Agent access the hub can't even honor. So advertise an
  * optional module's scopes only when its service is present in services.json.
  * (Trims the ADVERTISEMENT only; issuance/validation still use the full
  * `loadDeclaredScopes` set, and the per-vault PRM stays vault-narrowed.)
  */
 function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManifest): string[] {
-  const installed = new Set(manifest.services.map((s) => s.name));
+  const installedShorts = new Set(
+    manifest.services.map((s) => shortNameForManifest(s.name) ?? s.name),
+  );
   return Array.from(declared)
     .filter(isRequestableScope)
     .filter((scope) => {
-      for (const [prefix, service] of OPTIONAL_MODULE_SCOPES) {
-        if (scope.startsWith(prefix) && !installed.has(service)) return false;
+      for (const [prefix, short] of OPTIONAL_MODULE_SCOPES) {
+        if (scope.startsWith(prefix) && !installedShorts.has(short)) return false;
       }
       return true;
     });
@@ -889,11 +899,11 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
   //   1. The consent screen — and the session-less "App not yet approved"
   //      page (`pendingClientResponse`) — shows ONLY that vault's scopes
   //      instead of the whole-hub catalog. Narrowing DROPS non-vault scopes
-  //      (`scribe:*`, `channel:send`, `hub:admin`) outright: the token this
+  //      (`scribe:*`, `agent:send`, `hub:admin`) outright: the token this
   //      flow mints is stamped `aud=vault.<name>`, so they're unusable inside
   //      it and only inflate the consent surface — the exact "scary consent"
   //      a friend hit connecting Claude to ONE vault (scribe isn't even
-  //      installed; `channel:send` is meaningless to them).
+  //      installed; `agent:send` is meaningless to them).
   //   2. The minted token carries the named scope, so `inferAudience` stamps
   //      `aud=vault.<name>` and a current-line vault accepts it (an unnamed
   //      `vault:read` token is rejected by `findBroadVaultScopes`).

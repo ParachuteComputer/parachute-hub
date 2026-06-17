@@ -8,7 +8,7 @@ import type { ServiceEntry } from "./services-manifest.ts";
  *
  *   1939  parachute-hub      internal static + proxy, CLI-managed
  *   1940  parachute-vault    committed core
- *   1941  parachute-channel  exploration (may retire)
+ *   1941  parachute-agent    exploration (renamed from parachute-channel)
  *   1942  parachute-notes    committed core (PWA bundle)
  *   1943  parachute-scribe   committed core
  *   1944–1949  unassigned
@@ -64,7 +64,7 @@ export interface PortReservation {
 export const PORT_RESERVATIONS: readonly PortReservation[] = [
   { port: 1939, name: "parachute-hub", status: "assigned" },
   { port: 1940, name: "parachute-vault", status: "assigned" },
-  { port: 1941, name: "parachute-channel", status: "assigned" },
+  { port: 1941, name: "parachute-agent", status: "assigned" },
   { port: 1942, name: "parachute-notes", status: "assigned" },
   { port: 1943, name: "parachute-scribe", status: "assigned" },
   { port: 1944, name: "unassigned", status: "reserved" },
@@ -110,7 +110,7 @@ export interface FirstPartyExtras {
   /**
    * Does the service gate its endpoints behind auth today? Drives
    * `effectivePublicExposure`'s default for api/tool services. True for
-   * vault/channel; conservatively false for scribe until its auth-gate ships.
+   * vault/agent; conservatively false for scribe until its auth-gate ships.
    */
   readonly hasAuth?: boolean;
   /**
@@ -260,9 +260,10 @@ export function composeServiceSpec(opts: {
 //
 // As of 2026-05-21 (hub#310), vault / scribe / runner have all retired their
 // FALLBACK entries: each ships `module.json` AND self-registers its
-// services.json row at boot (vault#356, scribe#50, runner#3). Channel
-// followed in the 2026-06-09 hub-module-boundary migration (D3) — it ships
-// `.parachute/module.json` and self-registers (channel#34 era), so its
+// services.json row at boot (vault#356, scribe#50, runner#3). Agent
+// (renamed from channel 2026-06-17) followed in the 2026-06-09 hub-module-
+// boundary migration (D3) — it ships `.parachute/module.json` and
+// self-registers (channel#34 era, pre-rename), so its
 // vendored manifest retired to a KNOWN_MODULES row. Hub reads the
 // canonical fields from services.json (operator-authoritative) and falls
 // through to `<installDir>/.parachute/module.json` when a lifecycle command
@@ -321,7 +322,7 @@ const NOTES_FALLBACK: FirstPartyFallback = {
  * Indexed by short name (the `parachute install <X>` token).
  *
  * Only notes remains — see the block comment above for the rationale
- * (vault/scribe/runner/channel now self-register and ship their own
+ * (vault/scribe/runner/agent now self-register and ship their own
  * module.json). Other code paths consult both this table AND `KNOWN_MODULES`
  * (which carries the post-self-register-retirement entries) via the helpers
  * in this file (`shortNameForManifest`, `knownServices`, …).
@@ -332,7 +333,7 @@ export const FIRST_PARTY_FALLBACKS: Record<string, FirstPartyFallback> = {
 
 /**
  * Minimal install-time registry for first-party modules whose FALLBACK has
- * retired (vault / scribe / runner as of hub#310; channel as of the
+ * retired (vault / scribe / runner as of hub#310; agent as of the
  * 2026-06-09 hub-module-boundary migration, D3). Hub uses this for:
  *
  *   1. **Install bootstrap**: mapping `parachute install <short>` to the npm
@@ -457,28 +458,26 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
       hasAuth: true,
     },
   },
-  channel: {
-    short: "channel",
-    package: "@openparachute/channel",
-    manifestName: "parachute-channel",
+  agent: {
+    short: "agent",
+    package: "@openparachute/agent",
+    manifestName: "parachute-agent",
     canonicalPort: 1941,
-    displayName: "Channel",
-    // Mirrors channel's own module.json (the canonical fields below do too —
-    // keep in sync if channel's declaration changes). The retired FALLBACK's
-    // copy ("Notification fan-out across modules.", health "/channel/health",
-    // startCmd ["parachute-channel", "daemon"]) predated channel's
-    // module.json + self-registration and had drifted on all three.
+    displayName: "Agent",
+    // Mirrors agent's own module.json (the canonical fields below do too —
+    // keep in sync if agent's declaration changes). Renamed from `channel`
+    // 2026-06-17 (parachute-channel → parachute-agent); the module is the
+    // same webhook-fan-out + MCP bridge daemon, on the same port 1941.
     tagline: "Chat with your Claude Code sessions — a channel per session.",
-    canonicalPaths: ["/channel"],
+    canonicalPaths: ["/agent"],
     canonicalHealth: "/health",
     canonicalStripPrefix: true,
     extras: {
       // Backward-compat startCmd for rows without installDir — same rationale
-      // as scribe / vault / runner. The bare binary IS the daemon (channel's
-      // package.json bin maps `parachute-channel` → src/daemon.ts); the old
-      // vendored `["parachute-channel", "daemon"]` subcommand is stale.
-      startCmd: () => ["parachute-channel"],
-      // Channel gates its endpoints behind hub-issued JWTs (channel:* scopes).
+      // as scribe / vault / runner. The bare binary IS the daemon (agent's
+      // package.json bin maps `parachute-agent` → src/daemon.ts).
+      startCmd: () => ["parachute-agent"],
+      // Agent gates its endpoints behind hub-issued JWTs (agent:* scopes).
       hasAuth: true,
     },
   },
@@ -535,15 +534,20 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
  *     reappear silently on legacy installs.
  */
 export const RETIRED_MODULES: Record<string, { retiredAt: string; replacement?: string }> = {
-  agent: {
-    retiredAt: "2026-05-20",
-    replacement: "parachute-surface or parachute-runner (depending on use case)",
-  },
-  // 2026-05-20 retirement caught both forms of legacy rows.
-  "parachute-agent": {
-    retiredAt: "2026-05-20",
-    replacement: "parachute-surface or parachute-runner (depending on use case)",
-  },
+  // NOTE (2026-06-17, channel→agent rename): the `agent` / `parachute-agent`
+  // names were retired here on 2026-05-20 (the Claude-in-containers module).
+  // They are NOW RE-ASSIGNED to the renamed channel module (parachute-channel
+  // → parachute-agent). Keeping these as RETIRED entries would make
+  // `dropRetiredModuleRows` drop the NEW agent module's services.json row on
+  // load — breaking the live module. The names are no longer retired; they
+  // belong to the active agent module. The retired containers code now lives
+  // under `parachute-agent-legacy` (GitHub) and is not installable, so there
+  // is no live `agent` daemon to GC. (The historical `claw → agent`
+  // migration in services-manifest.ts still rewrites stale paraclaw rows to
+  // `name: "agent"` — they now resolve to the LIVE agent module's mount,
+  // which is harmless / arguably correct since paraclaw was the original
+  // "agent".)
+  //
   // The `parachute-app` row name retires 2026-05-27 along with the
   // app → surface rename (patterns#102). Operators upgrading from
   // 0.5.13-stable will have a `parachute-app` row in services.json
@@ -637,7 +641,7 @@ export function knownServices(): string[] {
  * The hub PREFERS a module's manifest-declared `focus`; this map is the
  * fallback when `module.json` omits it (and the bootstrap value before a
  * module is installed). vault / scribe / hub / surface are `core`; everything
- * else (channel / runner / notes / unknown third-party) defaults to
+ * else (agent / runner / notes / unknown third-party) defaults to
  * `experimental`. **Show all; never hide** — `focus` only groups + labels.
  */
 const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
@@ -645,7 +649,7 @@ const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
   scribe: "core",
   hub: "core",
   surface: "core",
-  channel: "experimental",
+  agent: "experimental",
   runner: "experimental",
   notes: "experimental",
 };
@@ -668,7 +672,7 @@ export function focusForShort(short: string, declared?: ModuleFocus): ModuleFocu
  * `CURATED_MODULES` whitelist (2026-06-09 modular-UI architecture, P2): every
  * module the hub can resolve a package/manifest for is discoverable + installable,
  * regardless of `focus` tier. Deduped, with FIRST_PARTY_FALLBACKS shorts first
- * (notes) then KNOWN_MODULES (vault / scribe / runner / channel / surface).
+ * (notes) then KNOWN_MODULES (vault / scribe / runner / agent / surface).
  *
  * `notes` is intentionally included — it's still resolvable (vendored fallback)
  * for legacy installs; it surfaces as `experimental` and isn't pushed as a
@@ -727,7 +731,7 @@ export function canonicalPortForManifest(manifestName: string): number | undefin
  * spec with embedded manifest + extras — the vendored manifest is the
  * source of truth pre-install and the install path preserves it through.
  *
- * KNOWN_MODULES shorts (vault / scribe / runner / channel / surface — post
+ * KNOWN_MODULES shorts (vault / scribe / runner / agent / surface — post
  * FALLBACK retirement) return a **minimal** spec carrying `package`, `manifestName`,
  * and the imperative `extras` fields
  * (`init`, `hasAuth`, `urlForEntry`, `postInstallFooter`). They do NOT carry
@@ -821,14 +825,23 @@ export async function getSpecFromInstallDir(
  * their install — without this alias, `parachute start/stop/logs/status`
  * silently skip those rows. Remove after launch, alongside the `lens →
  * notes` install alias.
+ *
+ * `parachute-channel` → `agent` (2026-06-17): the channel module was renamed
+ * to agent (parachute-channel → parachute-agent). Operators with an
+ * un-upgraded `services.json` carry a `name: "parachute-channel"` row; this
+ * alias keeps `shortNameForManifest("parachute-channel") === "agent"` so the
+ * legacy row still resolves to the live agent module for routing + lifecycle
+ * until the daemon re-registers under `parachute-agent`. Remove after one
+ * release cycle, alongside the `channel → agent` install alias.
  */
 const LEGACY_MANIFEST_ALIASES: Record<string, string> = {
   "parachute-lens": "notes",
+  "parachute-channel": "agent",
 };
 
 /** Short name for a given manifest name, e.g. `parachute-vault` → `vault`.
  *  Consults both FIRST_PARTY_FALLBACKS (notes) and KNOWN_MODULES
- *  (vault / scribe / runner / channel / surface — post-FALLBACK-retirement).
+ *  (vault / scribe / runner / agent / surface — post-FALLBACK-retirement).
  *  Returns undefined for unknown manifests. */
 export function shortNameForManifest(manifestName: string): string | undefined {
   for (const [short, fb] of Object.entries(FIRST_PARTY_FALLBACKS)) {
@@ -841,13 +854,13 @@ export function shortNameForManifest(manifestName: string): string | undefined {
 }
 
 /**
- * Find a services.json row by its SHORT name (e.g. `"channel"`), resolving each
- * row's manifest name (`parachute-channel`) back through `shortNameForManifest`.
+ * Find a services.json row by its SHORT name (e.g. `"agent"`), resolving each
+ * row's manifest name (`parachute-agent`) back through `shortNameForManifest`.
  *
  * services.json rows carry the MANIFEST name, not the bare short — so a direct
  * `s.name === short` comparison silently misses every first-party module. That
- * exact mismatch (`s.name === "channel"` vs a `parachute-channel` row) is what
- * surfaced a spurious "channel module is not installed" when wiring the channel
+ * exact mismatch (`s.name === "agent"` vs a `parachute-agent` row) is what
+ * surfaced a spurious "agent module is not installed" when wiring the agent
  * connection sink. Resolve through the short↔manifest map instead. Returns the
  * first match, or undefined when no installed row maps to `short`.
  *
@@ -855,7 +868,7 @@ export function shortNameForManifest(manifestName: string): string | undefined {
  * here — `shortNameForManifest` only knows the canonical `parachute-vault`, so
  * `findServiceByShort(services, "vault")` returns undefined even when a vault is
  * installed. Vault rows are resolved by mount path via `findVaultUpstream`; this
- * helper is for single-instance modules (channel / scribe / runner / surface).
+ * helper is for single-instance modules (agent / scribe / runner / surface).
  */
 export function findServiceByShort<T extends { name: string }>(
   services: readonly T[],

@@ -53,8 +53,8 @@ import {
   shortNameForManifest,
 } from "./service-spec.ts";
 // `FIRST_PARTY_FALLBACKS` and `KNOWN_MODULES` are both consulted by
-// `lookupModule` below — the former for notes/channel (vendored manifests
-// still required) and the latter for vault/scribe/runner (post-FALLBACK
+// `lookupModule` below — the former for notes (vendored manifest still
+// required) and the latter for vault/scribe/runner/agent (post-FALLBACK
 // retirement, hub#310). The local helper hides the split from the rest of
 // this file. `discoverableShorts` enumerates their UNION — the
 // self-registration-driven discovery surface that replaced the old
@@ -267,14 +267,14 @@ interface ModuleWireShape {
    * `.parachute/module.json` `configUiUrl`, joined against its mount path the
    * same way `management_url` resolves `managementUrl`/`uiUrl`. Drives the
    * Modules page's consistent **Configure** action — clicking lands the
-   * operator on the module's own config UI (channel `/channel/admin`, scribe
+   * operator on the module's own config UI (agent `/agent/admin`, scribe
    * `/scribe/admin`, …), which mints its admin Bearer from the hub's
-   * cookie-gated `/admin/module-token/<short>` (or `/admin/channel-token`).
+   * cookie-gated `/admin/module-token/<short>` (or `/admin/agent-token`).
    *
    * Null when the module hasn't declared `configUiUrl` — the SPA omits the
    * Configure action for that module rather than rendering a dead button.
    * Distinct from `management_url`: a module may declare one, both, or
-   * neither. Channel declares `configUiUrl: "/channel/admin"` + `uiUrl`;
+   * neither. Agent declares `configUiUrl: "/agent/admin"` + `uiUrl`;
    * vault declares `managementUrl` (its admin SPA is the config surface).
    */
   config_ui_url: string | null;
@@ -493,8 +493,8 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
         );
         if (resolvedManagement !== undefined) managementUrlByShort.set(short, resolvedManagement);
         // The config surface resolves with the SAME rule. A module may declare
-        // `configUiUrl` independently of `managementUrl` — channel ships
-        // `configUiUrl: "/channel/admin"` (single-instance, origin-absolute)
+        // `configUiUrl` independently of `managementUrl` — agent ships
+        // `configUiUrl: "/agent/admin"` (single-instance, origin-absolute)
         // alongside a separate `uiUrl`.
         const resolvedConfig = resolveModuleUrl(m.configUiUrl, value.mountPath, short);
         if (resolvedConfig !== undefined) configUiUrlByShort.set(short, resolvedConfig);
@@ -744,8 +744,8 @@ let warnedLegacyVaultAdminCandidate = false;
  *   - `undefined` candidate → `undefined` (the module didn't declare it).
  *   - Absolute http(s) URL → returned verbatim (off-origin escape hatch).
  *   - Leading-`/` path → ORIGIN-ABSOLUTE, returned verbatim. Single-instance
- *     modules (surface, scribe, runner, channel) declare their full hub-origin
- *     path this way (`/surface/admin/`, `/scribe/admin`, `/channel/admin`);
+ *     modules (surface, scribe, runner, agent) declare their full hub-origin
+ *     path this way (`/surface/admin/`, `/scribe/admin`, `/agent/admin`);
  *     vault's daemon-level surface is `/vault/admin/`.
  *   - Relative path (no leading slash) → MOUNT-JOINED: the per-instance form
  *     (`admin/` on a `/vault/default` mount → `/vault/default/admin/`). With

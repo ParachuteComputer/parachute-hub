@@ -6,7 +6,7 @@
  * Coverage map (from the feature brief):
  *   - PIN set / verify / change / remove.
  *   - The gate: locked → host-admin-token mint refused (423); unlocked → mint
- *     works; idle-expired → locked again; cascade to channel/vault/module mints.
+ *     works; idle-expired → locked again; cascade to agent/vault/module mints.
  *   - **OAuth path works while the admin session is locked** (the critical
  *     boundary — a surface OAuth'ing in never hits the lock).
  *   - Optional: no PIN → no lock, the mint works exactly as today.
@@ -21,7 +21,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { handleChannelToken } from "../admin-channel-token.ts";
+import { handleAgentToken } from "../admin-agent-token.ts";
 import { handleHostAdminToken } from "../admin-host-admin-token.ts";
 import {
   DEFAULT_ADMIN_LOCK_IDLE_SECONDS,
@@ -236,12 +236,12 @@ describe("lock cascade through the four admin-token mints", () => {
     expect((await handleHostAdminToken(mk(), { db: harness.db, issuer: ISSUER })).status).toBe(200);
   });
 
-  test("channel-token cascades (423 when locked)", async () => {
+  test("agent-token cascades (423 when locked)", async () => {
     const { cookie } = await withAdmin();
     rotateSigningKey(harness.db);
     await setPin(harness.db, "4827");
-    const res = await handleChannelToken(
-      new Request(`${ISSUER}/admin/channel-token`, { headers: { cookie } }),
+    const res = await handleAgentToken(
+      new Request(`${ISSUER}/admin/agent-token`, { headers: { cookie } }),
       { db: harness.db, issuer: ISSUER },
     );
     expect(res.status).toBe(423);

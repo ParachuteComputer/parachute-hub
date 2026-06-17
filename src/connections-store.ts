@@ -35,7 +35,7 @@ export interface ConnectionSource {
 
 /** The sink side — an action a module accepts (the sink is ALWAYS an action). */
 export interface ConnectionSink {
-  /** Sink module short name, e.g. `channel`. */
+  /** Sink module short name, e.g. `agent`. */
   readonly module: string;
   /** Action key declared in the sink module's `module.json`, e.g. `message.deliver`. */
   readonly action: string;
@@ -103,8 +103,8 @@ export interface ConnectionRecord {
   /**
    * Provenance — WHO requested this connection (modular-UI R2, module-initiated
    * connections). A module-owned config UI that creates a connection on the
-   * operator's behalf (e.g. the channel admin page's "link to a vault" flow)
-   * labels itself here (e.g. `"channel"`); a connection built by hand in the
+   * operator's behalf (e.g. the agent module's admin page "link to a vault" flow)
+   * labels itself here (e.g. `"agent"`); a connection built by hand in the
    * hub's own Connections builder is `"custom"`. Lets the operator see which
    * connections a module initiated vs which they wired themselves. Optional for
    * back-compat: records written before R2 read back as `undefined`, which the

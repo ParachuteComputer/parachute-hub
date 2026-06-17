@@ -115,9 +115,9 @@ describe("authorizationServerMetadata", () => {
     expect(scopesSupported).toContain("vault:admin");
     expect(scopesSupported).toContain("scribe:transcribe"); // scribe is in the fixture manifest
     expect(scopesSupported).toContain("hub:admin");
-    // channel isn't in the fixture manifest → its scopes aren't advertised
+    // agent isn't in the fixture manifest → its scopes aren't advertised
     // (hub#…: optional-module scopes only surface when the module is installed).
-    expect(scopesSupported).not.toContain("channel:send");
+    expect(scopesSupported).not.toContain("agent:send");
   });
 
   test("does NOT advertise non-requestable operator-only scopes", async () => {
@@ -145,8 +145,8 @@ describe("authorizationServerMetadata", () => {
       "vault:admin",
       "hub:admin",
       "parachute:host:admin", // declared but operator-only — must still be filtered
-      "agent:read",
-      "agent:write",
+      "widget:read",
+      "widget:write",
       "mymodule:do-thing",
     ]);
     const res = authorizationServerMetadata({
@@ -156,9 +156,10 @@ describe("authorizationServerMetadata", () => {
     });
     const body = (await res.json()) as Record<string, unknown>;
     const scopesSupported = body.scopes_supported as string[];
-    // Third-party scopes show up
-    expect(scopesSupported).toContain("agent:read");
-    expect(scopesSupported).toContain("agent:write");
+    // Third-party scopes show up (`widget:*` / `mymodule:*` aren't gated
+    // optional-module prefixes — only scribe:/agent: are, see OPTIONAL_MODULE_SCOPES).
+    expect(scopesSupported).toContain("widget:read");
+    expect(scopesSupported).toContain("widget:write");
     expect(scopesSupported).toContain("mymodule:do-thing");
     // First-party still advertised — no regression
     expect(scopesSupported).toContain("vault:read");
@@ -169,10 +170,10 @@ describe("authorizationServerMetadata", () => {
   });
 
   test("advertises an optional module's scopes only when it's installed", async () => {
-    // FIRST_PARTY_SCOPES carries scribe:* + channel:send statically. On a
+    // FIRST_PARTY_SCOPES carries scribe:* + agent:send statically. On a
     // vault-only hub they must NOT be advertised — a discovery client (e.g.
     // claude.ai's connector UI) lists the catalog verbatim, so a friend
-    // connecting one vault was shown Scribe + Channel access the hub can't
+    // connecting one vault was shown Scribe + Agent access the hub can't
     // honor. Vault + hub are core and always advertised.
     const declared = new Set<string>([
       "vault:read",
@@ -180,7 +181,7 @@ describe("authorizationServerMetadata", () => {
       "vault:admin",
       "scribe:transcribe",
       "scribe:admin",
-      "channel:send",
+      "agent:send",
       "hub:admin",
     ]);
     const vaultOnly = {
@@ -207,7 +208,7 @@ describe("authorizationServerMetadata", () => {
     // uninstalled optional-module scopes are dropped
     expect(scopes).not.toContain("scribe:transcribe");
     expect(scopes).not.toContain("scribe:admin");
-    expect(scopes).not.toContain("channel:send");
+    expect(scopes).not.toContain("agent:send");
 
     // ...but once scribe is installed, its scopes ARE advertised again.
     const withScribe = {
@@ -235,7 +236,7 @@ describe("authorizationServerMetadata", () => {
     });
     const scopes2 = ((await res2.json()) as Record<string, unknown>).scopes_supported as string[];
     expect(scopes2).toContain("scribe:transcribe");
-    expect(scopes2).not.toContain("channel:send"); // channel still not installed
+    expect(scopes2).not.toContain("agent:send"); // agent still not installed
   });
 });
 
@@ -263,7 +264,7 @@ describe("protectedResourceMetadata (RFC 9728, closes hub#393)", () => {
       "vault:admin",
       "hub:admin",
       "parachute:host:admin",
-      "agent:read",
+      "widget:read",
     ]);
     const res = protectedResourceMetadata({
       issuer: ISSUER,
@@ -273,7 +274,7 @@ describe("protectedResourceMetadata (RFC 9728, closes hub#393)", () => {
     const body = (await res.json()) as Record<string, unknown>;
     const scopes = body.scopes_supported as string[];
     expect(scopes).toContain("vault:read");
-    expect(scopes).toContain("agent:read");
+    expect(scopes).toContain("widget:read");
     expect(scopes).not.toContain("parachute:host:admin");
   });
 });
@@ -988,13 +989,13 @@ describe("handleAuthorizeGet — vault picker", () => {
 describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes (scary-consent fix)", () => {
   // claude.ai connecting to ONE vault reads the hub's whole-hub AS-metadata
   // `scopes_supported` and over-requests the full catalog. Bound to the vault
-  // resource (`aud=vault.<name>`), scribe/channel/hub scopes are unusable, so
+  // resource (`aud=vault.<name>`), scribe/agent/hub scopes are unusable, so
   // they must be DROPPED before consent — Aaron hit them as "a fuck ton of
   // privileges that don't make sense" (scribe isn't even installed here).
   const FOREIGN_AND_VAULT =
-    "vault:read vault:write scribe:transcribe scribe:admin channel:send hub:admin";
+    "vault:read vault:write scribe:transcribe scribe:admin agent:send hub:admin";
 
-  test("session consent for a vault MCP resource drops scribe/channel/hub scopes", async () => {
+  test("session consent for a vault MCP resource drops scribe/agent/hub scopes", async () => {
     const { db, cleanup } = await makeDb();
     try {
       const user = await createUser(db, "owner", "pw");
@@ -1035,7 +1036,7 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
       // The foreign scopes are gone.
       expect(html).not.toContain("Send audio to Scribe for transcription."); // scribe:transcribe
       expect(html).not.toContain("Manage Scribe configuration"); // scribe:admin
-      expect(html).not.toContain("Post messages to your Channel."); // channel:send
+      expect(html).not.toContain("Post messages to your Agent."); // agent:send
       expect(html).not.toContain("Manage hub identity"); // hub:admin
     } finally {
       cleanup();
@@ -1058,7 +1059,7 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
           response_type: "code",
           code_challenge: challenge,
           code_challenge_method: "S256",
-          scope: "vault:read scribe:transcribe channel:send",
+          scope: "vault:read scribe:transcribe agent:send",
           resource: `${ISSUER}/vault/default/mcp`,
         }),
         // No session cookie → the unauth pending page renders.
@@ -1072,13 +1073,13 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
       expect(html).toContain("App not yet approved");
       // Foreign scopes absent from the rendered rows...
       expect(html).not.toContain("Send audio to Scribe for transcription.");
-      expect(html).not.toContain("Post messages to your Channel.");
+      expect(html).not.toContain("Post messages to your Agent.");
       // ...and from the login round-trip URL embedded in the page (the
       // narrowed scope was written back onto `url` before this render).
       expect(html).not.toContain("scribe:transcribe");
-      expect(html).not.toContain("channel:send");
+      expect(html).not.toContain("agent:send");
       expect(html).not.toContain("scribe%3Atranscribe");
-      expect(html).not.toContain("channel%3Asend");
+      expect(html).not.toContain("agent%3Asend");
     } finally {
       cleanup();
     }
@@ -1105,7 +1106,7 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
           response_type: "code",
           code_challenge: challenge,
           code_challenge_method: "S256",
-          scope: "scribe:transcribe channel:send",
+          scope: "scribe:transcribe agent:send",
           resource: `${ISSUER}/vault/default/mcp`,
         }),
         {
@@ -1121,7 +1122,7 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
       expect(res.status).toBe(200);
       const html = await res.text();
       expect(html).not.toContain("Send audio to Scribe for transcription.");
-      expect(html).not.toContain("Post messages to your Channel.");
+      expect(html).not.toContain("Post messages to your Agent.");
     } finally {
       cleanup();
     }
@@ -1130,7 +1131,7 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
   test("trust-by-client_name no longer re-prompts when the request over-asks the whole-hub catalog", async () => {
     // Before the narrowing was moved ahead of the status branch, the
     // trust-by-client_name coverage check compared the RAW request
-    // (`vault:read scribe:transcribe channel:send`) against a vault-only prior
+    // (`vault:read scribe:transcribe agent:send`) against a vault-only prior
     // grant — never matched — re-prompting consent every session for a client
     // the operator had already approved. Narrowing first makes the comparison
     // vault-only-vs-vault-only, so the silent re-link fires.
@@ -1160,7 +1161,7 @@ describe("handleAuthorizeGet — RFC 8707 resource binding drops foreign scopes 
           response_type: "code",
           code_challenge: challenge,
           code_challenge_method: "S256",
-          scope: "vault:read scribe:transcribe channel:send",
+          scope: "vault:read scribe:transcribe agent:send",
           resource: `${ISSUER}/vault/default/mcp`,
         }),
         {

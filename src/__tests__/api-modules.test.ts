@@ -220,7 +220,7 @@ describe("GET /api/modules", () => {
     // by the UNION of the bootstrap registries (KNOWN_MODULES ∪
     // FIRST_PARTY_FALLBACKS), NOT a curated whitelist. Every known module
     // surfaces — core (vault/scribe/surface) in the headline tier, the rest
-    // (channel/runner/notes) as `experimental` — so the channel-not-installed
+    // (agent/runner/notes) as `experimental` — so the agent-not-installed
     // class (running but invisible) can't recur.
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
@@ -244,11 +244,11 @@ describe("GET /api/modules", () => {
     // The core tier leads, in the recommended install order (vault → scribe),
     // ahead of every experimental module.
     expect(shorts.indexOf("vault")).toBeLessThan(shorts.indexOf("scribe"));
-    expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("channel"));
+    expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("agent"));
     expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("runner"));
     // Every known module is discoverable — vault/scribe/surface (core) +
-    // channel/runner/notes (experimental).
-    for (const s of ["vault", "scribe", "surface", "channel", "runner", "notes"]) {
+    // agent/runner/notes (experimental).
+    for (const s of ["vault", "scribe", "surface", "agent", "runner", "notes"]) {
       expect(shorts).toContain(s);
     }
     // Focus tier resolves from the default map.
@@ -256,7 +256,7 @@ describe("GET /api/modules", () => {
     expect(byShort.get("vault")?.focus).toBe("core");
     expect(byShort.get("scribe")?.focus).toBe("core");
     expect(byShort.get("surface")?.focus).toBe("core");
-    expect(byShort.get("channel")?.focus).toBe("experimental");
+    expect(byShort.get("agent")?.focus).toBe("experimental");
     expect(byShort.get("runner")?.focus).toBe("experimental");
     expect(byShort.get("notes")?.focus).toBe("experimental");
     expect(body.modules.every((m) => m.available)).toBe(true);
@@ -304,24 +304,24 @@ describe("GET /api/modules", () => {
     expect(scribe?.available).toBe(true);
   });
 
-  test("channel (running + self-registered) appears as installed + experimental — regression for the channel-not-installed bug", async () => {
-    // THE bug this PR fixes (2026-06-09 modular-UI architecture, P2): channel
+  test("agent (running + self-registered) appears as installed + experimental — regression for the channel-not-installed bug", async () => {
+    // THE bug this PR fixes (2026-06-09 modular-UI architecture, P2): agent (renamed from channel 2026-06-17)
     // was running, proxied, supervised, and self-registered in services.json
     // yet invisible on the Modules screen — because the old CURATED_MODULES =
     // ["vault","scribe"] whitelist gated discovery. Now discovery is driven by
-    // self-registration ∪ the known registries, so a self-registered channel
+    // self-registration ∪ the known registries, so a self-registered agent
     // row surfaces as installed, in the experimental tier, with its run-state.
     writeManifest(h.manifestPath, [
       {
-        name: "parachute-channel",
+        name: "parachute-agent",
         port: 1941,
-        paths: ["/channel"],
-        health: "/channel/health",
+        paths: ["/agent"],
+        health: "/agent/health",
         version: "0.3.1",
       },
     ]);
     const { supervisor } = makeIdleSupervisor();
-    await supervisor.start({ short: "channel", cmd: ["parachute-channel", "daemon"] });
+    await supervisor.start({ short: "agent", cmd: ["parachute-agent"] });
 
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
@@ -340,18 +340,17 @@ describe("GET /api/modules", () => {
         supervisor_status: string | null;
       }>;
     };
-    const channel = body.modules.find((m) => m.short === "channel");
-    expect(channel).toBeDefined();
-    expect(channel?.installed).toBe(true);
-    expect(channel?.installed_version).toBe("0.3.1");
-    expect(channel?.focus).toBe("experimental");
-    expect(channel?.supervisor_status).toBe("running");
+    const agent = body.modules.find((m) => m.short === "agent");
+    expect(agent).toBeDefined();
+    expect(agent?.installed).toBe(true);
+    expect(agent?.installed_version).toBe("0.3.1");
+    expect(agent?.focus).toBe("experimental");
+    expect(agent?.supervisor_status).toBe("running");
   });
 
   test("every self-registered + known module appears in `modules` — no running-but-invisible class", async () => {
     // The two-registry-disagreement (services.json says installed, the curated
-    // whitelist says invisible) is gone: a self-registered surface row + a
-    // supervised channel both surface in `modules` (2026-06-09 modular-UI
+    // whitelist says invisible) is gone: a self-registered surface row + a    // supervised agent both surface in `modules` (2026-06-09 modular-UI
     // architecture). `supervised` still mirrors the run-state for every
     // tracked module (hub#539) — consumers dedupe by short.
     writeManifest(h.manifestPath, [
@@ -630,19 +629,19 @@ describe("GET /api/modules", () => {
   });
 
   test("populates config_ui_url from a module's configUiUrl (2026-06-09 modular-UI P3)", async () => {
-    // Channel declares `configUiUrl: "/channel/admin"` (a single-instance,
-    // origin-absolute path) + `uiUrl: "/channel/ui"`. The hub surfaces
+    // Agent declares `configUiUrl: "/agent/admin"` (a single-instance,
+    // origin-absolute path) + `uiUrl: "/agent/ui"`. The hub surfaces
     // both: `config_ui_url` drives the Modules page Configure action,
     // `management_url` drives Open. configUiUrl resolves identically to
     // managementUrl (same B4 unified semantics).
     writeManifest(h.manifestPath, [
       {
-        name: "channel",
+        name: "agent",
         port: 1941,
-        paths: ["/channel"],
+        paths: ["/agent"],
         health: "/health",
         version: "0.1.0",
-        installDir: "/install/dir/channel",
+        installDir: "/install/dir/agent",
       },
     ]);
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
@@ -652,17 +651,17 @@ describe("GET /api/modules", () => {
       manifestPath: h.manifestPath,
       fetchLatestVersion: async () => null,
       readModuleManifest: async (installDir) => {
-        if (installDir === "/install/dir/channel") {
+        if (installDir === "/install/dir/agent") {
           return {
-            name: "channel",
-            manifestName: "parachute-channel",
-            displayName: "Channel",
+            name: "agent",
+            manifestName: "parachute-agent",
+            displayName: "Agent",
             tagline: "",
             port: 1941,
-            paths: ["/channel"],
+            paths: ["/agent"],
             health: "/health",
-            uiUrl: "/channel/ui",
-            configUiUrl: "/channel/admin",
+            uiUrl: "/agent/ui",
+            configUiUrl: "/agent/admin",
           } as unknown as Awaited<
             ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
           >;
@@ -678,11 +677,11 @@ describe("GET /api/modules", () => {
         management_url: string | null;
       }>;
     };
-    const channel = body.modules.find((m) => m.short === "channel");
-    // Origin-absolute — verbatim, never double-prepends `/channel`.
-    expect(channel?.config_ui_url).toBe("/channel/admin");
+    const agent = body.modules.find((m) => m.short === "agent");
+    // Origin-absolute — verbatim, never double-prepends `/agent`.
+    expect(agent?.config_ui_url).toBe("/agent/admin");
     // uiUrl (no managementUrl) drives the Open action's management_url.
-    expect(channel?.management_url).toBe("/channel/ui");
+    expect(agent?.management_url).toBe("/agent/ui");
   });
 
   test("config_ui_url is null when the module declares no configUiUrl", async () => {

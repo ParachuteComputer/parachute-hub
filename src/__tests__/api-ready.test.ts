@@ -92,7 +92,7 @@ describe("handleApiReady — supervisor mode", () => {
       moduleState({ short: "vault", status: "starting" }),
       moduleState({ short: "scribe", status: "restarting" }),
       moduleState({ short: "notes", status: "crashed" }),
-      moduleState({ short: "channel", status: "stopped" }),
+      moduleState({ short: "agent", status: "stopped" }),
       moduleState({
         short: "runner",
         status: "running",
@@ -109,7 +109,7 @@ describe("handleApiReady — supervisor mode", () => {
     expect(body.ready).toBe(false);
     expect(body.ready_modules).toEqual(["runner"]);
     expect(body.transient_modules.sort()).toEqual(["scribe", "vault"]);
-    expect(body.persistent_modules.sort()).toEqual(["channel", "notes"]);
+    expect(body.persistent_modules.sort()).toEqual(["agent", "notes"]);
   });
 
   test("only crashed/stopped + nothing transient → ready=false (still failing)", async () => {

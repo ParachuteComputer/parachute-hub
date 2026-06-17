@@ -286,8 +286,9 @@ interface PathMatch {
  * for — but the gate is now "is this a KNOWN module" (`isKnownModuleShort`:
  * KNOWN_MODULES ∪ FIRST_PARTY_FALLBACKS), NOT the old `CURATED_MODULES`
  * whitelist (2026-06-09 modular-UI architecture, P2). This is what makes
- * `POST /api/modules/channel/install` resolve — channel was discoverable +
- * running yet un-installable because it sat outside the whitelist.
+ * `POST /api/modules/agent/install` resolve — the agent module (then named
+ * channel) was discoverable + running yet un-installable because it sat
+ * outside the whitelist.
  *
  * The hub (`hub`) and genuinely third-party services.json rows still fall
  * through to undefined: there's no install package to act on.

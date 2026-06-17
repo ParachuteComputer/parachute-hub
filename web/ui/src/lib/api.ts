@@ -720,8 +720,8 @@ export interface ModuleListing {
    * P3). Resolved server-side from `module.json`'s `configUiUrl`, joined
    * against the module's mount. Drives the consistent **Configure** action on
    * the Modules page — clicking opens the module-owned config UI (e.g.
-   * `/channel/admin`), which mints its admin Bearer from the hub's cookie-gated
-   * `/admin/module-token/<short>` (or `/admin/channel-token`). Null when the
+   * `/agent/admin`), which mints its admin Bearer from the hub's cookie-gated
+   * `/admin/module-token/<short>` (or `/admin/agent-token`). Null when the
    * module hasn't declared `configUiUrl` — the SPA omits the Configure action.
    *
    * Distinct from `management_url`: a module may declare one, both, or neither.
@@ -1624,7 +1624,7 @@ export interface ConnectionListing {
   /**
    * Provenance — WHO requested this connection (modular-UI R2). `"custom"` for a
    * connection built by hand in this builder; a module short name (e.g.
-   * `"channel"`) when a module-owned config UI created it on the operator's
+   * `"agent"`) when a module-owned config UI created it on the operator's
    * behalf. Always present on the GET wire shape (the server defaults pre-R2
    * records to `"custom"`); optional here for resilience to older responses.
    */

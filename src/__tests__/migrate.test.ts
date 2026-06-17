@@ -56,7 +56,7 @@ describe("safelistEntries", () => {
     expect(s.has("vault")).toBe(true);
     expect(s.has("notes")).toBe(true);
     expect(s.has("scribe")).toBe(true);
-    expect(s.has("channel")).toBe(true);
+    expect(s.has("agent")).toBe(true);
     // Internal
     expect(s.has("hub")).toBe(true);
     // CLI state

@@ -117,15 +117,15 @@ function decodeVaultName(segment: string): string | null {
  *   - already-named `vault:<other>:<verb>` is LEFT UNTOUCHED — a client that
  *     explicitly named a different vault is not silently re-pointed; the
  *     downstream picker / assignment defenses decide whether that's allowed.
- *   - non-vault scopes (`scribe:*`, `channel:send`, `hub:admin`, …) are
+ *   - non-vault scopes (`scribe:*`, `agent:send`, `hub:admin`, …) are
  *     DROPPED. This flow mints a token stamped `aud=vault.<name>` (RFC 8707),
- *     so a scribe/channel/hub scope inside it is unusable — keeping it only
+ *     so a scribe/agent/hub scope inside it is unusable — keeping it only
  *     inflates the consent surface a friend sees when connecting ONE vault.
  *     That "scary consent" is the failure mode this module exists to kill
  *     (see the header docstring): the verb-narrowing alone left the foreign
  *     scopes riding through, so a client that over-requests the whole-hub
  *     catalog (claude.ai reads it from the AS-metadata `scopes_supported`)
- *     still surfaced `scribe:admin` + `channel:send` on the consent screen.
+ *     still surfaced `scribe:admin` + `agent:send` on the consent screen.
  *     A client that genuinely wants a scribe token runs a separate flow
  *     naming the scribe resource.
  *
@@ -137,7 +137,7 @@ export function narrowResourceVaultScopes(scopes: readonly string[], vaultName: 
   const out: string[] = [];
   for (const s of scopes) {
     const parts = s.split(":");
-    if (parts[0] !== "vault") continue; // drop scribe:/channel:/hub:/… — foreign to a vault-audience token
+    if (parts[0] !== "vault") continue; // drop scribe:/agent:/hub:/… — foreign to a vault-audience token
     const verb = parts[1];
     if (parts.length === 2 && verb && VAULT_VERBS.has(verb)) {
       out.push(`vault:${vaultName}:${verb}`);

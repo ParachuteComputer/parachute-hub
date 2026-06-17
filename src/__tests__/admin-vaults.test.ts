@@ -735,7 +735,7 @@ import { findTokenRowByJti, listActiveRevocations, recordTokenMint } from "../jw
 import { createUser, setUserVaults } from "../users.ts";
 
 const VAULT_ORIGIN = "http://127.0.0.1:19400";
-const CHANNEL_ORIGIN = "http://127.0.0.1:19410";
+const AGENT_ORIGIN = "http://127.0.0.1:19410";
 
 /** Successful no-op runner — records the commands it was asked to run. */
 function stubRun(
@@ -788,7 +788,7 @@ interface DeleteCallOpts {
   connectionsStorePath: string;
   runCommand?: (cmd: readonly string[]) => Promise<RunResult>;
   restartVaultModule?: () => Promise<void>;
-  channelOrigin?: string | null;
+  agentOrigin?: string | null;
   fetchImpl?: typeof fetch;
   resolveVaultOrigin?: (v: string) => string | null;
 }
@@ -810,7 +810,7 @@ async function callDelete(opts: DeleteCallOpts): Promise<Response> {
     issuer: ISSUER,
     manifestPath: opts.manifestPath,
     connectionsStorePath: opts.connectionsStorePath,
-    channelOrigin: opts.channelOrigin ?? null,
+    agentOrigin: opts.agentOrigin ?? null,
     resolveVaultOrigin: opts.resolveVaultOrigin ?? (() => VAULT_ORIGIN),
     runCommand: opts.runCommand ?? stubRun().run,
     ...(opts.restartVaultModule ? { restartVaultModule: opts.restartVaultModule } : {}),
@@ -1002,7 +1002,7 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
         // 1. Registry rows: two naming "work" (one standalone + the
         //    connection's registered mint below), one naming "default".
         registryRow(db, "jti-work-1", ["vault:work:write"]);
-        registryRow(db, "jti-conn-1", ["channel:send"]); // connection webhook bearer (non-vault scope)
+        registryRow(db, "jti-conn-1", ["agent:send"]); // connection webhook bearer (non-vault scope)
         registryRow(db, "jti-default-1", ["vault:default:read"]);
 
         // 2. Grants: one spanning both vaults (rewrite), one work-only (drop).
@@ -1036,7 +1036,7 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
         putConnection(store, {
           id: "conn-work",
           source: { module: "vault", vault: "work", event: "note.created" },
-          sink: { module: "channel", action: "message.deliver", params: { channel: "eng" } },
+          sink: { module: "agent", action: "message.deliver", params: { channel: "eng" } },
           provisioned: {
             type: "vault-trigger",
             vault: "work",
@@ -1048,7 +1048,7 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
         putConnection(store, {
           id: "conn-default",
           source: { module: "vault", vault: "default", event: "note.created" },
-          sink: { module: "channel", action: "message.deliver", params: { channel: "ops" } },
+          sink: { module: "agent", action: "message.deliver", params: { channel: "ops" } },
           provisioned: { type: "vault-trigger", vault: "default", triggerName: "conn_d" },
           createdAt: new Date().toISOString(),
         });
@@ -1078,7 +1078,7 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
           restartVaultModule: async () => {
             restarted = true;
           },
-          channelOrigin: CHANNEL_ORIGIN,
+          agentOrigin: AGENT_ORIGIN,
           fetchImpl,
           resolveVaultOrigin: (v) => (v === "work" ? VAULT_ORIGIN : null),
         });
@@ -1102,7 +1102,7 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
         expect(out.name).toBe("work");
 
         // 1. Registry sweep: the work-scoped row revoked; default untouched.
-        //    The connection's webhook-bearer row (channel:send — names no
+        //    The connection's webhook-bearer row (agent:send — names no
         //    vault) is revoked by the CONNECTION teardown, not the sweep.
         expect(out.cascade.tokens_revoked).toBe(1);
         expect(findTokenRowByJti(db, "jti-work-1")?.revokedAt).not.toBeNull();
