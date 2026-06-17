@@ -93,7 +93,10 @@ export async function handleHostAdminToken(
   // Admin screen-lock gate (optional, off by default). When a lock PIN is set
   // AND this session isn't within an unlock window, refuse to mint — the SPA
   // shows the lock screen on the 423. No PIN configured → always allowed
-  // (today's behavior). A successful mint slides the idle window forward.
+  // (today's behavior). This mint is a PURE CHECK — it does NOT slide the idle
+  // window; sliding is driven only by genuine user activity (the SPA's debounced
+  // `/heartbeat`), so a background re-mint (e.g. the 30s version-badge poll) can't
+  // keep an idle tab unlocked. See the `requireUnlocked` docblock in admin-lock.ts.
   // The OAuth issuer (`/oauth/*`) never reaches this endpoint, so it's
   // unaffected by the lock.
   if (!requireUnlocked(deps.db, sid).ok) {
