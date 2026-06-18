@@ -191,6 +191,48 @@ export async function discover(mcpUrl: string, fetchFn: FetchFn = fetch): Promis
 }
 
 // ===========================================================================
+// Least-privilege scope derivation for Parachute-vault MCP URLs (#671)
+// ===========================================================================
+
+/**
+ * `…/vault/<name>/mcp` — a Parachute vault MCP endpoint. Anchored: the path must
+ * END at `/mcp` right after the vault name so a longer path
+ * (`/vault/x/mcp/extra`) doesn't masquerade as a vault MCP. `<name>` is the
+ * vault-name charset (the same conservative slug `validateVaultName` enforces —
+ * a non-empty run of letters/digits/`._-`), captured group 1.
+ */
+const VAULT_MCP_PATH_RE = /\/vault\/([a-z0-9][a-z0-9._-]*)\/mcp\/?$/i;
+
+/**
+ * Derive the least-privilege OAuth scope to request when starting an mcp-grant
+ * OAuth flow against a remote MCP URL (#671).
+ *
+ * The OAuth-start path historically requested the resource's ENTIRE advertised
+ * `scopes_supported`. For a Parachute vault MCP that set includes broad scopes
+ * (`hub:admin`, `vault:<name>:write`, …) — wildly over-privileged for an agent
+ * that only needs to READ the vault. So when the target URL is a Parachute vault
+ * MCP (`…/vault/<name>/mcp`), request a single least-privilege
+ * `vault:<name>:read` scope instead of the full set. Write is a deliberate
+ * future knob, not the default.
+ *
+ * For any non-vault-shaped MCP URL (or one with no parseable vault name), returns
+ * `null` — the caller keeps the existing behavior (request `scopes_supported`, or
+ * omit `scope` when the resource advertises none).
+ */
+export function deriveVaultScopeFromMcpUrl(mcpUrl: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(mcpUrl);
+  } catch {
+    return null;
+  }
+  const match = VAULT_MCP_PATH_RE.exec(parsed.pathname);
+  const name = match?.[1];
+  if (!name) return null;
+  return `vault:${name}:read`;
+}
+
+// ===========================================================================
 // Dynamic client registration (RFC 7591)
 // ===========================================================================
 
