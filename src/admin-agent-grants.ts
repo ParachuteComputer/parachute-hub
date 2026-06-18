@@ -70,6 +70,7 @@ import {
   listGrantsForAgent,
   putGrant,
   readGrants,
+  removeGrant,
 } from "./grants-store.ts";
 import {
   type signAccessToken as SignAccessTokenFn,
@@ -77,7 +78,7 @@ import {
   revokeTokenByJti,
   signAccessToken,
 } from "./jwt-sign.ts";
-import { type OAuthClient, realOAuthClient } from "./oauth-client.ts";
+import { type OAuthClient, deriveVaultScopeFromMcpUrl, realOAuthClient } from "./oauth-client.ts";
 import { type PendingFlow, deleteFlow, getFlowByState, putFlow } from "./oauth-flows-store.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
@@ -113,6 +114,15 @@ const MAX_TAG_LEN = 128;
  *  bounds a fat-finger paste from bloating the on-disk store — matches the other caps. */
 const MAX_TOKEN_LEN = 8192;
 const MAX_TAGS = 64;
+/**
+ * Reconcile caps (#96). A host-admin Bearer is high-privilege, but these bound a
+ * runaway/misconfigured module from POSTing a giant liveKeys array. The cap is
+ * generous vs. realistic agent connection counts ("a handful per agent").
+ */
+const MAX_LIVE_KEYS = 256;
+/** A connectionKey is `kind:target[:access][#tags]` — bounded by the upstream
+ *  target/tag caps, so this is a loose safety bound, not the real limit. */
+const MAX_CONNECTION_KEY_LEN = 1024;
 
 export interface AgentGrantsDeps {
   db: Database;
@@ -184,6 +194,18 @@ export async function handleAgentGrants(
     if (method === "PUT") return upsertGrant(req, deps);
     if (method === "GET") return listGrants(req, deps);
     return jsonError(405, "method_not_allowed", "use PUT or GET on /admin/grants");
+  }
+
+  // --- Collection sub-action: POST /reconcile (grant-GC, #96) — module-auth. ---
+  // `reconcile` is a reserved single-segment action, NOT a grant id (the
+  // GRANT_ID_RE slug never collides — but anchoring it here makes the routing
+  // explicit). The agent module POSTs the live connection keys for one holder;
+  // the hub prunes every grant for that holder whose key is no longer live.
+  if (segments.length === 1 && segments[0] === "reconcile") {
+    if (method !== "POST") {
+      return jsonError(405, "method_not_allowed", "use POST on /admin/grants/reconcile");
+    }
+    return reconcileGrants(req, deps);
   }
 
   const id = segments[0] ?? "";
@@ -816,8 +838,19 @@ async function approveMcpGrant(
   const verifier = client.generateCodeVerifier();
   const challenge = client.generateCodeChallenge(verifier);
   const state = client.generateState();
-  // Scope: the resource's advertised scopes (9728→8414), space-joined; omit if none.
-  const scope = discovery.scopesSupported?.length ? discovery.scopesSupported.join(" ") : undefined;
+  // Scope (#671). When the target is a Parachute vault MCP (`…/vault/<name>/mcp`),
+  // request a single least-privilege `vault:<name>:read` scope rather than the
+  // resource's full advertised set (which for a vault includes hub:admin,
+  // vault:<name>:write, … — wildly over-privileged for a read-only agent).
+  // Write is a deliberate future knob, not the default. For any non-vault MCP
+  // URL, fall back to the resource's advertised scopes (9728→8414), space-joined;
+  // omit if none.
+  const vaultScope = deriveVaultScopeFromMcpUrl(mcpUrl);
+  const scope = vaultScope
+    ? vaultScope
+    : discovery.scopesSupported?.length
+      ? discovery.scopesSupported.join(" ")
+      : undefined;
 
   const flow: PendingFlow = {
     state,
@@ -1066,30 +1099,7 @@ async function revokeGrant(req: Request, id: string, deps: AgentGrantsDeps): Pro
   if (!grant) return jsonError(404, "not_found", `no grant ${id}`);
 
   const now = deps.now?.() ?? new Date();
-  // Revoke the minted vault token in the registry so it's dead immediately, not
-  // just absent from the next fetch. Service tokens are operator-owned external
-  // creds — we drop our copy (the operator rotates them upstream if needed).
-  if (grant.material?.kind === "vault") {
-    try {
-      revokeTokenByJti(deps.db, grant.material.jti, now);
-    } catch {
-      // Best-effort.
-    }
-  } else if (
-    // mcp OAuth grant — best-effort revoke the refresh token at the issuer so the
-    // remote credential dies, not just our local copy. A static bearer has no
-    // refresh/revocation endpoint, so this is a no-op (operator rotates upstream).
-    grant.material?.kind === "mcp" &&
-    grant.material.refresh_token &&
-    grant.material.revocationEndpoint &&
-    grant.material.clientId
-  ) {
-    await oauth(deps).revokeRemote({
-      revocationEndpoint: grant.material.revocationEndpoint,
-      refreshToken: grant.material.refresh_token,
-      clientId: grant.material.clientId,
-    });
-  }
+  await tearDownGrantMaterial(grant, deps, now);
 
   const updated: GrantRecord = {
     id: grant.id,
@@ -1103,6 +1113,145 @@ async function revokeGrant(req: Request, id: string, deps: AgentGrantsDeps): Pro
   putGrant(deps.storePath, updated);
   console.log(`agent grant revoked: id=${id} agent=${grant.agent} kind=${grant.connection.kind}`);
   return grantResponse(200, updated);
+}
+
+/**
+ * Tear down a grant's credential material — shared by `revoke` (operator intent,
+ * keeps the row at status:revoked) and `reconcile` (the holder is gone, the row is
+ * then removed entirely). Idempotent + best-effort: a missing registry row or a
+ * failed remote revoke must not throw.
+ *
+ *   - vault   → revoke the minted token in the registry so it's dead immediately,
+ *               not just absent from the next fetch.
+ *   - mcp     → best-effort revoke the refresh token at the issuer so the remote
+ *               credential dies, not just our local copy. A static bearer (no
+ *               refresh/revocation endpoint) is a no-op (operator rotates upstream).
+ *   - service → operator-owned external cred; nothing to revoke remotely — the
+ *               caller drops our copy (the operator rotates upstream if needed).
+ */
+async function tearDownGrantMaterial(
+  grant: GrantRecord,
+  deps: AgentGrantsDeps,
+  now: Date,
+): Promise<void> {
+  if (grant.material?.kind === "vault") {
+    try {
+      revokeTokenByJti(deps.db, grant.material.jti, now);
+    } catch {
+      // Best-effort — a missing registry row leaves nothing to revoke.
+    }
+  } else if (
+    grant.material?.kind === "mcp" &&
+    grant.material.refresh_token &&
+    grant.material.revocationEndpoint &&
+    grant.material.clientId
+  ) {
+    // Best-effort + locally guarded (reviewer NIT2): `revokeRemote` swallows its
+    // own errors today, but don't rely on that — a throwing impl/test-double must
+    // not abort a reconcile mid-loop and leave the remaining grants un-pruned.
+    try {
+      await oauth(deps).revokeRemote({
+        revocationEndpoint: grant.material.revocationEndpoint,
+        refreshToken: grant.material.refresh_token,
+        clientId: grant.material.clientId,
+      });
+    } catch {
+      // best-effort — the local material is dropped by the caller regardless.
+    }
+  }
+}
+
+// ===========================================================================
+// POST /admin/grants/reconcile — grant-GC for a holder (#96; module-auth)
+// ===========================================================================
+
+/**
+ * Reconcile (garbage-collect) one holder's grants against its CURRENTLY-declared
+ * connections. The agent module computes the `connectionKey()` of every
+ * connection a holder still wants and POSTs them as `liveKeys`; the hub prunes
+ * every grant for that holder whose key is NOT in the live set — tearing down its
+ * material exactly like `revoke`, then REMOVING the row (the holder is gone, so a
+ * lingering status:revoked row is just cruft).
+ *
+ * Module-auth (host-admin Bearer), mirroring PUT/GET — NOT operator-cookie-gated.
+ * Pruning only ever REMOVES access (never escalates), so the "a note can only
+ * REQUEST, never GRANT" invariant is untouched: this can't mint or approve.
+ *
+ * Body: `{ agent: "<name>", liveKeys: ["<connectionKey>", ...] }`.
+ * `liveKeys: []` (the agent/def is gone) prunes ALL of that holder's grants.
+ * The keys MUST be computed by the agent side via the same `connectionKey()`
+ * exported from grants-store.ts so the comparison is exact.
+ *
+ * Returns `{ pruned: <number>, prunedIds: ["<id>", ...] }`.
+ */
+async function reconcileGrants(req: Request, deps: AgentGrantsDeps): Promise<Response> {
+  const auth = await requireModuleAuth(req, deps);
+  if (auth instanceof Response) return auth;
+
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return jsonError(400, "invalid_request", "body must be JSON");
+  }
+  if (!body || typeof body !== "object") {
+    return jsonError(400, "invalid_request", "body must be a JSON object");
+  }
+  const b = body as Record<string, unknown>;
+
+  const agent = typeof b.agent === "string" ? b.agent.trim() : "";
+  if (!agent || agent.length > MAX_AGENT_LEN || !AGENT_NAME_RE.test(agent)) {
+    return jsonError(
+      400,
+      "invalid_request",
+      `agent is required and must match [a-zA-Z0-9][a-zA-Z0-9_.-]* (max ${MAX_AGENT_LEN} chars)`,
+    );
+  }
+
+  if (!Array.isArray(b.liveKeys)) {
+    return jsonError(
+      400,
+      "invalid_request",
+      "liveKeys is required and must be an array of strings",
+    );
+  }
+  if (b.liveKeys.length > MAX_LIVE_KEYS) {
+    return jsonError(400, "invalid_request", `liveKeys exceeds the ${MAX_LIVE_KEYS}-entry limit`);
+  }
+  const liveKeys = new Set<string>();
+  for (const k of b.liveKeys) {
+    if (typeof k !== "string") {
+      return jsonError(400, "invalid_request", "liveKeys entries must be strings");
+    }
+    if (k.length > MAX_CONNECTION_KEY_LEN) {
+      return jsonError(
+        400,
+        "invalid_request",
+        `a liveKeys entry exceeds the ${MAX_CONNECTION_KEY_LEN}-char limit`,
+      );
+    }
+    liveKeys.add(k);
+  }
+
+  const now = deps.now?.() ?? new Date();
+  const held = listGrantsForAgent(deps.storePath, agent);
+  const prunedIds: string[] = [];
+  for (const grant of held) {
+    // connectionKey() derives the SAME key the agent side computed for liveKeys.
+    if (liveKeys.has(connectionKey(grant.connection))) continue;
+    await tearDownGrantMaterial(grant, deps, now);
+    removeGrant(deps.storePath, grant.id);
+    prunedIds.push(grant.id);
+  }
+
+  if (prunedIds.length > 0) {
+    // Identity fields + count only — NEVER a token.
+    console.log(`agent grants reconciled: agent=${agent} pruned=${prunedIds.length}`);
+  }
+  return new Response(JSON.stringify({ pruned: prunedIds.length, prunedIds }), {
+    status: 200,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
 }
 
 // ===========================================================================

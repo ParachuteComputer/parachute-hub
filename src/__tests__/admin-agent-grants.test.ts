@@ -23,7 +23,7 @@ import {
   handleAgentGrants,
   handleOAuthGrantCallback,
 } from "../admin-agent-grants.ts";
-import { readGrants } from "../grants-store.ts";
+import { connectionKey, getGrant, readGrants } from "../grants-store.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { findTokenRowByJti } from "../jwt-sign.ts";
 import { signAccessToken } from "../jwt-sign.ts";
@@ -800,6 +800,183 @@ describe("POST /admin/grants/<id>/revoke", () => {
   });
 });
 
+// === POST /admin/grants/reconcile (grant-GC, #96) ===========================
+
+describe("POST /admin/grants/reconcile", () => {
+  /** Create a grant via PUT; return its id + connectionKey. */
+  async function makeGrant(
+    bearer: string,
+    agent: string,
+    connection: Record<string, unknown>,
+  ): Promise<{ id: string; key: string }> {
+    const created = await json(
+      await dispatch(bearerReq("PUT", "/admin/grants", bearer, { agent, connection })),
+    );
+    // connectionKey derives the same key the agent side would compute for liveKeys.
+    return { id: created.id as string, key: connectionKey(connection as never) };
+  }
+
+  test("prunes grants whose key is NOT in liveKeys; keeps those that are", async () => {
+    const bearer = await moduleBearer();
+    const keep = await makeGrant(bearer, "a", {
+      kind: "vault",
+      target: "research",
+      access: "read",
+    });
+    const drop = await makeGrant(bearer, "a", { kind: "service", target: "github" });
+
+    const res = await dispatch(
+      bearerReq("POST", "/admin/grants/reconcile", bearer, {
+        agent: "a",
+        liveKeys: [keep.key], // drop's key is absent → it is pruned
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.pruned).toBe(1);
+    expect(body.prunedIds).toEqual([drop.id]);
+
+    // the kept grant survives; the dropped one is gone (row removed, not revoked)
+    expect(getGrant(harness.storePath, keep.id)?.status).toBe("pending");
+    expect(getGrant(harness.storePath, drop.id)).toBeNull();
+  });
+
+  test("a pruned APPROVED vault grant has its registry token revoked", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const g = await makeGrant(bearer, "a", { kind: "vault", target: "research", access: "read" });
+    await dispatch(cookieReq("POST", `/admin/grants/${g.id}/approve`, cookie));
+    const jti = (getGrant(harness.storePath, g.id)?.material as { jti: string }).jti;
+    expect(findTokenRowByJti(harness.db, jti)?.revokedAt).toBeFalsy();
+
+    // reconcile with NO live keys for this agent → prune everything
+    const res = await dispatch(
+      bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveKeys: [] }),
+    );
+    expect(res.status).toBe(200);
+    expect((await json(res)).pruned).toBe(1);
+
+    // the row is removed AND the minted token is revoked in the registry
+    expect(getGrant(harness.storePath, g.id)).toBeNull();
+    expect(findTokenRowByJti(harness.db, jti)?.revokedAt).toBeTruthy();
+  });
+
+  test("liveKeys=[] prunes ALL of the agent's grants", async () => {
+    const bearer = await moduleBearer();
+    await makeGrant(bearer, "a", { kind: "vault", target: "research", access: "read" });
+    await makeGrant(bearer, "a", { kind: "service", target: "github" });
+
+    const res = await dispatch(
+      bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveKeys: [] }),
+    );
+    expect(res.status).toBe(200);
+    expect((await json(res)).pruned).toBe(2);
+    expect(readGrants(harness.storePath).filter((r) => r.agent === "a")).toHaveLength(0);
+  });
+
+  test("leaves OTHER agents' grants untouched", async () => {
+    const bearer = await moduleBearer();
+    const mine = await makeGrant(bearer, "a", { kind: "service", target: "github" });
+    const theirs = await makeGrant(bearer, "b", { kind: "service", target: "github" });
+
+    const res = await dispatch(
+      bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveKeys: [] }),
+    );
+    expect(res.status).toBe(200);
+    expect((await json(res)).pruned).toBe(1);
+    expect(getGrant(harness.storePath, mine.id)).toBeNull();
+    // agent b's grant is untouched even though it has the SAME connectionKey
+    expect(getGrant(harness.storePath, theirs.id)?.agent).toBe("b");
+  });
+
+  test("returns the right count/ids (empty when nothing is pruned)", async () => {
+    const bearer = await moduleBearer();
+    const g = await makeGrant(bearer, "a", { kind: "service", target: "github" });
+
+    const res = await dispatch(
+      bearerReq("POST", "/admin/grants/reconcile", bearer, {
+        agent: "a",
+        liveKeys: [g.key], // the only grant is still live → nothing pruned
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.pruned).toBe(0);
+    expect(body.prunedIds).toEqual([]);
+    expect(getGrant(harness.storePath, g.id)).not.toBeNull();
+  });
+
+  test("401 without the module Bearer (auth-gated)", async () => {
+    const bearer = await moduleBearer();
+    await makeGrant(bearer, "a", { kind: "service", target: "github" });
+
+    // No Authorization header at all.
+    const req = new Request(`${HUB_ORIGIN}/admin/grants/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agent: "a", liveKeys: [] }),
+    });
+    const res = await handleAgentGrants(req, "/reconcile", deps());
+    expect(res.status).toBe(401);
+    // nothing was pruned
+    expect(readGrants(harness.storePath).filter((r) => r.agent === "a")).toHaveLength(1);
+  });
+
+  test("a cookie-only request (no Bearer) is rejected — module-auth only", async () => {
+    const bearer = await moduleBearer();
+    await makeGrant(bearer, "a", { kind: "service", target: "github" });
+    const cookie = await operatorCookie();
+    // An operator cookie is NOT module-auth — reconcile is host-admin-Bearer only.
+    const res = await dispatch(
+      cookieReq("POST", "/admin/grants/reconcile", cookie, { agent: "a", liveKeys: [] }),
+    );
+    expect(res.status).toBe(401);
+    expect(readGrants(harness.storePath).filter((r) => r.agent === "a")).toHaveLength(1);
+  });
+
+  test("405 on a non-POST method", async () => {
+    const bearer = await moduleBearer();
+    const res = await dispatch(bearerReq("GET", "/admin/grants/reconcile", bearer));
+    expect(res.status).toBe(405);
+  });
+
+  test("400 on a missing/invalid agent or liveKeys", async () => {
+    const bearer = await moduleBearer();
+    // missing agent
+    expect(
+      (await dispatch(bearerReq("POST", "/admin/grants/reconcile", bearer, { liveKeys: [] })))
+        .status,
+    ).toBe(400);
+    // liveKeys not an array
+    expect(
+      (
+        await dispatch(
+          bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveKeys: "x" }),
+        )
+      ).status,
+    ).toBe(400);
+    // a non-string liveKeys entry
+    expect(
+      (
+        await dispatch(
+          bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveKeys: [1] }),
+        )
+      ).status,
+    ).toBe(400);
+    // a bad agent charset
+    expect(
+      (
+        await dispatch(
+          bearerReq("POST", "/admin/grants/reconcile", bearer, {
+            agent: "bad name",
+            liveKeys: [],
+          }),
+        )
+      ).status,
+    ).toBe(400);
+  });
+});
+
 // === method/routing guards ==================================================
 
 describe("routing", () => {
@@ -966,6 +1143,55 @@ describe("approve(mcp) — start OAuth flow", () => {
     const res = await dispatch(cookieReq("POST", `/admin/grants/${created.id}/approve`, cookie));
     expect(res.status).toBe(502);
     expect(getFlowByState(harness.flowsStorePath, "fixed-state")).toBeNull();
+  });
+
+  // #671: least-privilege scope for a Parachute-vault MCP target. The fake
+  // discovery advertises the broad set (vault:eng:read + vault:eng:write); for a
+  // vault-shaped URL the flow must request ONLY vault:<name>:read instead.
+  test("#671 vault-shaped MCP target → requests least-privilege vault:<name>:read", async () => {
+    currentOAuth = fakeOAuth();
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          // A Parachute vault MCP URL at this hub's origin.
+          connection: { kind: "mcp", target: "https://hub.test/vault/research/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    expect(res.status).toBe(200);
+    // The persisted flow's scope is the single least-privilege read scope, NOT
+    // the resource's full advertised set.
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.scope).toBe("vault:research:read");
+    // And the authorize URL carries that scope, not the broad one.
+    const body = await json(res);
+    expect(body.authorizeUrl as string).toContain(encodeURIComponent("vault:research:read"));
+    expect(body.authorizeUrl as string).not.toContain("vault%3Aeng%3Awrite");
+  });
+
+  // #671: the complement — a non-vault MCP target keeps the old behavior
+  // (request the resource's advertised scopes_supported).
+  test("#671 non-vault MCP target → falls back to the advertised scopes_supported", async () => {
+    currentOAuth = fakeOAuth();
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.scope).toBe("vault:eng:read vault:eng:write");
   });
 });
 

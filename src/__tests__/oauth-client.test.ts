@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import {
   OAuthClientError,
   buildAuthorizeUrl,
+  deriveVaultScopeFromMcpUrl,
   discover,
   exchangeCode,
   fetchWithTimeout,
@@ -396,5 +397,50 @@ describe("fetchWithTimeout", () => {
     const fn = (async () => new Response("ok", { status: 200 })) as unknown as FetchFn;
     const res = await fetchWithTimeout("https://fast.test", { timeout: 1000 }, fn);
     expect(res.status).toBe(200);
+  });
+});
+
+// === deriveVaultScopeFromMcpUrl (#671) ======================================
+
+describe("deriveVaultScopeFromMcpUrl", () => {
+  test("a Parachute vault MCP URL → least-privilege vault:<name>:read", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://hub.test/vault/research/mcp")).toBe(
+      "vault:research:read",
+    );
+  });
+
+  test("a trailing slash after /mcp still matches", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://hub.test/vault/research/mcp/")).toBe(
+      "vault:research:read",
+    );
+  });
+
+  test("a vault name with dot/dash/underscore is captured", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://hub.test/vault/my-team_v2.0/mcp")).toBe(
+      "vault:my-team_v2.0:read",
+    );
+  });
+
+  test("a query string / fragment does not break the match", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://hub.test/vault/research/mcp?x=1#frag")).toBe(
+      "vault:research:read",
+    );
+  });
+
+  test("a non-vault MCP URL → null (caller falls back to scopes_supported)", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp")).toBeNull();
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/some/other/mcp")).toBeNull();
+  });
+
+  test("a deeper path after /mcp is NOT a vault MCP (anchored) → null", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://hub.test/vault/research/mcp/extra")).toBeNull();
+  });
+
+  test("a /vault/ path with no name segment → null", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://hub.test/vault//mcp")).toBeNull();
+  });
+
+  test("an unparseable URL → null", () => {
+    expect(deriveVaultScopeFromMcpUrl("not a url")).toBeNull();
   });
 });
