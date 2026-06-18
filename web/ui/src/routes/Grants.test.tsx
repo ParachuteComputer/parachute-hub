@@ -1,0 +1,177 @@
+/**
+ * Grants route tests (agent-connector grants, 4b-1) — loading, empty state,
+ * grouping by agent, the three status shapes (pending vault → one-click approve,
+ * pending service → token paste then approve, approved → revoke), and the
+ * non-grantable mcp row. The list NEVER carries secret material — the view only
+ * renders the wire shape from `listAgentGrants`.
+ *
+ * Mock `lib/api.ts` so the route's fetch helpers are stubbed; assert on the
+ * rendered DOM + the calls made (notably: approveAgentGrant for a service grant
+ * carries the pasted token; for a vault grant it carries no token).
+ */
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import * as api from "../lib/api.ts";
+import { Grants } from "./Grants.tsx";
+
+vi.mock("../lib/api.ts", async (orig) => {
+  const actual = (await orig()) as typeof api;
+  return {
+    ...actual,
+    listAgentGrants: vi.fn(),
+    approveAgentGrant: vi.fn(),
+    revokeAgentGrant: vi.fn(),
+  };
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+function renderRoute() {
+  return render(
+    <MemoryRouter>
+      <Grants />
+    </MemoryRouter>,
+  );
+}
+
+const sampleGrants: api.GrantListing[] = [
+  {
+    id: "agent1-vault-research-read",
+    agent: "agent1",
+    connection: { kind: "vault", target: "research", access: "read", tags: ["#published"] },
+    status: "pending",
+  },
+  {
+    id: "agent1-service-github",
+    agent: "agent1",
+    connection: { kind: "service", target: "github", inject: ["env", "mcp"] },
+    status: "pending",
+  },
+  {
+    id: "agent1-vault-notes-write",
+    agent: "agent1",
+    connection: { kind: "vault", target: "notes", access: "write" },
+    status: "approved",
+    approvedAt: "2026-06-17T00:00:00.000Z",
+  },
+  {
+    id: "agent1-vault-archive-read",
+    agent: "agent1",
+    connection: { kind: "vault", target: "archive", access: "read" },
+    status: "revoked",
+  },
+  {
+    id: "agent2-mcp-remote",
+    agent: "agent2",
+    connection: { kind: "mcp", target: "https://remote.test/mcp" },
+    status: "pending",
+    reason: "oauth not yet supported",
+  },
+];
+
+describe("Grants — loading + states", () => {
+  it("shows a loading state, then the grants grouped by agent", async () => {
+    vi.mocked(api.listAgentGrants).mockResolvedValue(sampleGrants);
+    renderRoute();
+    expect(screen.getByText(/loading grants/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("agent1")).toBeInTheDocument());
+    expect(screen.getByText("agent2")).toBeInTheDocument();
+    // both agent group sections present
+    expect(screen.getByLabelText("Grants for agent1")).toBeInTheDocument();
+    expect(screen.getByLabelText("Grants for agent2")).toBeInTheDocument();
+  });
+
+  it("shows the empty state when there are no grants", async () => {
+    vi.mocked(api.listAgentGrants).mockResolvedValue([]);
+    renderRoute();
+    await waitFor(() => expect(screen.getByText(/no grant requests yet/i)).toBeInTheDocument());
+  });
+
+  it("shows an error banner + retry on load failure", async () => {
+    vi.mocked(api.listAgentGrants).mockRejectedValueOnce(new Error("boom"));
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("boom")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+  });
+});
+
+describe("Grants — approve / revoke", () => {
+  it("a pending vault grant approves in one click (no token)", async () => {
+    vi.mocked(api.listAgentGrants).mockResolvedValue(sampleGrants);
+    vi.mocked(api.approveAgentGrant).mockResolvedValue();
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("agent1")).toBeInTheDocument());
+
+    const row = screen.getByText(/vault: research/i).closest("tr") as HTMLElement;
+    fireEvent.click(within(row).getByRole("button", { name: /^approve$/i }));
+
+    await waitFor(() =>
+      expect(api.approveAgentGrant).toHaveBeenCalledWith("agent1-vault-research-read"),
+    );
+    // vault approve carries NO token argument
+    expect(vi.mocked(api.approveAgentGrant).mock.calls[0]).toEqual(["agent1-vault-research-read"]);
+  });
+
+  it("a pending service grant reveals a token field, then approves WITH the token", async () => {
+    vi.mocked(api.listAgentGrants).mockResolvedValue(sampleGrants);
+    vi.mocked(api.approveAgentGrant).mockResolvedValue();
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("agent1")).toBeInTheDocument());
+
+    const row = screen.getByText(/service: github/i).closest("tr") as HTMLElement;
+    // first click reveals the paste field
+    fireEvent.click(within(row).getByRole("button", { name: /approve…/i }));
+    const input = within(row).getByLabelText(/api token for github/i);
+    fireEvent.change(input, { target: { value: "ghp_secret" } });
+    fireEvent.click(within(row).getByRole("button", { name: /save & approve/i }));
+
+    await waitFor(() =>
+      expect(api.approveAgentGrant).toHaveBeenCalledWith("agent1-service-github", "ghp_secret"),
+    );
+  });
+
+  it("an approved grant offers Revoke", async () => {
+    vi.mocked(api.listAgentGrants).mockResolvedValue(sampleGrants);
+    vi.mocked(api.revokeAgentGrant).mockResolvedValue();
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("agent1")).toBeInTheDocument());
+
+    const row = screen.getByText(/vault: notes/i).closest("tr") as HTMLElement;
+    fireEvent.click(within(row).getByRole("button", { name: /revoke/i }));
+    await waitFor(() =>
+      expect(api.revokeAgentGrant).toHaveBeenCalledWith("agent1-vault-notes-write"),
+    );
+  });
+
+  it("a revoked vault grant offers Re-approve (re-mints fresh material)", async () => {
+    vi.mocked(api.listAgentGrants).mockResolvedValue(sampleGrants);
+    vi.mocked(api.approveAgentGrant).mockResolvedValue();
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("agent1")).toBeInTheDocument());
+
+    const row = screen.getByText(/vault: archive/i).closest("tr") as HTMLElement;
+    fireEvent.click(within(row).getByRole("button", { name: /re-approve/i }));
+    await waitFor(() =>
+      expect(api.approveAgentGrant).toHaveBeenCalledWith("agent1-vault-archive-read"),
+    );
+  });
+});
+
+describe("Grants — mcp is modeled but not grantable (4b-1)", () => {
+  it("an mcp grant shows the 4b-2 message and offers no Approve", async () => {
+    vi.mocked(api.listAgentGrants).mockResolvedValue(sampleGrants);
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("agent2")).toBeInTheDocument());
+
+    const row = screen.getByText(/mcp: https:\/\/remote\.test\/mcp/i).closest("tr") as HTMLElement;
+    expect(within(row).getByText(/oauth coming in 4b-2/i)).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: /approve/i })).toBeNull();
+  });
+});

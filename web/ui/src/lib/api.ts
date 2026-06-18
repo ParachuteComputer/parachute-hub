@@ -1741,3 +1741,84 @@ export async function deleteConnection(id: string): Promise<void> {
   }
   if (!res.ok) throw new HttpError(res.status, await readError(res));
 }
+
+// ===========================================================================
+// Agent-connector GRANTS (4b-1) — /admin/grants
+// ===========================================================================
+
+/** A connection spec — what an agent declared it WANTS. Mirrors `grants-store.ts`. */
+export interface GrantConnection {
+  kind: "vault" | "service" | "mcp";
+  /** Vault name / service key / MCP URL, per `kind`. */
+  target: string;
+  /** Vault only — `read` | `write`. */
+  access?: "read" | "write";
+  /** Vault only — tag-scope. */
+  tags?: string[];
+  /** Service only — agent-side inject hints. */
+  inject?: ("env" | "mcp")[];
+}
+
+/** A grant in the list/echo wire shape (NEVER carries the secret material). */
+export interface GrantListing {
+  id: string;
+  agent: string;
+  connection: GrantConnection;
+  status: "pending" | "approved" | "revoked";
+  reason?: string;
+  approvedAt?: string;
+}
+
+/**
+ * GET /admin/grants — list every agent's connector grants. Host-admin Bearer
+ * (the list endpoint is module-auth; the SPA holds a host-admin token). NO
+ * secret material is ever returned here.
+ */
+export async function listAgentGrants(): Promise<GrantListing[]> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/admin/grants", {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { grants?: unknown };
+  return Array.isArray(body.grants) ? (body.grants as GrantListing[]) : [];
+}
+
+/**
+ * POST /admin/grants/<id>/approve — operator approves a grant. Cookie-authed
+ * (the route is first-admin-session gated, CSRF-belted). For a `service` grant,
+ * `token` is the operator-pasted API credential the hub stores. For `vault`,
+ * the hub mints the token itself — no `token` needed.
+ */
+export async function approveAgentGrant(id: string, token?: string): Promise<void> {
+  const res = await fetch(`/admin/grants/${encodeURIComponent(id)}/approve`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify(token !== undefined ? { token } : {}),
+  });
+  if (res.status === 401) {
+    await redirectToLoginAndHang<void>();
+    return;
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+/** POST /admin/grants/<id>/revoke — operator revokes a grant (drops the secret). */
+export async function revokeAgentGrant(id: string): Promise<void> {
+  const res = await fetch(`/admin/grants/${encodeURIComponent(id)}/revoke`, {
+    method: "POST",
+    headers: { accept: "application/json" },
+    credentials: "same-origin",
+  });
+  if (res.status === 401) {
+    await redirectToLoginAndHang<void>();
+    return;
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}

@@ -44,6 +44,7 @@ import { clearCachedToken } from "./lib/auth.ts";
 import { useAdminLock } from "./lib/useAdminLock.ts";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
 import { Connections } from "./routes/Connections.tsx";
+import { Grants } from "./routes/Grants.tsx";
 import { Home } from "./routes/Home.tsx";
 import { Modules } from "./routes/Modules.tsx";
 import { Permissions } from "./routes/Permissions.tsx";
@@ -251,6 +252,7 @@ export function App() {
             blur the exact boundary the divider marks. */}
         <NavSection to="/" label="Home" exact />
         <NavSection to="/connections" label="Connections" />
+        <NavSection to="/grants" label="Grants" />
         <NavSection to="/modules" label="Modules" />
         <NavSection to="/users" label="Users" />
         <NavSection to="/tokens" label="Tokens" />
@@ -275,6 +277,7 @@ export function App() {
         <Route path="/modules" element={<Modules />} />
         <Route path="/users" element={<Users />} />
         <Route path="/connections" element={<Connections />} />
+        <Route path="/grants" element={<Grants />} />
         {/* The pre-P5 Channels view was retired when P5 moved the feature into
             the general Connections engine. The back-compat route shouldn't
             linger as a dead end — redirect it to Connections. */}

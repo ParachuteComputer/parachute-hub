@@ -187,6 +187,11 @@ const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
  *     `fetch()` with `credentials: "include"`. The Bearer-authed
  *     `/<id>/renew` + `/<id>/claim` siblings pass the belt via the
  *     Authorization carve-out below.)
+ *   - `POST /admin/grants/<id>/approve` + `POST /admin/grants/<id>/revoke`
+ *     (agent-connector grant approval/revoke — operator cookie-authed in the
+ *     hub SPA, 4b-1. The `PUT /admin/grants` + `GET /admin/grants[/...]`
+ *     siblings are host-admin-Bearer-authed and pass via the Authorization
+ *     carve-out below.)
  *
  * (The legacy `POST/DELETE /admin/channels` pair was belted here until
  * boundary D1 retired the endpoint — superseded by `/admin/connections`.)

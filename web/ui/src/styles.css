@@ -1071,6 +1071,20 @@ a.btn:hover {
   background: var(--bg-soft);
   color: var(--fg-dim);
 }
+/*
+ * Agent-connector grant statuses (4b-1). `pending` reuses `.status-pending`;
+ * `approved` is the success terminal state; `revoked` reuses the muted rule
+ * above. `.error-inline` is the per-row action error beside the Approve/Revoke
+ * buttons in the Grants view.
+ */
+.status-approved {
+  background: var(--success-soft);
+  color: var(--success);
+}
+.error-inline {
+  color: var(--error);
+  font-size: 0.85rem;
+}
 
 /*
  * Back-compat aliases for the pre-F vocabulary. Modules / SDKs that
