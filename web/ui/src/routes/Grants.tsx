@@ -13,8 +13,12 @@
  * here. So defining agents "from any chat" is safe — worst case a request sits
  * pending.
  *
- * The `mcp` (remote/OAuth) kind is modeled but not grantable in 4b-1 — its
- * Approve is disabled with "OAuth coming in 4b-2 — not yet grantable."
+ * The `mcp` (remote/OAuth) kind is grantable in 4b-2 (hub-as-OAuth-client):
+ * "Connect" starts the OAuth dance (hub returns an `authorizeUrl`; the browser
+ * full-page redirects to the remote consent screen, the hub callback finishes
+ * server-side and flips the grant to `approved`). "Paste a token instead" stores
+ * a static bearer for non-OAuth MCPs. A `needs_consent` mcp grant (OAuth refresh
+ * died) re-offers the same Connect / paste path — treated like pending.
  *
  * Auth: list is host-admin-Bearer (`lib/api.ts:listAgentGrants`); approve/revoke
  * are cookie-authed first-admin routes. The `lib/api.ts` helpers redirect to
@@ -73,6 +77,8 @@ export function Grants(): React.ReactElement {
   async function onApproveVault(id: string): Promise<void> {
     setRowSt({ kind: "working", id });
     try {
+      // The returned listing is only needed by onConnectMcp (for authorizeUrl);
+      // the vault path just mints + reloads.
       await approveAgentGrant(id);
       setRowSt({ kind: "idle" });
       setReload((n) => n + 1);
@@ -88,11 +94,32 @@ export function Grants(): React.ReactElement {
     }
     setRowSt({ kind: "working", id });
     try {
+      // Static-bearer approve (service, or an mcp token-paste): the returned
+      // listing isn't needed here — store + reload.
       await approveAgentGrant(id, token);
       setRowSt({ kind: "idle" });
       setReload((n) => n + 1);
     } catch (err) {
       setRowSt({ kind: "error", id, message: errMessage(err, "Approve") });
+    }
+  }
+
+  // Start the remote-MCP OAuth dance: approve with NO token → the hub returns a
+  // listing carrying `authorizeUrl`; we full-page redirect to the remote consent
+  // (cross-origin, so window.location.assign — NOT react-router). On the rare
+  // no-authorizeUrl case (defensive), fall back to a list reload.
+  async function onConnectMcp(id: string): Promise<void> {
+    setRowSt({ kind: "working", id });
+    try {
+      const listing = await approveAgentGrant(id);
+      if (listing.authorizeUrl) {
+        window.location.assign(listing.authorizeUrl);
+        return; // navigating away — leave the row in its working state
+      }
+      setRowSt({ kind: "idle" });
+      setReload((n) => n + 1);
+    } catch (err) {
+      setRowSt({ kind: "error", id, message: errMessage(err, "Connect") });
     }
   }
 
@@ -122,6 +149,7 @@ export function Grants(): React.ReactElement {
       {renderBody(state, rowSt, setRowSt, {
         onApproveVault,
         onApproveService,
+        onConnectMcp,
         onRevoke,
         onRetry: () => setReload((n) => n + 1),
       })}
@@ -132,6 +160,7 @@ export function Grants(): React.ReactElement {
 interface RowActions {
   onApproveVault: (id: string) => Promise<void>;
   onApproveService: (id: string, token: string) => Promise<void>;
+  onConnectMcp: (id: string) => Promise<void>;
   onRevoke: (id: string) => Promise<void>;
   onRetry: () => void;
 }
@@ -235,24 +264,27 @@ function GrantRow({
   const c = grant.connection;
   const isMcp = c.kind === "mcp";
   const isService = c.kind === "service";
+  // A grant is actionable (approve / connect / paste) in any non-approved state —
+  // `pending`, `revoked`, OR `needs_consent` (the mcp re-consent path). The gate
+  // is intentionally `!== "approved"` so a new status lands on the action side.
+  const notApproved = grant.status !== "approved";
+  // The token-paste affordance is shared by service AND mcp (static-bearer MCPs).
   const pasting = rowSt.kind === "pasting" && rowSt.id === grant.id ? rowSt.token : null;
 
   return (
     <tr data-grant-id={grant.id}>
       <td>
         <code>{connectionLabel(c)}</code>
+        {isMcp && <span className="muted"> — remote MCP (OAuth)</span>}
       </td>
       <td>
         <span className={`status status-${grant.status}`}>{grant.status}</span>
         {grant.reason && <span className="muted"> — {grant.reason}</span>}
       </td>
       <td>
-        {/* mcp — modeled, not grantable in 4b-1. */}
-        {isMcp && <span className="muted">OAuth coming in 4b-2 — not yet grantable.</span>}
-
         {/* not-yet-granted vault (pending OR revoked) — single-click approve
             (the hub mints; approving a revoked grant re-mints fresh material). */}
-        {!isMcp && grant.status !== "approved" && c.kind === "vault" && (
+        {notApproved && c.kind === "vault" && (
           <button
             type="button"
             className="primary"
@@ -263,9 +295,34 @@ function GrantRow({
           </button>
         )}
 
+        {/* not-yet-granted mcp (pending / revoked / needs_consent) — primary
+            "Connect" starts the remote OAuth dance (full-page redirect to the
+            issuer's consent), with "Paste a token instead" as the static-bearer
+            fallback. Shown only when not mid-paste. */}
+        {notApproved && isMcp && pasting === null && (
+          <span style={{ display: "inline-flex", gap: "0.5rem", alignItems: "center" }}>
+            <button
+              type="button"
+              className="primary"
+              disabled={busy}
+              onClick={() => actions.onConnectMcp(grant.id)}
+            >
+              {busy ? "Connecting…" : grant.status === "needs_consent" ? "Reconnect" : "Connect"}
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              disabled={busy}
+              onClick={() => setRowSt({ kind: "pasting", id: grant.id, token: "" })}
+            >
+              Paste a token instead
+            </button>
+          </span>
+        )}
+
         {/* not-yet-granted service (pending OR revoked) — paste the API token,
             then approve. */}
-        {!isMcp && grant.status !== "approved" && isService && pasting === null && (
+        {notApproved && isService && pasting === null && (
           <button
             type="button"
             className="primary"
@@ -275,7 +332,9 @@ function GrantRow({
             {grant.status === "revoked" ? "Re-approve…" : "Approve…"}
           </button>
         )}
-        {!isMcp && grant.status !== "approved" && isService && pasting !== null && (
+
+        {/* token-paste field — shared by service + mcp (static-bearer). */}
+        {notApproved && (isService || isMcp) && pasting !== null && (
           <span style={{ display: "inline-flex", gap: "0.5rem", alignItems: "center" }}>
             <input
               type="password"
