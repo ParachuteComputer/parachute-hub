@@ -18,11 +18,17 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeJwt } from "jose";
-import { type AgentGrantsDeps, handleAgentGrants } from "../admin-agent-grants.ts";
+import {
+  type AgentGrantsDeps,
+  handleAgentGrants,
+  handleOAuthGrantCallback,
+} from "../admin-agent-grants.ts";
 import { readGrants } from "../grants-store.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { findTokenRowByJti } from "../jwt-sign.ts";
 import { signAccessToken } from "../jwt-sign.ts";
+import type { OAuthClient } from "../oauth-client.ts";
+import { getFlowByState } from "../oauth-flows-store.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "../sessions.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { createUser } from "../users.ts";
@@ -33,6 +39,7 @@ const VAULT_ORIGIN = "http://127.0.0.1:1940";
 interface Harness {
   db: Database;
   storePath: string;
+  flowsStorePath: string;
   cleanup: () => void;
 }
 
@@ -43,12 +50,68 @@ function makeHarness(): Harness {
   return {
     db,
     storePath: join(dir, "agent-grants.json"),
+    flowsStorePath: join(dir, "agent-oauth-flows.json"),
     cleanup: () => {
       db.close();
       rmSync(dir, { recursive: true, force: true });
     },
   };
 }
+
+/**
+ * A fake OAuth client. Deterministic verifier/challenge/state so tests can assert
+ * the persisted flow; the network methods return canned values or call recorded
+ * spies. No real network ever happens.
+ */
+function fakeOAuth(over: Partial<OAuthClient> = {}): OAuthClient & {
+  calls: { refresh: number; revoke: number; register: number; exchange: number };
+} {
+  const calls = { refresh: 0, revoke: 0, register: 0, exchange: 0 };
+  const base: OAuthClient = {
+    generateCodeVerifier: () => "fixed-verifier",
+    generateCodeChallenge: (v) => `chal(${v})`,
+    generateState: () => "fixed-state",
+    discover: async () => ({
+      issuer: "https://issuer.test",
+      authorizationEndpoint: "https://issuer.test/oauth/authorize",
+      tokenEndpoint: "https://issuer.test/oauth/token",
+      registrationEndpoint: "https://issuer.test/oauth/register",
+      revocationEndpoint: "https://issuer.test/oauth/revoke",
+      scopesSupported: ["vault:eng:read", "vault:eng:write"],
+    }),
+    registerClient: async () => {
+      calls.register++;
+      return { clientId: "dcr-client-1" };
+    },
+    buildAuthorizeUrl: (o) =>
+      `${o.authorizationEndpoint}?client_id=${o.clientId}&state=${o.state}&code_challenge=${o.codeChallenge}&code_challenge_method=S256${o.scope ? `&scope=${encodeURIComponent(o.scope)}` : ""}`,
+    exchangeCode: async () => {
+      calls.exchange++;
+      return {
+        access_token: "at-fresh",
+        refresh_token: "rt-fresh",
+        expiresAt: "2026-06-18T13:00:00.000Z",
+      };
+    },
+    refreshToken: async () => {
+      calls.refresh++;
+      return {
+        access_token: "at-refreshed",
+        refresh_token: "rt-refreshed",
+        expiresAt: "2026-06-18T14:00:00.000Z",
+      };
+    },
+    revokeRemote: async () => {
+      calls.revoke++;
+    },
+  };
+  return Object.assign({ calls }, base, over);
+}
+
+let currentOAuth: OAuthClient | undefined;
+beforeEach(() => {
+  currentOAuth = undefined;
+});
 
 let harness: Harness;
 beforeEach(() => {
@@ -64,12 +127,15 @@ beforeEach(() => {
   installedVaults = new Set<string>(["research"]);
 });
 
-function deps(): AgentGrantsDeps {
+function deps(over: Partial<AgentGrantsDeps> = {}): AgentGrantsDeps {
   return {
     db: harness.db,
     hubOrigin: HUB_ORIGIN,
     storePath: harness.storePath,
+    flowsStorePath: harness.flowsStorePath,
     resolveVaultOrigin: (name) => (installedVaults.has(name) ? VAULT_ORIGIN : null),
+    ...(currentOAuth ? { oauthClient: currentOAuth } : {}),
+    ...over,
   };
 }
 
@@ -202,7 +268,7 @@ describe("PUT /admin/grants (upsert)", () => {
     expect((body.connection as Record<string, unknown>).inject).toEqual(["env", "mcp"]);
   });
 
-  test("an mcp grant stays pending with the slice-2 reason", async () => {
+  test("an mcp grant lands pending awaiting oauth consent (4b-2)", async () => {
     const bearer = await moduleBearer();
     const res = await dispatch(
       bearerReq("PUT", "/admin/grants", bearer, {
@@ -213,7 +279,7 @@ describe("PUT /admin/grants (upsert)", () => {
     expect(res.status).toBe(201);
     const body = await json(res);
     expect(body.status).toBe("pending");
-    expect(body.reason).toBe("oauth not yet supported");
+    expect(body.reason).toBe("awaiting oauth consent");
   });
 
   test("re-declaring an APPROVED grant does not downgrade it to pending", async () => {
@@ -533,22 +599,6 @@ describe("POST /admin/grants/<id>/approve", () => {
     expect(res.status).toBe(400);
   });
 
-  test("mcp: 409 not_grantable (stays pending)", async () => {
-    const bearer = await moduleBearer();
-    const cookie = await operatorCookie();
-    const created = await json(
-      await dispatch(
-        bearerReq("PUT", "/admin/grants", bearer, {
-          agent: "a",
-          connection: { kind: "mcp", target: "https://remote.test/mcp" },
-        }),
-      ),
-    );
-    const res = await dispatch(cookieReq("POST", `/admin/grants/${created.id}/approve`, cookie));
-    expect(res.status).toBe(409);
-    expect(readGrants(harness.storePath).find((r) => r.id === created.id)?.status).toBe("pending");
-  });
-
   test("vault: 400 when the vault no longer exists", async () => {
     const bearer = await moduleBearer();
     const cookie = await operatorCookie();
@@ -778,5 +828,455 @@ describe("routing", () => {
     const bearer = await moduleBearer();
     const res = await dispatch(bearerReq("GET", "/admin/grants/x/bogus", bearer));
     expect(res.status).toBe(404);
+  });
+});
+
+// === 4b-2: mcp grants (OAuth client + static bearer) ========================
+
+describe("approve(mcp) — static bearer", () => {
+  test("a pasted token → approved + mcp material (no discovery, no flow)", async () => {
+    currentOAuth = fakeOAuth();
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    const res = await dispatch(
+      cookieReq("POST", `/admin/grants/${id}/approve`, cookie, { token: "static-paste-123" }),
+    );
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.status).toBe("approved");
+    expect(body).not.toHaveProperty("material");
+    expect(body).not.toHaveProperty("authorizeUrl");
+
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    const mat = stored?.material as { kind: string; access_token: string; mcpUrl: string };
+    expect(mat.kind).toBe("mcp");
+    expect(mat.access_token).toBe("static-paste-123");
+    expect(mat.mcpUrl).toBe("https://remote.test/mcp");
+    // no OAuth machinery ran, no pending flow persisted
+    expect(getFlowByState(harness.flowsStorePath, "fixed-state")).toBeNull();
+  });
+
+  test("a static-bearer /material returns { kind:mcp, token, mcpUrl }", async () => {
+    currentOAuth = fakeOAuth();
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(
+      cookieReq("POST", `/admin/grants/${id}/approve`, cookie, { token: "static-paste-123" }),
+    );
+    const res = await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.kind).toBe("mcp");
+    expect(body.token).toBe("static-paste-123");
+    expect(body.mcpUrl).toBe("https://remote.test/mcp");
+    // no refresh occurred for a static bearer
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.refresh).toBe(0);
+  });
+
+  test("rejects an over-long pasted token (400)", async () => {
+    currentOAuth = fakeOAuth();
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const res = await dispatch(
+      cookieReq("POST", `/admin/grants/${created.id}/approve`, cookie, { token: "x".repeat(9000) }),
+    );
+    expect(res.status).toBe(400);
+    expect(readGrants(harness.storePath).find((r) => r.id === created.id)?.status).toBe("pending");
+  });
+});
+
+describe("approve(mcp) — start OAuth flow", () => {
+  test("no token → discover + DCR + persist flow + return authorizeUrl (stays pending)", async () => {
+    currentOAuth = fakeOAuth();
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.status).toBe("pending");
+    expect(body.reason).toBe("awaiting oauth consent");
+    expect(typeof body.authorizeUrl).toBe("string");
+    expect(body.authorizeUrl as string).toContain("code_challenge_method=S256");
+    expect(body.authorizeUrl as string).toContain("state=fixed-state");
+    // grant is still pending (no material yet)
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("pending");
+
+    // a pending flow was persisted, bound to (state, grantId)
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.grantId).toBe(id);
+    expect(flow?.clientId).toBe("dcr-client-1");
+    expect(flow?.verifier).toBe("fixed-verifier");
+    expect(flow?.scope).toBe("vault:eng:read vault:eng:write");
+    expect(flow?.redirectUri).toBe("https://hub.test/oauth/agent-grant/callback");
+    // DCR happened once
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.register).toBe(1);
+  });
+
+  test("502 when discovery fails (grant stays pending, no flow)", async () => {
+    currentOAuth = fakeOAuth({
+      discover: async () => {
+        throw new Error("no metadata");
+      },
+    });
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${created.id}/approve`, cookie));
+    expect(res.status).toBe(502);
+    expect(getFlowByState(harness.flowsStorePath, "fixed-state")).toBeNull();
+  });
+});
+
+// callback dispatch helper (the route is a browser GET, no auth)
+async function callback(query: string): Promise<Response> {
+  const req = new Request(`${HUB_ORIGIN}/oauth/agent-grant/callback${query}`, { method: "GET" });
+  return handleOAuthGrantCallback(req, deps());
+}
+
+describe("GET /oauth/agent-grant/callback", () => {
+  async function startFlow(): Promise<string> {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    return id;
+  }
+
+  test("happy path → exchange + store material + status approved", async () => {
+    currentOAuth = fakeOAuth();
+    const id = await startFlow();
+
+    const res = await callback("?code=auth-code-1&state=fixed-state");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const html = await res.text();
+    expect(html).toContain("Connected");
+    // NEVER a token in the HTML
+    expect(html).not.toContain("at-fresh");
+    expect(html).not.toContain("rt-fresh");
+
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    expect(stored?.status).toBe("approved");
+    const mat = stored?.material as { kind: string; access_token: string; refresh_token: string };
+    expect(mat.kind).toBe("mcp");
+    expect(mat.access_token).toBe("at-fresh");
+    expect(mat.refresh_token).toBe("rt-fresh");
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.exchange).toBe(1);
+
+    // the flow was consumed (single-use)
+    expect(getFlowByState(harness.flowsStorePath, "fixed-state")).toBeNull();
+  });
+
+  test("unknown / replayed state → error HTML, no material", async () => {
+    currentOAuth = fakeOAuth();
+    const id = await startFlow();
+    // first use consumes the flow
+    await callback("?code=auth-code-1&state=fixed-state");
+    // replay
+    const res = await callback("?code=auth-code-1&state=fixed-state");
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain("Connection failed");
+    // exchange ran only once (the replay never reached it)
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.exchange).toBe(1);
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("approved");
+  });
+
+  test("a totally unknown state → 400, no exchange", async () => {
+    currentOAuth = fakeOAuth();
+    const res = await callback("?code=x&state=never-minted");
+    expect(res.status).toBe(400);
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.exchange).toBe(0);
+  });
+
+  test("operator Deny (?error=access_denied) → grant stays pending with reason 'operator declined'", async () => {
+    currentOAuth = fakeOAuth();
+    const id = await startFlow();
+    const res = await callback("?error=access_denied&state=fixed-state");
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain("not authorized");
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    expect(stored?.status).toBe("pending");
+    // admin can now distinguish "not yet tried" from "tried + denied"
+    expect(stored?.reason).toBe("operator declined");
+    // flow consumed even on deny
+    expect(getFlowByState(harness.flowsStorePath, "fixed-state")).toBeNull();
+  });
+
+  test("token exchange failure → error HTML, grant stays pending", async () => {
+    currentOAuth = fakeOAuth({
+      exchangeCode: async () => {
+        throw new Error("invalid_grant");
+      },
+    });
+    const id = await startFlow();
+    const res = await callback("?code=bad&state=fixed-state");
+    expect(res.status).toBe(502);
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("pending");
+  });
+
+  test("re-consent replaces material + best-effort revokes the old refresh", async () => {
+    currentOAuth = fakeOAuth();
+    const id = await startFlow();
+    // complete the first consent → approved with rt-fresh + revocationEndpoint
+    await callback("?code=c1&state=fixed-state");
+    const cookie = await operatorCookie();
+    // re-approve (already approved) → starts a fresh flow (reuses clientId, same issuer)
+    const reApprove = await json(
+      await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie)),
+    );
+    expect(reApprove.status).toBe("pending");
+    expect(typeof reApprove.authorizeUrl).toBe("string");
+    // DCR was NOT called again (clientId reused for the same issuer)
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.register).toBe(1);
+
+    // complete the second consent → revokes the prior refresh
+    const res = await callback("?code=c2&state=fixed-state");
+    expect(res.status).toBe(200);
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.revoke).toBe(1);
+  });
+});
+
+describe("material(mcp) — auto-refresh", () => {
+  // Drive a grant to approved-via-OAuth, with expiry in the (near) past/future.
+  async function approvedViaOAuth(expiresAt: string): Promise<string> {
+    currentOAuth = fakeOAuth({
+      exchangeCode: async () => ({
+        access_token: "at-initial",
+        refresh_token: "rt-initial",
+        expiresAt,
+      }),
+    });
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const req = new Request(`${HUB_ORIGIN}/oauth/agent-grant/callback?code=c&state=fixed-state`, {
+      method: "GET",
+    });
+    await handleOAuthGrantCallback(req, deps());
+    return id;
+  }
+
+  test("fresh token (far from expiry) → returned without a refresh", async () => {
+    const far = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const id = await approvedViaOAuth(far);
+    (currentOAuth as ReturnType<typeof fakeOAuth>).calls.refresh = 0;
+    const bearer = await moduleBearer();
+    const res = await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    expect(res.status).toBe(200);
+    expect((await json(res)).token).toBe("at-initial");
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.refresh).toBe(0);
+  });
+
+  test("near-expiry token → refresh first, return the new token, persist it", async () => {
+    // expiry within the 120s skew window
+    const soon = new Date(Date.now() + 60 * 1000).toISOString();
+    const id = await approvedViaOAuth(soon);
+    const before = (currentOAuth as ReturnType<typeof fakeOAuth>).calls.refresh;
+    const bearer = await moduleBearer();
+    const res = await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    expect(res.status).toBe(200);
+    expect((await json(res)).token).toBe("at-refreshed");
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.refresh).toBe(before + 1);
+    // new access + rotated refresh persisted
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    const mat = stored?.material as { access_token: string; refresh_token: string };
+    expect(mat.access_token).toBe("at-refreshed");
+    expect(mat.refresh_token).toBe("rt-refreshed");
+  });
+
+  test("refresh failure → status needs_consent + 409, material dropped", async () => {
+    const soon = new Date(Date.now() + 60 * 1000).toISOString();
+    // approve via OAuth, THEN swap in a client whose refresh fails
+    const id = await approvedViaOAuth(soon);
+    currentOAuth = fakeOAuth({
+      refreshToken: async () => {
+        throw new Error("invalid_grant");
+      },
+    });
+    const bearer = await moduleBearer();
+    const res = await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    expect(res.status).toBe(409);
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    expect(stored?.status).toBe("needs_consent");
+    expect(stored?.material).toBeUndefined();
+    expect(stored?.reason).toContain("refresh failed");
+  });
+
+  test("a needs_consent grant's /material 409 reason carries useful text", async () => {
+    const soon = new Date(Date.now() + 60 * 1000).toISOString();
+    const id = await approvedViaOAuth(soon);
+    currentOAuth = fakeOAuth({
+      refreshToken: async () => {
+        throw new Error("invalid_grant");
+      },
+    });
+    const bearer = await moduleBearer();
+    // first call drives it to needs_consent
+    await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    // second call: 409 whose reason text tells the operator to re-consent
+    const res = await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    expect(res.status).toBe(409);
+    const body = await json(res);
+    expect(body.error).toBe("not_approved");
+    const desc = body.error_description as string;
+    expect(desc).toContain("needs_consent");
+    expect(desc).toMatch(/re-consent|reconnect|approve/i);
+  });
+
+  test("needs_consent → re-approve → callback revives to approved with fresh material", async () => {
+    // Drive a grant to needs_consent (approved-via-OAuth, then a failed refresh).
+    const soon = new Date(Date.now() + 60 * 1000).toISOString();
+    const id = await approvedViaOAuth(soon);
+    currentOAuth = fakeOAuth({
+      refreshToken: async () => {
+        throw new Error("invalid_grant");
+      },
+    });
+    const bearer = await moduleBearer();
+    await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("needs_consent");
+
+    // Re-approve (no token) on a needs_consent grant → starts a FRESH OAuth flow.
+    currentOAuth = fakeOAuth();
+    const cookie = await operatorCookie();
+    const reApprove = await json(
+      await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie)),
+    );
+    expect(reApprove.status).toBe("pending");
+    expect(typeof reApprove.authorizeUrl).toBe("string");
+    // a fresh flow was persisted, bound to this grant
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.grantId).toBe(id);
+
+    // Complete the consent → revived to approved with fresh material.
+    const res = await callback("?code=revive&state=fixed-state");
+    expect(res.status).toBe(200);
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    expect(stored?.status).toBe("approved");
+    const mat = stored?.material as { kind: string; access_token: string };
+    expect(mat.kind).toBe("mcp");
+    expect(mat.access_token).toBe("at-fresh");
+    // /material now serves a live token (the fake's hardcoded expiry is past, so
+    // the lazy refresh kicks in and returns the refreshed token — proving the
+    // revived grant is fully functional, no longer 409ing).
+    const matRes = await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    expect(matRes.status).toBe(200);
+    expect((await json(matRes)).token).toBe("at-refreshed");
+  });
+});
+
+describe("revoke(mcp)", () => {
+  test("best-effort revokes the remote refresh + drops material", async () => {
+    currentOAuth = fakeOAuth();
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    await callback("?code=c&state=fixed-state"); // → approved with rt-fresh + revocationEndpoint
+
+    const before = (currentOAuth as ReturnType<typeof fakeOAuth>).calls.revoke;
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${id}/revoke`, cookie));
+    expect(res.status).toBe(200);
+    expect((await json(res)).status).toBe("revoked");
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.revoke).toBe(before + 1);
+
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    expect(stored?.material).toBeUndefined();
+    // /material now 409s
+    const mat = await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    expect(mat.status).toBe(409);
+  });
+
+  test("a static-bearer revoke drops material without a remote revoke call", async () => {
+    currentOAuth = fakeOAuth();
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(
+      cookieReq("POST", `/admin/grants/${id}/approve`, cookie, { token: "static-paste" }),
+    );
+    const before = (currentOAuth as ReturnType<typeof fakeOAuth>).calls.revoke;
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${id}/revoke`, cookie));
+    expect(res.status).toBe(200);
+    // no remote revoke for a static bearer (no refresh/revocation endpoint)
+    expect((currentOAuth as ReturnType<typeof fakeOAuth>).calls.revoke).toBe(before);
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.material).toBeUndefined();
   });
 });

@@ -62,6 +62,7 @@ import {
   type ConnectionSpec,
   type GrantAccess,
   type GrantInject,
+  type GrantMaterial,
   type GrantRecord,
   connectionKey,
   getGrant,
@@ -76,6 +77,8 @@ import {
   revokeTokenByJti,
   signAccessToken,
 } from "./jwt-sign.ts";
+import { type OAuthClient, realOAuthClient } from "./oauth-client.ts";
+import { type PendingFlow, deleteFlow, getFlowByState, putFlow } from "./oauth-flows-store.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
 import { validateVaultName } from "./vault-name.ts";
@@ -113,10 +116,16 @@ const MAX_TAGS = 64;
 
 export interface AgentGrantsDeps {
   db: Database;
-  /** Hub origin — the minted-token `iss` AND the base of the vault MCP URL. */
+  /**
+   * Hub origin — the minted-token `iss`, the base of the vault MCP URL, AND the
+   * base of the OAuth-client `redirect_uri`
+   * (`<hubOrigin>/oauth/agent-grant/callback`).
+   */
   hubOrigin: string;
   /** Absolute path to `agent-grants.json` in the hub state dir. */
   storePath: string;
+  /** Absolute path to `agent-oauth-flows.json` (the in-flight OAuth consents, 4b-2). */
+  flowsStorePath: string;
   /**
    * Resolve a vault's loopback origin from services.json, or `null` when no
    * vault by that name is installed. Mirrors `ConnectionsDeps.resolveVaultOrigin`
@@ -125,9 +134,24 @@ export interface AgentGrantsDeps {
   resolveVaultOrigin: (vaultName: string) => string | null;
   /** Test seam — defaults to the real `signAccessToken`. */
   signToken?: typeof SignAccessTokenFn;
+  /** Test seam — the OAuth-client engine (defaults to the real, network-bound one). */
+  oauthClient?: OAuthClient;
   /** Test seam for the clock. */
   now?: () => Date;
 }
+
+/** The OAuth-client engine — injected for tests, the real (network) one by default. */
+function oauth(deps: AgentGrantsDeps): OAuthClient {
+  return deps.oauthClient ?? realOAuthClient;
+}
+
+/** `<hubOrigin>/oauth/agent-grant/callback` — the DCR-registered redirect_uri. */
+function callbackUrl(hubOrigin: string): string {
+  return `${hubOrigin.replace(/\/+$/, "")}/oauth/agent-grant/callback`;
+}
+
+/** Refresh skew — refresh an mcp access token this many ms before its expiry. */
+const REFRESH_SKEW_MS = 120 * 1000;
 
 // ===========================================================================
 // Router
@@ -281,7 +305,9 @@ async function upsertGrant(req: Request, deps: AgentGrantsDeps): Promise<Respons
     return grantResponse(200, merged);
   }
 
-  const pendingReason = spec.kind === "mcp" ? "oauth not yet supported" : undefined;
+  // 4b-2: an mcp want is now grantable — it sits pending awaiting the operator's
+  // OAuth consent (or a pasted static bearer), not "not yet supported".
+  const pendingReason = spec.kind === "mcp" ? "awaiting oauth consent" : undefined;
   const record: GrantRecord = {
     id,
     agent,
@@ -428,15 +454,23 @@ async function grantMaterial(req: Request, id: string, deps: AgentGrantsDeps): P
     return jsonError(404, "not_found", `no grant ${id}`);
   }
   if (grant.status !== "approved" || !grant.material) {
+    // For a needs_consent grant, tell the operator how to revive it (re-approve
+    // re-runs the OAuth consent) so admin/agent surfaces can render an actionable
+    // message rather than a bare "not approved".
+    const hint =
+      grant.status === "needs_consent"
+        ? " — re-consent (approve again) to revive this connection"
+        : " — material is available only for approved grants";
     return jsonError(
       409,
       "not_approved",
-      `grant ${id} is ${grant.status}${grant.reason ? ` (${grant.reason})` : ""} — material is available only for approved grants`,
+      `grant ${id} is ${grant.status}${grant.reason ? ` (${grant.reason})` : ""}${hint}`,
     );
   }
 
   // The injectable secret. vault → token + the vault's MCP URL (so the agent
-  // can add it as an MCP server); service → token + the inject hints.
+  // can add it as an MCP server); service → token + the inject hints; mcp →
+  // refresh-if-needed then token + the remote MCP URL.
   let payload: Record<string, unknown>;
   if (grant.material.kind === "vault") {
     payload = {
@@ -444,11 +478,22 @@ async function grantMaterial(req: Request, id: string, deps: AgentGrantsDeps): P
       token: grant.material.token,
       mcpUrl: vaultMcpUrl(deps.hubOrigin, grant.connection.target),
     };
-  } else {
+  } else if (grant.material.kind === "service") {
     payload = {
       kind: "service",
       token: grant.material.token,
       inject: grant.connection.kind === "service" ? (grant.connection.inject ?? []) : [],
+    };
+  } else {
+    // mcp — refresh first if it's an OAuth grant near/past expiry. A refresh
+    // FAILURE flips the grant to needs_consent (material dropped) and 409s.
+    const resolved = await resolveMcpMaterial(grant, deps);
+    if (resolved instanceof Response) return resolved;
+    payload = {
+      kind: "mcp",
+      // Field-name seam: store field is `access_token`; wire field is `token`.
+      token: resolved.access_token,
+      mcpUrl: resolved.mcpUrl,
     };
   }
 
@@ -460,6 +505,90 @@ async function grantMaterial(req: Request, id: string, deps: AgentGrantsDeps): P
       "cache-control": "no-store",
     },
   });
+}
+
+/**
+ * Resolve an approved mcp grant's live access token, refreshing first if it's an
+ * OAuth grant that's expired or within the skew window. A static-bearer grant (no
+ * refresh_token / no expiresAt) returns its stored token unchanged. A refresh
+ * FAILURE flips the grant to `needs_consent` (material dropped) and returns a 409
+ * Response — the connection is simply absent next spawn until the operator
+ * re-consents.
+ *
+ * Returns the live mcp material on success, or a `Response` (the 409) on failure.
+ */
+async function resolveMcpMaterial(
+  grant: GrantRecord,
+  deps: AgentGrantsDeps,
+): Promise<Extract<GrantMaterial, { kind: "mcp" }> | Response> {
+  const mat = grant.material;
+  if (!mat || mat.kind !== "mcp") {
+    return jsonError(409, "not_approved", `grant ${grant.id} has no mcp material`);
+  }
+
+  // Static bearer — no refresh token / no expiry → return as-is.
+  if (!mat.refresh_token || !mat.expiresAt || !mat.tokenEndpoint || !mat.clientId) {
+    return mat;
+  }
+
+  const now = deps.now?.() ?? new Date();
+  const expiresMs = new Date(mat.expiresAt).getTime();
+  const needsRefresh = !Number.isFinite(expiresMs) || expiresMs - now.getTime() <= REFRESH_SKEW_MS;
+  if (!needsRefresh) return mat;
+
+  // Refresh.
+  try {
+    const refreshed = await oauth(deps).refreshToken(
+      {
+        tokenEndpoint: mat.tokenEndpoint,
+        refreshToken: mat.refresh_token,
+        clientId: mat.clientId,
+        now: deps.now ?? (() => new Date()),
+      },
+      undefined,
+    );
+    const updatedMaterial: GrantMaterial = {
+      kind: "mcp",
+      access_token: refreshed.access_token,
+      // Rotated refresh, if returned; else keep the existing one.
+      refresh_token: refreshed.refresh_token ?? mat.refresh_token,
+      ...(refreshed.expiresAt ? { expiresAt: refreshed.expiresAt } : {}),
+      ...(mat.issuer ? { issuer: mat.issuer } : {}),
+      clientId: mat.clientId,
+      tokenEndpoint: mat.tokenEndpoint,
+      ...(mat.revocationEndpoint ? { revocationEndpoint: mat.revocationEndpoint } : {}),
+      mcpUrl: mat.mcpUrl,
+    };
+    const updated: GrantRecord = {
+      id: grant.id,
+      agent: grant.agent,
+      connection: grant.connection,
+      status: "approved",
+      createdAt: grant.createdAt,
+      ...(grant.approvedAt ? { approvedAt: grant.approvedAt } : {}),
+      material: updatedMaterial,
+    };
+    putGrant(deps.storePath, updated);
+    return updatedMaterial;
+  } catch (err) {
+    // Refresh died (refresh token revoked/expired). Flip to needs_consent + drop
+    // material — the operator re-consents to revive. NEVER log the token/error
+    // detail that could carry one; the reason is the error message only.
+    const reason = `refresh failed: ${err instanceof Error ? err.message : "unknown error"}`;
+    const downgraded: GrantRecord = {
+      id: grant.id,
+      agent: grant.agent,
+      connection: grant.connection,
+      status: "needs_consent",
+      reason,
+      createdAt: grant.createdAt,
+      ...(grant.approvedAt ? { approvedAt: grant.approvedAt } : {}),
+      // material dropped.
+    };
+    putGrant(deps.storePath, downgraded);
+    console.log(`agent grant needs re-consent: id=${grant.id} agent=${grant.agent} kind=mcp`);
+    return jsonError(409, "not_approved", `grant ${grant.id} ${reason} — re-consent required`);
+  }
 }
 
 /** `<hub-origin>/vault/<name>/mcp` — the MCP endpoint a client connects to. */
@@ -494,13 +623,7 @@ async function approveGrant(req: Request, id: string, deps: AgentGrantsDeps): Pr
   const approvedAt = now.toISOString();
 
   if (conn.kind === "mcp") {
-    // 4b-1: remote MCP / OAuth is not implemented. Approval is refused; the
-    // grant stays pending with its reason. (Slice 2 wires hub-as-OAuth-client.)
-    return jsonError(
-      409,
-      "not_grantable",
-      "mcp (remote/OAuth) grants are not yet supported — coming in 4b-2",
-    );
+    return approveMcpGrant(grant, body, deps, approvedAt);
   }
 
   if (conn.kind === "vault") {
@@ -551,8 +674,11 @@ async function approveGrant(req: Request, id: string, deps: AgentGrantsDeps): Pr
   }
 
   // service — store the operator-pasted API token.
-  const token = typeof body.token === "string" ? body.token : "";
-  if (token.trim().length === 0) {
+  // Trim — a pasted "  tok  " must not inject whitespace into the eventual
+  // `Authorization: Bearer` header (drive-by correctness fix; the mcp
+  // static-bearer path has the same trim).
+  const token = typeof body.token === "string" ? body.token.trim() : "";
+  if (token.length === 0) {
     return jsonError(
       400,
       "token_required",
@@ -581,6 +707,351 @@ async function approveGrant(req: Request, id: string, deps: AgentGrantsDeps): Pr
 }
 
 // ===========================================================================
+// approve(mcp) — static bearer OR start the OAuth consent flow (4b-2)
+// ===========================================================================
+
+/**
+ * Approve a `kind:mcp` grant. Two paths:
+ *
+ *   - body `{ token }` (a pasted static bearer) → store
+ *     `material:{kind:"mcp", access_token, mcpUrl}` (no refresh) + status
+ *     `approved` immediately. No discovery. Weaker lifecycle (no expiry, no
+ *     refresh, no issuer-side revoke).
+ *   - body `{}` (no token) → START OAuth: discover → DCR (reuse a stored clientId
+ *     for the SAME issuer, else register) → mint PKCE + state → persist a pending
+ *     flow → return a `GrantListing` with `authorizeUrl` (status stays pending,
+ *     reason "awaiting oauth consent"). The operator's browser follows the URL;
+ *     the callback completes the flow.
+ *
+ * A re-approve of an already-approved mcp grant starts a FRESH flow; the callback
+ * replaces the material + best-effort revokes the old refresh token.
+ */
+async function approveMcpGrant(
+  grant: GrantRecord,
+  body: { token?: unknown },
+  deps: AgentGrantsDeps,
+  approvedAt: string,
+): Promise<Response> {
+  const mcpUrl = grant.connection.target;
+
+  // --- Static-bearer path: a pasted token short-circuits discovery. ---
+  if (typeof body.token === "string" && body.token.trim().length > 0) {
+    // Trim — a pasted "  tok  " must not inject whitespace into the eventual
+    // `Authorization: Bearer` header.
+    const token = body.token.trim();
+    if (token.length > MAX_TOKEN_LEN) {
+      return jsonError(400, "invalid_request", `token exceeds the ${MAX_TOKEN_LEN}-char limit`);
+    }
+    const updated: GrantRecord = {
+      id: grant.id,
+      agent: grant.agent,
+      connection: grant.connection,
+      status: "approved",
+      createdAt: grant.createdAt,
+      approvedAt,
+      material: { kind: "mcp", access_token: token, mcpUrl },
+    };
+    putGrant(deps.storePath, updated);
+    // NEVER log the token.
+    console.log(
+      `agent grant approved: id=${grant.id} agent=${grant.agent} kind=mcp mode=static-bearer`,
+    );
+    return grantResponse(200, updated);
+  }
+  // A non-empty-but-non-string token, or an over-long one, was handled above; a
+  // present-but-empty token falls through to the OAuth path (treated as "no token").
+  if (body.token !== undefined && typeof body.token !== "string") {
+    return jsonError(400, "invalid_request", "token must be a string when present");
+  }
+
+  // --- OAuth path: discover → DCR → PKCE/state → persist flow → authorizeUrl. ---
+  const client = oauth(deps);
+  const redirectUri = callbackUrl(deps.hubOrigin);
+
+  let discovery: Awaited<ReturnType<OAuthClient["discover"]>>;
+  try {
+    discovery = await client.discover(mcpUrl);
+  } catch (err) {
+    return jsonError(
+      502,
+      "discovery_failed",
+      `could not discover OAuth metadata for ${mcpUrl}: ${err instanceof Error ? err.message : "unknown error"}`,
+    );
+  }
+
+  // DCR client reuse: if the grant already has mcp material with a clientId for
+  // the SAME issuer (a re-consent), reuse it; else register a fresh client.
+  // ACCEPTED (per design): if the issuer rotates its registration (so the stored
+  // clientId is no longer valid), a fresh register orphans the old DCR client at
+  // the issuer. There is no cross-issuer client GC — orphans accrue only on issuer
+  // rotation, which is rare; noted, not built.
+  let clientId: string | undefined;
+  if (
+    grant.material?.kind === "mcp" &&
+    grant.material.clientId &&
+    grant.material.issuer === discovery.issuer
+  ) {
+    clientId = grant.material.clientId;
+  }
+  if (!clientId) {
+    if (!discovery.registrationEndpoint) {
+      return jsonError(
+        502,
+        "registration_unsupported",
+        `the issuer ${discovery.issuer} does not advertise a registration_endpoint (RFC 7591 DCR) — paste a static bearer token instead`,
+      );
+    }
+    try {
+      const reg = await client.registerClient(discovery.registrationEndpoint, redirectUri);
+      clientId = reg.clientId;
+    } catch (err) {
+      return jsonError(
+        502,
+        "registration_failed",
+        `dynamic client registration failed: ${err instanceof Error ? err.message : "unknown error"}`,
+      );
+    }
+  }
+
+  const verifier = client.generateCodeVerifier();
+  const challenge = client.generateCodeChallenge(verifier);
+  const state = client.generateState();
+  // Scope: the resource's advertised scopes (9728→8414), space-joined; omit if none.
+  const scope = discovery.scopesSupported?.length ? discovery.scopesSupported.join(" ") : undefined;
+
+  const flow: PendingFlow = {
+    state,
+    grantId: grant.id,
+    issuer: discovery.issuer,
+    clientId,
+    tokenEndpoint: discovery.tokenEndpoint,
+    ...(discovery.revocationEndpoint ? { revocationEndpoint: discovery.revocationEndpoint } : {}),
+    verifier,
+    mcpUrl,
+    ...(scope ? { scope } : {}),
+    redirectUri,
+    createdAt: (deps.now?.() ?? new Date()).toISOString(),
+  };
+  putFlow(deps.flowsStorePath, flow, (deps.now?.() ?? new Date()).getTime());
+
+  const authorizeUrl = client.buildAuthorizeUrl({
+    authorizationEndpoint: discovery.authorizationEndpoint,
+    clientId,
+    redirectUri,
+    ...(scope ? { scope } : {}),
+    state,
+    codeChallenge: challenge,
+  });
+
+  // Keep the grant pending with the slice-2 reason; surface authorizeUrl so the
+  // admin UI can redirect the browser. NEVER log the verifier/state.
+  console.log(
+    `agent grant oauth flow started: id=${grant.id} agent=${grant.agent} issuer=${discovery.issuer}`,
+  );
+  const listing: GrantListing & { authorizeUrl: string } = {
+    id: grant.id,
+    agent: grant.agent,
+    connection: grant.connection,
+    status: "pending",
+    reason: "awaiting oauth consent",
+    authorizeUrl,
+  };
+  return new Response(JSON.stringify(listing), {
+    status: 200,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
+}
+
+// ===========================================================================
+// GET /oauth/agent-grant/callback — the operator's browser redirect target (4b-2)
+// ===========================================================================
+
+/**
+ * The OAuth-client callback. The remote issuer redirects the operator's browser
+ * here with `?code&state` (success) or `?error&state` (RFC 6749 §4.1.2.1 — e.g.
+ * the operator clicked Deny). GET, no Bearer; the single-use `state` is the CSRF
+ * defense (this is a cross-site redirect IN — same-origin is NOT required).
+ *
+ * On success: look up the flow by `state` (delete-on-use), exchange the code,
+ * store the mcp material, flip the grant `approved`. If the grant previously had
+ * mcp material with a refresh_token + revocationEndpoint, best-effort revoke the
+ * OLD one first (one live credential per grant).
+ *
+ * Renders minimal HTML — NEVER a token. On any error, an HTML error page; the
+ * grant stays pending/needs_consent.
+ */
+export async function handleOAuthGrantCallback(
+  req: Request,
+  deps: AgentGrantsDeps,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const state = url.searchParams.get("state") ?? "";
+  const code = url.searchParams.get("code");
+  const errorParam = url.searchParams.get("error");
+
+  if (!state) {
+    return htmlPage(400, "Connection failed", "The authorization response was missing its state.");
+  }
+
+  // Single-use: look up, then delete the flow (delete-on-use). The get→delete
+  // pair is NOT atomic, but the race is benign: the auth `code` is single-use at
+  // the ISSUER (RFC 6749 §10.5), so a concurrent second callback with the same
+  // `state` exchanges the same code and the issuer rejects the second exchange.
+  // The design's concurrency posture is first-wins; the loser sees a token-error
+  // page, the grant ends approved exactly once.
+  const flow = getFlowByState(deps.flowsStorePath, state, (deps.now?.() ?? new Date()).getTime());
+  if (!flow) {
+    // Unknown / replayed / expired state — never mint anything.
+    return htmlPage(
+      400,
+      "Connection failed",
+      "This authorization link is unknown, already used, or expired. Start the connection again from the admin page.",
+    );
+  }
+  deleteFlow(deps.flowsStorePath, state);
+
+  // The operator clicked Deny (or the issuer returned an error). Leave the grant
+  // pending, but record WHY so admin can distinguish "not yet tried" from
+  // "tried + denied". (htmlPage single-escapes its args — pass the RAW string.)
+  if (errorParam) {
+    const denied = getGrant(deps.storePath, flow.grantId);
+    if (denied && denied.status === "pending") {
+      putGrant(deps.storePath, {
+        id: denied.id,
+        agent: denied.agent,
+        connection: denied.connection,
+        status: "pending",
+        reason: "operator declined",
+        createdAt: denied.createdAt,
+        ...(denied.approvedAt ? { approvedAt: denied.approvedAt } : {}),
+      });
+    }
+    return htmlPage(
+      400,
+      "Connection not authorized",
+      `The remote service did not grant access (${errorParam}). The connection stays pending — you can try again from the admin page.`,
+    );
+  }
+
+  if (!code) {
+    return htmlPage(
+      400,
+      "Connection failed",
+      "The authorization response was missing its code. Start the connection again from the admin page.",
+    );
+  }
+
+  const grant = getGrant(deps.storePath, flow.grantId);
+  if (!grant) {
+    // The grant was removed mid-consent — nothing to populate.
+    return htmlPage(
+      404,
+      "Connection failed",
+      "The grant this authorization belonged to no longer exists.",
+    );
+  }
+
+  const client = oauth(deps);
+  let tokens: Awaited<ReturnType<OAuthClient["exchangeCode"]>>;
+  try {
+    tokens = await client.exchangeCode({
+      tokenEndpoint: flow.tokenEndpoint,
+      code,
+      redirectUri: flow.redirectUri,
+      codeVerifier: flow.verifier,
+      clientId: flow.clientId,
+      now: deps.now ?? (() => new Date()),
+    });
+  } catch (err) {
+    // Token exchange failed — grant stays pending (the operator can retry).
+    // htmlPage single-escapes its args — pass the RAW message.
+    return htmlPage(
+      502,
+      "Connection failed",
+      `The token exchange with the remote service failed: ${err instanceof Error ? err.message : "unknown error"}. The connection stays pending — try again from the admin page.`,
+    );
+  }
+
+  // Best-effort revoke a prior refresh token (re-consent replaces material).
+  if (
+    grant.material?.kind === "mcp" &&
+    grant.material.refresh_token &&
+    grant.material.revocationEndpoint
+  ) {
+    await client.revokeRemote({
+      revocationEndpoint: grant.material.revocationEndpoint,
+      refreshToken: grant.material.refresh_token,
+      clientId: flow.clientId,
+    });
+  }
+
+  const material: GrantMaterial = {
+    kind: "mcp",
+    access_token: tokens.access_token,
+    ...(tokens.refresh_token ? { refresh_token: tokens.refresh_token } : {}),
+    ...(tokens.expiresAt ? { expiresAt: tokens.expiresAt } : {}),
+    issuer: flow.issuer,
+    clientId: flow.clientId,
+    tokenEndpoint: flow.tokenEndpoint,
+    ...(flow.revocationEndpoint ? { revocationEndpoint: flow.revocationEndpoint } : {}),
+    mcpUrl: flow.mcpUrl,
+  };
+  const updated: GrantRecord = {
+    id: grant.id,
+    agent: grant.agent,
+    connection: grant.connection,
+    status: "approved",
+    createdAt: grant.createdAt,
+    approvedAt: (deps.now?.() ?? new Date()).toISOString(),
+    material,
+  };
+  putGrant(deps.storePath, updated);
+  // NEVER log a token.
+  console.log(`agent grant approved: id=${grant.id} agent=${grant.agent} kind=mcp mode=oauth`);
+
+  return htmlPage(
+    200,
+    "Connected",
+    "The connection is authorized. You can close this tab — the agent will use it on its next run.",
+  );
+}
+
+/** Minimal server-rendered HTML — NEVER carries a token. */
+function htmlPage(status: number, heading: string, message: string): Response {
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(heading)} — Parachute</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 32rem; margin: 4rem auto; padding: 0 1.5rem; color: #1a1a1a; }
+  h1 { font-size: 1.5rem; }
+  p { line-height: 1.6; color: #444; }
+</style>
+</head>
+<body>
+<h1>${escapeHtml(heading)}</h1>
+<p>${escapeHtml(message)}</p>
+</body>
+</html>
+`;
+  return new Response(html, {
+    status,
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// ===========================================================================
 // POST /admin/grants/<id>/revoke — operator revokes (operator-auth)
 // ===========================================================================
 
@@ -604,6 +1075,20 @@ async function revokeGrant(req: Request, id: string, deps: AgentGrantsDeps): Pro
     } catch {
       // Best-effort.
     }
+  } else if (
+    // mcp OAuth grant — best-effort revoke the refresh token at the issuer so the
+    // remote credential dies, not just our local copy. A static bearer has no
+    // refresh/revocation endpoint, so this is a no-op (operator rotates upstream).
+    grant.material?.kind === "mcp" &&
+    grant.material.refresh_token &&
+    grant.material.revocationEndpoint &&
+    grant.material.clientId
+  ) {
+    await oauth(deps).revokeRemote({
+      revocationEndpoint: grant.material.revocationEndpoint,
+      refreshToken: grant.material.refresh_token,
+      clientId: grant.material.clientId,
+    });
   }
 
   const updated: GrantRecord = {
@@ -687,6 +1172,13 @@ export interface GrantListing {
   status: GrantRecord["status"];
   reason?: string;
   approvedAt?: string;
+  /**
+   * Present ONLY on a fresh `approve(mcp)` that started an OAuth flow — the URL
+   * the admin UI redirects the operator's browser to. A superset of the 4b-1
+   * listing shape; the UI ignores it for vault/service approves (absent there).
+   * Never persisted; `toListing` never emits it (it's a response-only field).
+   */
+  authorizeUrl?: string;
 }
 
 function toListing(g: GrantRecord): GrantListing {

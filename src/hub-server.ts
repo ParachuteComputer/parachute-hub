@@ -62,8 +62,9 @@
  *   /admin/connections/<id>/approve (POST)     → operator approval of a pending claim (cookie-gated; CSRF-belted)
  *   /admin/grants                 (PUT/GET)    → agent-connector grant upsert/list (4b-1; host-admin Bearer)
  *   /admin/grants/<id>/material   (GET)        → injectable secret for an APPROVED grant (4b-1; host-admin Bearer)
- *   /admin/grants/<id>/approve    (POST)       → operator approves a grant — mint (vault) / store (service) (cookie-gated; CSRF-belted)
- *   /admin/grants/<id>/revoke     (POST)       → operator revokes a grant — drop the stored secret (cookie-gated; CSRF-belted)
+ *   /admin/grants/<id>/approve    (POST)       → operator approves a grant — mint (vault) / store (service) / static-bearer-or-start-OAuth (mcp, 4b-2) (cookie-gated; CSRF-belted)
+ *   /admin/grants/<id>/revoke     (POST)       → operator revokes a grant — drop the stored secret + best-effort issuer revoke (mcp, 4b-2) (cookie-gated; CSRF-belted)
+ *   /oauth/agent-grant/callback   (GET)        → OAuth-client redirect target for an mcp grant consent (4b-2; single-use state, no Bearer, NOT same-origin-belted — cross-site redirect in)
  *
  *   # "CSRF-belted" = strict same-origin Origin check on cookie-authed
  *   # mutations (hub#632, boundary C1) — origin-check.ts
@@ -160,7 +161,11 @@ import pkg from "../package.json" with { type: "json" };
 import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.ts";
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
 import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
-import { type AgentGrantsDeps, handleAgentGrants } from "./admin-agent-grants.ts";
+import {
+  type AgentGrantsDeps,
+  handleAgentGrants,
+  handleOAuthGrantCallback,
+} from "./admin-agent-grants.ts";
 import { handleAgentToken } from "./admin-agent-token.ts";
 import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
 import {
@@ -1163,6 +1168,12 @@ export interface HubFetchDeps {
    * point this at a tmpdir; production defaults to `<CONFIG_DIR>/agent-grants.json`.
    */
   agentGrantsStorePath?: string;
+  /**
+   * Path to `agent-oauth-flows.json` (the in-flight agent-grant OAuth consents,
+   * 4b-2). Tests point this at a tmpdir; production defaults to
+   * `<CONFIG_DIR>/agent-oauth-flows.json`.
+   */
+  agentOAuthFlowsStorePath?: string;
   /**
    * Directory containing the built SPA bundle (`index.html` + `assets/`). When
    * absent, the hub auto-resolves to `<repo>/web/ui/dist/` — handy for the
@@ -2704,6 +2715,38 @@ export function hubFetch(
         return applyCorsHeaders(req, await handleRevoke(getDb(), req, oauthDeps(req)));
       }
 
+      // Agent-connector OAuth-client callback (Phase 4b-2). The operator's
+      // browser is redirected here by a REMOTE issuer after consenting to a
+      // `kind:mcp` grant. Standalone server-rendered route — NOT under /admin/*,
+      // so the SPA catch-all never swallows it. GET, no Bearer: the single-use
+      // `state` it carries is the CSRF defense (this is a cross-site redirect IN
+      // from the remote issuer, so the same-origin belt does NOT apply). The
+      // handler looks up the pending flow by `state`, exchanges the code at the
+      // remote token endpoint, stores the grant material, and renders a tiny
+      // HTML "connected" / error page (never a token).
+      if (pathname === "/oauth/agent-grant/callback") {
+        if (!getDb) return dbNotConfigured();
+        if (req.method !== "GET") {
+          return new Response("method not allowed", { status: 405 });
+        }
+        const resolveVaultOrigin = (vaultName: string): string | null => {
+          const match = findVaultUpstream(
+            readManifestLenient(manifestPath).services,
+            `/vault/${vaultName}`,
+          );
+          return match ? `http://127.0.0.1:${match.port}` : null;
+        };
+        const agentGrantsDeps: AgentGrantsDeps = {
+          db: getDb(),
+          hubOrigin: oauthDeps(req).issuer,
+          storePath: deps?.agentGrantsStorePath ?? join(CONFIG_DIR, "agent-grants.json"),
+          flowsStorePath:
+            deps?.agentOAuthFlowsStorePath ?? join(CONFIG_DIR, "agent-oauth-flows.json"),
+          resolveVaultOrigin,
+        };
+        return handleOAuthGrantCallback(req, agentGrantsDeps);
+      }
+
       if (pathname === "/vaults") {
         if (!getDb) return dbNotConfigured();
         return handleCreateVault(req, {
@@ -2892,6 +2935,8 @@ export function hubFetch(
           db: getDb(),
           hubOrigin: oauthDeps(req).issuer,
           storePath: deps?.agentGrantsStorePath ?? join(CONFIG_DIR, "agent-grants.json"),
+          flowsStorePath:
+            deps?.agentOAuthFlowsStorePath ?? join(CONFIG_DIR, "agent-oauth-flows.json"),
           resolveVaultOrigin,
         };
         // CSRF belt (same posture as /admin/connections, hub#632): a no-op for
