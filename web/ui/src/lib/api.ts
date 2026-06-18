@@ -1764,9 +1764,23 @@ export interface GrantListing {
   id: string;
   agent: string;
   connection: GrantConnection;
-  status: "pending" | "approved" | "revoked";
+  /**
+   * `pending` — never approved. `approved` — secret stored / token minted.
+   * `revoked` — operator dropped the secret. `needs_consent` (mcp/OAuth only) —
+   * an OAuth refresh died and the remote needs re-consent; the action UI treats
+   * it like `pending` (offer Connect / paste-a-token again).
+   */
+  status: "pending" | "approved" | "revoked" | "needs_consent";
   reason?: string;
   approvedAt?: string;
+  /**
+   * Remote-issuer consent URL, returned ONLY by `approveAgentGrant` when starting
+   * an `mcp` (hub-as-OAuth-client) flow with no pasted token. The caller redirects
+   * the browser here (full-page nav) to the remote consent screen; the hub callback
+   * finishes server-side and flips the grant to `approved`. Absent on the list
+   * endpoint and on token-paste / vault / service approvals.
+   */
+  authorizeUrl?: string;
 }
 
 /**
@@ -1791,11 +1805,20 @@ export async function listAgentGrants(): Promise<GrantListing[]> {
 
 /**
  * POST /admin/grants/<id>/approve — operator approves a grant. Cookie-authed
- * (the route is first-admin-session gated, CSRF-belted). For a `service` grant,
- * `token` is the operator-pasted API credential the hub stores. For `vault`,
- * the hub mints the token itself — no `token` needed.
+ * (the route is first-admin-session gated, CSRF-belted). Returns the echoed
+ * `GrantListing`.
+ *
+ *   - `vault`   — the hub mints the token itself; no `token` needed.
+ *   - `service` — `token` is the operator-pasted API credential the hub stores;
+ *     grant flips to `approved` immediately.
+ *   - `mcp` (hub-as-OAuth-client, 4b-2) — call with NO token to START OAuth: the
+ *     returned listing carries `authorizeUrl`, and the caller must full-page
+ *     redirect the browser there (remote consent). Or pass a `token` (a static
+ *     bearer for non-OAuth MCPs) to store it and approve immediately.
+ *
+ * The returned listing lets the caller read `authorizeUrl` to drive the redirect.
  */
-export async function approveAgentGrant(id: string, token?: string): Promise<void> {
+export async function approveAgentGrant(id: string, token?: string): Promise<GrantListing> {
   const res = await fetch(`/admin/grants/${encodeURIComponent(id)}/approve`, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -1803,10 +1826,10 @@ export async function approveAgentGrant(id: string, token?: string): Promise<voi
     body: JSON.stringify(token !== undefined ? { token } : {}),
   });
   if (res.status === 401) {
-    await redirectToLoginAndHang<void>();
-    return;
+    return redirectToLoginAndHang<GrantListing>();
   }
   if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as GrantListing;
 }
 
 /** POST /admin/grants/<id>/revoke — operator revokes a grant (drops the secret). */
