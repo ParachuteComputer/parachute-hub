@@ -23,7 +23,7 @@ import {
   handleAgentGrants,
   handleOAuthGrantCallback,
 } from "../admin-agent-grants.ts";
-import { connectionKey, getGrant, readGrants } from "../grants-store.ts";
+import { getGrant, readGrants } from "../grants-store.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { findTokenRowByJti } from "../jwt-sign.ts";
 import { signAccessToken } from "../jwt-sign.ts";
@@ -803,20 +803,19 @@ describe("POST /admin/grants/<id>/revoke", () => {
 // === POST /admin/grants/reconcile (grant-GC, #96) ===========================
 
 describe("POST /admin/grants/reconcile", () => {
-  /** Create a grant via PUT; return its id + connectionKey. */
+  /** Create a grant via PUT; return its id + the connection spec (sent back as a liveConnection). */
   async function makeGrant(
     bearer: string,
     agent: string,
     connection: Record<string, unknown>,
-  ): Promise<{ id: string; key: string }> {
+  ): Promise<{ id: string; connection: Record<string, unknown> }> {
     const created = await json(
       await dispatch(bearerReq("PUT", "/admin/grants", bearer, { agent, connection })),
     );
-    // connectionKey derives the same key the agent side would compute for liveKeys.
-    return { id: created.id as string, key: connectionKey(connection as never) };
+    return { id: created.id as string, connection };
   }
 
-  test("prunes grants whose key is NOT in liveKeys; keeps those that are", async () => {
+  test("prunes grants whose spec is NOT in liveConnections; keeps those that are", async () => {
     const bearer = await moduleBearer();
     const keep = await makeGrant(bearer, "a", {
       kind: "vault",
@@ -828,7 +827,7 @@ describe("POST /admin/grants/reconcile", () => {
     const res = await dispatch(
       bearerReq("POST", "/admin/grants/reconcile", bearer, {
         agent: "a",
-        liveKeys: [keep.key], // drop's key is absent → it is pruned
+        liveConnections: [keep.connection], // drop's spec is absent → it is pruned
       }),
     );
     expect(res.status).toBe(200);
@@ -841,6 +840,37 @@ describe("POST /admin/grants/reconcile", () => {
     expect(getGrant(harness.storePath, drop.id)).toBeNull();
   });
 
+  test("REGRESSION: a still-wanted service / tagged-vault grant is NOT pruned (spec-based, no cross-repo key drift)", async () => {
+    // The hub derives keys from the live SPECS with its own connectionKey — so a
+    // service grant (hub key `service:github`) sent back as its spec matches and
+    // survives. (Under the old "agent sends pre-computed keys" contract, the agent
+    // would send `env:github`, the hub key `service:github` wouldn't match, and this
+    // still-wanted grant would be WRONGLY pruned. Caught by live verification.)
+    const bearer = await moduleBearer();
+    const svc = await makeGrant(bearer, "a", {
+      kind: "service",
+      target: "github",
+      inject: ["env"],
+    });
+    const tagged = await makeGrant(bearer, "a", {
+      kind: "vault",
+      target: "research",
+      access: "read",
+      tags: ["#published", "#wip"],
+    });
+
+    const res = await dispatch(
+      bearerReq("POST", "/admin/grants/reconcile", bearer, {
+        agent: "a",
+        liveConnections: [svc.connection, tagged.connection],
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect((await json(res)).pruned).toBe(0);
+    expect(getGrant(harness.storePath, svc.id)).not.toBeNull();
+    expect(getGrant(harness.storePath, tagged.id)).not.toBeNull();
+  });
+
   test("a pruned APPROVED vault grant has its registry token revoked", async () => {
     const bearer = await moduleBearer();
     const cookie = await operatorCookie();
@@ -849,9 +879,9 @@ describe("POST /admin/grants/reconcile", () => {
     const jti = (getGrant(harness.storePath, g.id)?.material as { jti: string }).jti;
     expect(findTokenRowByJti(harness.db, jti)?.revokedAt).toBeFalsy();
 
-    // reconcile with NO live keys for this agent → prune everything
+    // reconcile with NO live connections for this agent → prune everything
     const res = await dispatch(
-      bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveKeys: [] }),
+      bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveConnections: [] }),
     );
     expect(res.status).toBe(200);
     expect((await json(res)).pruned).toBe(1);
@@ -861,13 +891,13 @@ describe("POST /admin/grants/reconcile", () => {
     expect(findTokenRowByJti(harness.db, jti)?.revokedAt).toBeTruthy();
   });
 
-  test("liveKeys=[] prunes ALL of the agent's grants", async () => {
+  test("liveConnections=[] prunes ALL of the agent's grants", async () => {
     const bearer = await moduleBearer();
     await makeGrant(bearer, "a", { kind: "vault", target: "research", access: "read" });
     await makeGrant(bearer, "a", { kind: "service", target: "github" });
 
     const res = await dispatch(
-      bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveKeys: [] }),
+      bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveConnections: [] }),
     );
     expect(res.status).toBe(200);
     expect((await json(res)).pruned).toBe(2);
@@ -880,7 +910,7 @@ describe("POST /admin/grants/reconcile", () => {
     const theirs = await makeGrant(bearer, "b", { kind: "service", target: "github" });
 
     const res = await dispatch(
-      bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveKeys: [] }),
+      bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveConnections: [] }),
     );
     expect(res.status).toBe(200);
     expect((await json(res)).pruned).toBe(1);
@@ -896,7 +926,7 @@ describe("POST /admin/grants/reconcile", () => {
     const res = await dispatch(
       bearerReq("POST", "/admin/grants/reconcile", bearer, {
         agent: "a",
-        liveKeys: [g.key], // the only grant is still live → nothing pruned
+        liveConnections: [g.connection], // the only grant is still live → nothing pruned
       }),
     );
     expect(res.status).toBe(200);
@@ -914,7 +944,7 @@ describe("POST /admin/grants/reconcile", () => {
     const req = new Request(`${HUB_ORIGIN}/admin/grants/reconcile`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ agent: "a", liveKeys: [] }),
+      body: JSON.stringify({ agent: "a", liveConnections: [] }),
     });
     const res = await handleAgentGrants(req, "/reconcile", deps());
     expect(res.status).toBe(401);
@@ -928,7 +958,7 @@ describe("POST /admin/grants/reconcile", () => {
     const cookie = await operatorCookie();
     // An operator cookie is NOT module-auth — reconcile is host-admin-Bearer only.
     const res = await dispatch(
-      cookieReq("POST", "/admin/grants/reconcile", cookie, { agent: "a", liveKeys: [] }),
+      cookieReq("POST", "/admin/grants/reconcile", cookie, { agent: "a", liveConnections: [] }),
     );
     expect(res.status).toBe(401);
     expect(readGrants(harness.storePath).filter((r) => r.agent === "a")).toHaveLength(1);
@@ -940,26 +970,35 @@ describe("POST /admin/grants/reconcile", () => {
     expect(res.status).toBe(405);
   });
 
-  test("400 on a missing/invalid agent or liveKeys", async () => {
+  test("400 on a missing/invalid agent or liveConnections", async () => {
     const bearer = await moduleBearer();
     // missing agent
     expect(
-      (await dispatch(bearerReq("POST", "/admin/grants/reconcile", bearer, { liveKeys: [] })))
-        .status,
-    ).toBe(400);
-    // liveKeys not an array
-    expect(
       (
         await dispatch(
-          bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveKeys: "x" }),
+          bearerReq("POST", "/admin/grants/reconcile", bearer, { liveConnections: [] }),
         )
       ).status,
     ).toBe(400);
-    // a non-string liveKeys entry
+    // liveConnections not an array
     expect(
       (
         await dispatch(
-          bearerReq("POST", "/admin/grants/reconcile", bearer, { agent: "a", liveKeys: [1] }),
+          bearerReq("POST", "/admin/grants/reconcile", bearer, {
+            agent: "a",
+            liveConnections: "x",
+          }),
+        )
+      ).status,
+    ).toBe(400);
+    // an invalid liveConnections entry (not a valid connection spec)
+    expect(
+      (
+        await dispatch(
+          bearerReq("POST", "/admin/grants/reconcile", bearer, {
+            agent: "a",
+            liveConnections: [{ kind: "bogus" }],
+          }),
         )
       ).status,
     ).toBe(400);
@@ -969,7 +1008,7 @@ describe("POST /admin/grants/reconcile", () => {
         await dispatch(
           bearerReq("POST", "/admin/grants/reconcile", bearer, {
             agent: "bad name",
-            liveKeys: [],
+            liveConnections: [],
           }),
         )
       ).status,
