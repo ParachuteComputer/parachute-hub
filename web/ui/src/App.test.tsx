@@ -127,6 +127,7 @@ describe("App — nav structure", () => {
       // dropdown), so the hub-native group no longer carries it.
       "Home",
       "Connections",
+      "Grants",
       "Modules",
       "Users",
       "Tokens",
@@ -156,6 +157,7 @@ describe("App — nav structure", () => {
       "Home",
       "Modules",
       "Connections",
+      "Grants",
       "Users",
       "Tokens",
       "Permissions",

@@ -152,7 +152,11 @@ export type TokenCreatedVia =
   | "cli_mint"
   | "operator_mint"
   | "connection_provision"
-  | "connection_credential";
+  | "connection_credential"
+  // Agent-connector grants (Phase 4b-1) — a vault token the hub mints when the
+  // operator approves an agent's `vault:<name>:<verb>` connection grant. Stored
+  // in the agent-grants store; registered here so revoke can drop it.
+  | "agent_grant";
 
 export interface SignedRefreshToken {
   /** Opaque token to return to the client. NOT recoverable from the DB. */

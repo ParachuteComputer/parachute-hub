@@ -60,6 +60,10 @@
  *   /admin/connections/<id>/renew (POST)       → credential renewal (H4; Bearer = the credential itself, proof of possession)
  *   /admin/connections/<id>/claim (POST)       → claim/reconcile a directly-delivered credential → pending record (surface#113; Bearer = the credential itself)
  *   /admin/connections/<id>/approve (POST)     → operator approval of a pending claim (cookie-gated; CSRF-belted)
+ *   /admin/grants                 (PUT/GET)    → agent-connector grant upsert/list (4b-1; host-admin Bearer)
+ *   /admin/grants/<id>/material   (GET)        → injectable secret for an APPROVED grant (4b-1; host-admin Bearer)
+ *   /admin/grants/<id>/approve    (POST)       → operator approves a grant — mint (vault) / store (service) (cookie-gated; CSRF-belted)
+ *   /admin/grants/<id>/revoke     (POST)       → operator revokes a grant — drop the stored secret (cookie-gated; CSRF-belted)
  *
  *   # "CSRF-belted" = strict same-origin Origin check on cookie-authed
  *   # mutations (hub#632, boundary C1) — origin-check.ts
@@ -156,6 +160,7 @@ import pkg from "../package.json" with { type: "json" };
 import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.ts";
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
 import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
+import { type AgentGrantsDeps, handleAgentGrants } from "./admin-agent-grants.ts";
 import { handleAgentToken } from "./admin-agent-token.ts";
 import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
 import {
@@ -1153,6 +1158,11 @@ export interface HubFetchDeps {
    * at a tmpdir; production defaults to `<CONFIG_DIR>/connections.json`.
    */
   connectionsStorePath?: string;
+  /**
+   * Path to `agent-grants.json` (the agent-connector grant store, 4b-1). Tests
+   * point this at a tmpdir; production defaults to `<CONFIG_DIR>/agent-grants.json`.
+   */
+  agentGrantsStorePath?: string;
   /**
    * Directory containing the built SPA bundle (`index.html` + `assets/`). When
    * absent, the hub auto-resolves to `<repo>/web/ui/dist/` — handy for the
@@ -2858,6 +2868,41 @@ export function hubFetch(
         }
         const subPath = pathname.slice("/admin/connections".length);
         return handleConnections(req, subPath, connectionsDeps);
+      }
+
+      // Agent-connector GRANTS — the approval-gated resource-grant subsystem
+      // (Phase 4b-1, agent-connectors design 2026-06-17). Generalizes the
+      // Connections engine from "event→action triggers" to "approval-gated
+      // resource grants": an agent declares connections it WANTS beyond its
+      // def-vault; the agent module registers each as a pending grant (PUT,
+      // host-admin Bearer); the operator approves per-connection (POST
+      // /approve, first-admin cookie); the hub mints (vault) / stores (service)
+      // the secret; the agent module fetches it at spawn (GET /material,
+      // host-admin Bearer). Two auth classes split by route inside the handler.
+      if (pathname === "/admin/grants" || pathname.startsWith("/admin/grants/")) {
+        if (!getDb) return dbNotConfigured();
+        const resolveVaultOrigin = (vaultName: string): string | null => {
+          const match = findVaultUpstream(
+            readManifestLenient(manifestPath).services,
+            `/vault/${vaultName}`,
+          );
+          return match ? `http://127.0.0.1:${match.port}` : null;
+        };
+        const agentGrantsDeps: AgentGrantsDeps = {
+          db: getDb(),
+          hubOrigin: oauthDeps(req).issuer,
+          storePath: deps?.agentGrantsStorePath ?? join(CONFIG_DIR, "agent-grants.json"),
+          resolveVaultOrigin,
+        };
+        // CSRF belt (same posture as /admin/connections, hub#632): a no-op for
+        // the host-admin-Bearer PUT/GET (Bearer → not a browser CSRF), and the
+        // real gate on the cookie-authed POST /approve + /revoke.
+        {
+          const rejected = assertSameOriginForCookieMutation(req, oauthDeps(req).hubBoundOrigins());
+          if (rejected) return rejected;
+        }
+        const subPath = pathname.slice("/admin/grants".length);
+        return handleAgentGrants(req, subPath, agentGrantsDeps);
       }
 
       if (pathname.startsWith("/admin/vault-admin-token/")) {
