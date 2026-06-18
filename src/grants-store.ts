@@ -131,6 +131,12 @@ const GRANT_ID_CHARSET = /[^a-z0-9]+/g;
  * Derive the grant id from `(agent, connectionKey)`. A conservative slug — it
  * lands in a URL path segment (`/admin/grants/<id>/...`). Deterministic so the
  * same `(agent, connection)` always upserts the same row.
+ *
+ * The slug collapses non-`[a-z0-9]` runs to a single `-`. A collision (two distinct
+ * `(agent, connection)` pairs slugging identically) is infeasible given the upstream
+ * validators — `kind` is an enum, vault `target` passes `validateVaultName`, service
+ * `target` matches `SERVICE_KEY_RE`, `access` is `read|write`, tags are charset-bounded
+ * — so the separators that survive the slug are non-ambiguous in practice.
  */
 export function grantId(agent: string, spec: ConnectionSpec): string {
   const raw = `${agent.trim().toLowerCase()}--${connectionKey(spec)}`;
@@ -184,9 +190,10 @@ function writeAll(storePath: string, records: GrantRecord[]): void {
   mkdirSync(dirname(storePath), { recursive: true });
   const file: GrantsFile = { grants: records };
   // 0600 — UNLIKE connections.json, this file holds the granted secrets
-  // (minted vault tokens + pasted service creds in `material`). Write the file
-  // first, then chmod, so a fresh-create never has a window at the default
-  // umask. chmod is idempotent on re-write.
+  // (minted vault tokens + pasted service creds in `material`). `writeFileSync`'s
+  // `mode` applies at CREATE time (passed to open(O_CREAT)), so a fresh file is
+  // never world-readable even for an instant; the chmodSync below is belt-and-
+  // suspenders for the re-write case (an existing file left at looser perms).
   writeFileSync(storePath, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
   try {
     chmodSync(storePath, 0o600);

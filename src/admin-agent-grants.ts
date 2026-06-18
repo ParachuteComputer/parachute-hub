@@ -106,6 +106,9 @@ const TAG_RE = /^\S+$/;
 const MAX_AGENT_LEN = 128;
 const MAX_TARGET_LEN = 512;
 const MAX_TAG_LEN = 128;
+/** Cap the operator-pasted service token. Operator-gated (nil trust exposure), but
+ *  bounds a fat-finger paste from bloating the on-disk store — matches the other caps. */
+const MAX_TOKEN_LEN = 8192;
 const MAX_TAGS = 64;
 
 export interface AgentGrantsDeps {
@@ -555,6 +558,9 @@ async function approveGrant(req: Request, id: string, deps: AgentGrantsDeps): Pr
       "token_required",
       "approving a service grant requires a non-empty `token` (the API credential to store)",
     );
+  }
+  if (token.length > MAX_TOKEN_LEN) {
+    return jsonError(400, "invalid_request", `token exceeds the ${MAX_TOKEN_LEN}-char limit`);
   }
   // Rebuild from identity fields (drops any pending `reason`).
   const updated: GrantRecord = {

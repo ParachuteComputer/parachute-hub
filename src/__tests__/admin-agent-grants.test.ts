@@ -496,6 +496,28 @@ describe("POST /admin/grants/<id>/approve", () => {
     expect((stored?.material as { kind: string; token: string }).token).toBe("ghp_secret123");
   });
 
+  test("service approve rejects an over-long pasted token (400)", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "service", target: "github", inject: ["env"] },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    const res = await dispatch(
+      cookieReq("POST", `/admin/grants/${id}/approve`, cookie, { token: "x".repeat(9000) }),
+    );
+    expect(res.status).toBe(400);
+    // not stored — the grant stays pending, no oversized material on disk.
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    expect(stored?.status).toBe("pending");
+    expect(stored?.material).toBeUndefined();
+  });
+
   test("service: 400 when no token is pasted", async () => {
     const bearer = await moduleBearer();
     const cookie = await operatorCookie();
