@@ -939,7 +939,19 @@ async function main(argv: string[]): Promise<number> {
       // after `vault` (including --help) is passed through verbatim.
       if (rest.length === 0) return await mod.dispatchVault(["--help"]);
 
-      // Everything under `vault` forwards transparently to `parachute-vault`.
+      // Intercept the delete verbs BEFORE the transparent passthrough (B3):
+      // `parachute vault remove <name>` must route through the hub's identity
+      // cascade (`DELETE /vaults/<name>`), NOT forward verbatim to
+      // `parachute-vault remove` (mechanics-only — orphans hub-side tokens,
+      // grants, user_vaults rows). `rm` is a convenience alias to the same path.
+      const sub = rest[0];
+      if (sub === "remove" || sub === "rm") {
+        const rm = await loadCommand("vault-remove", () => import("./commands/vault-remove.ts"));
+        if (!rm) return 1;
+        return await rm.vaultRemove(rest.slice(1));
+      }
+
+      // Everything else under `vault` forwards transparently to `parachute-vault`.
       // `vault tokens create` used to route through a guided interactive
       // wrapper, but the pvt_* DROP (vault#412 / hub#466) removed that vault
       // subcommand — it now exits 1 with migration guidance. Access tokens are

@@ -31,6 +31,9 @@ Usage:
   parachute vault <args...>         vault-specific ops (tokens, 2fa, config, init,
                                     etc.) — forwards to parachute-vault.
                                     For lifecycle, use \`parachute start|stop|restart|logs vault\`.
+                                    \`vault remove <name>\` is routed through the hub's
+                                    identity cascade (revokes the vault's tokens/grants),
+                                    not the raw mechanics-only delete.
 
 Flags:
   --help, -h                        show this help (also per-subcommand: \`parachute <cmd> --help\`)
