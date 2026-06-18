@@ -286,6 +286,46 @@ describe("PUT /admin/grants (upsert)", () => {
       ).status,
     ).toBe(400);
   });
+
+  test("400 on a reserved vault name (no phantom pending row)", async () => {
+    const bearer = await moduleBearer();
+    const res = await dispatch(
+      bearerReq("PUT", "/admin/grants", bearer, {
+        agent: "a",
+        connection: { kind: "vault", target: "admin" },
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(readGrants(harness.storePath)).toHaveLength(0);
+  });
+
+  test("400 on an over-long agent / tags array", async () => {
+    const bearer = await moduleBearer();
+    expect(
+      (
+        await dispatch(
+          bearerReq("PUT", "/admin/grants", bearer, {
+            agent: "x".repeat(200),
+            connection: { kind: "vault", target: "research" },
+          }),
+        )
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await dispatch(
+          bearerReq("PUT", "/admin/grants", bearer, {
+            agent: "a",
+            connection: {
+              kind: "vault",
+              target: "research",
+              tags: Array.from({ length: 100 }, (_, i) => `#t${i}`),
+            },
+          }),
+        )
+      ).status,
+    ).toBe(400);
+  });
 });
 
 // === GET /admin/grants ======================================================
@@ -383,6 +423,57 @@ describe("POST /admin/grants/<id>/approve", () => {
     expect((claims.permissions as { scoped_tags: string[] }).scoped_tags).toEqual(["#published"]);
     // registered → revocable
     expect(findTokenRowByJti(harness.db, mat.jti)).not.toBeNull();
+  });
+
+  test("vault: re-approval revokes the prior minted token (no orphaned live token)", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "vault", target: "research" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const firstJti = (
+      readGrants(harness.storePath).find((r) => r.id === id)?.material as { jti: string }
+    ).jti;
+
+    // approve again — should revoke the first token and mint a fresh one
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const secondJti = (
+      readGrants(harness.storePath).find((r) => r.id === id)?.material as { jti: string }
+    ).jti;
+
+    expect(secondJti).not.toBe(firstJti);
+    expect(findTokenRowByJti(harness.db, firstJti)?.revokedAt).toBeTruthy();
+    expect(findTokenRowByJti(harness.db, secondJti)?.revokedAt).toBeFalsy();
+  });
+
+  test("vault: a revoked grant can be re-approved (re-mints fresh material)", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "vault", target: "research" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/revoke`, cookie));
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("revoked");
+
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    expect(res.status).toBe(200);
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    expect(stored?.status).toBe("approved");
+    expect((stored?.material as { kind: string }).kind).toBe("vault");
   });
 
   test("service: stores the operator-pasted token", async () => {

@@ -62,6 +62,12 @@ const sampleGrants: api.GrantListing[] = [
     approvedAt: "2026-06-17T00:00:00.000Z",
   },
   {
+    id: "agent1-vault-archive-read",
+    agent: "agent1",
+    connection: { kind: "vault", target: "archive", access: "read" },
+    status: "revoked",
+  },
+  {
     id: "agent2-mcp-remote",
     agent: "agent2",
     connection: { kind: "mcp", target: "https://remote.test/mcp" },
@@ -141,6 +147,19 @@ describe("Grants — approve / revoke", () => {
     fireEvent.click(within(row).getByRole("button", { name: /revoke/i }));
     await waitFor(() =>
       expect(api.revokeAgentGrant).toHaveBeenCalledWith("agent1-vault-notes-write"),
+    );
+  });
+
+  it("a revoked vault grant offers Re-approve (re-mints fresh material)", async () => {
+    vi.mocked(api.listAgentGrants).mockResolvedValue(sampleGrants);
+    vi.mocked(api.approveAgentGrant).mockResolvedValue();
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("agent1")).toBeInTheDocument());
+
+    const row = screen.getByText(/vault: archive/i).closest("tr") as HTMLElement;
+    fireEvent.click(within(row).getByRole("button", { name: /re-approve/i }));
+    await waitFor(() =>
+      expect(api.approveAgentGrant).toHaveBeenCalledWith("agent1-vault-archive-read"),
     );
   });
 });

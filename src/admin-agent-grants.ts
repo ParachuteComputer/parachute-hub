@@ -78,7 +78,7 @@ import {
 } from "./jwt-sign.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
-import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
+import { validateVaultName } from "./vault-name.ts";
 
 /**
  * TTL of a minted vault grant token. 90 days — matches the Connections
@@ -97,6 +97,16 @@ const GRANT_ID_RE = /^[a-z0-9][a-z0-9-]*$/;
 const SERVICE_KEY_RE = /^[a-z0-9][a-z0-9_-]*$/i;
 /** A tag the agent declares for vault tag-scope. Conservative — no whitespace. */
 const TAG_RE = /^\S+$/;
+
+/**
+ * Input length caps (reviewer N3). A host-admin Bearer is already
+ * high-privilege, but these bound disk bloat from a runaway/misconfigured
+ * module registering grants on the operator's own machine.
+ */
+const MAX_AGENT_LEN = 128;
+const MAX_TARGET_LEN = 512;
+const MAX_TAG_LEN = 128;
+const MAX_TAGS = 64;
 
 export interface AgentGrantsDeps {
   db: Database;
@@ -234,11 +244,11 @@ async function upsertGrant(req: Request, deps: AgentGrantsDeps): Promise<Respons
   const b = body as Record<string, unknown>;
 
   const agent = typeof b.agent === "string" ? b.agent.trim() : "";
-  if (!agent || !AGENT_NAME_RE.test(agent)) {
+  if (!agent || agent.length > MAX_AGENT_LEN || !AGENT_NAME_RE.test(agent)) {
     return jsonError(
       400,
       "invalid_request",
-      "agent is required and must match [a-zA-Z0-9][a-zA-Z0-9_.-]*",
+      `agent is required and must match [a-zA-Z0-9][a-zA-Z0-9_.-]* (max ${MAX_AGENT_LEN} chars)`,
     );
   }
 
@@ -254,6 +264,12 @@ async function upsertGrant(req: Request, deps: AgentGrantsDeps): Promise<Respons
   // material on re-declare (the module re-registering the same want must NOT
   // downgrade an active grant to pending, nor re-open a revoked one). A new
   // grant lands pending — mcp pending with its slice-2 reason.
+  //
+  // Recovery from `revoked` (reviewer N2): re-declaring does NOT re-open it —
+  // the operator re-grants by approving the revoked row directly (the
+  // operator-gated approve path accepts any non-mcp grant regardless of prior
+  // status, re-minting fresh material). So a revoked grant is dormant, not
+  // dead; an explicit operator approve revives it.
   if (existing) {
     // Re-declare may refresh the agent-side `inject` hints on a service spec
     // without changing the grant's identity (inject is not part of the key).
@@ -291,10 +307,17 @@ function parseConnectionSpec(raw: unknown): { spec: ConnectionSpec } | { error: 
   }
   const target = typeof c.target === "string" ? c.target.trim() : "";
   if (!target) return { error: "connection.target is required" };
+  if (target.length > MAX_TARGET_LEN) {
+    return { error: `connection.target exceeds the ${MAX_TARGET_LEN}-char limit` };
+  }
 
   if (kind === "vault") {
-    if (!VAULT_NAME_CHARSET_RE.test(target)) {
-      return { error: `connection.target "${target}" is not a valid vault name` };
+    // Full vault-name validation (reviewer N4) — length + charset + reserved
+    // names (`admin`, `list`, `new`, `assets`). Rejecting reserved names here
+    // stops a phantom pending row that could never be approved.
+    const v = validateVaultName(target);
+    if (!v.ok) {
+      return { error: `connection.target ${v.error}` };
     }
     let access: GrantAccess = "read";
     if (c.access !== undefined) {
@@ -308,15 +331,21 @@ function parseConnectionSpec(raw: unknown): { spec: ConnectionSpec } | { error: 
       if (!Array.isArray(c.tags)) {
         return { error: "connection.tags must be an array of tag strings" };
       }
+      if (c.tags.length > MAX_TAGS) {
+        return { error: `connection.tags exceeds the ${MAX_TAGS}-entry limit` };
+      }
       for (const t of c.tags) {
-        if (typeof t !== "string" || !TAG_RE.test(t.trim()) || t.trim().length === 0) {
-          return { error: "connection.tags entries must be non-empty whitespace-free strings" };
+        const trimmed = typeof t === "string" ? t.trim() : "";
+        if (trimmed.length === 0 || trimmed.length > MAX_TAG_LEN || !TAG_RE.test(trimmed)) {
+          return {
+            error: `connection.tags entries must be non-empty whitespace-free strings (max ${MAX_TAG_LEN} chars)`,
+          };
         }
-        tags.push(t.trim());
+        tags.push(trimmed);
       }
     }
     return {
-      spec: { kind: "vault", target, access, ...(tags.length > 0 ? { tags } : {}) },
+      spec: { kind: "vault", target: v.name, access, ...(tags.length > 0 ? { tags } : {}) },
     };
   }
 

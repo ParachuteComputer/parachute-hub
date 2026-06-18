@@ -250,30 +250,32 @@ function GrantRow({
         {/* mcp — modeled, not grantable in 4b-1. */}
         {isMcp && <span className="muted">OAuth coming in 4b-2 — not yet grantable.</span>}
 
-        {/* pending vault — single-click approve (the hub mints). */}
-        {!isMcp && grant.status === "pending" && c.kind === "vault" && (
+        {/* not-yet-granted vault (pending OR revoked) — single-click approve
+            (the hub mints; approving a revoked grant re-mints fresh material). */}
+        {!isMcp && grant.status !== "approved" && c.kind === "vault" && (
           <button
             type="button"
             className="primary"
             disabled={busy}
             onClick={() => actions.onApproveVault(grant.id)}
           >
-            {busy ? "Approving…" : "Approve"}
+            {busy ? "Approving…" : grant.status === "revoked" ? "Re-approve" : "Approve"}
           </button>
         )}
 
-        {/* pending service — paste the API token, then approve. */}
-        {!isMcp && grant.status === "pending" && isService && pasting === null && (
+        {/* not-yet-granted service (pending OR revoked) — paste the API token,
+            then approve. */}
+        {!isMcp && grant.status !== "approved" && isService && pasting === null && (
           <button
             type="button"
             className="primary"
             disabled={busy}
             onClick={() => setRowSt({ kind: "pasting", id: grant.id, token: "" })}
           >
-            Approve…
+            {grant.status === "revoked" ? "Re-approve…" : "Approve…"}
           </button>
         )}
-        {!isMcp && grant.status === "pending" && isService && pasting !== null && (
+        {!isMcp && grant.status !== "approved" && isService && pasting !== null && (
           <span style={{ display: "inline-flex", gap: "0.5rem", alignItems: "center" }}>
             <input
               type="password"
@@ -307,9 +309,6 @@ function GrantRow({
             {busy ? "Revoking…" : "Revoke"}
           </button>
         )}
-
-        {/* revoked — re-approval happens after the agent re-declares. */}
-        {grant.status === "revoked" && <span className="muted">revoked</span>}
 
         {rowError && <span className="error-inline"> {rowError}</span>}
       </td>
