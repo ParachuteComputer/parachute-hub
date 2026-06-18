@@ -115,14 +115,12 @@ const MAX_TAG_LEN = 128;
 const MAX_TOKEN_LEN = 8192;
 const MAX_TAGS = 64;
 /**
- * Reconcile caps (#96). A host-admin Bearer is high-privilege, but these bound a
- * runaway/misconfigured module from POSTing a giant liveKeys array. The cap is
- * generous vs. realistic agent connection counts ("a handful per agent").
+ * Reconcile cap (#96). A host-admin Bearer is high-privilege, but this bounds a
+ * runaway/misconfigured module from POSTing a giant liveConnections array. The cap
+ * is generous vs. realistic agent connection counts ("a handful per agent"); each
+ * entry is further validated + bounded by parseConnectionSpec.
  */
 const MAX_LIVE_KEYS = 256;
-/** A connectionKey is `kind:target[:access][#tags]` — bounded by the upstream
- *  target/tag caps, so this is a loose safety bound, not the real limit. */
-const MAX_CONNECTION_KEY_LEN = 1024;
 
 export interface AgentGrantsDeps {
   db: Database;
@@ -1167,8 +1165,8 @@ async function tearDownGrantMaterial(
 
 /**
  * Reconcile (garbage-collect) one holder's grants against its CURRENTLY-declared
- * connections. The agent module computes the `connectionKey()` of every
- * connection a holder still wants and POSTs them as `liveKeys`; the hub prunes
+ * connections. The agent module POSTs the live connection SPECS a holder still
+ * wants; the hub re-derives each key with its OWN `connectionKey()` and prunes
  * every grant for that holder whose key is NOT in the live set — tearing down its
  * material exactly like `revoke`, then REMOVING the row (the holder is gone, so a
  * lingering status:revoked row is just cruft).
@@ -1177,10 +1175,13 @@ async function tearDownGrantMaterial(
  * Pruning only ever REMOVES access (never escalates), so the "a note can only
  * REQUEST, never GRANT" invariant is untouched: this can't mint or approve.
  *
- * Body: `{ agent: "<name>", liveKeys: ["<connectionKey>", ...] }`.
- * `liveKeys: []` (the agent/def is gone) prunes ALL of that holder's grants.
- * The keys MUST be computed by the agent side via the same `connectionKey()`
- * exported from grants-store.ts so the comparison is exact.
+ * Body: `{ agent: "<name>", liveConnections: [<ConnectionSpec>, ...] }`.
+ * `liveConnections: []` (the agent/def is gone) prunes ALL of that holder's grants.
+ * Sending SPECS (not pre-computed keys) is deliberate: the hub re-derives keys with
+ * the same normalization it stored them under, so there is NO dependency on the
+ * agent module's separate connectionKey() impl (which diverges for service /
+ * tagged-vault / mixed-case-mcp grants — a still-wanted grant would otherwise be
+ * wrongly pruned; caught by live verification 2026-06-18).
  *
  * Returns `{ pruned: <number>, prunedIds: ["<id>", ...] }`.
  */
@@ -1208,36 +1209,41 @@ async function reconcileGrants(req: Request, deps: AgentGrantsDeps): Promise<Res
     );
   }
 
-  if (!Array.isArray(b.liveKeys)) {
+  // The caller sends the live CONNECTION SPECS (not pre-computed keys): the hub
+  // re-derives each key with its OWN connectionKey() — the same normalization +
+  // function it used to store/grantId the grants — so the keep-set is guaranteed
+  // to match the stored keys. (Sending agent-computed keys would couple to the
+  // agent module's separate connectionKey() impl, which diverges for service /
+  // tagged-vault / mixed-case-mcp grants — caught live 2026-06-18.)
+  if (!Array.isArray(b.liveConnections)) {
     return jsonError(
       400,
       "invalid_request",
-      "liveKeys is required and must be an array of strings",
+      "liveConnections is required and must be an array of connection specs",
     );
   }
-  if (b.liveKeys.length > MAX_LIVE_KEYS) {
-    return jsonError(400, "invalid_request", `liveKeys exceeds the ${MAX_LIVE_KEYS}-entry limit`);
+  if (b.liveConnections.length > MAX_LIVE_KEYS) {
+    return jsonError(
+      400,
+      "invalid_request",
+      `liveConnections exceeds the ${MAX_LIVE_KEYS}-entry limit`,
+    );
   }
   const liveKeys = new Set<string>();
-  for (const k of b.liveKeys) {
-    if (typeof k !== "string") {
-      return jsonError(400, "invalid_request", "liveKeys entries must be strings");
+  for (const raw of b.liveConnections) {
+    const parsed = parseConnectionSpec(raw);
+    if ("error" in parsed) {
+      return jsonError(400, "invalid_request", `liveConnections entry invalid: ${parsed.error}`);
     }
-    if (k.length > MAX_CONNECTION_KEY_LEN) {
-      return jsonError(
-        400,
-        "invalid_request",
-        `a liveKeys entry exceeds the ${MAX_CONNECTION_KEY_LEN}-char limit`,
-      );
-    }
-    liveKeys.add(k);
+    liveKeys.add(connectionKey(parsed.spec));
   }
 
   const now = deps.now?.() ?? new Date();
   const held = listGrantsForAgent(deps.storePath, agent);
   const prunedIds: string[] = [];
   for (const grant of held) {
-    // connectionKey() derives the SAME key the agent side computed for liveKeys.
+    // Both sides of this comparison use the HUB's connectionKey (stored grant +
+    // re-derived live spec) — no cross-repo key-format dependency.
     if (liveKeys.has(connectionKey(grant.connection))) continue;
     await tearDownGrantMaterial(grant, deps, now);
     removeGrant(deps.storePath, grant.id);
