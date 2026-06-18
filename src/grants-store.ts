@@ -59,7 +59,13 @@ export interface ConnectionSpec {
   readonly inject?: readonly GrantInject[];
 }
 
-export type GrantStatus = "pending" | "approved" | "revoked";
+/**
+ * Grant lifecycle. `needs_consent` (added 4b-2) is distinct from `revoked`
+ * (operator-intended teardown) — it means "an mcp grant was working, its refresh
+ * died, re-consent to revive." The status resolver treats it as not-approved
+ * (so the agent def shows it in `pending:[…]`).
+ */
+export type GrantStatus = "pending" | "approved" | "revoked" | "needs_consent";
 
 /**
  * The granted secret material, kept on disk ONLY. Discriminated by `kind` to
@@ -80,6 +86,30 @@ export type GrantMaterial =
       readonly kind: "service";
       /** The operator-pasted API token. */
       readonly token: string;
+    }
+  | {
+      readonly kind: "mcp";
+      /**
+       * The remote MCP access token — OAuth-issued (auto-refreshed) OR an
+       * operator-pasted static bearer (no refresh). The `/material` WIRE shape
+       * projects this as `token` (matching the vault/service material the agent
+       * already consumes); the internal store field is `access_token`.
+       */
+      readonly access_token: string;
+      /** OAuth refresh token. Absent for a static-bearer grant. */
+      readonly refresh_token?: string;
+      /** ISO expiry of the access token. Absent for a static bearer (never refreshed). */
+      readonly expiresAt?: string;
+      /** Issuer (for refresh + revoke). Absent for a static bearer. */
+      readonly issuer?: string;
+      /** DCR client_id (for refresh). Absent for a static bearer. */
+      readonly clientId?: string;
+      /** Cached token endpoint (for refresh). Absent for a static bearer. */
+      readonly tokenEndpoint?: string;
+      /** Cached revocation endpoint (for revoke). Absent for a static bearer / non-advertising issuer. */
+      readonly revocationEndpoint?: string;
+      /** The remote MCP URL the agent connects to. */
+      readonly mcpUrl: string;
     };
 
 export interface GrantRecord {
@@ -181,7 +211,13 @@ export function readGrants(storePath: string): GrantRecord[] {
       typeof rec.id === "string" &&
       typeof rec.agent === "string" &&
       isConnectionSpec(rec.connection) &&
-      (rec.status === "pending" || rec.status === "approved" || rec.status === "revoked")
+      // NOTE (4b-2): `needs_consent` MUST be accepted here — else a row that
+      // flipped to needs_consent on a failed mcp refresh is silently dropped on
+      // re-read and `/material` 404s instead of 409ing. Regression-tested.
+      (rec.status === "pending" ||
+        rec.status === "approved" ||
+        rec.status === "revoked" ||
+        rec.status === "needs_consent")
     );
   });
 }

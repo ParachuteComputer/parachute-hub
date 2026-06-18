@@ -137,6 +137,53 @@ describe("lenient read", () => {
   });
 });
 
+describe("4b-2 mcp material + needs_consent (regression)", () => {
+  test("mcp material round-trips (OAuth shape)", () => {
+    const r = rec({
+      status: "approved",
+      connection: { kind: "mcp", target: "https://remote.test/mcp" },
+      material: {
+        kind: "mcp",
+        access_token: "at-1",
+        refresh_token: "rt-1",
+        expiresAt: "2026-06-18T13:00:00.000Z",
+        issuer: "https://issuer.test",
+        clientId: "cid-1",
+        tokenEndpoint: "https://issuer.test/oauth/token",
+        revocationEndpoint: "https://issuer.test/oauth/revoke",
+        mcpUrl: "https://remote.test/mcp",
+      },
+    });
+    putGrant(storePath, r);
+    const back = readGrants(storePath);
+    expect(back).toHaveLength(1);
+    expect(back[0]).toEqual(r);
+  });
+
+  test("mcp static-bearer material round-trips (no refresh)", () => {
+    const r = rec({
+      status: "approved",
+      connection: { kind: "mcp", target: "https://remote.test/mcp" },
+      material: { kind: "mcp", access_token: "static-paste", mcpUrl: "https://remote.test/mcp" },
+    });
+    putGrant(storePath, r);
+    expect(readGrants(storePath)[0]).toEqual(r);
+  });
+
+  test("a needs_consent row SURVIVES readGrants (the 4b-2 blocker regression)", () => {
+    const r = rec({
+      status: "needs_consent",
+      reason: "refresh failed: invalid_grant",
+      connection: { kind: "mcp", target: "https://remote.test/mcp" },
+    });
+    putGrant(storePath, r);
+    const back = readGrants(storePath);
+    expect(back).toHaveLength(1);
+    expect(back[0]?.status).toBe("needs_consent");
+    expect(getGrant(storePath, r.id)?.status).toBe("needs_consent");
+  });
+});
+
 describe("connectionKey / grantId derivation (idempotency)", () => {
   test("vault key includes access + sorted tags", () => {
     expect(connectionKey(vaultSpec())).toBe("vault:research:read");
