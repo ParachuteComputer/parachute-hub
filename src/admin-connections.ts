@@ -601,13 +601,19 @@ async function createConnection(
   // the record so teardown can revoke them (registered-mint rule).
   const mintedJtis: string[] = [];
 
-  // --- Sink prerequisite (agent reply path), fenced to the agent sink. ------
+  // --- Sink prerequisite (agent message-delivery reply path). --------------
   // Everything below this is general; THIS block is the only sink-specific step.
-  // The channel name comes from the action params (`sink.params.channel`) — it
-  // becomes a services.json key + an MCP server name, so it must be a slug.
-  // (The session-channel concept is kept; only the MODULE renamed
-  // channel → agent in the 2026-06-17 rename — `sink.module === "agent"`.)
-  if (sinkModule === "agent") {
+  // It is gated on the ACTION, not just the module: ONLY `message.deliver` needs
+  // a session reply path (a vault-backed channel's connected session replies via
+  // a `vault:<v>:write` token + a `channels.json` entry). Other agent actions —
+  // e.g. `definition.reload`, a pure inbound webhook with no session and no
+  // reply — need none of it. A module-level gate here 400'd every
+  // non-`message.deliver` agent sink for want of a `channel` param (agent#117:
+  // the def-reload connectors could never provision). The channel name comes
+  // from `sink.params.channel` — it becomes a services.json key + an MCP server
+  // name, so it must be a slug. (The session-channel concept is kept; only the
+  // MODULE renamed channel → agent in the 2026-06-17 rename.)
+  if (sinkModule === "agent" && sinkAction === "message.deliver") {
     const channelName = typeof sinkParams?.channel === "string" ? sinkParams.channel : "";
     if (!CHANNEL_NAME_RE.test(channelName)) {
       return jsonError(
