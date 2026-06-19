@@ -896,6 +896,39 @@ describe("POST /admin/connections — channel-backed (the #624 flow as a connect
     expect(scopeOf(trig.action.auth.bearer)).toEqual(["agent:send"]);
     expect(trig.when).toEqual({ tags: ["#agent/definition"] });
   });
+
+  test("definition.reload provisions even when agentOrigin is null (no reply path)", async () => {
+    // Unlike message.deliver (503 agent_unavailable above), a def-reload sink
+    // never touches the agent daemon at provision time — it only registers a
+    // vault trigger. So a null agentOrigin must NOT block it.
+    const { cookie } = await adminCookie();
+    const { fetchImpl } = mockFetch({
+      "POST /vault/default/api/triggers": () => ok({ ok: true }),
+    });
+    const deps = {
+      ...baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, CHANNEL_MANIFEST)),
+      agentOrigin: null,
+    };
+    const res = await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections`, {
+        method: "POST",
+        headers: { cookie },
+        body: JSON.stringify({
+          id: "agentdefs-edit-default",
+          source: {
+            module: "vault",
+            vault: "default",
+            event: "note.updated",
+            filter: { tags: ["#agent/definition"] },
+          },
+          sink: { module: "agent", action: "definition.reload" },
+        }),
+      }),
+      "",
+      deps,
+    );
+    expect(res.status).toBe(200);
+  });
 });
 
 // ===========================================================================
@@ -1023,6 +1056,59 @@ describe("DELETE /admin/connections/:id — teardown", () => {
           c.method === "DELETE" && c.url.endsWith("/vault/default/api/triggers/conn_agent-eng"),
       ),
     ).toBe(true);
+  });
+
+  test("definition.reload teardown removes the trigger but NOT a channel (agent#117)", async () => {
+    // Symmetric to the create-side fix: a channel-less agent action created no
+    // channel config entry, so teardown must not issue a spurious
+    // DELETE /api/channels/<id> (the old module-level gate fell back to record.id
+    // as the channel name → a delete against a never-created channel).
+    const { cookie } = await adminCookie();
+    const { fetchImpl, calls } = mockFetch({
+      "POST /vault/default/api/triggers": () => ok({ ok: true }),
+      "DELETE /vault/default/api/triggers/conn_agentdefs-create-default": () => ok({ ok: true }),
+      // Present so a regression surfaces as an unexpected matched call, not a 599.
+      "DELETE /api/channels/agentdefs-create-default": () => ok({ ok: true }),
+    });
+    const deps = baseDeps(fetchImpl, modulesOf(VAULT_MANIFEST, CHANNEL_MANIFEST));
+    await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections`, {
+        method: "POST",
+        headers: { cookie },
+        body: JSON.stringify({
+          id: "agentdefs-create-default",
+          source: {
+            module: "vault",
+            vault: "default",
+            event: "note.created",
+            filter: { tags: ["#agent/definition"] },
+          },
+          sink: { module: "agent", action: "definition.reload" },
+        }),
+      }),
+      "",
+      deps,
+    );
+    const res = await handleConnections(
+      new Request(`${HUB_ORIGIN}/admin/connections/agentdefs-create-default`, {
+        method: "DELETE",
+        headers: { cookie },
+      }),
+      "/agentdefs-create-default",
+      deps,
+    );
+    expect(res.status).toBe(200);
+    // NO channel delete (the channel-reply path was never created).
+    expect(calls.some((c) => c.method === "DELETE" && c.url.includes("/api/channels/"))).toBe(false);
+    // The vault trigger WAS torn down.
+    expect(
+      calls.some(
+        (c) =>
+          c.method === "DELETE" &&
+          c.url.endsWith("/vault/default/api/triggers/conn_agentdefs-create-default"),
+      ),
+    ).toBe(true);
+    expect(readConnections(harness.storePath)).toHaveLength(0);
   });
 
   test("404 deleting an unknown connection", async () => {

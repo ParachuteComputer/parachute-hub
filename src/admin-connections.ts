@@ -698,8 +698,9 @@ async function createConnection(
 /**
  * The agent sink's reply-path prerequisite (mirrors hub#624). Mints a
  * `vault:<v>:write` for the channel + writes the `channels.json` entry on the
- * agent daemon so the session can reply. Fenced to `sink.module === "agent"`
- * — this is sink-specific config, not part of the general vault-trigger engine.
+ * agent daemon so the session can reply. Fenced to the agent `message.deliver`
+ * action (the only one with a reply path) — sink-specific config, not part of
+ * the general vault-trigger engine.
  * Returns `{ error }` on failure, or `{ error: null, replyTokenJti }` on
  * success — the jti of the long-lived reply token, so the caller can persist
  * it for teardown revocation. (Renamed from `prepareChannelSink` 2026-06-17;
@@ -1544,9 +1545,20 @@ export async function teardownConnection(
   }
 
   // --- Agent-sink teardown (remove the channel config entry). --------------
-  // Fenced to event→action records: a credential connection whose HOLDER is
-  // the agent module must not delete an unrelated channel config entry.
-  if (record.kind !== "credential" && record.sink.module === "agent" && deps.agentOrigin) {
+  // Fenced to event→action records (a credential connection whose HOLDER is the
+  // agent module must not delete an unrelated channel config entry) AND — like
+  // the create-side prerequisite — to the `message.deliver` action: only that
+  // action created a channel config entry, so only it has one to remove. A
+  // module-level gate here would issue a spurious DELETE /api/channels/<id> for
+  // a channel-less action (e.g. definition.reload — `record.id` as the channel
+  // fallback), wasting an agent:admin mint on a never-created channel and
+  // risking a real same-named channel. Symmetric to the create-side gate.
+  if (
+    record.kind !== "credential" &&
+    record.sink.module === "agent" &&
+    record.sink.action === "message.deliver" &&
+    deps.agentOrigin
+  ) {
     const channelName =
       typeof record.sink.params?.channel === "string" ? record.sink.params.channel : record.id;
     try {
