@@ -601,13 +601,19 @@ async function createConnection(
   // the record so teardown can revoke them (registered-mint rule).
   const mintedJtis: string[] = [];
 
-  // --- Sink prerequisite (agent reply path), fenced to the agent sink. ------
+  // --- Sink prerequisite (agent message-delivery reply path). --------------
   // Everything below this is general; THIS block is the only sink-specific step.
-  // The channel name comes from the action params (`sink.params.channel`) — it
-  // becomes a services.json key + an MCP server name, so it must be a slug.
-  // (The session-channel concept is kept; only the MODULE renamed
-  // channel → agent in the 2026-06-17 rename — `sink.module === "agent"`.)
-  if (sinkModule === "agent") {
+  // It is gated on the ACTION, not just the module: ONLY `message.deliver` needs
+  // a session reply path (a vault-backed channel's connected session replies via
+  // a `vault:<v>:write` token + a `channels.json` entry). Other agent actions —
+  // e.g. `definition.reload`, a pure inbound webhook with no session and no
+  // reply — need none of it. A module-level gate here 400'd every
+  // non-`message.deliver` agent sink for want of a `channel` param (agent#117:
+  // the def-reload connectors could never provision). The channel name comes
+  // from `sink.params.channel` — it becomes a services.json key + an MCP server
+  // name, so it must be a slug. (The session-channel concept is kept; only the
+  // MODULE renamed channel → agent in the 2026-06-17 rename.)
+  if (sinkModule === "agent" && sinkAction === "message.deliver") {
     const channelName = typeof sinkParams?.channel === "string" ? sinkParams.channel : "";
     if (!CHANNEL_NAME_RE.test(channelName)) {
       return jsonError(
@@ -692,8 +698,9 @@ async function createConnection(
 /**
  * The agent sink's reply-path prerequisite (mirrors hub#624). Mints a
  * `vault:<v>:write` for the channel + writes the `channels.json` entry on the
- * agent daemon so the session can reply. Fenced to `sink.module === "agent"`
- * — this is sink-specific config, not part of the general vault-trigger engine.
+ * agent daemon so the session can reply. Fenced to the agent `message.deliver`
+ * action (the only one with a reply path) — sink-specific config, not part of
+ * the general vault-trigger engine.
  * Returns `{ error }` on failure, or `{ error: null, replyTokenJti }` on
  * success — the jti of the long-lived reply token, so the caller can persist
  * it for teardown revocation. (Renamed from `prepareChannelSink` 2026-06-17;
@@ -1538,9 +1545,20 @@ export async function teardownConnection(
   }
 
   // --- Agent-sink teardown (remove the channel config entry). --------------
-  // Fenced to event→action records: a credential connection whose HOLDER is
-  // the agent module must not delete an unrelated channel config entry.
-  if (record.kind !== "credential" && record.sink.module === "agent" && deps.agentOrigin) {
+  // Fenced to event→action records (a credential connection whose HOLDER is the
+  // agent module must not delete an unrelated channel config entry) AND — like
+  // the create-side prerequisite — to the `message.deliver` action: only that
+  // action created a channel config entry, so only it has one to remove. A
+  // module-level gate here would issue a spurious DELETE /api/channels/<id> for
+  // a channel-less action (e.g. definition.reload — `record.id` as the channel
+  // fallback), wasting an agent:admin mint on a never-created channel and
+  // risking a real same-named channel. Symmetric to the create-side gate.
+  if (
+    record.kind !== "credential" &&
+    record.sink.module === "agent" &&
+    record.sink.action === "message.deliver" &&
+    deps.agentOrigin
+  ) {
     const channelName =
       typeof record.sink.params?.channel === "string" ? record.sink.params.channel : record.id;
     try {
