@@ -2151,9 +2151,19 @@ describe("handleSetupExposePost", () => {
   });
 });
 
-// --- hub#272 Item A: auto-mint operator token + MCP command rendering ---
+// --- hub#272 Item A → OAuth-default MCP command (no auto-mint) ---
+//
+// History: hub#272 Item A auto-minted a full-scope operator token in the
+// expose POST + pre-filled the done-screen MCP command with a
+// `--header "Authorization: Bearer <token>"` flag (plus a masked-reveal /
+// Copy widget). Removed 2026-06-23 after Austen reported the header-auth
+// command broke his connect: vault/init is OAuth-default now (parachute-
+// vault #491), so the bare `claude mcp add` command — which triggers
+// browser OAuth on first use — is the correct UX. These tests pin the new
+// contract: no token minted/stored by default, and the done screen never
+// emits a Bearer header.
 
-describe("done screen auto-minted token (hub#272 Item A)", () => {
+describe("done screen MCP command — OAuth-default, no auto-mint", () => {
   let h: Harness;
   beforeEach(() => {
     h = makeHarness();
@@ -2191,7 +2201,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
     return { user, session, csrf };
   }
 
-  test("expose POST mints + stores an operator token in hub_settings (setup_minted_token)", async () => {
+  test("expose POST does NOT mint or store an operator token (setup_minted_token stays unset)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const { session, csrf } = await bringWizardToExposeStep(db);
@@ -2218,18 +2228,47 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
         },
       );
       expect(res.status).toBe(303);
-      // Token is a JWT (three base64url segments). We don't assert the
-      // exact value — the load-bearing surface is "a non-empty token
-      // exists" so the done-step renderer has something to inject.
-      const stored = getSetting(db, "setup_minted_token");
-      expect(stored).toBeDefined();
-      expect(stored?.split(".").length).toBe(3);
+      // The auto-mint was removed (Austen's report) — vault is OAuth-
+      // default, so nothing should land in hub_settings.
+      expect(getSetting(db, "setup_minted_token")).toBeUndefined();
     } finally {
       db.close();
     }
   });
 
-  test("done screen renders the MCP command with a Bearer header when a minted token exists", async () => {
+  test("expose POST JSON response carries no minted_token", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const { session, csrf } = await bringWizardToExposeStep(db);
+      const res = await handleSetupExposePost(
+        req("/admin/setup/expose", {
+          method: "POST",
+          body: JSON.stringify({ expose_mode: "localhost", [CSRF_FIELD_NAME]: csrf }),
+          headers: {
+            "content-type": "application/json",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.step).toBe("done");
+      expect(json).not.toHaveProperty("minted_token");
+      expect(getSetting(db, "setup_minted_token")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done screen renders the bare OAuth MCP command with NO Bearer header by default", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -2248,7 +2287,6 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
         h.manifestPath,
       );
       setSetting(db, "setup_expose_mode", "localhost");
-      setSetting(db, "setup_minted_token", "test-jwt-token-abc");
       const { createSession } = await import("../sessions.ts");
       const session = createSession(db, { userId: user.id });
       const res = handleSetupGet(
@@ -2266,332 +2304,109 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
       );
       expect(res.status).toBe(200);
       const html = await res.text();
-      // Real token rides in the hidden script-tag stash as JSON-encoded
-      // text — script element content is raw-text per the HTML spec
-      // (entities aren't parsed), so JSON encoding round-trips through
-      // textContent + JSON.parse without `&quot;` polluting the copied
-      // command. Verify the JSON-encoded form appears in the document.
+      // The bare OAuth command is the rendered command.
       expect(html).toContain(
-        '"claude mcp add --transport http parachute-default https://hub.example/vault/default/mcp --header \\"Authorization: Bearer test-jwt-token-abc\\""',
+        "claude mcp add --transport http parachute-default https://hub.example/vault/default/mcp",
       );
-      expect(html).toContain('id="mcp-cmd"');
-      expect(html).toContain('id="mcp-cmd-real"');
-      // The hidden stash is `<script type="application/json">` so the
-      // browser doesn't execute it but textContent is still readable.
-      expect(html).toContain('<script type="application/json" id="mcp-cmd-real">');
-      // The visible default state is masked: the <pre> body is wrapped
-      // with data-state="masked" and renders • placeholder characters
-      // rather than the live token. Verified by the masked Bearer
-      // header substring (• repeated).
-      expect(html).toContain('data-state="masked"');
-      expect(html).toMatch(/Bearer •+/);
-      // Show button + Copy button both present.
-      expect(html).toContain('id="mcp-cmd-show"');
-      expect(html).toContain('id="mcp-cmd-copy"');
+      // Load-bearing regression (Austen's report): the rendered COMMAND
+      // (the MCP tile's <pre> block) must NOT carry a `--header
+      // "Authorization: Bearer ..."` flag. This is the assertion that
+      // would have caught the bug — the prior build baked the header into
+      // the command. The headless-client fine print legitimately mentions
+      // the header form with an escaped `<token>` placeholder, so we
+      // scope the negative assertion to the command block, not the whole
+      // document. Anchor to the MCP-tile <h2> so the regex can't drift
+      // onto another tile's <pre> (e.g. the tailnet/public reachable
+      // tile's bare Tailscale command) under a different expose mode.
+      const cmdPre = html.match(/<h2>Connect Claude Code \(MCP\)<\/h2>[\s\S]*?<pre>([^<]*)<\/pre>/);
+      expect(cmdPre).not.toBeNull();
+      const cmdText = cmdPre?.[1] ?? "";
+      expect(cmdText).not.toContain("--header");
+      expect(cmdText).not.toContain("Authorization");
+      expect(cmdText).not.toContain("Bearer");
+      // The document must NOT carry a real or masked Bearer token — the
+      // only legitimate `Bearer` mention is the escaped placeholder in
+      // the guidance.
+      expect(html).not.toMatch(/Bearer •/);
+      expect(html).not.toContain("Authorization: Bearer test");
+      // Explanatory text leads with the OAuth path; the only mention of
+      // a Bearer header is the escaped `<token>` placeholder in the
+      // headless-client guidance.
+      expect(html).toContain("browser OAuth");
+      expect(html).toContain("Bearer &lt;token&gt;");
+      expect(html).not.toContain("pvt_");
+      expect(html).toContain("parachute auth mint-token");
       expect(html).toContain("/admin/tokens");
-      // The token is single-use — consumed on first render.
+      // None of the masked-token / Copy-widget DOM survives — the
+      // token-present branch was removed.
+      expect(html).not.toContain('id="mcp-cmd"');
+      expect(html).not.toContain('id="mcp-cmd-real"');
+      expect(html).not.toContain('id="mcp-cmd-copy"');
+      expect(html).not.toContain('data-state="masked"');
+    } finally {
+      db.close();
+    }
+  });
+
+  test("done screen never renders a stale setup_minted_token row + clears it defensively", async () => {
+    // Upgrade path: a pre-upgrade hub may have left a stale
+    // setup_minted_token row behind. The done-step GET must never paint
+    // it (no token surface anymore) and should clear it so it can't
+    // linger.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      // Plant a stale row as if a pre-upgrade hub had minted one.
+      setSetting(db, "setup_minted_token", "stale-token-from-old-hub");
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const res = handleSetupGet(
+        req("/admin/setup?just_finished=1", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
+          issuer: "https://hub.example",
+          registry: getDefaultOperationsRegistry(),
+        },
+      );
+      const html = await res.text();
+      // The stale token is NOT painted anywhere in the document, and the
+      // rendered command carries no Bearer header (the only `Bearer`
+      // mention is the escaped `<token>` placeholder in the guidance).
+      expect(html).not.toContain("stale-token-from-old-hub");
+      expect(html).not.toContain("Authorization: Bearer stale-token-from-old-hub");
+      const cmdPre = html.match(/<h2>Connect Claude Code \(MCP\)<\/h2>[\s\S]*?<pre>([^<]*)<\/pre>/);
+      expect(cmdPre?.[1] ?? "").not.toContain("Authorization");
+      // And the row is cleared so it can't linger across renders.
       expect(getSetting(db, "setup_minted_token")).toBeUndefined();
     } finally {
       db.close();
     }
   });
 
-  test("done screen falls back to bare MCP command + admin/tokens hint when no minted token", async () => {
-    const db = openHubDb(hubDbPath(h.dir));
-    try {
-      const user = await createUser(db, "owner", "pw");
-      writeManifest(
-        {
-          services: [
-            {
-              name: "parachute-vault",
-              version: "0.1.0",
-              port: 1940,
-              paths: ["/vault/default"],
-              health: "/health",
-            },
-          ],
-        },
-        h.manifestPath,
-      );
-      setSetting(db, "setup_expose_mode", "localhost");
-      const { createSession } = await import("../sessions.ts");
-      const session = createSession(db, { userId: user.id });
-      const res = handleSetupGet(
-        req("/admin/setup?just_finished=1", {
-          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
-        }),
-        {
-          db,
-          manifestPath: h.manifestPath,
-          configDir: h.dir,
-          readExposeStateFn: h.readExposeStateFn,
-          issuer: "https://hub.example",
-          registry: getDefaultOperationsRegistry(),
-        },
-      );
-      const html = await res.text();
-      expect(html).toContain("claude mcp add --transport http parachute-default");
-      // The fallback explanatory text leads with the OAuth path (no token
-      // needed) and, for headless clients, references a hub JWT placeholder
-      // — NOT the retired `pvt_*` format (gap #4). The `--header` flag must
-      // also NOT be appended to the command line itself.
-      expect(html).toContain("browser OAuth");
-      expect(html).toContain("Bearer &lt;token&gt;");
-      expect(html).not.toContain("pvt_");
-      expect(html).toContain("parachute auth mint-token");
-      expect(html).toContain("/admin/tokens");
-      // Specifically no Copy button — that's a token-present surface.
-      expect(html).not.toContain('id="mcp-cmd"');
-    } finally {
-      db.close();
-    }
-  });
-
-  test("minted token is consumed after first render — refresh shows the fallback shape", async () => {
-    const db = openHubDb(hubDbPath(h.dir));
-    try {
-      const user = await createUser(db, "owner", "pw");
-      writeManifest(
-        {
-          services: [
-            {
-              name: "parachute-vault",
-              version: "0.1.0",
-              port: 1940,
-              paths: ["/vault/default"],
-              health: "/health",
-            },
-          ],
-        },
-        h.manifestPath,
-      );
-      setSetting(db, "setup_expose_mode", "localhost");
-      setSetting(db, "setup_minted_token", "test-token-xyz");
-      const { createSession } = await import("../sessions.ts");
-      const session = createSession(db, { userId: user.id });
-      const deps = {
-        db,
-        manifestPath: h.manifestPath,
-        configDir: h.dir,
-        readExposeStateFn: h.readExposeStateFn,
-        issuer: "https://hub.example",
-        registry: getDefaultOperationsRegistry(),
-      };
-      const sessionedReq = () =>
-        req("/admin/setup?just_finished=1", {
-          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
-        });
-      const first = handleSetupGet(sessionedReq(), deps);
-      const firstHtml = await first.text();
-      expect(firstHtml).toContain("test-token-xyz");
-      const second = handleSetupGet(sessionedReq(), deps);
-      const secondHtml = await second.text();
-      expect(secondHtml).not.toContain("test-token-xyz");
-      // The MCP command tile has no Copy button on the fallback shape.
-      expect(secondHtml).not.toContain('id="mcp-cmd"');
-    } finally {
-      db.close();
-    }
-  });
-
-  // rc.11 — token visible by default on the done screen was a
-  // shoulder-surf hazard. The fix: render the visible command with
-  // a masked Bearer token, stash the real command in a
-  // hidden script tag, and surface a Show button + Copy button. Copy
-  // ALWAYS pulls the real command from the script tag so the
-  // operator's terminal paste never breaks regardless of mask state.
-  test("done screen masks the Bearer token in the visible <pre> by default", async () => {
-    const db = openHubDb(hubDbPath(h.dir));
-    try {
-      const user = await createUser(db, "owner", "pw");
-      writeManifest(
-        {
-          services: [
-            {
-              name: "parachute-vault",
-              version: "0.1.0",
-              port: 1940,
-              paths: ["/vault/default"],
-              health: "/health",
-            },
-          ],
-        },
-        h.manifestPath,
-      );
-      setSetting(db, "setup_expose_mode", "localhost");
-      setSetting(db, "setup_minted_token", "pvt_super_secret_token_payload");
-      const { createSession } = await import("../sessions.ts");
-      const session = createSession(db, { userId: user.id });
-      const res = handleSetupGet(
-        req("/admin/setup?just_finished=1", {
-          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
-        }),
-        {
-          db,
-          manifestPath: h.manifestPath,
-          configDir: h.dir,
-          readExposeStateFn: h.readExposeStateFn,
-          issuer: "https://hub.example",
-          registry: getDefaultOperationsRegistry(),
-        },
-      );
-      const html = await res.text();
-      // Extract the visible <pre id="mcp-cmd"> text only — the masked
-      // shape must live there, with no occurrence of the literal token
-      // string. The real token still appears elsewhere (the hidden
-      // script tag) so a plain `toContain` would miss the leak.
-      const preMatch = html.match(/<pre id="mcp-cmd">([^<]*)<\/pre>/);
-      expect(preMatch).not.toBeNull();
-      const preBody = preMatch?.[1] ?? "";
-      expect(preBody).not.toContain("pvt_super_secret_token_payload");
-      // Masked Bearer header is present in the <pre> text.
-      expect(preBody).toMatch(/Bearer •+/);
-      // Real command still in the document (hidden JSON stash) so the
-      // Copy handler can read it.
-      expect(html).toContain('<script type="application/json" id="mcp-cmd-real">');
-      expect(html).toContain("pvt_super_secret_token_payload");
-      // Default state is masked.
-      expect(html).toContain('data-state="masked"');
-    } finally {
-      db.close();
-    }
-  });
-
-  test("done screen JSON-encodes the stashed command so `</script>` in a token can't break out", async () => {
-    // Defense-in-depth: an attacker-shaped token containing `</script>`
-    // would prematurely close the stash tag if we just dropped it into
-    // the HTML. The renderer JSON-encodes the command AND replaces
-    // `</` with `<\/` inside the encoded string so the sequence can't
-    // appear in the document. Decode round-trips via JSON.parse.
-    const db = openHubDb(hubDbPath(h.dir));
-    try {
-      const user = await createUser(db, "owner", "pw");
-      writeManifest(
-        {
-          services: [
-            {
-              name: "parachute-vault",
-              version: "0.1.0",
-              port: 1940,
-              paths: ["/vault/default"],
-              health: "/health",
-            },
-          ],
-        },
-        h.manifestPath,
-      );
-      setSetting(db, "setup_expose_mode", "localhost");
-      // Token contains characters that would be load-bearing in the
-      // HTML/JS layer if mis-encoded: a quote (would close the JSON
-      // string) and `</script>` (would close the stash tag).
-      const hostileToken = `weird-token-with-"-and-</script>-inside`;
-      setSetting(db, "setup_minted_token", hostileToken);
-      const { createSession } = await import("../sessions.ts");
-      const session = createSession(db, { userId: user.id });
-      const res = handleSetupGet(
-        req("/admin/setup?just_finished=1", {
-          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
-        }),
-        {
-          db,
-          manifestPath: h.manifestPath,
-          configDir: h.dir,
-          readExposeStateFn: h.readExposeStateFn,
-          issuer: "https://hub.example",
-          registry: getDefaultOperationsRegistry(),
-        },
-      );
-      const html = await res.text();
-      // `</script>` must NOT appear inside the stash element. We
-      // verify by extracting the stash text via the literal HTML
-      // boundaries and asserting no close-tag escape escaped the
-      // encoder.
-      const stashMatch = html.match(
-        /<script type="application\/json" id="mcp-cmd-real">([\s\S]*?)<\/script>/,
-      );
-      expect(stashMatch).not.toBeNull();
-      const stashBody = stashMatch?.[1] ?? "";
-      // The encoder replaces `</` with `<\/` inside the JSON, so the
-      // raw bytes between the opening and the first `</script>` should
-      // not contain `</`.
-      expect(stashBody).not.toContain("</");
-      // Round-trips: `<\/` decodes back to `</` after JSON.parse +
-      // the script-end-sequence escape — the operator's clipboard
-      // gets the original bytes.
-      const decoded = JSON.parse(stashBody) as string;
-      expect(decoded).toContain(hostileToken);
-    } finally {
-      db.close();
-    }
-  });
-
-  test("done screen wires Show + Copy buttons that read from the hidden real-command stash", async () => {
-    const db = openHubDb(hubDbPath(h.dir));
-    try {
-      const user = await createUser(db, "owner", "pw");
-      writeManifest(
-        {
-          services: [
-            {
-              name: "parachute-vault",
-              version: "0.1.0",
-              port: 1940,
-              paths: ["/vault/default"],
-              health: "/health",
-            },
-          ],
-        },
-        h.manifestPath,
-      );
-      setSetting(db, "setup_expose_mode", "localhost");
-      setSetting(db, "setup_minted_token", "live-token-AAA");
-      const { createSession } = await import("../sessions.ts");
-      const session = createSession(db, { userId: user.id });
-      const res = handleSetupGet(
-        req("/admin/setup?just_finished=1", {
-          headers: { cookie: `${SESSION_COOKIE_NAME}=${session.id}` },
-        }),
-        {
-          db,
-          manifestPath: h.manifestPath,
-          configDir: h.dir,
-          readExposeStateFn: h.readExposeStateFn,
-          issuer: "https://hub.example",
-          registry: getDefaultOperationsRegistry(),
-        },
-      );
-      const html = await res.text();
-      // Both buttons present, both wired via addEventListener (no
-      // inline onclick — the script runs in a single IIFE).
-      expect(html).toContain('id="mcp-cmd-show"');
-      expect(html).toContain('id="mcp-cmd-copy"');
-      expect(html).toContain("'click'");
-      // The Copy handler reads from the hidden script tag, not from
-      // the visible <pre>. Regression: this was the load-bearing
-      // contract Aaron called out ("Copy still works without reveal").
-      expect(html).toContain("getElementById('mcp-cmd-real')");
-      // The stash holds JSON-encoded text and the handler decodes via
-      // JSON.parse so the clipboard receives the exact byte sequence of
-      // the command — `&quot;`-style HTML entities can't survive into
-      // the operator's shell because script-element content is raw text
-      // (the HTML parser doesn't decode entities inside <script>).
-      expect(html).toContain("JSON.parse(real.textContent");
-      // Auto-hide timer present so a stray reveal doesn't leak into a
-      // subsequent screencast capture.
-      expect(html).toContain("setTimeout(setMasked, 10000)");
-    } finally {
-      db.close();
-    }
-  });
-
-  test("GET /admin/setup?just_finished=1 without a session does NOT consume the minted token (hub#274 security fold)", async () => {
-    // Regression — without the session gate, any HTTP client racing the
-    // operator's browser between the expose POST (which mints + stores)
-    // and the done GET (which reads + consumes) walks off with a
-    // full-scope operator JWT. The gate sends sessionless GETs to
-    // /login + leaves the row in place so the operator's subsequent
-    // legitimate GET still surfaces the token.
+  test("GET /admin/setup?just_finished=1 without a session redirects to /login (done screen is post-setup admin)", async () => {
+    // The done screen is a post-setup admin surface and shouldn't render
+    // to a drive-by unauthenticated GET. (This gate originally protected
+    // the minted-token read; the mint is gone, but the gate stays.)
     const db = openHubDb(hubDbPath(h.dir));
     try {
       await createUser(db, "owner", "pw");
@@ -2610,10 +2425,7 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
         h.manifestPath,
       );
       setSetting(db, "setup_expose_mode", "localhost");
-      setSetting(db, "setup_minted_token", "test-secret-token-must-not-leak");
-      // No session cookie on this request — simulating a drive-by GET
-      // from an attacker or a stale bookmark in a different browser
-      // tab that doesn't carry the wizard's session.
+      // No session cookie — a drive-by GET.
       const res = handleSetupGet(req("/admin/setup?just_finished=1"), {
         db,
         manifestPath: h.manifestPath,
@@ -2622,14 +2434,8 @@ describe("done screen auto-minted token (hub#272 Item A)", () => {
         issuer: "https://hub.example",
         registry: getDefaultOperationsRegistry(),
       });
-      // The gate redirects to /login (302) rather than rendering the
-      // done screen. Body must NOT contain the token.
       expect(res.status).toBe(302);
       expect(res.headers.get("location")).toBe("/login");
-      // The setup_minted_token row is STILL present — the unauthed GET
-      // didn't consume it, so the legitimate operator's session-bearing
-      // GET will still see the token on the done screen.
-      expect(getSetting(db, "setup_minted_token")).toBe("test-secret-token-must-not-leak");
     } finally {
       db.close();
     }
