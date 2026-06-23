@@ -3257,64 +3257,6 @@ const STYLES = `
   .btn-secondary:hover {
     background: ${PALETTE.accentSoft};
   }
-  /* Copy + Show buttons ride the right edge of the MCP command pre.
-     Compact vertical sizing so they don't dwarf the snippet on narrow
-     widths; full text wrap on the pre keeps the snippet readable
-     behind them. The Show button toggles the visible mask on the
-     auto-minted Bearer token (rc.11 — discoverable
-     but not shoulder-surf-able). Both buttons share a small flex
-     container so they stack predictably on the wrap; layout-wise we
-     keep the right-edge padding on .mcp-cmd-wrap pre so the buttons
-     never overlap the command text. */
-  .mcp-cmd-wrap {
-    position: relative;
-    margin: 0.5rem 0;
-  }
-  .mcp-cmd-wrap pre {
-    background: ${PALETTE.bg};
-    border: 1px solid ${PALETTE.borderLight};
-    border-radius: 6px;
-    padding: 0.5rem 8.5rem 0.5rem 0.75rem;
-    overflow-x: auto;
-    font-size: 0.82rem;
-    margin: 0;
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-  .mcp-cmd-actions {
-    position: absolute;
-    top: 0.35rem;
-    right: 0.35rem;
-    display: flex;
-    gap: 0.3rem;
-  }
-  .btn-copy, .btn-mcp-aux {
-    padding: 0.25rem 0.6rem;
-    font-size: 0.78rem;
-    min-height: auto;
-    background: ${PALETTE.cardBg};
-    color: ${PALETTE.fg};
-    border: 1px solid ${PALETTE.border};
-    border-radius: 4px;
-    cursor: pointer;
-    font: inherit;
-    font-size: 0.78rem;
-  }
-  .btn-copy:hover, .btn-mcp-aux:hover {
-    border-color: ${PALETTE.accent};
-    color: ${PALETTE.accent};
-  }
-  .mcp-cmd-wrap[data-state="revealed"] pre {
-    /* Subtle visual cue that the token is currently visible — a warm
-       border so the operator notices on a screencast even at low
-       resolution. */
-    border-color: #d4a017;
-    background: rgba(212, 160, 23, 0.04);
-  }
-  .mcp-cmd-wrap[data-state="revealed"] .btn-mcp-aux {
-    border-color: #d4a017;
-    color: #6b4a00;
-  }
   /* Install-tile section (hub#272 Item B). Lives above the .done-grid;
      primary "what's next?" surface. Tiles render in a responsive grid
      that collapses to one column on narrow viewports. */
