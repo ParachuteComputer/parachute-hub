@@ -71,7 +71,6 @@ import {
   type IssueOperatorTokenResult,
   type MintOperatorTokenOpts,
   issueOperatorToken,
-  mintOperatorToken,
   readOperatorTokenFile,
 } from "./operator-token.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
@@ -1155,16 +1154,6 @@ export interface RenderDoneStepProps {
    */
   exposeMode?: SetupExposeMode;
   /**
-   * Auto-minted operator token surfaced once on the done screen
-   * (hub#272 Item A). When present, the MCP install command renders
-   * with `--header "Authorization: Bearer <token>"` pre-filled and a
-   * one-click Copy button. Absent means the mint either failed or
-   * the operator already consumed the single-use surface — the tile
-   * falls back to the un-headered command + a "mint at /admin/tokens"
-   * hint.
-   */
-  mintedToken?: string;
-  /**
    * Optional per-module install tiles to render alongside the MCP
    * command (hub#272 Item B). When omitted, the done step renders
    * only the MCP tile + the admin-UI fallback link. Production wires
@@ -1175,9 +1164,9 @@ export interface RenderDoneStepProps {
 }
 
 export function renderDoneStep(props: RenderDoneStepProps): string {
-  const { vaultName, hubOrigin, exposeMode, mintedToken, installTiles } = props;
+  const { vaultName, hubOrigin, exposeMode, installTiles } = props;
   const reachable = exposeMode ? renderReachableTile(exposeMode, hubOrigin) : "";
-  const mcpTile = renderMcpTile(vaultName, hubOrigin, mintedToken);
+  const mcpTile = renderMcpTile(vaultName, hubOrigin);
   const tiles = installTiles && installTiles.length > 0 ? installTiles : [];
   const installSection = tiles.length > 0 ? renderInstallTiles(tiles) : "";
   const startTile = renderStartUsingTile(vaultName, hubOrigin);
@@ -1241,129 +1230,26 @@ export function renderDoneStep(props: RenderDoneStepProps): string {
 }
 
 /**
- * The MCP-connect tile. With a freshly-minted token the command renders
- * fully formed with a `--header "Authorization: Bearer <token>"` flag +
- * a Copy button. Without one, we fall back to the bare command + a
- * pointer to `/admin/tokens` (the canonical mint surface). The Copy
- * button is a tiny inline `<script>` — no SPA bundle, no module deps,
- * the wizard stays server-rendered.
+ * The MCP-connect tile. Renders the bare `claude mcp add` command —
+ * no token, no `--header`. Vault/init is OAuth-default (parachute-vault
+ * #491), so the command triggers browser OAuth on first use: the
+ * operator signs in to this hub + approves access, and Claude Code
+ * stores the resulting credential. For headless clients that can't do
+ * the browser flow, the fine print points at `/admin/tokens` (the
+ * canonical mint surface) + the `--header "Authorization: Bearer
+ * <token>"` form they append themselves.
+ *
+ * History: an earlier build (hub#272 Item A) auto-minted a full-scope
+ * operator token here and pre-filled the command with a Bearer header
+ * + a masked-reveal/Copy widget. That was removed 2026-06-23 (Austen's
+ * report): header-auth was the wrong default once vault went OAuth-
+ * default, and baking an admin-scope bearer into a copy-pasted command
+ * was a privilege over-grant + a shoulder-surf hazard. The bare OAuth
+ * command was always the correct UX; it's now the only one.
  */
-function renderMcpTile(
-  vaultName: string,
-  hubOrigin: string,
-  mintedToken: string | undefined,
-): string {
+function renderMcpTile(vaultName: string, hubOrigin: string): string {
   const safeVault = escapeHtml(vaultName);
   const bareCmd = `claude mcp add --transport http parachute-${vaultName} ${hubOrigin}/vault/${vaultName}/mcp`;
-  if (mintedToken) {
-    // The token contents are surfaced once + then forgotten by the
-    // server (single-use hub_setting). Two visible variants of the
-    // command live in the DOM:
-    //
-    //   * `pre#mcp-cmd` — what the operator sees. The Bearer token is
-    //     replaced with a fixed-width row of • so shoulder-surfers,
-    //     screencasts, and over-the-shoulder photos don't capture
-    //     credentials by default. This is the "discoverable but not
-    //     shoulder-surf-able" framing Aaron asked for.
-    //   * `script#mcp-cmd-real` (type=text/plain) — the real command
-    //     with the live token, stashed in a non-rendering script tag.
-    //     The Copy + Show handlers read from this so the operator's
-    //     terminal paste still gets the real header without the page
-    //     ever painting the token.
-    //
-    // The view-source threat model is unchanged from rc.9 — the token
-    // is part of the response body either way. The improvement is
-    // *visibly hidden by default*, which is what an over-the-shoulder
-    // observer needs (and what existing screencasts of the wizard
-    // currently leak).
-    //
-    // Show toggles textContent between masked + real and flips a
-    // data-state attribute so a screencast / pair-programming session
-    // can briefly reveal-and-rehide without the operator losing the
-    // line of sight on which mode they're in. Auto-hide after 10s so
-    // a forgotten reveal doesn't leak the token into a subsequent
-    // recording.
-    const fullCmd = `${bareCmd} --header "Authorization: Bearer ${mintedToken}"`;
-    // Clamp the dot count to a 8–40 range so very-short or very-long
-    // tokens don't render comically — token format is fixed-width
-    // (JTI-derived), so this is purely visual.
-    const maskedToken = "•".repeat(Math.max(8, Math.min(40, mintedToken.length)));
-    const maskedCmd = `${bareCmd} --header "Authorization: Bearer ${maskedToken}"`;
-    // The real command rides in a hidden <script type="application/json">
-    // block as a JSON-encoded string. <script> element content is parsed
-    // as raw text (no entity references), so HTML escaping would put
-    // literal `&quot;` into the string — and Copy would paste that into
-    // the operator's terminal. JSON encoding (with `</` escaped so the
-    // sequence can't prematurely close the tag) round-trips safely:
-    // textContent returns the JSON, JSON.parse decodes back to the
-    // exact bytes of the original command. Caught while smoke-testing
-    // the rc.11 reveal/copy UX — pre-fix, the copied command included
-    // `&quot;` placeholders that broke shell parsing.
-    const fullCmdJson = JSON.stringify(fullCmd).replace(/<\//g, "<\\/");
-    return `<div class="done-tile">
-      <h2>Connect Claude Code (MCP)</h2>
-      <p>Wire <code>vault:${safeVault}</code> into Claude Code as an MCP server:</p>
-      <div class="mcp-cmd-wrap" data-state="masked">
-        <pre id="mcp-cmd">${escapeHtml(maskedCmd)}</pre>
-        <script type="application/json" id="mcp-cmd-real">${fullCmdJson}</script>
-        <div class="mcp-cmd-actions">
-          <button type="button" class="btn btn-mcp-aux" id="mcp-cmd-show">Show token</button>
-          <button type="button" class="btn btn-copy" id="mcp-cmd-copy">Copy</button>
-        </div>
-      </div>
-      <p class="fine">We minted this token for your first MCP connection.
-        It's masked above so it's safe to leave open on screen; Copy
-        copies the real command. It's a full-scope operator token tied
-        to your admin account; manage and revoke tokens at
-        <a href="/admin/tokens"><code>/admin/tokens</code></a>.</p>
-      <script>
-        (function () {
-          var wrap = document.querySelector('.mcp-cmd-wrap[data-state]');
-          var pre = document.getElementById('mcp-cmd');
-          var real = document.getElementById('mcp-cmd-real');
-          var copyBtn = document.getElementById('mcp-cmd-copy');
-          var showBtn = document.getElementById('mcp-cmd-show');
-          if (!wrap || !pre || !real || !copyBtn || !showBtn) return;
-          var realCmd;
-          try { realCmd = JSON.parse(real.textContent || '""'); }
-          catch (e) { realCmd = ''; }
-          var maskedCmd = pre.textContent || '';
-          var revealTimer = null;
-          function setMasked() {
-            pre.textContent = maskedCmd;
-            wrap.setAttribute('data-state', 'masked');
-            showBtn.textContent = 'Show token';
-            if (revealTimer) { clearTimeout(revealTimer); revealTimer = null; }
-          }
-          function setRevealed() {
-            pre.textContent = realCmd;
-            wrap.setAttribute('data-state', 'revealed');
-            showBtn.textContent = 'Hide token';
-            // Auto-hide after 10s so a stray reveal doesn't leak the
-            // token into a screencast capture that started after the
-            // click.
-            if (revealTimer) { clearTimeout(revealTimer); revealTimer = null; }
-            revealTimer = setTimeout(setMasked, 10000);
-          }
-          showBtn.addEventListener('click', function () {
-            if (wrap.getAttribute('data-state') === 'masked') setRevealed();
-            else setMasked();
-          });
-          copyBtn.addEventListener('click', function () {
-            // Copy ALWAYS pulls from the real command — the operator's
-            // terminal needs the live token regardless of whether the
-            // page is currently masked. This is the load-bearing path:
-            // the visible mask is a UX nicety; the clipboard must
-            // carry the real header.
-            navigator.clipboard.writeText(realCmd).then(function () {
-              copyBtn.textContent = 'Copied ✓';
-              setTimeout(function () { copyBtn.textContent = 'Copy'; }, 2000);
-            });
-          });
-        })();
-      </script>
-    </div>`;
-  }
   return `<div class="done-tile">
     <h2>Connect Claude Code (MCP)</h2>
     <p>Wire <code>vault:${safeVault}</code> into Claude Code as an MCP server:</p>
@@ -1755,25 +1641,21 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
   // request from step 2.
   if (state.hasAdmin && state.hasVault && state.hasExposeMode) {
     if (url.searchParams.get("just_finished") === "1") {
-      // hub#274 security fold: session-gate this branch. The
-      // `?just_finished=1` GET reads + consumes `setup_minted_token`
-      // (full-scope operator JWT) below; without a session check, any
-      // HTTP client that races the operator's browser between the
-      // expose POST (which writes the row) and the done GET (which
-      // reads it) walks off with admin-scope creds. The dispatcher
-      // in `hub-server.ts`'s `shouldGateForSetup` lets `/admin/setup*`
-      // through the pre-admin lockout, and that path stays open
-      // post-setup — so this gate has to live here, not at the
-      // dispatcher layer.
+      // hub#274 security fold: session-gate this branch. Originally this
+      // protected the `setup_minted_token` read-and-consume below (a
+      // full-scope operator JWT a racing client could have walked off
+      // with). The auto-mint was removed 2026-06-23 (Austen's report —
+      // vault is OAuth-default now, see the expose POST), so no secret
+      // is surfaced here anymore. The gate stays: the done screen is a
+      // post-setup admin surface and shouldn't render to a drive-by
+      // unauthenticated GET. The dispatcher in `hub-server.ts`'s
+      // `shouldGateForSetup` lets `/admin/setup*` through the pre-admin
+      // lockout, and that path stays open post-setup — so this gate has
+      // to live here, not at the dispatcher layer.
       //
       // A legitimate operator carrying the session cookie minted on
       // the account POST sails through. A drive-by GET without the
-      // cookie 302s to /login: if it's a stale bookmark in the
-      // operator's other tab, they sign in + the row is already
-      // consumed by the legitimate done-GET (the single-use shape
-      // guarantees they see the fallback shape, never the secret).
-      // If it's an attacker, they can't pass /login without the
-      // password.
+      // cookie 302s to /login.
       const session = findActiveSession(deps.db, req);
       if (!session) {
         // Preserve the CSRF set-cookie header on the 302 — same shape as
@@ -1790,13 +1672,17 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
       }
       const stored = getSetting(deps.db, "setup_expose_mode");
       const exposeMode = isSetupExposeMode(stored) ? stored : undefined;
-      // hub#272 Item A: read + consume the single-use minted-token row.
-      // Render-and-forget keeps the secret from re-appearing on
-      // refresh / back-button. The mint is non-fatal (see expose POST);
-      // its absence renders the bare MCP command + a hint at
-      // /admin/tokens.
-      const mintedToken = getSetting(deps.db, "setup_minted_token");
-      if (mintedToken) deleteSetting(deps.db, "setup_minted_token");
+      // No minted-token read here anymore — the auto-mint was removed
+      // 2026-06-23 (Austen's report). The done step always renders the
+      // bare OAuth `claude mcp add` command (no Bearer header), which is
+      // the correct UX for OAuth-default vaults. Headless clients mint a
+      // scoped token at /admin/tokens themselves (the bare tile points
+      // there). The defensive `deleteSetting` below clears any stale row
+      // a pre-upgrade hub left behind, so it never leaks on first render
+      // after upgrade.
+      if (getSetting(deps.db, "setup_minted_token") !== undefined) {
+        deleteSetting(deps.db, "setup_minted_token");
+      }
       // Prefer the LIVE vault name from services.json over the
       // operator-typed value cached in hub_settings (smoke
       // 2026-05-27, finding 2). The cached value is what the
@@ -1834,7 +1720,7 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
         installTiles,
       };
       if (exposeMode !== undefined) doneProps.exposeMode = exposeMode;
-      if (mintedToken) doneProps.mintedToken = mintedToken;
+      // No `doneProps.mintedToken` — see the OAuth-default note above.
       // Substitute CSRF placeholder for the install-tile forms with
       // the current CSRF token. Keeping the per-tile renderer pure
       // means the substitution lives here (one rewrite per render).
@@ -2861,35 +2747,23 @@ export async function handleSetupExposePost(
   console.log(
     `[setup-wizard] opened first-client auto-approve window (60min) after expose-mode=${rawMode}`,
   );
-  // hub#272 Item A: auto-mint an operator token under the broad `admin`
-  // scope-set + persist it once so the done-step renderer can pre-fill
-  // the MCP install command with a Bearer header. The token is single-
-  // use surface on the done page — the renderer deletes it from
-  // hub_settings after one read so a stale tab refresh / back button
-  // doesn't re-disclose the secret. The jti is still in the `tokens`
-  // registry so revocation via the admin UI works as usual. Failures
-  // are non-fatal: the done page falls back to the un-headered MCP
-  // command + a "mint manually at /admin/tokens" hint.
-  let mintedTokenForJson: string | undefined;
-  try {
-    const minted = await mintOperatorToken(deps.db, session.userId, {
-      issuer: deps.issuer,
-      scopeSet: "admin",
-    });
-    setSetting(deps.db, "setup_minted_token", minted.token);
-    mintedTokenForJson = minted.token;
-    console.log(
-      `[setup-wizard] auto-minted operator token (jti=${minted.jti}, scope-set=admin) for done-screen MCP command`,
-    );
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[setup-wizard] failed to auto-mint operator token: ${msg}`);
-  }
+  // hub#272 Item A USED to auto-mint a broad `admin`-scope operator token
+  // here + stash it (`setup_minted_token`) so the done screen could
+  // pre-fill the MCP install command with a `--header "Authorization:
+  // Bearer <token>"` flag. Removed 2026-06-23 (Austen's report): vault/
+  // init is OAuth-default now (parachute-vault #491), so the bare
+  // `claude mcp add` command is the correct UX — it triggers browser
+  // OAuth on first use. Baking a full admin-scope bearer into a copy-
+  // pasted command was both the wrong default and a privilege over-grant
+  // (a single shoulder-surf / screencast leaked an admin token). The
+  // done step now always renders the bare OAuth command; headless
+  // clients that can't do the browser flow mint a scoped token at
+  // /admin/tokens + append the header themselves (the bare tile points
+  // there). No token is minted or stored by default.
   if (form.isJson) {
     return jsonOkResponse({
       step: "done",
       message: "expose mode set",
-      ...(mintedTokenForJson ? { minted_token: mintedTokenForJson } : {}),
     });
   }
   return redirect("/admin/setup?just_finished=1");
@@ -3382,64 +3256,6 @@ const STYLES = `
   }
   .btn-secondary:hover {
     background: ${PALETTE.accentSoft};
-  }
-  /* Copy + Show buttons ride the right edge of the MCP command pre.
-     Compact vertical sizing so they don't dwarf the snippet on narrow
-     widths; full text wrap on the pre keeps the snippet readable
-     behind them. The Show button toggles the visible mask on the
-     auto-minted Bearer token (rc.11 — discoverable
-     but not shoulder-surf-able). Both buttons share a small flex
-     container so they stack predictably on the wrap; layout-wise we
-     keep the right-edge padding on .mcp-cmd-wrap pre so the buttons
-     never overlap the command text. */
-  .mcp-cmd-wrap {
-    position: relative;
-    margin: 0.5rem 0;
-  }
-  .mcp-cmd-wrap pre {
-    background: ${PALETTE.bg};
-    border: 1px solid ${PALETTE.borderLight};
-    border-radius: 6px;
-    padding: 0.5rem 8.5rem 0.5rem 0.75rem;
-    overflow-x: auto;
-    font-size: 0.82rem;
-    margin: 0;
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-  .mcp-cmd-actions {
-    position: absolute;
-    top: 0.35rem;
-    right: 0.35rem;
-    display: flex;
-    gap: 0.3rem;
-  }
-  .btn-copy, .btn-mcp-aux {
-    padding: 0.25rem 0.6rem;
-    font-size: 0.78rem;
-    min-height: auto;
-    background: ${PALETTE.cardBg};
-    color: ${PALETTE.fg};
-    border: 1px solid ${PALETTE.border};
-    border-radius: 4px;
-    cursor: pointer;
-    font: inherit;
-    font-size: 0.78rem;
-  }
-  .btn-copy:hover, .btn-mcp-aux:hover {
-    border-color: ${PALETTE.accent};
-    color: ${PALETTE.accent};
-  }
-  .mcp-cmd-wrap[data-state="revealed"] pre {
-    /* Subtle visual cue that the token is currently visible — a warm
-       border so the operator notices on a screencast even at low
-       resolution. */
-    border-color: #d4a017;
-    background: rgba(212, 160, 23, 0.04);
-  }
-  .mcp-cmd-wrap[data-state="revealed"] .btn-mcp-aux {
-    border-color: #d4a017;
-    color: #6b4a00;
   }
   /* Install-tile section (hub#272 Item B). Lives above the .done-grid;
      primary "what's next?" surface. Tiles render in a responsive grid

@@ -749,10 +749,10 @@ export async function runCliWizard(opts: RunCliWizardOpts): Promise<number> {
     state = await fetchWizardState(hubUrl, jar, fetchImpl);
   }
   // Done screen — fetch + show a brief summary. The browser wizard's
-  // done screen surfaces the MCP install command + auto-minted token;
-  // we mirror that by reading the same `setup_minted_token` row via
-  // the GET endpoint's JSON envelope. Best-effort: a missing token
-  // just means we point the operator at /admin/tokens instead.
+  // done screen surfaces the bare OAuth `claude mcp add` command (no
+  // token, no header — vault is OAuth-default per parachute-vault #491);
+  // the CLI path never minted a token, so we just point the operator at
+  // the admin SPA + /admin/tokens for the headless-client case.
   log("");
   log("✓ Setup complete.");
   log(`  Visit ${hubUrl}/admin/ to open the admin SPA.`);

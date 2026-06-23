@@ -28,13 +28,14 @@ import type { Database } from "bun:sqlite";
 export type HubSettingKey =
   | "setup_expose_mode"
   | "pending_first_client_auto_approve_until"
-  // hub#272: auto-minted operator token surfaced once on the wizard's
-  // done screen. Single-use — the done-step renderer reads + deletes the
-  // row so a subsequent GET (page refresh, back button) doesn't re-show
-  // the secret. Lives in hub_settings rather than tokens because it's a
-  // wizard-flow ephemeral, not a persistent issued credential — the
-  // mintOperatorToken call still records the jti in the `tokens`
-  // registry, so revocation works as usual.
+  // hub#272: DEPRECATED 2026-06-23 (Austen's report). Used to hold an
+  // auto-minted operator token surfaced once on the wizard's done screen
+  // so the MCP command could pre-fill a `--header "Authorization: Bearer
+  // <token>"` flag. The auto-mint was removed when vault went OAuth-
+  // default (parachute-vault #491) — nothing writes this row anymore.
+  // The key is retained so the done-step GET can defensively clear any
+  // stale row a pre-upgrade hub left behind (it never renders the value).
+  // Drop the member once no live hub_settings tables carry the row.
   | "setup_minted_token"
   // hub#267: the typed vault name. Persisted at vault POST time so the
   // done step can render the operator's choice in the MCP URL +

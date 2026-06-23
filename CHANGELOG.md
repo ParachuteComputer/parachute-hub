@@ -6,6 +6,16 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.2-rc.1] - 2026-06-23
+
+### Fixed
+
+- **Setup wizard "Connect Claude Code (MCP)" done-screen now hands out the bare OAuth command, not a header-auth one** (reported by Austen). Vault/init is OAuth-default now ([parachute-vault #491](https://github.com/ParachuteComputer/parachute-vault/pull/491)); the wizard was still auto-minting a full-scope operator token in the expose step and pre-filling the MCP install command with `--header "Authorization: Bearer <token>"`, which is the wrong default for an OAuth-default vault and broke the user's connect. The done screen now always renders the bare `claude mcp add` command, which triggers browser OAuth on first use. Headless clients that can't do the browser flow mint a scoped token at `/admin/tokens` and append the header themselves (the tile's fine print points there).
+
+### Security
+
+- **Dropped a privilege over-grant.** The retired auto-mint baked a full admin-scope bearer token into a copy-pasted command (with a masked-reveal/Copy widget) — a single shoulder-surf or screencast leaked an admin credential. No token is minted or stored by default anymore. The standalone `/admin/tokens` mint path is unchanged. The done-step GET defensively clears any stale `setup_minted_token` row a pre-upgrade hub may have left behind.
+
 ## [0.6.4] - 2026-06-06
 
 **Fresh-install onboarding overhaul + a multi-user/account security wave.** The 0.6.4-rc chain (rc.1–rc.10) promoted to stable. Driven by real field transcripts of operators hitting dead-ends on fresh boxes.
