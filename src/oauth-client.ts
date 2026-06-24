@@ -126,26 +126,74 @@ function asStringArray(v: unknown): string[] | undefined {
 }
 
 /**
+ * RFC 9728 §3.1 / RFC 8414 §3.1 well-known URL candidates for a resource or
+ * issuer URL. The spec INSERTS the well-known segment after the host while
+ * PRESERVING the URL's path: `https://h/p` → `https://h/.well-known/<seg>/p`.
+ * We try the path-inserted form FIRST (correct when the resource/issuer carries
+ * a path — e.g. an MCP served at `/mcp`, or a multi-tenant issuer at `/tenant`),
+ * then the host-root form (`https://h/.well-known/<seg>`) as a fallback for
+ * path-less deployments + older servers. De-duplicated, in priority order.
+ */
+function wellKnownCandidates(url: string, segment: string): string[] {
+  const u = new URL(url);
+  const path = u.pathname.replace(/\/+$/, ""); // drop trailing slash(es)
+  const root = `${u.origin}/.well-known/${segment}`;
+  const out = path ? [`${u.origin}/.well-known/${segment}${path}`, root] : [root];
+  return [...new Set(out)];
+}
+
+/**
+ * Fetch the first candidate URL that returns a valid JSON object; throws the
+ * LAST error if every candidate fails. Lets discovery probe the path-inserted
+ * well-known location first, then fall back to the host root.
+ */
+async function fetchJsonFirst(
+  urls: string[],
+  fetchFn: FetchFn,
+  what: string,
+): Promise<Record<string, unknown>> {
+  let lastErr: unknown;
+  for (const url of urls) {
+    try {
+      return await fetchJson(url, fetchFn, what);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr instanceof Error
+    ? lastErr
+    : new OAuthClientError(`${what}: no metadata at ${urls.join(", ")}`);
+}
+
+/**
  * Discover the issuer + endpoints for a remote MCP URL.
  *
- *   1. RFC 9728: GET <mcp-origin>/.well-known/oauth-protected-resource →
- *      authorization_servers[0] = issuer (+ scopes_supported).
- *   2. RFC 8414: GET <issuer>/.well-known/oauth-authorization-server →
+ *   1. RFC 9728: GET <mcp>/.well-known/oauth-protected-resource[/<path>] →
+ *      authorization_servers[0] = issuer (+ scopes_supported). The path-inserted
+ *      location is tried first (the modern MCP shape: an MCP at `/mcp` advertises
+ *      at `/.well-known/oauth-protected-resource/mcp`, and its auth server often
+ *      lives on a SEPARATE host), then the host root.
+ *   2. RFC 8414 / OIDC: GET <issuer>/.well-known/oauth-authorization-server then
+ *      /.well-known/openid-configuration (each path-inserted then host-root) →
  *      authorization_endpoint, token_endpoint, registration_endpoint,
  *      revocation_endpoint (+ scopes_supported fallback).
  *
  * If the resource has no 9728 doc, falls back to treating the MCP origin itself
- * as the issuer and reading its 8414 doc directly (8414-only resources).
+ * as the issuer and reading its 8414/OIDC doc directly (8414-only resources).
  */
 export async function discover(mcpUrl: string, fetchFn: FetchFn = fetch): Promise<DiscoveryResult> {
   const origin = originOf(mcpUrl);
 
-  // Step 1 — RFC 9728 (best-effort; some resources only expose 8414).
+  // Step 1 — RFC 9728 protected-resource metadata (best-effort; some resources
+  // only expose 8414). Probe the PATH-INSERTED location first (an MCP served at
+  // `/mcp` advertises at `/.well-known/oauth-protected-resource/mcp`), then the
+  // host root — this is what lets a resource whose auth server lives on a
+  // SEPARATE host be discovered at all.
   let issuer: string | undefined;
   let prScopes: string[] | undefined;
   try {
-    const pr = await fetchJson(
-      `${origin}/.well-known/oauth-protected-resource`,
+    const pr = await fetchJsonFirst(
+      wellKnownCandidates(mcpUrl, "oauth-protected-resource"),
       fetchFn,
       "protected-resource discovery",
     );
@@ -153,14 +201,19 @@ export async function discover(mcpUrl: string, fetchFn: FetchFn = fetch): Promis
     issuer = servers?.[0];
     prScopes = asStringArray(pr.scopes_supported);
   } catch {
-    // No 9728 doc — fall back to the MCP origin as issuer.
+    // No 9728 doc anywhere — fall back to the MCP origin as issuer.
     issuer = undefined;
   }
   if (!issuer) issuer = origin;
 
-  // Step 2 — RFC 8414 on the issuer.
-  const as = await fetchJson(
-    `${issuer.replace(/\/+$/, "")}/.well-known/oauth-authorization-server`,
+  // Step 2 — RFC 8414 / OIDC metadata on the issuer. Path-inserted before host
+  // root, and `oauth-authorization-server` before `openid-configuration`, so an
+  // issuer that sits at a path or only serves OIDC discovery still resolves.
+  const as = await fetchJsonFirst(
+    [
+      ...wellKnownCandidates(issuer, "oauth-authorization-server"),
+      ...wellKnownCandidates(issuer, "openid-configuration"),
+    ],
     fetchFn,
     "authorization-server discovery",
   );
