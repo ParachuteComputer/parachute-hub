@@ -52,6 +52,14 @@ export interface PendingFlow {
   readonly scope?: string;
   /** The hub's callback URL registered for this flow. */
   readonly redirectUri: string;
+  /**
+   * OPTIONAL same-origin (hub-relative) page the operator should be sent back
+   * to after a SUCCESSFUL consent — the agent ops surface / admin grants page
+   * they started from. Validated with `isSafeHubReturnTo` at stash time and
+   * (defensively) again at redirect time. Absent for flows started without one
+   * (and for all pre-existing on-disk flows — additive + back-compat).
+   */
+  readonly returnTo?: string;
   readonly createdAt: string;
 }
 
@@ -62,6 +70,10 @@ interface FlowsFile {
 function isPendingFlow(v: unknown): v is PendingFlow {
   if (!v || typeof v !== "object") return false;
   const f = v as Record<string, unknown>;
+  // `returnTo` is OPTIONAL + additive — absent on every pre-existing on-disk
+  // flow. Accept undefined; if present it must be a string (validated for
+  // open-redirect safety at the call sites, not here).
+  if (f.returnTo !== undefined && typeof f.returnTo !== "string") return false;
   return (
     typeof f.state === "string" &&
     typeof f.grantId === "string" &&

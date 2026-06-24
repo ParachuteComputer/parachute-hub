@@ -1884,6 +1884,26 @@ export async function handleApproveClientPost(
 }
 
 /**
+ * The load-bearing open-redirect guard, shared by every hub `return_to` gate.
+ * A safe hub-relative target is a SINGLE-slash root-relative path: same-origin
+ * to the hub, no scheme, no `//host` scheme-relative escape. Empty string is
+ * rejected.
+ *
+ * This is the same-origin core that `isSafeAuthorizeReturnTo` (OAuth-resume)
+ * builds on, and that broader same-origin gates (the agent-grant OAuth
+ * callback's `returnTo`) reuse directly — they need to return the operator to
+ * a `/admin/...` page, not specifically `/oauth/authorize`. Single source of
+ * truth for "is this an open redirect?" — do NOT reimplement the
+ * `startsWith("/") && !startsWith("//")` check elsewhere.
+ */
+export function isSafeHubReturnTo(value: string): boolean {
+  if (!value) return false;
+  // Reject scheme-relative ("//evil.example/foo") and absolute URLs. Only
+  // single-slash root-relative paths are allowed.
+  return value.startsWith("/") && !value.startsWith("//");
+}
+
+/**
  * Validate a form-submitted `return_to` value. Must be a hub-relative URL
  * (no scheme, no double-slash) targeting `/oauth/authorize` with a query
  * string — anything else is either an open-redirect attempt or a misuse of
@@ -1895,13 +1915,10 @@ export async function handleApproveClientPost(
  * valid OAuth-resume target?" for the whole hub.
  */
 export function isSafeAuthorizeReturnTo(value: string): boolean {
-  if (!value) return false;
-  // Reject scheme-relative ("//evil.example/foo") and absolute URLs. Only
-  // single-slash root-relative paths are allowed.
-  if (!value.startsWith("/") || value.startsWith("//")) return false;
-  // Must target the authorize endpoint with a query string. The OAuth flow
-  // re-enters via GET /oauth/authorize?<original-params>; anything off-path
-  // is a misuse.
+  // Same-origin open-redirect guard first (shared single source of truth)…
+  if (!isSafeHubReturnTo(value)) return false;
+  // …then the authorize-specific path constraint: the OAuth flow re-enters
+  // via GET /oauth/authorize?<original-params>; anything off-path is a misuse.
   return value.startsWith("/oauth/authorize?");
 }
 
