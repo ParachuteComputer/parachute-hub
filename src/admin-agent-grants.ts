@@ -80,6 +80,7 @@ import {
 } from "./jwt-sign.ts";
 import { type OAuthClient, deriveVaultScopeFromMcpUrl, realOAuthClient } from "./oauth-client.ts";
 import { type PendingFlow, deleteFlow, getFlowByState, putFlow } from "./oauth-flows-store.ts";
+import { isSafeHubReturnTo } from "./oauth-handlers.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
 import { validateVaultName } from "./vault-name.ts";
@@ -630,10 +631,15 @@ async function approveGrant(req: Request, id: string, deps: AgentGrantsDeps): Pr
   const grant = getGrant(deps.storePath, id);
   if (!grant) return jsonError(404, "not_found", `no grant ${id}`);
 
-  let body: { token?: unknown } = {};
+  // `returnTo` is consumed ONLY by the mcp/OAuth path (approveMcpGrant), which
+  // is the one approve flow that hands the browser off to a remote consent
+  // screen and needs somewhere to land on return. vault/service approvals
+  // complete synchronously and return JSON — there's no redirect, so they
+  // ignore `returnTo` by design.
+  let body: { token?: unknown; returnTo?: unknown } = {};
   try {
     const raw = await req.text();
-    if (raw.trim().length > 0) body = JSON.parse(raw) as { token?: unknown };
+    if (raw.trim().length > 0) body = JSON.parse(raw) as { token?: unknown; returnTo?: unknown };
   } catch {
     return jsonError(400, "invalid_request", "body must be JSON when present");
   }
@@ -748,7 +754,7 @@ async function approveGrant(req: Request, id: string, deps: AgentGrantsDeps): Pr
  */
 async function approveMcpGrant(
   grant: GrantRecord,
-  body: { token?: unknown },
+  body: { token?: unknown; returnTo?: unknown },
   deps: AgentGrantsDeps,
   approvedAt: string,
 ): Promise<Response> {
@@ -850,6 +856,16 @@ async function approveMcpGrant(
       ? discovery.scopesSupported.join(" ")
       : undefined;
 
+  // OPTIONAL `returnTo` — the same-origin (hub-relative) page the operator
+  // started from (the agent ops surface / admin grants page). Stash it on the
+  // flow ONLY when it passes the shared open-redirect guard; absent/invalid →
+  // omit it (the callback then renders the back-compat close-tab page). This is
+  // the open-redirect-load-bearing check — reuse, don't reinvent.
+  const returnTo =
+    typeof body.returnTo === "string" && isSafeHubReturnTo(body.returnTo)
+      ? body.returnTo
+      : undefined;
+
   const flow: PendingFlow = {
     state,
     grantId: grant.id,
@@ -861,6 +877,7 @@ async function approveMcpGrant(
     mcpUrl,
     ...(scope ? { scope } : {}),
     redirectUri,
+    ...(returnTo ? { returnTo } : {}),
     createdAt: (deps.now?.() ?? new Date()).toISOString(),
   };
   putFlow(deps.flowsStorePath, flow, (deps.now?.() ?? new Date()).getTime());
@@ -1040,11 +1057,42 @@ export async function handleOAuthGrantCallback(
   // NEVER log a token.
   console.log(`agent grant approved: id=${grant.id} agent=${grant.agent} kind=mcp mode=oauth`);
 
+  // If the operator started from a hub page (agent ops surface / admin grants),
+  // send them back there instead of a dead-end "close this tab" screen. Re-run
+  // the open-redirect guard DEFENSIVELY at redirect time (the value was already
+  // gated at stash time; this is belt-and-suspenders against a tampered store).
+  // Append `?mcp_connected=1` (preserving any existing query) so the SPA can
+  // react (toast / refetch the grant). Absent/invalid returnTo → the
+  // back-compat close-tab page.
+  if (flow.returnTo && isSafeHubReturnTo(flow.returnTo)) {
+    return redirectToReturn(flow.returnTo);
+  }
+
   return htmlPage(
     200,
     "Connected",
     "The connection is authorized. You can close this tab — the agent will use it on its next run.",
   );
+}
+
+/**
+ * 302 back to a same-origin (hub-relative) `returnTo`, appending
+ * `mcp_connected=1` so the SPA can show a success toast / refetch. The caller
+ * MUST have already passed `returnTo` through `isSafeHubReturnTo` — this builds
+ * the URL against a fixed dummy origin purely to merge the query param
+ * correctly, then emits only the path+query (never the origin), so a
+ * scheme-relative value can't leak through into the Location header.
+ */
+function redirectToReturn(returnTo: string): Response {
+  // Parse against a fixed base so query-string merging is correct even when
+  // returnTo already carries `?...`. Only `pathname + search + hash` is emitted.
+  const u = new URL(returnTo, "http://hub.invalid");
+  u.searchParams.set("mcp_connected", "1");
+  const location = `${u.pathname}${u.search}${u.hash}`;
+  return new Response(null, {
+    status: 302,
+    headers: { location, "cache-control": "no-store" },
+  });
 }
 
 /** Minimal server-rendered HTML — NEVER carries a token. */

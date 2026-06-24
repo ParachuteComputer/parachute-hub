@@ -1353,6 +1353,119 @@ describe("GET /oauth/agent-grant/callback", () => {
   });
 });
 
+// === returnTo: send the operator back to where they started ================
+//
+// The OAuth-consent round-trip used to dead-end on a "close this tab" page. A
+// same-origin (hub-relative) `returnTo` on the approve body is stashed on the
+// flow + 302'd to on success (with `?mcp_connected=1`). The open-redirect guard
+// (`isSafeHubReturnTo`, reused) is the load-bearing property: an off-origin /
+// scheme-relative value is dropped at stash time and never lands in Location.
+describe("approve(mcp) + callback — returnTo round-trip", () => {
+  async function startFlowWithBody(body: Record<string, unknown>): Promise<string> {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie, body));
+    return id;
+  }
+
+  test("approve stashes a valid same-origin returnTo on the flow", async () => {
+    currentOAuth = fakeOAuth();
+    await startFlowWithBody({ returnTo: "/admin/grants" });
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.returnTo).toBe("/admin/grants");
+  });
+
+  test("approve drops an off-origin returnTo (absolute URL) — open-redirect guard", async () => {
+    currentOAuth = fakeOAuth();
+    await startFlowWithBody({ returnTo: "https://evil.example/steal" });
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.returnTo).toBeUndefined();
+  });
+
+  test("approve drops a scheme-relative returnTo (//host) — open-redirect guard", async () => {
+    currentOAuth = fakeOAuth();
+    await startFlowWithBody({ returnTo: "//evil.example/steal" });
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.returnTo).toBeUndefined();
+  });
+
+  test("approve drops a `..` path-traversal returnTo — open-redirect guard", async () => {
+    currentOAuth = fakeOAuth();
+    await startFlowWithBody({ returnTo: "/admin/../../etc/passwd" });
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.returnTo).toBeUndefined();
+  });
+
+  test("approve drops a PERCENT-ENCODED `..` returnTo (%2e%2e) — open-redirect guard", async () => {
+    // `new URL()` decodes %2e%2e before emitting the redirect path, so the guard
+    // must reject the encoded form too, not just the literal `..`.
+    currentOAuth = fakeOAuth();
+    await startFlowWithBody({ returnTo: "/%2e%2e/etc/passwd" });
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.returnTo).toBeUndefined();
+  });
+
+  test("callback 302-redirects to a valid returnTo (with mcp_connected=1) on success", async () => {
+    currentOAuth = fakeOAuth();
+    const id = await startFlowWithBody({ returnTo: "/admin/grants?agent=a" });
+    const res = await callback("?code=ok&state=fixed-state");
+    expect(res.status).toBe(302);
+    const location = res.headers.get("location") ?? "";
+    expect(location).toContain("/admin/grants");
+    expect(location).toContain("agent=a");
+    expect(location).toContain("mcp_connected=1");
+    // Same-origin only — never a host/scheme in Location.
+    expect(location.startsWith("/")).toBe(true);
+    expect(location.startsWith("//")).toBe(false);
+    // The grant still flipped to approved (the success side-effects all ran).
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("approved");
+  });
+
+  test("callback overwrites a pre-existing mcp_connected param rather than duplicating it", async () => {
+    currentOAuth = fakeOAuth();
+    await startFlowWithBody({ returnTo: "/admin/grants?mcp_connected=0" });
+    const res = await callback("?code=ok&state=fixed-state");
+    expect(res.status).toBe(302);
+    const location = res.headers.get("location") ?? "";
+    expect(location).toContain("mcp_connected=1");
+    expect(location).not.toContain("mcp_connected=0");
+    // exactly one occurrence (searchParams.set semantics, not append)
+    expect(location.match(/mcp_connected=/g)?.length).toBe(1);
+  });
+
+  test("callback falls back to the close-tab HTML when no returnTo was stashed", async () => {
+    currentOAuth = fakeOAuth();
+    const id = await startFlowWithBody({}); // no returnTo
+    const res = await callback("?code=ok&state=fixed-state");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(await res.text()).toContain("Connected");
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("approved");
+  });
+
+  test("callback falls back to the close-tab HTML for an unsafe returnTo (never 302s off-origin)", async () => {
+    currentOAuth = fakeOAuth();
+    // The unsafe value was already dropped at stash time, so the callback has no
+    // returnTo to honor — it renders the back-compat page rather than redirecting.
+    const id = await startFlowWithBody({ returnTo: "https://evil.example/steal" });
+    const res = await callback("?code=ok&state=fixed-state");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(res.headers.get("location")).toBeNull();
+    expect(await res.text()).toContain("Connected");
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("approved");
+  });
+});
+
 describe("material(mcp) — auto-refresh", () => {
   // Drive a grant to approved-via-OAuth, with expiry in the (near) past/future.
   async function approvedViaOAuth(expiresAt: string): Promise<string> {
