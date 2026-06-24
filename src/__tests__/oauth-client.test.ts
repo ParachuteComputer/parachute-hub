@@ -176,6 +176,31 @@ describe("discover", () => {
     const d = await discover("https://api.example.ai/mcp", fn);
     expect(d.tokenEndpoint).toBe("https://authn.example.ai/oauth2/token");
   });
+
+  test("malformed authorization_servers issuer throws OAuthClientError (not a raw TypeError)", async () => {
+    const { fn } = fakeFetch({
+      "https://api.example.ai/.well-known/oauth-protected-resource/mcp": () =>
+        json({ authorization_servers: ["not-a-url"] }),
+    });
+    await expect(discover("https://api.example.ai/mcp", fn)).rejects.toBeInstanceOf(OAuthClientError);
+  });
+
+  test("AS discovery uses the OIDC-append form for a path-ful issuer", async () => {
+    const { fn } = fakeFetch({
+      "https://api.example.ai/.well-known/oauth-protected-resource/mcp": () =>
+        json({ authorization_servers: ["https://idp.example.ai/tenant1"] }),
+      // ONLY the OIDC-append URL exists (issuer-path + /.well-known/openid-configuration),
+      // not the RFC 8414 insert form — proves the append candidate is generated.
+      "https://idp.example.ai/tenant1/.well-known/openid-configuration": () =>
+        json({
+          issuer: "https://idp.example.ai/tenant1",
+          authorization_endpoint: "https://idp.example.ai/tenant1/auth",
+          token_endpoint: "https://idp.example.ai/tenant1/token",
+        }),
+    });
+    const d = await discover("https://api.example.ai/mcp", fn);
+    expect(d.tokenEndpoint).toBe("https://idp.example.ai/tenant1/token");
+  });
 });
 
 // === DCR ====================================================================

@@ -29,6 +29,15 @@ export type FetchFn = typeof fetch;
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
+ * Shorter timeout for best-effort DISCOVERY probes. Discovery tries several
+ * well-known candidates in priority order (path-inserted, host-root, OIDC), so a
+ * full 15s per probe could stack into a long wall-clock wait on a slow/firewalled
+ * remote. These metadata GETs are quick when they exist; a tight ceiling bounds
+ * the worst case while still tolerating a sluggish responder.
+ */
+const DISCOVERY_PROBE_TIMEOUT_MS = 6_000;
+
+/**
  * `fetch` with an AbortController timeout. The hub has no shared fetch wrapper,
  * so this lives here for all outbound OAuth-client calls — a slow/hung remote
  * issuer must not stall the approve request indefinitely.
@@ -93,10 +102,15 @@ async function fetchJson(
   url: string,
   fetchFn: FetchFn,
   what: string,
+  timeoutMs?: number,
 ): Promise<Record<string, unknown>> {
   let res: Response;
   try {
-    res = await fetchWithTimeout(url, { headers: { accept: "application/json" } }, fetchFn);
+    res = await fetchWithTimeout(
+      url,
+      { headers: { accept: "application/json" }, ...(timeoutMs ? { timeout: timeoutMs } : {}) },
+      fetchFn,
+    );
   } catch (err) {
     throw new OAuthClientError(`${what}: request to ${url} failed`, err);
   }
@@ -136,6 +150,8 @@ function asStringArray(v: unknown): string[] | undefined {
  */
 function wellKnownCandidates(url: string, segment: string): string[] {
   const u = new URL(url);
+  // The query string is intentionally excluded (u.pathname omits it) — RFC 9728
+  // §3.1 builds the well-known URL from the resource PATH only.
   const path = u.pathname.replace(/\/+$/, ""); // drop trailing slash(es)
   const root = `${u.origin}/.well-known/${segment}`;
   const out = path ? [`${u.origin}/.well-known/${segment}${path}`, root] : [root];
@@ -143,26 +159,29 @@ function wellKnownCandidates(url: string, segment: string): string[] {
 }
 
 /**
- * Fetch the first candidate URL that returns a valid JSON object; throws the
- * LAST error if every candidate fails. Lets discovery probe the path-inserted
- * well-known location first, then fall back to the host root.
+ * Fetch the first candidate URL (in priority order) that returns a valid JSON
+ * object. Lets discovery probe the path-inserted well-known location first, then
+ * fall back to the host root. If EVERY candidate fails, throws an
+ * OAuthClientError naming all tried locations (so a failure points at every
+ * probe, not just the last).
  */
 async function fetchJsonFirst(
   urls: string[],
   fetchFn: FetchFn,
   what: string,
+  timeoutMs?: number,
 ): Promise<Record<string, unknown>> {
-  let lastErr: unknown;
+  const errors: string[] = [];
   for (const url of urls) {
     try {
-      return await fetchJson(url, fetchFn, what);
+      return await fetchJson(url, fetchFn, what, timeoutMs);
     } catch (err) {
-      lastErr = err;
+      errors.push(err instanceof Error ? err.message : String(err));
     }
   }
-  throw lastErr instanceof Error
-    ? lastErr
-    : new OAuthClientError(`${what}: no metadata at ${urls.join(", ")}`);
+  throw new OAuthClientError(
+    `${what}: no metadata found — tried ${urls.length} location(s): ${errors.join(" | ")}`,
+  );
 }
 
 /**
@@ -196,6 +215,7 @@ export async function discover(mcpUrl: string, fetchFn: FetchFn = fetch): Promis
       wellKnownCandidates(mcpUrl, "oauth-protected-resource"),
       fetchFn,
       "protected-resource discovery",
+      DISCOVERY_PROBE_TIMEOUT_MS,
     );
     const servers = asStringArray(pr.authorization_servers);
     issuer = servers?.[0];
@@ -206,16 +226,33 @@ export async function discover(mcpUrl: string, fetchFn: FetchFn = fetch): Promis
   }
   if (!issuer) issuer = origin;
 
+  // The issuer comes from the (attacker-influenceable) PRM doc — validate it
+  // parses as a URL so a malformed value surfaces as an OAuthClientError rather
+  // than a raw TypeError out of the candidate construction below.
+  let issuerUrl: URL;
+  try {
+    issuerUrl = new URL(issuer);
+  } catch {
+    throw new OAuthClientError(`authorization_servers[0] is not a valid URL: ${issuer}`);
+  }
+
   // Step 2 — RFC 8414 / OIDC metadata on the issuer. Path-inserted before host
   // root, and `oauth-authorization-server` before `openid-configuration`, so an
-  // issuer that sits at a path or only serves OIDC discovery still resolves.
+  // issuer that sits at a path or only serves OIDC discovery still resolves. Plus
+  // the OIDC Discovery 1.0 §4.1 APPEND form (`<issuer-with-path>/.well-known/
+  // openid-configuration`) for a path-ful issuer — distinct from the 8414 INSERT.
+  const asCandidates = [
+    ...wellKnownCandidates(issuer, "oauth-authorization-server"),
+    ...wellKnownCandidates(issuer, "openid-configuration"),
+  ];
+  if (issuerUrl.pathname.replace(/\/+$/, "")) {
+    asCandidates.push(`${issuer.replace(/\/+$/, "")}/.well-known/openid-configuration`);
+  }
   const as = await fetchJsonFirst(
-    [
-      ...wellKnownCandidates(issuer, "oauth-authorization-server"),
-      ...wellKnownCandidates(issuer, "openid-configuration"),
-    ],
+    [...new Set(asCandidates)],
     fetchFn,
     "authorization-server discovery",
+    DISCOVERY_PROBE_TIMEOUT_MS,
   );
 
   const authorizationEndpoint = asString(as.authorization_endpoint);
