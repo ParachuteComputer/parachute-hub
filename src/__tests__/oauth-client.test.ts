@@ -126,6 +126,81 @@ describe("discover", () => {
     const { fn } = fakeFetch({});
     await expect(discover("not-a-url", fn)).rejects.toBeInstanceOf(OAuthClientError);
   });
+
+  test("RFC 9728 path-inserted PRM + auth server on a SEPARATE host (the Read.ai shape)", async () => {
+    // The PRM lives ONLY at the path-inserted location (host root 404s) and
+    // points at an auth server on a DIFFERENT host. The pre-fix discover()
+    // probed only the host-root PRM, fell back to mcp-origin-as-issuer, and
+    // 404'd on the (nonexistent) authorization-server doc — this is the
+    // regression that blocked connecting Read.ai.
+    const { fn, calls } = fakeFetch({
+      "https://api.example.ai/.well-known/oauth-protected-resource/mcp": () =>
+        json({
+          resource: "https://api.example.ai/mcp",
+          authorization_servers: ["https://authn.example.ai/"],
+          scopes_supported: ["mcp:execute", "meeting:read"],
+        }),
+      "https://authn.example.ai/.well-known/oauth-authorization-server": () =>
+        json({
+          issuer: "https://authn.example.ai/",
+          authorization_endpoint: "https://authn.example.ai/oauth2/auth",
+          token_endpoint: "https://authn.example.ai/oauth2/token",
+          registration_endpoint: "https://api.example.ai/oauth/register",
+        }),
+    });
+    const d = await discover("https://api.example.ai/mcp/", fn);
+    expect(d.issuer).toBe("https://authn.example.ai/");
+    expect(d.authorizationEndpoint).toBe("https://authn.example.ai/oauth2/auth");
+    expect(d.tokenEndpoint).toBe("https://authn.example.ai/oauth2/token");
+    expect(d.registrationEndpoint).toBe("https://api.example.ai/oauth/register");
+    // 9728 scopes win
+    expect(d.scopesSupported).toEqual(["mcp:execute", "meeting:read"]);
+    // proves the path-inserted PRM probe was used (host-root PRM isn't defined)
+    expect(
+      calls.some((c) => c.url === "https://api.example.ai/.well-known/oauth-protected-resource/mcp"),
+    ).toBe(true);
+  });
+
+  test("AS discovery falls back to openid-configuration when oauth-authorization-server is absent", async () => {
+    const { fn } = fakeFetch({
+      "https://api.example.ai/.well-known/oauth-protected-resource/mcp": () =>
+        json({ authorization_servers: ["https://authn.example.ai/"] }),
+      // No RFC 8414 doc — only OIDC discovery.
+      "https://authn.example.ai/.well-known/openid-configuration": () =>
+        json({
+          issuer: "https://authn.example.ai/",
+          authorization_endpoint: "https://authn.example.ai/oauth2/auth",
+          token_endpoint: "https://authn.example.ai/oauth2/token",
+        }),
+    });
+    const d = await discover("https://api.example.ai/mcp", fn);
+    expect(d.tokenEndpoint).toBe("https://authn.example.ai/oauth2/token");
+  });
+
+  test("malformed authorization_servers issuer throws OAuthClientError (not a raw TypeError)", async () => {
+    const { fn } = fakeFetch({
+      "https://api.example.ai/.well-known/oauth-protected-resource/mcp": () =>
+        json({ authorization_servers: ["not-a-url"] }),
+    });
+    await expect(discover("https://api.example.ai/mcp", fn)).rejects.toBeInstanceOf(OAuthClientError);
+  });
+
+  test("AS discovery uses the OIDC-append form for a path-ful issuer", async () => {
+    const { fn } = fakeFetch({
+      "https://api.example.ai/.well-known/oauth-protected-resource/mcp": () =>
+        json({ authorization_servers: ["https://idp.example.ai/tenant1"] }),
+      // ONLY the OIDC-append URL exists (issuer-path + /.well-known/openid-configuration),
+      // not the RFC 8414 insert form — proves the append candidate is generated.
+      "https://idp.example.ai/tenant1/.well-known/openid-configuration": () =>
+        json({
+          issuer: "https://idp.example.ai/tenant1",
+          authorization_endpoint: "https://idp.example.ai/tenant1/auth",
+          token_endpoint: "https://idp.example.ai/tenant1/token",
+        }),
+    });
+    const d = await discover("https://api.example.ai/mcp", fn);
+    expect(d.tokenEndpoint).toBe("https://idp.example.ai/tenant1/token");
+  });
 });
 
 // === DCR ====================================================================
