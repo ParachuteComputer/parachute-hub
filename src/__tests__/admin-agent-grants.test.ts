@@ -1398,6 +1398,13 @@ describe("approve(mcp) + callback — returnTo round-trip", () => {
     expect(flow?.returnTo).toBeUndefined();
   });
 
+  test("approve drops a `..` path-traversal returnTo — open-redirect guard", async () => {
+    currentOAuth = fakeOAuth();
+    await startFlowWithBody({ returnTo: "/admin/../../etc/passwd" });
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.returnTo).toBeUndefined();
+  });
+
   test("callback 302-redirects to a valid returnTo (with mcp_connected=1) on success", async () => {
     currentOAuth = fakeOAuth();
     const id = await startFlowWithBody({ returnTo: "/admin/grants?agent=a" });
@@ -1412,6 +1419,18 @@ describe("approve(mcp) + callback — returnTo round-trip", () => {
     expect(location.startsWith("//")).toBe(false);
     // The grant still flipped to approved (the success side-effects all ran).
     expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("approved");
+  });
+
+  test("callback overwrites a pre-existing mcp_connected param rather than duplicating it", async () => {
+    currentOAuth = fakeOAuth();
+    await startFlowWithBody({ returnTo: "/admin/grants?mcp_connected=0" });
+    const res = await callback("?code=ok&state=fixed-state");
+    expect(res.status).toBe(302);
+    const location = res.headers.get("location") ?? "";
+    expect(location).toContain("mcp_connected=1");
+    expect(location).not.toContain("mcp_connected=0");
+    // exactly one occurrence (searchParams.set semantics, not append)
+    expect(location.match(/mcp_connected=/g)?.length).toBe(1);
   });
 
   test("callback falls back to the close-tab HTML when no returnTo was stashed", async () => {

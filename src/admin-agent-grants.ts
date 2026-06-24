@@ -631,6 +631,11 @@ async function approveGrant(req: Request, id: string, deps: AgentGrantsDeps): Pr
   const grant = getGrant(deps.storePath, id);
   if (!grant) return jsonError(404, "not_found", `no grant ${id}`);
 
+  // `returnTo` is consumed ONLY by the mcp/OAuth path (approveMcpGrant), which
+  // is the one approve flow that hands the browser off to a remote consent
+  // screen and needs somewhere to land on return. vault/service approvals
+  // complete synchronously and return JSON — there's no redirect, so they
+  // ignore `returnTo` by design.
   let body: { token?: unknown; returnTo?: unknown } = {};
   try {
     const raw = await req.text();

@@ -1900,7 +1900,12 @@ export function isSafeHubReturnTo(value: string): boolean {
   if (!value) return false;
   // Reject scheme-relative ("//evil.example/foo") and absolute URLs. Only
   // single-slash root-relative paths are allowed.
-  return value.startsWith("/") && !value.startsWith("//");
+  if (!value.startsWith("/") || value.startsWith("//")) return false;
+  // Reject `..` traversal sequences — they stay same-origin but a redirect
+  // target that walks the path tree is never a legitimate return-to and lets a
+  // crafted value reach an unexpected hub path. (`/oauth/authorize?…` callers
+  // never carry `..`, so this is free for them.)
+  return !value.includes("..");
 }
 
 /**
