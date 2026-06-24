@@ -14,7 +14,12 @@ import {
   openFirstClientAutoApproveWindow,
   setSetting,
 } from "../hub-settings.ts";
-import { findTokenRowByJti, validateAccessToken } from "../jwt-sign.ts";
+import {
+  REFRESH_GRACE_MS,
+  findTokenRowByJti,
+  signRefreshToken,
+  validateAccessToken,
+} from "../jwt-sign.ts";
 import {
   authorizationServerMetadata,
   buildServicesCatalog,
@@ -2262,6 +2267,7 @@ describe("handleToken — full OAuth dance", () => {
         refresh_token: initial.refresh_token,
         client_id: reg.client.clientId,
       });
+      const rotateAt = new Date("2026-06-24T00:00:00Z");
       const refreshRes = await handleToken(
         db,
         new Request(`${ISSUER}/oauth/token`, {
@@ -2269,13 +2275,16 @@ describe("handleToken — full OAuth dance", () => {
           body: refreshForm,
           headers: { "content-type": "application/x-www-form-urlencoded" },
         }),
-        { issuer: ISSUER },
+        { issuer: ISSUER, now: () => rotateAt },
       );
       expect(refreshRes.status).toBe(200);
       const rotated = (await refreshRes.json()) as { refresh_token: string };
       expect(rotated.refresh_token).not.toBe(initial.refresh_token);
 
-      // Old refresh token should now fail (revoked).
+      // Old refresh token replayed PAST the one-generation grace window
+      // should fail (revoked) — the immediate-predecessor grace (hub#685)
+      // only tolerates a replay within REFRESH_GRACE_MS. Replay an hour
+      // later: genuine zero-tolerance rejection.
       const replayRes = await handleToken(
         db,
         new Request(`${ISSUER}/oauth/token`, {
@@ -2283,7 +2292,7 @@ describe("handleToken — full OAuth dance", () => {
           body: refreshForm,
           headers: { "content-type": "application/x-www-form-urlencoded" },
         }),
-        { issuer: ISSUER },
+        { issuer: ISSUER, now: () => new Date(rotateAt.getTime() + 60 * 60 * 1000) },
       );
       expect(replayRes.status).toBe(400);
       const err = (await replayRes.json()) as Record<string, unknown>;
@@ -4123,6 +4132,284 @@ describe("refresh-token rotation + /oauth/revoke (#73)", () => {
     } finally {
       cleanup();
     }
+  });
+
+  // hub#685 — one-generation rotation grace window. A benign concurrent /
+  // retried refresh of the *immediately-previous* (just-rotated) token within
+  // REFRESH_GRACE_MS must NOT revoke the family (multi-tab SPA, bfcache/
+  // stale-tab resume, network retry). Genuine theft — an older ancestor, or
+  // any replay past the window — MUST still revoke the family.
+  describe("rotation grace window (hub#685)", () => {
+    function liveRefreshCount(
+      db: Awaited<ReturnType<typeof makeDb>>["db"],
+      familyId: string,
+    ): number {
+      const r = db
+        .query<{ n: number }, [string]>(
+          "SELECT COUNT(*) AS n FROM tokens WHERE family_id = ? AND revoked_at IS NULL AND refresh_token_hash IS NOT NULL",
+        )
+        .get(familyId);
+      return r?.n ?? -1;
+    }
+
+    async function refreshAt(
+      db: Awaited<ReturnType<typeof makeDb>>["db"],
+      clientId: string,
+      refreshToken: string,
+      at: Date,
+    ): Promise<Response> {
+      return handleToken(
+        db,
+        tokenRequest(
+          new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: refreshToken,
+            client_id: clientId,
+          }),
+        ),
+        { issuer: ISSUER, loadServicesManifest: fixtureLoadServicesManifest, now: () => at },
+      );
+    }
+
+    test("benign concurrent refresh of the immediate predecessor within the window succeeds, no family revocation", async () => {
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const initial = await mintInitialPair(db, reg.client.clientId, user.id, session.id);
+        const family = familyIdFor(db, initial.refresh_token);
+
+        const t0 = new Date("2026-06-24T00:00:00Z");
+        // First (legitimate) rotation at t0 — `initial` becomes the immediate
+        // predecessor; rotated1 is the single live tip.
+        const r1 = await refreshAt(db, reg.client.clientId, initial.refresh_token, t0);
+        expect(r1.status).toBe(200);
+        const rotated1 = (await r1.json()) as { refresh_token: string };
+        expect(liveRefreshCount(db, family)).toBe(1);
+
+        // A moment later (5s, well within REFRESH_GRACE_MS) a stale tab /
+        // retry replays `initial`. Benign: succeeds, and converges the client
+        // onto the lineage rather than revoking the family.
+        const replay = await refreshAt(
+          db,
+          reg.client.clientId,
+          initial.refresh_token,
+          new Date(t0.getTime() + 5_000),
+        );
+        expect(replay.status).toBe(200);
+        const replayed = (await replay.json()) as { refresh_token: string; access_token: string };
+        expect(replayed.refresh_token).toBeTruthy();
+        expect(replayed.access_token).toBeTruthy();
+
+        // No family-wide revocation: exactly one live refresh row remains
+        // (the grace path rotated the tip → its successor is the new tip).
+        expect(liveRefreshCount(db, family)).toBe(1);
+
+        // The token handed back is usable for a normal subsequent refresh.
+        const next = await refreshAt(
+          db,
+          reg.client.clientId,
+          replayed.refresh_token,
+          new Date(t0.getTime() + 10_000),
+        );
+        expect(next.status).toBe(200);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("genuine reuse of an OLDER ancestor (two generations back) revokes the family even within the window", async () => {
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const initial = await mintInitialPair(db, reg.client.clientId, user.id, session.id);
+        const family = familyIdFor(db, initial.refresh_token);
+
+        const t0 = new Date("2026-06-24T00:00:00Z");
+        // Two legitimate rotations: initial → rotated1 → rotated2. `initial`
+        // is now an ancestor (its successor rotated1 is itself revoked).
+        const r1 = await refreshAt(db, reg.client.clientId, initial.refresh_token, t0);
+        const rotated1 = (await r1.json()) as { refresh_token: string };
+        const r2 = await refreshAt(
+          db,
+          reg.client.clientId,
+          rotated1.refresh_token,
+          new Date(t0.getTime() + 1_000),
+        );
+        expect(r2.status).toBe(200);
+
+        // Replay the ANCESTOR `initial` still within the window. Condition (b)
+        // fails — its successor (rotated1) is not the live tip — so this is
+        // treated as theft: family revoked.
+        const replay = await refreshAt(
+          db,
+          reg.client.clientId,
+          initial.refresh_token,
+          new Date(t0.getTime() + 2_000),
+        );
+        expect(replay.status).toBe(400);
+        expect(((await replay.json()) as Record<string, unknown>).error).toBe("invalid_grant");
+        expect(liveRefreshCount(db, family)).toBe(0);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("replay of the immediate predecessor AFTER the window revokes the family", async () => {
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const initial = await mintInitialPair(db, reg.client.clientId, user.id, session.id);
+        const family = familyIdFor(db, initial.refresh_token);
+
+        const t0 = new Date("2026-06-24T00:00:00Z");
+        const r1 = await refreshAt(db, reg.client.clientId, initial.refresh_token, t0);
+        expect(r1.status).toBe(200);
+
+        // Replay the immediate predecessor 1ms PAST the window. Condition (a)
+        // fails: zero-tolerance theft handling applies.
+        const replay = await refreshAt(
+          db,
+          reg.client.clientId,
+          initial.refresh_token,
+          new Date(t0.getTime() + REFRESH_GRACE_MS + 1),
+        );
+        expect(replay.status).toBe(400);
+        expect(((await replay.json()) as Record<string, unknown>).error).toBe("invalid_grant");
+        expect(liveRefreshCount(db, family)).toBe(0);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("window boundary: exactly at the edge succeeds, one ms past fails", async () => {
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+
+        // Just inside (=== REFRESH_GRACE_MS): benign success, family intact.
+        const aPair = await mintInitialPair(db, reg.client.clientId, user.id, session.id);
+        const aFamily = familyIdFor(db, aPair.refresh_token);
+        const a0 = new Date("2026-06-24T00:00:00Z");
+        await refreshAt(db, reg.client.clientId, aPair.refresh_token, a0);
+        const inEdge = await refreshAt(
+          db,
+          reg.client.clientId,
+          aPair.refresh_token,
+          new Date(a0.getTime() + REFRESH_GRACE_MS),
+        );
+        expect(inEdge.status).toBe(200);
+        expect(liveRefreshCount(db, aFamily)).toBe(1);
+
+        // One ms past the edge: theft handling, family revoked.
+        const bPair = await mintInitialPair(db, reg.client.clientId, user.id, session.id);
+        const bFamily = familyIdFor(db, bPair.refresh_token);
+        const b0 = new Date("2026-06-24T01:00:00Z");
+        await refreshAt(db, reg.client.clientId, bPair.refresh_token, b0);
+        const outEdge = await refreshAt(
+          db,
+          reg.client.clientId,
+          bPair.refresh_token,
+          new Date(b0.getTime() + REFRESH_GRACE_MS + 1),
+        );
+        expect(outEdge.status).toBe(400);
+        expect(liveRefreshCount(db, bFamily)).toBe(0);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("repeated benign replays of the same predecessor each converge on a live tip (idempotent-equivalent)", async () => {
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const initial = await mintInitialPair(db, reg.client.clientId, user.id, session.id);
+        const family = familyIdFor(db, initial.refresh_token);
+
+        const t0 = new Date("2026-06-24T00:00:00Z");
+        await refreshAt(db, reg.client.clientId, initial.refresh_token, t0);
+
+        // First benign replay of `initial`: succeeds, rotates the tip.
+        const replay1 = await refreshAt(
+          db,
+          reg.client.clientId,
+          initial.refresh_token,
+          new Date(t0.getTime() + 1_000),
+        );
+        expect(replay1.status).toBe(200);
+        expect(liveRefreshCount(db, family)).toBe(1);
+
+        // A SECOND replay of the SAME predecessor `initial`. Its successor is
+        // now revoked (the first replay rotated the tip), so `initial` is no
+        // longer the direct predecessor of the single live tip → theft. The
+        // grace window protects exactly ONE generation, not unbounded replay.
+        const replay2 = await refreshAt(
+          db,
+          reg.client.clientId,
+          initial.refresh_token,
+          new Date(t0.getTime() + 2_000),
+        );
+        expect(replay2.status).toBe(400);
+        expect(liveRefreshCount(db, family)).toBe(0);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test("already-forked family (multiple live tips) does NOT take the grace path — family revoked", async () => {
+      const { db, cleanup } = await makeDb();
+      try {
+        const user = await createUser(db, "owner", "pw");
+        const session = createSession(db, { userId: user.id });
+        const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+        const initial = await mintInitialPair(db, reg.client.clientId, user.id, session.id);
+        const family = familyIdFor(db, initial.refresh_token);
+
+        const t0 = new Date("2026-06-24T00:00:00Z");
+        // One legitimate rotation → `initial` is the immediate predecessor of
+        // the single live tip (live count == 1, the benign precondition).
+        const r1 = await refreshAt(db, reg.client.clientId, initial.refresh_token, t0);
+        expect(r1.status).toBe(200);
+        expect(liveRefreshCount(db, family)).toBe(1);
+
+        // Inject a SECOND live refresh row into the same family — simulating a
+        // family that has already forked into multiple live lineages (an
+        // already-compromised state). Now live count != 1, so `tip` is null.
+        signRefreshToken(db, {
+          jti: "injected-fork-jti",
+          userId: user.id,
+          clientId: reg.client.clientId,
+          scopes: ["vault:default:read"],
+          familyId: family,
+          now: () => t0,
+        });
+        expect(liveRefreshCount(db, family)).toBe(2);
+
+        // Replay the immediate predecessor WITHIN the window. Even though (a)
+        // holds and `initial.rotatedTo` is set, the single-live-tip check
+        // fails (2 live rows) → no grace → zero-tolerance family revocation.
+        const replay = await refreshAt(
+          db,
+          reg.client.clientId,
+          initial.refresh_token,
+          new Date(t0.getTime() + 1_000),
+        );
+        expect(replay.status).toBe(400);
+        expect(((await replay.json()) as Record<string, unknown>).error).toBe("invalid_grant");
+        expect(liveRefreshCount(db, family)).toBe(0);
+      } finally {
+        cleanup();
+      }
+    });
   });
 
   test("/oauth/revoke refresh_token: revokes the row, second use rejected", async () => {

@@ -10,7 +10,9 @@ import {
   RefreshTokenInsertError,
   findRefreshToken,
   findTokenRowByJti,
+  linkRotation,
   listActiveRevocations,
+  liveFamilyRefreshRows,
   recordTokenMint,
   revokeTokenByJti,
   signAccessToken,
@@ -618,6 +620,83 @@ describe("token registry (hub#212 Phase 1)", () => {
       });
       const row = findTokenRowByJti(db, "jti-oauth-stamped");
       expect(row?.createdVia).toBe("oauth_refresh");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// hub#685 — rotation-grace primitives. The grace decision in
+// `handleTokenRefresh` is built on these two helpers; unit-cover them
+// directly so the security-load-bearing predecessor check has a tight test.
+describe("rotation grace primitives (hub#685)", () => {
+  test("rotatedTo is null on a freshly minted row, set by linkRotation", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      rotateSigningKey(db);
+      const u = await createUser(db, "owner", "pw");
+      signRefreshToken(db, {
+        jti: "pred",
+        userId: u.id,
+        clientId: "parachute-hub",
+        scopes: ["vault:read"],
+        familyId: "fam-1",
+      });
+      expect(findTokenRowByJti(db, "pred")?.rotatedTo).toBeNull();
+
+      signRefreshToken(db, {
+        jti: "succ",
+        userId: u.id,
+        clientId: "parachute-hub",
+        scopes: ["vault:read"],
+        familyId: "fam-1",
+      });
+      linkRotation(db, "pred", "succ");
+      expect(findTokenRowByJti(db, "pred")?.rotatedTo).toBe("succ");
+      // Successor itself has not rotated yet.
+      expect(findTokenRowByJti(db, "succ")?.rotatedTo).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("liveFamilyRefreshRows returns only un-revoked, un-expired refresh rows in the family", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      rotateSigningKey(db);
+      const u = await createUser(db, "owner", "pw");
+      const t0 = new Date("2026-06-24T00:00:00Z");
+      for (const jti of ["a", "b", "c"]) {
+        signRefreshToken(db, {
+          jti,
+          userId: u.id,
+          clientId: "parachute-hub",
+          scopes: ["vault:read"],
+          familyId: "fam-x",
+          now: () => t0,
+        });
+      }
+      // A different family — must never leak in.
+      signRefreshToken(db, {
+        jti: "other",
+        userId: u.id,
+        clientId: "parachute-hub",
+        scopes: ["vault:read"],
+        familyId: "fam-y",
+        now: () => t0,
+      });
+      // Revoke one of the three.
+      revokeTokenByJti(db, "b", t0);
+
+      const live = liveFamilyRefreshRows(db, "fam-x", t0)
+        .map((r) => r.jti)
+        .sort();
+      expect(live).toEqual(["a", "c"]);
+
+      // Evaluated PAST the 30-day TTL: every row in the family is expired,
+      // so none count as a live tip — the grace path can't rotate into one.
+      const afterExpiry = new Date(t0.getTime() + REFRESH_TOKEN_TTL_MS + 1);
+      expect(liveFamilyRefreshRows(db, "fam-x", afterExpiry)).toEqual([]);
     } finally {
       cleanup();
     }
