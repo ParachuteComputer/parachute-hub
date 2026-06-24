@@ -1405,6 +1405,15 @@ describe("approve(mcp) + callback — returnTo round-trip", () => {
     expect(flow?.returnTo).toBeUndefined();
   });
 
+  test("approve drops a PERCENT-ENCODED `..` returnTo (%2e%2e) — open-redirect guard", async () => {
+    // `new URL()` decodes %2e%2e before emitting the redirect path, so the guard
+    // must reject the encoded form too, not just the literal `..`.
+    currentOAuth = fakeOAuth();
+    await startFlowWithBody({ returnTo: "/%2e%2e/etc/passwd" });
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.returnTo).toBeUndefined();
+  });
+
   test("callback 302-redirects to a valid returnTo (with mcp_connected=1) on success", async () => {
     currentOAuth = fakeOAuth();
     const id = await startFlowWithBody({ returnTo: "/admin/grants?agent=a" });

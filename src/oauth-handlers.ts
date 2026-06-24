@@ -1901,11 +1901,19 @@ export function isSafeHubReturnTo(value: string): boolean {
   // Reject scheme-relative ("//evil.example/foo") and absolute URLs. Only
   // single-slash root-relative paths are allowed.
   if (!value.startsWith("/") || value.startsWith("//")) return false;
-  // Reject `..` traversal sequences — they stay same-origin but a redirect
-  // target that walks the path tree is never a legitimate return-to and lets a
-  // crafted value reach an unexpected hub path. (`/oauth/authorize?…` callers
-  // never carry `..`, so this is free for them.)
-  return !value.includes("..");
+  // Reject `..` traversal sequences — literal AND percent-encoded (`%2e%2e`),
+  // since redirectToReturn's `new URL()` parse decodes them before emitting the
+  // path. They stay same-origin but a target that walks the path tree is never a
+  // legitimate return-to and lets a crafted value reach an unexpected hub path.
+  // (`/oauth/authorize?…` callers never carry `..`, so this is free for them.)
+  if (value.includes("..")) return false;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    return false; // malformed percent-encoding → reject rather than guess
+  }
+  return !decoded.includes("..");
 }
 
 /**
