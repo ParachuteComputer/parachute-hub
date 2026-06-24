@@ -32,6 +32,18 @@ import { getActiveSigningKey, getAllPublicKeys } from "./signing-keys.ts";
 
 export const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
 export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * One-generation rotation grace window (hub#685). When a presented refresh
+ * token has already been rotated (revoked), a refresh of the *immediately-
+ * previous* token within this window is treated as a benign concurrent /
+ * retried refresh (multi-tab SPA, bfcache/stale-tab resume, a network retry)
+ * rather than theft — it converges the client on the live tip instead of
+ * revoking the whole family. The window is deliberately short: it tolerates
+ * the brief overlap of a real client racing itself, NOT a delayed replay.
+ * Genuine theft (an OLDER ancestor, or ANY replay past the window) still
+ * revokes the family per RFC 6819 §5.2.2.3. See `handleTokenRefresh`.
+ */
+export const REFRESH_GRACE_MS = 30_000;
 export const SIGNING_ALGORITHM = "RS256";
 
 export interface SignAccessTokenOpts {
@@ -529,6 +541,14 @@ export interface RefreshTokenRow {
   createdVia: TokenCreatedVia;
   /** JSON-encoded fine-grained constraints (auth-architecture-shape.md §11.3). */
   permissions: string | null;
+  /**
+   * jti of the refresh-token row this row rotated INTO (set by
+   * `linkRotation` inside the rotation transaction). NULL until this row
+   * rotates, and NULL on every pre-v14 row. Powers the one-generation
+   * rotation grace window (hub#685): only the row whose `rotatedTo` is the
+   * family's single live tip is the benign immediate-predecessor.
+   */
+  rotatedTo: string | null;
 }
 
 /**
@@ -553,6 +573,7 @@ interface TokenRowDb {
   permissions: string | null;
   created_via: string;
   subject: string | null;
+  rotated_to: string | null;
 }
 
 function rowToRefreshToken(row: TokenRowDb): RefreshTokenRow {
@@ -568,6 +589,7 @@ function rowToRefreshToken(row: TokenRowDb): RefreshTokenRow {
     createdAt: row.created_at,
     createdVia: (row.created_via as TokenCreatedVia) ?? "oauth_refresh",
     permissions: row.permissions,
+    rotatedTo: row.rotated_to ?? null,
   };
 }
 
@@ -598,4 +620,40 @@ export function revokeFamily(db: Database, familyId: string, now: Date): number 
     .prepare("UPDATE tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL")
     .run(now.toISOString(), familyId);
   return Number(res.changes);
+}
+
+/**
+ * Record that `predecessorJti` rotated INTO `successorJti`. Called INSIDE the
+ * rotation transaction (alongside the revoke-old + insert-new) so the
+ * successor link, the predecessor's `revoked_at`, and the new row commit or
+ * roll back as a unit. Powers the one-generation rotation grace window
+ * (hub#685): a benign concurrent/retried refresh of the immediate
+ * predecessor can be told apart from a genuine replay of an older ancestor.
+ */
+export function linkRotation(db: Database, predecessorJti: string, successorJti: string): void {
+  db.prepare("UPDATE tokens SET rotated_to = ? WHERE jti = ?").run(successorJti, predecessorJti);
+}
+
+/**
+ * The live (un-revoked AND un-expired) refresh-token rows in a family as of
+ * `now`. The grace window asks "is there exactly one live tip, and is the
+ * presented (revoked) row its direct predecessor?" — so callers inspect this
+ * set. Two filters matter:
+ *   - `refresh_token_hash IS NOT NULL` — the family can also contain
+ *     access-token rows sharing the jti/family, irrelevant to rotation lineage.
+ *   - `expires_at > now` — an expired-but-not-revoked tip is not a valid
+ *     rotation target, so the grace path must never rotate into it. Keeping
+ *     "live" exhaustive here means the single caller doesn't re-check expiry.
+ */
+export function liveFamilyRefreshRows(
+  db: Database,
+  familyId: string,
+  now: Date,
+): RefreshTokenRow[] {
+  const rows = db
+    .query<TokenRowDb, [string, string]>(
+      "SELECT * FROM tokens WHERE family_id = ? AND revoked_at IS NULL AND refresh_token_hash IS NOT NULL AND expires_at > ?",
+    )
+    .all(familyId, now.toISOString());
+  return rows.map(rowToRefreshToken);
 }

@@ -51,9 +51,13 @@ import { consumeFirstClientAutoApproveWindow } from "./hub-settings.ts";
 import { VAULT_VERBS, inferAudience } from "./jwt-audience.ts";
 import {
   ACCESS_TOKEN_TTL_SECONDS,
+  REFRESH_GRACE_MS,
   RefreshTokenInsertError,
+  type RefreshTokenRow,
   findRefreshToken,
   findTokenRowByJti,
+  linkRotation,
+  liveFamilyRefreshRows,
   revokeFamily,
   signAccessToken,
   signRefreshToken,
@@ -2223,10 +2227,46 @@ async function handleTokenRefresh(
     // Replay of an already-rotated refresh token. Per RFC 6819 §5.2.2.3 the
     // working assumption is theft — the legitimate client received a new
     // refresh token at the prior rotation, so anyone presenting the old one
-    // either lost a race (rare) or stole it (the case we must defend
-    // against). Either way: revoke every descendant in the family so the
-    // attacker can't keep refreshing, and force the legitimate client to
-    // re-authorize. Cheaper than tracking which call was first.
+    // either lost a race or stole it (the case we must defend against).
+    //
+    // ONE-GENERATION GRACE WINDOW (hub#685). Benign concurrent/retried
+    // refreshes — a multi-tab SPA, a bfcache/stale-tab resume, a network
+    // retry — legitimately present the *just-rotated* token a moment after
+    // it rotated. To avoid forcing those real clients to re-login, we let
+    // through the SINGLE immediately-previous token, and ONLY it, for
+    // ~REFRESH_GRACE_MS. The grace case rotates the live tip and converges
+    // the replaying client onto the current token; it does NOT mint a
+    // second live token into a forked lineage.
+    //
+    // The window is narrow ON PURPOSE — both conditions must hold:
+    //   (a) WINDOW: this row was revoked within the last REFRESH_GRACE_MS.
+    //   (b) IMMEDIATE-PREDECESSOR: this row's recorded successor (rotated_to)
+    //       IS the family's single live refresh row. That proves it's the
+    //       direct parent of the current tip — not an older ancestor (whose
+    //       successor is itself revoked) and not a sibling fork.
+    //
+    // HARD SECURITY INVARIANT: anything outside (a)∧(b) — an OLDER/ancestor
+    // token, any replay past the window, a family with zero or multiple live
+    // tips (already a theft-revoked or forked family) — falls through to the
+    // unchanged zero-tolerance path: revokeFamily + invalid_grant. The grace
+    // window NEVER tolerates more than the one immediate predecessor, and
+    // never beyond REFRESH_GRACE_MS.
+    const live = liveFamilyRefreshRows(db, row.familyId, now);
+    const revokedAtMs = new Date(row.revokedAt).getTime();
+    const withinWindow =
+      now.getTime() - revokedAtMs <= REFRESH_GRACE_MS && now.getTime() >= revokedAtMs;
+    const tip = live.length === 1 ? live[0]! : null;
+    const isImmediatePredecessor =
+      tip !== null && row.rotatedTo !== null && row.rotatedTo === tip.jti;
+    if (withinWindow && isImmediatePredecessor && tip) {
+      // Benign replay of the immediate predecessor. Rotate the live tip and
+      // hand the client the new pair — it converges on the current lineage
+      // (single live token preserved), no family revocation. Equivalent to
+      // what the client would have received had it presented the tip itself.
+      return await rotateAndRespond(db, tip, deps, now);
+    }
+    // Genuine theft (or a too-late replay): revoke every descendant so the
+    // attacker can't keep refreshing, and force re-authorization.
     revokeFamily(db, row.familyId, now);
     return jsonResponse(
       { error: "invalid_grant", error_description: "refresh_token revoked" },
@@ -2239,17 +2279,34 @@ async function handleTokenRefresh(
       400,
     );
   }
-  // Rotate: revoke the old refresh row, mint a new access + refresh pair
-  // bound to the same family so a future replay of *any* descendant can
-  // walk the chain.
-  //
+  return await rotateAndRespond(db, row, deps, now);
+}
+
+/**
+ * Rotate a single live refresh-token row: revoke it, mint + insert a new
+ * access + refresh pair bound to the same family, and link old→new
+ * (`rotated_to`) so a future grace-window check can identify the direct
+ * predecessor (hub#685). Returns the spec-shaped token response.
+ *
+ * Both call sites pass a row that is live at the moment of the call: the
+ * normal path passes the presented (non-revoked) token; the grace path
+ * passes the family's single live tip. Used for both so the benign-replay
+ * client receives exactly what a direct refresh of the tip would yield.
+ */
+async function rotateAndRespond(
+  db: Database,
+  row: RefreshTokenRow,
+  deps: OAuthDeps,
+  now: Date,
+): Promise<Response> {
+  const refreshUserId = row.userId ?? "";
   // Mint the access token *before* opening the rotation transaction. JWT
   // signing is async (jose returns a Promise) and bun:sqlite's
   // `db.transaction()` is sync — running async work inside the closure
   // would silently break atomicity. Once we have the JWT, the UPDATE
-  // (revoke old) + INSERT (mint new refresh row) commit or roll back as
-  // a unit, so a mid-rotation crash can't dead-old-without-replacement
-  // (#107).
+  // (revoke old) + INSERT (mint new refresh row) + link (rotated_to) commit
+  // or roll back as a unit, so a mid-rotation crash can't
+  // dead-old-without-replacement (#107).
   const audience = inferAudience(row.scopes);
   const access = await signAccessToken(db, {
     sub: refreshUserId,
@@ -2271,7 +2328,7 @@ async function handleTokenRefresh(
   try {
     refresh = db.transaction(() => {
       db.prepare("UPDATE tokens SET revoked_at = ? WHERE jti = ?").run(now.toISOString(), row.jti);
-      return signRefreshToken(db, {
+      const minted = signRefreshToken(db, {
         jti: access.jti,
         userId: refreshUserId,
         clientId: row.clientId,
@@ -2279,6 +2336,10 @@ async function handleTokenRefresh(
         familyId: row.familyId,
         now: deps.now,
       });
+      // Link old→new so the grace-window check (hub#685) can tell the
+      // immediate predecessor apart from an older ancestor on replay.
+      linkRotation(db, row.jti, access.jti);
+      return minted;
     })();
   } catch (err) {
     // Concurrent rotation: a sibling refresh of the same row already

@@ -451,6 +451,29 @@ const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE invites ADD COLUMN username TEXT;
     `,
   },
+  {
+    version: 14,
+    sql: `
+      -- Refresh-token rotation grace window (hub#685). Records the successor
+      -- a refresh-token row rotated INTO, so the refresh handler can tell the
+      -- *immediately-previous* token (the single benign concurrent/retried
+      -- refresh a multi-tab / bfcache / network-retry client legitimately
+      -- presents) apart from a genuine replay of an older ancestor (theft).
+      --
+      -- \`rotated_to\` is the jti of the row minted when this row rotated. NULL
+      -- on every row that has not (yet) rotated: live tokens, revoked-by-
+      -- /oauth/revoke tokens, revoked-by-family-sweep tokens, and every
+      -- pre-v14 row (no backfill — pre-v14 rotations left no successor link,
+      -- so they fall through to the zero-tolerance theft path exactly as
+      -- before; the grace window only ever helps rows minted post-v14).
+      --
+      -- The successor link is the ONLY structural ordering signal we need:
+      -- created_at alone can't distinguish the direct predecessor from an
+      -- older ancestor under burst issuance (ties), and the grace decision is
+      -- security-load-bearing, so it must be exact, not heuristic.
+      ALTER TABLE tokens ADD COLUMN rotated_to TEXT;
+    `,
+  },
 ];
 
 export function openHubDb(path: string = hubDbPath()): Database {
