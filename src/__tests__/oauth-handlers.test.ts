@@ -1391,6 +1391,7 @@ describe("handleAuthorizePost — vault picker", () => {
 
 describe("handleAuthorizePost — login submit", () => {
   test("sets session cookie and redirects to GET on valid credentials", async () => {
+    resetRateLimit();
     const { db, cleanup } = await makeDb();
     try {
       await createUser(db, "owner", "hunter2");
@@ -1428,6 +1429,7 @@ describe("handleAuthorizePost — login submit", () => {
   });
 
   test("rejects bad password with 401, no cookie", async () => {
+    resetRateLimit();
     const { db, cleanup } = await makeDb();
     try {
       await createUser(db, "owner", "hunter2");

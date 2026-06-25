@@ -8,15 +8,16 @@
  * because its endpoint is meant to be redeemed by a room of people sharing one
  * egress IP (see `SIGNUP_MAX_ATTEMPTS`).
  *
- *   - `/login` (per-IP, hub#187 / hub#188): 5 attempts / 15 min.
- *     Lands as a floor under brute-force after hub#187 collapsed the
- *     public-reach matrix: with a cloudflare tunnel up, `/login` is now
- *     reachable from the open internet, and 2FA (#186) is the next PR
- *     rather than this one. A 5-attempts-per-15-minute bucket per IP is
- *     the standard login-form floor; it's not the primary defense, just
- *     the one that turns "infinite credential grinding" into "rotate IPs".
- *     (Endpoint was `/admin/login` pre-rename; bucket logic is path-
- *     agnostic so the rename was a comment-only change here.)
+ *   - `/login` (per-account floor + per-IP ceiling): the FLOOR is keyed by
+ *     `compositeKey(ip, username)` at 5 attempts / 15 min, shared with the
+ *     `/oauth/authorize` password door so both doors feed ONE per-account
+ *     bucket; the CEILING is `authIpCeilingRateLimiter` at 60 / 15 min keyed
+ *     by IP alone. Re-keyed from pure per-IP so a room of users behind one
+ *     NAT'd egress IP (shared wifi / cloudflare tunnel) no longer pool into a
+ *     single 5-slot bucket — the per-account floor still turns "infinite
+ *     credential grinding" into "rotate IPs", while the IP ceiling backstops
+ *     username-rotation. (Endpoint was `/admin/login` pre-rename; bucket
+ *     logic is path-agnostic so the rename was a comment-only change here.)
  *
  *   - `/account/change-password` (per-user, hub#282): 3 attempts / 5 min.
  *     The endpoint is session-gated, so the threat model isn't open-
