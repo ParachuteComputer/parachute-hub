@@ -88,6 +88,8 @@ export interface UserWireShape {
   id: string;
   username: string;
   password_changed: boolean;
+  /** Contactable email captured at signup (v15, B2), or null. Visible to admin. */
+  email: string | null;
   assigned_vaults: string[];
   created_at: string;
 }
@@ -97,6 +99,7 @@ function toWire(u: User): UserWireShape {
     id: u.id,
     username: u.username,
     password_changed: u.passwordChanged,
+    email: u.email,
     assigned_vaults: [...u.assignedVaults],
     created_at: u.createdAt,
   };

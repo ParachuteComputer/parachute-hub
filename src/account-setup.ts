@@ -6,10 +6,21 @@
  * account-claim flow (`setup-wizard.ts` `handleSetupAccountPost`). A brand-new
  * invitee opens the link with no session and no JS:
  *
- *   GET  → render the "pick username + password (+ vault name)" form.
+ * MULTI-USE (v15, DEMO-PREP-2026-06-25 Workstream B): this same surface is the
+ * PUBLIC SIGNUP PAGE (B4). A multi-use invite link (`max_uses > 1`) lets many
+ * strangers redeem the one link until its seats run out — each redeem creates
+ * a fresh account + vault. Such a link also collects the redeemer's EMAIL (B2,
+ * so the operator can reach signups) and STAMPS a per-vault storage cap (B4)
+ * onto each provisioned vault. A legacy single-use admin/friends invite
+ * (`max_uses = 1`, the default) behaves exactly as before — no email field, no
+ * cap, single redeem.
+ *
+ *   GET  → render the "pick username + password (+ email, + vault name)" form.
  *   POST → redeem: look up the invite by sha256(token), validate it's still
- *          redeemable, validate credentials, provision the vault, create the
- *          user, stamp the invite used, mint a session, 302 → /account/.
+ *          redeemable (seats left, not expired/revoked), validate credentials
+ *          (+ email for public links), provision the vault (stamping its cap),
+ *          create the user, record the redemption (bump used_count, capture
+ *          email), mint a session, 302 → /account/.
  *
  * Redeem ORDERING (the re-usability guarantee, mirroring the wizard):
  *   1. lookup + validate the invite (not-found/expired/used/revoked)
@@ -27,14 +38,17 @@
  *        The vault must still exist in services.json (the vault-delete
  *        cascade revokes pending invites, so this re-check is defense in
  *        depth against manual manifest edits).
- *   4. createUser (the commit point)
- *   5. consumeInvite — stamp used_at + redeemed_user_id ONLY AFTER (4) commits
- *   6. createSession + cookie + 302
+ *   4. createUser (the commit point) — and INSIDE its transaction (the
+ *      `withinTx` hook): recordInviteRedemption (bump used_count + stamp
+ *      used_at/email/redeemed_user_id) AND, for a capped provisioning link,
+ *      setVaultCap. All three commit atomically with the user row.
+ *   5. createSession + cookie + 302
  *
- * Because the invite is consumed only after the user row commits, a
- * createUser exception (UNIQUE collision, disk full, anything) leaves the
- * invite re-usable — the invitee can simply retry. `consumeInvite`'s
- * `used_at IS NULL` guard makes the stamp itself single-use / race-free.
+ * Because the redemption is recorded only inside the user-row transaction, a
+ * createUser exception (UNIQUE collision, disk full, anything) rolls back the
+ * used_count bump + cap write together — the seat stays available and the
+ * invitee can simply retry. `recordInviteRedemption`'s `used_count < max_uses`
+ * guard makes the increment itself exhaustion-safe / race-free.
  *
  * What an invite pre-authorizes: EXACTLY one account + the one named/created/
  * shared vault at the baked-in role — NEVER host:admin, NEVER another vault.
@@ -53,14 +67,15 @@ import { type RunResult, provisionVault } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import {
+  InviteExhaustedError,
   InviteExpiredError,
   InviteNotFoundError,
   InviteRevokedError,
   InviteUsedError,
   assertInviteRedeemable,
-  consumeInvite,
+  recordInviteRedemption,
 } from "./invites.ts";
-import { checkAndRecord, clientIpFromRequest } from "./rate-limit.ts";
+import { clientIpFromRequest, signupRateLimiter } from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "./sessions.ts";
 import {
@@ -68,9 +83,11 @@ import {
   UsernameTakenError,
   createUser,
   getUserByUsernameCI,
+  validateEmail,
   validatePassword,
   validateUsername,
 } from "./users.ts";
+import { setVaultCap } from "./vault-caps.ts";
 import { validateVaultName } from "./vault-name.ts";
 import { listVaultNamesFromPath } from "./vault-names.ts";
 
@@ -127,6 +144,16 @@ function rejectInvite(err: unknown): Response {
       410,
     );
   }
+  if (err instanceof InviteExhaustedError) {
+    return htmlResponse(
+      renderAdminError({
+        title: "Signups closed",
+        message:
+          "This signup link has reached its maximum number of accounts. Ask your hub operator for a new link.",
+      }),
+      410,
+    );
+  }
   if (err instanceof InviteRevokedError) {
     return htmlResponse(
       renderAdminError({
@@ -166,10 +193,23 @@ export function handleAccountSetupGet(
       pinnedUsername: invite.username,
       role: invite.role,
       provisionVault: invite.provisionVault,
+      collectEmail: collectsEmail(invite),
     }),
     200,
     setCookie,
   );
+}
+
+/**
+ * Whether this redemption captures the redeemer's email (B2). Multi-use
+ * public-signup links collect it (the operator must be able to reach the
+ * stranger who signed up); legacy single-use admin invites don't bother
+ * (the admin already knows who they handed the link to). The signal: a
+ * multi-use link (`max_uses > 1`). Public-signup links always mint with
+ * `max_uses > 1`, so this cleanly distinguishes them from the friends flow.
+ */
+function collectsEmail(invite: { maxUses: number }): boolean {
+  return invite.maxUses > 1;
 }
 
 /** POST /account/setup/<token> — redeem the invite (see file docstring for ordering). */
@@ -201,11 +241,15 @@ export async function handleAccountSetupPost(
     );
   }
 
-  // Rate limit — reuse the /login IP bucket so a redeem flood and a login
-  // flood share the same throttle. After CSRF (so a junk cross-site POST
-  // doesn't burn the bucket), before any account/vault work.
+  // Rate limit — a DEDICATED signup bucket (per-IP, 60/15min), NOT the /login
+  // bucket. A public multi-use signup link is redeemed by a room of people
+  // sharing one NAT'd egress IP, so the /login-sized 5/15min cap would 429 the
+  // ~6th legitimate signer mid-demo. Generous-but-bounded: the invite's own
+  // max_uses + expiry are the primary bound; this is the abuse floor. After
+  // CSRF (so a junk cross-site POST doesn't burn the bucket), before any
+  // account/vault work.
   const clientIp = clientIpFromRequest(req);
-  const gate = checkAndRecord(clientIp, now);
+  const gate = signupRateLimiter.checkAndRecord(clientIp, now);
   if (!gate.allowed) {
     return htmlResponse(
       renderAdminError({
@@ -223,6 +267,10 @@ export async function handleAccountSetupPost(
     invite.username !== null ? invite.username : String(form.get("username") ?? "").trim();
   const password = String(form.get("password") ?? "");
   const confirm = String(form.get("password_confirm") ?? "");
+  // Email (B2) — captured only for public-signup links (multi-use). The raw
+  // value is echoed back on a re-render so the redeemer doesn't retype it.
+  const collectEmail = collectsEmail(invite);
+  const emailRaw = String(form.get("email") ?? "").trim();
 
   const csrf = ensureCsrfToken(req);
   const setCookie: Record<string, string> = csrf.setCookie ? { "set-cookie": csrf.setCookie } : {};
@@ -236,7 +284,9 @@ export async function handleAccountSetupPost(
         pinnedUsername: invite.username,
         role: invite.role,
         provisionVault: invite.provisionVault,
+        collectEmail,
         username,
+        ...(collectEmail ? { email: emailRaw } : {}),
         ...(vaultNameEcho !== undefined ? { vaultName: vaultNameEcho } : {}),
         errorMessage: message,
       }),
@@ -265,6 +315,21 @@ export async function handleAccountSetupPost(
   }
   if (password !== confirm) {
     return rerender(400, "The two passwords don't match.");
+  }
+  // (2b) Email (B2) — required + format-validated ONLY for public-signup
+  // (multi-use) links, where the operator must be able to reach the stranger
+  // who signed up. Legacy single-use admin invites don't collect it. The
+  // canonical form is lowercased/trimmed by validateEmail.
+  let email: string | null = null;
+  if (collectEmail) {
+    if (emailRaw.length === 0) {
+      return rerender(400, "Enter your email so the hub operator can reach you.");
+    }
+    const e = validateEmail(emailRaw);
+    if (!e.valid) {
+      return rerender(400, "Enter a valid email address (e.g. you@example.com).");
+    }
+    email = e.email;
   }
   // Case-insensitive uniqueness — same gate as /api/users. For a pre-named
   // invite the name can't be changed by the invitee, so a collision (someone
@@ -393,22 +458,33 @@ export async function handleAccountSetupPost(
           : undefined,
       );
     }
+
+    // NOTE: the per-vault storage cap (B4) is PERSISTED below, inside
+    // createUser's transaction (the `withinTx` hook), so the cap write +
+    // redemption record + user insert all commit (or roll back) atomically —
+    // no stranded cap row for a vault whose account creation failed. The
+    // vault itself is provisioned here (the CLI shell-out can't join the
+    // sqlite tx), but the cap METADATA is hub-DB state, so it belongs in the
+    // atomic hook.
   }
 
-  // (4) Create the user + consume the invite ATOMICALLY — the COMMIT POINT.
-  // The invite is consumed INSIDE createUser's transaction (the `withinTx`
-  // hook), so the two single-use guarantees compose:
+  // (4) Create the user + record the redemption ATOMICALLY — the COMMIT POINT.
+  // The redemption is recorded INSIDE createUser's transaction (the `withinTx`
+  // hook), so the seat-accounting guarantees compose:
   //
-  //   - Single-use under concurrency: two redeems of one invite both pass
-  //     `assertInviteRedeemable` above, but only one's `consumeInvite` UPDATE
-  //     (`used_at IS NULL AND revoked_at IS NULL`) changes a row. The loser's
-  //     hook throws `InviteUsedError`, which rolls back ITS user insert — no
-  //     orphan account. Exactly one account results.
+  //   - Exhaustion under concurrency: two redeems of the LAST seat both pass
+  //     `assertInviteRedeemable` above, but only one's `recordInviteRedemption`
+  //     UPDATE (`used_count < max_uses AND revoked_at IS NULL`) changes a row.
+  //     The loser's hook throws (InviteExhaustedError for a multi-use link,
+  //     InviteUsedError for single-use), which rolls back ITS user insert — no
+  //     orphan account. Exactly one account per remaining seat results.
   //   - Re-usable on failure: if createUser throws (UNIQUE collision, etc.)
-  //     before the hook, the invite was never touched; if the hook itself
-  //     throws (lost race), the consume + the user insert roll back together.
-  //     Either way nothing commits, so the invite stays re-usable.
+  //     before the hook, used_count was never bumped; if the hook itself
+  //     throws (lost race), the increment + the user insert roll back together.
+  //     Either way nothing commits, so the seat stays available.
   //
+  // The email (B2) is recorded with the redemption (latest redeemer) AND on
+  // the account row (`users.email`, the canonical per-account field) below.
   // passwordChanged: TRUE (the invitee chose their own password → no force-
   // change). assignedVaults pins them to exactly their one vault at the
   // invite's role. allowMulti because the first admin already exists.
@@ -419,17 +495,27 @@ export async function handleAccountSetupPost(
       passwordChanged: true,
       assignedVaults: vaultName !== null ? [vaultName] : [],
       role: invite.role,
+      ...(email !== null ? { email } : {}),
       withinTx: (newUserId) => {
-        if (!consumeInvite(deps.db, invite.tokenHash, newUserId, now)) {
-          // Lost the redeem race (or a concurrent revoke landed). Throw to
-          // roll back this user insert; surfaced as the used/410 path below.
-          throw new InviteUsedError();
+        if (!recordInviteRedemption(deps.db, invite.tokenHash, newUserId, email, now)) {
+          // Lost the redeem race (or a concurrent revoke landed). Throw the
+          // shape-appropriate error to roll back this user insert; surfaced
+          // as the 410 path below.
+          throw invite.maxUses > 1 ? new InviteExhaustedError() : new InviteUsedError();
+        }
+        // (3b) Persist the per-vault storage cap (B4) atomically with the
+        // account + redemption. Only for a freshly-provisioned vault carrying
+        // an invite cap; legacy/uncapped links leave the vault with no
+        // vault_caps row ("uncapped" for the Phase-2 reader). The vault was
+        // confirmed freshly created above; `setVaultCap` is a plain upsert.
+        if (invite.provisionVault && vaultName !== null && invite.vaultCapBytes !== null) {
+          setVaultCap(deps.db, vaultName, invite.vaultCapBytes, now);
         }
       },
     });
     userId = created.id;
   } catch (err) {
-    if (err instanceof InviteUsedError) {
+    if (err instanceof InviteUsedError || err instanceof InviteExhaustedError) {
       return rejectInvite(err);
     }
     if (err instanceof UsernameTakenError) {

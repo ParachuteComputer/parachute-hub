@@ -68,6 +68,7 @@ import { revokeTokensNamingVault, signAccessToken } from "./jwt-sign.ts";
 import { findService, type readManifest, readManifestLenient } from "./services-manifest.ts";
 import { enrichedPath } from "./spawn-path.ts";
 import { removeVaultAssignments } from "./users.ts";
+import { removeVaultCap } from "./vault-caps.ts";
 import { RESERVED_VAULT_NAMES, VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 import { type WellKnownVaultEntry, isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
 
@@ -577,6 +578,7 @@ interface CascadeSummary {
   grants_dropped: number;
   user_vaults_removed: number;
   invites_invalidated: number;
+  vault_cap_removed: boolean;
   connections_torn_down: number;
   /**
    * Vault-backed channel-daemon entries still referencing the deleted vault
@@ -596,6 +598,7 @@ function emptyCascadeSummary(): CascadeSummary {
     grants_dropped: 0,
     user_vaults_removed: 0,
     invites_invalidated: 0,
+    vault_cap_removed: false,
     connections_torn_down: 0,
     orphaned_channels: [],
     vault_removed: false,
@@ -648,7 +651,8 @@ function listVaultInstanceNames(manifestPath: string): Set<string> {
  *      it empties — a (user,client) grant can span multiple vaults);
  *   3. `user_vaults` rows;
  *   4. unredeemed invites pinned to the vault (redemption would resurrect
- *      the name);
+ *      the name); the per-vault storage-cap row (v15) so a re-created
+ *      same-name vault doesn't inherit a stale cap;
  *   5. connections whose source/provisioned vault is the deleted vault
  *      (via `teardownConnection`, which post-B0 also revokes the registered
  *      long-lived mints) + a report-only scan of the agent's `/api/channels`
@@ -752,6 +756,10 @@ export async function handleDeleteVault(
 
   // --- 4. Unredeemed invites pinned to the vault. ----------------------------
   summary.invites_invalidated = revokeInvitesForVault(deps.db, name, now);
+
+  // --- 4b. Per-vault storage cap row (v15). ----------------------------------
+  // A re-created same-name vault must not inherit a stale cap; drop it.
+  summary.vault_cap_removed = removeVaultCap(deps.db, name) > 0;
 
   // --- 5. Connections teardown (+ legacy channel scan, report-only). --------
   // Runs BEFORE the CLI remove so the vault daemon is still alive to accept

@@ -733,6 +733,7 @@ import { findGrant, recordGrant } from "../grants.ts";
 import { findInviteByHash, issueInvite } from "../invites.ts";
 import { findTokenRowByJti, listActiveRevocations, recordTokenMint } from "../jwt-sign.ts";
 import { createUser, setUserVaults } from "../users.ts";
+import { getVaultCapBytes, setVaultCap } from "../vault-caps.ts";
 
 const VAULT_ORIGIN = "http://127.0.0.1:19400";
 const AGENT_ORIGIN = "http://127.0.0.1:19410";
@@ -1026,11 +1027,19 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
         const pendingWork = issueInvite(db, { createdBy: alice.id, vaultName: "work" });
         const pendingDefault = issueInvite(db, { createdBy: alice.id, vaultName: "default" });
         const redeemedWork = issueInvite(db, { createdBy: alice.id, vaultName: "work" });
-        db.prepare("UPDATE invites SET used_at = ?, redeemed_user_id = ? WHERE token = ?").run(
-          new Date().toISOString(),
-          alice.id,
-          redeemedWork.invite.tokenHash,
-        );
+        // Simulate a fully-redeemed single-use invite exactly as the redeem path
+        // leaves it (v15): used_at stamped AND used_count bumped to max_uses, so
+        // the cascade's `used_count < max_uses` exhaustion guard treats it as
+        // terminal (untouched), same as the pre-v15 `used_at IS NULL` guard did.
+        db.prepare(
+          "UPDATE invites SET used_at = ?, used_count = 1, redeemed_user_id = ? WHERE token = ?",
+        ).run(new Date().toISOString(), alice.id, redeemedWork.invite.tokenHash);
+
+        // 4b. vault_caps (v15): one row per vault. The work row is dropped by
+        //     the cascade; the default row stays (a re-created same-name vault
+        //     must not inherit a stale cap).
+        setVaultCap(db, "work", 1024 * 1024 * 1024);
+        setVaultCap(db, "default", 2 * 1024 * 1024 * 1024);
 
         // 5. Connections: one sourced on work (torn down), one on default (kept).
         putConnection(store, {
@@ -1092,6 +1101,7 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
             grants_dropped: number;
             user_vaults_removed: number;
             invites_invalidated: number;
+            vault_cap_removed: boolean;
             connections_torn_down: number;
             orphaned_channels: string[];
             vault_removed: boolean;
@@ -1133,6 +1143,11 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
         expect(findInviteByHash(db, pendingDefault.invite.tokenHash)?.revokedAt).toBeNull();
         expect(findInviteByHash(db, redeemedWork.invite.tokenHash)?.usedAt).not.toBeNull();
         expect(findInviteByHash(db, redeemedWork.invite.tokenHash)?.revokedAt).toBeNull();
+
+        // 4b. vault_caps: the work cap row dropped; the default cap row stays.
+        expect(out.cascade.vault_cap_removed).toBe(true);
+        expect(getVaultCapBytes(db, "work")).toBeNull();
+        expect(getVaultCapBytes(db, "default")).toBe(2 * 1024 * 1024 * 1024);
 
         // 5. Connections: work connection torn down (trigger deregistered +
         //    channel entry deleted + record removed); default connection kept.

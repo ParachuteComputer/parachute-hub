@@ -175,7 +175,16 @@ export interface InviteSetupProps {
   role: string;
   /** Whether redemption provisions a vault at all (shows the vault row iff true). */
   provisionVault: boolean;
+  /**
+   * Whether to collect the redeemer's email (B2). True for public-signup
+   * (multi-use) links — the operator must be able to reach the stranger who
+   * signed up; false for legacy single-use admin/friends invites. Default
+   * false (omitted) preserves the friends flow's no-email form.
+   */
+  collectEmail?: boolean;
   username?: string;
+  /** Echoed email value on a re-render so the redeemer doesn't retype it. */
+  email?: string;
   vaultName?: string;
   errorMessage?: string;
 }
@@ -194,12 +203,28 @@ export function renderInviteSetup(props: InviteSetupProps): string {
     pinnedUsername,
     role,
     provisionVault,
+    collectEmail,
     username,
+    email,
     vaultName,
     errorMessage,
   } = props;
   const error = errorMessage ? `<p class="error-banner">${escapeHtml(errorMessage)}</p>` : "";
   const usernameAttr = username ? ` value="${escapeAttr(username)}"` : "";
+  const emailAttr = email ? ` value="${escapeAttr(email)}"` : "";
+
+  // Email row (B2): shown ONLY for public-signup (multi-use) links so the
+  // operator can reach the stranger who signed up. `type=email` gets the
+  // browser's built-in client-side format check (the server re-validates).
+  const emailRow = collectEmail
+    ? `
+        <label class="field">
+          <span class="field-label">Email</span>
+          <input type="email" name="email" autocomplete="email" required
+            spellcheck="false" autocapitalize="off"${emailAttr} />
+          <span class="field-hint">So your hub operator can reach you.</span>
+        </label>`
+    : "";
 
   // Username row: pre-named → read-only display (the server ENFORCES the
   // invite's username; the disabled input never submits and the handler
@@ -304,6 +329,7 @@ export function renderInviteSetup(props: InviteSetupProps): string {
       <form method="POST" action="/account/setup/${escapeAttr(token)}" class="auth-form">
         ${renderCsrfHiddenInput(csrfToken)}
         ${usernameRow}
+        ${emailRow}
         <label class="field">
           <span class="field-label">Password</span>
           <input type="password" name="password" autocomplete="new-password"
@@ -405,7 +431,7 @@ const STYLES = `
     letter-spacing: 0.01em;
     font-family: ${FONT_MONO};
   }
-  input[type=text], input[type=password] {
+  input[type=text], input[type=password], input[type=email] {
     font: inherit;
     width: 100%;
     padding: 0.6rem 0.75rem;
@@ -415,7 +441,7 @@ const STYLES = `
     color: ${PALETTE.fg};
     transition: border-color 0.15s ease, background 0.15s ease;
   }
-  input[type=text]:focus, input[type=password]:focus {
+  input[type=text]:focus, input[type=password]:focus, input[type=email]:focus {
     outline: none;
     border-color: ${PALETTE.accent};
     background: ${PALETTE.cardBg};
@@ -461,10 +487,10 @@ const STYLES = `
     .card { background: #25221d; border-color: #3a362f; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3); }
     h1 { color: #f0ece4; }
     .subtitle, .field-label { color: #a8a29a; }
-    input[type=text], input[type=password] {
+    input[type=text], input[type=password], input[type=email] {
       background: #1f1c18; border-color: #3a362f; color: #e8e4dc;
     }
-    input[type=text]:focus, input[type=password]:focus {
+    input[type=text]:focus, input[type=password]:focus, input[type=email]:focus {
       background: #25221d;
     }
     .brand-tag { border-color: #3a362f; color: #a8a29a; }

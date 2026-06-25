@@ -23,6 +23,7 @@ import {
   setPassword,
   setUserVaults,
   userCount,
+  validateEmail,
   validatePassword,
   validateUsername,
   vaultVerbsForRole,
@@ -428,6 +429,38 @@ describe("validatePassword", () => {
     // toward passphrases we'll layer it as a separate signal, not a
     // hard gate.
     expect(validatePassword("aaaaaaaaaaaa").valid).toBe(true);
+  });
+});
+
+describe("validateEmail (v15, B2)", () => {
+  test("accepts ordinary addresses, canonicalizing to lowercase/trimmed", () => {
+    const r = validateEmail("  Alice@Example.com ");
+    expect(r.valid).toBe(true);
+    if (r.valid) expect(r.email).toBe("alice@example.com");
+    expect(validateEmail("a.b+tag@sub.domain.co.uk").valid).toBe(true);
+    expect(validateEmail("user_name@x.io").valid).toBe(true);
+  });
+
+  test("rejects malformed shapes", () => {
+    for (const bad of [
+      "",
+      "not-an-email",
+      "@example.com",
+      "alice@",
+      "alice@example",
+      "alice example@x.io",
+      "two@@x.io",
+      "alice@x.c",
+    ]) {
+      expect(validateEmail(bad).valid).toBe(false);
+    }
+  });
+
+  test("rejects over-length addresses (>254)", () => {
+    const long = `${"a".repeat(250)}@x.io`;
+    const r = validateEmail(long);
+    expect(r.valid).toBe(false);
+    if (!r.valid) expect(r.reason).toBe("length");
   });
 });
 
