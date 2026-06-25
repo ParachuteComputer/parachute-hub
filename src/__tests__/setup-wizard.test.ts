@@ -1825,6 +1825,24 @@ describe("handleSetupVaultPost", () => {
     expect(cfg?.cleanup).toEqual({ provider: "anthropic", default: true });
     expect(cfg?.cleanupProviders).toEqual({ anthropic: { apiKey: "sk-ant-cleanup-key" } });
   });
+
+  test("scribe transcribe=local resolves to the host platform's backend (the Linux trap fix)", async () => {
+    // The bug: `local` mapped UNCONDITIONALLY to parakeet-mlx (macOS-only),
+    // silently broken on every Linux box. After the fix it resolves to the
+    // platform backend. We assert against the actual host so it's correct on
+    // both Mac (parakeet-mlx) and Linux CI (onnx-asr). The RAM gate only kicks
+    // in below 2 GB — CI/dev boxes clear it, so the choice stays `local`.
+    const { platformLocalProvider } = await import("../scribe-config.ts");
+    const expected = platformLocalProvider(process.platform);
+    const { response } = await postVaultWithFields(h, { scribe_provider: "local" });
+    expect(response.status).toBe(303);
+    const cfg = readScribeConfig(h.dir);
+    if (expected !== null) {
+      // On a supported platform with enough RAM, `local` resolves to the
+      // platform backend — NOT a hardcoded parakeet-mlx on Linux.
+      expect(cfg?.transcribe).toEqual({ provider: expected });
+    }
+  });
 });
 
 // --- end-to-end through hubFetch -----------------------------------------

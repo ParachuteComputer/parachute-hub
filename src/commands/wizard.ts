@@ -39,8 +39,10 @@
  */
 
 import { createInterface } from "node:readline/promises";
+import { configDir } from "../config.ts";
 import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
 import { SESSION_COOKIE_NAME } from "../sessions.ts";
+import { type WizardCommandRunner, walkTranscriptionStep } from "./wizard-transcription.ts";
 
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes — generous enough for a slow `bun add` over a flaky connection.
@@ -111,6 +113,29 @@ export interface RunCliWizardOpts {
    * the wizard's.
    */
   exposeMode?: "localhost" | "tailnet" | "public";
+  /**
+   * `~/.parachute` (or the PARACHUTE_HOME override) — where scribe's config
+   * lives. Required for the transcription step to write the chosen provider +
+   * key. Init passes its resolved configDir; when absent the transcription
+   * step is skipped (the wizard can still walk account / vault / expose).
+   */
+  configDir?: string;
+  /**
+   * Pre-supply the transcription answer (non-interactive escape, mirrors the
+   * browser wizard's `scribe_provider`). `none` | `local` | `groq` | `openai`.
+   */
+  transcribeMode?: "none" | "local" | "groq" | "openai";
+  /** Pre-supplied cloud transcription API key (groq / openai). */
+  transcribeApiKey?: string;
+  /**
+   * Test seam: replace the transcription step's subprocess runner so tests
+   * never install scribe / shell out. Threaded into `walkTranscriptionStep`.
+   */
+  transcribeRunCommand?: WizardCommandRunner;
+  /** Test seam: platform override for the transcription step. */
+  platform?: NodeJS.Platform;
+  /** Test seam: available-RAM override (MiB) for the transcription step's gate. */
+  availableRamMib?: number | null;
 }
 
 /** Cookie jar — tiny, in-memory, no persistence across runs. */
@@ -395,9 +420,14 @@ async function pollOperation(
   }
 }
 
-/** Validate password length up front so we don't bounce off a 400 the operator can't see. */
+/**
+ * Validate password length up front so we don't bounce off a 400 the operator
+ * can't see. Floor is 12 to match the server (`PASSWORD_MIN_LEN`) AND this
+ * wizard's own "min 12 chars" copy at the password prompt — the validator was
+ * stuck at 8, contradicting both (onboarding-streamline hub PR1).
+ */
 function validatePassword(pw: string): string | undefined {
-  if (pw.length < 8) return "Password must be at least 8 characters.";
+  if (pw.length < 12) return "Password must be at least 12 characters.";
   return undefined;
 }
 
@@ -743,6 +773,24 @@ export async function runCliWizard(opts: RunCliWizardOpts): Promise<number> {
     if (code !== 0) return code;
     state = await fetchWizardState(hubUrl, jar, fetchImpl);
   }
+  // Transcription step (onboarding-streamline hub PR1) — the CLI's parity with
+  // the browser wizard's folded scribe sub-form. The hub's setup-state machine
+  // has no "transcription" step (scribe is a module install, not a wizard gate),
+  // so this runs unconditionally between vault and expose rather than off
+  // `state.step`. Skipped without a configDir (nowhere to write scribe config).
+  // Non-fatal: a transcription that couldn't be set up never blocks setup.
+  if (opts.configDir !== undefined) {
+    await walkTranscriptionStep({
+      configDir: opts.configDir,
+      log,
+      prompt,
+      ...(opts.transcribeMode !== undefined ? { transcribeMode: opts.transcribeMode } : {}),
+      ...(opts.transcribeApiKey !== undefined ? { transcribeApiKey: opts.transcribeApiKey } : {}),
+      ...(opts.transcribeRunCommand !== undefined ? { runCommand: opts.transcribeRunCommand } : {}),
+      ...(opts.platform !== undefined ? { platform: opts.platform } : {}),
+      ...(opts.availableRamMib !== undefined ? { availableRamMib: opts.availableRamMib } : {}),
+    });
+  }
   if (state.step === "expose") {
     const code = await walkExposeStep(hubUrl, jar, state, ctx);
     if (code !== 0) return code;
@@ -852,6 +900,21 @@ export function parseWizardArgs(args: readonly string[]): ParsedWizardArgs | { e
         }
         out.opts.exposeMode = value;
         break;
+      case "--transcribe-mode":
+        if (!consumeValue()) return { error: `${key} requires a value` };
+        if (value !== "none" && value !== "local" && value !== "groq" && value !== "openai") {
+          return { error: `${key} must be one of none, local, groq, openai` };
+        }
+        out.opts.transcribeMode = value;
+        break;
+      case "--transcribe-key":
+        if (!consumeValue()) return { error: `${key} requires a value` };
+        out.opts.transcribeApiKey = value;
+        break;
+      case "--config-dir":
+        if (!consumeValue()) return { error: `${key} requires a path` };
+        out.opts.configDir = value;
+        break;
       default:
         if (a.startsWith("--")) return { error: `unknown argument "${a}"` };
         return { error: `unexpected positional argument "${a}"` };
@@ -877,12 +940,19 @@ export async function runSetupWizardCommand(args: readonly string[]): Promise<nu
         "                              [--bootstrap-token <token>]\n" +
         "                              [--vault-mode create|import|skip] [--vault-name <name>]\n" +
         "                              [--vault-import-url <url>] [--vault-import-pat <pat>] [--vault-import-replace]\n" +
+        "                              [--transcribe-mode none|local|groq|openai] [--transcribe-key <key>]\n" +
+        "                              [--config-dir <path>]\n" +
         "                              [--expose-mode localhost|tailnet|public]",
     );
     return 1;
   }
+  // Default configDir from PARACHUTE_HOME (matching the rest of the CLI) so the
+  // standalone `parachute setup-wizard` invocation can run the transcription
+  // step. An explicit `--config-dir` wins.
+  const wizardOpts = { ...parsed.opts };
+  if (wizardOpts.configDir === undefined) wizardOpts.configDir = configDir();
   return await runCliWizard({
-    ...parsed.opts,
+    ...wizardOpts,
     log: (line) => console.log(line),
   });
 }

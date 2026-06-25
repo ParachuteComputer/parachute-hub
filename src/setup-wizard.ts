@@ -74,6 +74,11 @@ import {
   readOperatorTokenFile,
 } from "./operator-token.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
+import {
+  decideLocalProvider,
+  platformLocalProvider,
+  readAvailableRamMib,
+} from "./scribe-config.ts";
 import { SEED_VERSION } from "./service-spec.ts";
 import { findService, readManifestLenient } from "./services-manifest.ts";
 import {
@@ -2410,8 +2415,23 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
   // Cleanup-without-transcribe is a valid combo: the operator can
   // hit scribe's REST cleanup endpoint directly with their own raw
   // text. We install scribe + write the cleanup block in that case.
-  const scribeProvider = String(form.get("scribe_provider") ?? "").trim();
+  let scribeProvider = String(form.get("scribe_provider") ?? "").trim();
   const scribeCleanupProvider = String(form.get("scribe_cleanup_provider") ?? "").trim();
+  // RAM/platform gate: if the operator asked for `local` on a box that can't
+  // run a local ASR model (no local backend for the platform, or too little
+  // RAM — the 1 GB droplet would OOM), redirect the choice to a cloud provider
+  // (groq) rather than recording a dead `local` string scribe can never honor.
+  // The reason is logged; the inline UI surfaces it via the scribe op poll.
+  if (scribeProvider === "local") {
+    const decision = decideLocalProvider(process.platform, readAvailableRamMib());
+    if (!decision.ok) {
+      console.warn(
+        `[setup-wizard] local transcription unavailable on this host: ${decision.reason} ` +
+          `Steering to "${decision.steerTo}".`,
+      );
+      scribeProvider = decision.steerTo ?? "groq";
+    }
+  }
   const wantsTranscribe = scribeProvider !== "" && scribeProvider !== "none";
   const wantsCleanup = scribeCleanupProvider !== "" && scribeCleanupProvider !== "none";
   let scribeOpId: string | undefined;
@@ -2590,16 +2610,29 @@ interface WizardScribeConfig {
   transcribe?: { provider: string; apiKey: string };
   /** Set when the operator chose a cleanup provider (anything other than "none"). */
   cleanup?: { provider: string; apiKey: string };
+  /**
+   * Platform override for resolving the `local` choice (test seam). Defaults to
+   * the real host platform. Mac → parakeet-mlx, Linux → onnx-asr.
+   */
+  platform?: NodeJS.Platform;
 }
 function writeScribeConfigForWizard(configDir: string, config: WizardScribeConfig): void {
   const update: Record<string, unknown> = {};
+  const platform = config.platform ?? process.platform;
 
   if (config.transcribe) {
     const { provider, apiKey } = config.transcribe;
-    // For `local` (Mac MLX / cross-platform ONNX), just set the
-    // provider name — no key needed.
+    // For `local`, resolve to the CORRECT platform backend — parakeet-mlx on
+    // macOS, onnx-asr on Linux. (Was hardcoded to parakeet-mlx, which silently
+    // fails on every Linux box.) No key needed for local. The caller's
+    // RAM/platform gate is the single place that decides "local isn't possible
+    // here" and should have steered to cloud before reaching this writer — but
+    // if that gate is ever bypassed and the platform has no local backend, we
+    // write "none" (transcription off) rather than a dead provider string, so
+    // this writer can never record something that silently fails.
     if (provider === "local") {
-      update.transcribe = { provider: "parakeet-mlx" };
+      const resolved = platformLocalProvider(platform);
+      update.transcribe = { provider: resolved ?? "none" };
     } else {
       // Cloud providers need a key. Empty key → just set provider;
       // the operator can paste the key later via /scribe/admin
