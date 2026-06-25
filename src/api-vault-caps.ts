@@ -135,15 +135,16 @@ async function parseSetCapBody(req: Request): Promise<{ ok: true; body: SetCapBo
   }
   const obj = raw as Record<string, unknown>;
   const capBytes = obj.cap_bytes;
-  // Positive finite integer only — the table's CHECK (cap_bytes > 0) is the
-  // at-rest backstop; this is the edge validation so the operator gets a clean
-  // 400 instead of a sqlite constraint error.
-  if (typeof capBytes !== "number" || !Number.isFinite(capBytes) || capBytes <= 0) {
+  // Positive integer only — the table's CHECK (cap_bytes > 0) is the at-rest
+  // backstop; this is the edge validation so the operator gets a clean 400
+  // instead of a sqlite constraint error. A fractional byte count (which a byte
+  // count can never be) is rejected rather than silently floored downstream.
+  if (typeof capBytes !== "number" || !Number.isInteger(capBytes) || capBytes <= 0) {
     return {
       ok: false,
       status: 400,
       error: "invalid_request",
-      description: '"cap_bytes" must be a positive number of bytes',
+      description: '"cap_bytes" must be a positive integer number of bytes',
     };
   }
   return { ok: true, body: { cap_bytes: capBytes } };

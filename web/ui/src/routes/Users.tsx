@@ -562,8 +562,15 @@ function ListRendered({
                     {u.email ? (
                       // Email is the contactable identity captured at public
                       // signup (B2) — the operator's "who signed up + how do I
-                      // reach them" column. mailto so a click drafts an email.
-                      <a href={`mailto:${u.email}`}>{u.email}</a>
+                      // reach them" column. Only render a mailto link when the
+                      // value actually looks like an email; otherwise show it as
+                      // plain text (defense-in-depth against a non-email value
+                      // ever landing in the field).
+                      u.email.includes("@") ? (
+                        <a href={`mailto:${u.email}`}>{u.email}</a>
+                      ) : (
+                        <span>{u.email}</span>
+                      )
                     ) : (
                       <span
                         className="muted"

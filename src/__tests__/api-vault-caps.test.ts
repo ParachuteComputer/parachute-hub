@@ -145,6 +145,34 @@ describe("handleSetVaultCap", () => {
     expect(res.status).toBe(401);
   });
 
+  test("403 when bearer lacks parachute:host:admin", async () => {
+    const bearer = await makeAdminBearer(["other:scope"]);
+    const res = await handleSetVaultCap(
+      withBearer("/api/vault-caps/beta", bearer, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cap_bytes: 1000 }),
+      }),
+      "beta",
+      deps(),
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("400 on a fractional (non-integer) cap", async () => {
+    const bearer = await makeAdminBearer();
+    const res = await handleSetVaultCap(
+      withBearer("/api/vault-caps/beta", bearer, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cap_bytes: 1.5 }),
+      }),
+      "beta",
+      deps(),
+    );
+    expect(res.status).toBe(400);
+  });
+
   test("405 on GET", async () => {
     const bearer = await makeAdminBearer();
     const res = await handleSetVaultCap(withBearer("/api/vault-caps/beta", bearer), "beta", deps());
