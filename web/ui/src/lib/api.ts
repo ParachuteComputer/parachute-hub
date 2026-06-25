@@ -1002,6 +1002,12 @@ export interface UserListing {
   id: string;
   username: string;
   password_changed: boolean;
+  /**
+   * Contactable email captured at signup (v15, B2), or null for accounts
+   * created before email capture (wizard admin, env-seeded admin, pre-named
+   * friend invites). Visible to the operator so they can reach a signup.
+   */
+  email: string | null;
   assigned_vaults: string[];
   created_at: string;
 }
@@ -1187,6 +1193,70 @@ export async function listUserVaults(): Promise<string[]> {
   if (!res.ok) throw new HttpError(res.status, await readError(res));
   const body = (await res.json()) as { vaults: string[] };
   return body.vaults ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Per-vault storage caps (B5 admin visibility / D-slice). host:admin-gated;
+// same Bearer pattern as users. GET lists every vault joined with its cap;
+// PUT /:name sets/updates a cap.
+// ---------------------------------------------------------------------------
+
+/**
+ * One row from `GET /api/vault-caps` — a vault name + its persisted storage
+ * cap. `cap_bytes: null` means the vault has no cap row (uncapped); the
+ * Phase-2 enforcement reader treats that as "no ceiling." `created_at` /
+ * `updated_at` are null for an uncapped vault.
+ */
+export interface VaultCapListing {
+  vault_name: string;
+  cap_bytes: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/**
+ * GET /api/vault-caps — list every vault registered on this hub joined with
+ * its persisted storage cap. Same `host:admin` Bearer pattern as `listUsers`.
+ */
+export async function listVaultCaps(): Promise<VaultCapListing[]> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch("/api/vault-caps", {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearer}` },
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { vault_caps: VaultCapListing[] };
+  return body.vault_caps ?? [];
+}
+
+/**
+ * PUT /api/vault-caps/:name — set or update a vault's storage cap (bytes).
+ * Server validates the vault is registered in services.json (400
+ * `vault_not_found`) and the cap is a positive integer. Returns the updated
+ * row. Same Bearer pattern; 401/403 dumps the cached token.
+ */
+export async function setVaultCap(vaultName: string, capBytes: number): Promise<VaultCapListing> {
+  const bearer = await getHostAdminToken();
+  const res = await fetch(`/api/vault-caps/${encodeURIComponent(vaultName)}`, {
+    method: "PUT",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify({ cap_bytes: capBytes }),
+  });
+  if (res.status === 401 || res.status === 403) {
+    clearCachedToken();
+    throw new HttpError(res.status, await readError(res));
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  const body = (await res.json()) as { vault_cap: VaultCapListing };
+  return body.vault_cap;
 }
 
 // ---------------------------------------------------------------------------
