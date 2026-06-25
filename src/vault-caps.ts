@@ -98,6 +98,18 @@ export function getVaultCapBytes(db: Database, vaultName: string): number | null
 }
 
 /**
+ * List every persisted vault cap (B5 admin visibility). Returns only vaults
+ * that HAVE a cap row — the admin surface joins this against the live
+ * services.json vault list so an uncapped vault still appears (as "uncapped")
+ * while a capped vault shows its ceiling. Ordered by `vault_name` for a
+ * deterministic table.
+ */
+export function listVaultCaps(db: Database): VaultCap[] {
+  const rows = db.query<Row, []>("SELECT * FROM vault_caps ORDER BY vault_name ASC").all();
+  return rows.map(rowToCap);
+}
+
+/**
  * Vault-delete cascade hook (parity with the other per-vault identity
  * artifacts swept in admin-vaults.ts `handleDeleteVault`): drop the cap row
  * when its vault is deleted so a re-created same-name vault doesn't inherit a

@@ -49,12 +49,16 @@ import {
   type CreateUserInput,
   HttpError,
   type UserListing,
+  type VaultCapListing,
   createUser,
   deleteUser,
+  formatBytes,
   getHubOriginSetting,
   listUserVaults,
   listUsers,
+  listVaultCaps,
   resetUserPassword,
+  setVaultCap,
   updateUserVaults,
 } from "../lib/api.ts";
 import { InvitesSection } from "./InvitesSection";
@@ -403,6 +407,8 @@ export function Users() {
       )}
 
       {state.kind === "ok" && <InvitesSection hubOrigin={state.data.hubOrigin} />}
+
+      {state.kind === "ok" && <VaultCapsSection />}
     </div>
   );
 }
@@ -510,6 +516,8 @@ function ListRendered({
           <thead>
             <tr>
               <th scope="col">Username</th>
+              <th scope="col">Email</th>
+              <th scope="col">Role</th>
               <th scope="col">Assigned vaults</th>
               <th scope="col">Password set</th>
               <th scope="col">Created</th>
@@ -548,6 +556,32 @@ function ListRendered({
                       <span className="badge" style={{ marginLeft: "0.5rem" }}>
                         first admin
                       </span>
+                    )}
+                  </td>
+                  <td>
+                    {u.email ? (
+                      // Email is the contactable identity captured at public
+                      // signup (B2) — the operator's "who signed up + how do I
+                      // reach them" column. mailto so a click drafts an email.
+                      <a href={`mailto:${u.email}`}>{u.email}</a>
+                    ) : (
+                      <span
+                        className="muted"
+                        title="No email on file (account predates signup-email capture)"
+                      >
+                        —
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    {/* No per-user role column exists in Phase 1 — the first
+                        admin is *the* admin by construction (earliest-created
+                        row). Surface that as the operator-facing "role" so a
+                        demo viewer can tell admin from member at a glance. */}
+                    {isFirstAdmin ? (
+                      <span className="badge">admin</span>
+                    ) : (
+                      <span className="muted">member</span>
                     )}
                   </td>
                   <td>
@@ -1148,4 +1182,254 @@ function CreateUserSection({
 function formatCreatedAt(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
+// ---------------------------------------------------------------------------
+// Vault caps section (B5 / D-slice). Lists every vault on this hub with its
+// persisted storage cap (human-readable) and an inline editor to set/update a
+// cap. The operator-facing "who's using how much room" surface for the shared
+// beta box. Usage bytes (consumed) live in the VAULT service, not hub, so this
+// shows the CAP only — no new hub→vault plumbing for the demo slice.
+// ---------------------------------------------------------------------------
+
+const BYTES_PER_GIB = 1024 * 1024 * 1024;
+
+/** Cap in bytes → a GB number the operator edits (3 sig figs). 0/null → "". */
+function bytesToGiBInput(bytes: number | null): string {
+  if (bytes === null) return "";
+  const gib = bytes / BYTES_PER_GIB;
+  // Trim to a tidy value: integers stay integers, fractions keep 2 decimals.
+  return Number.isInteger(gib) ? String(gib) : gib.toFixed(2);
+}
+
+type VaultCapsState =
+  | { kind: "loading" }
+  | { kind: "ok"; caps: VaultCapListing[] }
+  | { kind: "error"; message: string };
+
+/** Per-row edit state — only one cap row can be open at a time. */
+type CapEditState =
+  | { kind: "idle" }
+  | { kind: "open"; vaultName: string; gibInput: string }
+  | { kind: "submitting"; vaultName: string; gibInput: string }
+  | { kind: "error"; vaultName: string; gibInput: string; message: string };
+
+function VaultCapsSection(): React.ReactNode {
+  const [state, setState] = useState<VaultCapsState>({ kind: "loading" });
+  const [reload, setReload] = useState(0);
+  const [edit, setEdit] = useState<CapEditState>({ kind: "idle" });
+
+  useEffect(() => {
+    void reload;
+    let cancelled = false;
+    setState({ kind: "loading" });
+    listVaultCaps()
+      .then((caps) => {
+        if (cancelled) return;
+        setState({ kind: "ok", caps });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        const message = err instanceof Error ? err.message : String(err);
+        setState({ kind: "error", message });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reload]);
+
+  async function onSubmit(vaultName: string, gibInput: string): Promise<void> {
+    const gib = Number(gibInput);
+    if (!Number.isFinite(gib) || gib <= 0) {
+      setEdit({
+        kind: "error",
+        vaultName,
+        gibInput,
+        message: "Cap must be a positive number of GB.",
+      });
+      return;
+    }
+    setEdit({ kind: "submitting", vaultName, gibInput });
+    try {
+      await setVaultCap(vaultName, Math.round(gib * BYTES_PER_GIB));
+      setEdit({ kind: "idle" });
+      setReload((n) => n + 1);
+    } catch (err) {
+      const message =
+        err instanceof HttpError
+          ? `Set cap failed (${err.status}): ${err.message}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      setEdit({ kind: "error", vaultName, gibInput, message });
+    }
+  }
+
+  return (
+    <section style={{ marginTop: "1.5rem" }} data-testid="vault-caps-section">
+      <h2>Vault caps</h2>
+      <p className="muted">
+        Per-vault storage ceilings for this hub. Public-signup vaults are stamped with a default cap
+        (~1 GB); admin-provisioned vaults are uncapped until you set one. Edit a cap to raise or
+        lower a vault's ceiling.
+      </p>
+      {state.kind === "loading" && <p className="muted">Loading vault caps…</p>}
+      {state.kind === "error" && (
+        <>
+          <div className="error-banner">
+            Couldn't load vault caps: <code>{state.message}</code>
+          </div>
+          <button type="button" className="secondary" onClick={() => setReload((n) => n + 1)}>
+            Retry
+          </button>
+        </>
+      )}
+      {state.kind === "ok" && state.caps.length === 0 && (
+        <div className="empty empty-rich">
+          <p className="empty-headline">No vaults on this hub yet.</p>
+          <p className="muted">Caps appear here once a vault is registered.</p>
+        </div>
+      )}
+      {state.kind === "ok" && state.caps.length > 0 && (
+        <div className="table-scroll" style={{ marginTop: "1rem" }}>
+          <table className="user-table">
+            <thead>
+              <tr>
+                <th scope="col">Vault</th>
+                <th scope="col">Cap</th>
+                <th scope="col">Updated</th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.caps.map((c) => {
+                const editForRow =
+                  (edit.kind === "open" || edit.kind === "submitting" || edit.kind === "error") &&
+                  edit.vaultName === c.vault_name
+                    ? edit
+                    : null;
+                return (
+                  <tr key={c.vault_name} data-vault-name={c.vault_name}>
+                    <td>
+                      <code>{c.vault_name}</code>
+                    </td>
+                    <td data-testid={`vault-cap-${c.vault_name}`}>
+                      {c.cap_bytes !== null ? (
+                        formatBytes(c.cap_bytes)
+                      ) : (
+                        <span className="muted" title="No cap set — this vault is uncapped">
+                          uncapped
+                        </span>
+                      )}
+                    </td>
+                    <td>
+                      {c.updated_at ? (
+                        <span title={c.updated_at}>{formatCreatedAt(c.updated_at)}</span>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
+                    <td>
+                      {editForRow ? (
+                        <CapEditRowForm
+                          vaultName={c.vault_name}
+                          state={editForRow}
+                          onCancel={() => setEdit({ kind: "idle" })}
+                          onChange={(gibInput) =>
+                            setEdit({ kind: "open", vaultName: c.vault_name, gibInput })
+                          }
+                          onSubmit={(gibInput) => {
+                            void onSubmit(c.vault_name, gibInput);
+                          }}
+                        />
+                      ) : (
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() =>
+                            setEdit({
+                              kind: "open",
+                              vaultName: c.vault_name,
+                              gibInput: bytesToGiBInput(c.cap_bytes),
+                            })
+                          }
+                          aria-label={`Edit cap for ${c.vault_name}`}
+                        >
+                          Edit cap
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+interface CapEditRowFormProps {
+  vaultName: string;
+  state:
+    | { kind: "open"; vaultName: string; gibInput: string }
+    | { kind: "submitting"; vaultName: string; gibInput: string }
+    | { kind: "error"; vaultName: string; gibInput: string; message: string };
+  onCancel: () => void;
+  onChange: (gibInput: string) => void;
+  onSubmit: (gibInput: string) => void;
+}
+
+function CapEditRowForm({
+  vaultName,
+  state,
+  onCancel,
+  onChange,
+  onSubmit,
+}: CapEditRowFormProps): React.ReactNode {
+  const submitting = state.kind === "submitting";
+  const errorMsg = state.kind === "error" ? state.message : null;
+  const inputId = `cap-input-${vaultName}`;
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSubmit(state.gibInput);
+      }}
+      aria-label={`Edit cap for ${vaultName}`}
+      style={{
+        padding: "0.5rem",
+        background: "var(--bg-soft, #f5f5f5)",
+        borderRadius: "4px",
+      }}
+    >
+      <label htmlFor={inputId}>
+        Cap for <code>{vaultName}</code> <span className="muted">(GB)</span>
+      </label>
+      <br />
+      <input
+        id={inputId}
+        type="number"
+        step="0.01"
+        value={state.gibInput}
+        disabled={submitting}
+        onChange={(e) => onChange(e.target.value)}
+        style={{ width: "8rem", marginTop: "0.25rem" }}
+      />
+      {errorMsg && (
+        <div className="error-banner" style={{ marginTop: "0.25rem" }}>
+          <code>{errorMsg}</code>
+        </div>
+      )}
+      <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+        <button type="submit" disabled={submitting}>
+          {submitting ? "Saving…" : "Save cap"}
+        </button>
+        <button type="button" className="secondary" onClick={onCancel} disabled={submitting}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
 }

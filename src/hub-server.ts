@@ -96,6 +96,8 @@
  *   /api/users/vaults             (GET)        → vault-name list for assigned-vault picker (host:admin)
  *   /api/users/<id>               (DELETE)     → hard-delete user + revoke tokens (host:admin)
  *   /api/users/<id>/reset-password (POST)      → admin-initiated password reset (host:admin)
+ *   /api/vault-caps               (GET)        → list vaults + persisted storage caps (host:admin)
+ *   /api/vault-caps/<name>        (PUT)        → set/update a vault's storage cap (host:admin)
  *   /login                        (GET + POST) → operator password login
  *   /login/2fa                    (POST)       → second-factor (TOTP/backup) step
  *                                                 (hub#473; reached after a correct
@@ -221,6 +223,7 @@ import {
   handleResetUserPassword,
   handleUpdateUserVaults,
 } from "./api-users.ts";
+import { handleListVaultCaps, handleSetVaultCap } from "./api-vault-caps.ts";
 import { gateUiAudience, resolveUiMount } from "./audience-gate.ts";
 import {
   CHROME_OPT_OUT_PREFIXES,
@@ -3345,6 +3348,30 @@ export function hubFetch(
           return new Response("not found", { status: 404 });
         }
         return handleRevokeInvite(req, id, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          manifestPath,
+        });
+      }
+
+      // Per-vault storage caps (B5 admin visibility / D-slice). GET lists every
+      // vault from services.json joined with its persisted cap; PUT /:name
+      // sets/updates a cap. host:admin-gated, same gate flavor as /api/users.
+      if (pathname === "/api/vault-caps") {
+        if (!getDb) return dbNotConfigured();
+        return handleListVaultCaps(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          manifestPath,
+        });
+      }
+      if (pathname.startsWith("/api/vault-caps/")) {
+        if (!getDb) return dbNotConfigured();
+        const name = decodeURIComponent(pathname.slice("/api/vault-caps/".length));
+        if (!name || name.includes("/")) {
+          return new Response("not found", { status: 404 });
+        }
+        return handleSetVaultCap(req, name, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
           manifestPath,

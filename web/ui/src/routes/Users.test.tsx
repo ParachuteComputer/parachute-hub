@@ -23,6 +23,8 @@ vi.mock("../lib/api.ts", async (orig) => {
     resetUserPassword: vi.fn(),
     updateUserVaults: vi.fn(),
     getHubOriginSetting: vi.fn(),
+    listVaultCaps: vi.fn(),
+    setVaultCap: vi.fn(),
   };
 });
 
@@ -38,6 +40,10 @@ beforeEach(() => {
     resolved_issuer: "https://hub.example.com",
     source: "settings",
   });
+  // The VaultCapsSection (rendered below the users table once the list
+  // resolves) fetches caps on mount. Default to empty so existing tests
+  // load cleanly; the cap-specific tests override it.
+  vi.mocked(api.listVaultCaps).mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -57,6 +63,7 @@ function user(username: string, overrides: Partial<api.UserListing> = {}): api.U
     id: `id-${username}`,
     username,
     password_changed: true,
+    email: null,
     assigned_vaults: [],
     created_at: "2026-05-01T12:00:00.000Z",
     ...overrides,
@@ -93,8 +100,9 @@ describe("Users — list rendering", () => {
     // badge specifically by its short label rather than matching any
     // "first admin" occurrence anywhere in the DOM.)
     expect(screen.getByText("first admin")).toBeInTheDocument();
-    // assigned_vault: null renders as em-dash.
-    expect(screen.getByText("—")).toBeInTheDocument();
+    // Em-dash placeholders appear in several cells now (empty assigned-vaults,
+    // null email). Assert at least one is present rather than uniqueness.
+    expect(screen.getAllByText("—").length).toBeGreaterThan(0);
     // password_changed: false renders the "pending first login" label.
     expect(screen.getByText(/pending first login/i)).toBeInTheDocument();
   });
@@ -601,5 +609,90 @@ describe("Users — sign-in handoff URL (onboarding discoverability)", () => {
     const banner = screen.getByText(/prompted to change their password/i).closest("output");
     // No double slash — the loader trims the trailing slash.
     expect(within(banner!).getByText("https://hub.example.com/login")).toBeInTheDocument();
+  });
+});
+
+describe("Users — email + role columns (B5)", () => {
+  it("renders the captured email as a mailto link and admin/member roles", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([
+      user("operator", { email: null }),
+      user("alice", { email: "alice@example.com" }),
+    ]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
+    // Email surfaced as a mailto link.
+    const mail = screen.getByText("alice@example.com");
+    expect(mail).toHaveAttribute("href", "mailto:alice@example.com");
+    // First admin → "admin" badge; the second user → "member".
+    expect(screen.getByText("admin")).toBeInTheDocument();
+    expect(screen.getByText("member")).toBeInTheDocument();
+  });
+});
+
+describe("Users — vault caps section (B5)", () => {
+  it("lists vaults with human-readable caps + uncapped placeholder", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    vi.mocked(api.listVaultCaps).mockResolvedValue([
+      {
+        vault_name: "beta",
+        cap_bytes: 1024 * 1024 * 1024,
+        created_at: "2026-06-20T00:00:00.000Z",
+        updated_at: "2026-06-21T00:00:00.000Z",
+      },
+      { vault_name: "personal", cap_bytes: null, created_at: null, updated_at: null },
+    ]);
+    renderRoute();
+    // Wait for the cap row itself (the section renders in a loading state
+    // first, then resolves its own listVaultCaps fetch).
+    const betaCell = await screen.findByTestId("vault-cap-beta");
+    // 1 GiB renders as "1.0 GB" via formatBytes.
+    expect(within(betaCell).getByText("1.0 GB")).toBeInTheDocument();
+    // No cap → "uncapped".
+    expect(
+      within(screen.getByTestId("vault-cap-personal")).getByText("uncapped"),
+    ).toBeInTheDocument();
+  });
+
+  it("edits a cap → PUTs bytes and reloads", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    vi.mocked(api.listVaultCaps).mockResolvedValue([
+      { vault_name: "beta", cap_bytes: null, created_at: null, updated_at: null },
+    ]);
+    vi.mocked(api.setVaultCap).mockResolvedValue({
+      vault_name: "beta",
+      cap_bytes: 2 * 1024 * 1024 * 1024,
+      created_at: "2026-06-25T00:00:00.000Z",
+      updated_at: "2026-06-25T00:00:00.000Z",
+    });
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /edit cap for beta/i }));
+    fireEvent.change(screen.getByLabelText(/cap for/i, { selector: "#cap-input-beta" }), {
+      target: { value: "2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save cap/i }));
+    await waitFor(() =>
+      expect(api.setVaultCap).toHaveBeenCalledWith("beta", 2 * 1024 * 1024 * 1024),
+    );
+  });
+
+  it("rejects a non-positive cap client-side without calling the API", async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([user("operator")]);
+    vi.mocked(api.listUserVaults).mockResolvedValue([]);
+    vi.mocked(api.listVaultCaps).mockResolvedValue([
+      { vault_name: "beta", cap_bytes: null, created_at: null, updated_at: null },
+    ]);
+    renderRoute();
+    fireEvent.click(await screen.findByRole("button", { name: /edit cap for beta/i }));
+    fireEvent.change(screen.getByLabelText(/cap for/i, { selector: "#cap-input-beta" }), {
+      target: { value: "0" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save cap/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/cap must be a positive number/i)).toBeInTheDocument(),
+    );
+    expect(api.setVaultCap).not.toHaveBeenCalled();
   });
 });
