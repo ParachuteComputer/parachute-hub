@@ -55,9 +55,20 @@ export interface SignAccessTokenOpts {
   clientId: string;
   /**
    * Hub origin — sets the `iss` claim. Required: every consumer (vault,
-   * scribe, channel) validates `iss` against `PARACHUTE_HUB_ORIGIN`, and a
-   * missing claim is rejected. Callers derive this via `deriveHubOrigin()`
-   * or thread it from `OAuthDeps.issuer`.
+   * scribe, agent) validates `iss`, and a missing claim is rejected. Callers
+   * derive this via `deriveHubOrigin()` or thread it from `OAuthDeps.issuer`
+   * (the per-request origin from `resolveIssuer`).
+   *
+   * Multi-origin iss-set (onboarding-streamline 2026-06-25): consumers no
+   * longer pin `iss` to a SINGLE `PARACHUTE_HUB_ORIGIN`. The hub publishes the
+   * SET of origins it legitimately answers on via `PARACHUTE_HUB_ORIGINS`
+   * (`buildHubBoundOrigins` — issuer ∪ loopback ∪ expose-state ∪ platform),
+   * and a scope-guard ≥0.5.0 consumer accepts `iss` ∈ that set. So a token
+   * minted here with one URL of a multi-URL box validates when the resource is
+   * reached via another URL of the SAME box. Mint stays per-request as-is: the
+   * canonical configured origin (the intended Caddy/zero-SSH deploy) is minted
+   * on every request AND is a member of the published set, so mint and validate
+   * already align — no clamp needed here.
    */
   issuer: string;
   /**

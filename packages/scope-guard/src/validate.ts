@@ -21,6 +21,12 @@ import {
  *   - The hub origin is the trust pin. `iss` MUST equal it; without that
  *     check, anyone could mint a token against any RSA key and pass JWKS
  *     verification (jose verifies the signature, not who issued the token).
+ *     With `allowedIssuers`, the pin widens from a single origin to a
+ *     hub-CONTROLLED SET of the hub's own legitimate origins (one box reached
+ *     via several URLs — loopback ∪ sslip.io ∪ custom domain). This is still a
+ *     pin against the hub's origins, NOT a relaxation: the signature verify
+ *     runs first and proves only this hub minted the token; the set never
+ *     includes an unvalidated request Host. See `allowedIssuers` jsdoc.
  *   - JWKS is fetched from `<jwksOrigin>/.well-known/jwks.json`, defaulting
  *     to the same `hubOrigin` used for the `iss` pin. Co-located resource
  *     servers can override `jwksOrigin` (e.g. loopback) to read their hub's
@@ -144,6 +150,43 @@ export interface CreateScopeGuardOptions {
    * form matches what the hub mints.
    */
   hubOrigin: string | (() => string);
+
+  /**
+   * The SET of additional origins to accept in the token's `iss` claim,
+   * beyond `hubOrigin`. **Optional and purely additive** — when omitted (the
+   * default), the `iss` check is byte-identical to before this seam existed:
+   * exact match against the single resolved `hubOrigin`.
+   *
+   * Motivation (multi-origin iss-set, onboarding-streamline 2026-06-25): one
+   * box reachable on several URLs at once (loopback + `<ip>.sslip.io` + a
+   * custom domain behind Caddy) mints tokens whose `iss` is whichever origin
+   * the request arrived on. The hub's signing KEY is stable and
+   * origin-independent — the only thing the origin drives is the `iss` string —
+   * so a token minted under URL-A must validate when the resource is reached
+   * via URL-B on the SAME box. jose's `issuer` option already accepts
+   * `string | string[]`; this option supplies the extra members of that set.
+   *
+   * SECURITY INVARIANT (load-bearing — do not loosen): the values returned
+   * here MUST be the hub's own legitimate origins ONLY — i.e. the output of
+   * the hub's `buildHubBoundOrigins` (configured issuer ∪ loopback aliases ∪
+   * expose-state public origin ∪ platform origin), published to the resource
+   * server out-of-band (env / config) by the HUB/OPERATOR. They must NEVER
+   * derive from an unvalidated request `Host` / `X-Forwarded-Host`. Accepting
+   * `iss ∈ this-set` is safe ONLY because the JWKS signature verify
+   * (`jwtVerify`, which runs FIRST and unconditionally) already proves THIS
+   * hub minted the token. The set is a belt-and-suspenders allowlist layered
+   * on top of the signature gate, never a substitute for it. A token signed by
+   * a foreign key fails the signature step regardless of its `iss`.
+   *
+   * Shape: a resolver function returning the set, re-evaluated per call so an
+   * operator widening the box's origins (a new domain via the env var) is
+   * picked up without a resource-server restart. The resolved `hubOrigin` is
+   * always added to whatever this returns, so a caller need not (but may)
+   * include it. Empty / undefined → identical to omitting the option (single
+   * `hubOrigin` only). Trailing slashes are stripped; malformed entries are
+   * dropped.
+   */
+  allowedIssuers?: () => readonly string[] | undefined;
 
   /**
    * Origin to FETCH the JWKS from, when it must differ from the `hubOrigin`
@@ -315,6 +358,7 @@ function resolveOrigin(input: string | (() => string)): string {
 export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
   const {
     hubOrigin,
+    allowedIssuers,
     jwksOrigin,
     jwks: jwksOpts,
     jwksGetter: injected,
@@ -397,17 +441,55 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
   }
 
   /**
+   * Resolve the accepted-`iss` value passed to jose's `issuer` option.
+   *
+   * Default (no `allowedIssuers`): the single canonical `origin` — byte-
+   * identical exact-match behavior to before the multi-origin seam existed.
+   *
+   * With `allowedIssuers`: the UNION of `origin` and the (sanitized) extra
+   * origins, deduped, returned as a `string[]`. jose accepts `string[]` for
+   * `issuer` and passes a token whose `iss` matches ANY member — this is the
+   * "same box, two URLs" tolerance. The canonical `origin` is always present
+   * so a single-member set behaves exactly like the default.
+   *
+   * SECURITY: this set is the hub's own legitimate-origin allowlist (see
+   * `allowedIssuers` jsdoc). The signature verify in `jwtVerify` runs FIRST
+   * and proves provenance unconditionally; widening the accepted `iss` from
+   * one string to this hub-controlled set never accepts a foreign-key token.
+   */
+  function resolveAcceptedIssuers(origin: string): string | string[] {
+    if (!allowedIssuers) return origin;
+    const extra = allowedIssuers();
+    if (!extra || extra.length === 0) return origin;
+    const set = new Set<string>([origin]);
+    for (const raw of extra) {
+      if (typeof raw !== "string") continue;
+      const trimmed = raw.replace(/\/$/, "");
+      if (trimmed.length > 0) set.add(trimmed);
+    }
+    // A single-member set collapses to the bare string so the
+    // default/single-origin path stays observably identical (jose treats
+    // `string` and `[string]` the same, but the string form keeps the
+    // configured-shape obvious in logs / tests).
+    return set.size === 1 ? origin : Array.from(set);
+  }
+
+  /**
    * Verify the JWT signature + issuer, with a force-reload-and-retry-once on
    * rotation-class failures. Returns the verified payload or throws a wrapped
    * `HubJwtError`. See the inline comment for the recovery rationale.
+   *
+   * `acceptedIssuers` is what jose checks `iss` against — a single string
+   * (default / single-origin) or a string[] (the multi-origin set). jose
+   * passes a token whose `iss` matches any member.
    */
   async function verifyWithRotationRetry(
     token: string,
-    origin: string,
+    acceptedIssuers: string | string[],
     getter: JwksGetter,
   ): Promise<JWTPayload> {
     try {
-      const verified = await jwtVerify(token, getter, { issuer: origin });
+      const verified = await jwtVerify(token, getter, { issuer: acceptedIssuers });
       return verified.payload;
     } catch (err) {
       const code = classifyJoseError(err);
@@ -429,7 +511,7 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
             // The retry's outcome — success OR error — is final and flows
             // through the same classify-and-wrap. No second reload.
             try {
-              const verified = await jwtVerify(token, getter, { issuer: origin });
+              const verified = await jwtVerify(token, getter, { issuer: acceptedIssuers });
               return verified.payload;
             } catch (retryErr) {
               throwWrapped(retryErr);
@@ -443,15 +525,20 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
 
   return {
     async validateHubJwt(token, validateOpts = {}) {
-      // `origin` pins the `iss` check (and the revocation-list endpoint, which
-      // lives on the issuer). `jwksFetchOrigin` is where the keys are fetched —
-      // identical to `origin` unless the caller supplied `jwksOrigin`. Both are
-      // resolved per call so env changes propagate without a restart.
+      // `origin` is the CANONICAL hub origin. It pins (a) the revocation-list
+      // endpoint, which lives on the canonical issuer, and (b) the default
+      // JWKS-fetch origin. `acceptedIssuers` is what the token's `iss` is
+      // checked against — `origin` alone by default, or the multi-origin SET
+      // (origin ∪ the hub's other legitimate origins) when `allowedIssuers` is
+      // supplied. `jwksFetchOrigin` is where the keys are fetched — identical
+      // to `origin` unless the caller supplied `jwksOrigin`. All resolved per
+      // call so env changes propagate without a restart.
       const origin = resolveOrigin(hubOrigin);
+      const acceptedIssuers = resolveAcceptedIssuers(origin);
       const jwksFetchOrigin = resolveOrigin(jwksOriginInput);
       const getter = pickGetter(jwksFetchOrigin);
 
-      const payload: JWTPayload = await verifyWithRotationRetry(token, origin, getter);
+      const payload: JWTPayload = await verifyWithRotationRetry(token, acceptedIssuers, getter);
 
       if (typeof payload.sub !== "string" || payload.sub.length === 0) {
         throw new HubJwtError("shape", "hub JWT missing required `sub` claim");

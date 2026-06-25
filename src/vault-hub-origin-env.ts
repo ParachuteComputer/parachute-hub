@@ -29,7 +29,10 @@
 import { join } from "node:path";
 import { parseEnvFile, removeEnvLine, upsertEnvLine, writeEnvFile } from "./env-file.ts";
 import { EXPOSE_STATE_PATH, readExposeState } from "./expose-state.ts";
-import { HUB_ORIGIN_ENV } from "./hub-origin.ts";
+import { readHubPort } from "./hub-control.ts";
+import { HUB_ORIGINS_ENV, HUB_ORIGIN_ENV, serializeHubOrigins } from "./hub-origin.ts";
+import { HUB_UNIT_DEFAULT_PORT } from "./hub-unit.ts";
+import { buildHubBoundOrigins } from "./origin-check.ts";
 
 /**
  * Loopback origins (`http://127.0.0.1:<port>`, `localhost`, `[::1]`) are the
@@ -92,10 +95,79 @@ function vaultEnvPath(configDir: string): string {
 }
 
 /**
+ * Compose `https://${FLY_APP_NAME}.fly.dev` when FLY_APP_NAME is a plausible
+ * Fly app slug (no slashes — Fly slugs don't contain them). Mirrors the
+ * private helper in operator-token.ts / hub-server.ts; kept local so the
+ * origin-SET assembly here doesn't reach across modules for a 3-line guard.
+ */
+function flyDefaultOriginFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  const app = env.FLY_APP_NAME;
+  if (typeof app !== "string" || app.length === 0 || app.includes("/")) return undefined;
+  return `https://${app}.fly.dev`;
+}
+
+/**
+ * Assemble the comma-separated `PARACHUTE_HUB_ORIGINS` value the hub injects
+ * into supervised resource servers (multi-origin iss-set). The SET is the
+ * hub's own legitimate origins — the env-injection sibling of the operator
+ * token's `buildKnownIssuersForOperatorToken` and the per-request
+ * `buildHubBoundOrigins` call in hub-server.ts. Inputs:
+ *
+ *   - `issuer` — the canonical hub origin the child also receives as the
+ *     single `PARACHUTE_HUB_ORIGIN` (the seed; always included).
+ *   - loopback aliases — `http://127.0.0.1:<port>` ∪ `http://localhost:<port>`
+ *     for the hub's port (`readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT`).
+ *   - the expose-state public origin — `expose-state.json`'s `hubOrigin`.
+ *   - the platform/env public origin — `RENDER_EXTERNAL_URL` ∪ the composed
+ *     Fly default (container deploys where the public origin comes from the
+ *     platform, not expose-state).
+ *
+ * SECURITY INVARIANT: every input is hub/operator-controlled config or
+ * on-disk state — NEVER an unvalidated request `Host` / `X-Forwarded-Host`.
+ * The accepted-`iss` widening this enables is safe only because the resource
+ * server verifies the JWKS signature first; this set is the belt-and-
+ * suspenders allowlist layered on top.
+ *
+ * Returns `undefined` when the seed issuer is absent AND nothing else resolves
+ * (caller skips the env var so the child keeps single-origin behavior).
+ */
+export function buildHubOriginsEnvValue(
+  configDir: string,
+  issuer: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  exposeStatePath: string = EXPOSE_STATE_PATH,
+): string | undefined {
+  const loopbackPort = readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT;
+  let exposeHubOrigin: string | undefined;
+  try {
+    exposeHubOrigin = readExposeState(exposeStatePath)?.hubOrigin;
+  } catch {
+    // A malformed expose-state.json must never block a module spawn — the seed
+    // issuer + loopback aliases already cover legitimate access.
+    exposeHubOrigin = undefined;
+  }
+  const platformOrigin = env.RENDER_EXTERNAL_URL ?? flyDefaultOriginFromEnv(env);
+  const origins = buildHubBoundOrigins({
+    // buildHubBoundOrigins requires `issuer`; pass "" when absent (it's dropped
+    // by the URL parse) so the loopback aliases still seed the set.
+    issuer: issuer ?? "",
+    loopbackPort,
+    ...(exposeHubOrigin !== undefined ? { exposeHubOrigin } : {}),
+    ...(platformOrigin !== undefined ? { platformOrigin } : {}),
+  });
+  return serializeHubOrigins(origins);
+}
+
+/**
  * Upsert `PARACHUTE_HUB_ORIGIN=<origin>` into `vault/.env` when `origin` is a
- * non-loopback public origin. Idempotent — skips the write (and the log) when
- * the value is already current so repeated `start`s don't churn the file.
- * Returns true iff the file was written this call.
+ * non-loopback public origin, AND the `PARACHUTE_HUB_ORIGINS` set (the
+ * multi-origin iss-set: origin ∪ loopback aliases ∪ expose-state ∪ platform)
+ * so the daemon-boot path validates `iss` against every URL the box answers on
+ * (a Caddy-fronted box reached via loopback + sslip.io + a custom domain at
+ * once). The set is assembled from hub-controlled inputs only (see
+ * `buildHubOriginsEnvValue`'s security invariant). Idempotent — skips the
+ * write (and the log) when BOTH values are already current so repeated
+ * `start`s don't churn the file. Returns true iff the file was written.
  */
 export function persistVaultHubOrigin(
   configDir: string,
@@ -105,26 +177,47 @@ export function persistVaultHubOrigin(
   if (isLoopbackOrigin(origin)) return false;
   const path = vaultEnvPath(configDir);
   const parsed = parseEnvFile(path);
-  if (parsed.values[HUB_ORIGIN_ENV] === origin) return false;
-  writeEnvFile(path, upsertEnvLine(parsed.lines, HUB_ORIGIN_ENV, origin));
-  log(`  persisted ${HUB_ORIGIN_ENV}=${origin} to ${path} (survives daemon restart)`);
+  const originsValue = buildHubOriginsEnvValue(configDir, origin);
+  const originCurrent = parsed.values[HUB_ORIGIN_ENV] === origin;
+  const originsCurrent =
+    originsValue === undefined || parsed.values[HUB_ORIGINS_ENV] === originsValue;
+  if (originCurrent && originsCurrent) return false;
+  let lines = parsed.lines;
+  if (!originCurrent) lines = upsertEnvLine(lines, HUB_ORIGIN_ENV, origin);
+  if (!originsCurrent && originsValue !== undefined) {
+    lines = upsertEnvLine(lines, HUB_ORIGINS_ENV, originsValue);
+  }
+  writeEnvFile(path, lines);
+  if (!originCurrent) {
+    log(`  persisted ${HUB_ORIGIN_ENV}=${origin} to ${path} (survives daemon restart)`);
+  }
+  if (!originsCurrent && originsValue !== undefined) {
+    log(`  persisted ${HUB_ORIGINS_ENV}=${originsValue} to ${path} (multi-origin iss-set)`);
+  }
   return true;
 }
 
 /**
- * Drop a previously-persisted `PARACHUTE_HUB_ORIGIN` from `vault/.env`. Called
- * on `expose … off`: once exposure is torn down, a local-only hub mints tokens
- * with a loopback `iss`, so a stale public origin left in `.env` would itself
- * cause the mismatch. Removing the line reverts vault to its loopback default
- * (`getHubOrigin`), which matches what the local hub now stamps. No-op (returns
- * false) when the key isn't present. Returns true iff the file was rewritten.
+ * Drop a previously-persisted `PARACHUTE_HUB_ORIGIN` (and `PARACHUTE_HUB_ORIGINS`)
+ * from `vault/.env`. Called on `expose … off`: once exposure is torn down, a
+ * local-only hub mints tokens with a loopback `iss`, so a stale public origin
+ * left in `.env` would itself cause the mismatch. Removing the lines reverts
+ * vault to its loopback default (`getHubOrigin`), which matches what the local
+ * hub now stamps. No-op (returns false) when neither key is present. Returns
+ * true iff the file was rewritten.
  */
 export function clearVaultHubOrigin(configDir: string, log: (line: string) => void): boolean {
   const path = vaultEnvPath(configDir);
   const parsed = parseEnvFile(path);
-  if (parsed.values[HUB_ORIGIN_ENV] === undefined) return false;
-  writeEnvFile(path, removeEnvLine(parsed.lines, HUB_ORIGIN_ENV));
-  log(`  cleared ${HUB_ORIGIN_ENV} from ${path} (exposure torn down)`);
+  const hadOrigin = parsed.values[HUB_ORIGIN_ENV] !== undefined;
+  const hadOrigins = parsed.values[HUB_ORIGINS_ENV] !== undefined;
+  if (!hadOrigin && !hadOrigins) return false;
+  let lines = parsed.lines;
+  if (hadOrigin) lines = removeEnvLine(lines, HUB_ORIGIN_ENV);
+  if (hadOrigins) lines = removeEnvLine(lines, HUB_ORIGINS_ENV);
+  writeEnvFile(path, lines);
+  if (hadOrigin) log(`  cleared ${HUB_ORIGIN_ENV} from ${path} (exposure torn down)`);
+  if (hadOrigins) log(`  cleared ${HUB_ORIGINS_ENV} from ${path} (exposure torn down)`);
   return true;
 }
 

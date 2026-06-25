@@ -393,6 +393,142 @@ describe("createScopeGuard — failure modes (HubJwtError.code)", () => {
   });
 });
 
+describe("createScopeGuard — multi-origin iss-set (allowedIssuers)", () => {
+  // The "same box, multiple URLs" case (onboarding-streamline 2026-06-25).
+  // A Caddy-fronted box reachable via loopback + <ip>.sslip.io + a custom
+  // domain mints `iss` = whichever URL the request arrived on; a token minted
+  // under URL-A must validate when the resource is reached via URL-B on the
+  // SAME box. The signing key is stable + origin-independent (the fixture
+  // serves ONE keypair), so widening the accepted-`iss` from one string to the
+  // hub's legitimate-origin SET is safe — the signature verify still gates
+  // provenance.
+  //
+  // `hubOrigin` = fixture.origin so JWKS + revocation fetch from the real
+  // fixture; the second/third URLs are provided via `allowedIssuers`. The
+  // fixture origin plays "URL-A"; "https://b.example" + "https://c.example"
+  // are the other URLs of the same box.
+  const URL_B = "https://b.example";
+  const URL_C = "https://c.example";
+
+  test("(a) token iss=A validates when allowed set is {A,B}", async () => {
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowedIssuers: () => [fixture.origin, URL_B],
+    });
+    const token = await signJwt(kp, { iss: fixture.origin });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.sub).toBe("user-1");
+    guard.resetJwksCache();
+  });
+
+  test("(b) token iss=B validates against set {A,B} — the core same-box-two-URLs case", async () => {
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowedIssuers: () => [fixture.origin, URL_B],
+    });
+    // Token minted under URL-B, presented to a resource reached via URL-A.
+    const token = await signJwt(kp, { iss: URL_B });
+    const claims = await guard.validateHubJwt(token);
+    expect(claims.sub).toBe("user-1");
+    guard.resetJwksCache();
+  });
+
+  test("(c) token iss=C is REJECTED against set {A,B}", async () => {
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowedIssuers: () => [fixture.origin, URL_B],
+    });
+    const token = await signJwt(kp, { iss: URL_C });
+    await expectError(guard.validateHubJwt(token), "issuer", /verification failed/);
+    guard.resetJwksCache();
+  });
+
+  test("(d) single-origin config → identical exact-match behavior (back-compat)", async () => {
+    // No allowedIssuers → byte-identical to before the seam existed: exact
+    // match against the single hubOrigin, foreign iss rejected.
+    const guard = createScopeGuard({ hubOrigin: fixture.origin });
+    const ok = await signJwt(kp, { iss: fixture.origin });
+    expect((await guard.validateHubJwt(ok)).sub).toBe("user-1");
+    const bad = await signJwt(kp, { iss: URL_B });
+    await expectError(guard.validateHubJwt(bad), "issuer", /verification failed/);
+    guard.resetJwksCache();
+  });
+
+  test("(d') allowedIssuers returning empty/undefined → exact-match on hubOrigin only", async () => {
+    // Defense: a resolver that returns an empty array (or undefined) collapses
+    // to the single-origin path — a non-hubOrigin iss is still rejected, never
+    // silently widened.
+    const guardEmpty = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowedIssuers: () => [],
+    });
+    expect((await guardEmpty.validateHubJwt(await signJwt(kp, { iss: fixture.origin }))).sub).toBe(
+      "user-1",
+    );
+    await expectError(
+      guardEmpty.validateHubJwt(await signJwt(kp, { iss: URL_B })),
+      "issuer",
+      /verification failed/,
+    );
+    guardEmpty.resetJwksCache();
+
+    const guardUndef = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowedIssuers: () => undefined,
+    });
+    await expectError(
+      guardUndef.validateHubJwt(await signJwt(kp, { iss: URL_B })),
+      "issuer",
+      /verification failed/,
+    );
+    guardUndef.resetJwksCache();
+  });
+
+  test("(e) hubOrigin is always accepted even when allowedIssuers omits it", async () => {
+    // The canonical hubOrigin (= JWKS/revocation pin) is always a member of the
+    // accepted set regardless of what allowedIssuers returns — so a caller that
+    // returns only the *extra* origins never accidentally locks out the
+    // canonical one. Loopback-as-canonical is the always-present case in
+    // production (buildHubBoundOrigins always seeds loopback aliases).
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowedIssuers: () => [URL_B, URL_C], // deliberately omits fixture.origin
+    });
+    const token = await signJwt(kp, { iss: fixture.origin });
+    expect((await guard.validateHubJwt(token)).sub).toBe("user-1");
+    // …and B is still accepted (it's in the extra set).
+    expect((await guard.validateHubJwt(await signJwt(kp, { iss: URL_B }))).sub).toBe("user-1");
+    guard.resetJwksCache();
+  });
+
+  test("allowedIssuers is re-evaluated per call (widening without restart)", async () => {
+    // An operator adding a domain (new env value) is picked up on the next
+    // request without a process restart — mirrors the resolver-per-call
+    // contract the existing hubOrigin/jwksOrigin resolvers already honor.
+    let allowed: string[] = [fixture.origin];
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowedIssuers: () => allowed,
+    });
+    const tokenB = await signJwt(kp, { iss: URL_B });
+    await expectError(guard.validateHubJwt(tokenB), "issuer", /verification failed/);
+    // Operator widens the set mid-process.
+    allowed = [fixture.origin, URL_B];
+    expect((await guard.validateHubJwt(tokenB)).sub).toBe("user-1");
+    guard.resetJwksCache();
+  });
+
+  test("trailing slashes in allowedIssuers are normalized (match hub-minted iss)", async () => {
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      allowedIssuers: () => [`${URL_B}/`],
+    });
+    const token = await signJwt(kp, { iss: URL_B });
+    expect((await guard.validateHubJwt(token)).sub).toBe("user-1");
+    guard.resetJwksCache();
+  });
+});
+
 describe("createScopeGuard — injected JWKS getter", () => {
   test("uses injected getter, ignores cache + origin fetch", async () => {
     const realGuard = makeGuard();

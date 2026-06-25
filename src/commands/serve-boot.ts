@@ -18,7 +18,7 @@
 
 import { join } from "node:path";
 import { readEnvFileValues } from "../env-file.ts";
-import { HUB_ORIGIN_ENV } from "../hub-origin.ts";
+import { HUB_ORIGINS_ENV, HUB_ORIGIN_ENV } from "../hub-origin.ts";
 import { ModuleManifestError } from "../module-manifest.ts";
 import {
   type ServiceSpec,
@@ -30,6 +30,7 @@ import {
 import { type ServiceEntry, readManifestLenient, upsertService } from "../services-manifest.ts";
 import { enrichedPath } from "../spawn-path.ts";
 import type { Supervisor } from "../supervisor.ts";
+import { buildHubOriginsEnvValue } from "../vault-hub-origin-env.ts";
 
 export interface BootOpts {
   /** Path to services.json. */
@@ -197,7 +198,20 @@ export function buildModuleSpawnRequest(
     PORT: String(entry.port),
     ...fileEnvSansPort,
   };
-  if (opts.hubOrigin) env[HUB_ORIGIN_ENV] = opts.hubOrigin;
+  if (opts.hubOrigin) {
+    env[HUB_ORIGIN_ENV] = opts.hubOrigin;
+    // Multi-origin iss-set (onboarding-streamline 2026-06-25): alongside the
+    // single canonical origin, inject the SET of origins this hub legitimately
+    // answers on (issuer ∪ loopback aliases ∪ expose-state ∪ platform). A
+    // resource server on scope-guard ≥0.5.0 widens its accepted-`iss` check to
+    // this set, so a token minted under one URL of a multi-URL box validates
+    // when the resource is reached via another URL of the SAME box. SECURITY:
+    // the set is hub-controlled config/disk state only, NEVER a request Host —
+    // see `buildHubOriginsEnvValue`. The single `PARACHUTE_HUB_ORIGIN` above
+    // stays for back-compat with older scope-guard.
+    const originsValue = buildHubOriginsEnvValue(opts.configDir, opts.hubOrigin);
+    if (originsValue) env[HUB_ORIGINS_ENV] = originsValue;
+  }
   if (opts.extraEnv) Object.assign(env, opts.extraEnv);
 
   const req: SpawnReqShape = { short, cmd };

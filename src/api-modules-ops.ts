@@ -55,6 +55,7 @@ import {
 import { findService, readManifestLenient, removeService } from "./services-manifest.ts";
 import { enrichedPath } from "./spawn-path.ts";
 import type { ModuleState, SpawnRequest, Supervisor } from "./supervisor.ts";
+import { buildHubOriginsEnvValue } from "./vault-hub-origin-env.ts";
 import { WELL_KNOWN_PATH, type regenerateWellKnown } from "./well-known.ts";
 
 /**
@@ -609,10 +610,21 @@ async function spawnSupervised(
   // `process.env.PATH` may ALREADY be enriched by serve startup (serve.ts);
   // re-enriching here is a harmless no-op — `enrichedPath` is idempotent
   // (dedupe + append-only), so double-enrichment can't duplicate or reorder.
+  // PARACHUTE_HUB_ORIGINS (multi-origin iss-set, onboarding-streamline
+  // 2026-06-25): alongside the single canonical PARACHUTE_HUB_ORIGIN, inject
+  // the SET of origins the hub legitimately answers on (issuer ∪ loopback ∪
+  // expose-state ∪ platform). A resource server on scope-guard ≥0.5.0 widens
+  // its accepted-`iss` check to this set so a token minted under one URL of a
+  // multi-URL box validates via another URL of the SAME box. Mirrors
+  // buildModuleSpawnRequest (serve-boot.ts) — keep the two in sync. SECURITY:
+  // the set is hub-controlled config/disk state ONLY, never a request Host
+  // (see buildHubOriginsEnvValue). `deps.spawnEnv` still wins.
+  const hubOrigins = deps.issuer ? buildHubOriginsEnvValue(deps.configDir, deps.issuer) : undefined;
   const childEnv: Record<string, string> = {
     PATH: enrichedPath(),
     PORT: String(entry.port),
     ...(deps.issuer ? { PARACHUTE_HUB_ORIGIN: deps.issuer } : {}),
+    ...(hubOrigins ? { PARACHUTE_HUB_ORIGINS: hubOrigins } : {}),
     ...(deps.spawnEnv ?? {}),
   };
   const req: SpawnRequest = {

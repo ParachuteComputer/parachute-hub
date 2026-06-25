@@ -76,13 +76,29 @@ describe("persistVaultHubOrigin", () => {
     expect(existsSync(vaultEnv())).toBe(false);
   });
 
-  test("is idempotent — no rewrite when the value is already current", () => {
+  test("is idempotent — no rewrite when both the origin and the set are current", () => {
     const log: string[] = [];
     expect(persistVaultHubOrigin(dir, "https://hub.example.com", (l) => log.push(l))).toBe(true);
+    // First call wrote BOTH the single origin and the multi-origin set.
+    expect(
+      log.some((l) => /persisted PARACHUTE_HUB_ORIGIN=https:\/\/hub\.example\.com/.test(l)),
+    ).toBe(true);
+    expect(log.some((l) => /persisted PARACHUTE_HUB_ORIGINS=/.test(l))).toBe(true);
+    const writesAfterFirst = log.length;
+    // Second call is a no-op: both values already current → false, no new logs.
     expect(persistVaultHubOrigin(dir, "https://hub.example.com", (l) => log.push(l))).toBe(false);
-    // Only the first call logged.
-    expect(log).toHaveLength(1);
-    expect(log[0]).toMatch(/persisted PARACHUTE_HUB_ORIGIN=https:\/\/hub\.example\.com/);
+    expect(log).toHaveLength(writesAfterFirst);
+  });
+
+  test("writes PARACHUTE_HUB_ORIGINS (multi-origin iss-set) alongside the single origin", () => {
+    expect(persistVaultHubOrigin(dir, "https://hub.example.com", () => {})).toBe(true);
+    const values = readEnvFileValues(vaultEnv());
+    expect(values.PARACHUTE_HUB_ORIGIN).toBe("https://hub.example.com");
+    // The set carries the issuer + loopback aliases (always present).
+    const set = (values.PARACHUTE_HUB_ORIGINS ?? "").split(",");
+    expect(set).toContain("https://hub.example.com");
+    expect(set.some((o) => o.startsWith("http://127.0.0.1:"))).toBe(true);
+    expect(set.some((o) => o.startsWith("http://localhost:"))).toBe(true);
   });
 
   test("updates a stale origin in-place and preserves sibling keys", () => {
@@ -111,6 +127,24 @@ describe("clearVaultHubOrigin", () => {
     const values = readEnvFileValues(vaultEnv());
     expect(values.PARACHUTE_HUB_ORIGIN).toBeUndefined();
     expect(values.SCRIBE_AUTH_TOKEN).toBe("secret");
+  });
+
+  test("removes BOTH the single origin and the multi-origin set, leaving siblings", () => {
+    writeFileSync(
+      mkVaultDir(),
+      "SCRIBE_AUTH_TOKEN=secret\nPARACHUTE_HUB_ORIGIN=https://hub.example.com\nPARACHUTE_HUB_ORIGINS=https://hub.example.com,http://127.0.0.1:1939\n",
+    );
+    expect(clearVaultHubOrigin(dir, () => {})).toBe(true);
+    const values = readEnvFileValues(vaultEnv());
+    expect(values.PARACHUTE_HUB_ORIGIN).toBeUndefined();
+    expect(values.PARACHUTE_HUB_ORIGINS).toBeUndefined();
+    expect(values.SCRIBE_AUTH_TOKEN).toBe("secret");
+  });
+
+  test("clears a lone PARACHUTE_HUB_ORIGINS even if the single origin is absent", () => {
+    writeFileSync(mkVaultDir(), "PARACHUTE_HUB_ORIGINS=https://hub.example.com\n");
+    expect(clearVaultHubOrigin(dir, () => {})).toBe(true);
+    expect(readEnvFileValues(vaultEnv()).PARACHUTE_HUB_ORIGINS).toBeUndefined();
   });
 
   test("no-op when no origin is present", () => {
