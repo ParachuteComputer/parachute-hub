@@ -333,6 +333,34 @@ describe("login two-step (TOTP) — hub#473", () => {
     expect(denied.headers.get("retry-after")).not.toBeNull();
   });
 
+  // Fallback path: when the pending login can't be resolved (bad/expired
+  // token), the floor keys by IP ALONE — NOT the (rotating) pendingToken.
+  // Proven here by sending a DIFFERENT bogus pending cookie on every attempt
+  // from one IP: if the floor keyed by the token each would get a fresh bucket
+  // and never 429; keying by IP, the 6th still trips.
+  test("2FA floor with unresolvable pending tokens keys by IP, not the token", async () => {
+    const buildReq = (bogusToken: string) => {
+      const tf = formBody({ [CSRF_FIELD_NAME]: TEST_CSRF, code: "000000", next: "/admin/vaults" });
+      return new Request("http://hub.test/login/2fa", {
+        method: "POST",
+        headers: {
+          ...tf.headers,
+          cookie: `${CSRF_COOKIE}; ${PENDING_LOGIN_COOKIE_NAME}=${bogusToken}`,
+          "cf-connecting-ip": "203.0.113.77",
+        },
+        body: tf.body,
+      });
+    };
+    for (let i = 0; i < 5; i++) {
+      // A unique bogus token per attempt → never resolves to a pending login.
+      const r = await handleAdminLoginTotpPost(harness.db, buildReq(`bogus-${i}`));
+      expect(r.status).toBe(401); // no pending login → 401, counts toward the IP floor
+    }
+    const denied = await handleAdminLoginTotpPost(harness.db, buildReq("bogus-final"));
+    expect(denied.status).toBe(429);
+    expect(denied.headers.get("retry-after")).not.toBeNull();
+  });
+
   // (d) The 2FA floor is keyed by (ip,userId), NOT the rotating pendingToken.
   // Re-POSTing /login mints a FRESH pendingToken for the SAME user — that must
   // NOT reset the per-account TOTP floor (otherwise an attacker grinds TOTP

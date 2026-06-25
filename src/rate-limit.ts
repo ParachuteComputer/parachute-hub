@@ -91,9 +91,11 @@ export const CHANGE_PASSWORD_MAX_ATTEMPTS = 3;
  * factor step (hub#473) sits behind a verified password + a short-lived
  * pending-login token, so the threat model is "attacker who already has the
  * password grinding 6-digit codes / backup codes." A 5-attempt / 15-min
- * bucket per IP turns 10^6-space TOTP grinding into "rotate IPs," same floor
- * as `/login`. Keyed by IP (the pending-login token is short-lived and an
- * attacker could mint many, so IP is the stable actor key here).
+ * floor turns 10^6-space TOTP grinding into "rotate IPs," same floor as
+ * `/login`. Keyed by `compositeKey(ip, userId)` (the shared-egress-IP fix) so
+ * each 2FA-enrolled user behind one NAT'd / Cloudflare egress IP gets their own
+ * floor — the STABLE userId from the pending-login, NOT the rotating pending
+ * token. The coarse per-IP `authIpCeilingRateLimiter` backstops it.
  */
 export const TOTP_WINDOW_MS = 15 * 60 * 1000;
 /** `/login/2fa` attempts allowed per window. 6th within the window is denied. */

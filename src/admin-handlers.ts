@@ -189,6 +189,10 @@ export async function handleAdminLoginPost(
   const username = String(form.get("username") ?? "");
   const clientIp = clientIpFromRequest(req);
   const now = deps.now ? deps.now() : new Date();
+  // Both checks always run (no short-circuit): a denied `checkAndRecord` does
+  // NOT append a timestamp, so running the floor after a denied ceiling never
+  // double-counts. We need both recorded so each independently tracks its own
+  // bucket (the floor still gates per-account even when the ceiling is fine).
   const ceiling = authIpCeilingRateLimiter.checkAndRecord(clientIp, now);
   const floor = loginRateLimiter.checkAndRecord(compositeKey(clientIp, username), now);
   if (!ceiling.allowed || !floor.allowed) {
