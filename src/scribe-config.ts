@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { totalmem } from "node:os";
 import { dirname, join } from "node:path";
 import { parseEnvFile, upsertEnvLine, writeEnvFile } from "./env-file.ts";
 
@@ -59,6 +60,118 @@ export type ScribeProviderKey = (typeof SCRIBE_PROVIDERS)[number]["key"];
 
 /** Default provider scribe falls back to when the config doesn't pick one. */
 export const SCRIBE_DEFAULT_PROVIDER: ScribeProviderKey = "parakeet-mlx";
+
+/**
+ * Resolve the "local" choice to the CORRECT platform backend. The setup
+ * wizard (browser + CLI) lets the operator pick "local" without knowing the
+ * engine name; this picks the one that actually runs here.
+ *
+ *   - macOS  → `parakeet-mlx` (Apple Silicon MLX)
+ *   - Linux  → `onnx-asr`     (cross-platform Sherpa-ONNX)
+ *   - other  → `null`         (no local backend — steer to cloud)
+ *
+ * Mirrors scribe's own `platformLocalProvider` (parachute-scribe
+ * src/install-backend.ts) so hub and scribe can't drift on the mapping.
+ * Fixes the long-standing bug where the wizard mapped `local` UNCONDITIONALLY
+ * to `parakeet-mlx`, which silently fails on every Linux box (the common
+ * DigitalOcean / VPS deploy).
+ */
+export function platformLocalProvider(
+  platform: NodeJS.Platform,
+): "parakeet-mlx" | "onnx-asr" | null {
+  if (platform === "darwin") return "parakeet-mlx";
+  if (platform === "linux") return "onnx-asr";
+  return null;
+}
+
+/**
+ * Minimum available RAM (MiB) below which a local ASR model would be
+ * OOM-killed. Mirrors scribe's `MIN_RAM_MIB` (parachute-scribe
+ * src/install-backend.ts) — the 1 GB DigitalOcean droplet is the box this
+ * guards against; a local Parakeet/ONNX model needs ~2 GB to load.
+ */
+export const MIN_RAM_MIB = 2048;
+
+/**
+ * Available RAM in MiB, or `null` when it can't be determined.
+ *
+ * Linux: reads `MemAvailable` from `/proc/meminfo` (the honest figure — free
+ * plus reclaimable cache), matching scribe's probe so the two layers agree on
+ * the same droplet. Falls back to `MemFree` on very old kernels that predate
+ * MemAvailable.
+ *
+ * Non-Linux: falls back to `os.totalmem()` (there's no MemAvailable analogue;
+ * total is a coarse upper bound but enough to keep a tiny VM from offering
+ * local). macOS dev boxes comfortably clear the floor, so the coarseness is
+ * harmless there.
+ *
+ * Sync by design: the wizard's provider-decision path is synchronous, and the
+ * `/proc/meminfo` read is a tiny file. Tests inject `availableRamMib` directly
+ * to exercise the gate without touching the real host.
+ */
+export function readAvailableRamMib(platform: NodeJS.Platform = process.platform): number | null {
+  if (platform === "linux") {
+    try {
+      const text = readFileSync("/proc/meminfo", "utf8");
+      const avail = /^MemAvailable:\s+(\d+)\s*kB/m.exec(text);
+      const free = /^MemFree:\s+(\d+)\s*kB/m.exec(text);
+      const kb = avail ? Number(avail[1]) : free ? Number(free[1]) : null;
+      if (kb === null || !Number.isFinite(kb)) return null;
+      return Math.floor(kb / 1024);
+    } catch {
+      return null;
+    }
+  }
+  // Non-Linux: total physical memory as a coarse fallback.
+  try {
+    const bytes = totalmem();
+    if (!Number.isFinite(bytes) || bytes <= 0) return null;
+    return Math.floor(bytes / (1024 * 1024));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decide whether a LOCAL transcription provider is offerable / acceptable on
+ * this host, and if not, why + what to steer to. Both wizard surfaces (browser
+ * POST handler + CLI) consult this BEFORE recording a `local` choice so we
+ * never write a dead provider string that scribe can't run.
+ *
+ * `ok: false` carries a `reason` (shown inline) and a `steerTo` cloud provider
+ * the caller should redirect to.
+ */
+export interface LocalProviderDecision {
+  ok: boolean;
+  /** The resolved platform backend when `ok` (parakeet-mlx / onnx-asr). */
+  provider?: "parakeet-mlx" | "onnx-asr";
+  /** Human-readable reason when `ok` is false (no local backend / too little RAM). */
+  reason?: string;
+  /** Cloud provider to redirect to when local is unavailable. */
+  steerTo?: "groq";
+}
+
+export function decideLocalProvider(
+  platform: NodeJS.Platform,
+  availableRamMib: number | null,
+): LocalProviderDecision {
+  const provider = platformLocalProvider(platform);
+  if (provider === null) {
+    return {
+      ok: false,
+      reason: `No local transcription backend runs on "${platform}". Use a cloud provider instead.`,
+      steerTo: "groq",
+    };
+  }
+  if (availableRamMib !== null && availableRamMib < MIN_RAM_MIB) {
+    return {
+      ok: false,
+      reason: `This box has ${availableRamMib} MiB available RAM, below the ${MIN_RAM_MIB} MiB a local ASR model needs (it would be OOM-killed). Use a cloud provider instead — groq is fast (~$0.04/hr of audio).`,
+      steerTo: "groq",
+    };
+  }
+  return { ok: true, provider };
+}
 
 export function isKnownScribeProvider(value: string): value is ScribeProviderKey {
   return SCRIBE_PROVIDERS.some((p) => p.key === value);
@@ -131,6 +244,38 @@ export function writeScribeProvider(configDir: string, provider: ScribeProviderK
     ...current,
     transcribe: { ...existingTranscribe, provider },
   };
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`);
+  renameSync(tmp, path);
+}
+
+/**
+ * Remove `transcribe.provider` from scribe's config.json (preserving every
+ * other key). Used by the wizard's local-install path to UNDO a provisional
+ * provider record when the engine install fails — so we never leave a dead
+ * provider string scribe can't honor. A no-op when the file or the
+ * `transcribe` block is absent.
+ */
+export function clearScribeProvider(configDir: string): void {
+  const path = scribeConfigPath(configDir);
+  if (!existsSync(path)) return;
+  let current: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    current = parsed as Record<string, unknown>;
+  } catch {
+    return; // malformed → leave it; auto-wire repairs on next run
+  }
+  const transcribe = current.transcribe;
+  if (typeof transcribe !== "object" || transcribe === null || Array.isArray(transcribe)) {
+    return;
+  }
+  // Drop `provider` from the transcribe block (destructure-omit, no `delete`).
+  const { provider: _dropped, ...block } = transcribe as Record<string, unknown>;
+  const { transcribe: _omit, ...rest } = current;
+  const next: Record<string, unknown> =
+    Object.keys(block).length === 0 ? rest : { ...rest, transcribe: block };
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
   writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`);
   renameSync(tmp, path);

@@ -3,10 +3,15 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  MIN_RAM_MIB,
   SCRIBE_DEFAULT_PROVIDER,
   SCRIBE_PROVIDERS,
   apiKeyEnvFor,
+  clearScribeProvider,
+  decideLocalProvider,
   isKnownScribeProvider,
+  platformLocalProvider,
+  readAvailableRamMib,
   readScribeProviderState,
   scribeConfigPath,
   scribeEnvPath,
@@ -38,6 +43,118 @@ describe("provider catalog", () => {
     expect(apiKeyEnvFor("parakeet-mlx")).toBeUndefined();
     expect(apiKeyEnvFor("onnx-asr")).toBeUndefined();
     expect(apiKeyEnvFor("whisper")).toBeUndefined();
+  });
+});
+
+describe("platformLocalProvider — the Linux 'local' trap fix", () => {
+  test("macOS → parakeet-mlx", () => {
+    expect(platformLocalProvider("darwin")).toBe("parakeet-mlx");
+  });
+
+  test("Linux → onnx-asr (NOT the macOS-only parakeet-mlx)", () => {
+    expect(platformLocalProvider("linux")).toBe("onnx-asr");
+  });
+
+  test("unsupported platform → null (steer to cloud)", () => {
+    expect(platformLocalProvider("win32")).toBeNull();
+  });
+});
+
+describe("readAvailableRamMib", () => {
+  test("non-Linux returns a positive number (totalmem fallback) or null", () => {
+    const ram = readAvailableRamMib("darwin");
+    // On any real CI/dev box totalmem is well-defined + positive.
+    expect(ram === null || (typeof ram === "number" && ram > 0)).toBe(true);
+  });
+
+  test("Linux path reads /proc/meminfo (or null when unreadable)", () => {
+    const ram = readAvailableRamMib("linux");
+    // On macOS CI there's no /proc/meminfo → null; on Linux CI a positive MiB.
+    expect(ram === null || (typeof ram === "number" && ram > 0)).toBe(true);
+  });
+});
+
+describe("decideLocalProvider — the RAM/platform gate", () => {
+  test("Linux with ample RAM → ok, onnx-asr", () => {
+    const d = decideLocalProvider("linux", 4096);
+    expect(d.ok).toBe(true);
+    expect(d.provider).toBe("onnx-asr");
+  });
+
+  test("macOS with ample RAM → ok, parakeet-mlx", () => {
+    const d = decideLocalProvider("darwin", 16384);
+    expect(d.ok).toBe(true);
+    expect(d.provider).toBe("parakeet-mlx");
+  });
+
+  test("below the RAM floor → refused, steers to groq, carries a reason", () => {
+    const d = decideLocalProvider("linux", MIN_RAM_MIB - 1);
+    expect(d.ok).toBe(false);
+    expect(d.steerTo).toBe("groq");
+    expect(d.reason).toContain(String(MIN_RAM_MIB));
+  });
+
+  test("exactly at the floor is OK (>= floor)", () => {
+    expect(decideLocalProvider("linux", MIN_RAM_MIB).ok).toBe(true);
+  });
+
+  test("unknown RAM (null) does not refuse on a supported platform", () => {
+    expect(decideLocalProvider("linux", null).ok).toBe(true);
+  });
+
+  test("unsupported platform → refused regardless of RAM, steers to groq", () => {
+    const d = decideLocalProvider("win32", 99999);
+    expect(d.ok).toBe(false);
+    expect(d.steerTo).toBe("groq");
+  });
+});
+
+describe("clearScribeProvider", () => {
+  test("removes transcribe.provider, preserving other keys", () => {
+    const h = makeHarness();
+    try {
+      mkdirSync(join(h.dir, "scribe"), { recursive: true });
+      writeFileSync(
+        scribeConfigPath(h.dir),
+        JSON.stringify({
+          transcribe: { provider: "onnx-asr", language: "en" },
+          auth: { required_token: "keep" },
+        }),
+      );
+      clearScribeProvider(h.dir);
+      const parsed = JSON.parse(readFileSync(scribeConfigPath(h.dir), "utf8"));
+      expect(parsed.transcribe).toEqual({ language: "en" });
+      expect(parsed.auth).toEqual({ required_token: "keep" });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("drops the transcribe block entirely when provider was its only key", () => {
+    const h = makeHarness();
+    try {
+      mkdirSync(join(h.dir, "scribe"), { recursive: true });
+      writeFileSync(
+        scribeConfigPath(h.dir),
+        JSON.stringify({ transcribe: { provider: "onnx-asr" }, auth: { required_token: "x" } }),
+      );
+      clearScribeProvider(h.dir);
+      const parsed = JSON.parse(readFileSync(scribeConfigPath(h.dir), "utf8"));
+      expect(parsed.transcribe).toBeUndefined();
+      expect(parsed.auth).toEqual({ required_token: "x" });
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("no-op when the file is absent", () => {
+    const h = makeHarness();
+    try {
+      // No file written.
+      expect(() => clearScribeProvider(h.dir)).not.toThrow();
+    } finally {
+      h.cleanup();
+    }
   });
 });
 

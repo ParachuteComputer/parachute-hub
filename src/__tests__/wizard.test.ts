@@ -293,6 +293,29 @@ describe("parseWizardArgs", () => {
     expect(r.opts.vaultMode).toBe("import");
     expect(r.opts.vaultImportRemoteUrl).toBe("https://github.com/me/v.git");
   });
+
+  test("parses --transcribe-mode + --transcribe-key + --config-dir", () => {
+    const r = parseWizardArgs([
+      "--hub-url",
+      "http://x",
+      "--transcribe-mode",
+      "groq",
+      "--transcribe-key",
+      "gsk_test",
+      "--config-dir",
+      "/tmp/ph",
+    ]);
+    expect("error" in r).toBe(false);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.opts.transcribeMode).toBe("groq");
+    expect(r.opts.transcribeApiKey).toBe("gsk_test");
+    expect(r.opts.configDir).toBe("/tmp/ph");
+  });
+
+  test("rejects invalid --transcribe-mode", () => {
+    const r = parseWizardArgs(["--hub-url", "http://x", "--transcribe-mode", "garbage"]);
+    expect("error" in r).toBe(true);
+  });
 });
 
 describe("runCliWizard", () => {
@@ -508,5 +531,128 @@ describe("runCliWizard", () => {
       exposeMode: "localhost",
     });
     expect(code).toBe(1);
+  });
+
+  test("password validator floor is 12 (matches the server) — an 11-char password is rejected", async () => {
+    const { fetchImpl } = makeFakeHub();
+    const logs: string[] = [];
+    const code = await runCliWizard({
+      hubUrl: "http://127.0.0.1:1939",
+      log: (l) => logs.push(l),
+      fetchImpl,
+      sleep: async () => {},
+      accountUsername: "admin",
+      accountPassword: "elevenchar.", // 11 chars
+      vaultMode: "skip",
+      exposeMode: "localhost",
+    });
+    expect(code).toBe(1);
+    expect(logs.join("\n")).toContain("at least 12 characters");
+  });
+
+  test("exactly 12 chars passes the validator (no early bounce)", async () => {
+    const { state, fetchImpl } = makeFakeHub();
+    const code = await runCliWizard({
+      hubUrl: "http://127.0.0.1:1939",
+      log: () => {},
+      fetchImpl,
+      sleep: async () => {},
+      accountUsername: "admin",
+      accountPassword: "twelvecharss", // 12 chars
+      vaultMode: "skip",
+      exposeMode: "localhost",
+    });
+    expect(code).toBe(0);
+    expect(state.posted.some((p) => p.path === "/admin/setup/account")).toBe(true);
+  });
+
+  test("transcription step runs between vault and expose when configDir is set", async () => {
+    const { state, fetchImpl } = makeFakeHub();
+    const transcribeCmds: string[][] = [];
+    const code = await runCliWizard({
+      hubUrl: "http://127.0.0.1:1939",
+      log: () => {},
+      fetchImpl,
+      sleep: async () => {},
+      accountUsername: "admin",
+      accountPassword: "longpassword",
+      vaultMode: "skip",
+      exposeMode: "localhost",
+      configDir: "/tmp/never-written-none-mode",
+      transcribeMode: "none", // none writes nothing + spawns nothing
+      transcribeRunCommand: async (cmd) => {
+        transcribeCmds.push([...cmd]);
+        return 0;
+      },
+    });
+    expect(code).toBe(0);
+    // The vault + expose POSTs still happened in order.
+    expect(state.posted.map((p) => p.path)).toEqual([
+      "/admin/setup/account",
+      "/admin/setup/vault",
+      "/admin/setup/expose",
+    ]);
+    // mode=none → no transcription subprocess.
+    expect(transcribeCmds).toEqual([]);
+  });
+
+  test("transcription step (cloud) drives the install one-shot via the injected runner", async () => {
+    const { fetchImpl } = makeFakeHub();
+    const transcribeCmds: string[][] = [];
+    const code = await runCliWizard({
+      hubUrl: "http://127.0.0.1:1939",
+      log: () => {},
+      fetchImpl,
+      sleep: async () => {},
+      accountUsername: "admin",
+      accountPassword: "longpassword",
+      vaultMode: "skip",
+      exposeMode: "localhost",
+      configDir: "/tmp/never-written-cloud-mode",
+      transcribeMode: "groq",
+      transcribeApiKey: "gsk_wired",
+      platform: "linux",
+      transcribeRunCommand: async (cmd) => {
+        transcribeCmds.push([...cmd]);
+        return 0;
+      },
+    });
+    expect(code).toBe(0);
+    expect(transcribeCmds[0]).toEqual([
+      "parachute",
+      "install",
+      "scribe",
+      "--scribe-provider",
+      "groq",
+      "--scribe-key",
+      "gsk_wired",
+    ]);
+  });
+
+  test("transcription step is skipped when configDir is absent", async () => {
+    const { state, fetchImpl } = makeFakeHub();
+    let ran = false;
+    const code = await runCliWizard({
+      hubUrl: "http://127.0.0.1:1939",
+      log: () => {},
+      fetchImpl,
+      sleep: async () => {},
+      accountUsername: "admin",
+      accountPassword: "longpassword",
+      vaultMode: "skip",
+      exposeMode: "localhost",
+      // no configDir
+      transcribeRunCommand: async () => {
+        ran = true;
+        return 0;
+      },
+    });
+    expect(code).toBe(0);
+    expect(ran).toBe(false);
+    expect(state.posted.map((p) => p.path)).toEqual([
+      "/admin/setup/account",
+      "/admin/setup/vault",
+      "/admin/setup/expose",
+    ]);
   });
 });

@@ -172,7 +172,11 @@ export interface InitOpts {
    * Test seam: shim for the CLI wizard chain (hub#168 Cut 3). Production
    * lazy-imports `runCliWizard` from `./wizard.ts`. Tests pass a stub.
    */
-  runCliWizardImpl?: (opts: { hubUrl: string; log: (l: string) => void }) => Promise<number>;
+  runCliWizardImpl?: (opts: {
+    hubUrl: string;
+    log: (l: string) => void;
+    configDir?: string;
+  }) => Promise<number>;
   /**
    * Skip the "browser or CLI?" wizard-choice prompt (hub#168 Cut 4). Used
    * by pre-Cut-4 tests that don't expect the new prompt + by the
@@ -485,6 +489,7 @@ async function defaultInstallVaultModule(configDir: string, manifestPath: string
 async function defaultRunCliWizard(opts: {
   hubUrl: string;
   log: (l: string) => void;
+  configDir?: string;
 }): Promise<number> {
   const { runCliWizard } = await import("./wizard.ts");
   return await runCliWizard(opts);
@@ -895,7 +900,10 @@ export async function init(opts: InitOpts = {}): Promise<number> {
     // (the loopback-gated GET /admin/setup probe) — the operator never has to
     // copy the token out of the startup logs.
     const cliWizardUrl = `http://127.0.0.1:${hubPort}`;
-    return await runCliWizardImpl({ hubUrl: cliWizardUrl, log });
+    // Pass the resolved configDir so the CLI wizard's transcription step can
+    // write scribe's config (onboarding-streamline hub PR1). Without it the
+    // step is skipped.
+    return await runCliWizardImpl({ hubUrl: cliWizardUrl, log, configDir });
   }
 
   // Step 5: offer to open the browser. Skip in non-TTY shells (CI),
