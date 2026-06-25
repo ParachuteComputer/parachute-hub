@@ -8,15 +8,16 @@
  * because its endpoint is meant to be redeemed by a room of people sharing one
  * egress IP (see `SIGNUP_MAX_ATTEMPTS`).
  *
- *   - `/login` (per-IP, hub#187 / hub#188): 5 attempts / 15 min.
- *     Lands as a floor under brute-force after hub#187 collapsed the
- *     public-reach matrix: with a cloudflare tunnel up, `/login` is now
- *     reachable from the open internet, and 2FA (#186) is the next PR
- *     rather than this one. A 5-attempts-per-15-minute bucket per IP is
- *     the standard login-form floor; it's not the primary defense, just
- *     the one that turns "infinite credential grinding" into "rotate IPs".
- *     (Endpoint was `/admin/login` pre-rename; bucket logic is path-
- *     agnostic so the rename was a comment-only change here.)
+ *   - `/login` (per-account floor + per-IP ceiling): the FLOOR is keyed by
+ *     `compositeKey(ip, username)` at 5 attempts / 15 min, shared with the
+ *     `/oauth/authorize` password door so both doors feed ONE per-account
+ *     bucket; the CEILING is `authIpCeilingRateLimiter` at 60 / 15 min keyed
+ *     by IP alone. Re-keyed from pure per-IP so a room of users behind one
+ *     NAT'd egress IP (shared wifi / cloudflare tunnel) no longer pool into a
+ *     single 5-slot bucket — the per-account floor still turns "infinite
+ *     credential grinding" into "rotate IPs", while the IP ceiling backstops
+ *     username-rotation. (Endpoint was `/admin/login` pre-rename; bucket
+ *     logic is path-agnostic so the rename was a comment-only change here.)
  *
  *   - `/account/change-password` (per-user, hub#282): 3 attempts / 5 min.
  *     The endpoint is session-gated, so the threat model isn't open-
@@ -91,13 +92,27 @@ export const CHANGE_PASSWORD_MAX_ATTEMPTS = 3;
  * factor step (hub#473) sits behind a verified password + a short-lived
  * pending-login token, so the threat model is "attacker who already has the
  * password grinding 6-digit codes / backup codes." A 5-attempt / 15-min
- * bucket per IP turns 10^6-space TOTP grinding into "rotate IPs," same floor
- * as `/login`. Keyed by IP (the pending-login token is short-lived and an
- * attacker could mint many, so IP is the stable actor key here).
+ * floor turns 10^6-space TOTP grinding into "rotate IPs," same floor as
+ * `/login`. Keyed by `compositeKey(ip, userId)` (the shared-egress-IP fix) so
+ * each 2FA-enrolled user behind one NAT'd / Cloudflare egress IP gets their own
+ * floor — the STABLE userId from the pending-login, NOT the rotating pending
+ * token. The coarse per-IP `authIpCeilingRateLimiter` backstops it.
  */
 export const TOTP_WINDOW_MS = 15 * 60 * 1000;
 /** `/login/2fa` attempts allowed per window. 6th within the window is denied. */
 export const TOTP_MAX_ATTEMPTS = 5;
+/**
+ * Coarse per-IP CEILING shared by all interactive auth doors (`/login`, the
+ * `/oauth/authorize` password door, `/login/2fa`). 60 attempts / 15 min — the
+ * same generous cap as public signup (`SIGNUP_MAX_ATTEMPTS`), chosen so a
+ * ~20-person demo room behind ONE NAT'd / Cloudflare egress IP clears it
+ * comfortably. It exists ONLY as a backstop against username-rotation: the
+ * per-(ip,identity) FLOORs stay tight at 5/15min, but an attacker who rotates
+ * usernames against one IP would otherwise get a fresh 5-slot floor per name.
+ * This ceiling caps total per-IP auth volume regardless of identity. Reuses the
+ * 15-min `WINDOW_MS`.
+ */
+export const AUTH_IP_CEILING_MAX_ATTEMPTS = 60;
 /**
  * `POST /account/vault-token/<name>` window length: 10 minutes. The endpoint
  * is session-gated and assignment-capped (a friend can only mint
@@ -235,9 +250,19 @@ export class RateLimiter {
 }
 
 /**
- * `/login` rate limiter — per-IP, 5 attempts / 15 min. Exported as a
- * singleton so all callers share one bucket map (rotating IPs across the
- * test suite or across a real attack must hit the same backing store).
+ * `/login` (+ the `/oauth/authorize` password door) rate limiter — per-
+ * account/per-half-login floor, keyed (ip,identity), 5 attempts / 15 min.
+ * RE-KEYED from per-IP to `compositeKey(ip, username)` (the shared-egress-IP
+ * fix): behind NAT / Cloudflare every user in a room presents one
+ * CF-Connecting-IP, so a per-IP-only key pooled the whole room into one 5-slot
+ * bucket and 429'd the 6th legitimate sign-in. Keyed by (ip,username) instead,
+ * each account gets its own floor while still pinning the floor to the IP so a
+ * single attacker can't grind one account from one box past 5 tries. BOTH
+ * password doors (`/login` and `/oauth/authorize` `__action=login`) share this
+ * ONE instance + the SAME key scheme, so an attacker can't get 5 tries per door
+ * against the same account. Exported as a singleton so all callers share one
+ * bucket map. The coarse per-IP `authIpCeilingRateLimiter` backstops
+ * username-rotation across this floor.
  */
 export const loginRateLimiter = new RateLimiter(MAX_ATTEMPTS, WINDOW_MS);
 
@@ -252,13 +277,29 @@ export const changePasswordRateLimiter = new RateLimiter(
 );
 
 /**
- * `/login/2fa` rate limiter — per-IP, 5 attempts / 15 min (hub#473). Bounds
- * second-factor grinding by an attacker who already has the password. Separate
+ * `/login/2fa` rate limiter — per-account/per-half-login floor, keyed
+ * (ip,identity), 5 attempts / 15 min (hub#473). Bounds second-factor grinding
+ * by an attacker who already has the password. RE-KEYED from per-IP to
+ * `compositeKey(ip, userId)` (the shared-egress-IP fix): keyed by the STABLE
+ * userId resolved from the pending-login (NOT the pendingToken, which rotates
+ * on every /login success and would reset the bucket). Behind NAT every 2FA-
+ * enrolled user in a room would otherwise pool into one per-IP bucket. Separate
  * bucket from `/login` so a password failure and a TOTP failure don't share a
- * window — but both are per-IP so rotating egress IPs is the only escape, same
- * as the password floor.
+ * window. The coarse per-IP `authIpCeilingRateLimiter` backstops this floor.
  */
 export const totpRateLimiter = new RateLimiter(TOTP_MAX_ATTEMPTS, TOTP_WINDOW_MS);
+
+/**
+ * Coarse per-IP CEILING rate limiter — 60 attempts / 15 min, keyed by client
+ * IP ONLY. Shared by all interactive auth doors (`/login`, the
+ * `/oauth/authorize` password door, `/login/2fa`) as a backstop against
+ * username-rotation: the per-(ip,identity) floors above stay tight, but an
+ * attacker rotating usernames against one IP would otherwise get a fresh floor
+ * per name. This ceiling caps total per-IP auth volume regardless of identity.
+ * Deliberately generous (matches the signup precedent) so a demo room sharing
+ * one egress IP clears it.
+ */
+export const authIpCeilingRateLimiter = new RateLimiter(AUTH_IP_CEILING_MAX_ATTEMPTS, WINDOW_MS);
 
 /**
  * `POST /account/vault-token/<name>` rate limiter — per-user, 10 attempts /
@@ -303,6 +344,19 @@ export function __resetForTests(): void {
   totpRateLimiter.reset();
   vaultTokenMintRateLimiter.reset();
   signupRateLimiter.reset();
+  authIpCeilingRateLimiter.reset();
+}
+
+/**
+ * Compose a per-(ip,identity) rate-limit key. Used by the per-account auth
+ * FLOORs (`/login` + `/oauth/authorize` keyed by username; `/login/2fa` keyed
+ * by userId) so each account behind a shared egress IP gets its own bucket
+ * while the floor still pins to the IP. The identity is trimmed + lowercased so
+ * `'Alice'` and `'alice'` share one bucket — otherwise an attacker could
+ * case-flip a username to mint a fresh 5-slot floor per casing.
+ */
+export function compositeKey(ip: string, id: string): string {
+  return `${ip}|${id.trim().toLowerCase()}`;
 }
 
 /**
