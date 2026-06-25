@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { handleAdminLoginTotpPost } from "../admin-handlers.ts";
+import { handleAdminLoginPost, handleAdminLoginTotpPost } from "../admin-handlers.ts";
 import { approveClient, getClient, registerClient } from "../clients.ts";
 import { CSRF_COOKIE_NAME } from "../csrf.ts";
 import { findGrant, recordGrant } from "../grants.ts";
@@ -1455,6 +1455,125 @@ describe("handleAuthorizePost — login submit", () => {
       const res = await handleAuthorizePost(db, req, { issuer: ISSUER });
       expect(res.status).toBe(401);
       expect(res.headers.get("set-cookie")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// --- Shared per-account login bucket across BOTH password doors -------------
+//
+// The shared-egress-IP fix re-keyed the login floor to (ip,username) AND wired
+// the same `loginRateLimiter` instance into the previously-ungated
+// `/oauth/authorize` password door. Both doors must share ONE per-account
+// bucket, so an attacker can't get 5 tries at `/login` PLUS another 5 at
+// `/oauth/authorize` for the same (ip,username).
+describe("login floor is shared across /login and /oauth/authorize (same per-account bucket)", () => {
+  const ATTACK_IP = "203.0.113.200";
+
+  function adminLoginReq(username: string, password: string): Request {
+    const body = new URLSearchParams({
+      __csrf: TEST_CSRF,
+      username,
+      password,
+      next: "/admin/vaults",
+    });
+    return new Request("http://hub.test/login", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        cookie: CSRF_COOKIE,
+        "cf-connecting-ip": ATTACK_IP,
+      },
+      body,
+    });
+  }
+
+  function oauthLoginReq(
+    username: string,
+    password: string,
+    clientId: string,
+    challenge: string,
+  ): Request {
+    const body = new URLSearchParams({
+      __action: "login",
+      __csrf: TEST_CSRF,
+      username,
+      password,
+      client_id: clientId,
+      redirect_uri: "https://app.example/cb",
+      response_type: "code",
+      scope: "vault:read",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    return new Request(`${ISSUER}/oauth/authorize`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        cookie: CSRF_COOKIE,
+        "cf-connecting-ip": ATTACK_IP,
+      },
+      body,
+    });
+  }
+
+  // (e) 5 at /login + 1 at /oauth/authorize for the same (ip,username) → the
+  // 6th (the /oauth/authorize attempt) is denied regardless of which door it
+  // came through.
+  test("(e) 5 /login attempts then 1 /oauth/authorize attempt → the 6th door is 429", async () => {
+    const { db, cleanup } = await makeDb();
+    resetRateLimit();
+    try {
+      await createUser(db, "owner", "hunter2", { passwordChanged: true });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+
+      // Burn the full 5-slot floor at the /login door (wrong password → 401).
+      for (let i = 0; i < 5; i++) {
+        const r = await handleAdminLoginPost(db, adminLoginReq("owner", "wrong"));
+        expect(r.status).toBe(401);
+      }
+      // 6th attempt — at the OTHER door (/oauth/authorize). Must be denied
+      // because both doors share ONE (ip,username) bucket.
+      const denied = await handleAuthorizePost(
+        db,
+        oauthLoginReq("owner", "hunter2", reg.client.clientId, challenge),
+        { issuer: ISSUER },
+      );
+      expect(denied.status).toBe(429);
+      expect(denied.headers.get("retry-after")).not.toBeNull();
+      // No session minted even though the password was correct — the floor
+      // fired before the credential check.
+      expect(cookieValueFrom(denied, "parachute_hub_session")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("the shared bucket is per-account: a DIFFERENT username at /oauth/authorize is unaffected", async () => {
+    const { db, cleanup } = await makeDb();
+    resetRateLimit();
+    try {
+      await createUser(db, "alice", "alice-pw", { passwordChanged: true });
+      await createUser(db, "bob", "bob-pw", { passwordChanged: true, allowMulti: true });
+      const reg = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      const { challenge } = makePkce();
+
+      // Exhaust alice's floor at /login.
+      for (let i = 0; i < 5; i++) {
+        await handleAdminLoginPost(db, adminLoginReq("alice", "wrong"));
+      }
+      expect((await handleAdminLoginPost(db, adminLoginReq("alice", "wrong"))).status).toBe(429);
+
+      // bob (same IP, different username) still signs in at /oauth/authorize.
+      const bobRes = await handleAuthorizePost(
+        db,
+        oauthLoginReq("bob", "bob-pw", reg.client.clientId, challenge),
+        { issuer: ISSUER },
+      );
+      expect(bobRes.status).toBe(302);
+      expect(bobRes.headers.get("location")).toContain("/oauth/authorize?");
     } finally {
       cleanup();
     }

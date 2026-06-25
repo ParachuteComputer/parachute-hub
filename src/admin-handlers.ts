@@ -21,7 +21,13 @@ import {
   getPendingLogin,
   parsePendingLoginCookie,
 } from "./pending-login.ts";
-import { checkAndRecord, clientIpFromRequest, totpRateLimiter } from "./rate-limit.ts";
+import {
+  authIpCeilingRateLimiter,
+  clientIpFromRequest,
+  compositeKey,
+  loginRateLimiter,
+  totpRateLimiter,
+} from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import {
   SESSION_TTL_MS,
@@ -167,24 +173,38 @@ export async function handleAdminLoginPost(
     );
   }
   // Rate-limit gate fires *after* CSRF (so a junk cross-site POST doesn't
-  // burn a bucket slot for the victim's IP) but *before* credential check.
+  // burn a bucket slot for the victim) but *before* credential check.
   // Every legitimate login attempt — wrong password, missing user, eventually
-  // failed-2FA (#186) — counts toward the same bucket so an attacker can't
-  // partition the cooldown across stages.
+  // failed-2FA — counts toward the same bucket so an attacker can't partition
+  // the cooldown across stages.
+  //
+  // Two tiers (the shared-egress-IP fix): a coarse per-IP CEILING (60/15min)
+  // backstops username-rotation, then a per-(ip,username) FLOOR (5/15min) so
+  // each account behind a shared NAT / Cloudflare egress IP gets its own
+  // bucket instead of the whole room pooling into one 5-slot per-IP bucket.
+  // `username` is hoisted above the gate because the floor keys on it. The same
+  // `loginRateLimiter` + `compositeKey(ip, username)` scheme backs the
+  // `/oauth/authorize` password door, so both doors share ONE per-account
+  // bucket.
+  const username = String(form.get("username") ?? "");
   const clientIp = clientIpFromRequest(req);
   const now = deps.now ? deps.now() : new Date();
-  const gate = checkAndRecord(clientIp, now);
-  if (!gate.allowed) {
+  const ceiling = authIpCeilingRateLimiter.checkAndRecord(clientIp, now);
+  const floor = loginRateLimiter.checkAndRecord(compositeKey(clientIp, username), now);
+  if (!ceiling.allowed || !floor.allowed) {
+    const retryAfterSeconds = Math.max(
+      ceiling.allowed ? 0 : (ceiling.retryAfterSeconds ?? 1),
+      floor.allowed ? 0 : (floor.retryAfterSeconds ?? 1),
+    );
     return htmlResponse(
       renderAdminError({
         title: "Too many login attempts",
-        message: `Too many login attempts from this IP. Try again in ${gate.retryAfterSeconds ?? 1} seconds.`,
+        message: `Too many login attempts. Try again in ${retryAfterSeconds} seconds.`,
       }),
       429,
-      { "retry-after": String(gate.retryAfterSeconds ?? 1) },
+      { "retry-after": String(retryAfterSeconds) },
     );
   }
-  const username = String(form.get("username") ?? "");
   const password = String(form.get("password") ?? "");
   const next = safeNext(String(form.get("next") ?? ""));
   const csrfToken = typeof formCsrf === "string" ? formCsrf : "";
@@ -314,23 +334,36 @@ export async function handleAdminLoginTotpPost(
   const next = safeNext(String(form.get("next") ?? ""));
   const code = String(form.get("code") ?? "");
 
-  // Rate-limit BEFORE resolving the pending login or verifying the factor.
+  // Rate-limit BEFORE verifying the factor. Resolve the pending login FIRST so
+  // the per-account floor can key on the STABLE userId (NOT the pendingToken,
+  // which a fresh /login success rotates and would reset the bucket). Resolving
+  // here also lets a bad/expired pending token fall back to keying the floor by
+  // IP alone — never by the rotating pendingToken.
   const clientIp = clientIpFromRequest(req);
   const now = deps.now ? deps.now() : new Date();
-  const gate = totpRateLimiter.checkAndRecord(clientIp, now);
-  if (!gate.allowed) {
+  const pendingToken = parsePendingLoginCookie(req.headers.get("cookie"));
+  const pending = getPendingLogin(pendingToken, () => now);
+  // Two tiers (the shared-egress-IP fix): coarse per-IP CEILING (60/15min) +
+  // per-(ip,userId) FLOOR (5/15min). When userId can't be resolved (bad/expired
+  // pending token), key the floor by IP alone — do NOT key by the pendingToken.
+  const ceiling = authIpCeilingRateLimiter.checkAndRecord(clientIp, now);
+  const floorKey = pending ? compositeKey(clientIp, pending.userId) : clientIp;
+  const floor = totpRateLimiter.checkAndRecord(floorKey, now);
+  if (!ceiling.allowed || !floor.allowed) {
+    const retryAfterSeconds = Math.max(
+      ceiling.allowed ? 0 : (ceiling.retryAfterSeconds ?? 1),
+      floor.allowed ? 0 : (floor.retryAfterSeconds ?? 1),
+    );
     return htmlResponse(
       renderAdminError({
         title: "Too many attempts",
-        message: `Too many verification attempts from this IP. Try again in ${gate.retryAfterSeconds ?? 1} seconds.`,
+        message: `Too many verification attempts. Try again in ${retryAfterSeconds} seconds.`,
       }),
       429,
-      { "retry-after": String(gate.retryAfterSeconds ?? 1) },
+      { "retry-after": String(retryAfterSeconds) },
     );
   }
 
-  const pendingToken = parsePendingLoginCookie(req.headers.get("cookie"));
-  const pending = getPendingLogin(pendingToken, () => now);
   if (!pending) {
     // No live pending login — expired, missing, or tampered. Send the user
     // back to the start; clear any stale pending cookie.

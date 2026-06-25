@@ -332,6 +332,72 @@ describe("login two-step (TOTP) — hub#473", () => {
     expect(denied.status).toBe(429);
     expect(denied.headers.get("retry-after")).not.toBeNull();
   });
+
+  // (d) The 2FA floor is keyed by (ip,userId), NOT the rotating pendingToken.
+  // Re-POSTing /login mints a FRESH pendingToken for the SAME user — that must
+  // NOT reset the per-account TOTP floor (otherwise an attacker grinds TOTP
+  // forever by re-doing the password step between every 5 code attempts).
+  test("(d) re-POSTing /login (new pendingToken) does NOT reset the per-account TOTP floor", async () => {
+    const u = await createUser(harness.db, "owner", "owner-password-123", {
+      passwordChanged: true,
+    });
+    await persistEnrollment(harness.db, u.id, generateTotpSecret("owner").secret);
+    const ATTACK_IP = "203.0.113.66";
+
+    const passwordPost = async (): Promise<string> => {
+      const pw = formBody({
+        [CSRF_FIELD_NAME]: TEST_CSRF,
+        username: "owner",
+        password: "owner-password-123",
+        next: "/admin/vaults",
+      });
+      const res = await handleAdminLoginPost(
+        harness.db,
+        new Request("http://hub.test/login", {
+          method: "POST",
+          headers: { ...pw.headers, cookie: CSRF_COOKIE, "cf-connecting-ip": ATTACK_IP },
+          body: pw.body,
+        }),
+      );
+      const token = cookieFrom(res, PENDING_LOGIN_COOKIE_NAME);
+      expect(token).toBeTruthy();
+      return token!;
+    };
+
+    const wrongTotp = (pendingToken: string): Request => {
+      const tf = formBody({ [CSRF_FIELD_NAME]: TEST_CSRF, code: "000000", next: "/admin/vaults" });
+      return new Request("http://hub.test/login/2fa", {
+        method: "POST",
+        headers: {
+          ...tf.headers,
+          cookie: `${CSRF_COOKIE}; ${PENDING_LOGIN_COOKIE_NAME}=${pendingToken}`,
+          "cf-connecting-ip": ATTACK_IP,
+        },
+        body: tf.body,
+      });
+    };
+
+    // First password step → pendingToken1.
+    const token1 = await passwordPost();
+    // 4 wrong TOTP attempts against pendingToken1 (all 401, all count toward
+    // the (ip,userId) bucket).
+    for (let i = 0; i < 4; i++) {
+      expect((await handleAdminLoginTotpPost(harness.db, wrongTotp(token1))).status).toBe(401);
+    }
+
+    // Re-do the password step → a BRAND-NEW pendingToken2 (same userId).
+    const token2 = await passwordPost();
+    expect(token2).not.toBe(token1);
+
+    // 5th wrong TOTP — under pendingToken2 but the SAME (ip,userId) bucket →
+    // still the 5th attempt → allowed (401), not reset to fresh.
+    expect((await handleAdminLoginTotpPost(harness.db, wrongTotp(token2))).status).toBe(401);
+    // 6th wrong TOTP → floor full → 429. If the floor were keyed by the
+    // pendingToken, token2 would have a fresh bucket and this would be a 401.
+    const denied = await handleAdminLoginTotpPost(harness.db, wrongTotp(token2));
+    expect(denied.status).toBe(429);
+    expect(denied.headers.get("retry-after")).not.toBeNull();
+  });
 });
 
 describe("/account/2fa handlers — hub#473", () => {

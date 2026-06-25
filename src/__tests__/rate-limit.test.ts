@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  AUTH_IP_CEILING_MAX_ATTEMPTS,
   CHANGE_PASSWORD_MAX_ATTEMPTS,
   CHANGE_PASSWORD_WINDOW_MS,
   MAX_ATTEMPTS,
@@ -7,9 +8,12 @@ import {
   UNKNOWN_IP_SENTINEL,
   WINDOW_MS,
   __resetForTests,
+  authIpCeilingRateLimiter,
   changePasswordRateLimiter,
   checkAndRecord,
   clientIpFromRequest,
+  compositeKey,
+  loginRateLimiter,
 } from "../rate-limit.ts";
 
 afterEach(() => {
@@ -300,5 +304,87 @@ describe("changePasswordRateLimiter — tighter floor for /account/change-passwo
     expect(changePasswordRateLimiter.checkAndRecord("user-a", now).allowed).toBe(false);
     __resetForTests();
     expect(changePasswordRateLimiter.checkAndRecord("user-a", now).allowed).toBe(true);
+  });
+});
+
+// The shared-egress-IP fix: the per-account FLOOR is now keyed by
+// `compositeKey(ip, identity)` so a room of users behind ONE NAT'd /
+// Cloudflare egress IP doesn't pool into one 5-slot bucket. A coarse per-IP
+// CEILING (60/15min) backstops username-rotation across the floors.
+describe("compositeKey + shared-egress-IP login floor", () => {
+  test("normalizes identity: trims + lowercases so casing/whitespace share a bucket", () => {
+    expect(compositeKey("1.2.3.4", "Alice")).toBe("1.2.3.4|alice");
+    expect(compositeKey("1.2.3.4", "  ALICE  ")).toBe("1.2.3.4|alice");
+    // Case-flip evasion is closed: 'Alice' and 'alice' resolve to one key.
+    expect(compositeKey("1.2.3.4", "Alice")).toBe(compositeKey("1.2.3.4", "alice"));
+  });
+
+  // (a) REGRESSION: two distinct usernames from the SAME ip each get a full
+  // independent 5/15min floor (the shared-wifi bug). Before the fix both would
+  // have pooled into one per-IP bucket and the second user's 1st attempt would
+  // have been the 6th overall → 429.
+  test("(a) two usernames from the same IP each get an independent 5/15min floor", () => {
+    const ip = "203.0.113.7";
+    const now = new Date("2026-06-25T12:00:00Z");
+    // Alice exhausts her floor.
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      expect(loginRateLimiter.checkAndRecord(compositeKey(ip, "alice"), now).allowed).toBe(true);
+    }
+    expect(loginRateLimiter.checkAndRecord(compositeKey(ip, "alice"), now).allowed).toBe(false);
+    // Bob (same IP, different username) still has a fresh full floor.
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      expect(loginRateLimiter.checkAndRecord(compositeKey(ip, "bob"), now).allowed).toBe(true);
+    }
+    expect(loginRateLimiter.checkAndRecord(compositeKey(ip, "bob"), now).allowed).toBe(false);
+  });
+
+  // (b) a single (ip,username) still denies on the 6th attempt.
+  test("(b) a single (ip,username) still denies on the 6th attempt", () => {
+    const ip = "203.0.113.7";
+    const now = new Date("2026-06-25T12:00:00Z");
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      expect(loginRateLimiter.checkAndRecord(compositeKey(ip, "alice"), now).allowed).toBe(true);
+    }
+    const denied = loginRateLimiter.checkAndRecord(compositeKey(ip, "alice"), now);
+    expect(denied.allowed).toBe(false);
+    expect(denied.retryAfterSeconds).toBe(WINDOW_MS / 1000);
+  });
+
+  // (c) the per-IP ceiling denies on the 61st attempt from one IP even across
+  // rotated usernames (each username's own floor never trips because each only
+  // sees one attempt, but the coarse ceiling caps total per-IP volume).
+  test("(c) per-IP ceiling denies the 61st attempt across rotated usernames", () => {
+    const ip = "203.0.113.7";
+    const now = new Date("2026-06-25T12:00:00Z");
+    for (let i = 0; i < AUTH_IP_CEILING_MAX_ATTEMPTS; i++) {
+      // Rotate a fresh username every attempt so no per-account floor ever fills.
+      expect(loginRateLimiter.checkAndRecord(compositeKey(ip, `u${i}`), now).allowed).toBe(true);
+      expect(authIpCeilingRateLimiter.checkAndRecord(ip, now).allowed).toBe(true);
+    }
+    // 61st attempt: a brand-new username (floor is fresh) but the ceiling is full.
+    expect(loginRateLimiter.checkAndRecord(compositeKey(ip, "u60"), now).allowed).toBe(true);
+    const ceilingDenied = authIpCeilingRateLimiter.checkAndRecord(ip, now);
+    expect(ceilingDenied.allowed).toBe(false);
+    expect(ceilingDenied.retryAfterSeconds).toBe(WINDOW_MS / 1000);
+  });
+
+  test("the ceiling is per-IP: a different IP is unaffected by another's full ceiling", () => {
+    const now = new Date("2026-06-25T12:00:00Z");
+    for (let i = 0; i < AUTH_IP_CEILING_MAX_ATTEMPTS; i++) {
+      authIpCeilingRateLimiter.checkAndRecord("203.0.113.7", now);
+    }
+    expect(authIpCeilingRateLimiter.checkAndRecord("203.0.113.7", now).allowed).toBe(false);
+    expect(authIpCeilingRateLimiter.checkAndRecord("198.51.100.99", now).allowed).toBe(true);
+  });
+
+  test("ceiling matches the signup precedent (60) and `__resetForTests` clears it", () => {
+    expect(AUTH_IP_CEILING_MAX_ATTEMPTS).toBe(60);
+    const now = new Date("2026-06-25T12:00:00Z");
+    for (let i = 0; i < AUTH_IP_CEILING_MAX_ATTEMPTS; i++) {
+      authIpCeilingRateLimiter.checkAndRecord("203.0.113.7", now);
+    }
+    expect(authIpCeilingRateLimiter.checkAndRecord("203.0.113.7", now).allowed).toBe(false);
+    __resetForTests();
+    expect(authIpCeilingRateLimiter.checkAndRecord("203.0.113.7", now).allowed).toBe(true);
   });
 });

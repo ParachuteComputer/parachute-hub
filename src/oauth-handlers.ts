@@ -72,6 +72,12 @@ import {
 } from "./oauth-ui.ts";
 import { isSameOriginRequest } from "./origin-check.ts";
 import { buildPendingLoginCookie, createPendingLogin } from "./pending-login.ts";
+import {
+  authIpCeilingRateLimiter,
+  clientIpFromRequest,
+  compositeKey,
+  loginRateLimiter,
+} from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { narrowResourceVaultScopes, resolveResourceVault } from "./resource-binding.ts";
 import { isNonRequestableScope, isRequestableScope, scopeIsAdmin } from "./scope-explanations.ts";
@@ -1386,12 +1392,40 @@ async function handleLoginSubmit(
   db: Database,
   req: Request,
   form: Awaited<ReturnType<Request["formData"]>>,
-  _deps: OAuthDeps,
+  deps: OAuthDeps,
   csrfToken: string,
 ): Promise<Response> {
   const username = String(form.get("username") ?? "");
   const password = String(form.get("password") ?? "");
   const params = paramsFromForm(form);
+  // Rate-limit gate — AFTER CSRF (verified by the `handleAuthorizePost` caller)
+  // and BEFORE the credential check. This `/oauth/authorize` password door had
+  // NO rate-limit before; without it an attacker got an unbounded brute-force
+  // channel that bypassed `/login`'s floor entirely. Two tiers, reusing the
+  // SAME `loginRateLimiter` instance + the SAME `compositeKey(ip, username)`
+  // scheme as `/login`, so the two password doors share ONE per-account bucket
+  // (an attacker can't get 5 tries at `/login` PLUS another 5 here). The coarse
+  // per-IP CEILING backstops username-rotation; the per-(ip,username) FLOOR is
+  // the brute-force floor.
+  const clientIp = clientIpFromRequest(req);
+  const now = deps.now ? deps.now() : new Date();
+  const ceiling = authIpCeilingRateLimiter.checkAndRecord(clientIp, now);
+  const floor = loginRateLimiter.checkAndRecord(compositeKey(clientIp, username), now);
+  if (!ceiling.allowed || !floor.allowed) {
+    const retryAfterSeconds = Math.max(
+      ceiling.allowed ? 0 : (ceiling.retryAfterSeconds ?? 1),
+      floor.allowed ? 0 : (floor.retryAfterSeconds ?? 1),
+    );
+    return htmlResponse(
+      renderLogin({
+        params,
+        csrfToken,
+        errorMessage: `Too many login attempts. Try again in ${retryAfterSeconds} seconds.`,
+      }),
+      429,
+      { "retry-after": String(retryAfterSeconds) },
+    );
+  }
   if (!username || !password) {
     return htmlResponse(
       renderLogin({ params, csrfToken, errorMessage: "Username and password are required." }),
