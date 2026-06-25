@@ -219,9 +219,11 @@ describe("GET /api/modules", () => {
     // yet. Post-2026-06-09 (modular-UI architecture, P2) discovery is driven
     // by the UNION of the bootstrap registries (KNOWN_MODULES ∪
     // FIRST_PARTY_FALLBACKS), NOT a curated whitelist. Every known module
-    // surfaces — core (vault/scribe/surface) in the headline tier, the rest
-    // (agent/runner/notes) as `experimental` — so the agent-not-installed
-    // class (running but invisible) can't recur.
+    // surfaces — core (vault/scribe/surface) in the headline tier, agent as
+    // `experimental`, and notes/runner as `deprecated` (2026-06-25, still
+    // resolvable but not offered for fresh installs) — so the agent-not-installed
+    // class (running but invisible) can't recur while deprecated modules stop
+    // being pushed on a fresh box.
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
@@ -233,8 +235,9 @@ describe("GET /api/modules", () => {
     const body = (await res.json()) as {
       modules: Array<{
         short: string;
-        focus: "core" | "experimental";
+        focus: "core" | "experimental" | "deprecated";
         available: boolean;
+        available_to_install: boolean;
         installed: boolean;
         latest_version: string | null;
       }>;
@@ -242,12 +245,14 @@ describe("GET /api/modules", () => {
     };
     const shorts = body.modules.map((m) => m.short);
     // The core tier leads, in the recommended install order (vault → scribe),
-    // ahead of every experimental module.
+    // ahead of every experimental module, which lead the deprecated ones.
     expect(shorts.indexOf("vault")).toBeLessThan(shorts.indexOf("scribe"));
     expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("agent"));
-    expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("runner"));
-    // Every known module is discoverable — vault/scribe/surface (core) +
-    // agent/runner/notes (experimental).
+    // agent (experimental) sorts ahead of notes/runner (deprecated).
+    expect(shorts.indexOf("agent")).toBeLessThan(shorts.indexOf("runner"));
+    expect(shorts.indexOf("agent")).toBeLessThan(shorts.indexOf("notes"));
+    // Every known module is discoverable — vault/scribe/surface (core),
+    // agent (experimental), notes/runner (deprecated).
     for (const s of ["vault", "scribe", "surface", "agent", "runner", "notes"]) {
       expect(shorts).toContain(s);
     }
@@ -257,13 +262,63 @@ describe("GET /api/modules", () => {
     expect(byShort.get("scribe")?.focus).toBe("core");
     expect(byShort.get("surface")?.focus).toBe("core");
     expect(byShort.get("agent")?.focus).toBe("experimental");
-    expect(byShort.get("runner")?.focus).toBe("experimental");
-    expect(byShort.get("notes")?.focus).toBe("experimental");
+    expect(byShort.get("runner")?.focus).toBe("deprecated");
+    expect(byShort.get("notes")?.focus).toBe("deprecated");
+    // `available` stays true for every known module (re-installable), but the
+    // fresh-install OFFER (`available_to_install`) drops the deprecated tier —
+    // notes/runner aren't pushed on a fresh box; agent (experimental) still is.
     expect(body.modules.every((m) => m.available)).toBe(true);
+    expect(byShort.get("vault")?.available_to_install).toBe(true);
+    expect(byShort.get("scribe")?.available_to_install).toBe(true);
+    expect(byShort.get("surface")?.available_to_install).toBe(true);
+    expect(byShort.get("agent")?.available_to_install).toBe(true);
+    expect(byShort.get("runner")?.available_to_install).toBe(false);
+    expect(byShort.get("notes")?.available_to_install).toBe(false);
     expect(body.modules.every((m) => !m.installed)).toBe(true);
     expect(body.modules.every((m) => m.latest_version === "0.9.9")).toBe(true);
     // Supervisor wasn't injected → flag reflects that.
     expect(body.supervisor_available).toBe(false);
+  });
+
+  test("an installed deprecated module (runner) still surfaces for management but is not offered for fresh install (2026-06-25)", async () => {
+    // A legacy operator with runner on disk: the row must remain visible
+    // (installed: true) + manageable, in the `deprecated` tier — but
+    // `available_to_install` is false so the SPA's install catalog won't push
+    // it. Mirrors the notes-daemon back-compat posture.
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-runner",
+        port: 1945,
+        paths: ["/runner", "/.parachute"],
+        health: "/runner/healthz",
+        version: "0.2.0",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+    });
+    const body = (await res.json()) as {
+      modules: Array<{
+        short: string;
+        focus: "core" | "experimental" | "deprecated";
+        installed: boolean;
+        installed_version: string | null;
+        available: boolean;
+        available_to_install: boolean;
+      }>;
+    };
+    const runner = body.modules.find((m) => m.short === "runner");
+    expect(runner).toBeDefined();
+    expect(runner?.installed).toBe(true);
+    expect(runner?.installed_version).toBe("0.2.0");
+    expect(runner?.focus).toBe("deprecated");
+    // Still hub-installable (re-install path) but NOT offered fresh.
+    expect(runner?.available).toBe(true);
+    expect(runner?.available_to_install).toBe(false);
   });
 
   test("scribe row carries package + display props from KNOWN_MODULES", async () => {

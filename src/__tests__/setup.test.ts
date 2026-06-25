@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { InstallOpts } from "../commands/install.ts";
-import { parseServicePicks, setup } from "../commands/setup.ts";
+import { isOfferable, parseServicePicks, setup } from "../commands/setup.ts";
 import { upsertService } from "../services-manifest.ts";
 
 interface InstallCall {
@@ -110,6 +110,26 @@ describe("parseServicePicks", () => {
   });
 });
 
+describe("isOfferable (fresh-install OFFER, 2026-06-25)", () => {
+  test("offers an uninstalled core/experimental module", () => {
+    expect(isOfferable({ short: "vault", installed: false })).toBe(true);
+    expect(isOfferable({ short: "scribe", installed: false })).toBe(true);
+    expect(isOfferable({ short: "surface", installed: false })).toBe(true);
+    // agent stays a legit experimental preview — still offered.
+    expect(isOfferable({ short: "agent", installed: false })).toBe(true);
+  });
+
+  test("does NOT offer a deprecated module (notes / runner) on a fresh install", () => {
+    expect(isOfferable({ short: "notes", installed: false })).toBe(false);
+    expect(isOfferable({ short: "runner", installed: false })).toBe(false);
+  });
+
+  test("never offers an already-installed module regardless of tier", () => {
+    expect(isOfferable({ short: "vault", installed: true })).toBe(false);
+    expect(isOfferable({ short: "notes", installed: true })).toBe(false);
+  });
+});
+
 describe("setup", () => {
   test("exits 0 with friendly note when every known service is installed", async () => {
     const h = makeHarness();
@@ -150,6 +170,96 @@ describe("setup", () => {
       expect(code).toBe(0);
       expect(h.calls).toHaveLength(0);
       expect(h.logs.join("\n")).toMatch(/All known services are already installed/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("fresh box: the offered 'Available to install' list excludes deprecated notes/runner (2026-06-25)", async () => {
+    const h = makeHarness();
+    try {
+      // 'all' picks every OFFERED service. With a clean services.json the survey
+      // sees every known short; the offered filter must drop notes + runner
+      // (deprecated) while keeping vault/scribe/surface/agent. Only vault +
+      // scribe have pre-install follow-up prompts (vault name, scribe provider);
+      // surface + agent have none — so the scripted answers below are complete.
+      const availability = scriptedAvailability([
+        "all", // pick everything offered
+        "default", // vault name (vault is in the offered set)
+        "1", // scribe provider
+      ]);
+      const code = await setup({
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        log: (l) => h.logs.push(l),
+        availability,
+        installFn: async (short, opts) => {
+          h.calls.push({ short, opts });
+          return 0;
+        },
+      });
+      expect(code).toBe(0);
+      // The "Available to install" banner must NOT list notes / runner.
+      const joined = h.logs.join("\n");
+      const availableBlock = joined.slice(joined.indexOf("Available to install:"));
+      expect(availableBlock).not.toMatch(/\bnotes\b/);
+      expect(availableBlock).not.toMatch(/\brunner\b/);
+      // …and `install()` is never invoked for the deprecated shorts.
+      const installedShorts = h.calls.map((c) => c.short);
+      expect(installedShorts).not.toContain("notes");
+      expect(installedShorts).not.toContain("runner");
+      // The non-deprecated set is still offered + installed.
+      expect(installedShorts).toContain("vault");
+      expect(installedShorts).toContain("scribe");
+      expect(installedShorts).toContain("surface");
+      expect(installedShorts).toContain("agent");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("an already-installed deprecated module still shows in 'Already installed' + isn't re-offered (back-compat)", async () => {
+    const h = makeHarness();
+    try {
+      // Legacy operator with runner (deprecated) on disk. It must surface in the
+      // "Already installed" banner (so they know it's there + can manage it via
+      // `parachute <verb> runner`), and must NOT reappear in the fresh-install
+      // OFFER list.
+      upsertService(
+        {
+          name: "parachute-runner",
+          version: "0.2.0",
+          port: 1945,
+          paths: ["/runner"],
+          health: "/runner/healthz",
+        },
+        h.manifestPath,
+      );
+      const availability = scriptedAvailability([
+        "surface", // pick a still-offered module
+      ]);
+      const code = await setup({
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        log: (l) => h.logs.push(l),
+        availability,
+        installFn: async (short, opts) => {
+          h.calls.push({ short, opts });
+          return 0;
+        },
+      });
+      expect(code).toBe(0);
+      const joined = h.logs.join("\n");
+      // Banner lists runner as already installed…
+      const installedBlock = joined.slice(
+        joined.indexOf("Already installed:"),
+        joined.indexOf("Available to install:"),
+      );
+      expect(installedBlock).toMatch(/\brunner\b/);
+      // …but runner is NOT in the fresh-install offer.
+      const availableBlock = joined.slice(joined.indexOf("Available to install:"));
+      expect(availableBlock).not.toMatch(/\brunner\b/);
+      expect(h.calls.map((c) => c.short)).not.toContain("runner");
     } finally {
       h.cleanup();
     }
@@ -220,7 +330,9 @@ describe("setup", () => {
     const h = makeHarness();
     try {
       const availability = scriptedAvailability([
-        "notes", // single pick — no follow-up prompts
+        // surface — a non-deprecated module with no follow-up prompts. (notes,
+        // the prior pick, is now `deprecated` → not in the offered set.)
+        "surface",
       ]);
       const code = await setup({
         manifestPath: h.manifestPath,
@@ -231,10 +343,10 @@ describe("setup", () => {
           h.calls.push({ short, opts });
           upsertService(
             {
-              name: "parachute-notes",
+              name: "parachute-surface",
               version: "0.1.0",
-              port: 1942,
-              paths: ["/notes"],
+              port: 1946,
+              paths: ["/surface"],
               health: "/health",
             },
             opts.manifestPath ?? h.manifestPath,
@@ -257,7 +369,8 @@ describe("setup", () => {
     const h = makeHarness();
     try {
       const availability = scriptedAvailability([
-        "vault, notes", // multi-select
+        // surface replaces the prior `notes` pick (now deprecated → not offered).
+        "vault, surface", // multi-select
         "default", // vault name
       ]);
       const code = await setup({
@@ -270,10 +383,10 @@ describe("setup", () => {
           if (short === "vault") return 7; // fail vault
           upsertService(
             {
-              name: "parachute-notes",
+              name: "parachute-surface",
               version: "0.1.0",
-              port: 1942,
-              paths: ["/notes"],
+              port: 1946,
+              paths: ["/surface"],
               health: "/health",
             },
             opts.manifestPath ?? h.manifestPath,
@@ -282,7 +395,7 @@ describe("setup", () => {
         },
       });
       expect(code).toBe(7);
-      expect(h.calls.map((c) => c.short)).toEqual(["vault", "notes"]);
+      expect(h.calls.map((c) => c.short)).toEqual(["vault", "surface"]);
       expect(h.logs.join("\n")).toMatch(/non-zero exit code/);
     } finally {
       h.cleanup();
@@ -295,7 +408,8 @@ describe("setup", () => {
       const availability = scriptedAvailability([
         "9", // out-of-range index — loop re-prompts
         "nope", // unknown name — loop re-prompts again
-        "notes", // single pick, no follow-up prompts
+        // surface — a non-deprecated single pick with no follow-up prompts.
+        "surface",
       ]);
       const code = await setup({
         manifestPath: h.manifestPath,
@@ -306,10 +420,10 @@ describe("setup", () => {
           h.calls.push({ short, opts });
           upsertService(
             {
-              name: "parachute-notes",
+              name: "parachute-surface",
               version: "0.1.0",
-              port: 1942,
-              paths: ["/notes"],
+              port: 1946,
+              paths: ["/surface"],
               health: "/health",
             },
             opts.manifestPath ?? h.manifestPath,
@@ -318,7 +432,7 @@ describe("setup", () => {
         },
       });
       expect(code).toBe(0);
-      expect(h.calls.map((c) => c.short)).toEqual(["notes"]);
+      expect(h.calls.map((c) => c.short)).toEqual(["surface"]);
       expect(availability.remaining()).toBe(0);
       const joined = h.logs.join("\n");
       expect(joined).toMatch(/out-of-range/);

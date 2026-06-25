@@ -66,16 +66,26 @@ export interface ConfigSchema {
 }
 
 /**
- * Discovery tier (2026-06-09 modular-UI architecture). `core` modules are the
- * product surface (vault / scribe / hub / surface); `experimental` modules
- * (channel / runner / others) render in a de-emphasized group on the Modules
- * screen. **Show all; never hide** — `focus` only sorts + labels.
+ * Discovery tier (2026-06-09 modular-UI architecture). Three tiers today:
+ *   - `core` — the product surface (vault / scribe / hub / surface).
+ *   - `experimental` — legit previews (agent) that render in a de-emphasized
+ *     group but ARE offered on a fresh install.
+ *   - `deprecated` — modules retained for back-compat (notes-daemon, runner)
+ *     that stay resolvable + shown-if-installed (so an existing operator can
+ *     still manage / uninstall them) but are NOT offered on a fresh setup
+ *     (2026-06-25). Distinct from a fully retired module (`RETIRED_MODULES`),
+ *     whose services.json row is GC'd on load.
+ *
+ * **Show all installed; never hide** — `focus` only sorts + labels for an
+ * installed/known module. The one behavioral lever it pulls is the fresh-install
+ * OFFER: `deprecated` shorts are dropped from the setup wizard + the admin SPA's
+ * "available to install" set.
  *
  * Absent in a `module.json` ⇒ the hub falls back to its default map (see
  * `service-spec.focusForShort`), which defaults unlisted modules to
  * `experimental`.
  */
-export type ModuleFocus = "core" | "experimental";
+export type ModuleFocus = "core" | "experimental" | "deprecated";
 
 /**
  * An event a module EMITS — the left-hand side of a Connection (2026-06-09
@@ -324,8 +334,10 @@ export interface ModuleManifest {
    * Discovery tier (2026-06-09 modular-UI architecture). When a module
    * declares `focus`, the hub's Modules screen uses it verbatim; otherwise it
    * falls back to `service-spec.focusForShort` (vault/scribe/hub/surface →
-   * `core`, everything else → `experimental`). **Show all; never hide** —
-   * `focus` only groups + de-emphasizes. Additive + back-compatible.
+   * `core`, notes/runner → `deprecated`, everything else → `experimental`).
+   * **Show all installed; never hide** — `focus` groups + de-emphasizes; the
+   * one behavioral lever is the fresh-install OFFER, which excludes
+   * `deprecated`. Additive + back-compatible.
    */
   readonly focus?: ModuleFocus;
   /**
@@ -711,12 +723,14 @@ function asCredentials(v: unknown, where: string): readonly ModuleCredential[] |
   });
 }
 
-const MODULE_FOCUS_VALUES = new Set<ModuleFocus>(["core", "experimental"]);
+const MODULE_FOCUS_VALUES = new Set<ModuleFocus>(["core", "experimental", "deprecated"]);
 
 function asFocus(v: unknown, where: string): ModuleFocus | undefined {
   if (v === undefined) return undefined;
   if (typeof v !== "string" || !MODULE_FOCUS_VALUES.has(v as ModuleFocus)) {
-    throw new ModuleManifestError(`${where}: "focus" must be "core" | "experimental" if present`);
+    throw new ModuleManifestError(
+      `${where}: "focus" must be "core" | "experimental" | "deprecated" if present`,
+    );
   }
   return v as ModuleFocus;
 }

@@ -637,12 +637,22 @@ export function knownServices(): string[] {
 }
 
 /**
- * Default discovery tier per short name (2026-06-09 modular-UI architecture).
- * The hub PREFERS a module's manifest-declared `focus`; this map is the
- * fallback when `module.json` omits it (and the bootstrap value before a
- * module is installed). vault / scribe / hub / surface are `core`; everything
- * else (agent / runner / notes / unknown third-party) defaults to
- * `experimental`. **Show all; never hide** — `focus` only groups + labels.
+ * Default discovery tier per short name (2026-06-09 modular-UI architecture;
+ * `deprecated` tier added 2026-06-25). The hub PREFERS a module's
+ * manifest-declared `focus`; this map is the fallback when `module.json` omits
+ * it (and the bootstrap value before a module is installed).
+ *
+ *   - `core` — vault / scribe / hub / surface (the product surface).
+ *   - `experimental` — agent (legit preview; still OFFERED on a fresh install)
+ *     + any unlisted third-party short.
+ *   - `deprecated` — notes (notes-daemon deprecated 2026-05-22; notes-ui moved
+ *     into parachute-surface) + runner (per Aaron 2026-06-25: not for new
+ *     installs). Still RESOLVABLE (discoverableShorts unchanged) and
+ *     SHOWN-IF-INSTALLED so an existing operator can manage/uninstall, but NOT
+ *     OFFERED on a fresh setup.
+ *
+ * **Show all installed; never hide** — `focus` groups + labels; the one
+ * behavioral lever is the fresh-install OFFER, which drops `deprecated` shorts.
  */
 const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
   vault: "core",
@@ -650,8 +660,8 @@ const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
   hub: "core",
   surface: "core",
   agent: "experimental",
-  runner: "experimental",
-  notes: "experimental",
+  runner: "deprecated",
+  notes: "deprecated",
 };
 
 /**
@@ -659,6 +669,13 @@ const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
  * `module.json` `focus`) is present it wins; otherwise fall back to
  * `FOCUS_DEFAULTS`, defaulting any unlisted short to `experimental`. Never
  * returns undefined — the Modules screen always has a tier to group by.
+ *
+ * Tier semantics: `core`/`experimental` are both OFFERED on a fresh install;
+ * `deprecated` (notes / runner) is NOT offered on a fresh setup but stays
+ * resolvable + shown-if-installed (the `isKnownModuleShort` /
+ * `discoverableShorts` resolution surface is unchanged). The fresh-install
+ * filters in `setup.ts` + `api-modules.ts` consult this tier to drop
+ * `deprecated` shorts from the "available to install" set.
  */
 export function focusForShort(short: string, declared?: ModuleFocus): ModuleFocus {
   if (declared !== undefined) return declared;
@@ -674,10 +691,12 @@ export function focusForShort(short: string, declared?: ModuleFocus): ModuleFocu
  * regardless of `focus` tier. Deduped, with FIRST_PARTY_FALLBACKS shorts first
  * (notes) then KNOWN_MODULES (vault / scribe / runner / agent / surface).
  *
- * `notes` is intentionally included — it's still resolvable (vendored fallback)
- * for legacy installs; it surfaces as `experimental` and isn't pushed as a
- * fresh install. Callers that want only the "recommended fresh-install" subset
- * can filter by `focus === "core"`.
+ * `notes` (and `runner`) are intentionally included — still resolvable
+ * (vendored fallback / KNOWN_MODULES) for legacy installs; they surface as
+ * `deprecated` (2026-06-25) and aren't OFFERED on a fresh install. The
+ * fresh-install OFFER (setup wizard + admin SPA) filters by tier
+ * (`focus !== "deprecated"`); `discoverableShorts` itself stays the full
+ * resolution surface so existing installs keep working.
  */
 export function discoverableShorts(): string[] {
   const seen = new Set<string>();
