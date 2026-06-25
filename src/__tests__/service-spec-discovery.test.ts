@@ -53,13 +53,33 @@ describe("focusForShort", () => {
     expect(focusForShort("vault")).toBe("core");
     expect(focusForShort("scribe")).toBe("core");
     expect(focusForShort("surface")).toBe("core");
+    // agent stays a legit experimental preview — still offered on a fresh install.
     expect(focusForShort("agent")).toBe("experimental");
-    expect(focusForShort("runner")).toBe("experimental");
-    expect(focusForShort("notes")).toBe("experimental");
+    // notes (notes-daemon, deprecated 2026-05-22) + runner (per Aaron
+    // 2026-06-25, not for new installs) are `deprecated`: still resolvable +
+    // shown-if-installed, but NOT offered on a fresh setup.
+    expect(focusForShort("runner")).toBe("deprecated");
+    expect(focusForShort("notes")).toBe("deprecated");
   });
 
   test("unlisted shorts default to experimental", () => {
     expect(focusForShort("some-third-party-module")).toBe("experimental");
+  });
+
+  test("a declared deprecated focus is honored over the default map", () => {
+    // A module can self-declare `deprecated` in its module.json.
+    expect(focusForShort("agent", "deprecated")).toBe("deprecated");
+  });
+
+  test("deprecated shorts stay resolvable (discoverable) — back-compat for existing installs", () => {
+    // The deprecated tier de-emphasizes + drops the fresh-install OFFER; it does
+    // NOT remove the short from the resolution surface, so an existing
+    // notes/runner install keeps routing + lifecycle.
+    const shorts = discoverableShorts();
+    expect(shorts).toContain("notes");
+    expect(shorts).toContain("runner");
+    expect(isKnownModuleShort("notes")).toBe(true);
+    expect(isKnownModuleShort("runner")).toBe(true);
   });
 });
 

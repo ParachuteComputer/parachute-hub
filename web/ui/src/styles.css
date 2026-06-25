@@ -824,6 +824,37 @@ form .field-error {
 }
 
 /*
+ * Deprecated tier (2026-06-25). Modules retained for back-compat (notes-daemon
+ * / runner) — shown only when already installed so an operator can manage /
+ * uninstall them; NOT offered on a fresh install. De-emphasized a touch further
+ * than experimental (lower base opacity) to read as "legacy, not the path
+ * forward." Same hover-restores-full-opacity affordance.
+ */
+.modules-deprecated {
+  margin-top: 1.25rem;
+  padding-top: 0.75rem;
+  border-top: 1px dashed var(--border, #d0d0d0);
+  opacity: 0.65;
+  transition: opacity 0.15s ease;
+}
+.modules-deprecated:hover,
+.modules-deprecated:focus-within {
+  opacity: 1;
+}
+.deprecated-heading {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.deprecated-heading > span.muted {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+}
+
+/*
  * "Install a module" catalog row — visually lighter than the heavier
  * `.module-row` (no status badge, no meta grid, just name + tagline +
  * package + Install). The card lays out as body+actions side by side

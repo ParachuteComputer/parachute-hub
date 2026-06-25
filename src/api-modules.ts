@@ -15,11 +15,21 @@
  *     / `crashed` / `starting` / `restarting`) + pid. Absent when the
  *     hub is in CLI mode (no supervisor injected through HubFetchDeps).
  *
- * `focus` ("core" | "experimental") comes from each module's `module.json`
- * when declared, else `focusForShort`'s default map. The SPA groups core first
- * + de-emphasizes experimental — it NEVER hides a module. This is what makes a
- * running, self-registered module (channel) visible + installable; the old
- * `CURATED_MODULES = ["vault","scribe"]` whitelist made it invisible.
+ * `focus` ("core" | "experimental" | "deprecated") comes from each module's
+ * `module.json` when declared, else `focusForShort`'s default map. The SPA
+ * groups core first, de-emphasizes experimental, and de-emphasizes
+ * `deprecated` (notes-daemon / runner) further — it NEVER hides an installed
+ * module (so an existing operator can still manage / uninstall a deprecated
+ * one). This is what makes a running, self-registered module (channel) visible
+ * + installable; the old `CURATED_MODULES = ["vault","scribe"]` whitelist made
+ * it invisible.
+ *
+ * `available_to_install` is the fresh-install OFFER (2026-06-25): a module the
+ * hub will push as a new install. It's `available && focus !== "deprecated"`
+ * — so a `deprecated` module that is ALREADY installed still surfaces (via the
+ * `modules` union + `installed: true`) and is manageable, but a deprecated
+ * module is never offered as a fresh install. `agent` (`experimental`) stays
+ * offered.
  *
  * Bearer-gated on `parachute:host:auth` to match the rest of `/api/auth/*`
  * and `/api/grants` — the admin SPA mints this scope via
@@ -199,14 +209,33 @@ interface ModuleWireShape {
   display_name: string;
   tagline: string;
   /**
-   * Discovery tier (2026-06-09 modular-UI architecture). `core` modules render
-   * in the headline group; `experimental` modules render in a de-emphasized
-   * "Experimental" group below — never hidden. Resolved from the module's
-   * `module.json` `focus` when declared, else `focusForShort`'s default map
-   * (vault/scribe/hub/surface → core, channel/runner/others → experimental).
+   * Discovery tier (2026-06-09 modular-UI architecture; `deprecated` added
+   * 2026-06-25). `core` modules render in the headline group; `experimental`
+   * modules render in a de-emphasized "Experimental" group; `deprecated`
+   * modules (notes-daemon / runner) render in a further-de-emphasized
+   * "Deprecated" group — never hidden when installed. Resolved from the
+   * module's `module.json` `focus` when declared, else `focusForShort`'s
+   * default map (vault/scribe/hub/surface → core, notes/runner → deprecated,
+   * others → experimental).
    */
   focus: ModuleFocus;
+  /**
+   * True iff the hub knows how to install this module (`package`/`manifest`
+   * resolvable). Historically "in the curated install catalog". Still set for
+   * every known module; a purely third-party services.json row is false.
+   * NOTE: this is NOT the fresh-install OFFER — a `deprecated` module is still
+   * `available: true` (it's installable for back-compat / re-install) but is
+   * excluded from `available_to_install`.
+   */
   available: boolean;
+  /**
+   * The fresh-install OFFER (2026-06-25): whether the hub presents this module
+   * in the "available to install fresh" set. `available && focus !==
+   * "deprecated"`. The SPA's "Install a module" catalog filters on this so
+   * notes-daemon / runner aren't pushed on a fresh box; an already-installed
+   * deprecated module still surfaces (in the Installed section) for management.
+   */
+  available_to_install: boolean;
   installed: boolean;
   installed_version: string | null;
   latest_version: string | null;
@@ -562,8 +591,8 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   // module's manifest-declared `focus` (when installed + declared) wins; else
   // the `focusForShort` default map. Sort: `core` group first (with the
   // CURATED_MODULES recommended-install order floated to the top of that
-  // group), then `experimental` — the SPA renders the two groups; `focus`
-  // never hides a module.
+  // group), then `experimental`, then `deprecated` (notes / runner) last — the
+  // SPA renders the groups; `focus` never hides an installed module.
   const recommendedOrder = new Map<string, number>(
     (CURATED_MODULES as readonly string[]).map((s, i) => [s, i]),
   );
@@ -585,6 +614,11 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
       // known modules; a purely third-party services.json row (no install
       // package) is not hub-installable → false.
       available: m !== undefined,
+      // Fresh-install OFFER (2026-06-25): installable AND not deprecated. A
+      // deprecated short (notes / runner) stays `available` (re-installable
+      // for back-compat) but is dropped from the offer set so the SPA's
+      // "Install a module" catalog doesn't push it on a fresh box.
+      available_to_install: m !== undefined && focus !== "deprecated",
       installed: installed !== undefined,
       installed_version: installed?.version ?? null,
       latest_version: latestByShort.get(short) ?? null,
@@ -598,7 +632,7 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
     };
     return row;
   });
-  const focusRank = (f: ModuleFocus): number => (f === "core" ? 0 : 1);
+  const focusRank = (f: ModuleFocus): number => (f === "core" ? 0 : f === "experimental" ? 1 : 2);
   rows.sort((a, b) => {
     if (a.focus !== b.focus) return focusRank(a.focus) - focusRank(b.focus);
     const ai = recommendedOrder.get(a.short) ?? Number.POSITIVE_INFINITY;

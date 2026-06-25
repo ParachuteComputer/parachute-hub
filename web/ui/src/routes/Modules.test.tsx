@@ -54,13 +54,14 @@ function renderRoute() {
 }
 
 function moduleRow(short: string, overrides: Partial<api.ModuleListing> = {}): api.ModuleListing {
-  return {
+  const base: api.ModuleListing = {
     short,
     package: `@openparachute/${short}`,
     display_name: short.charAt(0).toUpperCase() + short.slice(1),
     tagline: `the ${short} module`,
     focus: "core",
     available: true,
+    available_to_install: true,
     installed: false,
     installed_version: null,
     latest_version: "1.0.0",
@@ -72,6 +73,12 @@ function moduleRow(short: string, overrides: Partial<api.ModuleListing> = {}): a
     config_ui_url: null,
     ...overrides,
   };
+  // Mirror the server's derivation when the caller doesn't pin it explicitly:
+  // a deprecated module is never in the fresh-install OFFER (2026-06-25).
+  if (overrides.available_to_install === undefined) {
+    base.available_to_install = base.available && base.focus !== "deprecated";
+  }
+  return base;
 }
 
 describe("Modules — catalog rendering", () => {
@@ -163,6 +170,49 @@ describe("Modules — catalog rendering", () => {
     );
     expect(within(installableCore).getByText("Scribe")).toBeInTheDocument();
     expect(within(installableExperimental).getByText("Runner")).toBeInTheDocument();
+  });
+
+  it("deprecated tier (2026-06-25): installed deprecated module shows for management; non-installed deprecated is NOT offered fresh", async () => {
+    // An existing operator with a deprecated module (runner) on disk: it must
+    // render in the Installed section's de-emphasized Deprecated group with its
+    // lifecycle actions. A non-installed deprecated module (notes) carries
+    // available_to_install=false → it must NOT appear in the install catalog.
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        moduleRow("vault", { focus: "core", installed: true, supervisor_status: "running" }),
+        moduleRow("runner", {
+          focus: "deprecated",
+          installed: true,
+          installed_version: "0.2.0",
+          latest_version: "0.2.0",
+          supervisor_status: "running",
+          available_to_install: false,
+        }),
+        // notes: deprecated + NOT installed + not offered fresh.
+        moduleRow("notes", { focus: "deprecated", installed: false, available_to_install: false }),
+        moduleRow("scribe", { focus: "core", installed: false }),
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+
+    const installed = screen.getByTestId("installed-section");
+    const installable = screen.getByTestId("installable-section");
+
+    // Installed: runner in the de-emphasized Deprecated group, manageable.
+    const installedDeprecated = within(installed).getByTestId("installed-deprecated-group");
+    expect(within(installedDeprecated).getByText("Runner")).toBeInTheDocument();
+    expect(
+      within(installedDeprecated).getByRole("button", { name: /uninstall/i }),
+    ).toBeInTheDocument();
+    expect(within(installed).getAllByText(/deprecated/i).length).toBeGreaterThan(0);
+
+    // Install catalog: scribe is offered; notes (deprecated, not installed) is NOT.
+    expect(within(installable).getByText("Scribe")).toBeInTheDocument();
+    expect(within(installable).queryByText("Notes")).toBeNull();
+    expect(within(installable).queryByTestId("installable-deprecated-group")).toBeNull();
   });
 
   it("renders the 'no modules installed' empty state when nothing is installed", async () => {

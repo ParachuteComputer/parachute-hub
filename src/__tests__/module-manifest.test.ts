@@ -277,11 +277,13 @@ describe("validateModuleManifest", () => {
   // --- 2026-06-09 modular-UI architecture P1 fields: focus / configUiUrl /
   //     adminCapabilities / events / actions. All optional + additive. ---
 
-  test("focus accepts core / experimental and rejects anything else", () => {
+  test("focus accepts core / experimental / deprecated and rejects anything else", () => {
     expect(validateModuleManifest({ ...VALID, focus: "core" }, "x").focus).toBe("core");
     expect(validateModuleManifest({ ...VALID, focus: "experimental" }, "x").focus).toBe(
       "experimental",
     );
+    // `deprecated` tier (2026-06-25) — a module can self-declare it.
+    expect(validateModuleManifest({ ...VALID, focus: "deprecated" }, "x").focus).toBe("deprecated");
     // Absent stays absent (hub falls back to its default map downstream).
     expect(validateModuleManifest(VALID, "x").focus).toBeUndefined();
     expect(() => validateModuleManifest({ ...VALID, focus: "headline" }, "x")).toThrow(/focus/);

@@ -46,6 +46,7 @@ function makeModule(short: string, overrides: Partial<api.ModuleListing> = {}): 
     tagline: `the ${short} module`,
     focus: "core",
     available: true,
+    available_to_install: true,
     installed: true,
     installed_version: "1.0.0",
     latest_version: "1.0.0",

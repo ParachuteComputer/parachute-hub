@@ -674,8 +674,13 @@ export interface ModuleUiSubUnit {
  * One row from `GET /api/modules`. Mirrors the snake_case wire shape
  * from `src/api-modules.ts`.
  */
-/** Discovery tier — `core` (headline group) or `experimental` (de-emphasized). */
-export type ModuleFocus = "core" | "experimental";
+/**
+ * Discovery tier — `core` (headline group), `experimental` (de-emphasized), or
+ * `deprecated` (notes-daemon / runner — further de-emphasized + not offered on
+ * a fresh install, 2026-06-25). Must mirror `ModuleFocus` in
+ * `src/module-manifest.ts`.
+ */
+export type ModuleFocus = "core" | "experimental" | "deprecated";
 
 export interface ModuleListing {
   short: string;
@@ -683,13 +688,23 @@ export interface ModuleListing {
   display_name: string;
   tagline: string;
   /**
-   * Discovery tier (2026-06-09 modular-UI architecture). `core` modules render
-   * in the headline group; `experimental` modules render de-emphasized in a
-   * separate group — never hidden. Resolved server-side from the module's
+   * Discovery tier (2026-06-09 modular-UI architecture; `deprecated` added
+   * 2026-06-25). `core` modules render in the headline group; `experimental`
+   * modules render de-emphasized in a separate group; `deprecated` modules
+   * (notes-daemon / runner) render in a further-de-emphasized group — never
+   * hidden when installed. Resolved server-side from the module's
    * `module.json` `focus` (when declared) else hub's default tier map.
    */
   focus: ModuleFocus;
+  /** Hub knows how to install this module (re-installable for back-compat). */
   available: boolean;
+  /**
+   * Fresh-install OFFER (2026-06-25): `available && focus !== "deprecated"`.
+   * The "Install a module" catalog filters on this so notes-daemon / runner
+   * aren't pushed on a fresh box. An already-installed deprecated module still
+   * surfaces in the Installed section for management.
+   */
+  available_to_install: boolean;
   installed: boolean;
   installed_version: string | null;
   latest_version: string | null;

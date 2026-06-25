@@ -11,6 +11,7 @@ import {
   KNOWN_MODULES,
   type ServiceSpec,
   composeServiceSpec,
+  focusForShort,
   knownServices,
 } from "../service-spec.ts";
 import type { ServiceEntry } from "../services-manifest.ts";
@@ -108,10 +109,14 @@ function defaultAvailability(): InteractiveAvailability {
 }
 
 /**
- * Survey the eligible services. We include the four first-party shortnames
- * (vault / notes / scribe / agent + runner) but flag agent as exploratory
- * in the blurb so operators don't grab it by reflex. `installed` is true when
- * the service has a row in services.json.
+ * Survey ALL known first-party shortnames (vault / notes / scribe / agent /
+ * runner / surface) regardless of tier — `installed` is true when the service
+ * has a row in services.json. The fresh-install OFFER is narrowed downstream
+ * by `isOfferable` (drops already-installed + `deprecated`-tier shorts —
+ * notes / runner); agent (`experimental`) is flagged exploratory in its blurb
+ * but stays offered. Surveying everything keeps `installed` detection complete
+ * (the "already installed" banner still lists a deprecated module an operator
+ * has on disk).
  *
  * The full ServiceSpec is only available pre-install for FIRST_PARTY_FALLBACKS
  * shorts (notes — it carries a vendored manifest). KNOWN_MODULES shorts
@@ -149,10 +154,30 @@ function surveyServices(manifestPath: string): ServiceChoice[] {
   });
 }
 
+/**
+ * A surveyed service is OFFERED on a fresh setup iff it is not already
+ * installed AND its discovery tier is not `deprecated` (2026-06-25). The
+ * deprecated tier (notes-daemon, runner) stays resolvable + manageable for an
+ * existing install — it just isn't pushed on a fresh box. `agent`
+ * (`experimental`) is still offered. Exported so the setup tests can pin the
+ * exclusion directly.
+ */
+export function isOfferable(choice: { short: string; installed: boolean }): boolean {
+  if (choice.installed) return false;
+  // No `declared` arg: the survey fires PRE-install, before any module.json is
+  // on disk to read a self-declared `focus` from — so the static default map is
+  // the only signal available + the right one here.
+  return focusForShort(choice.short) !== "deprecated";
+}
+
 const BLURBS: Record<string, string> = {
   vault: "knowledge graph (MCP) — your owner-authenticated note + tag store",
+  surface: "Parachute UI host — auto-installs Notes on first boot (the recommended UI path)",
+  // `app` is the pre-2026-05-27 name for `surface`; kept for any legacy survey row.
   app: "Parachute UI host — auto-installs Notes on first boot (recommended over notes-daemon)",
-  notes: "Notes PWA — web/mobile UI on top of vault (notes-daemon; superseded by `app`)",
+  // notes / runner are `deprecated` (not offered on a fresh setup) — these
+  // blurbs only render if a legacy install surfaces them in the survey.
+  notes: "Notes PWA — web/mobile UI on top of vault (notes-daemon; superseded by `surface`)",
   scribe: "audio transcription for dictation + recordings",
   runner: "vault-as-job-substrate — scheduled claude -p against vault job notes",
   agent:
@@ -306,7 +331,7 @@ export async function setup(opts: SetupOpts = {}): Promise<number> {
 
   const survey = surveyServices(manifestPath);
   const installed = survey.filter((s) => s.installed);
-  const offered = survey.filter((s) => !s.installed);
+  const offered = survey.filter(isOfferable);
 
   if (installed.length > 0) {
     log("Already installed:");

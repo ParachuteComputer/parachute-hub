@@ -274,10 +274,14 @@ export function Modules() {
 
   // Two visual buckets driven entirely off the wire shape — no client
   // re-derivation of "is this available". Modules with `installed: true`
-  // go on top (operator's running set); modules with `available: true`
-  // and `!installed` go below as the install catalog.
+  // go on top (operator's running set); modules that are OFFERED for a fresh
+  // install (`available_to_install` — installable AND not deprecated) and
+  // `!installed` go below as the install catalog. A `deprecated` module
+  // (notes-daemon / runner) that ISN'T installed is excluded here so it isn't
+  // pushed on a fresh box; if it IS installed it still appears in the Installed
+  // section (its own deprecated group) for management/uninstall (2026-06-25).
   const installedModules = modules.filter((m) => m.installed);
-  const installableModules = modules.filter((m) => !m.installed && m.available);
+  const installableModules = modules.filter((m) => !m.installed && m.available_to_install);
 
   // While an install op is in flight for a given short, the catalog
   // hasn't refreshed yet (we wait for the terminal poll) so the module
@@ -437,24 +441,32 @@ export function Modules() {
 }
 
 /**
- * Split a module list into the `core` group then the `experimental` group,
- * rendering each via `renderList`. The experimental group gets a subtle
- * "Experimental" subheading + a de-emphasizing wrapper class — it's grouped
- * and visually backgrounded, NEVER hidden (2026-06-09 modular-UI architecture:
- * show all; focus only sorts + de-emphasizes). The server already sorts
- * core-first, so we just partition.
+ * Split a module list into the `core` group, then the `experimental` group,
+ * then the `deprecated` group (2026-06-25), rendering each via `renderList`.
+ * The experimental + deprecated groups get a subtle subheading + a
+ * de-emphasizing wrapper class — grouped + visually backgrounded, NEVER hidden
+ * (2026-06-09 modular-UI architecture: show all installed; focus only sorts +
+ * de-emphasizes). The server already sorts core → experimental → deprecated,
+ * so we just partition.
+ *
+ * The deprecated group is reached only from the **Installed** section in
+ * practice — `available_to_install` keeps deprecated modules out of the
+ * installable catalog (the install list is pre-filtered), so an operator only
+ * sees the Deprecated group when they already have notes-daemon / runner on
+ * disk and need to manage / uninstall it.
  *
  * `keyPrefix` namespaces the per-group `data-testid` so the installed and
  * installable sections don't collide (`installed-experimental-group`,
- * `installable-experimental-group`).
+ * `installable-experimental-group`, `installed-deprecated-group`).
  */
 function renderFocusGroups(
   modules: ModuleListing[],
   renderList: (group: ModuleListing[]) => ReactElement,
   keyPrefix: string,
 ): ReactElement {
-  const core = modules.filter((m) => m.focus !== "experimental");
+  const core = modules.filter((m) => m.focus === "core");
   const experimental = modules.filter((m) => m.focus === "experimental");
+  const deprecated = modules.filter((m) => m.focus === "deprecated");
   return (
     <>
       {core.length > 0 && <div data-testid={`${keyPrefix}-core-group`}>{renderList(core)}</div>}
@@ -465,6 +477,17 @@ function renderFocusGroups(
             <span className="muted">— exploration modules; not part of the core surface</span>
           </h3>
           {renderList(experimental)}
+        </div>
+      )}
+      {deprecated.length > 0 && (
+        <div className="modules-deprecated" data-testid={`${keyPrefix}-deprecated-group`}>
+          <h3 className="muted deprecated-heading">
+            Deprecated{" "}
+            <span className="muted">
+              — retained for existing installs; not offered for new setups
+            </span>
+          </h3>
+          {renderList(deprecated)}
         </div>
       )}
     </>
