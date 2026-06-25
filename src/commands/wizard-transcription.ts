@@ -270,6 +270,10 @@ async function handleLocal(
   // failure (no engine on PATH, too little RAM on its own re-check, etc.).
   log("");
   log(`  Installing the ${provider} engine via scribe (this can take a few minutes)…`);
+  // The `--provider <p>` FLAG form is intentional (not the positional
+  // `install-backend <p>`): scribe's cmdInstallBackend reads it via getFlag
+  // when args[1] starts with "-". If scribe ever moves off its module-level
+  // `args` global, re-confirm this flag is still honored.
   const code = await runCommand(["parachute-scribe", "install-backend", "--provider", provider]);
   if (code !== 0) {
     // HONEST skip — undo the provisional provider record; do NOT leave a dead

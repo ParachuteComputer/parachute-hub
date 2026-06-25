@@ -2624,13 +2624,15 @@ function writeScribeConfigForWizard(configDir: string, config: WizardScribeConfi
     const { provider, apiKey } = config.transcribe;
     // For `local`, resolve to the CORRECT platform backend — parakeet-mlx on
     // macOS, onnx-asr on Linux. (Was hardcoded to parakeet-mlx, which silently
-    // fails on every Linux box.) No key needed for local. If the platform has
-    // no local backend, fall through to writing the literal string so the
-    // caller's RAM/platform gate — which should have prevented this — is the
-    // single place that decides "local isn't possible here," not this writer.
+    // fails on every Linux box.) No key needed for local. The caller's
+    // RAM/platform gate is the single place that decides "local isn't possible
+    // here" and should have steered to cloud before reaching this writer — but
+    // if that gate is ever bypassed and the platform has no local backend, we
+    // write "none" (transcription off) rather than a dead provider string, so
+    // this writer can never record something that silently fails.
     if (provider === "local") {
       const resolved = platformLocalProvider(platform);
-      update.transcribe = { provider: resolved ?? "parakeet-mlx" };
+      update.transcribe = { provider: resolved ?? "none" };
     } else {
       // Cloud providers need a key. Empty key → just set provider;
       // the operator can paste the key later via /scribe/admin
