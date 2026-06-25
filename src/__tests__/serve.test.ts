@@ -21,7 +21,9 @@ describe("hubServeOptions — the production listener wires the WS bridge", () =
   // upgrades (the channel in-page terminal) 500'd through the hub
   // ("set the websocket object in Bun.serve({})"). The listener MUST declare a
   // websocket handler or `server.upgrade()` throws.
-  const fakeFetch = (() => new Response("ok")) as unknown as Parameters<typeof hubServeOptions>[0]["fetch"];
+  const fakeFetch = (() => new Response("ok")) as unknown as Parameters<
+    typeof hubServeOptions
+  >[0]["fetch"];
 
   test("declares a websocket handler set (open/message/close)", () => {
     const o = hubServeOptions({ port: 0, hostname: "127.0.0.1", fetch: fakeFetch });
@@ -403,6 +405,70 @@ describe("resolveStartupIssuer — precedence chain (hub#365)", () => {
 
   test("FLY_APP_NAME empty string → no fallback", () => {
     expect(resolveStartupIssuer({}, { FLY_APP_NAME: "" }, noExpose)).toBeUndefined();
+  });
+
+  // onboarding-streamline 2026-06-25 — the Caddy-direct zero-SSH boot-issuer
+  // fix. The operator-set `hub_settings.hub_origin` (tier-1 in resolveIssuer)
+  // MUST also drive the boot-time issuer, else a box whose ONLY canonical-
+  // origin source is the DB row boots without an issuer and injects only
+  // loopback into supervised children's PARACHUTE_HUB_ORIGINS.
+  describe("dbHubOrigin tier (DB hub_settings.hub_origin)", () => {
+    test("dbHubOrigin wins over env/platform/expose (mirrors resolveIssuer tier-1)", () => {
+      const got = resolveStartupIssuer(
+        { dbHubOrigin: "https://box.sslip.io" },
+        {
+          PARACHUTE_HUB_ORIGIN: "https://env.example",
+          RENDER_EXTERNAL_URL: "https://render.example.onrender.com",
+        },
+        () => "https://exposed.example",
+      );
+      expect(got).toBe("https://box.sslip.io");
+    });
+
+    test("dbHubOrigin even wins over explicit opts.issuer (DB is the operator's deliberate canonical)", () => {
+      const got = resolveStartupIssuer(
+        { issuer: "https://flag.example", dbHubOrigin: "https://box.sslip.io" },
+        {},
+        noExpose,
+      );
+      expect(got).toBe("https://box.sslip.io");
+    });
+
+    test("dbHubOrigin trailing slash is stripped", () => {
+      expect(resolveStartupIssuer({ dbHubOrigin: "https://box.sslip.io/" }, {}, noExpose)).toBe(
+        "https://box.sslip.io",
+      );
+    });
+
+    test("a loopback dbHubOrigin is rejected (sanitized) → falls through to next tier", () => {
+      // A stray loopback value in the DB must NOT pin the issuer to a non-
+      // public origin; fall through to env so the box keeps a usable issuer.
+      const got = resolveStartupIssuer(
+        { dbHubOrigin: "http://127.0.0.1:1939" },
+        { PARACHUTE_HUB_ORIGIN: "https://env.example" },
+        noExpose,
+      );
+      expect(got).toBe("https://env.example");
+    });
+
+    test("a non-http(s) dbHubOrigin is rejected → falls through", () => {
+      const got = resolveStartupIssuer(
+        { dbHubOrigin: "ftp://box.example" },
+        {},
+        () => "https://exposed.example",
+      );
+      expect(got).toBe("https://exposed.example");
+    });
+
+    test("undefined dbHubOrigin is a no-op (unchanged precedence)", () => {
+      expect(
+        resolveStartupIssuer(
+          { dbHubOrigin: undefined },
+          { PARACHUTE_HUB_ORIGIN: "https://e.x" },
+          noExpose,
+        ),
+      ).toBe("https://e.x");
+    });
   });
 });
 

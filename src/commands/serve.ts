@@ -37,13 +37,14 @@ import { readExposeState } from "../expose-state.ts";
 import { createDbHolder, defaultStatInode, startDbPathLivenessTimer } from "../hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
+import { getHubOrigin } from "../hub-settings.ts";
 import { writeHubFile } from "../hub.ts";
-import { createWsBridgeHandlers } from "../ws-bridge.ts";
 import { enrichedPath } from "../spawn-path.ts";
 import { Supervisor } from "../supervisor.ts";
 import { createUser, userCount } from "../users.ts";
 import { sanitizePublicOrigin } from "../vault-hub-origin-env.ts";
 import { WELL_KNOWN_DIR } from "../well-known.ts";
+import { createWsBridgeHandlers } from "../ws-bridge.ts";
 import { bootSupervisedModules } from "./serve-boot.ts";
 
 /**
@@ -217,12 +218,30 @@ function parsePort(raw: string | undefined): number | undefined {
  * remaining gap (rebuild the live spawn-env on `supervisor.restart` so the
  * first exposure propagates to already-running children without a manual
  * restart) is the deferred #532 follow-up; not implemented in this PR.
+ *
+ * DB ORIGIN, highest precedence (onboarding-streamline 2026-06-25, Caddy-direct
+ * zero-SSH path): the operator-set `hub_settings.hub_origin` is the tier-1 layer
+ * in the per-request `resolveIssuer` (hub-server.ts). The boot path MUST honor
+ * it too — otherwise a Caddy-fronted box whose ONLY canonical-origin source is
+ * the DB row (no `PARACHUTE_HUB_ORIGIN` env, no expose-state, no platform var)
+ * boots `serve` with no issuer, injects only loopback aliases into supervised
+ * children's `PARACHUTE_HUB_ORIGINS`, and vault/scribe then reject every token
+ * the hub mints under the public origin (which per-request `resolveIssuer` DOES
+ * stamp from the DB). Threading the DB origin in as the top input keeps the
+ * boot-time seed in lockstep with `resolveIssuer`'s tier-1. `serve()` reads the
+ * row off the opened hub DB and passes it as `dbHubOrigin`; tests pass it
+ * directly. It is sanitized like any other public-origin input (a stray
+ * loopback / non-http(s) DB value never pins the issuer).
  */
 export function resolveStartupIssuer(
-  opts: { issuer?: string },
+  opts: { issuer?: string; dbHubOrigin?: string },
   env: NodeJS.ProcessEnv,
   readExpose: () => string | undefined = defaultReadExposeHubOrigin,
 ): string | undefined {
+  // DB row first — mirrors `resolveIssuer`'s tier-1 (hub_settings.hub_origin).
+  // Sanitized so a stray loopback / non-http(s) value never pins the issuer.
+  const dbOrigin = sanitizePublicOrigin(opts.dbHubOrigin);
+  if (dbOrigin) return dbOrigin;
   const flyOrigin = flyDefaultOriginFromEnv(env);
   const explicit = (
     opts.issuer ??
@@ -435,7 +454,6 @@ export async function serve(opts: ServeOpts = {}): Promise<{
 
   const envPort = parsePort(env.PORT);
   const port = opts.port ?? envPort ?? DEFAULT_PORT;
-  const issuer = resolveStartupIssuer(opts, env);
   // Containers default to 0.0.0.0 so the platform's HTTP forwarder can
   // reach us; the `--hostname` flag / PARACHUTE_BIND_HOST is the escape
   // hatch for setups that want loopback-only inside a sidecar.
@@ -461,6 +479,24 @@ export async function serve(opts: ServeOpts = {}): Promise<{
   const dbPath = hubDbPath();
   // Self-heal-or-die DB holder (#594) + proactive ghost-fd watchdog (#610/#619).
   const { dbHolder, livenessTimer } = armServeDbWatchdog(dbPath, { log });
+  // Resolve the boot-time issuer AFTER the DB is open so the operator-set
+  // `hub_settings.hub_origin` (tier-1 in `resolveIssuer`) seeds the value the
+  // hub mints with AND the `PARACHUTE_HUB_ORIGINS` set injected into supervised
+  // children. This is what makes a Caddy-fronted, zero-SSH box (whose only
+  // canonical-origin source is the DB row) inject the public origin into
+  // vault/scribe so they accept hub-minted tokens. Pass it as `dbHubOrigin`;
+  // a malformed read can't crash startup — `getHubOrigin` is a plain SELECT
+  // and `resolveStartupIssuer` sanitizes the value.
+  let dbHubOrigin: string | undefined;
+  try {
+    dbHubOrigin = getHubOrigin(dbHolder.get()) ?? undefined;
+  } catch {
+    dbHubOrigin = undefined;
+  }
+  const issuer = resolveStartupIssuer(
+    { ...opts, ...(dbHubOrigin !== undefined ? { dbHubOrigin } : {}) },
+    env,
+  );
   const adminBootstrap = await seedInitialAdminIfNeeded(dbHolder.get(), env, log);
 
   if (adminBootstrap === "needs-setup") {

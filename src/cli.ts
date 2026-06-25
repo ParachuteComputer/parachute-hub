@@ -360,7 +360,12 @@ async function main(argv: string[]): Promise<number> {
         console.log(initHelp());
         return 0;
       }
-      const exposeExtract = extractNamedFlag(rest, "--expose");
+      const originExtract = extractHubOrigin(rest);
+      if (originExtract.error) {
+        console.error(`parachute init: ${originExtract.error}`);
+        return 1;
+      }
+      const exposeExtract = extractNamedFlag(originExtract.rest, "--expose");
       if (exposeExtract.error) {
         console.error(`parachute init: ${exposeExtract.error}`);
         return 1;
@@ -392,6 +397,7 @@ async function main(argv: string[]): Promise<number> {
         console.error(
           "usage: parachute init [--no-browser] [--no-expose-prompt]\n" +
             "                     [--expose none|tailnet|cloudflare]\n" +
+            "                     [--hub-origin <url>]\n" +
             "                     [--cli-wizard | --browser-wizard]",
         );
         return 1;
@@ -403,6 +409,7 @@ async function main(argv: string[]): Promise<number> {
       const initOpts: Parameters<typeof init>[0] = {};
       if (noBrowser) initOpts.noBrowser = true;
       if (noExposePrompt) initOpts.noExposePrompt = true;
+      if (originExtract.hubOrigin) initOpts.hubOrigin = originExtract.hubOrigin;
       if (exposeExtract.value) {
         initOpts.exposeChoice = exposeExtract.value as "none" | "tailnet" | "cloudflare";
       }
@@ -929,6 +936,12 @@ async function main(argv: string[]): Promise<number> {
       const mod = await loadCommand("auth", () => import("./commands/auth.ts"));
       if (!mod) return 1;
       return await mod.auth(rest);
+    }
+
+    case "hub": {
+      const mod = await loadCommand("hub", () => import("./commands/hub.ts"));
+      if (!mod) return 1;
+      return await mod.hub(rest);
     }
 
     case "vault": {

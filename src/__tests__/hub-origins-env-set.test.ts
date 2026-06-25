@@ -21,7 +21,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveStartupIssuer } from "../commands/serve.ts";
+import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { parseHubOrigins, serializeHubOrigins } from "../hub-origin.ts";
+import { getHubOrigin, setHubOrigin } from "../hub-settings.ts";
 import { buildHubOriginsEnvValue } from "../vault-hub-origin-env.ts";
 
 describe("serializeHubOrigins / parseHubOrigins round-trip", () => {
@@ -195,5 +198,76 @@ describe("buildHubOriginsEnvValue — assembles the hub's legitimate-origin set"
       ]);
       for (const o of set) expect(sanctioned.has(o)).toBe(true);
     });
+  });
+});
+
+/**
+ * THE CRUX (onboarding-streamline 2026-06-25, Caddy-direct zero-SSH path):
+ * a box whose ONLY canonical-origin source is the DB row `hub_settings.hub_origin`
+ * (no PARACHUTE_HUB_ORIGIN env, no expose-state, no RENDER/FLY platform var —
+ * the bare-droplet-behind-Caddy shape) MUST inject that public origin into the
+ * supervised modules' PARACHUTE_HUB_ORIGINS. Otherwise vault/scribe accept only
+ * loopback `iss` and reject every token the hub mints under the public origin
+ * (which the per-request resolveIssuer DOES stamp from the DB).
+ *
+ * These tests prove the full boot chain: DB row → `resolveStartupIssuer`
+ * (boot-time issuer seed) → `buildHubOriginsEnvValue` (the env injected at
+ * child spawn) CONTAINS the public origin.
+ */
+describe("DB hub_origin flows into the injected PARACHUTE_HUB_ORIGINS (Caddy-direct boot chain)", () => {
+  let dir: string;
+  const noExpose = (): string | undefined => undefined;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hub-origins-db-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("DB-persisted public origin lands in the assembled origin set", () => {
+    // Persist the Caddy public origin to the DB exactly as `hub set-origin` /
+    // `init --hub-origin` would.
+    const db = openHubDb(hubDbPath(dir));
+    setHubOrigin(db, "https://box.sslip.io");
+    db.close();
+
+    // Boot-time issuer resolution reads the DB row (passed as dbHubOrigin) —
+    // no env, no expose-state, no platform var (the bare-Caddy shape).
+    const dbOrigin = getHubOrigin(openHubDb(hubDbPath(dir))) ?? undefined;
+    const issuer = resolveStartupIssuer(
+      { ...(dbOrigin !== undefined ? { dbHubOrigin: dbOrigin } : {}) },
+      {},
+      noExpose,
+    );
+    expect(issuer).toBe("https://box.sslip.io");
+
+    // That issuer seeds the env injected into vault/scribe — the public origin
+    // MUST be in their accepted-`iss` set.
+    const set = parseHubOrigins(
+      buildHubOriginsEnvValue(dir, issuer, {}, join(dir, "expose-state.json")),
+    );
+    expect(set).toContain("https://box.sslip.io");
+    // Loopback aliases stay present (co-located CLI / loopback proxy path).
+    expect(set).toContain("http://127.0.0.1:1939");
+    expect(set).toContain("http://localhost:1939");
+  });
+
+  test("no DB origin AND nothing else → loopback-only (the regression this guards: no public origin would leak in)", () => {
+    // Fresh DB, no row, no env, no expose-state: the boot issuer is undefined
+    // and the set is loopback-only. Proves the fix doesn't fabricate an origin.
+    const dbOrigin = getHubOrigin(openHubDb(hubDbPath(dir))) ?? undefined;
+    const issuer = resolveStartupIssuer(
+      { ...(dbOrigin !== undefined ? { dbHubOrigin: dbOrigin } : {}) },
+      {},
+      noExpose,
+    );
+    expect(issuer).toBeUndefined();
+    const set = parseHubOrigins(
+      buildHubOriginsEnvValue(dir, issuer, {}, join(dir, "expose-state.json")),
+    );
+    // Loopback-only — no public origin fabricated. (Order is Set-insertion
+    // dependent; assert membership + size rather than a brittle exact array.)
+    expect(set).toContain("http://127.0.0.1:1939");
+    expect(set).toContain("http://localhost:1939");
+    expect(set).toHaveLength(2);
   });
 });

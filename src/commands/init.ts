@@ -41,6 +41,7 @@ import { type ExposeState, readExposeState } from "../expose-state.ts";
 import { type EnsureHubOpts, HUB_DEFAULT_PORT, HUB_SVC, readHubPort } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { deriveHubOrigin } from "../hub-origin.ts";
+import { setHubOrigin } from "../hub-settings.ts";
 import {
   type EnsureHubVersionMatchesResult,
   ensureHubUnit,
@@ -184,6 +185,27 @@ export interface InitOpts {
    * already known so there's no question to ask).
    */
   noWizardPrompt?: boolean;
+  /**
+   * Canonical public hub origin (the OAuth issuer / `iss` claim). Persisted to
+   * `hub_settings.hub_origin` BEFORE the hub unit starts + modules spawn, so
+   * supervised vault/scribe come up with the public origin already in their
+   * `PARACHUTE_HUB_ORIGINS` set in ONE pass — no restart needed. The headline
+   * use case is the zero-SSH Caddy-direct path: a cloud-init script passes
+   * `--hub-origin https://<droplet-ip>.sslip.io` so a reverse-proxied box
+   * records its public origin without an admin browser session. Validated +
+   * canonicalized by the CLI before it reaches here; persisted via the
+   * `setHubOriginImpl` seam. Loopback / non-http(s) values never reach this far
+   * (the CLI rejects them via `validateHubOrigin`). Absent → no-op (the laptop /
+   * loopback path is unchanged).
+   */
+  hubOrigin?: string;
+  /**
+   * Test seam: persist the canonical hub origin to `hub_settings.hub_origin`.
+   * Production opens `hub.db` (running migrations) and calls `setHubOrigin`.
+   * Tests pass a stub to assert the write happens BEFORE `ensureHub` without
+   * touching the operator's live DB. Receives the resolved configDir + origin.
+   */
+  setHubOriginImpl?: (configDir: string, origin: string) => void;
   /**
    * Test seam: probe the running hub for its first-claim bootstrap token
    * (hub#576). Production hits `GET http://127.0.0.1:<port>/admin/setup` with
@@ -389,6 +411,25 @@ async function defaultEnsureHubViaUnit(opts: EnsureHubOpts): Promise<{
   // no-manager / timeout / start-failed → actionable error. The init caller
   // catches this and prints the message + `parachute logs hub` hint.
   throw new Error(result.messages.join("\n") || `hub unit bringup failed (${result.outcome}).`);
+}
+
+/**
+ * Default impl for the `--hub-origin` persistence step. Opens `hub.db` (running
+ * migrations on a fresh box) and writes `hub_settings.hub_origin`. Runs BEFORE
+ * the hub unit starts so the boot-time issuer resolution + child-spawn env
+ * (`PARACHUTE_HUB_ORIGINS`) pick up the public origin in one pass. The DB is an
+ * on-disk SQLite file shared with the (not-yet-started) serve process, so a
+ * write here is visible to the unit when it boots. The CLI has already
+ * validated + canonicalized the URL via `validateHubOrigin`, so this trusts the
+ * input (mirrors `setHubOrigin`'s typed-callsite contract).
+ */
+function defaultSetHubOrigin(configDir: string, origin: string): void {
+  const db = openHubDb(hubDbPath(configDir));
+  try {
+    setHubOrigin(db, origin);
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -629,9 +670,31 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   const installVaultModuleImpl = opts.installVaultModuleImpl ?? defaultInstallVaultModule;
   const runCliWizardImpl = opts.runCliWizardImpl ?? defaultRunCliWizard;
   const fetchBootstrapTokenImpl = opts.fetchBootstrapTokenImpl ?? defaultFetchBootstrapToken;
+  const setHubOriginImpl = opts.setHubOriginImpl ?? defaultSetHubOrigin;
 
   log("Parachute init — getting your hub set up.");
   log("");
+
+  // Step 0: persist `--hub-origin` BEFORE the hub unit starts (below). The
+  // boot-time issuer resolution + child-spawn env (`PARACHUTE_HUB_ORIGINS`)
+  // both read `hub_settings.hub_origin`, so writing it now means vault/scribe
+  // come up with the public origin already in their accepted-`iss` set in ONE
+  // pass — no restart needed (the Caddy-direct zero-SSH path). A failure here
+  // is non-fatal: warn + continue (the operator can re-run `parachute hub
+  // set-origin` later), since init's contract is hub up → wizard regardless.
+  if (opts.hubOrigin) {
+    try {
+      setHubOriginImpl(configDir, opts.hubOrigin);
+      log(`✓ Canonical hub origin set to ${opts.hubOrigin} (OAuth issuer).`);
+      log("");
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      log(
+        `⚠ Couldn't persist the hub origin (${detail}); set it later with \`parachute hub set-origin <url>\`.`,
+      );
+      log("");
+    }
+  }
 
   // Step 1: hub running?
   // NB: under the Phase 3a unit-managed hub there is no pidfile, so

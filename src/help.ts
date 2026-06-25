@@ -28,6 +28,8 @@ Usage:
   parachute migrate --to-supervised move a legacy detached install to the managed hub
   parachute migrate [--dry-run]     archive legacy files at ecosystem root
   parachute auth <cmd>              identity (set password, manage 2FA)
+  parachute hub set-origin <url>    set the canonical public hub origin (OAuth issuer)
+                                    — for reverse-proxy / Caddy-direct boxes
   parachute vault <args...>         vault-specific ops (tokens, 2fa, config, init,
                                     etc.) — forwards to parachute-vault.
                                     For lifecycle, use \`parachute start|stop|restart|logs vault\`.
@@ -130,6 +132,7 @@ export function initHelp(): string {
 Usage:
   parachute init [--no-browser] [--no-expose-prompt]
                  [--expose none|tailnet|cloudflare]
+                 [--hub-origin <url>]
                  [--cli-wizard | --browser-wizard]
 
 What it does:
@@ -165,6 +168,11 @@ Flags:
                               none       — stay loopback-only
                               tailnet    — set up Tailscale serve (private to your tailnet)
                               cloudflare — set up Cloudflare Tunnel (your own domain)
+  --hub-origin <url>        set the canonical public origin (OAuth issuer) BEFORE
+                            the hub + modules start, so vault/scribe come up
+                            accepting it in one pass. For reverse-proxy /
+                            Caddy-direct boxes that bind loopback but are reached
+                            over a public HTTPS URL (e.g. https://<ip>.sslip.io).
   --cli-wizard              skip the "browser or CLI?" prompt and walk the wizard
                             in this terminal (hub#168 Cut 4)
   --browser-wizard          skip the prompt and open the browser wizard directly

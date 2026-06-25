@@ -960,6 +960,154 @@ describe("hasNoDisplay heuristic (Fix 2 — headless browser-open guard)", () =>
   });
 });
 
+describe("init --hub-origin (Caddy-direct zero-SSH boot, onboarding-streamline 2026-06-25)", () => {
+  test("persists the origin BEFORE ensureHub so modules spawn with it in one pass", async () => {
+    const h = makeHarness();
+    try {
+      const order: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        hubOrigin: "https://box.sslip.io",
+        // The load-bearing ordering assertion: the origin write MUST happen
+        // before the hub unit starts (which boots + spawns vault/scribe), so
+        // the boot-time issuer + child env pick it up without a restart.
+        setHubOriginImpl: (_dir, origin) => {
+          order.push(`set-origin:${origin}`);
+        },
+        ensureHub: async () => {
+          order.push("ensureHub");
+          writeHubPort(1939, h.configDir);
+          return { pid: 5555, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      expect(order).toEqual(["set-origin:https://box.sslip.io", "ensureHub"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("default impl writes hub_settings.hub_origin to the real DB", async () => {
+    const h = makeHarness();
+    try {
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        hubOrigin: "https://box.sslip.io",
+        // No setHubOriginImpl override → exercise the production default
+        // (openHubDb + setHubOrigin) against the harness's temp configDir.
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 5555, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      const { hubDbPath, openHubDb } = await import("../hub-db.ts");
+      const { getHubOrigin } = await import("../hub-settings.ts");
+      const db = openHubDb(hubDbPath(h.configDir));
+      try {
+        expect(getHubOrigin(db)).toBe("https://box.sslip.io");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("no --hub-origin → no persistence call (laptop/loopback path unchanged)", async () => {
+    const h = makeHarness();
+    try {
+      let setCalls = 0;
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        setHubOriginImpl: () => {
+          setCalls++;
+        },
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 5555, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      expect(setCalls).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a persistence failure is non-fatal — init still reaches the wizard", async () => {
+    const h = makeHarness();
+    try {
+      const logs: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: (l) => logs.push(l),
+        alive: () => false,
+        hubOrigin: "https://box.sslip.io",
+        setHubOriginImpl: () => {
+          throw new Error("disk full");
+        },
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 5555, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        installVaultModuleImpl: noopVaultInstall,
+      });
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toContain("Couldn't persist the hub origin");
+      expect(joined).toContain("http://127.0.0.1:1939/admin/");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 describe("init exposure chain", () => {
   test("TTY + no exposure + no flags → prompt is shown", async () => {
     const h = makeHarness();
