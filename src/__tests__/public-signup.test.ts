@@ -290,6 +290,48 @@ describe("public signup page — multi-use redemption + caps", () => {
     expect(getVaultCapBytes(harness.db, "nina")).toBeNull();
   });
 
+  test("CONCURRENT redeem of a max_uses=1 link: exactly one 302, one 410 (atomic exhaustion guard)", async () => {
+    const admin = await createUser(harness.db, "operator", "operator-password-1");
+    const { rawToken } = issueInvite(harness.db, { createdBy: admin.id, maxUses: 1 });
+    const stub = makeStubRunCommand();
+
+    // Build two complete POST requests up front, then fire them together with
+    // NO reset between them — a genuine race for the single seat. (The `signup`
+    // helper resets the rate-limiter per call, which would serialize the
+    // window; here both share one generous signup bucket, so neither 429s.)
+    const mkPost = (username: string): Request => {
+      const { token: csrfToken, cookieFragment } = csrfPair();
+      return postReq(
+        rawToken,
+        {
+          [CSRF_FIELD_NAME]: csrfToken,
+          username,
+          email: `${username}@example.com`,
+          password: `${username}-strong-password-1`,
+          password_confirm: `${username}-strong-password-1`,
+          vault_name: username,
+        },
+        cookieFragment,
+      );
+    };
+    const [r1, r2] = await Promise.all([
+      handleAccountSetupPost(mkPost("racea"), rawToken, deps(stub.run)),
+      handleAccountSetupPost(mkPost("raceb"), rawToken, deps(stub.run)),
+    ]);
+
+    // Exactly one winner (302) and one loser (410) — never two 302s.
+    expect([r1.status, r2.status].sort()).toEqual([302, 410]);
+
+    // The link recorded exactly ONE redemption; exactly one account exists.
+    const after = findInviteByRawToken(harness.db, rawToken);
+    expect(after?.usedCount).toBe(1);
+    const accounts = [
+      getUserByUsernameCI(harness.db, "racea"),
+      getUserByUsernameCI(harness.db, "raceb"),
+    ].filter((u) => u !== null);
+    expect(accounts.length).toBe(1);
+  });
+
   test("exhaustion refusal: the (N+1)th signup on a maxed link → 410", async () => {
     const admin = await createUser(harness.db, "operator", "operator-password-1");
     const { rawToken } = issueInvite(harness.db, { createdBy: admin.id, maxUses: 1 + 1 });

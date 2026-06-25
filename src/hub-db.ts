@@ -535,7 +535,9 @@ const MIGRATIONS: readonly Migration[] = [
       --     used across services.json / user_vaults / invites.vault_name; no
       --     FK — vault names resolve through services.json, not a DB row, the
       --     established pattern). cap_bytes is the byte ceiling (default
-      --     ~1 GB stamped by the public-signup flow). No backfill — existing
+      --     ~1 GB stamped by the public-signup flow), guarded by a
+      --     CHECK (cap_bytes > 0) so a direct DB write can't seed a 0/negative
+      --     cap the Phase-2 reader would misinterpret. No backfill — existing
       --     vaults have no cap row, which the Phase-2 enforcement reads as
       --     "uncapped" (only vaults provisioned through a capped signup get a
       --     row).
@@ -546,7 +548,11 @@ const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE users ADD COLUMN email TEXT;
       CREATE TABLE vault_caps (
         vault_name TEXT PRIMARY KEY,
-        cap_bytes INTEGER NOT NULL,
+        -- CHECK (cap_bytes > 0): guard against a 0/negative cap from a direct
+        -- DB write making the Phase-2 enforcement reader treat the vault as
+        -- "0-byte ceiling" (everything over cap) or nonsense. The mint + redeem
+        -- paths already validate positivity; this is the at-rest backstop.
+        cap_bytes INTEGER NOT NULL CHECK (cap_bytes > 0),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );

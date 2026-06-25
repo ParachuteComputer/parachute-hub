@@ -75,7 +75,7 @@ import {
   assertInviteRedeemable,
   recordInviteRedemption,
 } from "./invites.ts";
-import { checkAndRecord, clientIpFromRequest } from "./rate-limit.ts";
+import { clientIpFromRequest, signupRateLimiter } from "./rate-limit.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
 import { SESSION_TTL_MS, buildSessionCookie, createSession } from "./sessions.ts";
 import {
@@ -241,11 +241,15 @@ export async function handleAccountSetupPost(
     );
   }
 
-  // Rate limit — reuse the /login IP bucket so a redeem flood and a login
-  // flood share the same throttle. After CSRF (so a junk cross-site POST
-  // doesn't burn the bucket), before any account/vault work.
+  // Rate limit — a DEDICATED signup bucket (per-IP, 60/15min), NOT the /login
+  // bucket. A public multi-use signup link is redeemed by a room of people
+  // sharing one NAT'd egress IP, so the /login-sized 5/15min cap would 429 the
+  // ~6th legitimate signer mid-demo. Generous-but-bounded: the invite's own
+  // max_uses + expiry are the primary bound; this is the abuse floor. After
+  // CSRF (so a junk cross-site POST doesn't burn the bucket), before any
+  // account/vault work.
   const clientIp = clientIpFromRequest(req);
-  const gate = checkAndRecord(clientIp, now);
+  const gate = signupRateLimiter.checkAndRecord(clientIp, now);
   if (!gate.allowed) {
     return htmlResponse(
       renderAdminError({

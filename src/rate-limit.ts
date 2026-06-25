@@ -1,7 +1,12 @@
 /**
  * Rate-limit primitives for hub auth-surface endpoints.
  *
- * Two limiters today (one floor each — neither is the primary defense):
+ * Each limiter is a floor, not the primary defense. Two are highlighted below
+ * for their contrasting threat models; the rest (`/login/2fa`, vault-token
+ * mint, public signup) are documented at their `export const` definitions.
+ * The public-signup limiter is the deliberate OUTLIER — generous, not tight —
+ * because its endpoint is meant to be redeemed by a room of people sharing one
+ * egress IP (see `SIGNUP_MAX_ATTEMPTS`).
  *
  *   - `/login` (per-IP, hub#187 / hub#188): 5 attempts / 15 min.
  *     Lands as a floor under brute-force after hub#187 collapsed the
@@ -109,6 +114,27 @@ export const VAULT_TOKEN_MINT_WINDOW_MS = 10 * 60 * 1000;
  * minutes is generous for a human and still chokes a stolen-cookie flood.
  */
 export const VAULT_TOKEN_MINT_MAX_ATTEMPTS = 10;
+/**
+ * `POST /account/setup/<token>` (public invite redemption / signup) window
+ * length: 15 minutes — same window as `/login`, but a MUCH larger cap (below)
+ * because the threat model is the opposite. A public multi-use signup link is
+ * meant to be redeemed by a ROOM OF PEOPLE, and a demo room shares ONE NAT'd
+ * egress IP — so a per-IP `/login`-sized cap (5/15min) would 429 the ~6th
+ * legitimate signer. This bucket is deliberately generous so a shared egress
+ * IP comfortably handles a cohort, while still being a floor against an
+ * attacker scripting account creation against an open link (the invite's
+ * own `max_uses` + expiry are the primary bound; this is the abuse floor).
+ * Separate bucket from `/login` so a signup flurry never burns the login
+ * window, and vice-versa.
+ */
+export const SIGNUP_WINDOW_MS = 15 * 60 * 1000;
+/**
+ * `POST /account/setup/<token>` attempts allowed per IP per window. 60 is
+ * comfortably above a single demo room behind one NAT (and well above any
+ * legitimate human's retries) while still capping a scripted-abuse rate to
+ * ~4/min sustained. The 61st attempt within the window is denied.
+ */
+export const SIGNUP_MAX_ATTEMPTS = 60;
 /** Sentinel for the IP-extraction priority chain when nothing parsed. */
 export const UNKNOWN_IP_SENTINEL = "unknown";
 
@@ -247,6 +273,16 @@ export const vaultTokenMintRateLimiter = new RateLimiter(
 );
 
 /**
+ * `POST /account/setup/<token>` rate limiter — per-IP, 60 attempts / 15 min
+ * (public invite redemption / signup). DELIBERATELY generous: a public
+ * multi-use signup link is redeemed by a room of people sharing one NAT'd
+ * egress IP, so a `/login`-sized cap would 429 legitimate signers mid-demo.
+ * Separate bucket from `/login` so the two never share a window. The invite's
+ * own `max_uses` + expiry are the primary bound; this is the abuse floor.
+ */
+export const signupRateLimiter = new RateLimiter(SIGNUP_MAX_ATTEMPTS, SIGNUP_WINDOW_MS);
+
+/**
  * Backwards-compat shim for hub#188's call sites: the original
  * top-level `checkAndRecord` was the login limiter. New code should
  * reach into `loginRateLimiter.checkAndRecord` directly.
@@ -266,6 +302,7 @@ export function __resetForTests(): void {
   changePasswordRateLimiter.reset();
   totpRateLimiter.reset();
   vaultTokenMintRateLimiter.reset();
+  signupRateLimiter.reset();
 }
 
 /**
