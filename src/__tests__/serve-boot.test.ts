@@ -125,6 +125,51 @@ describe("bootSupervisedModules", () => {
     expect(recorder.calls[0]?.env?.PARACHUTE_HUB_ORIGIN).toBe("https://hub.example");
   });
 
+  test("forwards PARACHUTE_HUB_ORIGINS (the multi-origin iss-set) alongside the single origin", async () => {
+    // Multi-origin iss-set (onboarding-streamline 2026-06-25): a resource
+    // server on scope-guard ≥0.5.0 widens its accepted-`iss` check to this set
+    // so a token minted under one URL of a multi-URL box validates via another.
+    // The set always carries the issuer + loopback aliases (the deterministic
+    // members); expose-state / platform members vary by box.
+    writeManifest({ services: [VAULT_ENTRY] }, h.manifestPath);
+    const recorder = makeRecorder();
+    const sup = new Supervisor({ spawnFn: recorder.spawn });
+
+    await bootSupervisedModules(sup, {
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      hubOrigin: "https://hub.example",
+    });
+
+    const origins = recorder.calls[0]?.env?.PARACHUTE_HUB_ORIGINS;
+    expect(origins).toBeDefined();
+    const set = (origins ?? "").split(",");
+    expect(set).toContain("https://hub.example");
+    // SECURITY: the set is hub-controlled (issuer + loopback + expose +
+    // platform) — never a request Host. Loopback aliases are always present.
+    expect(set.some((o) => o.startsWith("http://127.0.0.1:"))).toBe(true);
+    expect(set.some((o) => o.startsWith("http://localhost:"))).toBe(true);
+    // And the single canonical origin is still written for back-compat.
+    expect(recorder.calls[0]?.env?.PARACHUTE_HUB_ORIGIN).toBe("https://hub.example");
+  });
+
+  test("no PARACHUTE_HUB_ORIGINS when hubOrigin is unset (no widening, single-origin only)", async () => {
+    // Back-compat: a boot with no hubOrigin neither sets PARACHUTE_HUB_ORIGIN
+    // nor the set — the child keeps its own loopback default + scope-guard's
+    // single-origin behavior.
+    writeManifest({ services: [VAULT_ENTRY] }, h.manifestPath);
+    const recorder = makeRecorder();
+    const sup = new Supervisor({ spawnFn: recorder.spawn });
+
+    await bootSupervisedModules(sup, {
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+    });
+
+    expect(recorder.calls[0]?.env?.PARACHUTE_HUB_ORIGIN).toBeUndefined();
+    expect(recorder.calls[0]?.env?.PARACHUTE_HUB_ORIGINS).toBeUndefined();
+  });
+
   test("sets PORT in child env from services.json entry (hub#357)", async () => {
     // Container deploys (Render etc.) set PORT in hub's process.env via
     // Dockerfile / platform injection. The supervisor's defaultSpawnFn
