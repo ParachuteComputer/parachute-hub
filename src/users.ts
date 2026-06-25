@@ -35,6 +35,15 @@ export interface User {
    */
   passwordChanged: boolean;
   /**
+   * Contactable email captured at signup (migration v15, B2). The username
+   * is the login + URL identity ([a-z0-9_-]); email is the SEPARATE contact
+   * field the operator sees + uses to reach a signup. `null` for every
+   * account created before email capture (wizard admin, env-seeded admin,
+   * pre-named friend invites that didn't collect one). Not unique at the
+   * schema level — see migration v15.
+   */
+  email: string | null;
+  /**
    * The vault instance names this user has access to (multi-user Phase 2
    * PR 2 — many-to-many via the `user_vaults` table; design
    * 2026-05-20-multi-user-phase-1.md §Phase 2). Empty `[]` means "no per-
@@ -81,6 +90,7 @@ interface Row {
   created_at: string;
   updated_at: string;
   password_changed: number;
+  email: string | null;
 }
 
 /**
@@ -126,6 +136,7 @@ function rowToUser(r: Row, assignedVaults: string[]): User {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     passwordChanged: r.password_changed === 1,
+    email: r.email ?? null,
     assignedVaults,
   };
 }
@@ -233,6 +244,15 @@ export interface CreateUserOpts {
    */
   assignedVaults?: string[];
   /**
+   * Contactable email to store on the new account (migration v15, B2).
+   * Default `null` — the wizard/env-seeded admin paths and pre-named
+   * friend invites that don't collect email omit it. The public-signup
+   * redeem path passes the validated email so the operator can reach the
+   * signup. Validation (format) is the caller's responsibility
+   * (`validateEmail`); this just persists what it's given.
+   */
+  email?: string | null;
+  /**
    * The `user_vaults.role` to write for every entry in `assignedVaults`.
    * Default `'write'` (= owner; `vaultVerbsForRole('write')` grants the
    * full read/write/admin triple). The invite-redeem path passes the
@@ -268,6 +288,7 @@ export async function createUser(
   const passwordHash = await argonHash(password);
   const stamp = (opts.now?.() ?? new Date()).toISOString();
   const passwordChanged = opts.passwordChanged === true ? 1 : 0;
+  const email = opts.email ?? null;
   // De-dupe + preserve insert order so the returned array matches what
   // `getUserById` would load right after (which sorts by created_at +
   // vault_name). Empty array is "no vaults" — admin posture or a non-
@@ -284,9 +305,9 @@ export async function createUser(
     db.transaction(() => {
       db.prepare(
         `INSERT INTO users
-           (id, username, password_hash, created_at, updated_at, password_changed)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(id, username, passwordHash, stamp, stamp, passwordChanged);
+           (id, username, password_hash, created_at, updated_at, password_changed, email)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id, username, passwordHash, stamp, stamp, passwordChanged, email);
       if (assignedVaults.length > 0) {
         const role = opts.role ?? "write";
         const insertVault = db.prepare(
@@ -315,6 +336,7 @@ export async function createUser(
     createdAt: stamp,
     updatedAt: stamp,
     passwordChanged: passwordChanged === 1,
+    email,
     assignedVaults,
   };
 }
@@ -748,4 +770,41 @@ export function validatePassword(password: string): ValidatePasswordResult {
     return { valid: false, reason: "too_short" };
   }
   return { valid: true };
+}
+
+/**
+ * Email validation (migration v15, B2 — public-signup email capture).
+ *
+ * Deliberately PERMISSIVE: a single `local@domain.tld` shape check, not a
+ * full RFC 5322 parser. The goal is "the operator can plausibly reach this
+ * person," not RFC compliance — over-strict regexes reject valid real-world
+ * addresses (plus-tags, subdomains, long TLDs) and add no security. We require:
+ *   * exactly one `@`,
+ *   * a non-empty local part with no whitespace,
+ *   * a domain with at least one `.` and a 2+ char final label,
+ *   * no whitespace anywhere, and an overall length ceiling (254, the SMTP
+ *     practical max) so a megabyte string can't be stored.
+ *
+ * The address is lowercased + trimmed before the check and returned in that
+ * canonical form. Same discriminated-union shape as the other validators so
+ * the API/redeem edge can surface the reason.
+ */
+export const EMAIL_MAX_LEN = 254;
+
+// One @, no whitespace, a dotted domain ending in a 2+ char label.
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@.]{2,}$/;
+
+export type ValidateEmailResult =
+  | { valid: true; email: string }
+  | { valid: false; reason: "format" | "length" };
+
+export function validateEmail(raw: string): ValidateEmailResult {
+  const email = raw.trim().toLowerCase();
+  if (email.length === 0 || email.length > EMAIL_MAX_LEN) {
+    return { valid: false, reason: "length" };
+  }
+  if (!EMAIL_REGEX.test(email)) {
+    return { valid: false, reason: "format" };
+  }
+  return { valid: true, email };
 }

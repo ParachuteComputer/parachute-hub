@@ -4,7 +4,10 @@
  * issuer — signing keys (v1), users + opaque refresh tokens (v2), OAuth
  * clients + auth-codes + grants + browser sessions (v3), TOTP 2FA
  * enrollment on the users row (v11, hub#473), and one-time invite links
- * (v12, the `invites` table; v13 adds the pre-named `username` column).
+ * (v12, the `invites` table; v13 adds the pre-named `username` column;
+ * v14 adds refresh-token rotation grace; v15 generalizes invites into
+ * multi-use public-signup links + email-as-username + the `vault_caps`
+ * per-vault storage-cap table).
  *
  * Each open() runs `migrate()` to bring the schema up to date. A
  * `schema_version` table records every applied migration so re-opens are
@@ -472,6 +475,81 @@ const MIGRATIONS: readonly Migration[] = [
       -- older ancestor under burst issuance (ties), and the grace decision is
       -- security-load-bearing, so it must be exact, not heuristic.
       ALTER TABLE tokens ADD COLUMN rotated_to TEXT;
+    `,
+  },
+  {
+    version: 15,
+    sql: `
+      -- Multi-use public signup links + email-as-username + per-vault caps
+      -- (DEMO-PREP-2026-06-25 Workstream B: B1 multi-use invite, B2 email
+      -- capture, B4 public signup page; the cap value is persisted now so
+      -- B3's vault-side enforcement — a separate Phase-2 PR — can read it).
+      --
+      -- (1) FOUR columns on \`invites\` generalize the single-use link into a
+      --     multi-use, capped one. Backwards compatible: every pre-v15 invite
+      --     redeems exactly as before because the defaults reproduce the old
+      --     single-use semantics.
+      --
+      --   * max_uses (INTEGER NOT NULL DEFAULT 1) — how many accounts ONE link
+      --     may create. DEFAULT 1 = the historical single-use invite, so every
+      --     pre-v15 row and every default-shaped new row stays single-use. A
+      --     public signup link mints with a higher value (e.g. 25 demo seats).
+      --   * used_count (INTEGER NOT NULL DEFAULT 0) — how many accounts the link
+      --     HAS created. Redeem refuses once used_count >= max_uses. Replaces
+      --     the boolean used_at as the exhaustion signal for multi-use links;
+      --     used_at is RETAINED (stamped on the FIRST redeem) so legacy
+      --     single-use lookups + the admin list's "redeemed" status keep
+      --     working unchanged.
+      --   * email (TEXT, nullable) — the redeemer's email captured at signup
+      --     as the contactable identity (B2). NULL on every pre-v15 invite and
+      --     on admin-issued links that don't collect email; set per-redemption
+      --     for public-signup links. Stored so the operator can reach signups.
+      --     (One link → many signups means one invite row can't hold every
+      --     redeemer's email; this column holds the MOST-RECENT redeemer's
+      --     email for a single-use link, and the per-account email lives on the
+      --     users row — see (3). For multi-use the canonical per-user email is
+      --     users.email.)
+      --   * vault_cap_bytes (INTEGER, nullable) — the per-vault storage cap to
+      --     STAMP onto each vault this link provisions (B4). NULL on every
+      --     pre-v15 invite + admin-issued links that don't set a cap (those
+      --     provision uncapped, the historical behavior); set to ~1 GB on a
+      --     public-signup link so each provisioned vault gets a vault_caps row
+      --     for the Phase-2 enforcement PR to read. The cap travels on the
+      --     invite (not a server-wide default) so different links can carry
+      --     different caps.
+      --
+      -- (2) ONE column on \`users\`: email-as-contactable-identity (B2). The
+      --     username stays the login + URL identity ([a-z0-9_-]); email is the
+      --     separate contact field the operator sees + uses to reach a signup.
+      --     Nullable: every pre-v15 account (wizard admin, env-seeded admin,
+      --     pre-named friend invites) predates email capture and keeps NULL.
+      --     NOT UNIQUE — two people behind one shared mailbox, or an operator
+      --     re-using their address across test accounts, shouldn't be blocked
+      --     at the schema. Validation (format) happens at the API/redeem edge.
+      --
+      -- (3) NEW \`vault_caps\` table — the per-vault storage cap, persisted at
+      --     provision time (B4: "persist a per-vault cap value at provision
+      --     time EVEN THOUGH vault-side enforcement lands in a separate
+      --     Phase-2 PR — at minimum store the cap so the later PR can read +
+      --     enforce it"). Keyed by vault_name (the same instance-name space
+      --     used across services.json / user_vaults / invites.vault_name; no
+      --     FK — vault names resolve through services.json, not a DB row, the
+      --     established pattern). cap_bytes is the byte ceiling (default
+      --     ~1 GB stamped by the public-signup flow). No backfill — existing
+      --     vaults have no cap row, which the Phase-2 enforcement reads as
+      --     "uncapped" (only vaults provisioned through a capped signup get a
+      --     row).
+      ALTER TABLE invites ADD COLUMN max_uses INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE invites ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE invites ADD COLUMN email TEXT;
+      ALTER TABLE invites ADD COLUMN vault_cap_bytes INTEGER;
+      ALTER TABLE users ADD COLUMN email TEXT;
+      CREATE TABLE vault_caps (
+        vault_name TEXT PRIMARY KEY,
+        cap_bytes INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `,
   },
 ];

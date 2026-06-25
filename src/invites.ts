@@ -37,10 +37,23 @@
  * v13): the redemption form shows it read-only and the redeem handler
  * enforces it. NULL = redeemer picks their own.
  *
- * Single-use is enforced by stamping `used_at` on redemption — a replay
- * attempt sees the row with `used_at` set and `redeemInvite` throws
- * `InviteUsedError`. Revocation is a separate `revoked_at` stamp the admin
- * sets before redemption. Expiry is enforced at redeem-time.
+ * MULTI-USE (migration v15, DEMO-PREP-2026-06-25 Workstream B): an invite
+ * carries `max_uses` (how many accounts ONE link may create) + `used_count`
+ * (how many it has). A redeem is refused once `used_count >= max_uses`. A
+ * LEGACY single-use invite is exactly `max_uses = 1` (the column default), so
+ * pre-v15 invites and default-shaped new ones behave identically to before.
+ * `used_at` is RETAINED — stamped on the FIRST redeem — so the admin list's
+ * "redeemed" status and any single-use lookups keep reading the same signal.
+ * Exhaustion is enforced atomically in `recordInviteRedemption` (the
+ * `used_count < max_uses` guard in the UPDATE), so two concurrent redeems of
+ * the last remaining seat can't both succeed.
+ *
+ * Revocation is a separate `revoked_at` stamp the admin sets before
+ * redemption (terminal regardless of remaining uses). Expiry is enforced at
+ * redeem-time. A public-signup link also captures the redeemer's `email`
+ * (B2 — the contactable identity, also stored per-account on `users.email`)
+ * and may carry a `vault_cap_bytes` to stamp onto each provisioned vault (B4
+ * — persisted to `vault_caps` for the Phase-2 enforcement PR to read).
  */
 import type { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
@@ -70,6 +83,24 @@ export interface Invite {
   provisionVault: boolean;
   /** `'internal' | 'off'` mirror knob for the provisioned vault, or null. */
   defaultMirror: string | null;
+  /**
+   * How many accounts this link may create (v15). 1 = legacy single-use
+   * (the column default); >1 = a multi-use public-signup link.
+   */
+  maxUses: number;
+  /** How many accounts this link HAS created (v15). Redeem refused once == maxUses. */
+  usedCount: number;
+  /**
+   * Most-recent redeemer's email (v15, B2), or null. For a multi-use link
+   * the canonical per-account email lives on `users.email`; this column
+   * holds the latest redeemer's for the admin's at-a-glance audit.
+   */
+  email: string | null;
+  /**
+   * Per-vault storage cap (bytes) to stamp onto each provisioned vault
+   * (v15, B4), or null to provision uncapped (legacy behavior).
+   */
+  vaultCapBytes: number | null;
   expiresAt: string;
   usedAt: string | null;
   redeemedUserId: string | null;
@@ -98,6 +129,20 @@ export class InviteUsedError extends Error {
   }
 }
 
+/**
+ * A multi-use link whose seats are all taken (`used_count >= max_uses`). For
+ * a single-use (max_uses=1) link this is the same condition the legacy
+ * `InviteUsedError` named, but the redeem path throws `InviteUsedError` for a
+ * single-use link (familiar "already used" copy) and `InviteExhaustedError`
+ * for a multi-use one ("all signups taken") so the message can differ.
+ */
+export class InviteExhaustedError extends Error {
+  constructor() {
+    super("invite has reached its maximum number of signups");
+    this.name = "InviteExhaustedError";
+  }
+}
+
 export class InviteRevokedError extends Error {
   constructor() {
     super("invite has been revoked");
@@ -113,6 +158,10 @@ interface Row {
   role: string;
   provision_vault: number;
   default_mirror: string | null;
+  max_uses: number;
+  used_count: number;
+  email: string | null;
+  vault_cap_bytes: number | null;
   expires_at: string;
   used_at: string | null;
   redeemed_user_id: string | null;
@@ -129,6 +178,10 @@ function rowToInvite(r: Row): Invite {
     role: r.role,
     provisionVault: r.provision_vault === 1,
     defaultMirror: r.default_mirror,
+    maxUses: r.max_uses,
+    usedCount: r.used_count,
+    email: r.email,
+    vaultCapBytes: r.vault_cap_bytes,
     expiresAt: r.expires_at,
     usedAt: r.used_at,
     redeemedUserId: r.redeemed_user_id,
@@ -142,10 +195,19 @@ export function hashInviteToken(rawToken: string): string {
   return createHash("sha256").update(rawToken).digest("hex");
 }
 
-/** Derive an invite's status from its stamps + the current time. */
+/**
+ * Derive an invite's status from its stamps + the current time.
+ *
+ * Multi-use (v15): an invite is "redeemed" only once every seat is taken
+ * (`usedCount >= maxUses`). A partially-used multi-use link (some seats left,
+ * not expired/revoked) is still "pending" — it can take more signups. A
+ * legacy single-use link (maxUses=1) flips to "redeemed" on its first
+ * redeem, exactly as before, because 1 >= 1. Expired wins over a not-yet-
+ * exhausted link; revoked + exhausted are checked first (terminal).
+ */
 export function inviteStatus(invite: Invite, now: Date = new Date()): InviteStatus {
   if (invite.revokedAt) return "revoked";
-  if (invite.usedAt) return "redeemed";
+  if (invite.usedCount >= invite.maxUses) return "redeemed";
   if (now.getTime() > new Date(invite.expiresAt).getTime()) return "expired";
   return "pending";
 }
@@ -166,6 +228,16 @@ export interface IssueInviteOpts {
   provisionVault?: boolean;
   /** `'internal' | 'off'` mirror knob for the provisioned vault. */
   defaultMirror?: string | null;
+  /**
+   * How many accounts this link may create (v15). Default 1 (single-use,
+   * the legacy shape). Caller validates the upper bound.
+   */
+  maxUses?: number;
+  /**
+   * Per-vault storage cap (bytes) to stamp onto each provisioned vault
+   * (v15, B4). Omit/null = provision uncapped (legacy behavior).
+   */
+  vaultCapBytes?: number | null;
   /** Lifetime in seconds. Default {@link DEFAULT_INVITE_TTL_SECONDS} (7 days). */
   expiresInSeconds?: number;
   now?: () => Date;
@@ -198,12 +270,15 @@ export function issueInvite(db: Database, opts: IssueInviteOpts): IssuedInvite {
   const username = opts.username ?? null;
   const provisionVault = opts.provisionVault ?? true;
   const defaultMirror = opts.defaultMirror ?? null;
+  const maxUses = opts.maxUses ?? 1;
+  const vaultCapBytes = opts.vaultCapBytes ?? null;
 
   db.prepare(
     `INSERT INTO invites
        (token, created_by, vault_name, username, role, provision_vault, default_mirror,
+        max_uses, used_count, email, vault_cap_bytes,
         expires_at, used_at, redeemed_user_id, revoked_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, NULL, NULL, NULL, ?)`,
   ).run(
     tokenHash,
     opts.createdBy,
@@ -212,6 +287,8 @@ export function issueInvite(db: Database, opts: IssueInviteOpts): IssuedInvite {
     role,
     provisionVault ? 1 : 0,
     defaultMirror,
+    maxUses,
+    vaultCapBytes,
     expiresAt,
     createdAt,
   );
@@ -226,6 +303,10 @@ export function issueInvite(db: Database, opts: IssueInviteOpts): IssuedInvite {
       role,
       provisionVault,
       defaultMirror,
+      maxUses,
+      usedCount: 0,
+      email: null,
+      vaultCapBytes,
       expiresAt,
       usedAt: null,
       redeemedUserId: null,
@@ -275,7 +356,7 @@ export function usernameReservedByPendingInvite(
   const row = db
     .query<{ token: string }, [string, string]>(
       `SELECT token FROM invites
-       WHERE username = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+       WHERE username = ? AND used_count < max_uses AND revoked_at IS NULL AND expires_at > ?
        LIMIT 1`,
     )
     .get(username, now.toISOString());
@@ -295,11 +376,13 @@ export function listInvites(
 }
 
 /**
- * Validate an invite for redemption WITHOUT consuming it. Throws on every
- * not-redeemable branch (not-found / expired / used / revoked). Returns the
- * invite when it's redeemable. The redemption handler calls this FIRST (so a
- * bad token is rejected before any account/vault work), then does
- * createUser, then `consumeInvite` AFTER the user row commits.
+ * Validate an invite for redemption WITHOUT recording one. Throws on every
+ * not-redeemable branch (not-found / expired / exhausted / revoked). Returns
+ * the invite when it's redeemable. The redemption handler calls this FIRST (so
+ * a bad token is rejected before any account/vault work), then does createUser,
+ * then `recordInviteRedemption` INSIDE the user-row transaction (the atomic
+ * seat-lock — the `< max_uses` UPDATE guard is what actually prevents an
+ * over-seat under concurrency; this early check is the fast-path rejection).
  */
 export function assertInviteRedeemable(
   db: Database,
@@ -308,10 +391,15 @@ export function assertInviteRedeemable(
 ): Invite {
   const invite = findInviteByRawToken(db, rawToken);
   if (!invite) throw new InviteNotFoundError();
-  // Revoked + used are terminal regardless of clock; check them before expiry
-  // so a revoked-then-expired invite reports the more specific reason.
+  // Revoked + exhausted are terminal regardless of clock; check them before
+  // expiry so a revoked-then-expired invite reports the more specific reason.
   if (invite.revokedAt) throw new InviteRevokedError();
-  if (invite.usedAt) throw new InviteUsedError();
+  // Exhaustion (v15): seats all taken. A single-use link (maxUses=1) throws
+  // the familiar InviteUsedError ("already used"); a multi-use one throws
+  // InviteExhaustedError ("all signups taken") so the copy can differ.
+  if (invite.usedCount >= invite.maxUses) {
+    throw invite.maxUses > 1 ? new InviteExhaustedError() : new InviteUsedError();
+  }
   if (now.getTime() > new Date(invite.expiresAt).getTime()) {
     throw new InviteExpiredError();
   }
@@ -319,15 +407,52 @@ export function assertInviteRedeemable(
 }
 
 /**
- * Mark an invite consumed — stamp `used_at` + `redeemed_user_id`. Called
- * Called within the account-creation transaction (or after a committed user
- * row). Single-use + not-revoked is enforced by the
- * `used_at IS NULL AND revoked_at IS NULL` guard in the UPDATE: a racing
- * second redeem — or a concurrent revoke — updates zero rows and the caller
- * treats that as already-consumed/revoked. Race-safe because sqlite
- * serializes writes.
+ * Record ONE redemption against an invite — the multi-use-aware consume
+ * (v15). Atomically:
+ *   - increments `used_count` by 1,
+ *   - stamps `used_at` on the FIRST redeem only (COALESCE keeps the original),
+ *   - records the redeemer's `email` (B2) + `redeemed_user_id` as the
+ *     MOST-RECENT redeemer (the canonical per-account email lives on
+ *     `users.email`; this is the admin's at-a-glance latest).
  *
- * Returns `true` if THIS call consumed the invite, `false` otherwise.
+ * Exhaustion + revocation are enforced by the `used_count < max_uses AND
+ * revoked_at IS NULL` guard in the UPDATE: a racing redeem that would take a
+ * seat past the cap — or one racing a revoke — updates zero rows, and the
+ * caller treats that as exhausted/revoked. Race-safe because sqlite
+ * serializes writes (a legacy single-use link is just the max_uses=1 case:
+ * the second concurrent redeem sees `used_count`=1, fails the `< max_uses`
+ * guard, and changes zero rows — exactly the old single-use behavior).
+ *
+ * Returns `true` if THIS call recorded a redemption, `false` otherwise.
+ */
+export function recordInviteRedemption(
+  db: Database,
+  tokenHash: string,
+  redeemedUserId: string,
+  email: string | null = null,
+  now: Date = new Date(),
+): boolean {
+  const stamp = now.toISOString();
+  const res = db
+    .prepare(
+      `UPDATE invites
+       SET used_count = used_count + 1,
+           used_at = COALESCE(used_at, ?),
+           redeemed_user_id = ?,
+           email = ?
+       WHERE token = ? AND used_count < max_uses AND revoked_at IS NULL`,
+    )
+    .run(stamp, redeemedUserId, email, tokenHash);
+  return res.changes > 0;
+}
+
+/**
+ * Legacy single-use consume — thin wrapper over {@link recordInviteRedemption}
+ * for callers that don't capture email. Retained for backwards compatibility;
+ * the redeem path uses `recordInviteRedemption` directly so it can record the
+ * email. Race-safe + exhaustion-aware via the underlying function.
+ *
+ * Returns `true` if THIS call recorded a redemption, `false` otherwise.
  */
 export function consumeInvite(
   db: Database,
@@ -335,23 +460,22 @@ export function consumeInvite(
   redeemedUserId: string,
   now: Date = new Date(),
 ): boolean {
-  const res = db
-    .prepare(
-      "UPDATE invites SET used_at = ?, redeemed_user_id = ? WHERE token = ? AND used_at IS NULL AND revoked_at IS NULL",
-    )
-    .run(now.toISOString(), redeemedUserId, tokenHash);
-  return res.changes > 0;
+  return recordInviteRedemption(db, tokenHash, redeemedUserId, null, now);
 }
 
 /**
  * Revoke a pending invite (admin DELETE). Stamps `revoked_at` only when the
- * invite isn't already used or revoked. Returns `true` if this call revoked
- * it, `false` if it was already consumed/revoked or not found.
+ * invite still has seats left (`used_count < max_uses`) and isn't already
+ * revoked. A multi-use link can be revoked mid-life to cut off its remaining
+ * seats; a fully-exhausted link is terminal and revoke is a no-op. (For a
+ * legacy single-use link `used_count < max_uses` is equivalent to the old
+ * `used_at IS NULL` guard.) Returns `true` if this call revoked it, `false`
+ * if it was already exhausted/revoked or not found.
  */
 export function revokeInvite(db: Database, tokenHash: string, now: Date = new Date()): boolean {
   const res = db
     .prepare(
-      "UPDATE invites SET revoked_at = ? WHERE token = ? AND used_at IS NULL AND revoked_at IS NULL",
+      "UPDATE invites SET revoked_at = ? WHERE token = ? AND used_count < max_uses AND revoked_at IS NULL",
     )
     .run(now.toISOString(), tokenHash);
   return res.changes > 0;
@@ -373,7 +497,7 @@ export function revokeInvitesForVault(
 ): number {
   const res = db
     .prepare(
-      "UPDATE invites SET revoked_at = ? WHERE vault_name = ? AND used_at IS NULL AND revoked_at IS NULL",
+      "UPDATE invites SET revoked_at = ? WHERE vault_name = ? AND used_count < max_uses AND revoked_at IS NULL",
     )
     .run(now.toISOString(), vaultName);
   return Number(res.changes);

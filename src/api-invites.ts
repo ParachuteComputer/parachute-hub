@@ -15,6 +15,18 @@
  *
  * Wire shape is snake_case (matches `/api/users`). An invite's raw token
  * NEVER appears in a GET/list response — only in the POST-create `url`.
+ *
+ * v15 (DEMO-PREP Workstream B) extends POST /api/invites with `max_uses`
+ * (multi-use public-signup links, default 1 = single-use) and
+ * `vault_cap_bytes` (per-vault storage cap stamped at provision, B4). A
+ * multi-use PROVISIONING link with no explicit `vault_cap_bytes` auto-defaults
+ * to ~1 GB (DEFAULT_VAULT_CAP_BYTES) so a public link never provisions
+ * uncapped by omission; single-use friends links stay uncapped unless opted
+ * in. The list/create wire shape gains `max_uses`, `used_count`, `email`
+ * (latest redeemer, B2), and `vault_cap_bytes`. `expires_in` already bounded
+ * the link lifetime (B1's expiry). A multi-use link can't pre-name a username
+ * or pin a single new vault name (every seat past the first would collide —
+ * rejected at mint).
  */
 import type { Database } from "bun:sqlite";
 import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
@@ -32,6 +44,7 @@ import {
   usernameReservedByPendingInvite,
 } from "./invites.ts";
 import { getUserByUsernameCI, validateUsername } from "./users.ts";
+import { DEFAULT_VAULT_CAP_BYTES } from "./vault-caps.ts";
 import { VAULT_NAME_CHARSET_RE } from "./vault-name.ts";
 import { listVaultNamesFromPath } from "./vault-names.ts";
 
@@ -47,6 +60,18 @@ export interface ApiInvitesDeps {
 const ALLOWED_ROLES = new Set(["read", "write"]);
 /** Cap an invite TTL so a typo can't mint a ~forever link. 90 days. */
 const MAX_INVITE_TTL_SECONDS = 90 * 24 * 60 * 60;
+/**
+ * Cap `max_uses` (v15) so a typo can't mint a runaway public-signup link on a
+ * shared box. 1000 is comfortably above any demo cohort while still bounding
+ * the abuse surface. The DEMO-PREP shared box uses small values (tens of seats).
+ */
+const MAX_INVITE_USES = 1000;
+/**
+ * Ceiling on a per-vault cap an invite may carry (v15, B4). 100 GiB — far
+ * above the ~1 GB default, but bounds a fat-finger that would make the cap
+ * meaningless on a shared box. The minimum is 1 byte (a positive integer).
+ */
+const MAX_VAULT_CAP_BYTES = 100 * 1024 * 1024 * 1024;
 
 interface InviteWireShape {
   /** sha256 hash — the stable id for list/revoke. NOT the raw token. */
@@ -57,6 +82,14 @@ interface InviteWireShape {
   role: string;
   provision_vault: boolean;
   default_mirror: string | null;
+  /** v15 — how many accounts this link may create (1 = single-use). */
+  max_uses: number;
+  /** v15 — how many it has created so far. */
+  used_count: number;
+  /** v15 — most-recent redeemer's email (B2), or null. */
+  email: string | null;
+  /** v15 — per-vault storage cap to stamp at provision (B4), or null (uncapped). */
+  vault_cap_bytes: number | null;
   expires_at: string;
   used_at: string | null;
   redeemed_user_id: string | null;
@@ -73,6 +106,10 @@ function toWire(invite: Invite, status: InviteStatus): InviteWireShape {
     role: invite.role,
     provision_vault: invite.provisionVault,
     default_mirror: invite.defaultMirror,
+    max_uses: invite.maxUses,
+    used_count: invite.usedCount,
+    email: invite.email,
+    vault_cap_bytes: invite.vaultCapBytes,
     expires_at: invite.expiresAt,
     used_at: invite.usedAt,
     redeemed_user_id: invite.redeemedUserId,
@@ -100,6 +137,10 @@ interface CreateInviteBody {
   provisionVault: boolean;
   defaultMirror: string | null;
   expiresInSeconds: number;
+  /** v15 — how many accounts the link may create (default 1 = single-use). */
+  maxUses: number;
+  /** v15 — per-vault storage cap (bytes) to stamp at provision, or null (uncapped). */
+  vaultCapBytes: number | null;
 }
 
 interface ParseErr {
@@ -283,9 +324,71 @@ async function parseCreateBody(
     expiresInSeconds = Math.floor(rawExpiry);
   }
 
+  // max_uses — v15. Default 1 (single-use, the legacy shape). A positive
+  // integer ≤ MAX_INVITE_USES. >1 = a multi-use public-signup link.
+  let maxUses = 1;
+  const rawMaxUses =
+    Object.hasOwn(obj, "max_uses") && obj.max_uses !== undefined
+      ? obj.max_uses
+      : Object.hasOwn(obj, "maxUses") && obj.maxUses !== undefined
+        ? obj.maxUses
+        : undefined;
+  if (rawMaxUses !== undefined && rawMaxUses !== null) {
+    if (
+      typeof rawMaxUses !== "number" ||
+      !Number.isInteger(rawMaxUses) ||
+      rawMaxUses < 1 ||
+      rawMaxUses > MAX_INVITE_USES
+    ) {
+      return {
+        ok: false,
+        status: 400,
+        error: "invalid_request",
+        description: `"max_uses" must be an integer between 1 and ${MAX_INVITE_USES}`,
+      };
+    }
+    maxUses = rawMaxUses;
+  }
+
+  // vault_cap_bytes — v15, B4. Optional per-vault storage cap stamped at
+  // provision. null/omitted = uncapped (legacy). A positive integer
+  // ≤ MAX_VAULT_CAP_BYTES.
+  let vaultCapBytes: number | null = null;
+  const rawCap =
+    Object.hasOwn(obj, "vault_cap_bytes") && obj.vault_cap_bytes !== undefined
+      ? obj.vault_cap_bytes
+      : Object.hasOwn(obj, "vaultCapBytes") && obj.vaultCapBytes !== undefined
+        ? obj.vaultCapBytes
+        : undefined;
+  if (rawCap !== undefined && rawCap !== null) {
+    if (
+      typeof rawCap !== "number" ||
+      !Number.isInteger(rawCap) ||
+      rawCap < 1 ||
+      rawCap > MAX_VAULT_CAP_BYTES
+    ) {
+      return {
+        ok: false,
+        status: 400,
+        error: "invalid_request",
+        description: `"vault_cap_bytes" must be a positive integer ≤ ${MAX_VAULT_CAP_BYTES} (100 GiB)`,
+      };
+    }
+    vaultCapBytes = rawCap;
+  }
+
   return {
     ok: true,
-    body: { vaultName, username, role, provisionVault, defaultMirror, expiresInSeconds },
+    body: {
+      vaultName,
+      username,
+      role,
+      provisionVault,
+      defaultMirror,
+      expiresInSeconds,
+      maxUses,
+      vaultCapBytes,
+    },
   };
 }
 
@@ -303,8 +406,16 @@ export async function handleCreateInvite(req: Request, deps: ApiInvitesDeps): Pr
   }
   const parsed = await parseCreateBody(req);
   if (!parsed.ok) return jsonError(parsed.status, parsed.error, parsed.description);
-  const { vaultName, username, role, provisionVault, defaultMirror, expiresInSeconds } =
-    parsed.body;
+  const {
+    vaultName,
+    username,
+    role,
+    provisionVault,
+    defaultMirror,
+    expiresInSeconds,
+    maxUses,
+    vaultCapBytes,
+  } = parsed.body;
   const now = (deps.now ?? (() => new Date()))();
 
   // Shape gates over the three supported invite shapes:
@@ -328,6 +439,42 @@ export async function handleCreateInvite(req: Request, deps: ApiInvitesDeps): Pr
       400,
       "invalid_request",
       'a provisioned vault\'s sole user must hold write — use role "write", or share an existing vault (provision_vault=false + vault_name) for read-only access',
+    );
+  }
+
+  // Multi-use coherence gates (v15). A link that creates many accounts can't:
+  //   - pre-name a username (one name can't be reused across redeemers), or
+  //   - pin a single NEW vault name (every redeemer would collide on it —
+  //     the redeem path's freshly-created invariant rejects the 2nd onward).
+  // Either combination would make every seat past the first dead-on-arrival,
+  // so reject at mint. (A multi-use SHARED-vault invite — provision_vault=false
+  // + an existing vault_name — IS coherent: many users joining one vault; it's
+  // not blocked here.)
+  if (maxUses > 1) {
+    if (username !== null) {
+      return jsonError(
+        400,
+        "invalid_request",
+        "a multi-use link (max_uses > 1) can't pre-name a username — one username can't be shared across signups. Omit \"username\".",
+      );
+    }
+    if (provisionVault && vaultName !== null) {
+      return jsonError(
+        400,
+        "invalid_request",
+        'a multi-use provisioning link (max_uses > 1) can\'t pin a single vault name — every signup would collide on it. Omit "vault_name" so each signup names their own vault.',
+      );
+    }
+  }
+
+  // A per-vault cap only applies to a vault THIS link provisions. Pinning a
+  // cap on a non-provisioning invite (account-only or shared-existing-vault)
+  // has nothing to stamp — reject the contradiction at mint.
+  if (vaultCapBytes !== null && !provisionVault) {
+    return jsonError(
+      400,
+      "invalid_request",
+      '"vault_cap_bytes" only applies to a provisioning invite (provision_vault=true) — a non-provisioning link has no vault to cap',
     );
   }
   if (vaultName !== null && !provisionVault) {
@@ -358,6 +505,17 @@ export async function handleCreateInvite(req: Request, deps: ApiInvitesDeps): Pr
     }
   }
 
+  // Auto-apply the ~1 GB default cap to a PUBLIC-SIGNUP (multi-use,
+  // provisioning) link when the admin didn't set one explicitly — the
+  // DEMO-PREP decision is "1 GB per vault, configurable," so a multi-use
+  // signup link on a shared box should never provision UNcapped by omission.
+  // An explicit cap (any value, validated above) is honored as-is; a
+  // single-use friends link stays uncapped unless the admin opts in.
+  const effectiveVaultCapBytes =
+    vaultCapBytes === null && maxUses > 1 && provisionVault
+      ? DEFAULT_VAULT_CAP_BYTES
+      : vaultCapBytes;
+
   const issued = issueInvite(deps.db, {
     createdBy: authUserId,
     vaultName,
@@ -366,6 +524,8 @@ export async function handleCreateInvite(req: Request, deps: ApiInvitesDeps): Pr
     provisionVault,
     defaultMirror,
     expiresInSeconds,
+    maxUses,
+    vaultCapBytes: effectiveVaultCapBytes,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
   const status = inviteStatus(issued.invite, now);

@@ -1026,11 +1026,13 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
         const pendingWork = issueInvite(db, { createdBy: alice.id, vaultName: "work" });
         const pendingDefault = issueInvite(db, { createdBy: alice.id, vaultName: "default" });
         const redeemedWork = issueInvite(db, { createdBy: alice.id, vaultName: "work" });
-        db.prepare("UPDATE invites SET used_at = ?, redeemed_user_id = ? WHERE token = ?").run(
-          new Date().toISOString(),
-          alice.id,
-          redeemedWork.invite.tokenHash,
-        );
+        // Simulate a fully-redeemed single-use invite exactly as the redeem path
+        // leaves it (v15): used_at stamped AND used_count bumped to max_uses, so
+        // the cascade's `used_count < max_uses` exhaustion guard treats it as
+        // terminal (untouched), same as the pre-v15 `used_at IS NULL` guard did.
+        db.prepare(
+          "UPDATE invites SET used_at = ?, used_count = 1, redeemed_user_id = ? WHERE token = ?",
+        ).run(new Date().toISOString(), alice.id, redeemedWork.invite.tokenHash);
 
         // 5. Connections: one sourced on work (torn down), one on default (kept).
         putConnection(store, {
