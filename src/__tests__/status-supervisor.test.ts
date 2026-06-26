@@ -80,6 +80,12 @@ interface SupervisorArmOpts {
   hubHealthy: boolean;
   moduleStates?: ModuleStatesResult;
   fetchModuleStatesImpl?: () => Promise<ModuleStatesResult>;
+  /**
+   * Inject the unauthenticated module-liveness probe (#700). Defaults to "every
+   * module is down" so the degraded-read tests don't accidentally hit the
+   * network; specific tests override to mark a module live.
+   */
+  probeModuleHealth?: (port: number, health: string) => Promise<boolean>;
 }
 
 /** Drive `status` through the supervisor arm with fully stubbed seams. */
@@ -96,6 +102,7 @@ function supervisorOpts(configDir: string, path: string, o: SupervisorArmOpts) {
       fetchModuleStates:
         o.fetchModuleStatesImpl ??
         (async () => o.moduleStates ?? { supervisorAvailable: true, modules: [] }),
+      probeModuleHealth: o.probeModuleHealth ?? (async () => false),
       openDb: fakeOpenDb as unknown as (configDir: string) => import("bun:sqlite").Database,
     },
   };
@@ -377,7 +384,7 @@ describe("status — Phase 3c supervisor arm: module rows", () => {
     }
   });
 
-  test("no operator token → graceful degrade (manifest rows + actionable hint), no 401 crash", async () => {
+  test("no operator token (fresh box, no admin) → note targets set-password, NOT rotate-operator (#700)", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       upsertService(
@@ -392,15 +399,121 @@ describe("status — Phase 3c supervisor arm: module rows", () => {
           fetchModuleStatesImpl: async () => {
             throw new NoOperatorTokenError();
           },
+          // No probe-live module here → row stays inactive (exit 0).
+          probeModuleHealth: async () => false,
         }),
         print: (l) => lines.push(l),
       });
       // We could not read run-state, but didn't crash. The module row falls back
-      // to `inactive` (no supervisor snapshot) — a stopped row is exit 0.
+      // to `inactive` (no supervisor snapshot, probe down) — a stopped row is exit 0.
       expect(code).toBe(0);
       const out = lines.join("\n");
       expect(out).toMatch(/parachute-vault/);
-      expect(out).toMatch(/run `parachute auth rotate-operator`/);
+      // #700: a fresh box has no admin, so rotate-operator would itself error.
+      // The note must point at set-password and must NOT be the bare
+      // rotate-operator guidance.
+      expect(out).toMatch(/parachute auth set-password/);
+      expect(out).not.toMatch(/run `parachute auth rotate-operator` to mint an operator token/);
+      const vaultLine = lines.find((l) => l.includes("parachute-vault"));
+      expect(vaultLine).toMatch(/\binactive\b/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("no operator token + module answers /health probe → LIVE (active), not inactive (#700)", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      upsertService(
+        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.6.2" },
+        path,
+      );
+      const probed: Array<{ port: number; health: string }> = [];
+      const lines: string[] = [];
+      const code = await status({
+        ...supervisorOpts(configDir, path, {
+          managerState: { state: "active" },
+          hubHealthy: true,
+          fetchModuleStatesImpl: async () => {
+            throw new NoOperatorTokenError();
+          },
+          // vault is genuinely up — its /health answers (2xx or 401 → live).
+          probeModuleHealth: async (port, health) => {
+            probed.push({ port, health });
+            return true;
+          },
+        }),
+        print: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      // The probe targeted the module's own port + health path from the manifest.
+      expect(probed).toEqual([{ port: 1940, health: "/health" }]);
+      const vaultLine = lines.find((l) => l.includes("parachute-vault"));
+      expect(vaultLine).toMatch(/\bactive\b/);
+      expect(vaultLine).not.toMatch(/\binactive\b/);
+      const out = lines.join("\n");
+      // The row is labelled as probe-derived so the operator knows it's thin.
+      expect(out).toMatch(/live via unauthenticated health probe/);
+      // The degraded-read hint still appears (why PID/uptime are absent).
+      expect(out).toMatch(/parachute auth set-password/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("degraded read + module probe FAILS → row stays inactive (#700)", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      upsertService(
+        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.6.2" },
+        path,
+      );
+      const lines: string[] = [];
+      const code = await status({
+        ...supervisorOpts(configDir, path, {
+          managerState: { state: "active" },
+          hubHealthy: true,
+          fetchModuleStatesImpl: async () => {
+            throw new NoOperatorTokenError();
+          },
+          probeModuleHealth: async () => false,
+        }),
+        print: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      const vaultLine = lines.find((l) => l.includes("parachute-vault"));
+      expect(vaultLine).toMatch(/\binactive\b/);
+      const out = lines.join("\n");
+      expect(out).not.toMatch(/live via unauthenticated health probe/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a throwing module probe never crashes status — row degrades to inactive (#700)", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      upsertService(
+        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.6.2" },
+        path,
+      );
+      const lines: string[] = [];
+      const code = await status({
+        ...supervisorOpts(configDir, path, {
+          managerState: { state: "active" },
+          hubHealthy: true,
+          fetchModuleStatesImpl: async () => {
+            throw new NoOperatorTokenError();
+          },
+          probeModuleHealth: async () => {
+            throw new Error("probe exploded");
+          },
+        }),
+        print: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      const vaultLine = lines.find((l) => l.includes("parachute-vault"));
+      expect(vaultLine).toMatch(/\binactive\b/);
     } finally {
       cleanup();
     }
@@ -428,6 +541,42 @@ describe("status — Phase 3c supervisor arm: module rows", () => {
       });
       expect(code).toBe(0);
       expect(lines.some((l) => l.includes("rotate-operator"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("expired operator token + module answers /health probe → LIVE (active) (#700)", async () => {
+    // Symmetry with the no-token case: the unauthenticated probe fallback fires
+    // on ANY degraded read where the hub is up + run-state is missing, so an
+    // expired-token box still shows a genuinely-serving module as `active`.
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      upsertService(
+        { name: "parachute-vault", port: 1940, paths: ["/"], health: "/health", version: "0.6.2" },
+        path,
+      );
+      const lines: string[] = [];
+      const code = await status({
+        ...supervisorOpts(configDir, path, {
+          managerState: { state: "active" },
+          hubHealthy: true,
+          fetchModuleStatesImpl: async () => {
+            throw new OperatorTokenExpiredError(
+              "token expired — run `parachute auth rotate-operator`",
+            );
+          },
+          probeModuleHealth: async () => true,
+        }),
+        print: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      const vaultLine = lines.find((l) => l.includes("parachute-vault"));
+      expect(vaultLine).toMatch(/\bactive\b/);
+      const out = lines.join("\n");
+      expect(out).toMatch(/live via unauthenticated health probe/);
+      // The expired-token degraded-read hint still points at rotate-operator.
+      expect(out).toMatch(/rotate-operator/);
     } finally {
       cleanup();
     }
