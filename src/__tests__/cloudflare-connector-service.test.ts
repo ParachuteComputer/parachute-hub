@@ -258,8 +258,10 @@ describe("installConnectorService — Linux systemd", () => {
       platform: "linux",
       getuid: () => 1000,
       userName: () => "op",
-      // enable-linger FAIL, then daemon-reload OK, enable --now OK.
+      // #528 probe: show-user → Linger=no (off, so we proceed to enable);
+      // then enable-linger FAIL, daemon-reload OK, enable --now OK.
       runResults: [
+        { code: 0, stdout: "Linger=no\n", stderr: "" },
         { code: 1, stdout: "", stderr: "Failed to enable linger" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },

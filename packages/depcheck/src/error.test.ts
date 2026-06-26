@@ -1,7 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   MissingDependencyError,
+  NonExecutableError,
   ensureExecutable,
+  findNonExecutableOnPath,
   isBinaryNotFoundError,
   rethrowIfMissing,
 } from "./error.ts";
@@ -72,6 +77,81 @@ describe("ensureExecutable", () => {
       expect(e).toBeInstanceOf(MissingDependencyError);
       expect((e as MissingDependencyError).spec).toBeUndefined();
     }
+  });
+
+  // #634: present-but-non-executable detection. The secondary probe is injected
+  // explicitly so the test stays fs-free; the pure `which`-only seam (no probe
+  // injected) still defaults to not-found, proving the gate.
+  test("#634: which→null + a present-but-non-executable hit → NonExecutableError (chmod hint)", () => {
+    try {
+      ensureExecutable("channel", {
+        which: () => null,
+        findNonExecutable: () => "/home/op/.bun/bin/channel",
+      });
+      throw new Error("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(NonExecutableError);
+      const err = e as NonExecutableError;
+      expect(err.errorType).toBe("non_executable");
+      expect(err.binary).toBe("channel");
+      expect(err.path).toBe("/home/op/.bun/bin/channel");
+      expect(err.message).toContain(
+        "channel found at /home/op/.bun/bin/channel but is not executable",
+      );
+      expect(err.message).toContain("chmod +x /home/op/.bun/bin/channel");
+    }
+  });
+
+  test("#634: which→null + no non-executable hit → still MissingDependencyError (not collapsed)", () => {
+    try {
+      ensureExecutable("git", { which: () => null, findNonExecutable: () => null });
+      throw new Error("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(MissingDependencyError);
+      expect(e).not.toBeInstanceOf(NonExecutableError);
+    }
+  });
+
+  test("#634: a stubbed `which` WITHOUT an injected probe keeps the pure not-found seam (no fs touch)", () => {
+    // Existing call shape — a test that injects only `which` must NOT trip the
+    // real PATH walk (gate: the production probe runs only for real Bun.which).
+    expect(() => ensureExecutable("git", { which: () => null })).toThrow(MissingDependencyError);
+  });
+});
+
+describe("findNonExecutableOnPath (#634 real-fs probe)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "depcheck-nonexec-"));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("returns the path of a present-but-non-executable file on PATH", () => {
+    const p = join(dir, "noexec-tool");
+    writeFileSync(p, "#!/bin/sh\necho hi\n");
+    chmodSync(p, 0o644); // present, regular file, NOT executable
+    const found = findNonExecutableOnPath("noexec-tool", { PATH: dir } as NodeJS.ProcessEnv);
+    expect(found).toBe(p);
+  });
+
+  test("returns null for an executable file (not our case)", () => {
+    const p = join(dir, "exec-tool");
+    writeFileSync(p, "#!/bin/sh\necho hi\n");
+    chmodSync(p, 0o755); // executable → not a non-executable hit
+    expect(findNonExecutableOnPath("exec-tool", { PATH: dir } as NodeJS.ProcessEnv)).toBeNull();
+  });
+
+  test("returns null when the binary is absent from PATH (genuinely not installed)", () => {
+    expect(
+      findNonExecutableOnPath("totally-absent", { PATH: dir } as NodeJS.ProcessEnv),
+    ).toBeNull();
+  });
+});
+
+describe("NonExecutableError", () => {
+  test("interactive:false strips nothing extra but renders the chmod block", () => {
+    const err = new NonExecutableError("bun", "/usr/local/bin/bun", { interactive: false });
+    expect(err).toBeInstanceOf(Error);
+    expect(err.errorType).toBe("non_executable");
+    expect(err.message).toContain("bun found at /usr/local/bin/bun but is not executable");
+    expect(err.message).toContain("chmod +x /usr/local/bin/bun");
   });
 });
 

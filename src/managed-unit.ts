@@ -454,6 +454,25 @@ function installLaunchdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
   };
 }
 
+/**
+ * #528: is `loginctl` linger already enabled for `userName`? Best-effort probe:
+ * `loginctl show-user <user> --property=Linger` prints `Linger=yes` / `Linger=no`.
+ * Returns true ONLY on a clear `Linger=yes`; ANY ambiguity (non-zero exit, a
+ * throw, or unparseable output) returns false so the caller falls through to the
+ * enable attempt — we never SKIP enabling on a guess, only when linger is
+ * provably already on. (`show-user` of a user with no session can itself exit
+ * non-zero; treat that as "unknown → try to enable".)
+ */
+function lingerAlreadyOn(deps: ManagedUnitDeps, userName: string): boolean {
+  try {
+    const probe = deps.run(["loginctl", "show-user", userName, "--property=Linger"]);
+    if (probe.code !== 0) return false;
+    return /(^|\n)\s*Linger=yes\s*(\n|$)/i.test(probe.stdout);
+  } catch {
+    return false;
+  }
+}
+
 function installSystemdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallResult {
   const { unit, deps, messages } = opts;
   const start = opts.start ?? true;
@@ -490,10 +509,20 @@ function installSystemdUnit(opts: InstallManagedUnitOpts): ManagedUnitInstallRes
   // systemctl but not loginctl would propagate the spawn error out and hard-fail
   // the calling command. (Run on both start + install-without-start: linger is a
   // boot-survival nicety independent of whether we start the unit now.)
+  //
+  // #528: pre-check the CURRENT linger state before trying to enable it. When
+  // linger is ALREADY on (the common re-install / re-migrate case on a box
+  // whose owner already enabled it), `enable-linger` is a no-op we don't need —
+  // and on some systemd builds it can return non-zero even though linger is
+  // genuinely on, raising a scary "couldn't enable lingering, your hub won't
+  // survive reboot" warning that is a FALSE ALARM. So: probe first; if linger
+  // is on, skip both the enable AND the warning. Only when linger is genuinely
+  // OFF and the enable attempt then fails do we warn. This is the single-owner
+  // self-host reboot-survival happy path — keep it quiet when it's already good.
   if (!root && userName) {
     if (deps.which("loginctl") === null) {
       outMessages.push(messages.lingerWarning);
-    } else {
+    } else if (!lingerAlreadyOn(deps, userName)) {
       try {
         const linger = deps.run(["loginctl", "enable-linger", userName]);
         if (linger.code !== 0) outMessages.push(messages.lingerWarning);

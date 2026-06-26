@@ -323,8 +323,15 @@ describe("POST /api/hub/upgrade — redeploy-required short-circuit (§5.3)", ()
 });
 
 describe("POST /api/hub/upgrade — 409 in-flight guard (concurrent-upgrade)", () => {
-  /** Seed the status file with a prior op in the given phase. */
-  function seedStatus(dir: string, phase: HubUpgradeStatus["phase"], opId = "prior-op"): void {
+  /** Seed the status file with a prior op in the given phase. `startedAt`
+   * defaults to now (a FRESH in-flight slot); pass an old ISO string to seed a
+   * stale / abandoned slot for the #506 TTL tests. */
+  function seedStatus(
+    dir: string,
+    phase: HubUpgradeStatus["phase"],
+    opId = "prior-op",
+    startedAt: string = new Date().toISOString(),
+  ): void {
     writeHubUpgradeStatus(dir, {
       operation_id: opId,
       phase,
@@ -333,7 +340,7 @@ describe("POST /api/hub/upgrade — 409 in-flight guard (concurrent-upgrade)", (
       target_version: "0.6.3-rc.2",
       channel: "rc",
       log: [],
-      started_at: new Date().toISOString(),
+      started_at: startedAt,
     });
   }
 
@@ -382,6 +389,55 @@ describe("POST /api/hub/upgrade — 409 in-flight guard (concurrent-upgrade)", (
       postReq({ authorization: `Bearer ${bearer}` }, { channel: "rc" }),
       deps,
     );
+    expect(res.status).toBe(202);
+    expect(spawned.length).toBe(1);
+  });
+
+  // #506: a crashed helper leaves an in-flight slot stuck forever — without a
+  // TTL it 409-deadlocks every future upgrade. A STALE in-flight slot must be
+  // treated as abandoned so the new request proceeds.
+  for (const phase of ["pending", "running", "restarting"] as const) {
+    test(`#506: STALE in-flight slot (phase=${phase}, started 30m ago) → proceeds, not 409`, async () => {
+      const bearer = await mintBearer(harness, ["parachute:host:admin"]);
+      const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+      seedStatus(harness.dir, phase, "crashed-op", thirtyMinAgo);
+      const { deps, spawned } = baseDeps(harness);
+      const res = await handleHubUpgrade(
+        postReq({ authorization: `Bearer ${bearer}` }, { channel: "rc" }),
+        deps,
+      );
+      // Abandoned slot freed: a fresh op took over + spawned its helper.
+      expect(res.status).toBe(202);
+      expect(spawned.length).toBe(1);
+      const status = readHubUpgradeStatus(harness.dir);
+      expect(status?.operation_id).not.toBe("crashed-op");
+      expect(spawned[0]?.operationId).toBe(status?.operation_id);
+    });
+  }
+
+  test("#506: FRESH in-flight slot (started just now) → still 409", async () => {
+    const bearer = await mintBearer(harness, ["parachute:host:admin"]);
+    // Just-started (well within the 15m TTL) → a real, live upgrade → 409.
+    seedStatus(harness.dir, "running", "live-op", new Date().toISOString());
+    const { deps, spawned } = baseDeps(harness);
+    const res = await handleHubUpgrade(
+      postReq({ authorization: `Bearer ${bearer}` }, { channel: "rc" }),
+      deps,
+    );
+    expect(res.status).toBe(409);
+    expect(spawned.length).toBe(0);
+    expect(readHubUpgradeStatus(harness.dir)?.operation_id).toBe("live-op");
+  });
+
+  test("#506: in-flight slot with a malformed started_at → treated as stale, proceeds", async () => {
+    const bearer = await mintBearer(harness, ["parachute:host:admin"]);
+    seedStatus(harness.dir, "running", "garbage-op", "not-a-date");
+    const { deps, spawned } = baseDeps(harness);
+    const res = await handleHubUpgrade(
+      postReq({ authorization: `Bearer ${bearer}` }, { channel: "rc" }),
+      deps,
+    );
+    // An unparseable timestamp must not deadlock — treat as abandoned.
     expect(res.status).toBe(202);
     expect(spawned.length).toBe(1);
   });
