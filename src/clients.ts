@@ -323,9 +323,23 @@ function timingSafeEqualHex(a: string, b: string): boolean {
  * URIs). Doesn't try to match a registered URI; that's `requireRegisteredRedirectUri`.
  */
 export function isValidRedirectUri(uri: string): boolean {
+  // hub#663: reject control chars (C0 0x00-0x1f + DEL 0x7f) in the RAW input
+  // BEFORE URL parsing normalizes/strips them. A `\r`/`\n`/NUL smuggled into a
+  // redirect_uri is a header/log-injection vector even though our exact-match +
+  // verbatim foreign-storage neutralize it downstream — spec-forbidden hygiene.
+  // (Charcode scan rather than a control-char regex literal, which biome's
+  // noControlCharactersInRegex rightly flags as an easy footgun.)
+  for (let i = 0; i < uri.length; i++) {
+    const c = uri.charCodeAt(i);
+    if (c <= 0x1f || c === 0x7f) return false;
+  }
   try {
     const u = new URL(uri);
     if (u.protocol === "javascript:" || u.protocol === "data:") return false;
+    // hub#663: reject userinfo (`https://x@evil.com/cb`). A redirect target
+    // carrying credentials is spec-forbidden and an open-redirect / phishing
+    // shape; the protocol allowlist alone let it through.
+    if (u.username !== "" || u.password !== "") return false;
     return u.protocol === "http:" || u.protocol === "https:";
   } catch {
     return false;

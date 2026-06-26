@@ -990,6 +990,123 @@ describe("handleSetupGet", () => {
       db.close();
     }
   });
+
+  // hub#618: gate the JSON `?op=` op-snapshot once setup is complete.
+  // Mid-setup it stays OPEN (the unauth CLI wizard + brand-new-operator
+  // browser both poll it before any session exists); post-complete it
+  // requires a session or loopback (it's a post-setup admin surface, and
+  // `/admin/setup` is always lockout-exempt so it's otherwise unauth-reachable).
+
+  test("mid-setup unauth ?op= still returns the op snapshot (hub#618 regression guard)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      // No admin yet → setup INCOMPLETE → the surface stays open.
+      const reg = getDefaultOperationsRegistry();
+      const op = reg.create("install", "vault");
+      reg.update(op.id, { status: "running" }, "running bun add -g @openparachute/vault@latest");
+      const res = handleSetupGet(
+        req(`/admin/setup?op=${op.id}`, { headers: { accept: "application/json" } }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
+          issuer: "https://hub.example",
+          registry: reg,
+          // No loopback flag, no session — the unauth first-boot poll.
+        },
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        hasAdmin: boolean;
+        operation?: { id: string; status: string; log: readonly string[] };
+      };
+      expect(body.hasAdmin).toBe(false);
+      expect(body.operation).toBeDefined();
+      expect(body.operation?.id).toBe(op.id);
+      expect(body.operation?.status).toBe("running");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("post-complete unauth ?op= omits the op snapshot; session OR loopback restores it (hub#618)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      // Drive state to COMPLETE: admin + vault + expose mode.
+      const user = await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.1.0",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      setSetting(db, "setup_expose_mode", "localhost");
+      const reg = getDefaultOperationsRegistry();
+      const op = reg.create("install", "vault");
+      reg.update(op.id, { status: "running" }, "still running");
+
+      const deps = {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "https://hub.example",
+        registry: reg,
+      };
+
+      // (a) Unauth, non-loopback → operation omitted.
+      const unauth = handleSetupGet(
+        req(`/admin/setup?op=${op.id}`, { headers: { accept: "application/json" } }),
+        deps,
+      );
+      expect(unauth.status).toBe(200);
+      const unauthBody = (await unauth.json()) as {
+        hasAdmin: boolean;
+        hasVault: boolean;
+        hasExposeMode: boolean;
+        operation?: unknown;
+      };
+      // Confirm setup actually derived as complete (else the gate is vacuous).
+      expect(unauthBody.hasAdmin).toBe(true);
+      expect(unauthBody.hasVault).toBe(true);
+      expect(unauthBody.hasExposeMode).toBe(true);
+      expect(unauthBody.operation).toBeUndefined();
+
+      // (b) Valid session → operation restored.
+      const { createSession } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      const authed = handleSetupGet(
+        req(`/admin/setup?op=${op.id}`, {
+          headers: {
+            accept: "application/json",
+            cookie: `${SESSION_COOKIE_NAME}=${session.id}`,
+          },
+        }),
+        deps,
+      );
+      const authedBody = (await authed.json()) as { operation?: { id: string } };
+      expect(authedBody.operation?.id).toBe(op.id);
+
+      // (c) Loopback (no session) → operation restored.
+      const loopback = handleSetupGet(
+        req(`/admin/setup?op=${op.id}`, { headers: { accept: "application/json" } }),
+        { ...deps, requestIsLoopback: true },
+      );
+      const loopbackBody = (await loopback.json()) as { operation?: { id: string } };
+      expect(loopbackBody.operation?.id).toBe(op.id);
+    } finally {
+      db.close();
+    }
+  });
 });
 
 // --- POST /admin/setup/account -------------------------------------------

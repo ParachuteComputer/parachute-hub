@@ -1592,14 +1592,33 @@ export function handleSetupGet(req: Request, deps: SetupWizardDeps): Response {
     // poll on the auth the wizard already carries.
     const opId = url.searchParams.get("op");
     if (opId) {
-      const op = deps.registry?.get(opId);
-      if (op) {
-        envelope.operation = {
-          id: op.id,
-          status: op.status,
-          log: op.log,
-          ...(op.error !== undefined ? { error: op.error } : {}),
-        };
+      // hub#618: post-setup this JSON `?op=` surface is unauth-reachable —
+      // `/admin/setup` is always lockout-exempt (the dispatcher's
+      // `shouldGateForSetup` lets it through so a stale bookmark resolves), and
+      // the snapshot is read BEFORE any session check. The leak is small (an
+      // in-memory op's status + install-progress log lines, behind an
+      // unguessable UUID), but it's still a post-setup admin surface, so gate
+      // it once setup is COMPLETE. During setup (no admin yet) the surface
+      // stays OPEN: the unauth CLI wizard (`parachute init`) AND the brand-new-
+      // operator browser both poll this `?op=` snapshot mid-setup before any
+      // session exists — gating then would break first-boot vault
+      // provisioning. Loopback always passes (same on-box trust as the
+      // `bootstrapToken` branch below); a valid session also passes.
+      const setupComplete = state.hasAdmin && state.hasVault && state.hasExposeMode;
+      const opSnapshotAllowed =
+        !setupComplete ||
+        deps.requestIsLoopback === true ||
+        findActiveSession(deps.db, req) !== null;
+      if (opSnapshotAllowed) {
+        const op = deps.registry?.get(opId);
+        if (op) {
+          envelope.operation = {
+            id: op.id,
+            status: op.status,
+            log: op.log,
+            ...(op.error !== undefined ? { error: op.error } : {}),
+          };
+        }
       }
     }
     // hub#576: hand the actual token to a LOOPBACK caller only. The on-box

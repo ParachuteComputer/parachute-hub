@@ -3824,13 +3824,57 @@ async function decorateWithChrome(
   if (setCookie && out !== res) {
     const headers = new Headers(out.headers);
     headers.append("set-cookie", setCookie);
-    return new Response(out.body, {
-      status: out.status,
-      statusText: out.statusText,
-      headers,
-    });
+    return withProxySecurityHeaders(
+      new Response(out.body, {
+        status: out.status,
+        statusText: out.statusText,
+        headers,
+      }),
+    );
   }
-  return out;
+  // hub#643: every exit runs through the security-header step, which self-
+  // gates on content-type — so a non-HTML pass-through (`out === res`, e.g. a
+  // 502 proxy error or a JSON/asset body) is returned unchanged, preserving
+  // the pre-existing behavior for those responses.
+  return withProxySecurityHeaders(out);
+}
+
+/**
+ * hub#643 (Tier-1): stamp non-script security headers on proxied `text/html`
+ * pages — the per-vault `/vault/<name>/*` proxy and the generic
+ * services-mount `/<mount>/*` proxy both flow through `decorateWithChrome`,
+ * so this is the single chokepoint that covers a module / surface page.
+ *
+ *   - `X-Content-Type-Options: nosniff` — stops content-type sniffing.
+ *   - `Content-Security-Policy: frame-ancestors 'self'; object-src 'none';
+ *     base-uri 'self'` — clickjacking (external framing) + plugin + base-tag
+ *     hardening.
+ *
+ * Deliberately NO `script-src`: a strict script-src would white-screen
+ * self-built GitHub-hosted surfaces (the primary surface story) and
+ * inline-script module pages. The opt-in strict script-src CSP is Tier-2,
+ * explicitly deferred (hub#643 stays open).
+ *
+ * Header-only: we never buffer the body. Only `text/html` responses are
+ * decorated, so JSON / `.js` / CSS / image assets proxied through the same
+ * path are left untouched. Existing headers are preserved (a fresh Headers
+ * copy is mutated); we set (not append) so a re-decorated response can't
+ * accumulate duplicates.
+ */
+function withProxySecurityHeaders(res: Response): Response {
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("text/html")) return res;
+  const headers = new Headers(res.headers);
+  headers.set("x-content-type-options", "nosniff");
+  headers.set(
+    "content-security-policy",
+    "frame-ancestors 'self'; object-src 'none'; base-uri 'self'",
+  );
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers,
+  });
 }
 
 if (import.meta.main) {
