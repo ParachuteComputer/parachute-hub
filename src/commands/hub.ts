@@ -289,7 +289,17 @@ export async function hubSetOrigin(
         log(`  Update its site address to "${host}" by hand, then: sudo systemctl reload caddy`);
       }
       if (wrote) {
-        const reload = await runCaddyReload(run);
+        // `runCaddyReload` → defaultRunner pre-flights `systemctl` and THROWS
+        // (friendly missing-dep error) on a non-systemd box, before its own
+        // try/catch. Wrap it so a throw degrades to the manual-reload hint
+        // instead of escaping past the module restart below — the origin is
+        // already persisted, so the restart must still run.
+        let reload: CommandResult;
+        try {
+          reload = await runCaddyReload(run);
+        } catch (e) {
+          reload = { code: 1, stdout: "", stderr: e instanceof Error ? e.message : String(e) };
+        }
         if (reload.code === 0) {
           log("");
           log(`✓ Rewrote ${caddyfilePath} → ${host}, reloaded Caddy.`);
