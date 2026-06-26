@@ -151,7 +151,10 @@ describe("expandRedirectUrisForHubOrigins (surface#118 cross-hub-origin DCR expa
   const hubOrigins = [LOOPBACK, "http://localhost:1939", PUBLIC];
 
   test("expands a loopback-rooted URI onto every other hub origin", () => {
-    const out = expandRedirectUrisForHubOrigins([`${LOOPBACK}/surface/notes/oauth/callback`], hubOrigins);
+    const out = expandRedirectUrisForHubOrigins(
+      [`${LOOPBACK}/surface/notes/oauth/callback`],
+      hubOrigins,
+    );
     // Original is preserved + the public + localhost variants are added.
     expect(out).toContain(`${LOOPBACK}/surface/notes/oauth/callback`);
     expect(out).toContain(`${PUBLIC}/surface/notes/oauth/callback`);
@@ -188,10 +191,7 @@ describe("expandRedirectUrisForHubOrigins (surface#118 cross-hub-origin DCR expa
   });
 
   test("single known hub origin → no expansion (submitted set returned as-is)", () => {
-    const out = expandRedirectUrisForHubOrigins(
-      [`${LOOPBACK}/surface/notes/`],
-      [LOOPBACK],
-    );
+    const out = expandRedirectUrisForHubOrigins([`${LOOPBACK}/surface/notes/`], [LOOPBACK]);
     expect(out).toEqual([`${LOOPBACK}/surface/notes/`]);
   });
 
@@ -222,9 +222,9 @@ describe("expandRedirectUrisForHubOrigins (surface#118 cross-hub-origin DCR expa
       const r = registerClient(db, { redirectUris: expanded });
       // The public-origin variant now matches exactly at authorize time — the
       // off-localhost sign-in that surface#118 broke.
-      expect(
-        requireRegisteredRedirectUri(r.client, `${PUBLIC}/surface/notes/oauth/callback`),
-      ).toBe(`${PUBLIC}/surface/notes/oauth/callback`);
+      expect(requireRegisteredRedirectUri(r.client, `${PUBLIC}/surface/notes/oauth/callback`)).toBe(
+        `${PUBLIC}/surface/notes/oauth/callback`,
+      );
       // A truly-unregistered URI is still rejected — strict match unchanged.
       expect(() =>
         requireRegisteredRedirectUri(r.client, "https://evil.example/surface/notes/oauth/callback"),
@@ -351,5 +351,25 @@ describe("isValidRedirectUri", () => {
     expect(isValidRedirectUri("data:text/html,x")).toBe(false);
     expect(isValidRedirectUri("/relative")).toBe(false);
     expect(isValidRedirectUri("not a url")).toBe(false);
+  });
+  // hub#663: spec-forbidden shapes that the protocol allowlist alone passed.
+  test("rejects userinfo-bearing redirect URIs (hub#663)", () => {
+    expect(isValidRedirectUri("https://x@evil.com/cb")).toBe(false);
+    expect(isValidRedirectUri("https://user:pass@evil.com/cb")).toBe(false);
+    expect(isValidRedirectUri("http://attacker@127.0.0.1:3000/cb")).toBe(false);
+  });
+  test("rejects control chars in the raw input (hub#663)", () => {
+    // Control chars must be caught on the RAW string — URL parsing would
+    // otherwise strip a trailing \r\n and the smuggled value would pass.
+    expect(isValidRedirectUri("https://example.com/cb\r\nSet-Cookie: x")).toBe(false);
+    expect(isValidRedirectUri("https://example.com/\x00cb")).toBe(false);
+    expect(isValidRedirectUri("https://example.com/cb\x7f")).toBe(false);
+  });
+  test("still accepts clean http(s) with ports, paths, and queries (regression guard)", () => {
+    // Legitimate clients (hub modules, self-built surfaces, Notes, Claude DCR)
+    // all register clean URIs — these must keep passing.
+    expect(isValidRedirectUri("https://claude.ai/api/mcp/auth_callback")).toBe(true);
+    expect(isValidRedirectUri("http://localhost:1939/admin/oauth/callback")).toBe(true);
+    expect(isValidRedirectUri("https://my-surface.github.io/cb?x=1")).toBe(true);
   });
 });
