@@ -578,6 +578,16 @@ export type RequestLayer = "loopback" | "tailnet" | "public";
  * the cloak fires. When `peerAddr` is unknown (null/undefined — no Server
  * threaded, e.g. a unit test calling `layerOf(req)` directly), we fail CLOSED
  * to `public` rather than open to `loopback`.
+ *
+ * Caddy/nginx-direct (hub#704): a SAME-BOX reverse proxy dials loopback (peer
+ * is 127.0.0.1) but, unlike cloudflared/tailscale, sets NO cf/tailscale header
+ * — so a header-only-or-peer-only classifier would call every public request
+ * through it "loopback" (most-trusted). The discriminator is the standard
+ * reverse-proxy forwarding headers (X-Forwarded-For / X-Forwarded-Host /
+ * Forwarded): a loopback peer that carries one is a proxied PUBLIC request →
+ * `public`; a header-less loopback peer (direct on-box caller — CLI, probes,
+ * the init bootstrap-token loopback probe) stays `loopback`. See the inline
+ * comment in the function for the full rationale + spoof analysis.
  */
 export function layerOf(req: Request, peerAddr?: string | null): RequestLayer {
   const h = req.headers;
@@ -590,6 +600,37 @@ export function layerOf(req: Request, peerAddr?: string | null): RequestLayer {
   // value to compare against, hence the presence-check above.
   if (h.get("tailscale-funnel-request") === "?1") return "public";
   if (h.get("tailscale-user-login") !== null) return "tailnet";
+  // Caddy/nginx-direct deploy (hub#704): a same-box reverse proxy terminates
+  // TLS and `reverse_proxy 127.0.0.1:1939` — so it dials loopback (peer is
+  // 127.0.0.1) and, unlike cloudflared/tailscale, stamps NO cf/tailscale
+  // header. Without this branch every PUBLIC request through such a proxy
+  // would classify "loopback" (the MOST-trusted layer): the GET /admin/setup
+  // bootstrap-token JSON probe would hand the token to any public visitor, and
+  // the publicExposure:"loopback" 404-cloak would stop hiding loopback-only
+  // services/vaults from the network.
+  //
+  // The discriminator is the standard reverse-proxy forwarding headers. A
+  // same-box proxy carrying a PUBLIC request sets X-Forwarded-For /
+  // X-Forwarded-Host / Forwarded; a direct on-box caller (the CLI, health
+  // probes, the init bootstrap-token loopback probe `curl 127.0.0.1/admin/setup`,
+  // the hub's own loopback self-requests) sets none of them — the hub never
+  // injects X-Forwarded-* on the INBOUND request it classifies (it only stamps
+  // X-Forwarded-Host/Proto on OUTBOUND proxy requests to modules). So a
+  // loopback peer that ALSO carries a forwarding header is a proxied public
+  // request → "public"; a header-less loopback peer stays "loopback".
+  //
+  // No spoof vector: a NON-loopback peer is already "public" regardless of
+  // headers (the branch below), so adding these headers can only DOWNGRADE a
+  // loopback caller (the on-box operator hurting only their own request) —
+  // never upgrade a network peer to "loopback".
+  if (
+    isLoopbackPeer(peerAddr) &&
+    (h.get("x-forwarded-for") !== null ||
+      h.get("x-forwarded-host") !== null ||
+      h.get("forwarded") !== null)
+  ) {
+    return "public";
+  }
   // No proxy headers — classify by peer address, failing closed when unknown.
   return isLoopbackPeer(peerAddr) ? "loopback" : "public";
 }

@@ -3,6 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  _resetBootstrapTokenForTests,
+  generateBootstrapToken,
+} from "../bootstrap-token.ts";
 import { buildCsrfCookie, generateCsrfToken } from "../csrf.ts";
 import { HUB_SVC, hubPortPath } from "../hub-control.ts";
 import { createDbHolder } from "../hub-db-liveness.ts";
@@ -3676,6 +3680,63 @@ describe("layerOf — classify trust layer from proxy headers + peer (item E / #
     });
     expect(layerOf(r)).toBe("public");
   });
+
+  // Caddy/nginx-direct deploy (hub#704). A same-box reverse proxy dials
+  // loopback (peer 127.0.0.1) and stamps NO cf/tailscale header — but it DOES
+  // set a standard reverse-proxy forwarding header. That header is the
+  // discriminator: a loopback peer carrying one is a proxied PUBLIC request and
+  // must NOT be "loopback" (which would leak the bootstrap token + drop the
+  // loopback-exposure cloak for every public visitor on a Caddy-direct box).
+  test("loopback peer + X-Forwarded-For → public (Caddy-direct, NOT loopback) [#704]", () => {
+    const r = req("/", { headers: { "X-Forwarded-For": "203.0.113.7" } });
+    expect(layerOf(r, "127.0.0.1")).toBe("public");
+  });
+
+  test("loopback peer + X-Forwarded-Host → public (Caddy-direct) [#704]", () => {
+    const r = req("/", { headers: { "X-Forwarded-Host": "hub.example.com" } });
+    expect(layerOf(r, "127.0.0.1")).toBe("public");
+  });
+
+  test("loopback peer + Forwarded (RFC 7239) → public (Caddy-direct) [#704]", () => {
+    const r = req("/", { headers: { Forwarded: "for=203.0.113.7;host=hub.example.com" } });
+    expect(layerOf(r, "127.0.0.1")).toBe("public");
+  });
+
+  test("IPv6-mapped loopback peer + X-Forwarded-For → public (Caddy-direct) [#704]", () => {
+    const r = req("/", { headers: { "X-Forwarded-For": "203.0.113.7" } });
+    expect(layerOf(r, "::ffff:127.0.0.1")).toBe("public");
+  });
+
+  // The genuine on-box caller (CLI, health probe, init bootstrap-token loopback
+  // probe `curl 127.0.0.1/admin/setup`, hub self-requests) sets NO forwarding
+  // header and MUST stay loopback. This is the not-broken half of the fix.
+  test("loopback peer + NO forwarding header → loopback (genuine on-box caller) [#704]", () => {
+    expect(layerOf(req("/"), "127.0.0.1")).toBe("loopback");
+    expect(layerOf(req("/"), "::1")).toBe("loopback");
+  });
+
+  // No spoof vector: forwarding headers can only DOWNGRADE a loopback caller.
+  // A NON-loopback peer is already "public" regardless of headers, so adding
+  // X-Forwarded-* never upgrades a network peer to a more-trusted layer.
+  test("non-loopback peer + X-Forwarded-For → public (no upgrade; spoof-proof) [#704]", () => {
+    const r = req("/", { headers: { "X-Forwarded-For": "127.0.0.1" } });
+    expect(layerOf(r, "203.0.113.7")).toBe("public");
+  });
+
+  // CF/TS header checks run FIRST — a Caddy-style forwarding header alongside a
+  // cf/tailscale header doesn't change those (still public/tailnet). Order
+  // preserved.
+  test("CF-Ray + X-Forwarded-For from loopback peer → public (CF check wins, order preserved)", () => {
+    const r = req("/", { headers: { "CF-Ray": "abc123-DEN", "X-Forwarded-For": "203.0.113.7" } });
+    expect(layerOf(r, "127.0.0.1")).toBe("public");
+  });
+
+  test("Tailscale-User-Login + X-Forwarded-For from loopback peer → tailnet (TS check wins)", () => {
+    const r = req("/", {
+      headers: { "Tailscale-User-Login": "alice@example.com", "X-Forwarded-For": "100.64.0.1" },
+    });
+    expect(layerOf(r, "127.0.0.1")).toBe("tailnet");
+  });
 });
 
 describe("hubFetch publicExposure layer-gate (proxyToService)", () => {
@@ -3817,6 +3878,74 @@ describe("hubFetch publicExposure layer-gate (proxyToService)", () => {
       const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
       const res = await fetcher(req("/loopback-only/health"), fakeServer("203.0.113.9"));
       expect(res.status).toBe(404);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  // hub#704 — Caddy/nginx-direct. A same-box reverse proxy dials loopback
+  // (peer 127.0.0.1) and stamps NO cf/tailscale header, but DOES set
+  // X-Forwarded-For. That request is a PUBLIC visitor proxied to the box and
+  // must hit the loopback-exposure cloak (404) — otherwise a Caddy-direct box
+  // leaks every loopback-only service/vault to the network.
+  test("publicExposure: loopback + X-Forwarded-For + loopback peer → 404 (Caddy-direct cloak fires) [#704]", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("loopback-only");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "loopback-only",
+              port: upstream.port,
+              paths: ["/loopback-only"],
+              health: "/loopback-only/health",
+              version: "0.1.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      // Caddy: peer is 127.0.0.1 (reverse_proxy 127.0.0.1:1939) but the request
+      // carries X-Forwarded-For for the real public client.
+      const r = req("/loopback-only/health", { headers: { "X-Forwarded-For": "203.0.113.7" } });
+      const res = await fetcher(r, fakeServer("127.0.0.1"));
+      expect(res.status).toBe(404);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  // The not-broken half: a header-less loopback peer (genuine on-box caller)
+  // still reaches the loopback-only service through the cloak.
+  test("publicExposure: loopback + NO forwarding header + loopback peer → reaches upstream [#704]", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("loopback-only");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "loopback-only",
+              port: upstream.port,
+              paths: ["/loopback-only"],
+              health: "/loopback-only/health",
+              version: "0.1.0",
+              publicExposure: "loopback",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/loopback-only/health"), fakeServer("127.0.0.1"));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { tag: string };
+      expect(body.tag).toBe("loopback-only");
     } finally {
       upstream.stop();
       h.cleanup();
@@ -5848,5 +5977,105 @@ describe("resolveClientIp (H2)", () => {
   test("whitespace-only header values are treated as absent", () => {
     const r = req("/", { headers: { "x-forwarded-for": "   " } });
     expect(resolveClientIp(r, null)).toBeNull();
+  });
+});
+
+describe("GET /admin/setup bootstrap-token probe — loopback-gated (hub#576 + Caddy-direct #704)", () => {
+  // The hub#576 token probe: a LOOPBACK caller (the on-box operator's own
+  // shell / `parachute init`) reading GET /admin/setup with Accept:
+  // application/json gets the actual bootstrap token in the JSON envelope; a
+  // public/tailnet caller does not. The hub derives requestIsLoopback from
+  // `layerOf(req, peerAddr) === "loopback"` (hub-server.ts ~2296), so the
+  // Caddy-direct fix (#704) flows straight through: a same-box reverse proxy
+  // carrying X-Forwarded-For now classifies "public" and the token is withheld
+  // even though the peer is 127.0.0.1.
+
+  // Fake Bun Server handle (mirrors the cloak suite) so the fetch fn resolves
+  // the peer address. The on-box operator connects from 127.0.0.1; Caddy
+  // reverse_proxy also dials 127.0.0.1 but stamps X-Forwarded-For.
+  const fakeServer = (address: string) => ({ requestIP: () => ({ address }) });
+
+  test("loopback peer + NO forwarding header → bootstrapToken present (on-box operator) [#576]", async () => {
+    const h = makeHarness();
+    _resetBootstrapTokenForTests();
+    const token = generateBootstrapToken();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        // No admin row → wizard mode → GET /admin/setup JSON probe is live.
+        const res = await hubFetch(h.dir, { getDb: () => db })(
+          req("/admin/setup", { headers: { accept: "application/json" } }),
+          fakeServer("127.0.0.1"),
+        );
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as {
+          requireBootstrapToken?: boolean;
+          bootstrapToken?: string;
+        };
+        expect(body.requireBootstrapToken).toBe(true);
+        expect(body.bootstrapToken).toBe(token);
+      } finally {
+        db.close();
+      }
+    } finally {
+      _resetBootstrapTokenForTests();
+      h.cleanup();
+    }
+  });
+
+  test("loopback peer + X-Forwarded-For → bootstrapToken WITHHELD (Caddy-direct public visitor) [#704]", async () => {
+    const h = makeHarness();
+    _resetBootstrapTokenForTests();
+    generateBootstrapToken();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        // Caddy: peer 127.0.0.1, but the request carries the public client's
+        // X-Forwarded-For. Pre-fix this leaked the token to any public visitor.
+        const res = await hubFetch(h.dir, { getDb: () => db })(
+          req("/admin/setup", {
+            headers: { accept: "application/json", "x-forwarded-for": "203.0.113.7" },
+          }),
+          fakeServer("127.0.0.1"),
+        );
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as {
+          requireBootstrapToken?: boolean;
+          bootstrapToken?: string;
+        };
+        // The gate still SAYS a token is required (so the form renders the
+        // field) — it just doesn't hand the value to the public caller.
+        expect(body.requireBootstrapToken).toBe(true);
+        expect(body.bootstrapToken).toBeUndefined();
+      } finally {
+        db.close();
+      }
+    } finally {
+      _resetBootstrapTokenForTests();
+      h.cleanup();
+    }
+  });
+
+  test("non-loopback peer → bootstrapToken WITHHELD (direct public/tailnet)", async () => {
+    const h = makeHarness();
+    _resetBootstrapTokenForTests();
+    generateBootstrapToken();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const res = await hubFetch(h.dir, { getDb: () => db })(
+          req("/admin/setup", { headers: { accept: "application/json" } }),
+          fakeServer("203.0.113.9"),
+        );
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { bootstrapToken?: string };
+        expect(body.bootstrapToken).toBeUndefined();
+      } finally {
+        db.close();
+      }
+    } finally {
+      _resetBootstrapTokenForTests();
+      h.cleanup();
+    }
   });
 });
