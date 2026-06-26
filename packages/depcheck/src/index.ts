@@ -33,12 +33,15 @@ export {
   type FormatOpts,
   type MissingDependencyWire,
   formatMissingDependency,
+  formatNonExecutable,
   resolveInstallCommands,
   toMissingDependencyWire,
 } from "./format.js";
 export {
   MissingDependencyError,
+  NonExecutableError,
   ensureExecutable,
+  findNonExecutableOnPath,
   isBinaryNotFoundError,
   rethrowIfMissing,
 } from "./error.js";

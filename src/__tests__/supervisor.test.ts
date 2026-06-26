@@ -1591,6 +1591,31 @@ describe("Supervisor port-readiness + structured start-error (§6.5)", () => {
     expect(spawner.calls).toHaveLength(0);
   });
 
+  test("(#634) preflight non-executable binary → non_executable start-error, NO spawn", async () => {
+    const spawner = makeQueueSpawner();
+    const sup = new Supervisor({
+      spawnFn: spawner.spawn,
+      killFn: noopKill,
+      // `which` requires X_OK so it returns null for a 100644 bin...
+      which: () => null,
+      // ...but the secondary probe finds it present-but-non-executable.
+      findNonExecutable: () => "/x/vault/bin/parachute-vault",
+      portListening: async () => true,
+      startReadyMs: 50,
+      sleep: () => Promise.resolve(),
+    });
+    const state = await sup.start(reqWithPort("vault", 1940));
+
+    expect(state.status).toBe("crashed");
+    expect(state.startError?.error_type).toBe("non_executable");
+    expect(state.startError?.error_description).toContain(
+      "but is not executable — run chmod +x /x/vault/bin/parachute-vault",
+    );
+    // No misleading "not installed" install card, and never spawned.
+    expect(state.startError?.binary).toBe("parachute-vault");
+    expect(spawner.calls).toHaveLength(0);
+  });
+
   test("a clean re-start clears a prior started-but-unbound start-error", async () => {
     const first = makeFakeProc(201);
     const second = makeFakeProc(202);

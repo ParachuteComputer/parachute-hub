@@ -38,6 +38,7 @@ import { spawnSync } from "node:child_process";
 import {
   MissingDependencyError,
   type MissingDependencyWire,
+  NonExecutableError,
   ensureExecutable,
   rethrowIfMissing,
 } from "@openparachute/depcheck";
@@ -264,6 +265,14 @@ export interface SupervisorOpts {
    */
   readonly which?: (cmd: string) => string | null;
   /**
+   * #634 secondary-probe seam for `ensureExecutable`: when `which` returns null,
+   * walk PATH IGNORING X_OK to detect a present-but-non-executable binary (a
+   * `bin` that lost its +x bit). Production leaves this undefined so depcheck's
+   * real PATH walk runs (gated to the real `Bun.which`); tests inject it to
+   * exercise the non-executable preflight branch through a stubbed `which`.
+   */
+  readonly findNonExecutable?: (binary: string) => string | null;
+  /**
    * Pre-spawn port-squatter detection (#580 item 4). Returns the pid holding a
    * TCP LISTEN on the module's port, or undefined when the port is free /
    * undetectable. Before spawning a module, the supervisor checks whether the
@@ -427,8 +436,11 @@ export class LogRingBuffer {
  * boot and threads it into the API handlers.
  */
 export class Supervisor {
-  private readonly opts: Required<Omit<SupervisorOpts, "spawnFn">> & {
+  private readonly opts: Required<Omit<SupervisorOpts, "spawnFn" | "findNonExecutable">> & {
     readonly spawnFn: SpawnFn;
+    // Optional #634 probe seam — undefined on the production path so depcheck's
+    // own real PATH walk runs (gated to the real `Bun.which`).
+    readonly findNonExecutable?: (binary: string) => string | null;
   };
   private readonly modules = new Map<string, ModuleEntry>();
 
@@ -459,6 +471,9 @@ export class Supervisor {
       lateBindWatchMs: opts.lateBindWatchMs ?? DEFAULT_LATE_BIND_WATCH_MS,
       lateBindPollMs: opts.lateBindPollMs ?? DEFAULT_LATE_BIND_POLL_MS,
       which: opts.which ?? (isProductionPath ? Bun.which : () => "/stub/bin/preflight-skipped"),
+      // #634: undefined on production so depcheck's real PATH walk runs (its
+      // gate keys on the real `Bun.which`); tests inject it to drive the branch.
+      findNonExecutable: opts.findNonExecutable,
       // Squatter detection (#580 item 4): real probes on the production path;
       // the stub-spawner test path defaults to "no squatter / unknown owner" so
       // fake-proc tests (which never hold a real port) aren't tripped. Tests
@@ -509,7 +524,9 @@ export class Supervisor {
     const startBinary = req.cmd[0];
     if (startBinary) {
       try {
-        ensureExecutable(startBinary, { which: this.opts.which });
+        const ensureOpts: Parameters<typeof ensureExecutable>[1] = { which: this.opts.which };
+        if (this.opts.findNonExecutable) ensureOpts.findNonExecutable = this.opts.findNonExecutable;
+        ensureExecutable(startBinary, ensureOpts);
       } catch (err) {
         if (err instanceof MissingDependencyError) {
           entry.state = {
@@ -517,6 +534,18 @@ export class Supervisor {
             status: "crashed",
             pid: undefined,
             startError: startErrorFromWire(err.toWire(), this.opts.now),
+          };
+          return entry.state;
+        }
+        // #634: the binary IS present but not executable (a `bin` that lost its
+        // +x bit). Record the actionable chmod hint instead of a misleading
+        // "not installed" — and never throw out of `start`.
+        if (err instanceof NonExecutableError) {
+          entry.state = {
+            ...entry.state,
+            status: "crashed",
+            pid: undefined,
+            startError: nonExecutableStartError(err, this.opts.now),
           };
           return entry.state;
         }
@@ -1239,6 +1268,21 @@ function startErrorFromWire(wire: MissingDependencyWire, now: () => number): Mod
     docs_url: wire.docs_url,
     install: wire.install,
     sysadmin_hint: wire.sysadmin_hint,
+    at: new Date(now()).toISOString(),
+  };
+}
+
+/**
+ * #634: map a `NonExecutableError` (binary present on PATH but not +x) onto the
+ * `ModuleStartError` shape. `error_type: "non_executable"` so a UI can branch;
+ * `error_description` is the formatted `chmod +x` block. No install card — the
+ * fix is a permission flip, not a reinstall.
+ */
+function nonExecutableStartError(err: NonExecutableError, now: () => number): ModuleStartError {
+  return {
+    error_type: err.errorType,
+    error_description: err.message,
+    binary: err.binary,
     at: new Date(now()).toISOString(),
   };
 }

@@ -56,6 +56,23 @@ export interface MissingDependencyWire {
 
 const SYSADMIN_TRAILER = "Or ask your system administrator to install it for you.";
 
+/**
+ * #634: the operator-facing block for a binary that IS present on PATH but is
+ * NOT executable (a 100644 file — caught when a module's `bin` lost its +x bit
+ * and the supervisor reported a misleading "<binary> not installed" despite an
+ * intact symlink). Distinct from "not found on PATH": the file is right there,
+ * the fix is `chmod +x`, NOT a reinstall. Self-contained (no DepSpec needed —
+ * the path + chmod recipe is the whole message). `interactive: false` strips
+ * ANSI for a headless / JSON reader.
+ */
+export function formatNonExecutable(binary: string, path: string, opts: FormatOpts = {}): string {
+  const interactive = opts.interactive ?? true;
+  const out = [`${binary} found at ${path} but is not executable — run chmod +x ${path}`].join(
+    "\n",
+  );
+  return interactive ? out : stripAnsi(out);
+}
+
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching ANSI SGR escapes is the point.
 const ANSI_PATTERN = /\[[0-9;]*m/g;
 
