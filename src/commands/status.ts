@@ -368,6 +368,8 @@ async function defaultProbeModuleHealth(port: number, health: string): Promise<b
   try {
     const res = await fetch(`http://127.0.0.1:${port}${health}`, {
       signal: AbortSignal.timeout(1500),
+      // Loopback-only target, but never chase a redirect off-box (defensive).
+      redirect: "manual",
     });
     return res.ok || res.status === 401;
   } catch {
