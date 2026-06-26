@@ -1292,7 +1292,8 @@ function capScopesToUserAuthority(
     if (name === undefined || verb === undefined || !VAULT_VERBS.has(verb)) return true;
     // Named vault verb requested by a non-owner: admit only if the user holds
     // it. `vaultVerbsForUserVault` returns null for an unassigned vault (drop)
-    // or the held verb list (today read/write only — never admin).
+    // or the held verb list — a `write` role holds [read, write, admin], a
+    // `read` role holds [read] (see `vaultVerbsForRole`).
     const held = vaultVerbsForUserVault(db, userId, name);
     return held !== null && (held as readonly string[]).includes(verb);
   });
