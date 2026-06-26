@@ -67,6 +67,34 @@ export const HUB_UPGRADE_REQUIRED_SCOPE = "parachute:host:admin";
  */
 const IN_FLIGHT_PHASES = new Set<HubUpgradeStatus["phase"]>(["pending", "running", "restarting"]);
 
+/**
+ * #506: TTL for the 409 in-flight guard. The status file is single-slot, and a
+ * helper that CRASHES (OOM, killed mid-rewrite, host reboot) never reaches a
+ * terminal phase — leaving the slot stuck in `pending`/`running`/`restarting`
+ * FOREVER and 409-deadlocking every future upgrade. So: an in-flight slot whose
+ * `started_at` is older than this bound is treated as ABANDONED and the new
+ * request proceeds (overwriting the stale slot).
+ *
+ * 15 minutes — comfortably past the longest expected in-place upgrade (an
+ * `npm view` + `bun add -g` rewrite + restart is seconds-to-low-minutes even on
+ * a slow box / cold cache). A live upgrade finishing under the bound is never
+ * mistaken for abandoned; a crashed one frees the slot within 15 min instead of
+ * never. (A missing/garbage `started_at` is treated as stale → not 409, so a
+ * malformed file can't deadlock either.)
+ */
+const IN_FLIGHT_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Is an in-flight slot still FRESH (within the TTL), so a second POST must be
+ * rejected 409? An unparseable / missing `started_at` is treated as stale
+ * (not fresh) so a malformed file frees the slot rather than deadlocking it.
+ */
+function isInFlightFresh(existing: HubUpgradeStatus, now: Date): boolean {
+  const startedMs = Date.parse(existing.started_at);
+  if (Number.isNaN(startedMs)) return false;
+  return now.getTime() - startedMs < IN_FLIGHT_TTL_MS;
+}
+
 export interface SpawnHelperArgs {
   operationId: string;
   channel: "rc" | "latest";
@@ -213,7 +241,9 @@ export async function handleHubUpgrade(req: Request, deps: ApiHubUpgradeDeps): P
   const parsed = await parseBody(req);
   if (parsed instanceof Response) return parsed;
 
-  // ── 409 in-flight guard ────────────────────────────────────────────────────
+  const now = (deps.now ?? (() => new Date()))();
+
+  // ── 409 in-flight guard (TTL-bounded) ──────────────────────────────────────
   // The status file is single-slot (one hub, one upgrade). If a prior upgrade
   // is still in a non-terminal phase (pending/running/restarting), starting a
   // SECOND would overwrite its operation_id — and a still-running first helper
@@ -222,9 +252,15 @@ export async function handleHubUpgrade(req: Request, deps: ApiHubUpgradeDeps): P
   // server-side too (a second tab, a stale page, a scripted POST). Reject with
   // 409 unless the slot is free (no file) or the prior op reached a terminal
   // phase (failed / redeploy-required / succeeded).
+  //
+  // #506: BUT a non-terminal slot is only a real block while it's FRESH. A
+  // helper that crashed (OOM / killed / host reboot) leaves the slot stuck
+  // in-flight forever and would 409-deadlock every future upgrade. So an
+  // in-flight slot older than IN_FLIGHT_TTL_MS is treated as ABANDONED and the
+  // request proceeds (the seeded status below overwrites the stale slot).
   const readStatus = deps.readStatus ?? readHubUpgradeStatus;
   const existing = readStatus(deps.configDir);
-  if (existing && IN_FLIGHT_PHASES.has(existing.phase)) {
+  if (existing && IN_FLIGHT_PHASES.has(existing.phase) && isInFlightFresh(existing, now)) {
     return jsonError(
       409,
       "upgrade_in_flight",
@@ -234,7 +270,6 @@ export async function handleHubUpgrade(req: Request, deps: ApiHubUpgradeDeps): P
 
   const hubSrcDir = deps.hubSrcDir ?? dirname(fileURLToPath(import.meta.url));
   const env = deps.env ?? process.env;
-  const now = (deps.now ?? (() => new Date()))();
 
   const currentVersion = (deps.currentVersion ?? (() => defaultCurrentVersion(hubSrcDir)))();
   // Auto-detect the channel from the current version when not explicitly set —
