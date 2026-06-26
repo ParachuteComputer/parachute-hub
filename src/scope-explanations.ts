@@ -42,7 +42,8 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     level: "write",
   },
   "vault:admin": {
-    label: "Full vault access plus configuration changes (rotate tokens, change settings).",
+    label:
+      "Read and write everything, plus admin: config & settings, triggers & automation, GitHub backup, and minting access tokens.",
     level: "admin",
   },
   // Optional-module scopes (scribe / agent). These are in FIRST_PARTY_SCOPES

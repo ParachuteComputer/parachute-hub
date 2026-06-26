@@ -116,7 +116,8 @@ describe("renderConsent", () => {
     expect(html).toContain("vault:admin");
     // Scope explanations from the registry
     expect(html).toContain("Read your notes");
-    expect(html).toContain("Full vault access");
+    // hub#689 Leg 1: the admin label now enumerates the concrete grants.
+    expect(html).toContain("Read and write everything, plus admin");
   });
 
   test("highlights admin scopes with a danger color and badge", () => {
@@ -251,6 +252,59 @@ describe("renderConsent", () => {
     });
     expect(html).not.toContain("You have no assigned vaults");
     expect(html).not.toContain('value="yes" class="btn btn-primary" disabled');
+  });
+
+  // hub#689 — owner-on-own-vault verb selector rendering.
+  test("renders the owner verb selector (read/write/admin), pre-selected to admin", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work"], lockedVault: "work" },
+      ownerVerbSelector: { requestedVerbs: ["read"] },
+    });
+    expect(html).toContain("Access level");
+    expect(html).toContain('name="verb_select" value="read"');
+    expect(html).toContain('name="verb_select" value="write"');
+    expect(html).toContain('name="verb_select" value="admin"');
+    // Admin is the pre-selected (checked) option.
+    expect(html).toMatch(/name="verb_select" value="admin"[^>]*checked/);
+    // read/write are NOT pre-checked.
+    expect(html).not.toMatch(/name="verb_select" value="read"[^>]*checked/);
+    expect(html).not.toMatch(/name="verb_select" value="write"[^>]*checked/);
+  });
+
+  test("owner verb selector keeps the admin option visibly flagged (admin badge + red border)", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work"], lockedVault: "work" },
+      ownerVerbSelector: { requestedVerbs: ["read"] },
+    });
+    // The .scope-admin red-border class + the admin badge ride on the admin
+    // radio option so a pre-selected admin grant stays transparent.
+    expect(html).toContain("verb-option-admin");
+    expect(html).toContain("scope-admin");
+    expect(html).toContain("badge-admin");
+  });
+
+  test("does NOT render the verb selector when ownerVerbSelector is absent (non-owner)", () => {
+    const html = renderConsent({
+      params: { ...PARAMS, scope: "vault:read" },
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      vaultPicker: { unnamedVerbs: ["read"], availableVaults: ["work"], lockedVault: "work" },
+      // ownerVerbSelector omitted → no selector
+    });
+    expect(html).not.toContain("Access level");
+    expect(html).not.toContain('name="verb_select"');
   });
 });
 

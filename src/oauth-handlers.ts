@@ -1209,9 +1209,31 @@ export function handleAuthorizeGet(db: Database, req: Request, deps: OAuthDeps):
     return issueAuthCodeRedirect(db, parsed, requestedScopes, session.userId, deps);
   }
 
+  // hub#689 — does the user hold ADMIN on every vault they could pick? Admin
+  // (isFirstAdmin) owns the whole hub. A non-admin owns a vault only if their
+  // `user_vaults` role grants admin there (today role=write does; a role=read
+  // assignment would NOT). Re-derived from the DB so the owner-verb-selector
+  // is offered only to a genuine owner — the submit path re-checks the PICKED
+  // vault and the cap is the backstop, but rendering it precisely avoids
+  // promising an admin upgrade the cap would silently demote.
+  const userHoldsAdminOnPickable =
+    userIsAdmin ||
+    (assignedVaults.length > 0 &&
+      assignedVaults.every((v) =>
+        (vaultVerbsForUserVault(db, session.userId, v) ?? []).includes("admin"),
+      ));
+
   return htmlResponse(
     renderConsent(
-      consentProps(client, parsed, vaultNames, csrf.token, assignedVaults, userIsAdmin),
+      consentProps(
+        client,
+        parsed,
+        vaultNames,
+        csrf.token,
+        assignedVaults,
+        userIsAdmin,
+        userHoldsAdminOnPickable,
+      ),
     ),
     200,
     extra,
@@ -1681,6 +1703,44 @@ async function handleConsentSubmit(
         `vault_scope_mismatch: the picked vault "${pickedVault}" is not in your vault assignment. Ask the hub admin to update your assignment, or pick a vault shown on the consent screen.`,
         400,
       );
+    }
+    // hub#689 — owner-on-own-vault verb widening. The consent screen offers
+    // owners a read/write/admin selector (pre-selected to admin) for an
+    // unnamed `vault:read`/`vault:write` request, so an owner whose AI client
+    // asked for read-only can grant the level it actually needs in-flow. The
+    // submitted `verb_select` is an UNTRUSTED hint — we re-derive ownership of
+    // the PICKED vault server-side here, and `capScopesToUserAuthority` (inside
+    // issueAuthCodeRedirect) is the backstop that drops any verb the user
+    // doesn't actually hold. This only ever rewrites the unnamed read/write
+    // verb(s) to the selected level on the picked vault; named scopes and every
+    // other scope are untouched. A forged `verb_select=admin` from a user who
+    // doesn't own the picked vault gets capped back to what they hold (or, for
+    // a vault outside a pinned user's assignment, never reaches here — the
+    // mismatch checks above already 400'd it).
+    const selectedVerb = String(form.get("verb_select") ?? "").trim();
+    if (selectedVerb === "read" || selectedVerb === "write" || selectedVerb === "admin") {
+      // Re-derive, server-side, whether THIS user owns (holds admin on) the
+      // PICKED vault. Owner === first admin (holds admin everywhere) OR an
+      // assigned user whose role grants admin on this vault. Never trust the
+      // client-submitted selector to establish authority.
+      const heldOnPicked = vaultVerbsForUserVault(db, session.userId, pickedVault);
+      const ownsPicked = userIsAdmin || (heldOnPicked?.includes("admin") ?? false);
+      if (ownsPicked) {
+        scopes = scopes.map((s) => {
+          const parts = s.split(":");
+          // Only widen the unnamed read/write verbs the selector was offered
+          // for — leave an unnamed `vault:admin`, named scopes, and non-vault
+          // scopes exactly as requested.
+          if (
+            parts.length === 2 &&
+            parts[0] === "vault" &&
+            (parts[1] === "read" || parts[1] === "write")
+          ) {
+            return `vault:${selectedVerb}`;
+          }
+          return s;
+        });
+      }
     }
     scopes = narrowVaultScopes(scopes, pickedVault);
   }
@@ -2746,6 +2806,10 @@ function consentProps(
   csrfToken: string,
   assignedVaults: readonly string[],
   userIsAdmin: boolean,
+  // hub#689 — true when the user holds admin on every vault they could pick
+  // (admin owns the hub; an assigned non-admin only if their role grants admin
+  // on each assigned vault). Gates whether the owner-verb-selector renders.
+  userHoldsAdminOnPickable = userIsAdmin,
 ) {
   const scopes = params.scope.split(" ").filter((s) => s.length > 0);
   const unnamedVerbs = unnamedVaultVerbs(scopes);
@@ -2875,6 +2939,25 @@ function consentProps(
     const only = vaultNames[0];
     if (only) displayVault = only;
   }
+  // hub#689 — owner-on-own-vault verb selector. The client requested an
+  // unnamed `vault:read`/`vault:write` verb, and the consenting user owns
+  // (holds admin on) every vault they could pick — first admin owns the whole
+  // hub; an assigned non-admin holds admin on each of their assigned vaults
+  // (vaultVerbsForRole('write') → [read,write,admin]). Offer the selector so
+  // they can grant the level their client actually needs (or downgrade), with
+  // admin pre-selected. Suppressed when the request can't be authorized (zero-
+  // vault non-admin) or the assignment is stale (no valid vault to own).
+  //
+  // SECURITY: this only DECIDES WHETHER TO RENDER. The actual widening is
+  // re-derived server-side in `handleConsentSubmit` against the *picked* vault
+  // and capped by `capScopesToUserAuthority`. The selector value is a hint.
+  const upgradeableUnnamedVerbs = unnamedVerbs.filter((v) => v === "read" || v === "write");
+  const userOwnsEveryPickableVault =
+    !hasStaleAssignment && userCanAuthorizeRequest && userHoldsAdminOnPickable;
+  const ownerVerbSelector =
+    upgradeableUnnamedVerbs.length > 0 && userOwnsEveryPickableVault
+      ? { requestedVerbs: upgradeableUnnamedVerbs }
+      : undefined;
   return {
     params,
     clientId: client.clientId,
@@ -2883,6 +2966,7 @@ function consentProps(
     csrfToken,
     vaultPicker,
     displayVault,
+    ownerVerbSelector,
     staleAssignedVault,
     // Approve stays enabled for non-vault scopes even when assigned_vault
     // is stale — the user can still consent to e.g. `scribe:transcribe`
