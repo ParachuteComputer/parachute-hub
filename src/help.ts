@@ -132,6 +132,7 @@ export function initHelp(): string {
 Usage:
   parachute init [--no-browser] [--no-expose-prompt]
                  [--expose none|tailnet|cloudflare]
+                 [--channel rc|latest]
                  [--hub-origin <url>]
                  [--cli-wizard | --browser-wizard]
 
@@ -168,6 +169,10 @@ Flags:
                               none       — stay loopback-only
                               tailnet    — set up Tailscale serve (private to your tailnet)
                               cloudflare — set up Cloudflare Tunnel (your own domain)
+  --channel <rc|latest>     npm dist-tag for the vault module install (default: latest).
+                            Use \`rc\` on an rc-channel box so init doesn't downgrade
+                            vault below the hub. Also honors PARACHUTE_CHANNEL /
+                            PARACHUTE_INSTALL_CHANNEL env when the flag is absent.
   --hub-origin <url>        set the canonical public origin (OAuth issuer) BEFORE
                             the hub + modules start, so vault/scribe come up
                             accepting it in one pass. For reverse-proxy /
@@ -185,6 +190,7 @@ Examples:
   parachute init --expose tailnet             # CI/scripted: chain straight into Tailscale
   parachute init --no-browser                 # don't shell out to open / xdg-open
   parachute init --cli-wizard                 # walk the wizard in this terminal (hub#168)
+  parachute init --channel rc                  # rc box: install the vault module from @rc
 `;
 }
 

@@ -155,13 +155,30 @@ export interface InitOpts {
    */
   exposeCloudflareImpl?: () => Promise<number>;
   /**
+   * Install channel for the vault module (hub#694 bug 2). `"rc"` makes init's
+   * vault install resolve `@openparachute/vault@rc` instead of `@latest`, so an
+   * rc-channel box (hub installed from `@rc`) doesn't DOWNGRADE vault below the
+   * hub on `parachute init`. Default `"latest"` (npm default; back-compat for
+   * every existing operator). Precedence in the CLI: `--channel <v>` flag >
+   * `PARACHUTE_CHANNEL` / `PARACHUTE_INSTALL_CHANNEL` env > `"latest"`. Threaded
+   * verbatim into `install()`'s existing `channel` plumbing
+   * (`resolveInstallChannel`).
+   */
+  channel?: "latest" | "rc";
+  /**
    * Test seam: shim for the vault-module install step (hub#168 Cut 1).
    * Production calls `install("vault", { noCreate: true, noStart: true, …})`
    * to put `@openparachute/vault` on PATH without creating a first-vault
    * instance — the wizard's vault step decides Create/Import/Skip. Tests
-   * pass a stub to record the call without shelling out.
+   * pass a stub to record the call without shelling out. The `channel` arg
+   * (hub#694) forwards into `install()`'s `channel` option so an rc box installs
+   * vault from `@rc`.
    */
-  installVaultModuleImpl?: (configDir: string, manifestPath: string) => Promise<number>;
+  installVaultModuleImpl?: (
+    configDir: string,
+    manifestPath: string,
+    channel?: "latest" | "rc",
+  ) => Promise<number>;
   /**
    * Override the wizard-choice prompt (hub#168 Cut 4). When set, the
    * "Continue setup in the browser or CLI?" question is answered without
@@ -509,8 +526,18 @@ async function defaultGuaranteeOperatorToken(ctx: {
  * shim that re-emits each line under an `[install vault] ` prefix so the
  * init log stays grep-able. Idempotent — `install` short-circuits the
  * bun-add when vault is already linked / installed.
+ *
+ * The `channel` arg (hub#694) forwards into `install()`'s `channel` option so
+ * an rc-channel box installs `@openparachute/vault@rc` instead of `@latest` —
+ * otherwise init silently DOWNGRADES vault below the rc-tracking hub. Undefined
+ * → install's own resolution (`--tag` > `channel` > `PARACHUTE_INSTALL_CHANNEL`
+ * env > `"latest"`) applies, preserving today's behavior.
  */
-async function defaultInstallVaultModule(configDir: string, manifestPath: string): Promise<number> {
+async function defaultInstallVaultModule(
+  configDir: string,
+  manifestPath: string,
+  channel?: "latest" | "rc",
+): Promise<number> {
   const installOpts: InstallOpts = {
     configDir,
     manifestPath,
@@ -518,6 +545,7 @@ async function defaultInstallVaultModule(configDir: string, manifestPath: string
     noStart: true,
     log: (line) => console.log(`[install vault] ${line}`),
   };
+  if (channel) installOpts.channel = channel;
   return await defaultInstall("vault", installOpts);
 }
 
@@ -637,6 +665,32 @@ async function promptExposeChoice(
   return defaultChoice;
 }
 
+/**
+ * Resolve the install channel for init's vault module step (hub#694 bug 2).
+ *
+ * Precedence (highest → lowest):
+ *   1. explicit `--channel rc|latest` (parsed in cli.ts → `opts.channel`)
+ *   2. `PARACHUTE_CHANNEL` env (the DigitalOcean cloud-init script's var)
+ *   3. `PARACHUTE_INSTALL_CHANNEL` env (the install layer's own platform cascade)
+ *   4. `undefined` → `install()` falls back to its own "latest" default
+ *
+ * Returns `"latest"` / `"rc"` when one is resolved, or `undefined` to defer to
+ * `install()`'s resolution. A non-`rc`/`latest` env value is ignored (returns
+ * undefined) so a typo degrades to "latest" rather than crashing init — the
+ * same forgiving posture `resolveInstallChannel` takes for the install command.
+ */
+export function resolveInitChannel(
+  explicit: "latest" | "rc" | undefined,
+  env: NodeJS.ProcessEnv,
+): "latest" | "rc" | undefined {
+  if (explicit === "rc" || explicit === "latest") return explicit;
+  for (const key of ["PARACHUTE_CHANNEL", "PARACHUTE_INSTALL_CHANNEL"]) {
+    const v = env[key];
+    if (v === "rc" || v === "latest") return v;
+  }
+  return undefined;
+}
+
 export async function init(opts: InitOpts = {}): Promise<number> {
   const configDir = opts.configDir ?? CONFIG_DIR;
   const manifestPath = opts.manifestPath ?? SERVICES_MANIFEST_PATH;
@@ -668,6 +722,16 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   const exposeTailnetImpl = opts.exposeTailnetImpl ?? defaultExposeTailnet;
   const exposeCloudflareImpl = opts.exposeCloudflareImpl ?? defaultExposeCloudflare;
   const installVaultModuleImpl = opts.installVaultModuleImpl ?? defaultInstallVaultModule;
+  // hub#694 bug 2: resolve the channel for the vault module install. Precedence:
+  // explicit `--channel <v>` (opts.channel) > `PARACHUTE_CHANNEL` /
+  // `PARACHUTE_INSTALL_CHANNEL` env > undefined (install's own "latest"
+  // fallback). The env fallback is what makes the DigitalOcean cloud-init
+  // script's `PARACHUTE_CHANNEL=rc` cascade into init's vault install with zero
+  // extra flags — init never received a `--channel` from that script, but it
+  // reads the env the script already exports. A garbage env value falls through
+  // to undefined → install resolves "latest" (matching resolveInstallChannel's
+  // own garbage-handling), so an operator typo can't break init.
+  const installChannel: "latest" | "rc" | undefined = resolveInitChannel(opts.channel, env);
   const runCliWizardImpl = opts.runCliWizardImpl ?? defaultRunCliWizard;
   const fetchBootstrapTokenImpl = opts.fetchBootstrapTokenImpl ?? defaultFetchBootstrapToken;
   const setHubOriginImpl = opts.setHubOriginImpl ?? defaultSetHubOrigin;
@@ -694,6 +758,48 @@ export async function init(opts: InitOpts = {}): Promise<number> {
       );
       log("");
     }
+  }
+
+  // Step 0.5 (hub#694 bug 1 — the spawn race): install + seed the vault module
+  // into services.json BEFORE the hub unit starts (Step 1 below). The hub unit's
+  // `serve` runs the in-process Supervisor, which scans services.json EXACTLY
+  // ONCE at boot (`bootSupervisedModules`) and never rescans. If we seed vault
+  // AFTER the unit boots (the old Step 2.5 ordering), that single scan reads a
+  // services.json with no vault row → vault is registered-but-never-spawned, so
+  // `/vault/*` 502s until a manual `parachute restart` re-triggers a per-module
+  // start. On a slow box (1GB droplet) the scan reliably wins that race. Seeding
+  // first means the boot scan finds vault and spawns it on the first pass — no
+  // restart needed.
+  //
+  // `install("vault", { noCreate: true, noStart: true, … })` only does the
+  // on-disk work — `bun add -g` (idempotent; short-circuits when vault is
+  // bun-linked / already installed) + an `upsertService` seed write. It does NOT
+  // need a running hub: the start path, the stale-unit sweep, and the
+  // supervised-hub guidance probe are all gated off under `noCreate`/`noStart`,
+  // so running it before the unit exists is safe. The wizard's vault step still
+  // owns Create / Import / Skip (noCreate defers first-vault creation); the
+  // supervisor (not install.ts) owns spawning (noStart).
+  //
+  // Idempotent: if a vault row already exists (re-run, or a prior install), this
+  // short-circuits past the bun-add and the row is left intact. We don't block
+  // init on a non-zero exit — the wizard can retry from /admin/setup.
+  const findVaultEntry = (): boolean => {
+    try {
+      return findService("parachute-vault", manifestPath) !== undefined;
+    } catch {
+      return false;
+    }
+  };
+  const vaultAlreadyInstalled = findVaultEntry();
+  if (!vaultAlreadyInstalled) {
+    log("Installing the vault module so the wizard can offer create / import / skip…");
+    const installCode = await installVaultModuleImpl(configDir, manifestPath, installChannel);
+    if (installCode !== 0) {
+      log(
+        `⚠ vault module install returned ${installCode}; the wizard can retry from /admin/setup.`,
+      );
+    }
+    log("");
   }
 
   // Step 1: hub running?
@@ -831,41 +937,14 @@ export async function init(opts: InitOpts = {}): Promise<number> {
     }
   }
 
-  // Step 2.5: always install the vault module (hub#168 Cut 1). Aaron's
-  // 2026-05-28 directive: "it should always install the vault module"
-  // even though "creating a vault should be optional." We split the
-  // module install (always) from the first-vault create (deferred to
-  // the wizard) by passing `noCreate: true` to install — bun add -g
-  // runs, services.json gets seeded, but `parachute-vault init` (which
-  // would auto-create a `default` vault) is skipped. The wizard's
-  // vault step then either Creates / Imports / Skips.
-  //
-  // Idempotent: install short-circuits the bun-add when vault is
-  // already linked (`bun link`) or already globally installed. If the
-  // operator already has a vault row, this is a no-op past the
-  // already-installed log line. We don't block init on this step;
-  // a non-zero exit code is logged but treated as a warning, since the
-  // wizard can re-attempt the install itself from /admin/setup.
-  const findVaultEntry = (): boolean => {
-    try {
-      return findService("parachute-vault", manifestPath) !== undefined;
-    } catch {
-      return false;
-    }
-  };
-  const vaultAlreadyInstalled = findVaultEntry();
-  if (!vaultAlreadyInstalled) {
-    log("");
-    log("Installing the vault module so the wizard can offer create / import / skip…");
-    const installCode = await installVaultModuleImpl(configDir, manifestPath);
-    if (installCode !== 0) {
-      log(
-        `⚠ vault module install returned ${installCode}; the wizard can retry from /admin/setup.`,
-      );
-    }
-  }
+  // (The vault module install + seed now runs at Step 0.5, BEFORE the hub unit
+  // starts — see hub#694 bug 1. It used to live here, after exposure; moving it
+  // ahead of Step 1's hub bringup is what lets the supervisor's one-time boot
+  // scan find + spawn vault instead of registering it after the scan already
+  // ran. The "always install the vault module" directive — Aaron 2026-05-28,
+  // hub#168 Cut 1 — and the noCreate/noStart split are unchanged.)
 
-  // Step 3: vault configured? (After the module install above, this may
+  // Step 3: vault configured? (After the Step 0.5 module install above, this may
   // have flipped from false to true on a fresh box. The wizard reads
   // services.json on every request, so the "configured" answer here is
   // best-effort — it only shapes the next-step log message below.)
