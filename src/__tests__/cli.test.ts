@@ -103,6 +103,28 @@ describe("cli", () => {
     expect(code).toBe(1);
     expect(stderr).toMatch(/invalid --hub-origin/);
   });
+
+  // hub#694 bug 2: `init --channel` mirrors `install --channel` — rejected at
+  // the arg layer (exit 1) before any daemon work, so these are hermetic.
+  test("init --channel without a value exits 1 (hub#694)", async () => {
+    const { code, stderr } = await runCli(["init", "--channel"]);
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/--channel requires a value/);
+  });
+
+  test("init --channel with an invalid value exits 1 (hub#694)", async () => {
+    const { code, stderr } = await runCli(["init", "--channel", "banana"]);
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/--channel must be "rc" or "latest"/);
+    expect(stderr).toMatch(/banana/);
+  });
+
+  test("init --help documents --channel (hub#694)", async () => {
+    const { code, stdout } = await runCli(["init", "--help"]);
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/--channel/);
+    expect(stdout).toMatch(/rc\|latest/);
+  });
 });
 
 describe("cli per-subcommand help", () => {

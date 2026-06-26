@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hasNoDisplay, init, looksLikeServer, resolveAdminUrl } from "../commands/init.ts";
+import {
+  hasNoDisplay,
+  init,
+  looksLikeServer,
+  resolveAdminUrl,
+  resolveInitChannel,
+} from "../commands/init.ts";
 import type { ExposeState } from "../expose-state.ts";
 import { writeHubPort } from "../hub-control.ts";
 import { writePid } from "../process-state.ts";
@@ -1862,6 +1868,353 @@ describe("init exposure chain", () => {
     } finally {
       h.cleanup();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hub#694 — first-run robustness.
+//
+// Bug 1 (the spawn race): the supervisor scans services.json EXACTLY ONCE at
+// hub-unit boot. So the vault module MUST be seeded into services.json BEFORE
+// the hub unit starts (ensureHub) — otherwise the boot scan finds no vault row
+// and vault never spawns until a manual `parachute restart`. These tests pin the
+// ordering: vault-install precedes ensureHub on both the laptop (no --hub-origin)
+// and the DO (--hub-origin) path, and Step-0 origin-persist stays first.
+//
+// Bug 2 (channel): init must install the vault module from the chosen channel
+// (`--channel rc` / PARACHUTE_CHANNEL=rc), not always @latest — otherwise an rc
+// box downgrades vault below the rc-tracking hub.
+// ---------------------------------------------------------------------------
+
+describe("init hub#694 — vault seeded before the supervisor boot scan (bug 1)", () => {
+  test("laptop (no --hub-origin): installs+seeds vault BEFORE ensureHub", async () => {
+    const h = makeHarness();
+    try {
+      const order: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        // The load-bearing assertion: the vault module install (which seeds the
+        // services.json row) MUST happen before the hub unit boots, so the
+        // supervisor's one-time boot scan finds + spawns vault on the first pass.
+        installVaultModuleImpl: async () => {
+          order.push("install-vault");
+          return 0;
+        },
+        ensureHub: async () => {
+          order.push("ensureHub");
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+      });
+      expect(code).toBe(0);
+      expect(order).toEqual(["install-vault", "ensureHub"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--hub-origin (DO path): order is set-origin → install vault → ensureHub", async () => {
+    const h = makeHarness();
+    try {
+      const order: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        hubOrigin: "https://box.sslip.io",
+        // hub#693 Step-0 origin persist must remain FIRST (boot issuer + child
+        // env read it); the hub#694 vault seed slots in AFTER it but BEFORE the
+        // hub unit boots, so the freshly-spawned vault comes up with the public
+        // origin in its accepted-iss set AND is present in the boot scan — in one
+        // pass, no restart.
+        setHubOriginImpl: (_dir, origin) => {
+          order.push(`set-origin:${origin}`);
+        },
+        installVaultModuleImpl: async () => {
+          order.push("install-vault");
+          return 0;
+        },
+        ensureHub: async () => {
+          order.push("ensureHub");
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+      });
+      expect(code).toBe(0);
+      expect(order).toEqual(["set-origin:https://box.sslip.io", "install-vault", "ensureHub"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("real seed: vault row is in services.json by the time ensureHub runs", async () => {
+    // End-to-end-ish: drive the REAL defaultInstallVaultModule (bun-linked vault
+    // short-circuits the bun-add) and assert the services.json row exists when
+    // ensureHub is invoked — i.e. the boot scan would find it.
+    const h = makeHarness();
+    try {
+      let vaultRowAtEnsure: boolean | undefined;
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        ensureHub: async () => {
+          // At hub-unit-boot time the services.json must already carry vault.
+          const { findService } = await import("../services-manifest.ts");
+          vaultRowAtEnsure = findService("parachute-vault", h.manifestPath) !== undefined;
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+        // NOTE: no installVaultModuleImpl override — exercise the real install
+        // so we prove the seed write lands before ensureHub, not just the stub.
+      });
+      expect(code).toBe(0);
+      expect(vaultRowAtEnsure).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("already-seeded vault: install is skipped, ensureHub still runs", async () => {
+    const h = makeHarness();
+    try {
+      seedVault(h.manifestPath);
+      const order: string[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        installVaultModuleImpl: async () => {
+          order.push("install-vault");
+          return 0;
+        },
+        ensureHub: async () => {
+          order.push("ensureHub");
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+      });
+      expect(code).toBe(0);
+      // Vault already present → install short-circuits; only ensureHub fires.
+      expect(order).toEqual(["ensureHub"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("init hub#694 — install channel (bug 2)", () => {
+  test("--channel rc propagates to the vault module install", async () => {
+    const h = makeHarness();
+    try {
+      const channels: (string | undefined)[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        channel: "rc",
+        installVaultModuleImpl: async (_d, _m, channel) => {
+          channels.push(channel);
+          return 0;
+        },
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+      });
+      expect(code).toBe(0);
+      expect(channels).toEqual(["rc"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("PARACHUTE_CHANNEL=rc env propagates when no --channel flag", async () => {
+    const h = makeHarness();
+    try {
+      const channels: (string | undefined)[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        // No `channel` opt — exercise the env fallback the DO cloud-init script
+        // relies on (it exports PARACHUTE_CHANNEL but passes no --channel flag).
+        env: { PARACHUTE_CHANNEL: "rc" } as NodeJS.ProcessEnv,
+        installVaultModuleImpl: async (_d, _m, channel) => {
+          channels.push(channel);
+          return 0;
+        },
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+      });
+      expect(code).toBe(0);
+      expect(channels).toEqual(["rc"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("default (no flag, no env): vault install gets undefined → install resolves latest", async () => {
+    const h = makeHarness();
+    try {
+      const channels: (string | undefined)[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        env: {} as NodeJS.ProcessEnv,
+        installVaultModuleImpl: async (_d, _m, channel) => {
+          channels.push(channel);
+          return 0;
+        },
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+      });
+      expect(code).toBe(0);
+      expect(channels).toEqual([undefined]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--channel flag overrides PARACHUTE_CHANNEL env", async () => {
+    const h = makeHarness();
+    try {
+      const channels: (string | undefined)[] = [];
+      const code = await init({
+        configDir: h.configDir,
+        ensureHubVersion: async () => ({
+          outcome: "match" as const,
+          installedVersion: "test",
+          messages: [],
+        }),
+        manifestPath: h.manifestPath,
+        log: () => {},
+        alive: () => false,
+        channel: "latest",
+        env: { PARACHUTE_CHANNEL: "rc" } as NodeJS.ProcessEnv,
+        installVaultModuleImpl: async (_d, _m, channel) => {
+          channels.push(channel);
+          return 0;
+        },
+        ensureHub: async () => {
+          writeHubPort(1939, h.configDir);
+          return { pid: 0, port: 1939, started: true };
+        },
+        readExposeStateFn: () => undefined,
+        isTty: false,
+        platform: "linux",
+      });
+      expect(code).toBe(0);
+      expect(channels).toEqual(["latest"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("resolveInitChannel (hub#694 bug 2)", () => {
+  const empty = {} as NodeJS.ProcessEnv;
+  test("explicit rc/latest wins", () => {
+    expect(resolveInitChannel("rc", empty)).toBe("rc");
+    expect(resolveInitChannel("latest", { PARACHUTE_CHANNEL: "rc" } as NodeJS.ProcessEnv)).toBe(
+      "latest",
+    );
+  });
+  test("PARACHUTE_CHANNEL env when no explicit", () => {
+    expect(resolveInitChannel(undefined, { PARACHUTE_CHANNEL: "rc" } as NodeJS.ProcessEnv)).toBe(
+      "rc",
+    );
+  });
+  test("PARACHUTE_INSTALL_CHANNEL env when no explicit + no PARACHUTE_CHANNEL", () => {
+    expect(
+      resolveInitChannel(undefined, { PARACHUTE_INSTALL_CHANNEL: "rc" } as NodeJS.ProcessEnv),
+    ).toBe("rc");
+  });
+  test("PARACHUTE_CHANNEL wins over PARACHUTE_INSTALL_CHANNEL", () => {
+    expect(
+      resolveInitChannel(undefined, {
+        PARACHUTE_CHANNEL: "latest",
+        PARACHUTE_INSTALL_CHANNEL: "rc",
+      } as NodeJS.ProcessEnv),
+    ).toBe("latest");
+  });
+  test("garbage env → undefined (install falls back to latest)", () => {
+    expect(
+      resolveInitChannel(undefined, { PARACHUTE_CHANNEL: "banana" } as NodeJS.ProcessEnv),
+    ).toBe(undefined);
+  });
+  test("nothing set → undefined", () => {
+    expect(resolveInitChannel(undefined, empty)).toBe(undefined);
   });
 });
 

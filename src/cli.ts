@@ -402,22 +402,41 @@ async function main(argv: string[]): Promise<number> {
         );
         return 1;
       }
-      const noBrowser = exposeExtract.rest.includes("--no-browser");
-      const noExposePrompt = exposeExtract.rest.includes("--no-expose-prompt");
-      const cliWizard = exposeExtract.rest.includes("--cli-wizard");
-      const browserWizard = exposeExtract.rest.includes("--browser-wizard");
+      // hub#694 bug 2: `--channel rc|latest` picks the dist-tag init installs the
+      // vault module from. Without it, init always resolved @latest — DOWNGRADING
+      // vault below an rc-tracking hub. Mirrors `parachute install --channel`.
+      const channelExtract = extractNamedFlag(exposeExtract.rest, "--channel");
+      if (channelExtract.error) {
+        console.error(`parachute init: ${channelExtract.error}`);
+        return 1;
+      }
+      if (
+        channelExtract.value !== undefined &&
+        channelExtract.value !== "rc" &&
+        channelExtract.value !== "latest"
+      ) {
+        console.error(
+          `parachute init: --channel must be "rc" or "latest" (got "${channelExtract.value}")`,
+        );
+        return 1;
+      }
+      const noBrowser = channelExtract.rest.includes("--no-browser");
+      const noExposePrompt = channelExtract.rest.includes("--no-expose-prompt");
+      const cliWizard = channelExtract.rest.includes("--cli-wizard");
+      const browserWizard = channelExtract.rest.includes("--browser-wizard");
       const known = new Set([
         "--no-browser",
         "--no-expose-prompt",
         "--cli-wizard",
         "--browser-wizard",
       ]);
-      const unknown = exposeExtract.rest.find((a) => !known.has(a));
+      const unknown = channelExtract.rest.find((a) => !known.has(a));
       if (unknown !== undefined) {
         console.error(`parachute init: unknown argument "${unknown}"`);
         console.error(
           "usage: parachute init [--no-browser] [--no-expose-prompt]\n" +
             "                     [--expose none|tailnet|cloudflare]\n" +
+            "                     [--channel rc|latest]\n" +
             "                     [--hub-origin <url>]\n" +
             "                     [--cli-wizard | --browser-wizard]",
         );
@@ -433,6 +452,9 @@ async function main(argv: string[]): Promise<number> {
       if (validatedHubOrigin) initOpts.hubOrigin = validatedHubOrigin;
       if (exposeExtract.value) {
         initOpts.exposeChoice = exposeExtract.value as "none" | "tailnet" | "cloudflare";
+      }
+      if (channelExtract.value === "rc" || channelExtract.value === "latest") {
+        initOpts.channel = channelExtract.value;
       }
       if (cliWizard) initOpts.wizardChoice = "cli";
       else if (browserWizard) initOpts.wizardChoice = "browser";
