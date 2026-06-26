@@ -83,6 +83,26 @@ describe("cli", () => {
     expect(code).toBe(1);
     expect(stderr).toMatch(/unknown command/);
   });
+
+  // hub#693: --hub-origin is persisted to hub_settings.hub_origin and stamps the
+  // OAuth `iss` claim, so the CLI must validate it to the same shape as
+  // `hub set-origin` BEFORE it reaches init() / the DB. These reject at the arg
+  // layer (exit 1) before any daemon work runs.
+  test("init --hub-origin with a path component exits 1", async () => {
+    const { code, stderr } = await runCli([
+      "init",
+      "--hub-origin",
+      "https://host.example/some/path",
+    ]);
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/invalid --hub-origin/);
+  });
+
+  test("init --hub-origin with a non-http(s) scheme exits 1", async () => {
+    const { code, stderr } = await runCli(["init", "--hub-origin", "ftp://bad.example"]);
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/invalid --hub-origin/);
+  });
 });
 
 describe("cli per-subcommand help", () => {
