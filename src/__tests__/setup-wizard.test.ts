@@ -26,7 +26,7 @@ import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
 import { type ExposeState, readExposeState, writeExposeState } from "../expose-state.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
-import { getSetting, setSetting } from "../hub-settings.ts";
+import { getSetting, setHubOrigin, setSetting } from "../hub-settings.ts";
 import { validateAccessToken } from "../jwt-sign.ts";
 import {
   OPERATOR_TOKEN_SCOPE_SET_CLAIM,
@@ -533,6 +533,126 @@ describe("deriveWizardState", () => {
       expect(s.hasAdmin).toBe(true);
       expect(s.hasVault).toBe(true);
       expect(s.hasExposeMode).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  // --- Caddy-direct: a configured public origin already answers "how reached?"
+  // Seed a real vault row so the only step left to decide is expose.
+  const seedAdminAndVault = async (db: ReturnType<typeof openHubDb>) => {
+    await createUser(db, "owner", "pw");
+    writeManifest(
+      {
+        services: [
+          {
+            name: "parachute-vault",
+            version: "0.1.0",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/health",
+          },
+        ],
+      },
+      h.manifestPath,
+    );
+  };
+
+  test("auto-skips expose when a public hub_origin is configured (Caddy-direct / init --hub-origin)", async () => {
+    // Caddy-direct box: `parachute init --hub-origin https://host` persisted a
+    // real public origin to hub_settings.hub_origin BEFORE the wizard opened.
+    // No Render/Fly env var, no live tailscale exposure. That origin already
+    // answers "how will this hub be reached?" — the wizard must skip the expose
+    // step (account → vault → done) rather than re-asking.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await seedAdminAndVault(db);
+      setHubOrigin(db, "https://box.example.com");
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: {},
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.step).toBe("done");
+      expect(s.hasExposeMode).toBe(true);
+      // Seeded "public" (not localhost/tailnet) — a Caddy-fronted box is public.
+      expect(getSetting(db, "setup_expose_mode")).toBe("public");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("auto-skips expose when PARACHUTE_HUB_ORIGIN env is a public origin (env-var Caddy box)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await seedAdminAndVault(db);
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: { PARACHUTE_HUB_ORIGIN: "https://box.example.com" },
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.step).toBe("done");
+      expect(s.hasExposeMode).toBe(true);
+      expect(getSetting(db, "setup_expose_mode")).toBe("public");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("does NOT skip expose when hub_origin is loopback (laptop / dev box still asks)", async () => {
+    // A loopback hub_origin must NOT count as "reached publicly" —
+    // sanitizePublicOrigin rejects 127.0.0.1/localhost/::1/0.0.0.0, so the
+    // expose step still renders and the operator chooses.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await seedAdminAndVault(db);
+      setHubOrigin(db, "http://127.0.0.1:1939");
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: {},
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.step).toBe("expose");
+      expect(s.hasExposeMode).toBe(false);
+      expect(getSetting(db, "setup_expose_mode")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("does NOT skip expose when no origin is configured (unset → still asks)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await seedAdminAndVault(db);
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: {},
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.step).toBe("expose");
+      expect(s.hasExposeMode).toBe(false);
+      expect(getSetting(db, "setup_expose_mode")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("does NOT skip expose when PARACHUTE_HUB_ORIGIN env is loopback", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await seedAdminAndVault(db);
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        env: { PARACHUTE_HUB_ORIGIN: "http://localhost:1939" },
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.step).toBe("expose");
+      expect(s.hasExposeMode).toBe(false);
     } finally {
       db.close();
     }

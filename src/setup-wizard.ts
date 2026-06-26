@@ -60,6 +60,7 @@ import {
   SETUP_EXPOSE_MODES,
   type SetupExposeMode,
   deleteSetting,
+  getHubOrigin,
   getSetting,
   isSetupExposeMode,
   openFirstClientAutoApproveWindow,
@@ -89,6 +90,7 @@ import {
 } from "./sessions.ts";
 import type { Supervisor } from "./supervisor.ts";
 import { createUser, userCount } from "./users.ts";
+import { sanitizePublicOrigin } from "./vault-hub-origin-env.ts";
 import { DEFAULT_VAULT_NAME, validateVaultName } from "./vault-name.ts";
 
 // --- shared chrome --------------------------------------------------------
@@ -350,6 +352,24 @@ export function deriveWizardState(deps: {
     const seeded = exposeModeFromLiveState(deps.readExposeStateFn ?? readExposeState);
     if (seeded !== undefined) {
       setSetting(deps.db, "setup_expose_mode", seeded);
+    }
+  }
+  // hub Caddy-direct case: a reverse-proxy box (`parachute init --hub-origin
+  // https://<host>`, or `parachute hub set-origin`) persists a real public
+  // origin to `hub_settings.hub_origin` (also honored from PARACHUTE_HUB_ORIGIN).
+  // That origin already answers "how is this hub reached?" — Caddy/Let's-Encrypt
+  // fronts the loopback hub, no `parachute expose` and no Render/Fly env var.
+  // Auto-seed `setup_expose_mode = "public"` so the wizard skips the expose step
+  // exactly as the Render/Fly + live-tailscale branches do. `sanitizePublicOrigin`
+  // (the SAME guard `resolveIssuer`/`exposeIssuerOrigin` use) requires an absolute
+  // http(s) URL and REJECTS loopback/0.0.0.0 — so a laptop/loopback/unset origin
+  // returns undefined and the expose step still renders (the operator chooses).
+  if (getSetting(deps.db, "setup_expose_mode") === undefined) {
+    const configured =
+      sanitizePublicOrigin(getHubOrigin(deps.db) ?? undefined) ??
+      sanitizePublicOrigin(deps.env?.PARACHUTE_HUB_ORIGIN ?? process.env.PARACHUTE_HUB_ORIGIN);
+    if (configured !== undefined) {
+      setSetting(deps.db, "setup_expose_mode", "public");
     }
   }
   const hasExposeMode = getSetting(deps.db, "setup_expose_mode") !== undefined;
