@@ -623,6 +623,11 @@ export function layerOf(req: Request, peerAddr?: string | null): RequestLayer {
   // headers (the branch below), so adding these headers can only DOWNGRADE a
   // loopback caller (the on-box operator hurting only their own request) —
   // never upgrade a network peer to "loopback".
+  //
+  // Presence check (`!== null`), NOT a trim: an empty/whitespace forwarding
+  // header still means "a proxy is in front" → err to public. Downgrading on
+  // ambiguity is the safe direction for a trust classifier; a future ".trim()
+  // tidy-up" that let an empty XFF fall back to loopback would re-open the leak.
   if (
     isLoopbackPeer(peerAddr) &&
     (h.get("x-forwarded-for") !== null ||

@@ -3707,6 +3707,17 @@ describe("layerOf — classify trust layer from proxy headers + peer (item E / #
     expect(layerOf(r, "::ffff:127.0.0.1")).toBe("public");
   });
 
+  // Security edge: an EMPTY / whitespace-only forwarding header (a misconfigured
+  // or stripped-but-present proxy header) must still err toward "public", never
+  // back to "loopback". `layerOf` uses a presence check (`!== null`), not a
+  // trim — keep it that way: the safe direction for a trust classifier is to
+  // DOWNGRADE on ambiguity. A future "tidy up with .trim()" refactor that
+  // flipped an empty XFF back to loopback would re-open the Caddy-direct leak.
+  test("loopback peer + empty X-Forwarded-For → public (errs safe, not loopback) [#704]", () => {
+    expect(layerOf(req("/", { headers: { "X-Forwarded-For": "" } }), "127.0.0.1")).toBe("public");
+    expect(layerOf(req("/", { headers: { "X-Forwarded-For": "   " } }), "127.0.0.1")).toBe("public");
+  });
+
   // The genuine on-box caller (CLI, health probe, init bootstrap-token loopback
   // probe `curl 127.0.0.1/admin/setup`, hub self-requests) sets NO forwarding
   // header and MUST stay loopback. This is the not-broken half of the fix.
