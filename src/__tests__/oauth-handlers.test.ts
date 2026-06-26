@@ -9899,3 +9899,422 @@ describe("single OAuth consent + grantable vault admin + delegate-only cap (2026
     }
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// hub#689 — owner-on-own-vault VERB SELECTOR. The consent screen offers an
+// owner of the picked vault a read/write/admin selector (pre-selected to
+// admin) when the client requested an UNNAMED `vault:read`/`vault:write`. On
+// submit, the owner's selection widens the unnamed verb to the chosen level
+// on the picked vault — BEFORE `capScopesToUserAuthority`, which remains the
+// backstop. The selector value is an UNTRUSTED hint: the handler re-derives
+// ownership of the picked vault server-side, and the cap drops any verb the
+// user doesn't actually hold.
+// ───────────────────────────────────────────────────────────────────────────
+describe("hub#689 — owner-on-own-vault verb selector + widening", () => {
+  const TTL_S = Math.floor(SESSION_TTL_MS / 1000);
+  const SEL_MANIFEST: ServicesManifest = {
+    services: [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/work", "/vault/other"],
+        health: "/health",
+        version: "0.7.0",
+      },
+    ],
+  };
+  const selDeps = {
+    issuer: ISSUER,
+    loadServicesManifest: () => SEL_MANIFEST,
+    hubBoundOrigins: () => [ISSUER],
+  };
+
+  async function submitConsent(
+    db: Awaited<ReturnType<typeof makeDb>>["db"],
+    sessionId: string,
+    clientId: string,
+    scope: string,
+    challenge: string,
+    extra: Record<string, string> = {},
+  ): Promise<Response> {
+    const form = new URLSearchParams({
+      __action: "consent",
+      __csrf: TEST_CSRF,
+      approve: "yes",
+      client_id: clientId,
+      redirect_uri: "https://app.example/cb",
+      response_type: "code",
+      scope,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      ...extra,
+    });
+    return handleAuthorizePost(
+      db,
+      new Request(`${ISSUER}/oauth/authorize`, {
+        method: "POST",
+        body: form,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: `${CSRF_COOKIE}; ${buildSessionCookie(sessionId, TTL_S)}`,
+        },
+      }),
+      selDeps,
+    );
+  }
+
+  async function redeemScope(
+    db: Awaited<ReturnType<typeof makeDb>>["db"],
+    code: string,
+    clientId: string,
+    verifier: string,
+  ): Promise<string> {
+    const tokenRes = await handleToken(
+      db,
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          client_id: clientId,
+          redirect_uri: "https://app.example/cb",
+          code_verifier: verifier,
+        }),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+      }),
+      selDeps,
+    );
+    expect(tokenRes.status).toBe(200);
+    const body = (await tokenRes.json()) as { scope: string };
+    return body.scope;
+  }
+
+  // GET render: owner of the picked vault sees the selector. A non-admin
+  // assigned to exactly one vault gets the locked picker → the selector is
+  // offered (they hold admin on their assigned vault).
+  test("selector RENDERED for an owner (assigned user) of the picked vault", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw"); // consumes the admin slot
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]); // role=write → holds admin on "work"
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:read",
+          }),
+          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+        ),
+        selDeps,
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("Access level");
+      expect(html).toContain('name="verb_select"');
+      // Admin pre-selected, still visibly flagged.
+      expect(html).toMatch(/name="verb_select" value="admin"[^>]*checked/);
+      expect(html).toContain("badge-admin");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // GET render: a read-only-assigned user (role=read → holds read, NOT admin)
+  // does NOT see the selector — offering admin pre-selected would promise an
+  // upgrade the cap silently demotes. They hold the vault but not admin on it.
+  test("selector NOT rendered for a read-only-assigned user (holds read, not admin)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const reader = await createUser(db, "reader", "pw", { allowMulti: true });
+      // role=read directly (setUserVaults hardcodes write) → holds read only.
+      db.prepare(
+        "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, 'read', ?)",
+      ).run(reader.id, "work", new Date().toISOString());
+      const session = createSession(db, { userId: reader.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:read",
+          }),
+          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+        ),
+        selDeps,
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("Access level");
+      expect(html).not.toContain('name="verb_select"');
+    } finally {
+      cleanup();
+    }
+  });
+
+  // GET render: a non-owner (non-admin with ZERO assigned vaults) does NOT
+  // see the selector — they can't authorize a vault scope at all.
+  test("selector NOT rendered for a non-owner (zero-vault non-admin)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const stranger = await createUser(db, "stranger", "pw", { allowMulti: true });
+      // No setUserVaults → zero assignments → not an owner of anything.
+      const session = createSession(db, { userId: stranger.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:read",
+          }),
+          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+        ),
+        selDeps,
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toContain("Access level");
+      expect(html).not.toContain('name="verb_select"');
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Submit: owner (first admin) + client requested unnamed vault:read + selects
+  // admin → minted vault:<picked>:admin. THE core bug fix.
+  test("owner selects admin on an unnamed vault:read → minted vault:work:admin", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw"); // first admin
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const res = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read",
+        challenge,
+        {
+          vault_pick: "work",
+          verb_select: "admin",
+        },
+      );
+      expect(res.status).toBe(302);
+      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+      expect(code).toBeTruthy();
+      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope).toBe("vault:work:admin");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Submit: owner selects write → vault:<picked>:write.
+  test("owner selects write on an unnamed vault:read → minted vault:work:write", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const res = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read",
+        challenge,
+        {
+          vault_pick: "work",
+          verb_select: "write",
+        },
+      );
+      expect(res.status).toBe(302);
+      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope).toBe("vault:work:write");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Submit: owner DOWNGRADES — selects read on an unnamed vault:write → read.
+  test("owner selects read on an unnamed vault:write → minted vault:work:read (downgrade)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const res = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:write",
+        challenge,
+        {
+          vault_pick: "work",
+          verb_select: "read",
+        },
+      );
+      expect(res.status).toBe(302);
+      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope).toBe("vault:work:read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // SECURITY: a non-owner who holds only READ on the picked vault forges
+  // verb_select=admin → the server re-derives ownership (no admin held) and
+  // refuses to widen; the cap is the backstop. Minted scope is capped to
+  // their actual authority (read), NOT elevated to admin.
+  test("SECURITY: read-only-assigned non-owner forges verb_select=admin → minted vault:work:read, NOT admin", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw"); // first admin = owner
+      const reader = await createUser(db, "reader", "pw", { allowMulti: true });
+      // Assign "work" with role=read directly → holds read only (NOT admin).
+      // setUserVaults hardcodes role=write, so insert the read row by hand to
+      // construct the read-only-authority case the cap must defend.
+      db.prepare(
+        "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, 'read', ?)",
+      ).run(reader.id, "work", new Date().toISOString());
+      const session = createSession(db, { userId: reader.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const res = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read",
+        challenge,
+        {
+          vault_pick: "work",
+          verb_select: "admin", // FORGED — reader holds read only
+        },
+      );
+      // Read survives (held); admin never rides along.
+      expect(res.status).toBe(302);
+      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+      expect(code).toBeTruthy();
+      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope).toBe("vault:work:read");
+      expect(scope).not.toContain("admin");
+      // And the recorded grant carries no admin verb either.
+      const grant = findGrant(db, reader.id, reg.client.clientId);
+      expect(grant?.scopes ?? []).not.toContain("vault:work:admin");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // SECURITY: a non-admin assigned to "work" picks/forges admin on "other"
+  // (a vault outside their assignment) — the assignment-mismatch gate refuses
+  // before widening ever runs. No token minted.
+  test("SECURITY: forged verb_select=admin against an UNASSIGNED vault → 400 (mismatch gate, no mint)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const friend = await createUser(db, "friend", "pw", { allowMulti: true });
+      setUserVaults(db, friend.id, ["work"]); // assigned "work" only
+      const session = createSession(db, { userId: friend.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const res = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read",
+        challenge,
+        {
+          vault_pick: "other", // NOT in friend's assignment
+          verb_select: "admin",
+        },
+      );
+      expect(res.status).toBe(400);
+      expect(findGrant(db, friend.id, reg.client.clientId)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Owner without a verb_select field (older form / JS-off) → unchanged
+  // behavior: the unnamed verb narrows as-requested (vault:read → work:read).
+  test("owner with NO verb_select → unchanged narrowing (vault:read → vault:work:read)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const owner = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: owner.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { verifier, challenge } = makePkce();
+      const res = await submitConsent(
+        db,
+        session.id,
+        reg.client.clientId,
+        "vault:read",
+        challenge,
+        {
+          vault_pick: "work",
+          // no verb_select
+        },
+      );
+      expect(res.status).toBe(302);
+      const code = new URL(res.headers.get("location") ?? "").searchParams.get("code");
+      const scope = await redeemScope(db, code ?? "", reg.client.clientId, verifier);
+      expect(scope).toBe("vault:work:read");
+    } finally {
+      cleanup();
+    }
+  });
+});

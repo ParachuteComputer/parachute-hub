@@ -147,6 +147,31 @@ export interface ConsentViewProps {
    * the user on an error page. Defaults to authorizable when omitted.
    */
   userCanAuthorizeRequest?: boolean;
+  /**
+   * hub#689 — owner-on-own-vault verb selector. Set when the consenting user
+   * OWNS (holds admin on) every vault they could pick AND the client requested
+   * an unnamed `vault:read`/`vault:write` verb. Renders a read/write/admin
+   * radio group, pre-selected to admin, so the owner can grant the level their
+   * AI client actually needs in-flow (the requested-scope shape was the
+   * blocker, not the user's authority) — or transparently downgrade.
+   *
+   * The submitted `verb_select` is an UNTRUSTED hint: the consent-submit
+   * handler re-derives, server-side, whether the user actually owns the picked
+   * vault before widening, and `capScopesToUserAuthority` remains the backstop
+   * that drops any verb the user doesn't hold. The selector only ever WIDENS
+   * the unnamed verb(s) on the picked vault; it never touches any other scope.
+   */
+  ownerVerbSelector?: OwnerVerbSelector;
+}
+
+export interface OwnerVerbSelector {
+  /**
+   * The unnamed read/write verb(s) the client requested. Only `read`/`write`
+   * are upgradeable here — an unnamed `vault:admin` request already renders
+   * with the admin badge and needs no selector. Used to word the selector
+   * help text ("the app asked for write access").
+   */
+  requestedVerbs: string[];
 }
 
 export interface VaultPicker {
@@ -328,6 +353,7 @@ export function renderConsent(props: ConsentViewProps): string {
     staleAssignedVault,
     blockApproveForStaleAssignment,
     userCanAuthorizeRequest,
+    ownerVerbSelector,
   } = props;
   // Substitute unnamed `vault:<verb>` rows with the resolved named form so
   // the operator sees the scope shape that will appear in the token. Raw
@@ -339,6 +365,7 @@ export function renderConsent(props: ConsentViewProps): string {
       ? `<li class="scope scope-empty">No scopes requested — the app gets a session token only.</li>`
       : displayedScopes.map(renderScopeRow).join("\n");
   const pickerSection = vaultPicker ? renderVaultPicker(vaultPicker) : "";
+  const verbSelectorSection = ownerVerbSelector ? renderOwnerVerbSelector(ownerVerbSelector) : "";
   // Approve is disabled when the picker can't yield a valid vault. The
   // empty-vault branch (no vaults registered) is the original case. A
   // locked-vault picker (multi-user Phase 1) always has a valid value via
@@ -418,6 +445,7 @@ export function renderConsent(props: ConsentViewProps): string {
         ${renderCsrfHiddenInput(csrfToken)}
         ${renderHiddenInputs(params)}
         ${pickerSection}
+        ${verbSelectorSection}
         <div class="button-row">
           <button type="submit" name="approve" value="yes" class="btn btn-primary"${approveDisabled}>Approve</button>
           <button type="submit" name="approve" value="no" class="btn btn-secondary">Deny</button>
@@ -488,6 +516,60 @@ function renderVaultPicker(picker: VaultPicker): string {
             ${verbList} apply to the vault you select below.
           </p>
           <div class="vault-options">${options}
+          </div>
+        </section>`;
+}
+
+/**
+ * hub#689 — owner-on-own-vault verb selector. Rendered only when the
+ * consenting user owns (holds admin on) every vault they could pick and the
+ * client requested an unnamed `vault:read`/`vault:write` verb. Three radios
+ * (read / write / admin), pre-selected to **admin** so the common case (the
+ * owner's own AI client that needs full access) is one click — but the owner
+ * sees and submits the choice, and can downgrade.
+ *
+ * The `admin` option keeps the `.scope-admin` red border + admin badge so an
+ * admin grant stays visibly flagged even when pre-selected. The submitted
+ * `verb_select` is an untrusted hint re-checked server-side (ownership
+ * re-derivation in `handleConsentSubmit` + `capScopesToUserAuthority` backstop);
+ * this template only renders the choice.
+ */
+function renderOwnerVerbSelector(selector: OwnerVerbSelector): string {
+  const requested = selector.requestedVerbs.map((v) => `<code>vault:${escapeHtml(v)}</code>`);
+  const requestedList =
+    requested.length === 1
+      ? requested[0]
+      : `${requested.slice(0, -1).join(", ")} and ${requested.at(-1)}`;
+  const option = (
+    verb: "read" | "write" | "admin",
+    title: string,
+    desc: string,
+    checked: boolean,
+  ): string => {
+    const isAdmin = verb === "admin";
+    const cls = `verb-option${isAdmin ? " verb-option-admin scope-admin" : ""}`;
+    const badge = isAdmin ? `<span class="badge badge-admin">admin</span>` : "";
+    return `
+            <label class="${cls}">
+              <input type="radio" name="verb_select" value="${verb}"${checked ? " checked" : ""} />
+              <span class="verb-option-body">
+                <span class="verb-option-head">
+                  <span class="verb-option-title">${escapeHtml(title)}</span>
+                  ${badge}
+                </span>
+                <span class="verb-option-desc">${escapeHtml(desc)}</span>
+              </span>
+            </label>`;
+  };
+  return `
+        <section class="verb-selector">
+          <h2 class="scopes-title">Access level</h2>
+          <p class="picker-help">
+            This app asked for ${requestedList} access to your vault. Because you own
+            this vault, you can grant a different level — admin is selected so your app
+            can do everything it might need; lower it if you'd rather not.
+          </p>
+          <div class="verb-options">${option("read", "Read only", "View notes, tags, attachments, and config.", false)}${option("write", "Read & write", "Create, edit, and delete notes, tags, and attachments.", false)}${option("admin", "Admin", "Full access plus config, triggers/automation, GitHub backup, and minting tokens.", true)}
           </div>
         </section>`;
 }
@@ -1282,6 +1364,47 @@ const STYLES = `
     font-size: 0.88rem;
     color: ${PALETTE.fg};
   }
+  /* hub#689 — owner-on-own-vault verb selector. Same card shell as the
+     vault picker; the admin option carries the .scope-admin red border so an
+     admin grant stays visibly flagged even when pre-selected. */
+  .verb-selector {
+    margin: 0 0 1.25rem;
+    padding: 0.75rem 0.85rem;
+    border: 1px solid ${PALETTE.borderLight};
+    border-radius: 6px;
+    background: ${PALETTE.bgSoft};
+  }
+  .verb-selector .scopes-title { margin-bottom: 0.4rem; }
+  .verb-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .verb-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid ${PALETTE.border};
+    border-radius: 6px;
+    background: ${PALETTE.cardBg};
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .verb-option:hover { border-color: ${PALETTE.accent}; }
+  .verb-option input[type=radio] { margin-top: 0.25rem; }
+  .verb-option input[type=radio]:focus { outline: 2px solid ${PALETTE.accent}; outline-offset: 2px; }
+  .verb-option-body { display: flex; flex-direction: column; gap: 0.1rem; }
+  .verb-option-head {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .verb-option-title { font-weight: 500; color: ${PALETTE.fg}; font-size: 0.9rem; }
+  .verb-option-desc { font-size: 0.82rem; color: ${PALETTE.fgMuted}; }
+  .verb-option-admin .verb-option-title { color: ${PALETTE.danger}; }
+
   .vault-picker-empty .picker-help { color: ${PALETTE.danger}; }
   .vault-picker-empty .picker-help code { color: ${PALETTE.fg}; }
   .vault-picker-locked .picker-help { color: ${PALETTE.fgMuted}; }

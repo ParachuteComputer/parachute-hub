@@ -29,6 +29,25 @@ describe("SCOPE_EXPLANATIONS", () => {
     }
   });
 
+  // hub#689 Leg 1: the vault:admin consent copy must enumerate what
+  // admin actually grants (config/settings, triggers/automation, GitHub
+  // backup, token minting) on top of read/write — so the consent screen
+  // is honest about the admin blast radius, not a vague "configuration
+  // changes" hand-wave.
+  test("vault:admin label enumerates the concrete admin grants (hub#689 Leg 1)", () => {
+    const label = SCOPE_EXPLANATIONS["vault:admin"]?.label ?? "";
+    const lower = label.toLowerCase();
+    expect(SCOPE_EXPLANATIONS["vault:admin"]?.level).toBe("admin");
+    // Read + write are still part of what admin grants.
+    expect(lower).toContain("read");
+    expect(lower).toContain("write");
+    // The four enumerated admin powers.
+    expect(lower).toContain("config");
+    expect(lower).toContain("trigger");
+    expect(lower).toContain("github");
+    expect(lower).toContain("token");
+  });
+
   test("FIRST_PARTY_SCOPES is sorted and matches the keys of SCOPE_EXPLANATIONS", () => {
     expect(FIRST_PARTY_SCOPES).toEqual([...FIRST_PARTY_SCOPES].sort());
     expect(new Set(FIRST_PARTY_SCOPES)).toEqual(new Set(Object.keys(SCOPE_EXPLANATIONS)));
