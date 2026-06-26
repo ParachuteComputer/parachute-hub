@@ -19,8 +19,8 @@ import {
 } from "../install-source.ts";
 import {
   type DriveModuleOpDeps,
-  type ModuleStatesResult,
   type ModuleStateSnapshot,
+  type ModuleStatesResult,
   NoOperatorTokenError,
   OperatorTokenExpiredError,
   fetchModuleStates as fetchModuleStatesImpl,
@@ -71,6 +71,17 @@ export interface StatusOpts {
     probeHubHealth?: (port: number) => Promise<boolean>;
     /** Read the running supervisor's module states (§6.4 module rows). */
     fetchModuleStates?: (deps: DriveModuleOpDeps) => Promise<ModuleStatesResult>;
+    /**
+     * Unauthenticated module-liveness probe (#700). Used ONLY on the degraded
+     * path where the supervisor run-state read couldn't run (no/expired/invalid
+     * operator token, or any API error) but the hub itself is up: probes a
+     * module's own `/health` directly on its loopback port. Treats 2xx AND 401
+     * as live (mirrors the "auth-gated health = healthy" rule, #423: a module
+     * that answers 401 is authenticated-but-alive, not down). Bounded; never
+     * throws. Production reuses the same bounded fetch shape as the hub probe;
+     * tests inject so they don't hit the network.
+     */
+    probeModuleHealth?: (port: number, health: string) => Promise<boolean>;
     /**
      * Open the hub DB used to validate/auto-rotate the operator token in
      * `fetchModuleStates`. Production opens `<configDir>/hub.db`; tests inject a
@@ -162,6 +173,15 @@ interface StatusRow {
    * Printed on a continuation line like the other notes.
    */
   managerNote?: string;
+  /**
+   * Set on a module row whose STATE was derived from an unauthenticated
+   * `/health` probe rather than the supervisor's run-state (#700) — the
+   * degraded-read fallback (no/expired operator token, or an API error) where
+   * the module is genuinely serving. Tells the operator the row is live-but-
+   * thin: no PID/uptime/structured run-state until they sign in. Printed on a
+   * continuation line like the other notes.
+   */
+  probeNote?: string;
 }
 
 /**
@@ -319,6 +339,7 @@ function renderRows(rows: StatusRow[], print: (line: string) => void): void {
       print(`  ! probe: ${row.healthDetail}`);
     }
     if (row.managerNote) print(`  ! ${row.managerNote}`);
+    if (row.probeNote) print(`  → ${row.probeNote}`);
     if (row.driftWarning) print(`  ! ${row.driftWarning}`);
     if (row.staleNote) print(`  ! ${row.staleNote}`);
     if (row.startErrorNote) print(`  ! ${row.startErrorNote}`);
@@ -336,12 +357,33 @@ function renderRows(rows: StatusRow[], print: (line: string) => void): void {
 // in Phase 5b.
 // ---------------------------------------------------------------------------
 
+/**
+ * Default unauthenticated module-liveness probe (#700). A bounded `fetch` to the
+ * module's own `http://127.0.0.1:<port><health>`. Treats 2xx AND 401 as live —
+ * an auth-gated `/health` that answers 401 is authenticated-but-alive, not down
+ * (the "auth-gated health = healthy" rule, #423). Any other status / network
+ * error / timeout → false. 1.5s timeout, mirroring hub-unit's `defaultProbeHealth`.
+ */
+async function defaultProbeModuleHealth(port: number, health: string): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}${health}`, {
+      signal: AbortSignal.timeout(1500),
+      // Loopback-only target, but never chase a redirect off-box (defensive).
+      redirect: "manual",
+    });
+    return res.ok || res.status === 401;
+  } catch {
+    return false;
+  }
+}
+
 /** Resolved supervisor-path seams (see `StatusOpts.supervisor`). */
 interface ResolvedStatusSupervisor {
   hubUnitDeps: HubUnitDeps;
   queryHubUnitState: (deps: HubUnitDeps) => HubUnitStateResult;
   probeHubHealth: (port: number) => Promise<boolean>;
   fetchModuleStates: (deps: DriveModuleOpDeps) => Promise<ModuleStatesResult>;
+  probeModuleHealth: (port: number, health: string) => Promise<boolean>;
   openDb: (configDir: string) => Database;
   baseUrl: string | undefined;
 }
@@ -357,6 +399,7 @@ function resolveStatusSupervisor(opts: StatusOpts["supervisor"]): ResolvedStatus
     queryHubUnitState: opts?.queryHubUnitState ?? queryHubUnitStateImpl,
     probeHubHealth: opts?.probeHubHealth ?? hubUnitDeps.probeHealth,
     fetchModuleStates: opts?.fetchModuleStates ?? fetchModuleStatesImpl,
+    probeModuleHealth: opts?.probeModuleHealth ?? defaultProbeModuleHealth,
     openDb: opts?.openDb ?? ((configDir) => openHubDb(hubDbPath(configDir))),
     baseUrl: opts?.baseUrl,
   };
@@ -471,10 +514,17 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
         ...(sup.baseUrl !== undefined ? { baseUrl: sup.baseUrl } : {}),
       });
     } catch (err) {
-      if (err instanceof NoOperatorTokenError || err instanceof OperatorTokenExpiredError) {
-        // No / expired operator token: we can't read module run-state, but the
-        // hub is up. Show the manifest-derived rows with an actionable note —
-        // do NOT 401-crash status (§6.4 graceful degradation).
+      if (err instanceof NoOperatorTokenError) {
+        // No operator token AND none can be minted yet — on a fresh box the
+        // first admin doesn't exist, so `rotate-operator` would itself hard-error
+        // ("no hub users yet"). Point at `set-password` (create the first admin),
+        // the actual unblocking step. We still can't read run-state, but the hub
+        // is up — degrade gracefully (§6.4), do NOT 401-crash status (#700).
+        moduleReadNote =
+          "couldn't read live module state — run `parachute auth set-password` to create the first admin (then `parachute auth rotate-operator`)";
+      } else if (err instanceof OperatorTokenExpiredError) {
+        // Token exists but is stale: an admin already exists, so re-minting works.
+        // Keep the rotate-operator guidance.
         moduleReadNote =
           "couldn't read live module state — run `parachute auth rotate-operator` to mint an operator token";
       } else {
@@ -498,6 +548,26 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
   // despite running (hub#539). Curated entries already in the map win (richer).
   for (const m of states?.supervised ?? []) {
     if (m.short && !stateByShort.has(m.short)) stateByShort.set(m.short, m);
+  }
+
+  // Unauthenticated-liveness fallback (#700). On the degraded path — the hub is
+  // up but we couldn't read supervisor run-state (no/expired operator token, or
+  // an API error) — probe each module's own `/health` directly so a module that
+  // is genuinely serving reads LIVE instead of being mapped null→`inactive`
+  // (which falsely told fresh-box operators a working install was broken). Keyed
+  // by the unique `entry.name`; probed concurrently, bounded, never throws.
+  const probeAlive = new Map<string, boolean>();
+  if (hubHealthy && !states) {
+    await Promise.all(
+      manifest.services.map(async (entry) => {
+        try {
+          const alive = await sup.probeModuleHealth(entry.port, entry.health);
+          if (alive) probeAlive.set(entry.name, true);
+        } catch {
+          // Probe must never crash status — absent from the map = treated as down.
+        }
+      }),
+    );
   }
 
   const rows: StatusRow[] = manifest.services.map((entry) => {
@@ -524,6 +594,39 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
         ...(base.staleNote ? { staleNote: base.staleNote } : {}),
         managerNote: "hub is down — its modules are stopped",
       };
+    }
+
+    // Degraded read, but the module answered an unauthenticated `/health` probe
+    // (#700): show it LIVE instead of null→`inactive`. We can't surface PID/
+    // uptime/structured run-state (those need the operator token), so keep the
+    // degraded `moduleReadNote` AND add a probe-derived continuation note so the
+    // operator understands the row is from a liveness probe, not full supervisor
+    // state. `skipped: true` keeps a working install at exit 0.
+    if (!snap && probeAlive.get(entry.name)) {
+      const row: StatusRow = {
+        service: entry.name,
+        port: String(entry.port),
+        version: entry.version,
+        stateLabel: "active",
+        pidLabel: "-",
+        uptimeLabel: "-",
+        healthDetail: "-",
+        latencyLabel: "-",
+        sourceLabel: base.sourceLabel,
+        url: base.url,
+        healthy: true,
+        skipped: true,
+      };
+      row.probeNote = "live via unauthenticated health probe — sign in for full supervisor state";
+      if (base.driftWarning) row.driftWarning = base.driftWarning;
+      if (base.staleNote) row.staleNote = base.staleNote;
+      if (base.manifestStartErrorNote) row.startErrorNote = base.manifestStartErrorNote;
+      // Surface the degraded-read note ONCE (first module row), same as below.
+      if (moduleReadNote) {
+        row.managerNote = moduleReadNote;
+        moduleReadNote = undefined;
+      }
+      return row;
     }
 
     const { stateLabel, healthy, skipped } = mapSupervisorStatus(snap?.supervisor_status ?? null);
