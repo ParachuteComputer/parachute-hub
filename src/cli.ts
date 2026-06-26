@@ -8,6 +8,7 @@
 
 import { MissingDependencyError } from "@openparachute/depcheck";
 import pkg from "../package.json" with { type: "json" };
+import { validateHubOrigin } from "./api-settings-hub-origin.ts";
 import { CloudflaredStateError } from "./cloudflare/state.ts";
 // Command-implementation modules are loaded LAZILY inside their switch arms (see
 // `loadCommand` + each `case`), so a module that throws at eval-time is isolated
@@ -360,7 +361,32 @@ async function main(argv: string[]): Promise<number> {
         console.log(initHelp());
         return 0;
       }
-      const exposeExtract = extractNamedFlag(rest, "--expose");
+      const originExtract = extractHubOrigin(rest);
+      if (originExtract.error) {
+        console.error(`parachute init: ${originExtract.error}`);
+        return 1;
+      }
+      // Validate --hub-origin to the SAME shape `hub set-origin` enforces — the
+      // value is persisted to hub_settings.hub_origin and stamps the OAuth `iss`
+      // claim on every minted token, so a malformed path/scheme/credential must
+      // never reach the DB. Strip a trailing slash first (browser copy-paste
+      // ergonomics), then validate; pass the normalized form downstream.
+      let validatedHubOrigin: string | undefined;
+      if (originExtract.hubOrigin !== undefined) {
+        const result = validateHubOrigin(originExtract.hubOrigin.replace(/\/+$/, ""));
+        if (!result.ok) {
+          console.error(`parachute init: invalid --hub-origin: ${result.description}`);
+          return 1;
+        }
+        if (result.normalized === null) {
+          console.error(
+            "parachute init: invalid --hub-origin: an empty value is not a valid public origin.",
+          );
+          return 1;
+        }
+        validatedHubOrigin = result.normalized;
+      }
+      const exposeExtract = extractNamedFlag(originExtract.rest, "--expose");
       if (exposeExtract.error) {
         console.error(`parachute init: ${exposeExtract.error}`);
         return 1;
@@ -392,6 +418,7 @@ async function main(argv: string[]): Promise<number> {
         console.error(
           "usage: parachute init [--no-browser] [--no-expose-prompt]\n" +
             "                     [--expose none|tailnet|cloudflare]\n" +
+            "                     [--hub-origin <url>]\n" +
             "                     [--cli-wizard | --browser-wizard]",
         );
         return 1;
@@ -403,6 +430,7 @@ async function main(argv: string[]): Promise<number> {
       const initOpts: Parameters<typeof init>[0] = {};
       if (noBrowser) initOpts.noBrowser = true;
       if (noExposePrompt) initOpts.noExposePrompt = true;
+      if (validatedHubOrigin) initOpts.hubOrigin = validatedHubOrigin;
       if (exposeExtract.value) {
         initOpts.exposeChoice = exposeExtract.value as "none" | "tailnet" | "cloudflare";
       }
@@ -929,6 +957,12 @@ async function main(argv: string[]): Promise<number> {
       const mod = await loadCommand("auth", () => import("./commands/auth.ts"));
       if (!mod) return 1;
       return await mod.auth(rest);
+    }
+
+    case "hub": {
+      const mod = await loadCommand("hub", () => import("./commands/hub.ts"));
+      if (!mod) return 1;
+      return await mod.hub(rest);
     }
 
     case "vault": {
