@@ -398,6 +398,68 @@ describe("installManagedUnit — start:boolean (§7.1)", () => {
     expect(f.calls).toContainEqual(["systemctl", "--user", "daemon-reload"]);
     expect(f.calls.some((c) => c.includes("enable"))).toBe(false);
   });
+
+  // #528: a per-command fake `run` so the linger probe + enable-linger can return
+  // distinct results. Non-linger commands (systemctl daemon-reload / enable) all
+  // succeed; only the linger sequence is scripted via `linger`.
+  function lingerDeps(linger: {
+    probe?: ServiceCommandResult;
+    enable?: ServiceCommandResult;
+  }): FakeDepsState {
+    const ok: ServiceCommandResult = { code: 0, stdout: "", stderr: "" };
+    return fakeDeps({
+      platform: "linux",
+      getuid: () => 1000,
+      userName: () => "op",
+      run: ((cmd: readonly string[]) => {
+        // `calls` is recorded by the default run; here we record into a closure
+        // list returned alongside via the returned FakeDepsState — but fakeDeps
+        // only records in its OWN default run. So push into a shared array.
+        recorded.push([...cmd]);
+        if (cmd[0] === "loginctl" && cmd[1] === "show-user") return linger.probe ?? ok;
+        if (cmd[0] === "loginctl" && cmd[1] === "enable-linger") return linger.enable ?? ok;
+        return ok;
+      }) as ManagedUnitDeps["run"],
+    });
+  }
+  // Shared recorder for the per-command run above (fakeDeps's own `calls` array
+  // isn't populated when we override `run`).
+  let recorded: string[][] = [];
+
+  test("#528: linger ALREADY on → no enable attempt, no warning (false-alarm fix)", () => {
+    recorded = [];
+    const f = lingerDeps({ probe: { code: 0, stdout: "Linger=yes\n", stderr: "" } });
+    const result = installManagedUnit({
+      unit: hubUnit(f.deps),
+      deps: f.deps,
+      messages: HUB_MESSAGES,
+      start: false,
+    });
+    // Probed current state...
+    expect(recorded).toContainEqual(["loginctl", "show-user", "op", "--property=Linger"]);
+    // ...and because it's already on, did NOT try to enable it.
+    expect(recorded.some((c) => c[0] === "loginctl" && c[1] === "enable-linger")).toBe(false);
+    // ...and emitted NO scary linger warning.
+    expect(result.messages).not.toContain(HUB_MESSAGES.lingerWarning);
+  });
+
+  test("#528: linger OFF + enable-linger fails → warning surfaces", () => {
+    recorded = [];
+    const f = lingerDeps({
+      probe: { code: 0, stdout: "Linger=no\n", stderr: "" },
+      enable: { code: 1, stdout: "", stderr: "operation not permitted" },
+    });
+    const result = installManagedUnit({
+      unit: hubUnit(f.deps),
+      deps: f.deps,
+      messages: HUB_MESSAGES,
+      start: false,
+    });
+    // Off → did attempt to enable...
+    expect(recorded).toContainEqual(["loginctl", "enable-linger", "op"]);
+    // ...and the genuine failure warns.
+    expect(result.messages).toContain(HUB_MESSAGES.lingerWarning);
+  });
 });
 
 // ---------------------------------------------------------------------------
