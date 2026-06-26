@@ -3,10 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  _resetBootstrapTokenForTests,
-  generateBootstrapToken,
-} from "../bootstrap-token.ts";
+import { _resetBootstrapTokenForTests, generateBootstrapToken } from "../bootstrap-token.ts";
 import { buildCsrfCookie, generateCsrfToken } from "../csrf.ts";
 import { HUB_SVC, hubPortPath } from "../hub-control.ts";
 import { createDbHolder } from "../hub-db-liveness.ts";
@@ -3715,7 +3712,9 @@ describe("layerOf — classify trust layer from proxy headers + peer (item E / #
   // flipped an empty XFF back to loopback would re-open the Caddy-direct leak.
   test("loopback peer + empty X-Forwarded-For → public (errs safe, not loopback) [#704]", () => {
     expect(layerOf(req("/", { headers: { "X-Forwarded-For": "" } }), "127.0.0.1")).toBe("public");
-    expect(layerOf(req("/", { headers: { "X-Forwarded-For": "   " } }), "127.0.0.1")).toBe("public");
+    expect(layerOf(req("/", { headers: { "X-Forwarded-For": "   " } }), "127.0.0.1")).toBe(
+      "public",
+    );
   });
 
   // The genuine on-box caller (CLI, health probe, init bootstrap-token loopback
@@ -6086,6 +6085,129 @@ describe("GET /admin/setup bootstrap-token probe — loopback-gated (hub#576 + C
       }
     } finally {
       _resetBootstrapTokenForTests();
+      h.cleanup();
+    }
+  });
+});
+
+// hub#643 (Tier-1): non-script security headers on proxied module/surface
+// text/html pages. The vault content proxy and the generic services-mount
+// proxy both flow through `decorateWithChrome`, so the headers land on both.
+// DELIBERATELY no `script-src` — a strict script-src would white-screen
+// self-built GitHub-hosted surfaces + inline-script module pages (that's the
+// deferred Tier-2). Header-only: non-HTML proxied responses are NOT decorated.
+describe("hubFetch proxied-page security headers (hub#643 Tier-1)", () => {
+  const TIER1_CSP = "frame-ancestors 'self'; object-src 'none'; base-uri 'self'";
+
+  // Live upstream that echoes a fixed content-type + body so the test can
+  // exercise both the text/html (decorated) and JSON (untouched) branches.
+  function startUpstream(contentType: string, body: string): { port: number; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () => new Response(body, { status: 200, headers: { "content-type": contentType } }),
+    });
+    return { port: server.port as number, stop: () => server.stop(true) };
+  }
+
+  test("decorates a proxied text/html generic-mount page with nosniff + the Tier-1 CSP", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream(
+      "text/html; charset=utf-8",
+      "<html><body><h1>my surface</h1></body></html>",
+    );
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-surface",
+              port: upstream.port,
+              paths: ["/surface"],
+              health: "/surface/health",
+              version: "0.2.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(req("/surface/foo"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      const csp = res.headers.get("content-security-policy");
+      expect(csp).toBe(TIER1_CSP);
+      // The critical Tier-1/Tier-2 boundary: NO script-src — self-built
+      // GitHub-hosted surfaces + inline-script module pages must stay
+      // unrestricted. A strict script-src is the deferred Tier-2.
+      expect(csp).not.toContain("script-src");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("decorates a proxied text/html per-vault page (the Notes-PWA path) with the same headers", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("text/html; charset=utf-8", "<html><body>notes</body></html>");
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: upstream.port,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(
+        req("/vault/default/some-page"),
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(res.headers.get("content-security-policy")).toBe(TIER1_CSP);
+      expect(res.headers.get("content-security-policy")).not.toContain("script-src");
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("leaves a proxied NON-HTML response (JSON) undecorated", async () => {
+    const h = makeHarness();
+    const upstream = startUpstream("application/json", JSON.stringify({ ok: true }));
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-surface",
+              port: upstream.port,
+              paths: ["/surface"],
+              health: "/surface/health",
+              version: "0.2.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(req("/surface/api/data"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      // No HTML CSP on a JSON API response (proves the header is gated on
+      // content-type, so a `.js` asset proxied through the same path is also
+      // left alone).
+      expect(res.headers.get("content-security-policy")).toBeNull();
+      expect(res.headers.get("x-content-type-options")).toBeNull();
+      const body = (await res.json()) as { ok: boolean };
+      expect(body.ok).toBe(true);
+    } finally {
+      upstream.stop();
       h.cleanup();
     }
   });
