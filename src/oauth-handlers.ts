@@ -2984,6 +2984,11 @@ function consentProps(
     blockApproveForStaleAssignment:
       staleAssignedVault !== undefined && (unnamedVerbs.length > 0 || hasNamedStaleVaultScope),
     userCanAuthorizeRequest,
+    // hub#314 — surface the client's provenance (same-hub first-party vs
+    // external third-party DCR) so the operator sees the trust level on the
+    // consent screen. Clean DB-backed signal: the `same_hub` column written
+    // at DCR time (bearer hub:admin / same-origin session → true).
+    sameHub: client.sameHub,
   };
 }
 

@@ -306,6 +306,58 @@ describe("renderConsent", () => {
     expect(html).not.toContain("Access level");
     expect(html).not.toContain('name="verb_select"');
   });
+
+  // hub#314 — same-hub vs external trust marker. The `.badge-trust-*` class
+  // names are always present in the inlined <style> block, so assertions target
+  // the RENDERED ELEMENT form (`class="badge badge-trust-*"`) + the copy text,
+  // which only appear in the consent body when the marker actually renders.
+  test("renders the first-party trust marker for a same-hub client", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      sameHub: true,
+    });
+    expect(html).toContain('class="badge badge-trust-same-hub"');
+    expect(html).toContain(">First-party<");
+    expect(html).toContain("Registered through this hub");
+    // The external badge / copy must NOT appear for a same-hub client.
+    expect(html).not.toContain('class="badge badge-trust-external"');
+    expect(html).not.toContain("third-party app that registered itself");
+  });
+
+  test("renders the external trust marker for a third-party DCR client", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      sameHub: false,
+    });
+    expect(html).toContain('class="badge badge-trust-external"');
+    expect(html).toContain(">External<");
+    expect(html).toContain("third-party app that registered itself");
+    // The first-party badge / copy must NOT appear for an external client.
+    expect(html).not.toContain('class="badge badge-trust-same-hub"');
+    expect(html).not.toContain("Registered through this hub");
+  });
+
+  test("renders no trust marker when provenance is unknown (sameHub omitted)", () => {
+    const html = renderConsent({
+      params: PARAMS,
+      csrfToken: CSRF,
+      clientId: "c",
+      clientName: "App",
+      scopes: ["vault:read"],
+      // sameHub omitted → undefined → no badge
+    });
+    expect(html).not.toContain('class="trust-marker');
+    expect(html).not.toContain('class="badge badge-trust-same-hub"');
+    expect(html).not.toContain('class="badge badge-trust-external"');
+  });
 });
 
 describe("renderError", () => {
