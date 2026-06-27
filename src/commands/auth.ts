@@ -25,7 +25,16 @@
 
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { approveClient, deleteClient, getClient, listClientsByStatus } from "../clients.ts";
+import {
+  DEFAULT_REAP_AGE_MS,
+  type ReapableClient,
+  approveClient,
+  deleteClient,
+  findReapableClients,
+  getClient,
+  listClientsByStatus,
+  reapClient,
+} from "../clients.ts";
 import { CONFIG_DIR } from "../config.ts";
 import { readExposeState } from "../expose-state.ts";
 import { listGrantsForUser, revokeGrant } from "../grants.ts";
@@ -97,6 +106,7 @@ const HUB_LOCAL_SUBCOMMANDS = new Set([
   "pending-clients",
   "approve-client",
   "revoke-client",
+  "reap-clients",
   "list-grants",
   "revoke-grant",
 ]);
@@ -139,6 +149,12 @@ Usage:
   parachute auth revoke-client <id>    Deregister (delete) an OAuth client,
                                        cascading its grants + auth codes
                                        (RFC 7592 deregistration)
+  parachute auth reap-clients [--older-than <days>] [--apply] [--json]
+                                       Garbage-collect abandoned/dead OAuth
+                                       clients (DCR reconnect churn). Dry-run
+                                       by default — lists what WOULD be reaped
+                                       and deletes nothing; pass --apply to
+                                       actually delete.
   parachute auth list-grants [--username <name>]
                                        Show OAuth scope grants on record
   parachute auth revoke-grant <client_id> [--username <name>]
@@ -241,6 +257,19 @@ approval (closes #74). Self-served DCR registrations land as 'pending'
 and cannot OAuth until you run \`parachute auth approve-client <id>\`.
 First-party install flows that present \`Authorization: Bearer
 <operator-token>\` with \`hub:admin\` scope land as 'approved' immediately.
+
+reap-clients garbage-collects abandoned/dead OAuth clients (closes #640).
+DCR churn — Notes/Claude mint a FRESH client_id per reconnect — accumulates
+dead \`clients\` rows in the operator's hub.db. reap-clients deletes only the
+PROVABLY-DEAD ones: a client is reapable iff it has ZERO grants (no standing
+consent), ZERO live tokens (none unexpired+unrevoked), ZERO in-flight auth
+codes, AND was registered more than --older-than days ago (default 30). A
+client with a live grant, a live token, or an in-flight code is NEVER touched.
+
+Dry-run by DEFAULT: prints the clients that WOULD be reaped and deletes
+nothing — review before deleting. Pass \`--apply\` to actually delete them
+(grants + auth codes + dead tokens cascade). \`--older-than <days>\` tunes the
+age floor; \`--json\` emits machine-readable output.
 
 list-grants + revoke-grant manage the OAuth consent skip-list (closes
 #75). When you approve a scope-set on the consent screen, the hub
@@ -659,6 +688,179 @@ function runRevokeClient(args: readonly string[], deps: AuthDeps): number {
   } finally {
     db.close();
   }
+}
+
+interface ReapClientsFlags {
+  /** Age floor in days. Defaults to DEFAULT_REAP_AGE_MS / day. */
+  olderThanDays?: number;
+  /** --apply: actually delete. Without it, dry-run (default). */
+  apply: boolean;
+  /** --json: machine-readable output. */
+  json: boolean;
+  error?: string;
+}
+
+function parseReapClientsFlags(args: readonly string[]): ReapClientsFlags {
+  let olderThanDays: number | undefined;
+  let apply = false;
+  let json = false;
+  const parseDays = (raw: string | undefined): number | undefined | "error" => {
+    if (!raw) return "error";
+    // Whole, positive day count. Reject 0 / negatives / non-integers — an
+    // --older-than 0 would reap freshly-registered clients (the exact thing
+    // condition 4 of the gate exists to prevent).
+    if (!/^\d+$/.test(raw)) return "error";
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isFinite(n) || n <= 0) return "error";
+    return n;
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--older-than") {
+      const parsed = parseDays(args[++i]);
+      if (parsed === "error")
+        return { apply, json, error: "--older-than requires a positive integer (days)" };
+      olderThanDays = parsed;
+    } else if (a?.startsWith("--older-than=")) {
+      const parsed = parseDays(a.slice("--older-than=".length));
+      if (parsed === "error")
+        return { apply, json, error: "--older-than requires a positive integer (days)" };
+      olderThanDays = parsed;
+    } else if (a === "--apply") {
+      apply = true;
+    } else if (a === "--json") {
+      json = true;
+    } else {
+      return { apply, json, error: `unknown flag "${a}"` };
+    }
+  }
+  return olderThanDays !== undefined ? { olderThanDays, apply, json } : { apply, json };
+}
+
+/**
+ * `parachute auth reap-clients` — garbage-collect abandoned/dead OAuth clients
+ * (closes hub#640). DCR churn (Notes/Claude mint a fresh client_id per
+ * reconnect) accumulates dead `clients` rows; this reaps the PROVABLY-DEAD
+ * ones via the conservative `findReapableClients` gate (zero grants, zero live
+ * tokens, zero in-flight auth_codes, older than the age floor).
+ *
+ * DRY-RUN BY DEFAULT — the load-bearing safety choice. A reaper that deletes a
+ * live client breaks a user's active connection, so the default run only
+ * REPORTS what it would delete and touches nothing; `--apply` performs the
+ * deletion. The same `findReapableClients` snapshot drives both the dry-run
+ * listing and the --apply loop, so what's printed is exactly what gets reaped.
+ */
+function runReapClients(args: readonly string[], deps: AuthDeps): number {
+  const flags = parseReapClientsFlags(args);
+  if (flags.error) {
+    console.error(`parachute auth reap-clients: ${flags.error}`);
+    console.error("usage: parachute auth reap-clients [--older-than <days>] [--apply] [--json]");
+    return 1;
+  }
+  const olderThanMs =
+    flags.olderThanDays !== undefined
+      ? flags.olderThanDays * 24 * 60 * 60 * 1000
+      : DEFAULT_REAP_AGE_MS;
+  const olderThanDays = olderThanMs / (24 * 60 * 60 * 1000);
+
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    const reapable = findReapableClients(db, { olderThanMs });
+
+    if (flags.json) {
+      // Machine-readable: the candidate set + whether we actually deleted.
+      // In --apply mode each row carries `reaped: true` after deletion. Audit
+      // lines route to stderr so stdout stays pure JSON for piping into `jq`.
+      const deleted = flags.apply ? applyReap(db, reapable, console.error) : [];
+      console.log(
+        JSON.stringify(
+          {
+            applied: flags.apply,
+            olderThanDays,
+            count: reapable.length,
+            clients: reapable.map((c) => ({
+              clientId: c.clientId,
+              clientName: c.clientName,
+              registeredAt: c.registeredAt,
+              status: c.status,
+              ageDays: c.ageDays,
+              ...(flags.apply ? { reaped: deleted.includes(c.clientId) } : {}),
+            })),
+          },
+          null,
+          2,
+        ),
+      );
+      return 0;
+    }
+
+    if (reapable.length === 0) {
+      console.log("No abandoned clients to reap.");
+      return 0;
+    }
+
+    printReapTable(reapable);
+
+    if (!flags.apply) {
+      const plural = reapable.length === 1 ? "client" : "clients";
+      console.log("");
+      console.log(
+        `Dry run — nothing deleted. Run with --apply to delete ${reapable.length} ${plural}.`,
+      );
+      return 0;
+    }
+
+    const deleted = applyReap(db, reapable);
+    console.log("");
+    const plural = deleted.length === 1 ? "client" : "clients";
+    console.log(
+      `Reaped ${deleted.length} abandoned OAuth ${plural} (grants + auth codes + dead tokens cascaded).`,
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+/** Print the dry-run / apply table of reapable clients. */
+function printReapTable(reapable: readonly ReapableClient[]): void {
+  console.log(
+    "CLIENT_ID                              NAME                 STATUS    AGE_DAYS  REGISTERED",
+  );
+  for (const c of reapable) {
+    const id = c.clientId.padEnd(36).slice(0, 36);
+    const name = (c.clientName ?? "").padEnd(20).slice(0, 20);
+    const status = c.status.padEnd(8).slice(0, 8);
+    const age = String(c.ageDays).padStart(8);
+    console.log(`${id}  ${name} ${status}  ${age}  ${c.registeredAt}`);
+  }
+}
+
+/**
+ * Delete each reapable client via `reapClient`, emitting one audit line per
+ * deletion (`client reaped:` — greppable in hub.log alongside `client
+ * deleted:` from the manual revoke path). Returns the client_ids actually
+ * removed. Callers pass ONLY the `findReapableClients` output, so every id
+ * here has already cleared the safety gate.
+ *
+ * `audit` is the sink for the per-deletion lines — `console.log` for the human
+ * table path, `console.error` for `--json` (keeps stdout pure JSON for `jq`).
+ */
+function applyReap(
+  db: ReturnType<typeof openHubDb>,
+  reapable: readonly ReapableClient[],
+  audit: (line: string) => void = console.log,
+): string[] {
+  const deleted: string[] = [];
+  for (const c of reapable) {
+    if (reapClient(db, c.clientId)) {
+      deleted.push(c.clientId);
+      audit(
+        `client reaped: client_id=${c.clientId} client_name=${c.clientName ?? ""} age_days=${c.ageDays} status=${c.status}`,
+      );
+    }
+  }
+  return deleted;
 }
 
 interface UsernameFlag {
@@ -1453,6 +1655,15 @@ export async function auth(args: readonly string[], deps: AuthDeps | Runner = {}
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`parachute auth revoke-client: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "reap-clients") {
+      try {
+        return runReapClients(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth reap-clients: ${msg}`);
         return 1;
       }
     }

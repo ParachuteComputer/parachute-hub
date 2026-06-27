@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { issueAuthCode } from "../auth-codes.ts";
 import { registerClient } from "../clients.ts";
 import { type AuthDeps, type Runner, auth, authHelp } from "../commands/auth.ts";
 import { findGrant, recordGrant } from "../grants.ts";
@@ -269,6 +270,16 @@ describe("authHelp", () => {
     expect(h).toContain("parachute auth list-users");
     expect(h).toContain("parachute auth 2fa");
     expect(h).toContain("parachute auth rotate-key");
+    expect(h).toContain("parachute auth reap-clients");
+  });
+
+  test("reap-clients help documents dry-run-by-default + the conservative gate (#640)", () => {
+    expect(h).toContain("reap-clients");
+    expect(h).toContain("Dry-run by DEFAULT");
+    expect(h).toContain("--apply");
+    expect(h).toContain("--older-than");
+    expect(h).toContain("PROVABLY-DEAD");
+    expect(h).toContain("#640");
   });
 
   test("2fa help documents the real hub-login TOTP subcommands (#473)", () => {
@@ -911,6 +922,262 @@ describe("parachute auth revoke-client", () => {
         expect(findGrant(db2, userId, clientId)).toBeNull();
       } finally {
         db2.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+});
+
+// closes #640 — OAuth client GC reaper. Dry-run by default; only provably-dead
+// clients are reapable. The deep gate coverage lives in clients.test.ts; these
+// exercise the CLI surface (dry-run safety, --apply, --json, empty case).
+describe("parachute auth reap-clients", () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  /** Register a client `daysAgo` days before now (relative to wall clock). */
+  function oldClient(db: ReturnType<typeof openHubDb>, daysAgo: number, name?: string): string {
+    const when = new Date(Date.now() - daysAgo * DAY_MS);
+    return registerClient(db, {
+      redirectUris: ["https://app.example/cb"],
+      ...(name !== undefined ? { clientName: name } : {}),
+      now: () => when,
+    }).client.clientId;
+  }
+
+  test("empty case: clean message, exit 0, no false alarm", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      const { code, stdout } = await captureOutput(() => auth(["reap-clients"], deps));
+      expect(code).toBe(0);
+      expect(stdout).toContain("No abandoned clients to reap.");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("dry-run by DEFAULT lists candidates but deletes NOTHING", async () => {
+    const tmp = makeTmp();
+    let deadId: string;
+    try {
+      const db = openHubDb(tmp.dbPath);
+      try {
+        deadId = oldClient(db, 60, "DeadApp");
+      } finally {
+        db.close();
+      }
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      const { code, stdout } = await captureOutput(() => auth(["reap-clients"], deps));
+      expect(code).toBe(0);
+      expect(stdout).toContain(deadId);
+      expect(stdout).toContain("DeadApp");
+      expect(stdout).toContain("--apply");
+      expect(stdout).toContain("nothing deleted");
+
+      // Count unchanged: the client is still there.
+      const db2 = openHubDb(tmp.dbPath);
+      try {
+        const n = db2.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM clients").get()?.n;
+        expect(n).toBe(1);
+      } finally {
+        db2.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--apply actually reaps + emits an audit line, dry-run is a no-op before it", async () => {
+    const tmp = makeTmp();
+    let deadId: string;
+    try {
+      const db = openHubDb(tmp.dbPath);
+      try {
+        deadId = oldClient(db, 60, "DeadApp");
+      } finally {
+        db.close();
+      }
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+
+      // Dry-run first: count before == count after.
+      await captureOutput(() => auth(["reap-clients"], deps));
+      const db2 = openHubDb(tmp.dbPath);
+      try {
+        expect(db2.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM clients").get()?.n).toBe(1);
+      } finally {
+        db2.close();
+      }
+
+      // --apply deletes.
+      const { code, stdout } = await captureOutput(() => auth(["reap-clients", "--apply"], deps));
+      expect(code).toBe(0);
+      expect(stdout).toContain("Reaped 1 abandoned OAuth client");
+      expect(stdout).toContain(`client reaped: client_id=${deadId}`);
+      expect(stdout).toContain("client_name=DeadApp");
+
+      const db3 = openHubDb(tmp.dbPath);
+      try {
+        expect(db3.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM clients").get()?.n).toBe(0);
+      } finally {
+        db3.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("NEVER reaps a client with a live grant (--apply leaves it intact)", async () => {
+    const tmp = makeTmp();
+    let liveId: string;
+    let userId: string;
+    try {
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const user = await createUser(db, "owner", "pw");
+        userId = user.id;
+        liveId = oldClient(db, 60, "GrantedApp");
+        recordGrant(db, userId, liveId, ["vault:work:read"]);
+      } finally {
+        db.close();
+      }
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      const { code, stdout } = await captureOutput(() => auth(["reap-clients", "--apply"], deps));
+      expect(code).toBe(0);
+      expect(stdout).toContain("No abandoned clients to reap.");
+
+      const db2 = openHubDb(tmp.dbPath);
+      try {
+        expect(
+          db2.query("SELECT client_id FROM clients WHERE client_id = ?").get(liveId),
+        ).not.toBeNull();
+        expect(findGrant(db2, userId, liveId)).not.toBeNull();
+      } finally {
+        db2.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("NEVER reaps a freshly-registered client (inside the 30d floor)", async () => {
+    const tmp = makeTmp();
+    try {
+      const db = openHubDb(tmp.dbPath);
+      try {
+        oldClient(db, 5); // 5 days old
+      } finally {
+        db.close();
+      }
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      const { code, stdout } = await captureOutput(() => auth(["reap-clients"], deps));
+      expect(code).toBe(0);
+      expect(stdout).toContain("No abandoned clients to reap.");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--older-than tunes the age floor", async () => {
+    const tmp = makeTmp();
+    let id: string;
+    try {
+      const db = openHubDb(tmp.dbPath);
+      try {
+        id = oldClient(db, 15); // 15 days old
+      } finally {
+        db.close();
+      }
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      // Default 30d → not reapable.
+      const def = await captureOutput(() => auth(["reap-clients"], deps));
+      expect(def.stdout).toContain("No abandoned clients to reap.");
+      // 10d floor → reapable.
+      const tuned = await captureOutput(() => auth(["reap-clients", "--older-than", "10"], deps));
+      expect(tuned.stdout).toContain(id);
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("--json emits machine output; applied=false in dry-run, true with --apply", async () => {
+    const tmp = makeTmp();
+    let deadId: string;
+    try {
+      const db = openHubDb(tmp.dbPath);
+      try {
+        deadId = oldClient(db, 60, "JsonApp");
+      } finally {
+        db.close();
+      }
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      const dry = await captureOutput(() => auth(["reap-clients", "--json"], deps));
+      expect(dry.code).toBe(0);
+      const parsed = JSON.parse(dry.stdout) as {
+        applied: boolean;
+        count: number;
+        clients: Array<{ clientId: string }>;
+      };
+      expect(parsed.applied).toBe(false);
+      expect(parsed.count).toBe(1);
+      expect(parsed.clients[0]?.clientId).toBe(deadId);
+      // dry-run JSON deleted nothing.
+      const db2 = openHubDb(tmp.dbPath);
+      try {
+        expect(db2.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM clients").get()?.n).toBe(1);
+      } finally {
+        db2.close();
+      }
+
+      const wet = await captureOutput(() => auth(["reap-clients", "--json", "--apply"], deps));
+      const wetParsed = JSON.parse(wet.stdout) as {
+        applied: boolean;
+        clients: Array<{ reaped?: boolean }>;
+      };
+      expect(wetParsed.applied).toBe(true);
+      expect(wetParsed.clients[0]?.reaped).toBe(true);
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("a client with only an in-flight auth_code is NEVER reaped", async () => {
+    const tmp = makeTmp();
+    let id: string;
+    try {
+      const db = openHubDb(tmp.dbPath);
+      try {
+        const user = await createUser(db, "owner", "pw");
+        id = oldClient(db, 60);
+        issueAuthCode(db, {
+          clientId: id,
+          userId: user.id,
+          redirectUri: "https://app.example/cb",
+          scopes: ["vault:work:read"],
+          codeChallenge: "x".repeat(43),
+          codeChallengeMethod: "S256",
+        });
+      } finally {
+        db.close();
+      }
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      const { stdout } = await captureOutput(() => auth(["reap-clients"], deps));
+      expect(stdout).toContain("No abandoned clients to reap.");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("rejects --older-than 0 / negative / non-integer", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      for (const bad of ["0", "-5", "abc"]) {
+        const { code, stderr } = await captureOutput(() =>
+          auth(["reap-clients", "--older-than", bad], deps),
+        );
+        expect(code).toBe(1);
+        expect(stderr).toContain("--older-than");
       }
     } finally {
       tmp.cleanup();

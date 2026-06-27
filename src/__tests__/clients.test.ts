@@ -8,9 +8,11 @@ import {
   approveClient,
   deleteClient,
   expandRedirectUrisForHubOrigins,
+  findReapableClients,
   getClient,
   isValidRedirectUri,
   listClientsByStatus,
+  reapClient,
   registerClient,
   requireRegisteredRedirectUri,
   verifyClientSecret,
@@ -424,6 +426,213 @@ describe("deleteClient cascade (hub#640 RFC 7592 deregistration)", () => {
       expect(findGrant(db, user.id, keep.client.clientId)).not.toBeNull();
       expect(getClient(db, drop.client.clientId)).toBeNull();
       expect(findGrant(db, user.id, drop.client.clientId)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("findReapableClients / reapClient — the GC safety gate (hub#640)", () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  // A fixed "now" so age math is deterministic. All planted clients register
+  // 60 days before this unless a test overrides.
+  const NOW = new Date("2026-06-27T00:00:00Z");
+  const now = () => NOW;
+  const OLD = new Date(NOW.getTime() - 60 * DAY_MS); // 60d old → past 30d floor
+  const oldNow = () => OLD;
+
+  /** Plant a `tokens` row with precise expiry/revocation for a client. */
+  function plantToken(
+    db: ReturnType<typeof openHubDb>,
+    opts: {
+      clientId: string;
+      userId: string;
+      jti: string;
+      expiresAt: string;
+      revokedAt?: string | null;
+    },
+  ): void {
+    db.prepare(
+      `INSERT INTO tokens
+       (jti, user_id, client_id, scopes, refresh_token_hash, family_id,
+        expires_at, revoked_at, created_at, created_via, subject)
+       VALUES (?, ?, ?, '', NULL, NULL, ?, ?, ?, 'oauth_refresh', NULL)`,
+    ).run(
+      opts.jti,
+      opts.userId,
+      opts.clientId,
+      opts.expiresAt,
+      opts.revokedAt ?? null,
+      OLD.toISOString(),
+    );
+  }
+
+  test("a genuinely-dead old client IS reaped (no grants, only expired/revoked tokens, no live codes)", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const dead = registerClient(db, { redirectUris: ["https://dead.example/cb"], now: oldNow });
+      const id = dead.client.clientId;
+      // An expired token + a revoked token — both dead.
+      plantToken(db, {
+        clientId: id,
+        userId: user.id,
+        jti: "jti-expired",
+        expiresAt: new Date(NOW.getTime() - DAY_MS).toISOString(),
+      });
+      plantToken(db, {
+        clientId: id,
+        userId: user.id,
+        jti: "jti-revoked",
+        expiresAt: new Date(NOW.getTime() + DAY_MS).toISOString(), // unexpired...
+        revokedAt: new Date(NOW.getTime() - DAY_MS).toISOString(), // ...but revoked → dead
+      });
+
+      const reapable = findReapableClients(db, { now });
+      expect(reapable.map((c) => c.clientId)).toEqual([id]);
+      expect(reapable[0]?.ageDays).toBe(60);
+
+      // reapClient removes the client AND its dead token rows.
+      expect(reapClient(db, id)).toBe(true);
+      expect(getClient(db, id)).toBeNull();
+      expect(db.query("SELECT jti FROM tokens WHERE client_id = ?").all(id)).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a client WITH a live grant is NEVER reaped, even when old", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const c = registerClient(db, { redirectUris: ["https://granted.example/cb"], now: oldNow });
+      recordGrant(db, user.id, c.client.clientId, ["vault:work:read"]);
+      const reapable = findReapableClients(db, { now });
+      expect(reapable.map((x) => x.clientId)).not.toContain(c.client.clientId);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a client with a live (unexpired, unrevoked) token is NEVER reaped, even when old", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const c = registerClient(db, { redirectUris: ["https://live.example/cb"], now: oldNow });
+      plantToken(db, {
+        clientId: c.client.clientId,
+        userId: user.id,
+        jti: "jti-live",
+        expiresAt: new Date(NOW.getTime() + 7 * DAY_MS).toISOString(),
+        revokedAt: null,
+      });
+      const reapable = findReapableClients(db, { now });
+      expect(reapable.map((x) => x.clientId)).not.toContain(c.client.clientId);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a client with an unexpired auth_code is NEVER reaped (in-flight OAuth)", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const c = registerClient(db, { redirectUris: ["https://inflight.example/cb"], now: oldNow });
+      // issueAuthCode mints a code expiring AUTH_CODE_TTL after `now` → unexpired.
+      issueAuthCode(db, {
+        clientId: c.client.clientId,
+        userId: user.id,
+        redirectUri: "https://inflight.example/cb",
+        scopes: ["vault:work:read"],
+        codeChallenge: "x".repeat(43),
+        codeChallengeMethod: "S256",
+        now,
+      });
+      const reapable = findReapableClients(db, { now });
+      expect(reapable.map((x) => x.clientId)).not.toContain(c.client.clientId);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a freshly-registered client is NEVER reaped, even with zero grants/tokens/codes", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      // Registered 5 days ago — inside the default 30d floor.
+      const fresh = registerClient(db, {
+        redirectUris: ["https://fresh.example/cb"],
+        now: () => new Date(NOW.getTime() - 5 * DAY_MS),
+      });
+      const reapable = findReapableClients(db, { now });
+      expect(reapable.map((x) => x.clientId)).not.toContain(fresh.client.clientId);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("an expired auth_code does NOT protect a client (only LIVE codes do)", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const c = registerClient(db, { redirectUris: ["https://stale.example/cb"], now: oldNow });
+      // Code issued 60d ago → long expired.
+      issueAuthCode(db, {
+        clientId: c.client.clientId,
+        userId: user.id,
+        redirectUri: "https://stale.example/cb",
+        scopes: ["vault:work:read"],
+        codeChallenge: "x".repeat(43),
+        codeChallengeMethod: "S256",
+        now: oldNow,
+      });
+      const reapable = findReapableClients(db, { now });
+      expect(reapable.map((x) => x.clientId)).toContain(c.client.clientId);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("--older-than threshold is honored (a 20d-old client falls under a 10d floor but not 30d)", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const c = registerClient(db, {
+        redirectUris: ["https://midage.example/cb"],
+        now: () => new Date(NOW.getTime() - 20 * DAY_MS),
+      });
+      // Default 30d floor → not yet reapable.
+      expect(findReapableClients(db, { now }).map((x) => x.clientId)).not.toContain(
+        c.client.clientId,
+      );
+      // 10d floor → now reapable.
+      expect(
+        findReapableClients(db, { now, olderThanMs: 10 * DAY_MS }).map((x) => x.clientId),
+      ).toContain(c.client.clientId);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("reapClient on a still-protected client deletes nothing the gate excluded (callers pass only gated ids)", async () => {
+    // Belt-and-suspenders: reapClient itself doesn't re-check the gate (the
+    // caller is contractually responsible). This asserts the realistic flow —
+    // a live client is simply NOT in the findReapableClients output, so the
+    // apply loop never calls reapClient on it.
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const live = registerClient(db, { redirectUris: ["https://keep.example/cb"], now: oldNow });
+      recordGrant(db, user.id, live.client.clientId, ["vault:work:read"]);
+      const dead = registerClient(db, { redirectUris: ["https://gone.example/cb"], now: oldNow });
+
+      const reapable = findReapableClients(db, { now });
+      const ids = reapable.map((x) => x.clientId);
+      expect(ids).toEqual([dead.client.clientId]);
+      for (const c of reapable) reapClient(db, c.clientId);
+
+      // Live client + its grant survive; only the dead one is gone.
+      expect(getClient(db, live.client.clientId)).not.toBeNull();
+      expect(findGrant(db, user.id, live.client.clientId)).not.toBeNull();
+      expect(getClient(db, dead.client.clientId)).toBeNull();
     } finally {
       cleanup();
     }
