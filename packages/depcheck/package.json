@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/depcheck",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Canonical missing-dependency UX for Parachute modules: a dependency registry, a message formatter, and ENOENT spawn-error helpers shared across vault / scribe / runner / hub.",
   "license": "AGPL-3.0",
   "type": "module",
