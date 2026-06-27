@@ -43,6 +43,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { createInterface } from "node:readline/promises";
 import {
   type MissingDependencyError,
   NonExecutableError,
@@ -61,12 +62,18 @@ import {
 } from "../hub-unit.ts";
 import { hasPriorDetachedInstall } from "../migrate-offer.ts";
 import { buildKnownIssuersForOperatorToken, operatorTokenPath } from "../operator-token.ts";
-import { getSpec, getSpecFromInstallDir, shortNameForManifest } from "../service-spec.ts";
+import {
+  canonicalPortForManifest,
+  getSpec,
+  getSpecFromInstallDir,
+  shortNameForManifest,
+} from "../service-spec.ts";
 import {
   type ServiceEntry,
   ServicesManifestError,
   readManifest,
   readManifestLenient,
+  writeManifest,
 } from "../services-manifest.ts";
 import { migrateNotice } from "./migrate.ts";
 
@@ -139,6 +146,17 @@ export interface DoctorDeps {
   findNonExecutable?: (binary: string) => string | null;
   /** Clock seam for date-stamped detectors (migrate). */
   now?: () => Date;
+  /**
+   * TTY check for `--fix`'s confirmation gate. Production reads
+   * `process.stdin.isTTY && process.stdout.isTTY`; tests inject to drive both
+   * the interactive (confirm) and non-interactive (bail without `--yes`) paths.
+   */
+  isInteractive?: () => boolean;
+  /**
+   * Read a line of input for the `--fix` confirmation prompt. Production wraps
+   * readline; tests inject a canned answer.
+   */
+  readLine?: (prompt: string) => Promise<string>;
 }
 
 export interface DoctorOpts {
@@ -147,6 +165,14 @@ export interface DoctorOpts {
   print?: (line: string) => void;
   /** Emit a single JSON object instead of the human report. */
   json?: boolean;
+  /**
+   * Repair canonical-port drift in services.json (and ONLY that — every other
+   * check stays report-only). Shows the diff, confirms in a TTY (or `--yes`),
+   * bails in a non-TTY without `--yes`. Idempotent: a clean file is a no-op.
+   */
+  fix?: boolean;
+  /** Skip the `--fix` confirmation prompt (required in a non-TTY). */
+  yes?: boolean;
   deps?: DoctorDeps;
 }
 
@@ -191,6 +217,21 @@ async function defaultProbePublicHealth(origin: string): Promise<boolean> {
   }
 }
 
+/** Both ends of the pipe must be a TTY for an interactive confirm to make sense. */
+function defaultIsInteractive(): boolean {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+/** Readline-backed line reader for the `--fix` confirmation prompt. */
+async function defaultReadLine(prompt: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await rl.question(prompt);
+  } finally {
+    rl.close();
+  }
+}
+
 interface ResolvedDeps {
   probeHubHealth: (port: number) => Promise<boolean>;
   probeModuleHealth: (port: number, health: string) => Promise<boolean>;
@@ -200,6 +241,8 @@ interface ResolvedDeps {
   which: (binary: string) => string | null;
   findNonExecutable: ((binary: string) => string | null) | undefined;
   now: () => Date;
+  isInteractive: () => boolean;
+  readLine: (prompt: string) => Promise<string>;
 }
 
 function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
@@ -212,6 +255,8 @@ function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
     which: d?.which ?? Bun.which,
     findNonExecutable: d?.findNonExecutable,
     now: d?.now ?? (() => new Date()),
+    isInteractive: d?.isInteractive ?? defaultIsInteractive,
+    readLine: d?.readLine ?? defaultReadLine,
   };
 }
 
@@ -407,6 +452,174 @@ function checkServicesManifest(manifestPath: string): CheckResult {
       fix: `edit ${manifestPath} to fix the offending entry`,
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical-port-drift detection (read) + repair (`--fix`).
+//
+// Two drift shapes, both produced by legacy services.json files written before
+// the duplicate-port validation gate (or hand-edits):
+//   1. A KNOWN module whose row port ≠ its canonical port (SERVICE_SPECS).
+//   2. Two services sharing one port (the silent-miswire class, hub#195) —
+//      with the multi-vault carve-out (one vault process, N mounts, one port).
+//
+// THE #717 RULE applies hard here: canonical ports are DERIVED from the
+// service registry (`canonicalPortForManifest`, which reads SERVICE_SPECS /
+// KNOWN_MODULES + FIRST_PARTY_FALLBACKS), never a hardcoded map — so adding a
+// future service can't make this check false-positive on a fresh box. A
+// third-party / unknown service with NO canonical port is benign info, never
+// a drift WARN: we don't flag what has no canonical to drift from.
+//
+// IMPORTANT — why this reads RAW rows, not `readManifest` / `readManifestLenient`:
+// the exact drift this command exists to repair (a duplicate-port pair in a
+// legacy services.json) is precisely what those readers HEAL away before we'd
+// ever see it — the strict reader THROWS on a duplicate port, the lenient
+// reader DROPS one of the colliding rows. To detect (and let `--fix` repair)
+// that pre-gate state, drift logic operates on the raw JSON rows, validating
+// only the minimal `{name, port}` shape each row needs. The shape-level
+// `services-manifest` check still surfaces a genuinely malformed file.
+// ---------------------------------------------------------------------------
+
+/** Minimal row shape drift logic needs — satisfied by both `ServiceEntry`
+ *  and a raw parsed JSON row. */
+interface PortRow {
+  name: string;
+  port: number;
+}
+
+/** One service whose row port doesn't match its registry-canonical port. */
+export interface PortDrift {
+  /** services.json row name (manifestName, e.g. `parachute-vault`). */
+  name: string;
+  /** Short name for display, when resolvable. */
+  short?: string;
+  /** The current (drifted) port in services.json. */
+  current: number;
+  /** The registry-canonical port this service should be on. */
+  canonical: number;
+}
+
+export interface PortDriftReport {
+  /** Services on a non-canonical port (KNOWN modules only — unknowns skipped). */
+  drifted: PortDrift[];
+  /**
+   * Ports claimed by ≥2 distinct (non-vault) services — a hard collision. Each
+   * entry lists the conflicting row names. Multi-vault rows sharing 1940 are
+   * NOT a collision and are excluded (the same carve-out the manifest gate uses).
+   */
+  duplicates: { port: number; names: string[] }[];
+}
+
+function isVaultRowName(name: string): boolean {
+  return name === "parachute-vault" || name.startsWith("parachute-vault-");
+}
+
+/**
+ * Read services.json as raw `{name, port}` rows WITHOUT the manifest readers'
+ * duplicate-port heal (strict throws, lenient drops). Returns [] when the file
+ * is absent (fresh install) or can't be parsed into rows — drift logic then
+ * reports "no drift", and the shape-level `services-manifest` check owns the
+ * malformed-file FAIL. Only rows with a string name + integer port are
+ * returned; anything else isn't part of the drift bug class.
+ */
+function readRawPortRows(manifestPath: string): PortRow[] {
+  let text: string;
+  try {
+    text = readFileSync(manifestPath, "utf8");
+  } catch {
+    return [];
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  if (!raw || typeof raw !== "object") return [];
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return [];
+  const rows: PortRow[] = [];
+  for (const row of services) {
+    if (!row || typeof row !== "object") continue;
+    const name = (row as Record<string, unknown>).name;
+    const port = (row as Record<string, unknown>).port;
+    if (typeof name !== "string" || typeof port !== "number" || !Number.isInteger(port)) continue;
+    rows.push({ name, port });
+  }
+  return rows;
+}
+
+/**
+ * Pure drift computation over a manifest's rows. Derives every canonical port
+ * from the service registry (`canonicalPortForManifest`) — no hardcoded port
+ * map, so the source of truth can't drift from this check. Returns both
+ * non-canonical-port rows (KNOWN modules only) and duplicate-port collisions
+ * (with the multi-vault carve-out). Pure: no fs, no mutation.
+ */
+export function computePortDrift(services: readonly PortRow[]): PortDriftReport {
+  const drifted: PortDrift[] = [];
+  for (const entry of services) {
+    const canonical = canonicalPortForManifest(entry.name);
+    // Unknown / third-party service with no canonical port → benign, skip.
+    if (canonical === undefined) continue;
+    if (entry.port !== canonical) {
+      const drift: PortDrift = { name: entry.name, current: entry.port, canonical };
+      const short = shortNameForManifest(entry.name);
+      if (short !== undefined) drift.short = short;
+      drifted.push(drift);
+    }
+  }
+
+  // Duplicate-port detection — group distinct service names by port, excluding
+  // the deliberate multi-vault case (N vault rows on one port is by design).
+  const byPort = new Map<number, string[]>();
+  for (const entry of services) {
+    const names = byPort.get(entry.port) ?? [];
+    if (!names.includes(entry.name)) names.push(entry.name);
+    byPort.set(entry.port, names);
+  }
+  const duplicates: { port: number; names: string[] }[] = [];
+  for (const [port, names] of byPort) {
+    if (names.length < 2) continue;
+    // All-vault rows on one port is the multi-vault carve-out, not a collision.
+    if (names.every(isVaultRowName)) continue;
+    duplicates.push({ port, names });
+  }
+
+  return { drifted, duplicates };
+}
+
+/**
+ * Canonical-port-drift check (read-only). WARN (advisory — the box may work,
+ * the operator may have moved a service deliberately) when any KNOWN module
+ * sits off its canonical port OR two services collide on one port. A clean
+ * file → PASS. Unknown/third-party services with no canonical port are never
+ * flagged (#717 — no canonical, no drift signal).
+ */
+function checkPortDrift(manifestPath: string): CheckResult {
+  const { drifted, duplicates } = computePortDrift(readRawPortRows(manifestPath));
+  if (drifted.length === 0 && duplicates.length === 0) {
+    return {
+      name: "port-drift",
+      title: "Services on canonical ports",
+      status: "pass",
+      detail: "all services are on their canonical ports — no drift",
+    };
+  }
+  const parts: string[] = [];
+  for (const d of drifted) {
+    parts.push(`${d.short ?? d.name} is on :${d.current} (canonical :${d.canonical})`);
+  }
+  for (const dup of duplicates) {
+    parts.push(`port :${dup.port} is claimed by ${dup.names.join(" + ")}`);
+  }
+  return {
+    name: "port-drift",
+    title: "Services on canonical ports",
+    status: "warn",
+    detail: `canonical-port drift: ${parts.join("; ")}`,
+    fix: "parachute doctor --fix",
+  };
 }
 
 /**
@@ -806,6 +1019,7 @@ async function runChecks(
     checkExposure(configDir, deps),
   ]);
   const manifestCheck = checkServicesManifest(manifestPath);
+  const portDrift = checkPortDrift(manifestPath);
   const operator = checkOperatorToken(configDir);
   const migration = checkMigration(configDir, manifestPath, deps);
   const versionDrift = checkVersionDrift(manifest);
@@ -816,7 +1030,7 @@ async function runChecks(
   };
   add("Hub", [hub]);
   add("Modules", [...modules, ...bins]);
-  add("Configuration", [manifestCheck, operator]);
+  add("Configuration", [manifestCheck, portDrift, operator]);
   add("Migration", migration);
   add("Exposure", [exposure, versionDrift]);
   return grouped;
@@ -871,17 +1085,129 @@ function renderJson(checks: GroupedCheck[], print: (line: string) => void): void
   print(JSON.stringify(payload, null, 2));
 }
 
+// ---------------------------------------------------------------------------
+// `doctor --fix` — the ONLY writing path. Repairs canonical-port drift in
+// services.json and nothing else (every other check stays report-only). The
+// guards, all load-bearing:
+//   - SHOW THE DIFF first (old→new per service) so the operator sees the exact
+//     change before it lands.
+//   - CONFIRMATION-GATED: a TTY prompts y/N; `--yes` skips the prompt; a
+//     non-TTY WITHOUT `--yes` bails (exit non-zero) with a hint, never writing.
+//   - IDEMPOTENT: a clean file is "no drift, nothing to fix", exit 0.
+//   - PRESERVES every field + the writer's formatting: it parses the RAW rows
+//     (so a duplicate-port legacy file — which `readManifest` would THROW on
+//     and `readManifestLenient` would DROP a row from — is repairable), mutates
+//     ONLY the `port` of drifted rows, and writes back through `writeManifest`
+//     (atomic tmp+rename, trailing-newline formatting). Optional/unknown fields
+//     (displayName, tagline, stripPrefix, …) round-trip untouched.
+//   - Duplicate-port collisions are REPORTED (not separately auto-resolved):
+//     fixing canonical drift often clears the collision on its own (both rows
+//     move to distinct canonical slots); any residual collision is surfaced for
+//     the operator rather than guessed at.
+// ---------------------------------------------------------------------------
+
+async function fixPortDrift(
+  manifestPath: string,
+  opts: { yes: boolean; print: (line: string) => void; deps: ResolvedDeps },
+): Promise<number> {
+  const { print, deps } = opts;
+
+  // Parse the RAW file — not through readManifest (throws on dup ports) or
+  // readManifestLenient (drops a colliding row). We need the pre-gate shape to
+  // repair it. A genuinely unparseable file → bail (the read-only
+  // `services-manifest` check surfaces the parse error in the report).
+  let parsed: { services: Record<string, unknown>[] };
+  try {
+    const raw = JSON.parse(readFileSync(manifestPath, "utf8")) as unknown;
+    if (
+      !raw ||
+      typeof raw !== "object" ||
+      !Array.isArray((raw as { services?: unknown }).services)
+    ) {
+      throw new Error('expected an object with a "services" array');
+    }
+    parsed = raw as { services: Record<string, unknown>[] };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    print(`parachute doctor --fix: can't read services.json — ${message}`);
+    print("Fix the file by hand first; --fix only rewrites canonical-port drift.");
+    return 1;
+  }
+
+  const { drifted, duplicates } = computePortDrift(readRawPortRows(manifestPath));
+
+  // Report any duplicate-port collisions up front (not separately auto-fixed —
+  // canonical-drift repair below usually clears them by moving each row to its
+  // own canonical slot).
+  for (const dup of duplicates) {
+    print(
+      `note: port :${dup.port} is shared by ${dup.names.join(" + ")} — fixing canonical drift below; verify each ends on a unique port.`,
+    );
+  }
+
+  // Idempotent: clean (no off-canonical rows) → no-op, exit 0.
+  if (drifted.length === 0) {
+    print("No canonical-port drift — nothing to fix.");
+    return 0;
+  }
+
+  // Show the diff BEFORE applying — the operator sees exactly what changes.
+  print("Canonical-port drift to repair:");
+  for (const d of drifted) {
+    print(`  ${d.short ?? d.name}: :${d.current} → :${d.canonical}`);
+  }
+  print("");
+
+  // Confirmation gate. `--yes` skips it; otherwise a TTY prompts and a non-TTY
+  // bails (never write without the operator seeing the change).
+  if (!opts.yes) {
+    if (!deps.isInteractive()) {
+      print("Refusing to rewrite services.json without confirmation in a non-interactive shell.");
+      print("Re-run with --yes to apply, or run interactively to confirm.");
+      return 1;
+    }
+    const answer = (await deps.readLine("Apply these port changes? [y/N] ")).trim().toLowerCase();
+    if (answer !== "y" && answer !== "yes") {
+      print("Aborted — services.json unchanged.");
+      return 1;
+    }
+  }
+
+  // Apply: mutate ONLY the port of drifted rows on the raw parsed object;
+  // every other field round-trips verbatim. Write through `writeManifest` for
+  // the atomic tmp+rename + trailing-newline formatting. Cast is safe — the raw
+  // rows carry the full ServiceEntry shape; we only touched `port`.
+  const canonicalByName = new Map(drifted.map((d) => [d.name, d.canonical]));
+  const next = {
+    services: parsed.services.map((row) => {
+      const canonical = canonicalByName.get(row.name as string);
+      return canonical === undefined ? row : { ...row, port: canonical };
+    }),
+  };
+  writeManifest(next as unknown as { services: ServiceEntry[] }, manifestPath);
+  print(`Rewrote ${drifted.length} service port${drifted.length === 1 ? "" : "s"} to canonical.`);
+  return 0;
+}
+
 /**
  * `parachute doctor`. Returns the process exit code: 0 when no check FAILs
  * (WARN is allowed), non-zero on any FAIL. Never throws — every check is
  * individually wrapped + degrades gracefully, so doctor is itself a reliable
  * diagnostic regardless of the box's state.
+ *
+ * `--fix` is the one writing mode: it repairs canonical-port drift in
+ * services.json (and ONLY that) behind a show-diff + confirmation gate, then
+ * returns its own exit code without running the full diagnostic report.
  */
 export async function doctor(opts: DoctorOpts = {}): Promise<number> {
   const configDir = opts.configDir ?? CONFIG_DIR;
   const manifestPath = opts.manifestPath ?? SERVICES_MANIFEST_PATH;
   const print = opts.print ?? ((line) => console.log(line));
   const deps = resolveDeps(opts.deps);
+
+  if (opts.fix) {
+    return await fixPortDrift(manifestPath, { yes: opts.yes ?? false, print, deps });
+  }
 
   const checks = await runChecks(configDir, manifestPath, deps);
   if (opts.json) {

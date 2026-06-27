@@ -581,15 +581,22 @@ async function main(argv: string[]): Promise<number> {
         return 0;
       }
       const json = rest.includes("--json");
-      const unknown = rest.find((a) => a !== "--json");
+      const fix = rest.includes("--fix");
+      const yes = rest.includes("--yes") || rest.includes("-y");
+      const known = new Set(["--json", "--fix", "--yes", "-y"]);
+      const unknown = rest.find((a) => !known.has(a));
       if (unknown !== undefined) {
         console.error(`parachute doctor: unknown argument "${unknown}"`);
-        console.error("usage: parachute doctor [--json]");
+        console.error("usage: parachute doctor [--json] [--fix [--yes]]");
+        return 1;
+      }
+      if (json && fix) {
+        console.error("parachute doctor: --json and --fix are mutually exclusive");
         return 1;
       }
       const mod = await loadCommand("doctor", () => import("./commands/doctor.ts"));
       if (!mod) return 1;
-      return await mod.doctor({ json });
+      return await mod.doctor({ json, fix, yes });
     }
 
     case "expose": {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CheckResult, type DoctorDeps, doctor } from "../commands/doctor.ts";
@@ -457,6 +457,248 @@ describe("doctor — version drift (cosmetic; never FAIL)", () => {
       expect(vd?.detail).toContain("cosmetic");
       expect(code).toBe(0);
       expectNoUnexpectedNonPass(checks, ["version-drift"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Canonical-port-drift detection + `doctor --fix` repair (#267 doctor sub-item)
+// ---------------------------------------------------------------------------
+
+/** Write a services.json with the given rows (verbatim — for drift fixtures). */
+function writeManifestRows(manifestPath: string, services: unknown[]): void {
+  writeFileSync(manifestPath, JSON.stringify({ services }, null, 2));
+}
+
+/** Read services.json back as parsed rows for post-fix assertions. */
+function readRows(manifestPath: string): Record<string, unknown>[] {
+  const parsed = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+    services: Record<string, unknown>[];
+  };
+  return parsed.services;
+}
+
+/** Run `doctor --fix`, capturing printed lines + exit code. */
+async function runFix(
+  h: Harness,
+  over: Partial<DoctorDeps> = {},
+  flags: { yes?: boolean } = {},
+): Promise<{ code: number; lines: string[] }> {
+  const lines: string[] = [];
+  const code = await doctor({
+    configDir: h.configDir,
+    manifestPath: h.manifestPath,
+    print: (l) => lines.push(l),
+    fix: true,
+    yes: flags.yes ?? false,
+    deps: healthyDeps(over),
+  });
+  return { code, lines };
+}
+
+describe("doctor — canonical-port-drift detection (read-only)", () => {
+  test("a non-canonical port + a duplicate-port pair → port-drift WARNs naming the services", async () => {
+    const h = makeHarness();
+    try {
+      // scribe drifted off 1943 onto 1944; agent also squats 1944 (a collision).
+      writeManifestRows(h.manifestPath, [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/h",
+          version: "1",
+        },
+        { name: "parachute-scribe", port: 1944, paths: ["/scribe"], health: "/h", version: "1" },
+        { name: "parachute-agent", port: 1944, paths: ["/agent"], health: "/h", version: "1" },
+      ]);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      const pd = byName(checks, "port-drift");
+      expect(pd?.status).toBe("warn");
+      // Names the drifted service AND the colliding pair.
+      expect(pd?.detail).toContain("scribe");
+      expect(pd?.detail).toContain("1944");
+      expect(pd?.detail).toContain("parachute-scribe + parachute-agent");
+      expect(pd?.fix).toBe("parachute doctor --fix");
+      // Drift is advisory — exit stays 0 (a WARN, not a FAIL). The duplicate
+      // rows also trip modules-alive (both can't bind 1944) but that's expected
+      // for this fixture; we only assert on port-drift here.
+      expect([0, 1]).toContain(code);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a clean file → port-drift PASSES with no drift", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      const pd = byName(checks, "port-drift");
+      expect(pd?.status).toBe("pass");
+      expect(pd?.detail).toContain("canonical");
+      expect(code).toBe(0);
+      expectNoUnexpectedNonPass(checks, []);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a third-party service with NO canonical port is not flagged", async () => {
+    const h = makeHarness();
+    try {
+      // An unknown module on a non-1939–1949 port — no canonical to drift from.
+      writeManifestRows(h.manifestPath, [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/h",
+          version: "1",
+        },
+        { name: "acme-thing", port: 5000, paths: ["/acme"], health: "/h", version: "1" },
+      ]);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      const pd = byName(checks, "port-drift");
+      expect(pd?.status).toBe("pass");
+      expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("doctor --fix — canonical-port repair (confirm-gated, idempotent, non-tty-safe)", () => {
+  test("--fix on a clean file → 'no drift', exit 0, file unchanged (idempotent)", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      const before = readFileSync(h.manifestPath, "utf8");
+      const { code, lines } = await runFix(h, { isInteractive: () => true }, { yes: true });
+      expect(code).toBe(0);
+      expect(lines.join("\n").toLowerCase()).toContain("nothing to fix");
+      expect(readFileSync(h.manifestPath, "utf8")).toBe(before);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--fix --yes rewrites the drifted port to canonical + preserves other fields", async () => {
+    const h = makeHarness();
+    try {
+      // scribe drifted onto 1944; carries an optional displayName/tagline that
+      // must survive the rewrite.
+      writeManifestRows(h.manifestPath, [
+        {
+          name: "parachute-scribe",
+          port: 1944,
+          paths: ["/scribe"],
+          health: "/scribe/health",
+          version: "0.7.4",
+          displayName: "Scribe",
+          tagline: "Local audio transcription.",
+          stripPrefix: true,
+        },
+      ]);
+      const { code, lines } = await runFix(h, {}, { yes: true });
+      expect(code).toBe(0);
+      expect(lines.join("\n")).toContain("→ :1943");
+      const rows = readRows(h.manifestPath);
+      const scribe = rows.find((r) => r.name === "parachute-scribe");
+      expect(scribe?.port).toBe(1943);
+      // Optional + unknown fields preserved verbatim.
+      expect(scribe?.displayName).toBe("Scribe");
+      expect(scribe?.tagline).toBe("Local audio transcription.");
+      expect(scribe?.stripPrefix).toBe(true);
+
+      // Re-run → idempotent: now clean, exit 0, nothing to fix.
+      const again = await runFix(h, {}, { yes: true });
+      expect(again.code).toBe(0);
+      expect(again.lines.join("\n").toLowerCase()).toContain("nothing to fix");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--fix in a TTY without --yes prompts; 'y' applies the rewrite", async () => {
+    const h = makeHarness();
+    try {
+      writeManifestRows(h.manifestPath, [
+        { name: "parachute-scribe", port: 1944, paths: ["/scribe"], health: "/h", version: "1" },
+      ]);
+      const { code } = await runFix(
+        h,
+        { isInteractive: () => true, readLine: async () => "y" },
+        { yes: false },
+      );
+      expect(code).toBe(0);
+      expect(readRows(h.manifestPath).find((r) => r.name === "parachute-scribe")?.port).toBe(1943);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--fix in a TTY answered 'n' → aborts, exit non-zero, file UNCHANGED", async () => {
+    const h = makeHarness();
+    try {
+      writeManifestRows(h.manifestPath, [
+        { name: "parachute-scribe", port: 1944, paths: ["/scribe"], health: "/h", version: "1" },
+      ]);
+      const before = readFileSync(h.manifestPath, "utf8");
+      const { code, lines } = await runFix(
+        h,
+        { isInteractive: () => true, readLine: async () => "n" },
+        { yes: false },
+      );
+      expect(code).not.toBe(0);
+      expect(lines.join("\n").toLowerCase()).toContain("unchanged");
+      expect(readFileSync(h.manifestPath, "utf8")).toBe(before);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--fix in a NON-TTY without --yes → bails, exit non-zero, file UNCHANGED", async () => {
+    const h = makeHarness();
+    try {
+      writeManifestRows(h.manifestPath, [
+        { name: "parachute-scribe", port: 1944, paths: ["/scribe"], health: "/h", version: "1" },
+      ]);
+      const before = readFileSync(h.manifestPath, "utf8");
+      const { code, lines } = await runFix(h, { isInteractive: () => false }, { yes: false });
+      expect(code).not.toBe(0);
+      expect(lines.join("\n")).toContain("--yes");
+      // The load-bearing guarantee: no write happened.
+      expect(readFileSync(h.manifestPath, "utf8")).toBe(before);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("--fix reports a duplicate-port collision but does not auto-resolve it", async () => {
+    const h = makeHarness();
+    try {
+      // Two services collide on 1944; neither is on its canonical slot. The
+      // diff fixes the canonical drift; the collision is reported, not guessed.
+      writeManifestRows(h.manifestPath, [
+        { name: "parachute-scribe", port: 1944, paths: ["/scribe"], health: "/h", version: "1" },
+        { name: "parachute-agent", port: 1944, paths: ["/agent"], health: "/h", version: "1" },
+      ]);
+      const { code, lines } = await runFix(h, {}, { yes: true });
+      const text = lines.join("\n");
+      expect(text.toLowerCase()).toContain("shared by");
+      expect(text).toContain("parachute-scribe + parachute-agent");
+      // scribe → 1943 and agent → 1941 are both off 1944, so after the rewrite
+      // they no longer collide; fix applied, exit 0.
+      expect(code).toBe(0);
+      const rows = readRows(h.manifestPath);
+      expect(rows.find((r) => r.name === "parachute-scribe")?.port).toBe(1943);
+      expect(rows.find((r) => r.name === "parachute-agent")?.port).toBe(1941);
     } finally {
       h.cleanup();
     }
