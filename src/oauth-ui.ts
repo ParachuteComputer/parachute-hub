@@ -162,6 +162,21 @@ export interface ConsentViewProps {
    * the unnamed verb(s) on the picked vault; it never touches any other scope.
    */
   ownerVerbSelector?: OwnerVerbSelector;
+  /**
+   * hub#314 — same-hub vs external trust marker. True when the requesting
+   * client was registered through this hub's own flow / first-party install
+   * (`OAuthClient.sameHub` — bearer `hub:admin` OR session-cookie +
+   * same-origin DCR). False for a third-party Dynamic Client Registration
+   * (an external app, e.g. Claude.ai, that self-registered). Drives a small
+   * trust badge in the consent card header so the operator knows the trust
+   * level of the app they're approving before they click Approve.
+   *
+   * Omitted / undefined → no badge (provenance unknown; only the GET-handler
+   * call site, which always has the client row, populates it). Provenance is
+   * a clean DB-backed signal — see the `same_hub` column on `clients` and the
+   * `consentProps` call site in `oauth-handlers.ts`.
+   */
+  sameHub?: boolean;
 }
 
 export interface OwnerVerbSelector {
@@ -354,6 +369,7 @@ export function renderConsent(props: ConsentViewProps): string {
     blockApproveForStaleAssignment,
     userCanAuthorizeRequest,
     ownerVerbSelector,
+    sameHub,
   } = props;
   // Substitute unnamed `vault:<verb>` rows with the resolved named form so
   // the operator sees the scope shape that will appear in the token. Raw
@@ -418,6 +434,24 @@ export function renderConsent(props: ConsentViewProps): string {
             before authorizing vault access.
           </p>`
     : "";
+  // hub#314 — same-hub vs external trust marker. `sameHub === true` means the
+  // client was registered through this hub's own flow (first-party / operator-
+  // authenticated DCR); `false` means a third-party app self-registered via
+  // public Dynamic Client Registration. `undefined` → no badge (provenance
+  // unknown to the caller). The badge sits in the header so the operator sees
+  // the trust level before reading the scope list.
+  const trustMarker =
+    sameHub === undefined
+      ? ""
+      : sameHub
+        ? `<p class="trust-marker trust-marker-same-hub">
+            <span class="badge badge-trust-same-hub">First-party</span>
+            <span class="trust-marker-text">Registered through this hub.</span>
+          </p>`
+        : `<p class="trust-marker trust-marker-external">
+            <span class="badge badge-trust-external">External</span>
+            <span class="trust-marker-text">A third-party app that registered itself. Approve only if you recognise it.</span>
+          </p>`;
   const body = `
     <div class="card">
       <div class="card-header">
@@ -429,6 +463,7 @@ export function renderConsent(props: ConsentViewProps): string {
         <p class="subtitle">
           This app is requesting access to your Parachute account.
         </p>
+        ${trustMarker}
         <p class="client-meta">
           <span class="client-meta-label">client_id</span>
           <code>${escapeHtml(clientId)}</code>
@@ -1578,6 +1613,22 @@ const STYLES = `
   .badge-write { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
   .badge-send { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
   .badge-admin { background: ${PALETTE.danger}; color: ${PALETTE.cardBg}; }
+
+  /* hub#314 — same-hub vs external trust marker on the consent header. The
+     first-party badge uses the accent (calm/trusted); external uses the danger
+     tint so a third-party DCR client stands out without being alarmist. */
+  .trust-marker {
+    display: flex;
+    align-items: baseline;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+    margin: 0.75rem 0 0;
+    font-size: 0.85rem;
+    color: ${PALETTE.fgMuted};
+  }
+  .trust-marker-text { flex: 1; min-width: 12rem; }
+  .badge-trust-same-hub { background: ${PALETTE.accentSoft}; color: ${PALETTE.accent}; }
+  .badge-trust-external { background: ${PALETTE.dangerSoft}; color: ${PALETTE.danger}; }
 
   @media (max-width: 480px) {
     main { padding: 0.75rem; }

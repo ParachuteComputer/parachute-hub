@@ -353,6 +353,88 @@ describe("handleAuthorizeGet", () => {
     }
   });
 
+  // hub#314 — same-hub vs external trust marker reaches the rendered consent
+  // screen via `client.sameHub`. An unnamed `vault:read` request from a
+  // same-hub client falls through to consent (the auto-approve gate requires
+  // `!hasUnnamedVault`), so we can assert the marker on the GET render.
+  test("renders the EXTERNAL trust marker for a third-party DCR client", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      // registerClient defaults sameHub:false → external (third-party DCR).
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "ThirdPartyApp",
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Element form — the `.badge-trust-*` CSS class names are always in the
+      // inlined <style>; the rendered ELEMENT only appears when the marker fires.
+      expect(html).toContain('class="badge badge-trust-external"');
+      expect(html).toContain("third-party app that registered itself");
+      expect(html).not.toContain('class="badge badge-trust-same-hub"');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("renders the FIRST-PARTY trust marker for a same-hub client", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        clientName: "FirstPartyApp",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          // Unnamed vault verb → bypasses the same-hub auto-approve gate
+          // (`!hasUnnamedVault`) and falls through to the consent render.
+          scope: "vault:read",
+        }),
+        {
+          headers: {
+            cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000))}`,
+          },
+        },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('class="badge badge-trust-same-hub"');
+      expect(html).toContain("Registered through this hub");
+      expect(html).not.toContain('class="badge badge-trust-external"');
+    } finally {
+      cleanup();
+    }
+  });
+
   test("rejects unknown client_id with 400", async () => {
     const { db, cleanup } = await makeDb();
     try {
@@ -10137,6 +10219,62 @@ describe("hub#689 — owner-on-own-vault verb selector + widening", () => {
       const html = await res.text();
       expect(html).not.toContain("Access level");
       expect(html).not.toContain('name="verb_select"');
+    } finally {
+      cleanup();
+    }
+  });
+
+  // GET render (hub#703, folded into hub#314): a user with MIXED authority —
+  // admin on vault A (role=write → holds admin) but only read on vault B
+  // (direct INSERT role=read) — does NOT see the selector. The user could pick
+  // either vault, but doesn't own (hold admin on) EVERY pickable vault, so the
+  // `userHoldsAdminOnPickable` predicate (`assignedVaults.every(v => verbs
+  // includes "admin")`) fails on vault B and the selector is suppressed. The
+  // suppression logic already ships + is correct (oauth-handlers.ts ~2963 +
+  // ~1226); this test closes the coverage gap with no code change.
+  test("selector NOT rendered for a mixed-authority user (admin on A, read-only on B)", async () => {
+    const { db, cleanup } = await makeDb();
+    try {
+      await createUser(db, "owner", "pw");
+      const mixed = await createUser(db, "mixed", "pw", { allowMulti: true });
+      // Vault A ("work"): role=write → vaultVerbsForRole maps to [read,write,
+      // admin], so the user holds admin on A. (setUserVaults hardcodes write.)
+      setUserVaults(db, mixed.id, ["work"]);
+      // Vault B ("other"): direct INSERT role=read → holds read only, NOT admin.
+      // setUserVaults DELETEs first, so this INSERT must come after it to keep A.
+      db.prepare(
+        "INSERT INTO user_vaults (user_id, vault_name, role, created_at) VALUES (?, ?, 'read', ?)",
+      ).run(mixed.id, "other", new Date().toISOString());
+      const session = createSession(db, { userId: mixed.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+      });
+      const { challenge } = makePkce();
+      const res = handleAuthorizeGet(
+        db,
+        new Request(
+          authorizeUrl({
+            client_id: reg.client.clientId,
+            redirect_uri: "https://app.example/cb",
+            response_type: "code",
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            scope: "vault:read",
+          }),
+          { headers: { cookie: `${CSRF_COOKIE}; ${buildSessionCookie(session.id, TTL_S)}` } },
+        ),
+        selDeps,
+      );
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Suppressed: the `.every(v => verbs includes "admin")` check fails on B.
+      expect(html).not.toContain("Access level");
+      expect(html).not.toContain('name="verb_select"');
+      // Sanity: the multi-vault picker DID render (two assigned vaults), so the
+      // suppression is specifically the verb selector, not the whole flow.
+      expect(html).toContain('name="vault_pick" value="work"');
+      expect(html).toContain('name="vault_pick" value="other"');
     } finally {
       cleanup();
     }
