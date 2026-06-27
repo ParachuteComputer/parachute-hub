@@ -571,6 +571,41 @@ describe("doctor — canonical-port-drift detection (read-only)", () => {
       h.cleanup();
     }
   });
+
+  test("a named multi-vault row sharing 1940 is NOT flagged (drift or duplicate)", async () => {
+    const h = makeHarness();
+    try {
+      // A legit multi-vault setup: the canonical vault row plus a second named
+      // vault instance, both on 1940 (the documented carve-out). Neither should
+      // be flagged as drifted (named vault rows have no canonical port) nor as a
+      // duplicate-port collision (all-vault-on-1940 is by design).
+      writeManifestRows(h.manifestPath, [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: ["/vault/default"],
+          health: "/h",
+          version: "1",
+        },
+        {
+          name: "parachute-vault-work",
+          port: 1940,
+          paths: ["/vault/work"],
+          health: "/h",
+          version: "1",
+        },
+      ]);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      const pd = byName(checks, "port-drift");
+      // PASS (clean) — neither flagged as drifted nor as a duplicate collision.
+      expect(pd?.status).toBe("pass");
+      expect(pd?.detail).toContain("canonical");
+      expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 describe("doctor --fix — canonical-port repair (confirm-gated, idempotent, non-tty-safe)", () => {

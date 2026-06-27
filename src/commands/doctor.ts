@@ -560,7 +560,11 @@ export function computePortDrift(services: readonly PortRow[]): PortDriftReport 
   const drifted: PortDrift[] = [];
   for (const entry of services) {
     const canonical = canonicalPortForManifest(entry.name);
-    // Unknown / third-party service with no canonical port → benign, skip.
+    // No canonical port for this name → benign, skip. Covers unknown/third-party
+    // services AND named multi-vault rows (`parachute-vault-<name>`), which
+    // canonicalPortForManifest deliberately returns undefined for (documented
+    // gap in service-spec.ts → shortNameForManifest). So a named vault is never
+    // flagged as drifted; multi-vault-on-1940 is the carve-out handled below.
     if (canonical === undefined) continue;
     if (entry.port !== canonical) {
       const drift: PortDrift = { name: entry.name, current: entry.port, canonical };
@@ -1204,12 +1208,14 @@ async function fixPortDrift(
   const canonicalByName = new Map(drifted.map((d) => [d.name, d.canonical]));
   const next = {
     services: parsed.services.map((row) => {
-      const canonical = canonicalByName.get(row.name as string);
+      const canonical =
+        typeof row.name === "string" ? canonicalByName.get(row.name) : undefined;
       return canonical === undefined ? row : { ...row, port: canonical };
     }),
   };
   writeManifest(next as unknown as { services: ServiceEntry[] }, manifestPath);
   print(`Rewrote ${drifted.length} service port${drifted.length === 1 ? "" : "s"} to canonical.`);
+  print("Run `parachute doctor` to see the full health report.");
   return 0;
 }
 
