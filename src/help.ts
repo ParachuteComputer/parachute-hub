@@ -181,8 +181,9 @@ Flags:
                             over a public HTTPS URL (e.g. https://<ip>.sslip.io).
   --vault-name <name>       create the first vault in one shot (#478 Part 2).
                             Runs \`parachute-vault create <name>\` after the hub
-                            is up. Skipped if a vault is already configured
-                            (idempotent). Must be a valid vault name: lowercase
+                            is up. Non-fatal on re-run — \`create\` exits
+                            non-zero if the vault already exists, and that's
+                            tolerated. Must be a valid vault name: lowercase
                             alphanumeric + hyphens/underscores, 2–32 chars.
                             Without this flag, the wizard owns vault creation
                             (the default experience is unchanged).

@@ -227,13 +227,14 @@ export interface InitOpts {
   vaultName?: string;
   /**
    * Test seam: injectable impl for the `--vault-name` create step (#478
-   * Part 2). Production shells out `["parachute-vault", "create", name]`
-   * via the injected runner. Tests pass a stub to record the call without
-   * touching a live vault binary. Receives the vault name + a runner shim;
-   * returns an exit code (0 = success).
+   * Part 2). This IS the whole create implementation — tests swap the
+   * entire function for a stub that records the call without touching a
+   * live vault binary. It takes the vault name plus a ctx carrying a
+   * runner shim, and returns an exit code (0 = success).
    *
-   * The production default (`defaultCreateFirstVault`) uses the `Runner`
-   * type pattern already established across every command that shells out:
+   * The production default (`defaultCreateFirstVault`) uses that runner to
+   * shell out `["parachute-vault", "create", name]`, following the `Runner`
+   * type pattern established across every command that shells out:
    * `readonly string[] => Promise<number>`.
    */
   createFirstVaultImpl?: (
