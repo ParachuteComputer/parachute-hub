@@ -2218,5 +2218,158 @@ describe("resolveInitChannel (hub#694 bug 2)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// #478 Part 2 — `parachute init --vault-name <name>` creates the first vault
+// ---------------------------------------------------------------------------
+
+describe("init --vault-name (#478 Part 2)", () => {
+  /** Minimal stub that satisfies every init seam except the ones under test. */
+  function baseOpts(
+    h: Harness,
+    overrides: Parameters<typeof init>[0] = {},
+  ): Parameters<typeof init>[0] {
+    return {
+      configDir: h.configDir,
+      manifestPath: h.manifestPath,
+      log: () => {},
+      alive: () => false,
+      ensureHubVersion: async () => ({
+        outcome: "match" as const,
+        installedVersion: "test",
+        messages: [],
+      }),
+      ensureHub: async () => {
+        writeHubPort(1939, h.configDir);
+        return { pid: 0, port: 1939, started: true };
+      },
+      readExposeStateFn: () => undefined,
+      isTty: false,
+      platform: "linux" as const,
+      installVaultModuleImpl: noopVaultInstall,
+      noBrowser: true,
+      noExposePrompt: true,
+      noWizardPrompt: true,
+      ...overrides,
+    };
+  }
+
+  test("(a) with vaultName set: invokes createFirstVaultImpl with the name", async () => {
+    const h = makeHarness();
+    try {
+      const createCalls: string[] = [];
+      const logs: string[] = [];
+      const code = await init(
+        baseOpts(h, {
+          vaultName: "myvault",
+          log: (l) => logs.push(l),
+          createFirstVaultImpl: async (name) => {
+            createCalls.push(name);
+            return 0;
+          },
+        }),
+      );
+      expect(code).toBe(0);
+      expect(createCalls).toEqual(["myvault"]);
+      expect(logs.join("\n")).toContain('Creating vault "myvault"');
+      expect(logs.join("\n")).toContain('Vault "myvault" created');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(b) without vaultName: does NOT invoke createFirstVaultImpl", async () => {
+    const h = makeHarness();
+    try {
+      let createCalled = false;
+      const code = await init(
+        baseOpts(h, {
+          // no vaultName set
+          createFirstVaultImpl: async () => {
+            createCalled = true;
+            return 0;
+          },
+        }),
+      );
+      expect(code).toBe(0);
+      expect(createCalled).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(c) invalid vault name via the CLI seam: validateVaultName rejects it", () => {
+    // The CLI validates before calling init; test the validator directly
+    // so the unit test doesn't need to drive argv parsing. The validator
+    // is the same one the CLI uses (imported in cli.ts).
+    const { validateVaultName } = require("../vault-name.ts");
+    const result = validateVaultName("My Vault!");
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/lowercase alphanumeric/);
+  });
+
+  test("(d) a seeded services.json vault MODULE row does NOT suppress the create", async () => {
+    // REGRESSION (the rc.7 verification bug): Step 0.5's `install("vault",
+    // { noCreate: true })` seeds a `parachute-vault` services.json row via
+    // `spec.seedEntry` on EVERY fresh install. The OLD Step 1.6 keyed
+    // idempotency off that row, so on the exact fresh-box path this feature
+    // targets it saw the row + silently no-op'd the create — the headline
+    // feature never fired. The row marks "module installed", not "instance
+    // exists". Idempotency must live in `parachute-vault create`'s own exit
+    // (which errors "already exists" on a real re-run), NOT a row precheck.
+    // So: a seeded module row must NOT prevent the create from being attempted.
+    const h = makeHarness();
+    try {
+      // Seed services.json with the module row (as Step 0.5 always does).
+      seedVault(h.manifestPath);
+      const createCalls: string[] = [];
+      const logs: string[] = [];
+      const code = await init(
+        baseOpts(h, {
+          vaultName: "myvault",
+          log: (l) => logs.push(l),
+          createFirstVaultImpl: async (name) => {
+            createCalls.push(name);
+            return 0;
+          },
+        }),
+      );
+      expect(code).toBe(0);
+      // The create WAS attempted despite the seeded module row.
+      expect(createCalls).toEqual(["myvault"]);
+      expect(logs.join("\n")).toContain('Creating vault "myvault"');
+      expect(logs.join("\n")).toContain('Vault "myvault" created');
+      // No "already configured / ignored" no-op message.
+      expect(logs.join("\n")).not.toContain("already configured");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("non-zero exit from create (e.g. vault already exists): warns but init still exits 0", async () => {
+    // A non-zero exit covers both "vault already exists" (a benign re-run, where
+    // `parachute-vault create` errors + exits 1) and a genuine creation failure.
+    // Either way init is non-fatal — the operator can re-run / check status.
+    const h = makeHarness();
+    try {
+      const logs: string[] = [];
+      const code = await init(
+        baseOpts(h, {
+          vaultName: "myvault",
+          log: (l) => logs.push(l),
+          createFirstVaultImpl: async () => 1,
+        }),
+      );
+      // Init is non-fatal on create failure — operator can retry.
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toContain("exited 1");
+      expect(joined).toContain("may already exist, or creation failed");
+      expect(joined).toContain("parachute vault create myvault");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 // Type alias used only inside this test file for the heuristic test.
 type ExposeChoice = "none" | "tailnet" | "cloudflare";

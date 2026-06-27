@@ -420,17 +420,37 @@ async function main(argv: string[]): Promise<number> {
         );
         return 1;
       }
-      const noBrowser = channelExtract.rest.includes("--no-browser");
-      const noExposePrompt = channelExtract.rest.includes("--no-expose-prompt");
-      const cliWizard = channelExtract.rest.includes("--cli-wizard");
-      const browserWizard = channelExtract.rest.includes("--browser-wizard");
+      // #478 Part 2: --vault-name <name> creates the first vault in one shot.
+      const vaultNameExtract = extractNamedFlag(channelExtract.rest, "--vault-name");
+      if (vaultNameExtract.error) {
+        console.error(`parachute init: ${vaultNameExtract.error}`);
+        return 1;
+      }
+      let validatedVaultName: string | undefined;
+      if (vaultNameExtract.value !== undefined) {
+        if (vaultNameExtract.value.trim() === "") {
+          console.error("parachute init: --vault-name must not be empty.");
+          return 1;
+        }
+        const { validateVaultName: vvn } = await import("./vault-name.ts");
+        const vr = vvn(vaultNameExtract.value);
+        if (!vr.ok) {
+          console.error(`parachute init: invalid --vault-name: ${vr.error}`);
+          return 1;
+        }
+        validatedVaultName = vr.name;
+      }
+      const noBrowser = vaultNameExtract.rest.includes("--no-browser");
+      const noExposePrompt = vaultNameExtract.rest.includes("--no-expose-prompt");
+      const cliWizard = vaultNameExtract.rest.includes("--cli-wizard");
+      const browserWizard = vaultNameExtract.rest.includes("--browser-wizard");
       const known = new Set([
         "--no-browser",
         "--no-expose-prompt",
         "--cli-wizard",
         "--browser-wizard",
       ]);
-      const unknown = channelExtract.rest.find((a) => !known.has(a));
+      const unknown = vaultNameExtract.rest.find((a) => !known.has(a));
       if (unknown !== undefined) {
         console.error(`parachute init: unknown argument "${unknown}"`);
         console.error(
@@ -438,6 +458,7 @@ async function main(argv: string[]): Promise<number> {
             "                     [--expose none|tailnet|cloudflare]\n" +
             "                     [--channel rc|latest]\n" +
             "                     [--hub-origin <url>]\n" +
+            "                     [--vault-name <name>]\n" +
             "                     [--cli-wizard | --browser-wizard]",
         );
         return 1;
@@ -456,6 +477,7 @@ async function main(argv: string[]): Promise<number> {
       if (channelExtract.value === "rc" || channelExtract.value === "latest") {
         initOpts.channel = channelExtract.value;
       }
+      if (validatedVaultName !== undefined) initOpts.vaultName = validatedVaultName;
       if (cliWizard) initOpts.wizardChoice = "cli";
       else if (browserWizard) initOpts.wizardChoice = "browser";
       const mod = await loadCommand("init", () => import("./commands/init.ts"));

@@ -52,6 +52,7 @@ import { issueOperatorToken, readOperatorTokenFile } from "../operator-token.ts"
 import { type AliveFn, defaultAlive, processState } from "../process-state.ts";
 import { findService, readManifestLenient } from "../services-manifest.ts";
 import { listUsers } from "../users.ts";
+import { validateVaultName } from "../vault-name.ts";
 import { type InstallOpts, install as defaultInstall } from "./install.ts";
 
 /** The three options the exposure prompt offers — also the `--expose` flag's domain. */
@@ -202,6 +203,44 @@ export interface InitOpts {
    * already known so there's no question to ask).
    */
   noWizardPrompt?: boolean;
+  /**
+   * Vault name to create as part of `parachute init --vault-name <name>`
+   * (#478 Part 2). When set, init creates the first vault via
+   * `createFirstVaultImpl` immediately after Step 1.5 (operator-token
+   * guarantee), before the admin-URL resolution. Validated with
+   * `validateVaultName` in the CLI before reaching here.
+   *
+   * Idempotency lives in `parachute-vault create`, NOT in a services.json
+   * precheck: `create <name>` exits 0 + creates when `<name>` is new, and
+   * exits non-zero ("Vault \"<name>\" already exists.") on a re-run. We
+   * therefore ALWAYS attempt the create when this field is set and treat a
+   * non-zero exit as non-fatal (warn + continue). A services.json
+   * `parachute-vault` row is the MODULE-installed marker (Step 0.5 seeds it
+   * via `spec.seedEntry` on EVERY fresh install), not an instance marker —
+   * keying idempotency off it would silently no-op the create on the exact
+   * fresh-box path this feature targets.
+   *
+   * Without this field (the default), init makes NO vault — the wizard
+   * owns Create/Import/Skip as before. The --no-browser / scripted path
+   * remains vault-free unless --vault-name is explicitly passed.
+   */
+  vaultName?: string;
+  /**
+   * Test seam: injectable impl for the `--vault-name` create step (#478
+   * Part 2). This IS the whole create implementation — tests swap the
+   * entire function for a stub that records the call without touching a
+   * live vault binary. It takes the vault name plus a ctx carrying a
+   * runner shim, and returns an exit code (0 = success).
+   *
+   * The production default (`defaultCreateFirstVault`) uses that runner to
+   * shell out `["parachute-vault", "create", name]`, following the `Runner`
+   * type pattern established across every command that shells out:
+   * `readonly string[] => Promise<number>`.
+   */
+  createFirstVaultImpl?: (
+    name: string,
+    ctx: { runner: (cmd: readonly string[]) => Promise<number> },
+  ) => Promise<number>;
   /**
    * Canonical public hub origin (the OAuth issuer / `iss` claim). Persisted to
    * `hub_settings.hub_origin` BEFORE the hub unit starts + modules spawn, so
@@ -600,6 +639,38 @@ async function defaultFetchBootstrapToken(loopbackUrl: string): Promise<string |
 }
 
 /**
+ * Default runner shim for the `--vault-name` create step (#478 Part 2).
+ * Shells out `parachute-vault create <name>` via Bun.spawn, inheriting
+ * the operator's full env (so PARACHUTE_HOME, PATH, etc. pass through).
+ *
+ * This is the same pattern every other command that shells out uses — a
+ * `Runner` (`readonly string[] => Promise<number>`) so tests can inject a
+ * stub without touching the real vault binary.
+ */
+async function defaultRunner(cmd: readonly string[]): Promise<number> {
+  const proc = Bun.spawn([...cmd], {
+    stdio: ["inherit", "inherit", "inherit"],
+    env: process.env,
+  });
+  return await proc.exited;
+}
+
+/**
+ * Default impl for the `--vault-name` first-vault create step (#478 Part 2).
+ * Invokes `parachute-vault create <name>` via the injectable runner. The
+ * `parachute-vault` binary must already be on PATH (guaranteed by Step 0.5's
+ * vault-module install). Exit code is forwarded directly — callers log the
+ * outcome and continue (a non-zero create doesn't abort init; the operator
+ * can re-run `parachute vault create <name>` or use the wizard to retry).
+ */
+async function defaultCreateFirstVault(
+  name: string,
+  ctx: { runner: (cmd: readonly string[]) => Promise<number> },
+): Promise<number> {
+  return await ctx.runner(["parachute-vault", "create", name]);
+}
+
+/**
  * Prompt for the wizard-choice question (hub#168 Cut 4). Returns the
  * picked option, or `undefined` if the operator quit. Default is
  * `browser` because (a) the browser flow is the canonical post-launch
@@ -735,6 +806,7 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   const runCliWizardImpl = opts.runCliWizardImpl ?? defaultRunCliWizard;
   const fetchBootstrapTokenImpl = opts.fetchBootstrapTokenImpl ?? defaultFetchBootstrapToken;
   const setHubOriginImpl = opts.setHubOriginImpl ?? defaultSetHubOrigin;
+  const createFirstVaultImpl = opts.createFirstVaultImpl ?? defaultCreateFirstVault;
 
   log("Parachute init — getting your hub set up.");
   log("");
@@ -884,6 +956,42 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   // mints it when it creates the admin. Non-fatal either way — init continues
   // to the wizard regardless.
   await guaranteeOperatorToken({ configDir, hubPort, log });
+
+  // Step 1.6 (#478 Part 2): if `--vault-name <name>` was given, create the
+  // first vault now — after the hub is up (Step 1) and the operator token is
+  // guaranteed (Step 1.5). The vault module was installed at Step 0.5, so
+  // `parachute-vault` is on PATH.
+  //
+  // We ALWAYS attempt the create when `--vault-name` is set. Idempotency lives
+  // in `parachute-vault create` itself, NOT in a services.json precheck:
+  //   - `create <name>` exits 0 + creates the vault when `<name>` is new.
+  //   - `create <name>` exits non-zero ("Vault \"<name>\" already exists.") when
+  //     that exact name already exists (a benign re-run).
+  //
+  // We DON'T precheck the services.json `parachute-vault` row: Step 0.5's
+  // `install("vault", { noCreate: true })` seeds that row via `spec.seedEntry`
+  // on EVERY fresh install (the module-installed marker — see install.ts's
+  // InstallOpts doc), so on the exact fresh-box path this feature targets the
+  // row is ALWAYS present and a row-keyed precheck would silently no-op the
+  // create. The row marks "module installed", not "instance exists" — only the
+  // create command's own exit reliably distinguishes the two.
+  //
+  // A non-zero exit is non-fatal: warn + continue. It could mean the vault
+  // already exists (a fine re-run) OR a genuine creation failure — init's
+  // contract is hub up → wizard regardless, so we never abort here. The
+  // operator can check `parachute status` / re-run `parachute vault create`.
+  if (opts.vaultName !== undefined) {
+    log(`Creating vault "${opts.vaultName}"…`);
+    const createCode = await createFirstVaultImpl(opts.vaultName, { runner: defaultRunner });
+    if (createCode === 0) {
+      log(`✓ Vault "${opts.vaultName}" created.`);
+    } else {
+      log(
+        `⚠ \`parachute-vault create ${opts.vaultName}\` exited ${createCode} — the vault may already exist, or creation failed. Check \`parachute status\` / re-run \`parachute vault create ${opts.vaultName}\`.`,
+      );
+    }
+    log("");
+  }
 
   // Step 2: exposure chain. Skipped when already exposed, in non-TTY,
   // or when --no-expose-prompt was passed. `--expose <choice>` jumps

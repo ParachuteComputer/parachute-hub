@@ -134,6 +134,7 @@ Usage:
                  [--expose none|tailnet|cloudflare]
                  [--channel rc|latest]
                  [--hub-origin <url>]
+                 [--vault-name <name>]
                  [--cli-wizard | --browser-wizard]
 
 What it does:
@@ -178,6 +179,14 @@ Flags:
                             accepting it in one pass. For reverse-proxy /
                             Caddy-direct boxes that bind loopback but are reached
                             over a public HTTPS URL (e.g. https://<ip>.sslip.io).
+  --vault-name <name>       create the first vault in one shot (#478 Part 2).
+                            Runs \`parachute-vault create <name>\` after the hub
+                            is up. Non-fatal on re-run — \`create\` exits
+                            non-zero if the vault already exists, and that's
+                            tolerated. Must be a valid vault name: lowercase
+                            alphanumeric + hyphens/underscores, 2–32 chars.
+                            Without this flag, the wizard owns vault creation
+                            (the default experience is unchanged).
   --cli-wizard              skip the "browser or CLI?" prompt and walk the wizard
                             in this terminal (hub#168 Cut 4)
   --browser-wizard          skip the prompt and open the browser wizard directly
@@ -190,7 +199,9 @@ Examples:
   parachute init --expose tailnet             # CI/scripted: chain straight into Tailscale
   parachute init --no-browser                 # don't shell out to open / xdg-open
   parachute init --cli-wizard                 # walk the wizard in this terminal (hub#168)
-  parachute init --channel rc                  # rc box: install the vault module from @rc
+  parachute init --channel rc                 # rc box: install the vault module from @rc
+  parachute init --vault-name default --no-browser
+                                              # CI/scripted: hub + first vault in one pass
 `;
 }
 
