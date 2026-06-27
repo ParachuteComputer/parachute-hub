@@ -68,11 +68,16 @@ describe("listVaultNames", () => {
     expect(listVaultNames(manifest)).toEqual(["personal", "work"]);
   });
 
-  test("entry with no paths falls back to the manifest-suffix name (hub#143)", () => {
+  test("#478: bare empty-paths `parachute-vault` row yields NO name (no phantom 'default')", () => {
+    // What vault's self-register emits at zero vaults: the row stays present
+    // (installed-detection) but advertises no `/vault/<name>` path. It must not
+    // leak a selectable/assignable "default" before any vault exists. Mirrors
+    // the empty-paths skip in admin-vaults.ts (findExistingVault /
+    // listVaultInstanceNames).
     const manifest: ServicesManifest = {
       services: [
         {
-          name: "parachute-vault-archived",
+          name: "parachute-vault",
           port: 1940,
           paths: [],
           health: "/h",
@@ -80,7 +85,31 @@ describe("listVaultNames", () => {
         },
       ],
     };
-    expect(listVaultNames(manifest)).toEqual(["archived"]);
+    expect(listVaultNames(manifest)).toEqual([]);
+  });
+
+  test("#478: empty-paths row is skipped; real-paths vault rows are unchanged (positive control)", () => {
+    // An empty-paths row alongside a real-paths row: the real instance still
+    // resolves, the empty one contributes nothing.
+    const manifest: ServicesManifest = {
+      services: [
+        {
+          name: "parachute-vault",
+          port: 1940,
+          paths: [],
+          health: "/h",
+          version: "0.1.0",
+        },
+        {
+          name: "parachute-vault-work",
+          port: 1941,
+          paths: ["/vault/work"],
+          health: "/h",
+          version: "0.1.0",
+        },
+      ],
+    };
+    expect(listVaultNames(manifest)).toEqual(["work"]);
   });
 
   test("deduplicates collisions across single-entry + per-vault shapes", () => {

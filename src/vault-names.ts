@@ -23,8 +23,17 @@
  * Walks both manifest shapes: single-entry-multi-path (`parachute-vault`
  * with `paths: ["/vault/work", "/vault/personal"]`) and per-vault entries
  * (`parachute-vault-work`) by delegating each (name, path) pair to
- * `vaultInstanceNameFor`. Entries with no paths still resolve to a name via
- * the helper's manifest-suffix fallback (hub#143).
+ * `vaultInstanceNameFor`.
+ *
+ * #478: an empty-paths vault row (e.g. `parachute-vault` with `paths: []`,
+ * which vault's self-register emits at zero vaults) is "installed but no
+ * servable vault instance" and is SKIPPED entirely — it must not synthesize a
+ * name (the bare `parachute-vault` would otherwise resolve to a phantom
+ * "default"). This mirrors the empty-paths `continue` in `admin-vaults.ts`'s
+ * `findExistingVault`/`listVaultInstanceNames`, so every read path agrees: a
+ * vault instance is named only by a real `/vault/<name>` mount path. This
+ * supersedes the prior hub#143 manifest-suffix fallback for path-less entries
+ * — a registered vault carries its mount path once a vault exists.
  */
 import { type ServicesManifest, readManifestLenient } from "./services-manifest.ts";
 import { isVaultEntry, vaultInstanceNameFor } from "./well-known.ts";
@@ -39,8 +48,10 @@ export function listVaultNames(manifest: ServicesManifest): string[] {
   const names = new Set<string>();
   for (const svc of manifest.services) {
     if (!isVaultEntry(svc)) continue;
-    const paths = svc.paths.length > 0 ? svc.paths : [undefined];
-    for (const path of paths) {
+    // #478: an empty-paths vault row means "installed but no servable vault
+    // instance" — skip it so it never synthesizes a phantom "default".
+    if (svc.paths.length === 0) continue;
+    for (const path of svc.paths) {
       names.add(vaultInstanceNameFor(svc.name, path));
     }
   }
