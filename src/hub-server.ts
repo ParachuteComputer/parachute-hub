@@ -171,7 +171,7 @@ import {
   handleOAuthGrantCallback,
 } from "./admin-agent-grants.ts";
 import { handleAgentToken } from "./admin-agent-token.ts";
-import { handleApproveClient, handleGetClient } from "./admin-clients.ts";
+import { handleApproveClient, handleDeleteClient, handleGetClient } from "./admin-clients.ts";
 import {
   type ConnectionsDeps,
   handleConnections,
@@ -2765,6 +2765,33 @@ export function hubFetch(
           return applyCorsHeaders(req, new Response("method not allowed", { status: 405 }));
         }
         return applyCorsHeaders(req, await handleRevoke(getDb(), req, oauthDeps(req)));
+      }
+
+      // RFC 7592 client deregistration: DELETE /oauth/clients/<id> (hub#640).
+      // Mounted at this TOP-LEVEL `/oauth/clients/` prefix — NOT under
+      // `/api/oauth/clients/` — because that's the path parachute-surface's
+      // remove-flow actually calls (`packages/surface-host/src/dcr.ts` fires a
+      // best-effort DELETE on every Notes/Claude reconnect, carrying the
+      // operator token as a Bearer). Without it the hub 404'd every such
+      // DELETE and orphaned a `clients` row per reconnect. Operator-bearer-
+      // gated (parachute:host:admin) inside handleDeleteClient; 204 on delete,
+      // 404 if absent. CORS-wrapped + OPTIONS-preflighted like its OAuth
+      // siblings (the top-of-dispatch isCorsAllowedRoute("/oauth/") preempts
+      // the preflight). The GET/approve sub-paths stay on `/api/oauth/clients/`
+      // (the SPA-facing admin surface) below.
+      if (pathname.startsWith("/oauth/clients/")) {
+        if (!getDb) return applyCorsHeaders(req, dbNotConfigured());
+        const clientId = decodeURIComponent(pathname.slice("/oauth/clients/".length));
+        if (!clientId || clientId.includes("/")) {
+          return applyCorsHeaders(req, new Response("not found", { status: 404 }));
+        }
+        return applyCorsHeaders(
+          req,
+          await handleDeleteClient(req, clientId, {
+            db: getDb(),
+            issuer: oauthDeps(req).issuer,
+          }),
+        );
       }
 
       // Agent-connector OAuth-client callback (Phase 4b-2). The operator's

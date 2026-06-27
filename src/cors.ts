@@ -89,8 +89,9 @@
  *     leaking the wrong ACAO and breaking CORS in unpredictable ways.
  *     Critical for cache correctness.
  *
- *   Access-Control-Allow-Methods: GET, POST, OPTIONS
- *     The union of methods the in-scope route family supports. Per-route
+ *   Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS
+ *     The union of methods the in-scope route family supports (DELETE for the
+ *     RFC 7592 `DELETE /oauth/clients/<id>` deregistration, hub#640). Per-route
  *     could be narrower (e.g. /oauth/token is POST-only), but advertising
  *     the union is the simpler shape and browsers don't enforce a per-route
  *     check anyway — the *actual* request method gates execution at the
@@ -137,7 +138,10 @@ const CORS_STATIC_RESPONSE_HEADERS: Readonly<Record<string, string>> = {
  * `corsPreflightResponse`.
  */
 const CORS_STATIC_PREFLIGHT_HEADERS: Readonly<Record<string, string>> = {
-  "access-control-allow-methods": "GET, POST, OPTIONS",
+  // DELETE is in the union for RFC 7592 client deregistration
+  // (`DELETE /oauth/clients/<id>`, hub#640). A cross-origin browser caller
+  // (vs the server-side surface daemon) would otherwise fail the preflight.
+  "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
   "access-control-allow-headers": "Authorization, Content-Type, X-Requested-With",
   "access-control-max-age": "86400",
 };

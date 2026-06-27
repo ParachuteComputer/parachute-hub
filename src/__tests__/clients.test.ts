@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { issueAuthCode } from "../auth-codes.ts";
 import {
   InvalidRedirectUriError,
   approveClient,
+  deleteClient,
   expandRedirectUrisForHubOrigins,
   getClient,
   isValidRedirectUri,
@@ -13,7 +15,9 @@ import {
   requireRegisteredRedirectUri,
   verifyClientSecret,
 } from "../clients.ts";
+import { findGrant, recordGrant } from "../grants.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { createUser } from "../users.ts";
 
 function makeDb() {
   const configDir = mkdtempSync(join(tmpdir(), "phub-clients-"));
@@ -335,6 +339,91 @@ describe("approval gate (#74)", () => {
       expect(pending).toEqual([a.client.clientId, c.client.clientId]);
       const approved = listClientsByStatus(db, "approved").map((r) => r.clientId);
       expect(approved).toEqual([b.client.clientId]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("deleteClient cascade (hub#640 RFC 7592 deregistration)", () => {
+  test("returns false for an unknown client_id (nothing to delete)", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      expect(deleteClient(db, "no-such-client")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("deletes the client row and reports true", () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const r = registerClient(db, { redirectUris: ["https://app.example/cb"] });
+      expect(getClient(db, r.client.clientId)).not.toBeNull();
+      expect(deleteClient(db, r.client.clientId)).toBe(true);
+      expect(getClient(db, r.client.clientId)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("cascades dependent grants + auth_codes (FK ON, no ON DELETE CASCADE)", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const r = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        scopes: ["vault:work:read"],
+      });
+      const clientId = r.client.clientId;
+
+      // Plant a live grant + auth_code that reference the client. Without the
+      // cascade, the bare DELETE FROM clients would throw a FK violation while
+      // these rows exist (PRAGMA foreign_keys = ON).
+      recordGrant(db, user.id, clientId, ["vault:work:read"]);
+      const ac = issueAuthCode(db, {
+        clientId,
+        userId: user.id,
+        redirectUri: "https://app.example/cb",
+        scopes: ["vault:work:read"],
+        codeChallenge: "x".repeat(43),
+        codeChallengeMethod: "S256",
+      });
+      // Sanity: the dependents are present before the delete.
+      expect(findGrant(db, user.id, clientId)).not.toBeNull();
+      expect(db.query("SELECT code FROM auth_codes WHERE code = ?").get(ac.code)).not.toBeNull();
+
+      // Delete cascades — no FK throw, true returned.
+      expect(deleteClient(db, clientId)).toBe(true);
+
+      // Client + both dependents are gone.
+      expect(getClient(db, clientId)).toBeNull();
+      expect(findGrant(db, user.id, clientId)).toBeNull();
+      expect(db.query("SELECT code FROM auth_codes WHERE code = ?").get(ac.code)).toBeNull();
+      // The user row is untouched — only client-keyed rows cascade.
+      expect(db.query("SELECT id FROM users WHERE id = ?").get(user.id)).not.toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("transactional: deleting one client leaves a sibling client's grants intact", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const keep = registerClient(db, { redirectUris: ["https://keep.example/cb"] });
+      const drop = registerClient(db, { redirectUris: ["https://drop.example/cb"] });
+      recordGrant(db, user.id, keep.client.clientId, ["vault:work:read"]);
+      recordGrant(db, user.id, drop.client.clientId, ["vault:work:read"]);
+
+      expect(deleteClient(db, drop.client.clientId)).toBe(true);
+
+      // The kept client + its grant survive; only the dropped client's
+      // grant cascaded.
+      expect(getClient(db, keep.client.clientId)).not.toBeNull();
+      expect(findGrant(db, user.id, keep.client.clientId)).not.toBeNull();
+      expect(getClient(db, drop.client.clientId)).toBeNull();
+      expect(findGrant(db, user.id, drop.client.clientId)).toBeNull();
     } finally {
       cleanup();
     }

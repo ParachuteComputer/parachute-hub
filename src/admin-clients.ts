@@ -4,8 +4,11 @@
  * without round-tripping through the `/oauth/authorize` flow (whose
  * `POST /oauth/authorize/approve` requires a `return_to` authorize URL).
  *
- *   GET  /api/oauth/clients/<client_id>            client details
- *   POST /api/oauth/clients/<client_id>/approve    flip status to approved
+ *   GET    /api/oauth/clients/<client_id>          client details
+ *   POST   /api/oauth/clients/<client_id>/approve  flip status to approved
+ *   DELETE /oauth/clients/<client_id>              deregister (RFC 7592) — note
+ *                                                  the TOP-LEVEL prefix, see
+ *                                                  handleDeleteClient
  *
  * Both gated by `parachute:host:admin` Bearer (same shape as /api/grants,
  * /api/auth/tokens, etc.). The SPA mints one via the session cookie at
@@ -54,7 +57,7 @@ import {
   requireScope,
 } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
-import { approveClient, getClient } from "./clients.ts";
+import { approveClient, deleteClient, getClient } from "./clients.ts";
 import { isSafeAuthorizeReturnTo } from "./oauth-handlers.ts";
 
 export interface AdminClientsDeps {
@@ -175,6 +178,55 @@ export async function handleApproveClient(
       "cache-control": "no-store",
     },
   });
+}
+
+/**
+ * RFC 7592 Dynamic Client Registration *deletion* (deregistration).
+ *
+ *   DELETE /oauth/clients/<client_id>    remove the client + its cascade
+ *
+ * Mounted at the TOP-LEVEL `/oauth/clients/` prefix (NOT under `/api/...`)
+ * because that's the path parachute-surface's remove-flow actually calls
+ * (`packages/surface-host/src/dcr.ts` → `DELETE <hub>/oauth/clients/<id>`),
+ * carrying the operator token as a Bearer. Before this route existed the
+ * hub 404'd every such DELETE, so every Notes/Claude reconnect orphaned a
+ * `clients` row in the operator's DB (closes hub#640, 4/5 boxes — the GC
+ * reaper for legacy orphans is a separate follow-up).
+ *
+ * Auth mirrors `handleGetClient`: `parachute:host:admin` Bearer via
+ * `requireScope`. Returns 204 (no content) on a successful delete, 404 when
+ * the client isn't registered — the same shape the surface already tolerates
+ * (`hubDeleteStatus: "ok"` on 200/204, `"not_found"` on a JSON 404).
+ *
+ * Audit: emits a `client deleted: ...` line in the same `key=value` shape as
+ * the `client approved: ...` line, so cross-machine "who removed this client"
+ * is greppable in hub.log.
+ */
+export async function handleDeleteClient(
+  req: Request,
+  clientId: string,
+  deps: AdminClientsDeps,
+): Promise<Response> {
+  if (req.method !== "DELETE") {
+    return jsonError(405, "method_not_allowed", "use DELETE");
+  }
+  let ctx: AdminAuthContext;
+  try {
+    ctx = await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+  } catch (err) {
+    return adminAuthErrorResponse(err as AdminAuthError);
+  }
+  // Capture the name BEFORE deleting so the audit line can carry it.
+  const before = getClient(deps.db, clientId);
+  const removed = deleteClient(deps.db, clientId);
+  if (!removed) {
+    return jsonError(404, "not_found", `no client registered with id ${clientId}`);
+  }
+  console.log(
+    `client deleted: client_id=${clientId} client_name=${before?.clientName ?? ""} remover_sub=${ctx.sub}`,
+  );
+  // 204 No Content — RFC 7592 §2.3 prescribes 204 for a successful delete.
+  return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
 }
 
 interface ApproveClientResponse {

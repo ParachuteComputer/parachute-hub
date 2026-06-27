@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getClient, registerClient } from "../clients.ts";
 import {
   CORS_PREFLIGHT_HEADERS,
   CORS_RESPONSE_HEADERS,
@@ -11,7 +12,9 @@ import {
 } from "../cors.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
+import { signAccessToken } from "../jwt-sign.ts";
 import { writeManifest } from "../services-manifest.ts";
+import { createUser } from "../users.ts";
 
 const GITCOIN_BRAIN_ORIGIN = "https://unforced-dev.github.io";
 const EXAMPLE_ORIGIN = "https://example.com";
@@ -51,10 +54,12 @@ describe("cors helper module", () => {
     expect(CORS_RESPONSE_HEADERS["access-control-expose-headers"]).toContain("WWW-Authenticate");
   });
 
-  test("CORS_PREFLIGHT_HEADERS announces GET + POST + OPTIONS and standard request headers", () => {
+  test("CORS_PREFLIGHT_HEADERS announces GET + POST + DELETE + OPTIONS and standard request headers", () => {
     const methods = CORS_PREFLIGHT_HEADERS["access-control-allow-methods"] ?? "";
     expect(methods).toContain("GET");
     expect(methods).toContain("POST");
+    // DELETE for RFC 7592 client deregistration (hub#640).
+    expect(methods).toContain("DELETE");
     expect(methods).toContain("OPTIONS");
     const headers = CORS_PREFLIGHT_HEADERS["access-control-allow-headers"] ?? "";
     expect(headers).toContain("Authorization");
@@ -577,6 +582,138 @@ describe("hubFetch CORS scope discipline — out-of-scope routes stay same-origi
         const acao = res.headers.get("access-control-allow-origin");
         expect(acao).not.toBe(GITCOIN_BRAIN_ORIGIN);
         expect(acao).not.toBe("*");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// hub#640 — confirm the TOP-LEVEL DELETE /oauth/clients/<id> route is wired
+// into the real dispatch (not just the handler in isolation). This is the
+// load-bearing "right prefix" check: the surface remove-flow fires DELETE at
+// exactly this path, and before this route the hub 404'd it. Goes through
+// hubFetch so the dispatch order + the path-prefix branch are exercised.
+describe("hub#640 DELETE /oauth/clients/<id> dispatch (RFC 7592)", () => {
+  async function operatorBearer(db: ReturnType<typeof openHubDb>): Promise<string> {
+    const user = await createUser(db, "owner", "pw");
+    const minted = await signAccessToken(db, {
+      sub: user.id,
+      scopes: ["parachute:host:admin"],
+      audience: "hub",
+      clientId: "parachute-hub-spa",
+      issuer: ISSUER,
+      ttlSeconds: 600,
+    });
+    return minted.token;
+  }
+
+  test("204 + row gone with a valid operator Bearer (the surface remove-flow path)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const bearer = await operatorBearer(db);
+        const id = registerClient(db, {
+          redirectUris: ["https://app.example/cb"],
+          clientName: "Notes",
+        }).client.clientId;
+
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+        })(
+          new Request(`${ISSUER}/oauth/clients/${encodeURIComponent(id)}`, {
+            method: "DELETE",
+            headers: { authorization: `Bearer ${bearer}` },
+          }),
+        );
+        expect(res.status).toBe(204);
+        expect(getClient(db, id)).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("401 without a Bearer — the route is auth-gated, not open", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const id = registerClient(db, {
+          redirectUris: ["https://app.example/cb"],
+        }).client.clientId;
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+        })(
+          new Request(`${ISSUER}/oauth/clients/${encodeURIComponent(id)}`, {
+            method: "DELETE",
+          }),
+        );
+        expect(res.status).toBe(401);
+        // Row survives an unauthenticated DELETE.
+        expect(getClient(db, id)).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("404 for an absent client_id through dispatch (matches surface 'not_found')", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const bearer = await operatorBearer(db);
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+        })(
+          new Request(`${ISSUER}/oauth/clients/no-such-client`, {
+            method: "DELETE",
+            headers: { authorization: `Bearer ${bearer}` },
+          }),
+        );
+        expect(res.status).toBe(404);
+        // The surface keys off a JSON 404 → hubDeleteStatus "not_found".
+        const body = (await res.json()) as Record<string, unknown>;
+        expect(body.error).toBe("not_found");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("OPTIONS preflight on the DELETE path advertises DELETE in Allow-Methods", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        const res = await hubFetch(h.dir, {
+          getDb: () => db,
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+        })(preflight("/oauth/clients/some-id", EXAMPLE_ORIGIN));
+        expect(res.status).toBe(204);
+        expect(res.headers.get("access-control-allow-methods")).toContain("DELETE");
+        expect(res.headers.get("access-control-allow-origin")).toBe(EXAMPLE_ORIGIN);
       } finally {
         db.close();
       }

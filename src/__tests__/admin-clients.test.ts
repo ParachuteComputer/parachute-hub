@@ -12,8 +12,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { handleApproveClient, handleGetClient } from "../admin-clients.ts";
+import { handleApproveClient, handleDeleteClient, handleGetClient } from "../admin-clients.ts";
 import { approveClient, getClient, registerClient } from "../clients.ts";
+import { findGrant, recordGrant } from "../grants.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { signAccessToken } from "../jwt-sign.ts";
 import { createUser } from "../users.ts";
@@ -81,6 +82,23 @@ function approveReq(clientId: string, bearer?: string, method = "POST"): Request
   const init: RequestInit = { method };
   if (bearer) init.headers = { authorization: `Bearer ${bearer}` };
   return new Request(`${ISSUER}/api/oauth/clients/${encodeURIComponent(clientId)}/approve`, init);
+}
+
+// DELETE hits the TOP-LEVEL /oauth/clients/<id> prefix (the path the surface
+// remove-flow calls), not the /api/... admin prefix the GET/approve use.
+function deleteReq(clientId: string, bearer?: string, method = "DELETE"): Request {
+  const init: RequestInit = { method };
+  if (bearer) init.headers = { authorization: `Bearer ${bearer}` };
+  return new Request(`${ISSUER}/oauth/clients/${encodeURIComponent(clientId)}`, init);
+}
+
+function regApproved(name?: string): string {
+  const r = registerClient(harness.db, {
+    redirectUris: ["https://app.example/cb"],
+    scopes: ["vault:work:read"],
+    ...(name !== undefined ? { clientName: name } : {}),
+  });
+  return r.client.clientId;
 }
 
 describe("handleGetClient", () => {
@@ -458,5 +476,89 @@ describe("handleApproveClient", () => {
       expect(body.already_approved).toBe(true);
       expect(body.redirect_to).toBe(returnTo);
     });
+  });
+});
+
+// hub#640 — RFC 7592 client deregistration. The surface fires DELETE on the
+// top-level /oauth/clients/<id> path; the handler is operator-bearer-gated,
+// returns 204 on delete (cascading grants + auth_codes), 404 when absent.
+describe("handleDeleteClient", () => {
+  test("401 without Bearer (row survives)", async () => {
+    const id = regApproved("App");
+    const res = await handleDeleteClient(deleteReq(id), id, {
+      db: harness.db,
+      issuer: ISSUER,
+    });
+    expect(res.status).toBe(401);
+    expect(getClient(harness.db, id)).not.toBeNull();
+  });
+
+  test("403 with the wrong scope (row survives)", async () => {
+    const { bearer } = await makeOperatorBearer(["parachute:host:auth"]);
+    const id = regApproved("App");
+    const res = await handleDeleteClient(deleteReq(id, bearer), id, {
+      db: harness.db,
+      issuer: ISSUER,
+    });
+    expect(res.status).toBe(403);
+    expect(getClient(harness.db, id)).not.toBeNull();
+  });
+
+  test("204 on an existing client + cascade gone + audit line", async () => {
+    const { bearer, userId } = await makeOperatorBearer();
+    const id = regApproved("Notes");
+    // Plant a grant so the cascade has something to remove.
+    recordGrant(harness.db, userId, id, ["vault:work:read"]);
+    expect(findGrant(harness.db, userId, id)).not.toBeNull();
+
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    let res: Response;
+    try {
+      res = await handleDeleteClient(deleteReq(id, bearer), id, {
+        db: harness.db,
+        issuer: ISSUER,
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    expect(res.status).toBe(204);
+    // 204 carries no body.
+    expect(await res.text()).toBe("");
+    // Client + its grant are gone.
+    expect(getClient(harness.db, id)).toBeNull();
+    expect(findGrant(harness.db, userId, id)).toBeNull();
+
+    const line = logs.find((l) => l.startsWith("client deleted:"));
+    expect(line).toBeDefined();
+    expect(line).toContain(`client_id=${id}`);
+    expect(line).toContain("client_name=Notes");
+    expect(line).toContain(`remover_sub=${userId}`);
+  });
+
+  test("404 on an absent client_id", async () => {
+    const { bearer } = await makeOperatorBearer();
+    const res = await handleDeleteClient(deleteReq("nope", bearer), "nope", {
+      db: harness.db,
+      issuer: ISSUER,
+    });
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe("not_found");
+  });
+
+  test("405 on a non-DELETE method", async () => {
+    const { bearer } = await makeOperatorBearer();
+    const id = regApproved();
+    const res = await handleDeleteClient(deleteReq(id, bearer, "GET"), id, {
+      db: harness.db,
+      issuer: ISSUER,
+    });
+    expect(res.status).toBe(405);
+    // Row untouched.
+    expect(getClient(harness.db, id)).not.toBeNull();
   });
 });

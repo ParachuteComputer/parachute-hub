@@ -204,6 +204,41 @@ export function getClient(db: Database, clientId: string): OAuthClient | null {
 }
 
 /**
+ * Delete an OAuth client and everything that references it. Returns true when
+ * a client row was removed, false when no such client existed.
+ *
+ * Backs the RFC 7592 `DELETE /oauth/clients/<id>` deregistration endpoint
+ * (closes hub#640): parachute-surface fires a best-effort DELETE on every
+ * Notes/Claude remove-flow, so without this helper + route every reconnect
+ * orphaned a `clients` row in the operator's hub DB.
+ *
+ * CASCADE-BY-HAND. `auth_codes.client_id` and `grants.client_id` both
+ * `REFERENCES clients(client_id)` with NO `ON DELETE CASCADE`, and the hub
+ * opens its DB with `PRAGMA foreign_keys = ON` — so a bare
+ * `DELETE FROM clients` while a dependent auth_code or grant row exists
+ * throws a FOREIGN KEY constraint violation. We delete the dependents FIRST,
+ * then the client row, all inside a single transaction so a mid-cascade
+ * failure rolls the whole thing back (no half-deleted client). Modelled on
+ * `grants.revokeGrant` + the vault-delete cascade in `admin-vaults`.
+ *
+ * Note on tokens: access tokens already minted for this client are NOT
+ * touched here (the `tokens` registry is keyed by jti, not client_id, and
+ * carries no FK to `clients`). They expire on their own; an operator who
+ * wants to kill live sessions runs `/oauth/revoke` separately. Same posture
+ * `revokeGrant` documents.
+ */
+export function deleteClient(db: Database, clientId: string): boolean {
+  return db.transaction(() => {
+    // Delete dependents first — FK ON, no cascade, so the client row can't
+    // go while an auth_code or grant still points at it.
+    db.prepare("DELETE FROM auth_codes WHERE client_id = ?").run(clientId);
+    db.prepare("DELETE FROM grants WHERE client_id = ?").run(clientId);
+    const res = db.prepare("DELETE FROM clients WHERE client_id = ?").run(clientId);
+    return res.changes > 0;
+  })();
+}
+
+/**
  * Returns the registered redirect URI matching `candidate` exactly, or throws.
  * RFC 8252 + 6749 require exact-match for redirect URIs (no wildcards, no
  * loose comparison) — anything looser is an open-redirect waiting to happen.
