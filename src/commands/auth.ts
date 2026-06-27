@@ -25,7 +25,7 @@
 
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { approveClient, getClient, listClientsByStatus } from "../clients.ts";
+import { approveClient, deleteClient, getClient, listClientsByStatus } from "../clients.ts";
 import { CONFIG_DIR } from "../config.ts";
 import { readExposeState } from "../expose-state.ts";
 import { listGrantsForUser, revokeGrant } from "../grants.ts";
@@ -96,6 +96,7 @@ const HUB_LOCAL_SUBCOMMANDS = new Set([
   "revoke-token",
   "pending-clients",
   "approve-client",
+  "revoke-client",
   "list-grants",
   "revoke-grant",
 ]);
@@ -135,6 +136,9 @@ Usage:
                                        exits 0.
   parachute auth pending-clients       List OAuth clients awaiting approval
   parachute auth approve-client <id>   Approve a pending OAuth client
+  parachute auth revoke-client <id>    Deregister (delete) an OAuth client,
+                                       cascading its grants + auth codes
+                                       (RFC 7592 deregistration)
   parachute auth list-grants [--username <name>]
                                        Show OAuth scope grants on record
   parachute auth revoke-grant <client_id> [--username <name>]
@@ -613,6 +617,44 @@ function runApproveClient(args: readonly string[], deps: AuthDeps): number {
       return 1;
     }
     console.log(`Approved OAuth client "${clientId}".`);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * `parachute auth revoke-client <id>` — RFC 7592 deregistration from the
+ * terminal. The CLI complement to the `DELETE /oauth/clients/<id>` route
+ * parachute-surface fires automatically; an operator runs this to clean up
+ * an orphaned / stale client by hand (closes hub#640). Calls the
+ * `deleteClient` cascade helper directly (same db, no round-trip through the
+ * HTTP route) and emits the same `client deleted:` audit line the route does
+ * so browser-driven and terminal-driven deletions are uniformly greppable in
+ * hub.log. `remover_sub=cli` distinguishes the terminal path (which has no
+ * authenticated JWT subject) from the route's `remover_sub=<jwt sub>`.
+ */
+function runRevokeClient(args: readonly string[], deps: AuthDeps): number {
+  const clientId = args[0];
+  if (!clientId) {
+    console.error("parachute auth revoke-client: missing client_id argument");
+    console.error("usage: parachute auth revoke-client <client_id>");
+    return 1;
+  }
+  const db = deps.dbPath ? openHubDb(deps.dbPath) : openHubDb();
+  try {
+    // Read the name before deleting so the audit line + confirmation can
+    // carry it. getClient also gives us the "exists?" answer for the 404 path.
+    const before = getClient(db, clientId);
+    const removed = deleteClient(db, clientId);
+    if (!removed) {
+      console.error(`no OAuth client registered with client_id "${clientId}"`);
+      return 1;
+    }
+    console.log(
+      `client deleted: client_id=${clientId} client_name=${before?.clientName ?? ""} remover_sub=cli`,
+    );
+    console.log(`Deregistered OAuth client "${clientId}" (grants + auth codes cascaded).`);
     return 0;
   } finally {
     db.close();
@@ -1402,6 +1444,15 @@ export async function auth(args: readonly string[], deps: AuthDeps | Runner = {}
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`parachute auth approve-client: ${msg}`);
+        return 1;
+      }
+    }
+    if (sub === "revoke-client") {
+      try {
+        return runRevokeClient(args.slice(1), normalized);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`parachute auth revoke-client: ${msg}`);
         return 1;
       }
     }

@@ -849,6 +849,75 @@ describe("parachute auth pending-clients / approve-client", () => {
   });
 });
 
+// hub#640 — RFC 7592 deregistration from the terminal.
+describe("parachute auth revoke-client", () => {
+  test("revoke-client without an arg is a usage error", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      const { code, stderr } = await captureOutput(() => auth(["revoke-client"], deps));
+      expect(code).toBe(1);
+      expect(stderr).toContain("missing client_id");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("revoke-client <unknown> exits 1 with a friendly message", async () => {
+    const tmp = makeTmp();
+    try {
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      const { code, stderr } = await captureOutput(() => auth(["revoke-client", "no-such"], deps));
+      expect(code).toBe(1);
+      expect(stderr).toContain("no OAuth client");
+    } finally {
+      tmp.cleanup();
+    }
+  });
+
+  test("revoke-client deletes the client + cascades its grant + emits audit line", async () => {
+    const tmp = makeTmp();
+    try {
+      const db = openHubDb(tmp.dbPath);
+      let userId: string;
+      let clientId: string;
+      try {
+        const user = await createUser(db, "owner", "pw");
+        userId = user.id;
+        clientId = registerClient(db, {
+          redirectUris: ["https://app.example/cb"],
+          clientName: "MyApp",
+        }).client.clientId;
+        recordGrant(db, userId, clientId, ["vault:work:read"]);
+        expect(findGrant(db, userId, clientId)).not.toBeNull();
+      } finally {
+        db.close();
+      }
+      const deps: AuthDeps = { dbPath: tmp.dbPath };
+      const { code, stdout } = await captureOutput(() => auth(["revoke-client", clientId], deps));
+      expect(code).toBe(0);
+      expect(stdout).toContain("Deregistered OAuth client");
+      // Audit line for greppability (matches the route's shape, remover_sub=cli).
+      expect(stdout).toContain(`client deleted: client_id=${clientId}`);
+      expect(stdout).toContain("client_name=MyApp");
+      expect(stdout).toContain("remover_sub=cli");
+
+      // Verify the cascade actually landed in the db.
+      const db2 = openHubDb(tmp.dbPath);
+      try {
+        expect(
+          db2.query("SELECT client_id FROM clients WHERE client_id = ?").get(clientId),
+        ).toBeNull();
+        expect(findGrant(db2, userId, clientId)).toBeNull();
+      } finally {
+        db2.close();
+      }
+    } finally {
+      tmp.cleanup();
+    }
+  });
+});
+
 // closes #75 — operator-facing controls for the OAuth consent skip-list.
 describe("parachute auth list-grants / revoke-grant", () => {
   test("list-grants shows the seeding hint when no users exist", async () => {
