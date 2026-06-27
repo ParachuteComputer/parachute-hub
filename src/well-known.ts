@@ -247,7 +247,16 @@ export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
     // multi-path on those is treated as aliases rather than separate
     // installs.
     const isVault = isVaultEntry(s);
-    const pathsToEmit = isVault && s.paths.length > 0 ? s.paths : [s.paths[0] ?? "/"];
+    // #478: an empty-paths VAULT row means "installed but no servable vault
+    // instance" — vault's self-register emits `paths: []` at zero vaults.
+    // Skip it entirely: emitting `["/"]` here would fabricate a phantom vault
+    // entry at root in both the `services` catalog and the `vaults` array.
+    // This mirrors the empty-paths `continue` in admin-vaults.ts / vault-names.ts
+    // so every read path agrees: a vault instance exists only by a real
+    // `/vault/<name>` mount path. Non-vault services keep the `paths[0] ?? "/"`
+    // fallback (a path-less non-vault row legitimately mounts at root).
+    if (isVault && s.paths.length === 0) continue;
+    const pathsToEmit = isVault ? s.paths : [s.paths[0] ?? "/"];
     for (const path of pathsToEmit) {
       const url = new URL(path, `${base}/`).toString();
       const infoUrl = new URL(joinInfoPath(path), `${base}/`).toString();

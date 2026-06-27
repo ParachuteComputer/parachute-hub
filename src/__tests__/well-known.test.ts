@@ -472,13 +472,48 @@ describe("buildWellKnown", () => {
     );
   });
 
-  test("falls back to / for empty paths", () => {
+  test("an empty-paths VAULT row is skipped entirely — no phantom default (#478)", () => {
+    // A vault services row with `paths: []` means "module installed but no
+    // servable vault instance" (vault's self-register emits this at zero
+    // vaults). It must NOT fabricate a vault entry at root in either the
+    // `vaults` array or the flat `services` catalog. Mirrors the empty-paths
+    // skip in admin-vaults.ts / vault-names.ts / oauth-handlers.ts.
     const entry: ServiceEntry = { ...vault, paths: [] };
     const doc = buildWellKnown({
       services: [entry],
       canonicalOrigin: "https://x.example",
     });
-    expect(doc.vaults[0]?.url).toBe("https://x.example/");
+    expect(doc.vaults).toEqual([]);
+    // The row contributes nothing to the flat services list either — no
+    // phantom `/` mount advertised.
+    expect(doc.services).toEqual([]);
+  });
+
+  test("positive control: a vault row WITH a path still emits its vault + services entries (#478)", () => {
+    const doc = buildWellKnown({
+      services: [{ ...vault, paths: ["/vault/default"] }],
+      canonicalOrigin: "https://x.example",
+    });
+    expect(doc.vaults).toEqual([
+      {
+        name: "default",
+        url: "https://x.example/vault/default",
+        version: "0.2.4",
+      },
+    ]);
+    expect(doc.services.map((s) => s.name)).toEqual(["parachute-vault"]);
+  });
+
+  test("a NON-vault row with empty paths still falls back to / (#478 scope guard)", () => {
+    // The empty-paths skip is vault-only. A non-vault service legitimately
+    // mounts at root when path-less — that behavior is unchanged.
+    const entry: ServiceEntry = { ...notes, paths: [] };
+    const doc = buildWellKnown({
+      services: [entry],
+      canonicalOrigin: "https://x.example",
+    });
+    expect(doc.services.map((s) => s.path)).toEqual(["/"]);
+    expect(doc.notes).toEqual([{ url: "https://x.example/", version: "0.0.1" }]);
   });
 
   // Hierarchical sub-units (hub#313 — parachute-app design doc §12). Each
