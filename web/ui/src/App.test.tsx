@@ -43,6 +43,10 @@ vi.mock("./lib/api.ts", async (orig) => {
       idle_seconds: 900,
       unlock_seconds_remaining: 0,
     }),
+    // The real /heartbeat response carries idle_seconds (see api-admin-lock.ts);
+    // the client re-anchors its idle timer from it. (A prior mock that included
+    // idle_seconds masked the bug where the server omitted it — keep this
+    // matching the real wire shape.)
     adminLockHeartbeat: vi.fn().mockResolvedValue({
       configured: false,
       locked: false,
