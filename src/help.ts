@@ -373,6 +373,7 @@ export function doctorHelp(): string {
 
 Usage:
   parachute doctor [--json]
+  parachute doctor --fix [--yes]
 
 What it does:
   Runs a set of independent health checks and prints a grouped report
@@ -386,6 +387,10 @@ What it does:
     - Each CONFIGURED module alive via its loopback /health (2xx or 401 = live).
     - services.json parses + required fields valid (a missing file is the
       fresh pre-install state, not a failure).
+    - Services on canonical ports — flags any KNOWN module whose port has
+      drifted off its canonical slot, or two services sharing one port
+      (legacy services.json written before the validation gate). A
+      third-party service with no canonical port is never flagged.
     - operator.token exists, parses, and its issuer matches the hub (the
       recurring "not signed in to the hub" / issuer-mismatch class).
     - Each first-party module bin is executable (catches the lost-+x-bit
@@ -398,10 +403,20 @@ What it does:
 
 Flags:
   --json     emit a single JSON object instead of the human report
+  --fix      repair canonical-port drift in services.json — and ONLY that.
+             It is NOT a "fix everything" flag; every other check stays
+             report-only. Shows the old→new diff first, then confirms before
+             writing (a TTY prompts; --yes skips the prompt; a non-TTY without
+             --yes bails without writing). Idempotent: a clean file is a no-op.
+             Duplicate-port collisions are reported, not auto-resolved.
+  --yes      skip the --fix confirmation prompt (required to apply in a
+             non-interactive shell)
 
 Exit codes:
-  0   no failures (warnings are advisory and still exit 0)
-  1   one or more checks failed
+  0   no failures (warnings are advisory and still exit 0); --fix: applied or
+      nothing-to-fix
+  1   one or more checks failed; or --fix bailed (non-TTY without --yes /
+      aborted at the prompt / unreadable services.json)
 `;
 }
 
