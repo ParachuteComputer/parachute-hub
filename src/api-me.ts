@@ -14,7 +14,12 @@
  * Response shape:
  *
  *   { hasSession: false }
- *   { hasSession: true, user: { id, displayName }, csrf: "<token>" }
+ *   { hasSession: true, user: { id, displayName }, csrf: "<token>",
+ *     two_factor_enabled: boolean }
+ *
+ * `two_factor_enabled` (hub#85) lets the SPA's "My account" page render the
+ * 2FA status without a separate read. It reflects `users.totp_secret` being
+ * set for the signed-in user.
  *
  * `displayName` is the user's `username` today — there's no separate
  * display-name field on the User shape. Surfaced under a different key
@@ -39,6 +44,7 @@
 import type { Database } from "bun:sqlite";
 import { ensureCsrfToken } from "./csrf.ts";
 import { findActiveSession } from "./sessions.ts";
+import { isTotpEnrolled } from "./two-factor-store.ts";
 import { getUserById } from "./users.ts";
 
 export interface ApiMeDeps {
@@ -59,7 +65,9 @@ interface SignedInUser {
  * that mixes states — e.g. `{ hasSession: false, user: staleUser }`
  * fails at the type-check, not just at code-review.
  */
-type ApiMeResponse = { hasSession: false } | { hasSession: true; user: SignedInUser; csrf: string };
+type ApiMeResponse =
+  | { hasSession: false }
+  | { hasSession: true; user: SignedInUser; csrf: string; two_factor_enabled: boolean };
 
 export function handleApiMe(req: Request, deps: ApiMeDeps): Response {
   if (req.method !== "GET") {
@@ -99,6 +107,7 @@ export function handleApiMe(req: Request, deps: ApiMeDeps): Response {
       displayName: user.username,
     },
     csrf: csrf.token,
+    two_factor_enabled: isTotpEnrolled(deps.db, user.id),
   };
   return new Response(JSON.stringify(body), { status: 200, headers });
 }
