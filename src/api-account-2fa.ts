@@ -224,7 +224,9 @@ async function handleConfirm(
   // by user.id, lenient (10/15min) so honest enroll mistypes aren't punished —
   // defense-in-depth (#712). Fires AFTER the format + already-enrolled guards so
   // junk/no-op POSTs don't burn the legit enroller's budget, and BEFORE the
-  // code verify so the grind window is actually bounded.
+  // code verify so the grind window is actually bounded. A SUCCESSFUL confirm
+  // also consumes one slot (checkAndRecord counts every attempt) — harmless,
+  // since an enrolled account 409s on any further confirm anyway.
   const confirmLimited = totpEnrollConfirmRateLimiter.checkAndRecord(
     user.id,
     deps.now ? deps.now() : new Date(),

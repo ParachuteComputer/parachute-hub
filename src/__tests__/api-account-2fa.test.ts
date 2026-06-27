@@ -341,6 +341,29 @@ describe("/api/account/2fa start + confirm", () => {
     expect(isTotpEnrolled(harness.db, userId)).toBe(false);
   });
 
+  test("malformed-secret POSTs don't burn the confirm budget (#712)", async () => {
+    const { userId, cookie } = await userWithSession(harness.db, "owner", "owner-password-123");
+    const startRes = await post("/2fa/start", cookie, { __csrf: TEST_CSRF });
+    const { secret } = (await startRes.json()) as { secret: string };
+    // 10 junk POSTs are rejected by the format guard BEFORE the limiter runs.
+    for (let i = 0; i < 10; i++) {
+      const r = await post("/2fa/confirm", cookie, {
+        __csrf: TEST_CSRF,
+        secret: "not-base32!!",
+        code: "000000",
+      });
+      expect(r.status).toBe(400);
+    }
+    // Budget untouched — the legit live code still enrolls on the next attempt.
+    const ok = await post("/2fa/confirm", cookie, {
+      __csrf: TEST_CSRF,
+      secret,
+      code: liveCode(secret),
+    });
+    expect(ok.status).toBe(200);
+    expect(isTotpEnrolled(harness.db, userId)).toBe(true);
+  });
+
   test("a few mistypes then the live code within budget still enrolls (lenient)", async () => {
     const { userId, cookie } = await userWithSession(harness.db, "owner", "owner-password-123");
     const startRes = await post("/2fa/start", cookie, { __csrf: TEST_CSRF });
