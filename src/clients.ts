@@ -239,6 +239,135 @@ export function deleteClient(db: Database, clientId: string): boolean {
 }
 
 /**
+ * Default reaper age threshold: 30 days. A client registered more recently
+ * than this is NEVER reaped — it may be mid-first-OAuth-flow (registered →
+ * user is on the consent screen → no grant/token/code written yet). The
+ * threshold buys generous headroom over the worst-case human consent latency.
+ */
+export const DEFAULT_REAP_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** A client the reaper has proven dead. Carries enough to display a dry-run row. */
+export interface ReapableClient {
+  clientId: string;
+  clientName: string | null;
+  registeredAt: string;
+  status: ClientStatus;
+  /** Whole days since registration, floored. For the dry-run/`--json` display. */
+  ageDays: number;
+}
+
+export interface FindReapableOpts {
+  /** Reap only clients older than this many ms. Defaults to 30 days. */
+  olderThanMs?: number;
+  /** Injectable clock — all age + liveness comparisons use this. */
+  now?: () => Date;
+}
+
+/**
+ * Find OAuth clients that are PROVABLY DEAD and safe to garbage-collect.
+ *
+ * THE SAFETY GATE (maximally conservative — see hub#640). DCR churn (Notes /
+ * Claude mint a fresh `client_id` per reconnect) accumulates dead `clients`
+ * rows; this reaps them. But a reaper that deletes a LIVE client breaks a
+ * user's active connection, and we've been bitten by over-eager pruning
+ * before (a derived-key divergence wrongly pruned still-wanted grants). So a
+ * client is reapable IFF **ALL** of:
+ *
+ *   1. ZERO rows in `grants` — no standing consent. A grant means the user
+ *      approved this client; never touch it.
+ *   2. ZERO live tokens — no row in `tokens` with `expires_at > now AND
+ *      revoked_at IS NULL`. A live token means an active session.
+ *   3. ZERO live auth_codes — no row in `auth_codes` with `expires_at > now`.
+ *      A live code means an OAuth exchange is in flight RIGHT NOW.
+ *   4. `registered_at` older than `olderThanMs` (default 30d) — a freshly-
+ *      registered client may be mid-first-flow before any of the above rows
+ *      land.
+ *
+ * This reaps abandoned-never-consented `pending` DCR registrations and fully-
+ * dead (revoked/expired) clients, and NEVER a client with a live grant, live
+ * token, or in-flight code. Pure read — touches nothing. `reapClient` does the
+ * deletion.
+ *
+ * Implemented as a single `NOT EXISTS` SELECT so the gate is evaluated
+ * atomically per row against one consistent DB snapshot (no read-modify-write
+ * window where a token could land between the check and a later delete — the
+ * delete re-derives nothing; callers re-run the gate, see below).
+ */
+export function findReapableClients(db: Database, opts: FindReapableOpts = {}): ReapableClient[] {
+  const now = opts.now?.() ?? new Date();
+  const olderThanMs = opts.olderThanMs ?? DEFAULT_REAP_AGE_MS;
+  const nowIso = now.toISOString();
+  // Registered strictly before this cutoff to qualify on age (condition 4).
+  const cutoffIso = new Date(now.getTime() - olderThanMs).toISOString();
+
+  const rows = db
+    .query<Row, [string, string, string]>(
+      `SELECT c.* FROM clients c
+       WHERE c.registered_at < ?1
+         AND NOT EXISTS (SELECT 1 FROM grants g WHERE g.client_id = c.client_id)
+         AND NOT EXISTS (
+           SELECT 1 FROM tokens t
+           WHERE t.client_id = c.client_id
+             AND t.revoked_at IS NULL
+             AND t.expires_at > ?2
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM auth_codes a
+           WHERE a.client_id = c.client_id
+             AND a.expires_at > ?3
+         )
+       ORDER BY c.registered_at`,
+    )
+    .all(cutoffIso, nowIso, nowIso);
+
+  return rows.map((r) => {
+    const client = rowToClient(r);
+    const ageMs = now.getTime() - new Date(client.registeredAt).getTime();
+    return {
+      clientId: client.clientId,
+      clientName: client.clientName,
+      registeredAt: client.registeredAt,
+      status: client.status,
+      ageDays: Math.floor(ageMs / (24 * 60 * 60 * 1000)),
+    };
+  });
+}
+
+/**
+ * Garbage-collect a single PROVABLY-DEAD client. Wraps the `deleteClient`
+ * cascade (grants + auth_codes + client row) AND a `DELETE FROM tokens` for
+ * the same client_id, all in ONE transaction.
+ *
+ * Why also delete tokens here when `deleteClient` deliberately leaves them?
+ * `deleteClient` is the general deregistration path — it can run against a
+ * client that still has LIVE tokens (an operator force-removing an app mid-
+ * session), so it leaves the `tokens` rows to expire on their own (they carry
+ * no FK to `clients`). The reaper, by contrast, only ever runs on a client the
+ * gate has PROVEN has no live tokens — every remaining `tokens` row for it is
+ * already expired or revoked (dead). Deleting them completes the GC instead of
+ * leaving dead registry rows behind forever. Callers MUST pass only client_ids
+ * returned by `findReapableClients` (the safety gate); see the CLI's reap loop.
+ *
+ * TOCTOU note: `reapClient` does NOT re-check the gate — it trusts the caller's
+ * list. There is a theoretical window where a grant/token lands between the
+ * `findReapableClients` snapshot and this delete, reaping a client that just
+ * went live. On the single-operator hub this is cosmetically impossible: the
+ * OAuth flow that would create a grant runs synchronously on the same SQLite
+ * connection and never races a CLI invocation. Re-running `findReapableClients`
+ * immediately before each call would close the window at the cost of N extra
+ * round-trips; not worth it under the current trust model.
+ */
+export function reapClient(db: Database, clientId: string): boolean {
+  return db.transaction(() => {
+    // Dead token rows first — the gate proved none are live; this completes
+    // the GC (deleteClient leaves tokens alone for the general delete path).
+    db.prepare("DELETE FROM tokens WHERE client_id = ?").run(clientId);
+    // The cascade: auth_codes + grants (both dead per the gate) + the client.
+    return deleteClient(db, clientId);
+  })();
+}
+
+/**
  * Returns the registered redirect URI matching `candidate` exactly, or throws.
  * RFC 8252 + 6749 require exact-match for redirect URIs (no wildcards, no
  * loose comparison) — anything looser is an open-redirect waiting to happen.

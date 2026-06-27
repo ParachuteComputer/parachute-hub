@@ -558,6 +558,20 @@ const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 16,
+    sql: `
+      -- Index tokens by client_id for the OAuth client GC reaper (#640). The
+      -- reaper's gate runs a correlated NOT EXISTS (SELECT 1 FROM tokens WHERE
+      -- client_id = ? AND ...) per candidate client; tokens previously had no
+      -- client_id index (only user_id / refresh_token_hash / family_id /
+      -- revoked_at / subject), so each check was a full tokens-table walk. Under
+      -- the DCR reconnect churn this GC targets — thousands of dead token rows
+      -- accumulating before a sweep — that is O(total tokens) per client. This
+      -- makes it O(tokens for that client). IF NOT EXISTS so re-opens are inert.
+      CREATE INDEX IF NOT EXISTS tokens_client ON tokens (client_id);
+    `,
+  },
 ];
 
 export function openHubDb(path: string = hubDbPath()): Database {
