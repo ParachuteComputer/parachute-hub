@@ -22,6 +22,7 @@ import type { setup } from "./commands/setup.ts";
 import type { upgrade } from "./commands/upgrade.ts";
 import { ExposeStateError } from "./expose-state.ts";
 import {
+  doctorHelp,
   exposeHelp,
   initHelp,
   installHelp,
@@ -573,6 +574,23 @@ async function main(argv: string[]): Promise<number> {
         if (!mod) return 1;
         return await mod.status({ supervisor: {} });
       }
+
+    case "doctor": {
+      if (isHelpFlag(rest[0])) {
+        console.log(doctorHelp());
+        return 0;
+      }
+      const json = rest.includes("--json");
+      const unknown = rest.find((a) => a !== "--json");
+      if (unknown !== undefined) {
+        console.error(`parachute doctor: unknown argument "${unknown}"`);
+        console.error("usage: parachute doctor [--json]");
+        return 1;
+      }
+      const mod = await loadCommand("doctor", () => import("./commands/doctor.ts"));
+      if (!mod) return 1;
+      return await mod.doctor({ json });
+    }
 
     case "expose": {
       const hubExtract = extractHubOrigin(rest);
