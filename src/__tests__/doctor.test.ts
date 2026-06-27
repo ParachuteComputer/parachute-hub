@@ -333,6 +333,11 @@ describe("doctor — failure modes (each detected in isolation; others stay gree
       const { code, checks } = await runDoctor(h, healthyDeps());
       expect(byName(checks, "migration-detached")?.status).toBe("warn");
       expect(byName(checks, "migration-detached")?.fix).toContain("--to-supervised");
+      // Title must describe the DETECTED condition, not its absence — a warn
+      // titled "No legacy detached install" is the title-vs-status bug.
+      const detachedTitle = byName(checks, "migration-detached")?.title ?? "";
+      expect(detachedTitle.toLowerCase()).toContain("detached");
+      expect(detachedTitle).not.toMatch(/^no /i);
       // A WARN is advisory — exit code stays 0.
       expect(code).toBe(0);
       expectNoUnexpectedNonPass(checks, ["migration-detached"]);
@@ -351,6 +356,10 @@ describe("doctor — failure modes (each detected in isolation; others stay gree
       const { code, checks } = await runDoctor(h, healthyDeps());
       expect(byName(checks, "migration-cruft")?.status).toBe("warn");
       expect(byName(checks, "migration-cruft")?.fix).toBe("parachute migrate");
+      // Title must describe the DETECTED condition, not its absence.
+      const cruftTitle = byName(checks, "migration-cruft")?.title ?? "";
+      expect(cruftTitle.toLowerCase()).toContain("cruft");
+      expect(cruftTitle).not.toMatch(/^no /i);
       expect(code).toBe(0);
       expectNoUnexpectedNonPass(checks, ["migration-cruft"]);
     } finally {

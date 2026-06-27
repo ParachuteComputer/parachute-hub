@@ -369,9 +369,12 @@ async function checkModulesAlive(
  * doctor reads leniently so one bad row doesn't sink every other check).
  */
 function checkServicesManifest(manifestPath: string): CheckResult {
-  let raw: string | undefined;
+  // Probe presence FIRST so we can tell apart absent (→ fresh-install PASS)
+  // from present-but-malformed (→ FAIL below). Without this split a missing
+  // services.json would reach readManifest's throw and be reported as
+  // "malformed" — a false positive on the fresh install we must never flag.
   try {
-    raw = readFileSync(manifestPath, "utf8");
+    readFileSync(manifestPath, "utf8");
   } catch {
     // ENOENT (or unreadable) — treat absence as the fresh, pre-install state.
     return {
@@ -381,7 +384,6 @@ function checkServicesManifest(manifestPath: string): CheckResult {
       detail: "no services.json yet — fresh install (nothing configured)",
     };
   }
-  void raw;
   try {
     const manifest = readManifest(manifestPath);
     return {
@@ -635,7 +637,7 @@ function checkMigration(
   if (priorDetached) {
     out.push({
       name: "migration-detached",
-      title: "No legacy detached install",
+      title: "Legacy detached install detected",
       status: "warn",
       detail:
         "this box has a prior detached-model install (pidfiles present) — the current hub runs supervised under a process manager",
@@ -652,7 +654,7 @@ function checkMigration(
   if (notice) {
     out.push({
       name: "migration-cruft",
-      title: "No archivable cruft at ecosystem root",
+      title: "Archivable cruft at ecosystem root",
       status: "warn",
       detail: notice.replace(/^parachute migrate: /, "").replace(/ — run.*$/, ""),
       fix: "parachute migrate",
