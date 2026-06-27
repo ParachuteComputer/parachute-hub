@@ -104,7 +104,7 @@ describe("App — brand subtitle (route-derived)", () => {
 });
 
 describe("App — nav structure", () => {
-  it("renders all hub-native nav links in order: brand, Home, Connections, Modules, Users, Tokens, Permissions, Settings, Discovery (signed-out)", async () => {
+  it("renders all hub-native nav links in order: brand, Home, Connections, Modules, Users, Tokens, Permissions, Settings, My account, Discovery (signed-out)", async () => {
     renderAt("/vaults");
     // Wait for /api/me to resolve so AuthIndicator's "Sign in" link
     // appears in the nav before we snapshot the link order.
@@ -133,6 +133,7 @@ describe("App — nav structure", () => {
       "Tokens",
       "Permissions",
       "Settings",
+      "My account",
       // Past the divider: the off-shell Discovery escape hatch.
       "Discovery",
     ]);
@@ -162,6 +163,7 @@ describe("App — nav structure", () => {
       "Tokens",
       "Permissions",
       "Settings",
+      "My account",
     ]) {
       expect(
         within(nav).getByRole("link", { name: new RegExp(`^${label}$`, "i") }),
@@ -285,6 +287,7 @@ describe("App — auth indicator (rc.13)", () => {
       hasSession: true,
       user: { id: "u1", displayName: "aaron" },
       csrf: "csrf-token-abc",
+      two_factor_enabled: false,
     });
     renderAt("/vaults");
     await waitFor(() => expect(screen.getByText(/signed in as/i)).toBeInTheDocument());
@@ -299,6 +302,7 @@ describe("App — auth indicator (rc.13)", () => {
       hasSession: true,
       user: { id: "u1", displayName: "aaron" },
       csrf: "csrf-token-abc",
+      two_factor_enabled: false,
     });
     vi.mocked(api.signOut).mockResolvedValue();
     // Stub window.location so we can observe the navigation without
@@ -327,6 +331,7 @@ describe("App — auth indicator (rc.13)", () => {
       hasSession: true,
       user: { id: "u1", displayName: "aaron" },
       csrf: "csrf-token-abc",
+      two_factor_enabled: false,
     });
     let resolveSignOut: () => void = () => {};
     vi.mocked(api.signOut).mockReturnValue(
@@ -351,6 +356,7 @@ describe("App — installed-services dropdown (hub#342)", () => {
       hasSession: true,
       user: { id: "u1", displayName: "aaron" },
       csrf: "csrf",
+      two_factor_enabled: false,
     });
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [],
@@ -367,6 +373,7 @@ describe("App — installed-services dropdown (hub#342)", () => {
       hasSession: true,
       user: { id: "u1", displayName: "aaron" },
       csrf: "csrf",
+      two_factor_enabled: false,
     });
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [
@@ -479,6 +486,7 @@ describe("App — admin screen lock", () => {
       hasSession: true,
       user: { id: "u1", displayName: "Op" },
       csrf: "csrf-1",
+      two_factor_enabled: false,
     });
     vi.mocked(api.getAdminLockStatus).mockResolvedValue({
       configured: true,
@@ -497,6 +505,7 @@ describe("App — admin screen lock", () => {
       hasSession: true,
       user: { id: "u1", displayName: "Op" },
       csrf: "csrf-1",
+      two_factor_enabled: false,
     });
     vi.mocked(api.getAdminLockStatus).mockResolvedValue({
       configured: true,
@@ -515,6 +524,7 @@ describe("App — admin screen lock", () => {
       hasSession: true,
       user: { id: "u1", displayName: "Op" },
       csrf: "csrf-1",
+      two_factor_enabled: false,
     });
     vi.mocked(api.getAdminLockStatus).mockResolvedValue({
       configured: false,
@@ -532,6 +542,7 @@ describe("App — admin screen lock", () => {
       hasSession: true,
       user: { id: "u1", displayName: "Op" },
       csrf: "csrf-1",
+      two_factor_enabled: false,
     });
     // First call: locked. After unlock, refresh() re-reads → unlocked.
     vi.mocked(api.getAdminLockStatus)

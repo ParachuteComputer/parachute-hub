@@ -69,9 +69,11 @@
  *   # "CSRF-belted" = strict same-origin Origin check on cookie-authed
  *   # mutations (hub#632, boundary C1) — origin-check.ts
  *   # `assertSameOriginForCookieMutation` carries the canonical enumeration.
- *   /api/me                       (GET)        → who-am-I (session+CSRF or hasSession:false)
+ *   /api/me                       (GET)        → who-am-I (session+CSRF+two_factor_enabled or hasSession:false)
  *   /api/admin-lock               (GET)        → screen-lock status (cookie-gated; first-admin)
  *   /api/admin-lock/{set,change,remove,unlock,lock,heartbeat} (POST) → manage the optional admin idle PIN lock (cookie-gated; CSRF)
+ *   /api/account/2fa/{start,confirm,disable} (POST) → self-service 2FA for the SPA (cookie-gated; CSRF; self-only) — hub#85
+ *   /api/account/password         (POST)       → self-service password change for the SPA (cookie-gated; CSRF; self-only) — hub#85
  *   /api/hub                      (GET)        → hub version + uptime + install-source (host:admin)
  *   /api/hub/upgrade              (POST)       → SPA-driven hub self-upgrade → 202 + detached helper (host:admin, §5.3/D4)
  *   /api/hub/upgrade/status       (GET)        → poll the on-disk hub-upgrade status (host:admin)
@@ -186,6 +188,7 @@ import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleModuleToken } from "./admin-module-token.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault, handleDeleteVault } from "./admin-vaults.ts";
+import { handleApiAccount } from "./api-account-2fa.ts";
 import {
   handleAccountChangePasswordGet,
   handleAccountChangePasswordPost,
@@ -3042,6 +3045,24 @@ export function hubFetch(
         }
         const subpath = pathname.slice("/api/admin-lock".length);
         return handleAdminLock(req, subpath, { db: getDb() });
+      }
+
+      // JSON self-service account surfaces for the admin SPA "My account" page
+      // (hub#85): password change + 2FA enroll/confirm/disable. Self-only
+      // (acts on `session.userId`, never a client-supplied id) — ANY signed-in
+      // user, not just the first admin. Same cookie + CSRF + same-origin
+      // posture as /api/admin-lock above (NOT the host-admin Bearer posture —
+      // a user managing their own credentials needs no admin scope). The
+      // server-rendered /account/2fa + /account/change-password pages stay for
+      // the no-JS / friend-facing path; these are the JSON twins.
+      if (pathname.startsWith("/api/account/")) {
+        if (!getDb) return dbNotConfigured();
+        {
+          const rejected = assertSameOriginForCookieMutation(req, oauthDeps(req).hubBoundOrigins());
+          if (rejected) return rejected;
+        }
+        const subpath = pathname.slice("/api/account".length);
+        return handleApiAccount(req, subpath, { db: getDb() });
       }
 
       // SPA-driven hub self-upgrade (design 2026-06-01 §5.3 / D4). Dedicated

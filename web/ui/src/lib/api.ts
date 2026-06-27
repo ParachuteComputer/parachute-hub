@@ -290,6 +290,8 @@ export interface MeSignedIn {
   user: { id: string; displayName: string };
   /** Per-session CSRF token; submit as `__csrf` against /logout etc. */
   csrf: string;
+  /** Whether the signed-in user has TOTP 2FA enrolled (hub#85). Drives the My-account page status. */
+  two_factor_enabled: boolean;
 }
 export interface MeSignedOut {
   hasSession: false;
@@ -1927,6 +1929,105 @@ export async function revokeAgentGrant(id: string): Promise<void> {
   if (res.status === 401) {
     await redirectToLoginAndHang<void>();
     return;
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+// ===========================================================================
+// Self-service account (hub#85) — /api/account/*
+//
+// These talk to the hub with the SESSION COOKIE directly (NOT the host-admin
+// Bearer): a user managing their OWN password / 2FA needs no admin scope, and
+// the endpoints key everything off `session.userId`. Same cookie + CSRF
+// posture as the admin-lock helpers above — the POST body carries the `__csrf`
+// token from `/api/me`; the browser adds the Origin header for the server's
+// same-origin belt. 401 means the session is gone → bounce to /login.
+// ===========================================================================
+
+async function postAccount(
+  subpath: string,
+  csrf: string,
+  body: Record<string, unknown> = {},
+): Promise<Response> {
+  return await fetch(`/api/account${subpath}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ __csrf: csrf, ...body }),
+  });
+}
+
+/** Response from `POST /api/account/2fa/start` — the in-flight enroll artifacts. */
+export interface TwoFactorStart {
+  /** Base32 secret — the SPA holds this and sends it back on confirm. Show for manual entry. */
+  secret: string;
+  /** `otpauth://` provisioning URI (manual-entry / copy affordance). */
+  otpauth_url: string;
+  /** PNG data-URL QR for the otpauth URI — render in an <img src>. */
+  qr_data_url: string;
+}
+
+/** POST /api/account/2fa/start — mint a fresh secret + QR. Refuses (409) if already enrolled. */
+export async function startTwoFactor(csrf: string): Promise<TwoFactorStart> {
+  const res = await postAccount("/2fa/start", csrf);
+  if (res.status === 401) return redirectToLoginAndHang<TwoFactorStart>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as TwoFactorStart;
+}
+
+/** Response from `POST /api/account/2fa/confirm` — backup codes shown ONCE. */
+export interface TwoFactorConfirmed {
+  enrolled: true;
+  enrolled_at: string;
+  /** Single-use backup codes — display once; never retrievable again. */
+  backup_codes: string[];
+}
+
+/**
+ * POST /api/account/2fa/confirm {secret, code} — verify the live code against
+ * the in-flight secret + persist enrollment. Returns the backup codes once.
+ */
+export async function confirmTwoFactor(
+  csrf: string,
+  secret: string,
+  code: string,
+): Promise<TwoFactorConfirmed> {
+  const res = await postAccount("/2fa/confirm", csrf, { secret, code });
+  if (res.status === 401) return redirectToLoginAndHang<TwoFactorConfirmed>();
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+  return (await res.json()) as TwoFactorConfirmed;
+}
+
+/** POST /api/account/2fa/disable {password} — password-gated; clears 2FA. */
+export async function disableTwoFactor(csrf: string, password: string): Promise<void> {
+  const res = await postAccount("/2fa/disable", csrf, { password });
+  if (res.status === 401) {
+    await redirectToLoginAndHang<void>();
+    return;
+  }
+  if (!res.ok) throw new HttpError(res.status, await readError(res));
+}
+
+/**
+ * POST /api/account/password {current_password, new_password} — change the
+ * signed-in user's own password. Verifies the current password server-side;
+ * revokes the user's still-active tokens on success.
+ */
+export async function changeAccountPassword(
+  csrf: string,
+  currentPassword: string,
+  newPassword: string,
+): Promise<void> {
+  const res = await postAccount("/password", csrf, {
+    current_password: currentPassword,
+    new_password: newPassword,
+  });
+  if (res.status === 401) {
+    // 401 here is ambiguous: a gone session OR a wrong current password.
+    // The server distinguishes them by `error` — wrong-password carries
+    // `invalid_credentials`, gone-session carries `unauthenticated`. Surface
+    // the server message rather than bouncing to /login on a typo'd password.
+    throw new HttpError(res.status, await readError(res));
   }
   if (!res.ok) throw new HttpError(res.status, await readError(res));
 }

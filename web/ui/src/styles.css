@@ -1542,3 +1542,18 @@ a.btn:hover {
   background: var(--bg-soft);
   color: var(--fg-muted);
 }
+
+/* One-time 2FA backup codes (My account page). Monospace grid for legibility. */
+.backup-codes {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(8rem, 1fr));
+  gap: 0.35rem;
+}
+
+.backup-codes li code {
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+}

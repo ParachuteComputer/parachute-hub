@@ -42,6 +42,7 @@ import {
 } from "./lib/api.ts";
 import { clearCachedToken } from "./lib/auth.ts";
 import { useAdminLock } from "./lib/useAdminLock.ts";
+import { Account } from "./routes/Account.tsx";
 import { ApproveClient } from "./routes/ApproveClient.tsx";
 import { Connections } from "./routes/Connections.tsx";
 import { Grants } from "./routes/Grants.tsx";
@@ -79,6 +80,9 @@ function subtitleFor(pathname: string): string {
   }
   if (pathname === "/settings" || pathname.startsWith("/settings/")) {
     return "settings";
+  }
+  if (pathname === "/account" || pathname.startsWith("/account/")) {
+    return "my account";
   }
   if (pathname.startsWith("/approve-client/")) {
     return "approve app";
@@ -258,6 +262,7 @@ export function App() {
         <NavSection to="/tokens" label="Tokens" />
         <NavSection to="/permissions" label="Permissions" />
         <NavSection to="/settings" label="Settings" />
+        <NavSection to="/account" label="My account" />
         {/* Boundary: everything past here is module-owned / off-shell. */}
         <span className="nav-divider" aria-hidden="true" />
         <InstalledServicesDropdown services={installedServices} />
@@ -286,6 +291,7 @@ export function App() {
         <Route path="/permissions" element={<Permissions />} />
         <Route path="/tokens" element={<Tokens />} />
         <Route path="/settings" element={<Settings />} />
+        <Route path="/account" element={<Account />} />
         <Route path="/approve-client/:clientId" element={<ApproveClient />} />
         <Route
           path="*"
