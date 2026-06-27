@@ -294,8 +294,11 @@ export function buildServicesCatalog(
   if (audiences.has("vault")) {
     for (const entry of manifest.services) {
       if (!isVaultEntry(entry)) continue;
-      const paths = entry.paths.length > 0 ? entry.paths : ["/"];
-      for (const path of paths) {
+      // #478: an empty-paths vault row is "installed but no servable instance"
+      // — skip it so it never counts toward (or, below, fabricates) a phantom
+      // vault. Mirrors the continue in well-known.ts / admin-vaults.ts.
+      if (entry.paths.length === 0) continue;
+      for (const path of entry.paths) {
         const instance = vaultInstanceNameFor(entry.name, path);
         if (broadVaultScope || namedVaults.has(instance)) admittedVaultPathCount++;
       }
@@ -308,12 +311,16 @@ export function buildServicesCatalog(
   for (const entry of manifest.services) {
     if (isVaultEntry(entry)) {
       if (!audiences.has("vault")) continue;
+      // #478: an empty-paths vault row is "installed but no servable instance"
+      // — skip it so the catalog never offers a phantom `vault` / `vault:default`
+      // entry pointing at root before any vault exists. Mirrors well-known.ts /
+      // admin-vaults.ts / vault-names.ts.
+      if (entry.paths.length === 0) continue;
       // Walk every path the row exposes. Real multi-vault on the hub is a
       // single `parachute-vault` row with N paths (one per vault instance);
       // legacy per-vault rows (`parachute-vault-<name>`) are handled by the
       // same loop because each contributes one path.
-      const paths = entry.paths.length > 0 ? entry.paths : ["/"];
-      for (const path of paths) {
+      for (const path of entry.paths) {
         const instance = vaultInstanceNameFor(entry.name, path);
         const admit = broadVaultScope || namedVaults.has(instance);
         if (!admit) continue;

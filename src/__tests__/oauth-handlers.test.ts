@@ -2914,6 +2914,75 @@ describe("handleToken — full OAuth dance", () => {
         notes: { url: `${ISSUER}/notes`, version: "0.3.0" },
       });
     });
+
+    // closes #478 — an empty-paths vault row ("installed but no servable
+    // instance"; vault's self-register emits `paths: []` at zero vaults) must
+    // NOT synthesize a phantom `vault` / `vault:default` entry pointing at
+    // root in the /oauth/token services catalog. Pre-fix the `["/"]` fallback
+    // resolved `vaultInstanceNameFor(name, "/")` → "default" and advertised
+    // `${ISSUER}/` as the vault. Mirrors the skip in well-known.ts /
+    // admin-vaults.ts / vault-names.ts.
+    test("empty-paths vault row produces NO catalog entry — no phantom default (#478)", () => {
+      const emptyPathsManifest: ServicesManifest = {
+        services: [
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: [],
+            health: "/vault/default/health",
+            version: "0.7.0",
+          },
+        ],
+      };
+      // Broad scope: would have leaked `vault` + `vault:default` at `/`.
+      expect(buildServicesCatalog(emptyPathsManifest, ISSUER, ["vault:read"])).toEqual({});
+      // Per-vault-narrowed scope for the phantom name: also nothing.
+      expect(buildServicesCatalog(emptyPathsManifest, ISSUER, ["vault:default:read"])).toEqual({});
+    });
+
+    test("positive control: a vault row WITH a path is still cataloged (#478)", () => {
+      const realManifest: ServicesManifest = {
+        services: [
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/vault/default/health",
+            version: "0.7.0",
+          },
+        ],
+      };
+      expect(buildServicesCatalog(realManifest, ISSUER, ["vault:read"])).toEqual({
+        vault: { url: `${ISSUER}/vault/default`, version: "0.7.0" },
+      });
+    });
+
+    test("empty-paths vault row alongside a real vault: only the real one is cataloged (#478)", () => {
+      // A transitional manifest could carry both a path-less bare row and a
+      // real instance row. The empty-paths row must contribute nothing; the
+      // real vault is unaffected.
+      const mixedManifest: ServicesManifest = {
+        services: [
+          {
+            name: "parachute-vault",
+            port: 1940,
+            paths: [],
+            health: "/vault/default/health",
+            version: "0.7.0",
+          },
+          {
+            name: "parachute-vault-work",
+            port: 1941,
+            paths: ["/vault/work"],
+            health: "/vault/work/health",
+            version: "0.7.0",
+          },
+        ],
+      };
+      expect(buildServicesCatalog(mixedManifest, ISSUER, ["vault:read"])).toEqual({
+        vault: { url: `${ISSUER}/vault/work`, version: "0.7.0" },
+      });
+    });
   });
 });
 
