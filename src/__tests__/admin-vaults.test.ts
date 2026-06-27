@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HOST_ADMIN_SCOPE, type RunResult, handleCreateVault } from "../admin-vaults.ts";
+import {
+  HOST_ADMIN_SCOPE,
+  type RunResult,
+  handleCreateVault,
+  listVaultInstanceNames,
+  provisionVault,
+} from "../admin-vaults.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { signAccessToken } from "../jwt-sign.ts";
 import { upsertService, writeManifest } from "../services-manifest.ts";
@@ -1299,6 +1305,163 @@ describe("DELETE /vaults/<name> — the identity cascade", () => {
       } finally {
         db.close();
       }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ===========================================================================
+// #478 — empty-paths vault rows must not resolve to phantom "default"
+// ===========================================================================
+
+describe("#478 — empty-paths vault row tolerance", () => {
+  test("findExistingVault: empty-paths vault row does NOT match 'default'", () => {
+    // A vault module registered in services.json with paths:[] is "installed
+    // but no servable vault instance". Hub must skip it — never synthesize a
+    // phantom "default" — so provisionVault can proceed to a real create.
+    const h = makeHarness();
+    try {
+      // Write a services.json with a parachute-vault entry carrying paths:[].
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: [],
+              health: "/health",
+              version: "0.5.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      // Calling provisionVault("default") internally calls findExistingVault.
+      // We verify the behaviour indirectly via listVaultInstanceNames (exported
+      // for this test) and via provisionVault's created:true path below.
+      const names = listVaultInstanceNames(h.manifestPath);
+      expect(names.has("default")).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("listVaultInstanceNames: empty-paths vault row is omitted from the Set", () => {
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: [],
+              health: "/health",
+              version: "0.5.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const names = listVaultInstanceNames(h.manifestPath);
+      expect(names.size).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("provisionVault: empty-paths row → created:true (proceeds to orchestrate, not false 'already exists')", async () => {
+    // Core regression test for #478: before the fix, an empty-paths row
+    // resolved to phantom "default" → findExistingVault returned non-null →
+    // provisionVault short-circuited to created:false with "already exists".
+    // After the fix: findExistingVault returns null → orchestrate runs →
+    // created:true.
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        // Seed an empty-paths vault row (what vault's self-register emits at
+        // zero vaults, per the #478 contract).
+        writeManifest(
+          {
+            services: [
+              {
+                name: "parachute-vault",
+                port: 1940,
+                paths: [],
+                health: "/health",
+                version: "0.5.0",
+              },
+            ],
+          },
+          h.manifestPath,
+        );
+
+        const calls: Array<readonly string[]> = [];
+        const runCommand = async (cmd: readonly string[]): Promise<RunResult> => {
+          calls.push(cmd);
+          // Simulate vault CLI writing the real path into services.json after
+          // a successful create. Because vault IS already registered (paths:[]),
+          // orchestrate picks the `parachute-vault create --json` branch and
+          // expects JSON stdout.
+          upsertService(
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/health",
+              version: "0.5.0",
+            },
+            h.manifestPath,
+          );
+          return { exitCode: 0, stdout: vaultCreateJson("default"), stderr: "" };
+        };
+
+        const result = await provisionVault("default", {
+          issuer: ISSUER,
+          manifestPath: h.manifestPath,
+          runCommand,
+        });
+
+        // Must have proceeded to orchestrate and returned created:true.
+        expect(result.ok).toBe(true);
+        if (!result.ok) return; // narrow for TS
+        expect(result.created).toBe(true);
+        // The orchestration command ran (not short-circuited).
+        expect(calls.length).toBeGreaterThan(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("listVaultInstanceNames: real paths still enumerate correctly (empty-paths does not break them)", () => {
+    // Sanity: mixing an empty-paths row with a real-paths row — the real
+    // paths are still found, the empty one is still skipped.
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/default", "/vault/work"],
+              health: "/health",
+              version: "0.5.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const names = listVaultInstanceNames(h.manifestPath);
+      expect(names.has("default")).toBe(true);
+      expect(names.has("work")).toBe(true);
+      expect(names.size).toBe(2);
     } finally {
       h.cleanup();
     }

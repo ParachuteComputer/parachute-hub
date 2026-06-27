@@ -207,15 +207,11 @@ function findExistingVault(
   } catch {
     return null;
   }
-  const target = `/vault/${name}`;
   for (const svc of manifest.services) {
     if (!isVaultEntry(svc)) continue;
-    if (svc.paths.length === 0) {
-      if (vaultInstanceNameFor(svc.name, undefined) === name) {
-        return { url: target, version: svc.version, path: target };
-      }
-      continue;
-    }
+    // #478: an empty-paths vault row means "installed but no servable vault
+    // instance" — skip it entirely so it never resolves to a phantom "default".
+    if (svc.paths.length === 0) continue;
     for (const path of svc.paths) {
       if (vaultInstanceNameFor(svc.name, path) === name) {
         return { url: path, version: svc.version, path };
@@ -607,7 +603,7 @@ function emptyCascadeSummary(): CascadeSummary {
 }
 
 /** Every vault instance name currently registered in services.json. */
-function listVaultInstanceNames(manifestPath: string): Set<string> {
+export function listVaultInstanceNames(manifestPath: string): Set<string> {
   const names = new Set<string>();
   let manifest: ReturnType<typeof readManifest>;
   try {
@@ -617,10 +613,9 @@ function listVaultInstanceNames(manifestPath: string): Set<string> {
   }
   for (const svc of manifest.services) {
     if (!isVaultEntry(svc)) continue;
-    if (svc.paths.length === 0) {
-      names.add(vaultInstanceNameFor(svc.name, undefined));
-      continue;
-    }
+    // #478: an empty-paths vault row means "installed but no servable vault
+    // instance" — skip it so no phantom "default" is synthesized.
+    if (svc.paths.length === 0) continue;
     for (const path of svc.paths) names.add(vaultInstanceNameFor(svc.name, path));
   }
   return names;
