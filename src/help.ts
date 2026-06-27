@@ -17,6 +17,7 @@ Usage:
   parachute install <service>       install and register a service
                                     services: ${services}
   parachute status                  show installed services, run state, health
+  parachute doctor                  run health checks + tell you the one thing to fix
   parachute start   [service]       start a module via the supervisor (or ensure the hub is up)
   parachute stop    [service]       stop a module via the supervisor (or stop the hub unit)
   parachute restart [service]       restart a module via the supervisor (or restart the hub unit)
@@ -364,6 +365,43 @@ Example:
     → http://127.0.0.1:1940/vault/default/mcp
   parachute-app    1946  0.2.0    active  12346  2h 12m  3ms      npm (0.2.0-rc.4)
     → http://127.0.0.1:1946/surface/notes
+`;
+}
+
+export function doctorHelp(): string {
+  return `parachute doctor — health / diagnostics for your Parachute install
+
+Usage:
+  parachute doctor [--json]
+
+What it does:
+  Runs a set of independent health checks and prints a grouped report
+  (✓ pass / ⚠ warn / ✗ fail), each with a one-line detail and — where there
+  is one — a copy-pasteable fix-it command. The single command that answers
+  "is my Parachute healthy, and if not, what's the one thing to fix?"
+
+  Checks (each PASSES on a fresh / fully-current install — doctor positively
+  detects a known-bad condition and never treats "not configured" as broken):
+    - Hub supervisor reachable on :1939 (/health).
+    - Each CONFIGURED module alive via its loopback /health (2xx or 401 = live).
+    - services.json parses + required fields valid (a missing file is the
+      fresh pre-install state, not a failure).
+    - operator.token exists, parses, and its issuer matches the hub (the
+      recurring "not signed in to the hub" / issuer-mismatch class).
+    - Each first-party module bin is executable (catches the lost-+x-bit
+      start-failure class).
+    - Migration: legacy detached install? known cruft at the ecosystem root?
+      (allowlist detectors only — a fresh root flags nothing).
+    - Exposure: if exposed, is the public origin reachable? If not exposed,
+      "loopback only" is reported as benign info, never a warning.
+    - Version freshness (cosmetic) — drift is WARN at most, never a failure.
+
+Flags:
+  --json     emit a single JSON object instead of the human report
+
+Exit codes:
+  0   no failures (warnings are advisory and still exit 0)
+  1   one or more checks failed
 `;
 }
 
