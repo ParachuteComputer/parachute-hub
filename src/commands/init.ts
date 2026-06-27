@@ -210,8 +210,15 @@ export interface InitOpts {
    * guarantee), before the admin-URL resolution. Validated with
    * `validateVaultName` in the CLI before reaching here.
    *
-   * If a vault already exists (services.json has a parachute-vault row),
-   * the create is skipped and a note is logged — idempotent on re-runs.
+   * Idempotency lives in `parachute-vault create`, NOT in a services.json
+   * precheck: `create <name>` exits 0 + creates when `<name>` is new, and
+   * exits non-zero ("Vault \"<name>\" already exists.") on a re-run. We
+   * therefore ALWAYS attempt the create when this field is set and treat a
+   * non-zero exit as non-fatal (warn + continue). A services.json
+   * `parachute-vault` row is the MODULE-installed marker (Step 0.5 seeds it
+   * via `spec.seedEntry` on EVERY fresh install), not an instance marker —
+   * keying idempotency off it would silently no-op the create on the exact
+   * fresh-box path this feature targets.
    *
    * Without this field (the default), init makes NO vault — the wizard
    * owns Create/Import/Skip as before. The --no-browser / scripted path
@@ -954,37 +961,35 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   // guaranteed (Step 1.5). The vault module was installed at Step 0.5, so
   // `parachute-vault` is on PATH.
   //
-  // Skip the create when:
-  //   - no `--vault-name` was given (default wizard-owns-create path)
-  //   - a vault row already exists in services.json (idempotent re-run)
+  // We ALWAYS attempt the create when `--vault-name` is set. Idempotency lives
+  // in `parachute-vault create` itself, NOT in a services.json precheck:
+  //   - `create <name>` exits 0 + creates the vault when `<name>` is new.
+  //   - `create <name>` exits non-zero ("Vault \"<name>\" already exists.") when
+  //     that exact name already exists (a benign re-run).
   //
-  // A non-zero exit from `parachute-vault create` is non-fatal: warn + continue.
-  // The operator can re-run `parachute vault create <name>` or use the wizard.
+  // We DON'T precheck the services.json `parachute-vault` row: Step 0.5's
+  // `install("vault", { noCreate: true })` seeds that row via `spec.seedEntry`
+  // on EVERY fresh install (the module-installed marker — see install.ts's
+  // InstallOpts doc), so on the exact fresh-box path this feature targets the
+  // row is ALWAYS present and a row-keyed precheck would silently no-op the
+  // create. The row marks "module installed", not "instance exists" — only the
+  // create command's own exit reliably distinguishes the two.
+  //
+  // A non-zero exit is non-fatal: warn + continue. It could mean the vault
+  // already exists (a fine re-run) OR a genuine creation failure — init's
+  // contract is hub up → wizard regardless, so we never abort here. The
+  // operator can check `parachute status` / re-run `parachute vault create`.
   if (opts.vaultName !== undefined) {
-    // Re-check whether a vault exists AFTER vault-module install (Step 0.5
-    // may have seeded a row). Use the same check init already does at Step 3.
-    let vaultExistsNow = false;
-    try {
-      const manifest = readManifestLenient(manifestPath);
-      vaultExistsNow = manifest.services.some((s) => s.name.startsWith("parachute-vault"));
-    } catch {
-      vaultExistsNow = false;
-    }
-    if (vaultExistsNow) {
-      log(`note: vault already configured — --vault-name ${opts.vaultName} ignored.`);
+    log(`Creating vault "${opts.vaultName}"…`);
+    const createCode = await createFirstVaultImpl(opts.vaultName, { runner: defaultRunner });
+    if (createCode === 0) {
+      log(`✓ Vault "${opts.vaultName}" created.`);
     } else {
-      log(`Creating vault "${opts.vaultName}"…`);
-      const createCode = await createFirstVaultImpl(opts.vaultName, { runner: defaultRunner });
-      if (createCode === 0) {
-        log(`✓ Vault "${opts.vaultName}" created.`);
-      } else {
-        log(
-          `⚠ \`parachute-vault create ${opts.vaultName}\` exited ${createCode}. ` +
-            `You can retry with: parachute vault create ${opts.vaultName}`,
-        );
-      }
-      log("");
+      log(
+        `⚠ \`parachute-vault create ${opts.vaultName}\` exited ${createCode} — the vault may already exist, or creation failed. Check \`parachute status\` / re-run \`parachute vault create ${opts.vaultName}\`.`,
+      );
     }
+    log("");
   }
 
   // Step 2: exposure chain. Skipped when already exposed, in non-TTY,

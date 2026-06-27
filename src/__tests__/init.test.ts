@@ -2307,10 +2307,19 @@ describe("init --vault-name (#478 Part 2)", () => {
     expect(result.error).toMatch(/lowercase alphanumeric/);
   });
 
-  test("(d) vault already exists: create is skipped, note logged", async () => {
+  test("(d) a seeded services.json vault MODULE row does NOT suppress the create", async () => {
+    // REGRESSION (the rc.7 verification bug): Step 0.5's `install("vault",
+    // { noCreate: true })` seeds a `parachute-vault` services.json row via
+    // `spec.seedEntry` on EVERY fresh install. The OLD Step 1.6 keyed
+    // idempotency off that row, so on the exact fresh-box path this feature
+    // targets it saw the row + silently no-op'd the create — the headline
+    // feature never fired. The row marks "module installed", not "instance
+    // exists". Idempotency must live in `parachute-vault create`'s own exit
+    // (which errors "already exists" on a real re-run), NOT a row precheck.
+    // So: a seeded module row must NOT prevent the create from being attempted.
     const h = makeHarness();
     try {
-      // Seed services.json so init sees a vault row before Step 1.6.
+      // Seed services.json with the module row (as Step 0.5 always does).
       seedVault(h.manifestPath);
       const createCalls: string[] = [];
       const logs: string[] = [];
@@ -2325,15 +2334,21 @@ describe("init --vault-name (#478 Part 2)", () => {
         }),
       );
       expect(code).toBe(0);
-      // Create was not invoked — vault already existed.
-      expect(createCalls).toEqual([]);
-      expect(logs.join("\n")).toContain("vault already configured");
+      // The create WAS attempted despite the seeded module row.
+      expect(createCalls).toEqual(["myvault"]);
+      expect(logs.join("\n")).toContain('Creating vault "myvault"');
+      expect(logs.join("\n")).toContain('Vault "myvault" created');
+      // No "already configured / ignored" no-op message.
+      expect(logs.join("\n")).not.toContain("already configured");
     } finally {
       h.cleanup();
     }
   });
 
-  test("non-zero exit from create: warns but init still exits 0", async () => {
+  test("non-zero exit from create (e.g. vault already exists): warns but init still exits 0", async () => {
+    // A non-zero exit covers both "vault already exists" (a benign re-run, where
+    // `parachute-vault create` errors + exits 1) and a genuine creation failure.
+    // Either way init is non-fatal — the operator can re-run / check status.
     const h = makeHarness();
     try {
       const logs: string[] = [];
@@ -2348,6 +2363,7 @@ describe("init --vault-name (#478 Part 2)", () => {
       expect(code).toBe(0);
       const joined = logs.join("\n");
       expect(joined).toContain("exited 1");
+      expect(joined).toContain("may already exist, or creation failed");
       expect(joined).toContain("parachute vault create myvault");
     } finally {
       h.cleanup();
