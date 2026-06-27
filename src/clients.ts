@@ -347,6 +347,15 @@ export function findReapableClients(db: Database, opts: FindReapableOpts = {}): 
  * already expired or revoked (dead). Deleting them completes the GC instead of
  * leaving dead registry rows behind forever. Callers MUST pass only client_ids
  * returned by `findReapableClients` (the safety gate); see the CLI's reap loop.
+ *
+ * TOCTOU note: `reapClient` does NOT re-check the gate — it trusts the caller's
+ * list. There is a theoretical window where a grant/token lands between the
+ * `findReapableClients` snapshot and this delete, reaping a client that just
+ * went live. On the single-operator hub this is cosmetically impossible: the
+ * OAuth flow that would create a grant runs synchronously on the same SQLite
+ * connection and never races a CLI invocation. Re-running `findReapableClients`
+ * immediately before each call would close the window at the cost of N extra
+ * round-trips; not worth it under the current trust model.
  */
 export function reapClient(db: Database, clientId: string): boolean {
   return db.transaction(() => {
