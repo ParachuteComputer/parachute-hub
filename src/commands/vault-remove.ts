@@ -31,14 +31,18 @@
  * `parachute:host:admin` — exactly the scope the endpoint gates on. This is the
  * same read-never-mint credential path `parachute start/stop/restart <svc>` use.
  *
- * ## The 409 guardrail (load-bearing)
+ * ## Last-vault handling (#678)
  *
- * On a `409 last_vault` the endpoint refuses (deleting the last vault would let
- * vault's boot silently resurrect a fresh `default`). We print the endpoint's
- * message + note the raw escape hatch (`parachute-vault remove <name> --yes`)
- * which SKIPS the cascade, then return NON-ZERO. We MUST NOT fall through to
- * spawning `parachute-vault` ourselves: a "helpful" fall-through would re-open
- * the exact orphaning bug B3 closes. The test locks this invariant.
+ * The last/only vault is deleted IDENTICALLY to any other vault: the endpoint
+ * runs the full cascade-then-delete and returns 200. There is no special-case
+ * here. (Older builds refused the last vault with a `409 last_vault` and steered
+ * the operator to the raw `parachute-vault remove --yes` — but that escape hatch
+ * SKIPS the cascade, orphaning the very identity artifacts B3 set out to clean
+ * up. hub#678 removed that refusal: vault's boot can no longer silently
+ * resurrect a fresh first vault because vault's CLI writes an
+ * `auto_create: false` marker on last-vault removal and the boot gate honors
+ * it.) This command therefore needs no 409 branch — the 200 path renders the
+ * cascade summary for the last vault just like every other delete.
  */
 
 import { CONFIG_DIR } from "../config.ts";
@@ -56,8 +60,9 @@ import {
 
 /**
  * Injectable seams. Production wires the real operator-token bearer resolver +
- * the global `fetch`; tests inject fakes to assert the request shape + lock the
- * 409 guardrail without a live hub or a real socket.
+ * the global `fetch`; tests inject fakes to assert the request shape + that
+ * destruction always goes through the hub endpoint (never a direct
+ * `parachute-vault` spawn) without a live hub or a real socket.
  */
 export interface VaultRemoveDeps {
   /**
@@ -84,6 +89,7 @@ interface CascadeSummaryWire {
   grants_dropped?: number;
   user_vaults_removed?: number;
   invites_invalidated?: number;
+  vault_cap_removed?: boolean;
   connections_torn_down?: number;
   orphaned_channels?: unknown;
   vault_removed?: boolean;
@@ -151,6 +157,7 @@ function renderCascadeSummary(
   log(`  grants dropped:        ${n(c.grants_dropped)}`);
   log(`  user_vaults removed:   ${n(c.user_vaults_removed)}`);
   log(`  invites invalidated:   ${n(c.invites_invalidated)}`);
+  log(`  storage cap removed:   ${c.vault_cap_removed === true ? "yes" : "no"}`);
   log(`  connections torn down: ${n(c.connections_torn_down)}`);
   log(`  vault removed:         ${c.vault_removed === true ? "yes" : "no"}`);
   log(`  vault module restarted:${c.module_restarted === true ? " yes" : " no"}`);
@@ -300,21 +307,6 @@ export async function vaultRemove(args: string[], deps: VaultRemoveDeps = {}): P
     // Idempotent: a re-run after a successful delete lands here. Not scary.
     log(`Vault "${name}" does not exist on this hub (already removed). Nothing to do.`);
     return 0;
-  }
-
-  if (res.status === 409 && error === "last_vault") {
-    // CRITICAL GUARDRAIL: print + exit non-zero. Do NOT fall through to spawning
-    // `parachute-vault` — that would re-open the orphaned-identity bug B3 closes.
-    logError(`parachute vault remove: ${error_description}`);
-    logError("");
-    logError(
-      `The raw mechanics-only path \`parachute-vault remove ${name} --yes\` can delete the last vault,`,
-    );
-    logError(
-      "but it SKIPS the identity cascade — live tokens, grants, and user_vaults rows for that",
-    );
-    logError("vault would be left orphaned. Create another vault first if you can.");
-    return 1;
   }
 
   if (res.status === 400 && error === "confirm_mismatch") {

@@ -630,14 +630,21 @@ export function listVaultInstanceNames(manifestPath: string): Set<string> {
  *
  * Refusals:
  *   - unknown vault → 404;
- *   - LAST remaining vault → 409. Vault's boot auto-creates `default` at
- *     zero vaults, so deleting the last one would silently resurrect a fresh
- *     `default` (with a fresh global API key) — refusing sidesteps the
- *     resurrection class entirely. The CLI (`parachute-vault remove`) is the
- *     escape hatch for an operator who really means it.
  *   - RESERVED names are deliberately ALLOWED (no reserved-name gate): a
  *     squatted `admin`/`new`/`assets` vault created before the B2h
  *     reservation must be removable through this endpoint.
+ *
+ * Last-vault handling (#678): deleting the LAST remaining vault runs the SAME
+ * cascade-then-delete as any other vault — it is NOT refused. The old 409 that
+ * steered the operator to the raw `parachute-vault remove` CLI was a
+ * correctness defect: that escape hatch SKIPS this cascade, orphaning tokens +
+ * grants that named the last vault. The resurrection risk the refusal once
+ * guarded (vault boot auto-creating a fresh-credentialed first vault at zero
+ * vaults) is handled downstream instead: the vault CLI writes an
+ * `auto_create: false` marker on last-vault removal and the vault boot gate
+ * honors it, so the server won't silently resurrect. Detection stays
+ * count-based + name-agnostic (no `name === "default"` special case); the last
+ * vault just adds a `last_vault` warning to the 200 response.
  *
  * Cascade, in order (identity first, mechanics last — revocation is the safe
  * direction if a later step fails):
@@ -661,6 +668,15 @@ export function listVaultInstanceNames(manifestPath: string): Set<string> {
  * Response: 200 with a structured per-step summary (counts +
  * `orphaned_channels` + warnings). A mechanics failure responds 500 with
  * the partial summary — the identity artifacts already revoked stay revoked.
+ *
+ * Bounded residual: the cascade revokes every *registered* token row naming
+ * the vault, but an UNREGISTERED interactive-mint (a host-admin browser
+ * session minting a short-lived vault token at ≤10-min TTL — see
+ * REGISTERED_MINT_TTL_THRESHOLD_SECONDS in admin-connections.ts) that was
+ * issued just before the delete leaves no registry row to sweep. Such a token
+ * stays valid for at most its remaining ≤10-min TTL, against a vault whose
+ * daemon is evicted in step 7 anyway. Same bound the auth-codes note below
+ * relies on; not eliminated, just bounded.
  */
 export async function handleDeleteVault(
   req: Request,
@@ -714,16 +730,20 @@ export async function handleDeleteVault(
     return jsonError(404, "not_found", `no vault named "${name}" on this hub`);
   }
 
-  // Last-vault refusal (resurrection guard).
+  // Last-vault detection (count-based, name-agnostic). Deleting the LAST
+  // vault used to refuse with 409 and steer the operator to the raw
+  // `parachute-vault remove` CLI — but that path SKIPS this whole identity
+  // cascade, orphaning tokens + grants that named the vault. The resurrection
+  // risk the refusal guarded against is already handled downstream: the vault
+  // CLI writes an `auto_create: false` marker when it removes the last vault
+  // (vault `cli.ts` cmdRemove) and the vault boot gate honors it
+  // (`bootAutoCreateAllowed` in vault `config.ts`), so the server won't
+  // silently resurrect a fresh-credentialed first vault. We therefore run the
+  // cascade-then-delete for the last vault exactly as for any other — the
+  // count is informational only (no refusal).
   const instanceNames = listVaultInstanceNames(manifestPath);
   instanceNames.delete(name);
-  if (instanceNames.size === 0) {
-    return jsonError(
-      409,
-      "last_vault",
-      `"${name}" is the last vault on this hub. Vault's boot auto-creates "default" at zero vaults, so deleting the last one would silently resurrect it with fresh credentials. Create another vault first, or use the CLI (parachute-vault remove ${name} --yes) if you really mean to empty the hub.`,
-    );
-  }
+  const isLastVault = instanceNames.size === 0;
 
   const summary = emptyCascadeSummary();
   const warnings: { step: string; detail: string }[] = [];
@@ -863,6 +883,18 @@ export async function handleDeleteVault(
       "server_error",
       `orchestration failed: ${msg} — identity artifacts already revoked (summary: ${JSON.stringify(summary)})`,
     );
+  }
+
+  // Last-vault heads-up. The vault CLI's remove wrote `auto_create: false`, so
+  // the next vault boot won't resurrect a fresh-credentialed first vault — the
+  // hub is now deliberately empty. Surface that so the operator knows to create
+  // one when they want the hub serving again.
+  if (isLastVault) {
+    warnings.push({
+      step: "last_vault",
+      detail:
+        "the deleted vault was the last one on this hub — no vaults remain. The vault CLI wrote auto_create: false, so boot won't recreate a default vault. Create one with: parachute-vault create <name>",
+    });
   }
 
   // --- 7. Daemon eviction: supervisor-restart the vault module. -------------

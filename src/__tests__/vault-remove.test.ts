@@ -83,6 +83,7 @@ const SUCCESS_BODY = {
     grants_dropped: 2,
     user_vaults_removed: 4,
     invites_invalidated: 1,
+    vault_cap_removed: true,
     connections_torn_down: 1,
     orphaned_channels: [],
     vault_removed: true,
@@ -156,6 +157,7 @@ describe("vaultRemove — 200 success", () => {
     expect(text).toContain("3");
     expect(text).toContain("user_vaults removed:");
     expect(text).toContain("4");
+    expect(text).toContain("storage cap removed:");
     expect(text).toContain("vault removed:");
   });
 
@@ -194,19 +196,35 @@ describe("vaultRemove — 200 success", () => {
   });
 });
 
-describe("vaultRemove — 409 last_vault GUARDRAIL", () => {
-  test("returns NON-ZERO and NEVER spawns parachute-vault", async () => {
+describe("vaultRemove — last vault (#678: cascade-then-delete, no 409)", () => {
+  test("the last vault deletes via the cascade (200) and NEVER spawns parachute-vault directly", async () => {
     await withSpawnSpy(async (spawned) => {
-      const { fetch, calls } = fakeFetch([
-        {
-          status: 409,
-          body: {
-            error: "last_vault",
-            error_description:
-              '"scratch" is the last vault on this hub. Create another vault first, or use the CLI.',
-          },
+      // The endpoint no longer refuses the last vault — it returns 200 with the
+      // cascade summary, identical to any other delete. The CLI just renders it.
+      const lastVaultBody = {
+        ok: true,
+        name: "scratch",
+        cascade: {
+          tokens_revoked: 2,
+          grants_rewritten: 0,
+          grants_dropped: 1,
+          user_vaults_removed: 1,
+          invites_invalidated: 0,
+          vault_cap_removed: true,
+          connections_torn_down: 0,
+          orphaned_channels: [],
+          vault_removed: true,
+          module_restarted: true,
         },
-      ]);
+        warnings: [
+          {
+            step: "last_vault",
+            detail:
+              "the deleted vault was the last one on this hub — no vaults remain. The vault CLI wrote auto_create: false, so boot won't recreate a default vault. Create one with: parachute-vault create <name>",
+          },
+        ],
+      };
+      const { fetch, calls } = fakeFetch([{ status: 200, body: lastVaultBody }]);
       const sinks = makeSinks();
       const code = await vaultRemove(["scratch"], {
         resolveBearer: async () => BEARER,
@@ -214,17 +232,20 @@ describe("vaultRemove — 409 last_vault GUARDRAIL", () => {
         log: sinks.log,
         logError: sinks.logError,
       });
-      // Non-zero exit.
-      expect(code).not.toBe(0);
-      // Exactly ONE fetch (the DELETE) — no fall-through retry path.
+      // 200 → success exit; the cascade did its work.
+      expect(code).toBe(0);
+      // Exactly ONE fetch (the DELETE) — the cascade runs server-side over loopback.
       expect(calls).toHaveLength(1);
       expect(calls[0]?.method).toBe("DELETE");
-      // The load-bearing invariant: no `parachute-vault` spawn.
+      // The load-bearing invariant still holds: the CLI never spawns
+      // `parachute-vault` itself — destruction goes through the hub endpoint.
       expect(spawned.count).toBe(0);
-      // Surfaces the endpoint message + the cascade-skip warning on the escape hatch.
-      const errText = sinks.errText();
-      expect(errText).toContain("last vault");
-      expect(errText).toContain("SKIPS the identity cascade");
+      // The cascade summary renders, including the last_vault heads-up warning.
+      const text = sinks.text();
+      expect(text).toContain("tokens revoked:");
+      expect(text).toContain("vault removed:");
+      expect(text).toContain("last_vault");
+      expect(text).toContain("auto_create: false");
     });
   });
 });
