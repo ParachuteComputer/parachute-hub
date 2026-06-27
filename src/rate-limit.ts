@@ -88,6 +88,21 @@ export const CHANGE_PASSWORD_WINDOW_MS = 5 * 60 * 1000;
  */
 export const CHANGE_PASSWORD_MAX_ATTEMPTS = 3;
 /**
+ * `/api/account/2fa/confirm` (TOTP enrollment seal) window: 15 minutes. This is
+ * the SELF-only, already-session-authenticated enrollment step — the operator is
+ * typing the first live code off their own authenticator while it drifts into
+ * sync, so legitimate mistypes are common and must not be punished. The threat
+ * is only a hijacked session grinding the (client-held, not-yet-persisted)
+ * in-flight secret, which the 10^6 code space + replay cache already make
+ * effectively non-exploitable — so this is defense-in-depth, deliberately MORE
+ * generous than the 3/5-min change-password bucket. NOT the `/login/2fa` bucket:
+ * that one is the strict, pre-auth brute-force door (5/15-min); enrollment is a
+ * different, lower-risk surface and gets its own lenient bucket.
+ */
+export const TOTP_ENROLL_CONFIRM_WINDOW_MS = 15 * 60 * 1000;
+/** `/api/account/2fa/confirm` attempts allowed per window. 11th is denied. */
+export const TOTP_ENROLL_CONFIRM_MAX_ATTEMPTS = 10;
+/**
  * `/login/2fa` window length: 15 minutes — same as `/login`. The second-
  * factor step (hub#473) sits behind a verified password + a short-lived
  * pending-login token, so the threat model is "attacker who already has the
@@ -290,6 +305,18 @@ export const changePasswordRateLimiter = new RateLimiter(
 export const totpRateLimiter = new RateLimiter(TOTP_MAX_ATTEMPTS, TOTP_WINDOW_MS);
 
 /**
+ * `/api/account/2fa/confirm` enrollment-seal bucket. Lenient (10 / 15 min),
+ * keyed by `user.id` (the session already establishes identity). Separate from
+ * `totpRateLimiter` so an enrollment mistype and a `/login/2fa` failure never
+ * share a window — different surfaces, different threat models (see the const
+ * docs above).
+ */
+export const totpEnrollConfirmRateLimiter = new RateLimiter(
+  TOTP_ENROLL_CONFIRM_MAX_ATTEMPTS,
+  TOTP_ENROLL_CONFIRM_WINDOW_MS,
+);
+
+/**
  * Coarse per-IP CEILING rate limiter — 60 attempts / 15 min, keyed by client
  * IP ONLY. Shared by all interactive auth doors (`/login`, the
  * `/oauth/authorize` password door, `/login/2fa`) as a backstop against
@@ -342,6 +369,7 @@ export function __resetForTests(): void {
   loginRateLimiter.reset();
   changePasswordRateLimiter.reset();
   totpRateLimiter.reset();
+  totpEnrollConfirmRateLimiter.reset();
   vaultTokenMintRateLimiter.reset();
   signupRateLimiter.reset();
   authIpCeilingRateLimiter.reset();

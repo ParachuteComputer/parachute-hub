@@ -40,7 +40,7 @@ import type { Database } from "bun:sqlite";
 import { hash as argonHash } from "@node-rs/argon2";
 import QRCode from "qrcode";
 import { verifyCsrfToken } from "./csrf.ts";
-import { changePasswordRateLimiter } from "./rate-limit.ts";
+import { changePasswordRateLimiter, totpEnrollConfirmRateLimiter } from "./rate-limit.ts";
 import { findActiveSession } from "./sessions.ts";
 import { generateTotpSecret, otpauthUrlFor, verifyTotpCode } from "./totp.ts";
 import {
@@ -219,6 +219,26 @@ async function handleConfirm(
   // Defensive — a confirm POST against an already-enrolled account.
   if (isTotpEnrolled(deps.db, user.id)) {
     return jsonError(409, "already_enrolled", "Two-factor is already enabled.");
+  }
+  // Bound a hijacked session grinding the in-flight (client-held) secret. Keyed
+  // by user.id, lenient (10/15min) so honest enroll mistypes aren't punished —
+  // defense-in-depth (#712). Fires AFTER the format + already-enrolled guards so
+  // junk/no-op POSTs don't burn the legit enroller's budget, and BEFORE the
+  // code verify so the grind window is actually bounded.
+  const confirmLimited = totpEnrollConfirmRateLimiter.checkAndRecord(
+    user.id,
+    deps.now ? deps.now() : new Date(),
+  );
+  if (!confirmLimited.allowed) {
+    const retryAfter = confirmLimited.retryAfterSeconds ?? 1;
+    return json(
+      429,
+      {
+        error: "too_many_attempts",
+        error_description: `Too many attempts. Try again in ${retryAfter} seconds.`,
+      },
+      { "retry-after": String(retryAfter) },
+    );
   }
   if (!verifyTotpCode(secret, code)) {
     return jsonError(
