@@ -940,27 +940,70 @@ describe("DELETE /vaults/<name> — gates", () => {
     }
   });
 
-  test("409 last_vault on the only remaining vault (CLI never runs)", async () => {
+  test("#678: deleting the LAST vault cascades + deletes (no 409), with a last_vault warning", async () => {
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
-        writeVaults(h.manifestPath, ["default"]);
+        // Only one vault on the hub — the previously-refused last-vault case.
+        writeVaults(h.manifestPath, ["solo"]);
+
+        // Seed identity artifacts naming the soon-to-be-deleted last vault.
+        registryRow(db, "jti-solo", ["vault:solo:write"]);
+        const carol = await createUser(db, "carol", "carol-passphrase-123");
+        const client = registerClient(db, { redirectUris: ["https://d.example/cb"] }).client
+          .clientId;
+        recordGrant(db, carol.id, client, ["vault:solo:admin"]);
+        setUserVaults(db, carol.id, ["solo"]);
+
         const runner = stubRun();
         const res = await callDelete({
-          name: "default",
+          name: "solo",
           db,
           manifestPath: h.manifestPath,
           connectionsStorePath: join(h.dir, "connections.json"),
           runCommand: runner.run,
         });
-        expect(res.status).toBe(409);
-        const out = (await res.json()) as { error: string; error_description: string };
-        expect(out.error).toBe("last_vault");
-        // Guidance names the CLI escape hatch + the resurrection reason.
-        expect(out.error_description).toContain("parachute-vault remove");
-        expect(runner.calls.length).toBe(0);
+
+        // No 409 — the delete completes.
+        expect(res.status).toBe(200);
+        const out = (await res.json()) as {
+          ok: boolean;
+          cascade: {
+            tokens_revoked: number;
+            grants_dropped: number;
+            user_vaults_removed: number;
+            vault_removed: boolean;
+          };
+          warnings?: { step: string; detail: string }[];
+        };
+        expect(out.ok).toBe(true);
+
+        // The cascade ran for the last vault: tokens/grants/assignments gone.
+        expect(out.cascade.tokens_revoked).toBe(1);
+        expect(findTokenRowByJti(db, "jti-solo")?.revokedAt).not.toBeNull();
+        expect(out.cascade.grants_dropped).toBe(1);
+        expect(findGrant(db, carol.id, client)).toBeNull();
+        expect(out.cascade.user_vaults_removed).toBe(1);
+        expect(
+          db
+            .query<{ vault_name: string }, [string]>(
+              "SELECT vault_name FROM user_vaults WHERE user_id = ?",
+            )
+            .all(carol.id),
+        ).toEqual([]);
+
+        // The underlying vault remove ran (the cascade no longer skips it).
+        expect(runner.calls).toContainEqual(["parachute-vault", "remove", "solo", "--yes"]);
+        expect(out.cascade.vault_removed).toBe(true);
+
+        // A last_vault heads-up warning is surfaced (name-agnostic — does not
+        // assume "default"); the auto_create:false marker prevents resurrection.
+        const lastVaultWarning = out.warnings?.find((w) => w.step === "last_vault");
+        expect(lastVaultWarning).toBeDefined();
+        expect(lastVaultWarning?.detail).toContain("auto_create: false");
+        expect(lastVaultWarning?.detail).not.toContain('"default"');
       } finally {
         db.close();
       }
