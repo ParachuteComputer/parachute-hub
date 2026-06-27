@@ -159,8 +159,15 @@ export async function handleAdminLock(
     case "/heartbeat":
       // Slide the idle window forward if (and only if) currently unlocked.
       refreshActivity(gate.sessionId, getIdleSeconds(db), now().getTime());
+      // `idle_seconds` is part of the response so the heartbeat fulfills the
+      // same `AdminLockStatus` shape as GET status — the client re-anchors its
+      // local idle timer from it on every heartbeat, so it MUST be present.
+      // Omitting it poisoned the client timer with `undefined` (→ NaN → instant
+      // re-lock), the bug this fixes. It also lets a live session pick up an
+      // idle-window change the operator made in Settings mid-session.
       return json(200, {
         locked: isLockConfigured(db) && !isSessionUnlocked(gate.sessionId, now().getTime()),
+        idle_seconds: getIdleSeconds(db),
         unlock_seconds_remaining: unlockSecondsRemaining(gate.sessionId, now().getTime()),
       });
     default:

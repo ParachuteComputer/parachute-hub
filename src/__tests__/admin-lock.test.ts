@@ -527,7 +527,13 @@ describe("admin-lock management API", () => {
     const r2 = await handleAdminLock(lockReq("/heartbeat", cookie, {}), "/heartbeat", {
       db: harness.db,
     });
-    expect(((await r2.json()) as { locked: boolean }).locked).toBe(false);
+    const body2 = (await r2.json()) as { locked: boolean; idle_seconds?: number };
+    expect(body2.locked).toBe(false);
+    // The heartbeat MUST carry idle_seconds — the client re-anchors its local
+    // idle timer from it on every heartbeat. Omitting it poisoned the timer
+    // (undefined → NaN → instant re-lock). Regression guard for the PIN
+    // re-prompt loop.
+    expect(body2.idle_seconds).toBe(getIdleSeconds(harness.db));
   });
 
   test("unlock brute-force limiter: 6th attempt is 429", async () => {

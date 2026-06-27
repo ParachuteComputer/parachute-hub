@@ -58,14 +58,18 @@ export function useAdminLock(csrf: string | null, enabled: boolean): UseAdminLoc
     clearIdleTimer();
     // Local idle expiry → show the lock screen. The server window is the same
     // length, so by the time this fires the next mint would 423 anyway.
-    idleTimer.current = setTimeout(() => setLocked(true), Math.max(1, idleSeconds.current) * 1000);
+    // Guard against a non-finite ref value: a bad/absent server `idle_seconds`
+    // (NaN/undefined) must NOT collapse to setTimeout(fn, 0) and slam the
+    // operator to the lock screen instantly — fall back to the 15-min default.
+    const seconds = Number.isFinite(idleSeconds.current) ? idleSeconds.current : 15 * 60;
+    idleTimer.current = setTimeout(() => setLocked(true), Math.max(1, seconds) * 1000);
   }, [clearIdleTimer]);
 
   const applyStatus = useCallback(
     (s: AdminLockStatus) => {
       setConfigured(s.configured);
       setLocked(s.locked);
-      idleSeconds.current = s.idle_seconds;
+      if (Number.isFinite(s.idle_seconds)) idleSeconds.current = s.idle_seconds;
       if (s.configured && !s.locked) {
         armIdleTimer();
       } else {
@@ -111,7 +115,10 @@ export function useAdminLock(csrf: string | null, enabled: boolean): UseAdminLoc
         .then((s) => {
           // The server may report a lock that drifted (e.g. another tab locked).
           if (s.locked) setLocked(true);
-          else idleSeconds.current = s.idle_seconds;
+          // Re-anchor the local idle window from the heartbeat — but ONLY when
+          // the server actually sent a usable number. Assigning an absent field
+          // here is what poisoned the timer (→ NaN → instant re-lock).
+          else if (Number.isFinite(s.idle_seconds)) idleSeconds.current = s.idle_seconds;
         })
         .catch(() => {
           // Ignore — the idle timer + next mint failure are the backstop.
