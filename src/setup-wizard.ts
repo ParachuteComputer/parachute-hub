@@ -2344,19 +2344,19 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
   if (registry) {
     // hub#267: thread the typed name through `PARACHUTE_VAULT_NAME` so
     // vault's first-boot path (vault#342) names the created vault
-    // accordingly. Skip the env override when the operator left the
-    // field blank — vault's `resolveFirstBootVaultName` defaults to
-    // `default` on absent env vars, so this preserves the prior
-    // behaviour for the empty-input case.
+    // accordingly.
     //
-    // If the operator typed "default" explicitly, treat the same as
-    // blank — vault's first-boot defaults to "default" anyway, so
-    // skipping the env override is correct (the comparison below
-    // catches both blank-trimmed-to-DEFAULT and typed-"default").
-    const spawnEnv: Record<string, string> = {};
-    if (vaultName !== DEFAULT_VAULT_NAME) {
-      spawnEnv.PARACHUTE_VAULT_NAME = vaultName;
-    }
+    // #478 Part 2: ALWAYS set `PARACHUTE_VAULT_NAME`, even when the name
+    // is "default". Once vault removes its silent auto-create-on-missing-env
+    // behavior, vault's first-boot will require the env var to know which
+    // vault to create — a missing `PARACHUTE_VAULT_NAME` will mean "no vault
+    // to create" rather than "create one named default". Passing it
+    // explicitly for every path (including the default) is correct and safe:
+    // vault's `resolveFirstBootVaultName` accepts "default" as a valid name
+    // and behaves identically to the prior implicit default.
+    const spawnEnv: Record<string, string> = {
+      PARACHUTE_VAULT_NAME: vaultName,
+    };
     // Capture importParams + deps in the runInstall promise chain — when
     // mode === "import", run the vault-side `/.parachute/mirror/import`
     // POST as a follow-up step once the supervised vault has come up
@@ -2377,7 +2377,7 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
       registry,
       ...(deps.run ? { run: deps.run } : {}),
       ...(deps.isLinked ? { isLinked: deps.isLinked } : {}),
-      ...(Object.keys(spawnEnv).length > 0 ? { spawnEnv } : {}),
+      spawnEnv,
     })
       .then(async () => {
         if (!importToRun) return;

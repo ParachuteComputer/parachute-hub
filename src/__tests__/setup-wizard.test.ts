@@ -3267,7 +3267,7 @@ describe("typed vault name (hub#267)", () => {
     }
   });
 
-  test("vault POST with empty name falls back to 'default' + omits the env override", async () => {
+  test("vault POST with empty name falls back to 'default' + ALWAYS passes PARACHUTE_VAULT_NAME (#478 Part 2)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -3330,12 +3330,12 @@ describe("typed vault name (hub#267)", () => {
       await new Promise((r) => setTimeout(r, 50));
       const vaultSpawn = spawnRequests.find((s) => s.short === "vault");
       expect(vaultSpawn).toBeDefined();
-      // No PARACHUTE_VAULT_NAME override on the default-name path (vault's
-      // resolveFirstBootVaultName already defaults to "default" when the
-      // env var is absent). PORT is set by the supervisor (hub#356) for
-      // every supervised child regardless — assert the empty-name path
-      // doesn't add PARACHUTE_VAULT_NAME.
-      expect(vaultSpawn?.env?.PARACHUTE_VAULT_NAME).toBeUndefined();
+      // #478 Part 2: wizard ALWAYS passes PARACHUTE_VAULT_NAME so vault's
+      // first-boot knows which vault to create once silent auto-create is
+      // removed. Even for the default name, the env var must be set to
+      // "default" — not omitted. PORT is set by the supervisor (hub#356)
+      // for every supervised child regardless.
+      expect(vaultSpawn?.env?.PARACHUTE_VAULT_NAME).toBe("default");
       expect(vaultSpawn?.env?.PORT).toBe("1940");
     } finally {
       db.close();

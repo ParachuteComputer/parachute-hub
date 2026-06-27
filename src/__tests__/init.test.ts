@@ -2218,5 +2218,142 @@ describe("resolveInitChannel (hub#694 bug 2)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// #478 Part 2 — `parachute init --vault-name <name>` creates the first vault
+// ---------------------------------------------------------------------------
+
+describe("init --vault-name (#478 Part 2)", () => {
+  /** Minimal stub that satisfies every init seam except the ones under test. */
+  function baseOpts(
+    h: Harness,
+    overrides: Parameters<typeof init>[0] = {},
+  ): Parameters<typeof init>[0] {
+    return {
+      configDir: h.configDir,
+      manifestPath: h.manifestPath,
+      log: () => {},
+      alive: () => false,
+      ensureHubVersion: async () => ({
+        outcome: "match" as const,
+        installedVersion: "test",
+        messages: [],
+      }),
+      ensureHub: async () => {
+        writeHubPort(1939, h.configDir);
+        return { pid: 0, port: 1939, started: true };
+      },
+      readExposeStateFn: () => undefined,
+      isTty: false,
+      platform: "linux" as const,
+      installVaultModuleImpl: noopVaultInstall,
+      noBrowser: true,
+      noExposePrompt: true,
+      noWizardPrompt: true,
+      ...overrides,
+    };
+  }
+
+  test("(a) with vaultName set: invokes createFirstVaultImpl with the name", async () => {
+    const h = makeHarness();
+    try {
+      const createCalls: string[] = [];
+      const logs: string[] = [];
+      const code = await init(
+        baseOpts(h, {
+          vaultName: "myvault",
+          log: (l) => logs.push(l),
+          createFirstVaultImpl: async (name) => {
+            createCalls.push(name);
+            return 0;
+          },
+        }),
+      );
+      expect(code).toBe(0);
+      expect(createCalls).toEqual(["myvault"]);
+      expect(logs.join("\n")).toContain('Creating vault "myvault"');
+      expect(logs.join("\n")).toContain('Vault "myvault" created');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(b) without vaultName: does NOT invoke createFirstVaultImpl", async () => {
+    const h = makeHarness();
+    try {
+      let createCalled = false;
+      const code = await init(
+        baseOpts(h, {
+          // no vaultName set
+          createFirstVaultImpl: async () => {
+            createCalled = true;
+            return 0;
+          },
+        }),
+      );
+      expect(code).toBe(0);
+      expect(createCalled).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("(c) invalid vault name via the CLI seam: validateVaultName rejects it", () => {
+    // The CLI validates before calling init; test the validator directly
+    // so the unit test doesn't need to drive argv parsing. The validator
+    // is the same one the CLI uses (imported in cli.ts).
+    const { validateVaultName } = require("../vault-name.ts");
+    const result = validateVaultName("My Vault!");
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/lowercase alphanumeric/);
+  });
+
+  test("(d) vault already exists: create is skipped, note logged", async () => {
+    const h = makeHarness();
+    try {
+      // Seed services.json so init sees a vault row before Step 1.6.
+      seedVault(h.manifestPath);
+      const createCalls: string[] = [];
+      const logs: string[] = [];
+      const code = await init(
+        baseOpts(h, {
+          vaultName: "myvault",
+          log: (l) => logs.push(l),
+          createFirstVaultImpl: async (name) => {
+            createCalls.push(name);
+            return 0;
+          },
+        }),
+      );
+      expect(code).toBe(0);
+      // Create was not invoked — vault already existed.
+      expect(createCalls).toEqual([]);
+      expect(logs.join("\n")).toContain("vault already configured");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("non-zero exit from create: warns but init still exits 0", async () => {
+    const h = makeHarness();
+    try {
+      const logs: string[] = [];
+      const code = await init(
+        baseOpts(h, {
+          vaultName: "myvault",
+          log: (l) => logs.push(l),
+          createFirstVaultImpl: async () => 1,
+        }),
+      );
+      // Init is non-fatal on create failure — operator can retry.
+      expect(code).toBe(0);
+      const joined = logs.join("\n");
+      expect(joined).toContain("exited 1");
+      expect(joined).toContain("parachute vault create myvault");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 // Type alias used only inside this test file for the heuristic test.
 type ExposeChoice = "none" | "tailnet" | "cloudflare";

@@ -52,6 +52,7 @@ import { issueOperatorToken, readOperatorTokenFile } from "../operator-token.ts"
 import { type AliveFn, defaultAlive, processState } from "../process-state.ts";
 import { findService, readManifestLenient } from "../services-manifest.ts";
 import { listUsers } from "../users.ts";
+import { validateVaultName } from "../vault-name.ts";
 import { type InstallOpts, install as defaultInstall } from "./install.ts";
 
 /** The three options the exposure prompt offers — also the `--expose` flag's domain. */
@@ -202,6 +203,36 @@ export interface InitOpts {
    * already known so there's no question to ask).
    */
   noWizardPrompt?: boolean;
+  /**
+   * Vault name to create as part of `parachute init --vault-name <name>`
+   * (#478 Part 2). When set, init creates the first vault via
+   * `createFirstVaultImpl` immediately after Step 1.5 (operator-token
+   * guarantee), before the admin-URL resolution. Validated with
+   * `validateVaultName` in the CLI before reaching here.
+   *
+   * If a vault already exists (services.json has a parachute-vault row),
+   * the create is skipped and a note is logged — idempotent on re-runs.
+   *
+   * Without this field (the default), init makes NO vault — the wizard
+   * owns Create/Import/Skip as before. The --no-browser / scripted path
+   * remains vault-free unless --vault-name is explicitly passed.
+   */
+  vaultName?: string;
+  /**
+   * Test seam: injectable impl for the `--vault-name` create step (#478
+   * Part 2). Production shells out `["parachute-vault", "create", name]`
+   * via the injected runner. Tests pass a stub to record the call without
+   * touching a live vault binary. Receives the vault name + a runner shim;
+   * returns an exit code (0 = success).
+   *
+   * The production default (`defaultCreateFirstVault`) uses the `Runner`
+   * type pattern already established across every command that shells out:
+   * `readonly string[] => Promise<number>`.
+   */
+  createFirstVaultImpl?: (
+    name: string,
+    ctx: { runner: (cmd: readonly string[]) => Promise<number> },
+  ) => Promise<number>;
   /**
    * Canonical public hub origin (the OAuth issuer / `iss` claim). Persisted to
    * `hub_settings.hub_origin` BEFORE the hub unit starts + modules spawn, so
@@ -600,6 +631,38 @@ async function defaultFetchBootstrapToken(loopbackUrl: string): Promise<string |
 }
 
 /**
+ * Default runner shim for the `--vault-name` create step (#478 Part 2).
+ * Shells out `parachute-vault create <name>` via Bun.spawn, inheriting
+ * the operator's full env (so PARACHUTE_HOME, PATH, etc. pass through).
+ *
+ * This is the same pattern every other command that shells out uses — a
+ * `Runner` (`readonly string[] => Promise<number>`) so tests can inject a
+ * stub without touching the real vault binary.
+ */
+async function defaultRunner(cmd: readonly string[]): Promise<number> {
+  const proc = Bun.spawn([...cmd], {
+    stdio: ["inherit", "inherit", "inherit"],
+    env: process.env,
+  });
+  return await proc.exited;
+}
+
+/**
+ * Default impl for the `--vault-name` first-vault create step (#478 Part 2).
+ * Invokes `parachute-vault create <name>` via the injectable runner. The
+ * `parachute-vault` binary must already be on PATH (guaranteed by Step 0.5's
+ * vault-module install). Exit code is forwarded directly — callers log the
+ * outcome and continue (a non-zero create doesn't abort init; the operator
+ * can re-run `parachute vault create <name>` or use the wizard to retry).
+ */
+async function defaultCreateFirstVault(
+  name: string,
+  ctx: { runner: (cmd: readonly string[]) => Promise<number> },
+): Promise<number> {
+  return await ctx.runner(["parachute-vault", "create", name]);
+}
+
+/**
  * Prompt for the wizard-choice question (hub#168 Cut 4). Returns the
  * picked option, or `undefined` if the operator quit. Default is
  * `browser` because (a) the browser flow is the canonical post-launch
@@ -735,6 +798,7 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   const runCliWizardImpl = opts.runCliWizardImpl ?? defaultRunCliWizard;
   const fetchBootstrapTokenImpl = opts.fetchBootstrapTokenImpl ?? defaultFetchBootstrapToken;
   const setHubOriginImpl = opts.setHubOriginImpl ?? defaultSetHubOrigin;
+  const createFirstVaultImpl = opts.createFirstVaultImpl ?? defaultCreateFirstVault;
 
   log("Parachute init — getting your hub set up.");
   log("");
@@ -884,6 +948,44 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   // mints it when it creates the admin. Non-fatal either way — init continues
   // to the wizard regardless.
   await guaranteeOperatorToken({ configDir, hubPort, log });
+
+  // Step 1.6 (#478 Part 2): if `--vault-name <name>` was given, create the
+  // first vault now — after the hub is up (Step 1) and the operator token is
+  // guaranteed (Step 1.5). The vault module was installed at Step 0.5, so
+  // `parachute-vault` is on PATH.
+  //
+  // Skip the create when:
+  //   - no `--vault-name` was given (default wizard-owns-create path)
+  //   - a vault row already exists in services.json (idempotent re-run)
+  //
+  // A non-zero exit from `parachute-vault create` is non-fatal: warn + continue.
+  // The operator can re-run `parachute vault create <name>` or use the wizard.
+  if (opts.vaultName !== undefined) {
+    // Re-check whether a vault exists AFTER vault-module install (Step 0.5
+    // may have seeded a row). Use the same check init already does at Step 3.
+    let vaultExistsNow = false;
+    try {
+      const manifest = readManifestLenient(manifestPath);
+      vaultExistsNow = manifest.services.some((s) => s.name.startsWith("parachute-vault"));
+    } catch {
+      vaultExistsNow = false;
+    }
+    if (vaultExistsNow) {
+      log(`note: vault already configured — --vault-name ${opts.vaultName} ignored.`);
+    } else {
+      log(`Creating vault "${opts.vaultName}"…`);
+      const createCode = await createFirstVaultImpl(opts.vaultName, { runner: defaultRunner });
+      if (createCode === 0) {
+        log(`✓ Vault "${opts.vaultName}" created.`);
+      } else {
+        log(
+          `⚠ \`parachute-vault create ${opts.vaultName}\` exited ${createCode}. ` +
+            `You can retry with: parachute vault create ${opts.vaultName}`,
+        );
+      }
+      log("");
+    }
+  }
 
   // Step 2: exposure chain. Skipped when already exposed, in non-TTY,
   // or when --no-expose-prompt was passed. `--expose <choice>` jumps
