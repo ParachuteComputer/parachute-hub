@@ -594,6 +594,10 @@ async function main(argv: string[]): Promise<number> {
         console.error("parachute doctor: --json and --fix are mutually exclusive");
         return 1;
       }
+      if (yes && !fix) {
+        console.error("parachute doctor: --yes has no effect without --fix");
+        return 1;
+      }
       const mod = await loadCommand("doctor", () => import("./commands/doctor.ts"));
       if (!mod) return 1;
       return await mod.doctor({ json, fix, yes });

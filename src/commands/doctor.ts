@@ -1112,13 +1112,23 @@ async function fixPortDrift(
 ): Promise<number> {
   const { print, deps } = opts;
 
-  // Parse the RAW file — not through readManifest (throws on dup ports) or
+  // Read the RAW file — not through readManifest (throws on dup ports) or
   // readManifestLenient (drops a colliding row). We need the pre-gate shape to
-  // repair it. A genuinely unparseable file → bail (the read-only
+  // repair it.
+  let text: string;
+  try {
+    text = readFileSync(manifestPath, "utf8");
+  } catch {
+    // Absent (ENOENT) / unreadable services.json is the fresh pre-install
+    // state, not a corrupt file — there's no drift to fix. Idempotent no-op.
+    print("No canonical-port drift — nothing to fix.");
+    return 0;
+  }
+  // A genuinely unparseable / wrong-shape file → bail (the read-only
   // `services-manifest` check surfaces the parse error in the report).
   let parsed: { services: Record<string, unknown>[] };
   try {
-    const raw = JSON.parse(readFileSync(manifestPath, "utf8")) as unknown;
+    const raw = JSON.parse(text) as unknown;
     if (
       !raw ||
       typeof raw !== "object" ||
@@ -1134,7 +1144,18 @@ async function fixPortDrift(
     return 1;
   }
 
-  const { drifted, duplicates } = computePortDrift(readRawPortRows(manifestPath));
+  // Compute drift from the SAME parsed object we'll mutate below (one read —
+  // no read-it-twice window where the file could change between detection and
+  // rewrite). Filter to the minimal {name, port} rows computePortDrift needs.
+  const portRows: PortRow[] = [];
+  for (const row of parsed.services) {
+    const name = row.name;
+    const port = row.port;
+    if (typeof name === "string" && typeof port === "number" && Number.isInteger(port)) {
+      portRows.push({ name, port });
+    }
+  }
+  const { drifted, duplicates } = computePortDrift(portRows);
 
   // Report any duplicate-port collisions up front (not separately auto-fixed —
   // canonical-drift repair below usually clears them by moving each row to its
@@ -1174,9 +1195,12 @@ async function fixPortDrift(
   }
 
   // Apply: mutate ONLY the port of drifted rows on the raw parsed object;
-  // every other field round-trips verbatim. Write through `writeManifest` for
-  // the atomic tmp+rename + trailing-newline formatting. Cast is safe — the raw
-  // rows carry the full ServiceEntry shape; we only touched `port`.
+  // every other field round-trips verbatim. Write through `writeManifest`, which
+  // JSON.stringifies the object as-is (no field filtering) + does the atomic
+  // tmp+rename + trailing-newline formatting — so unknown/optional fields are
+  // preserved. The cast is to satisfy writeManifest's parameter type; we never
+  // rely on the raw rows actually being well-formed ServiceEntry objects (a
+  // malformed sibling row round-trips untouched, same as it was on disk).
   const canonicalByName = new Map(drifted.map((d) => [d.name, d.canonical]));
   const next = {
     services: parsed.services.map((row) => {

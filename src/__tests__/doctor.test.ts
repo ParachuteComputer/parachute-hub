@@ -588,6 +588,20 @@ describe("doctor --fix — canonical-port repair (confirm-gated, idempotent, non
     }
   });
 
+  test("--fix on an absent services.json (fresh install) → 'nothing to fix', exit 0", async () => {
+    const h = makeHarness();
+    try {
+      // No services.json at all — the truly-fresh case. --fix must NOT report a
+      // corrupt-file error; it's the idempotent no-op path.
+      const { code, lines } = await runFix(h, { isInteractive: () => false }, { yes: false });
+      expect(code).toBe(0);
+      expect(lines.join("\n").toLowerCase()).toContain("nothing to fix");
+      expect(lines.join("\n").toLowerCase()).not.toContain("can't read");
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("--fix --yes rewrites the drifted port to canonical + preserves other fields", async () => {
     const h = makeHarness();
     try {
