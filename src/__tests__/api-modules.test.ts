@@ -6,8 +6,10 @@ import {
   API_MODULES_CHANNEL_REQUIRED_SCOPE,
   API_MODULES_REQUIRED_SCOPE,
   _clearLatestVersionCacheForTests,
+  defaultReadInstalledVersion,
   handleApiModules,
   handleApiModulesChannel,
+  isUpgradeAvailable,
 } from "../api-modules.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { getSetting, setModuleInstallChannel } from "../hub-settings.ts";
@@ -489,6 +491,147 @@ describe("GET /api/modules", () => {
     const scribe = body.modules.find((m) => m.short === "scribe");
     expect(scribe?.installed).toBe(false);
     expect(scribe?.installed_version).toBeNull();
+  });
+
+  // ── hub#243: upgrade-offer must be semver-aware + installed-version must be live ──
+
+  type UpgradeWire = {
+    short: string;
+    installed_version: string | null;
+    latest_version: string | null;
+    upgrade_available: boolean;
+  };
+
+  async function modulesWith(opts: {
+    installedVersion: string;
+    latest: string | null;
+    readInstalledVersion?: (installDir: string) => string | null;
+  }): Promise<UpgradeWire[]> {
+    writeManifest(h.manifestPath, [
+      {
+        name: "parachute-vault",
+        port: 1940,
+        paths: ["/vault/default"],
+        health: "/vault/default/health",
+        version: opts.installedVersion,
+        installDir: "/install/dir/vault",
+      },
+    ]);
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => opts.latest,
+      // Default: no live read (synthetic install dir has no package.json), so
+      // the services.json cache is used — matching the prior behavior.
+      readInstalledVersion: opts.readInstalledVersion ?? (() => null),
+    });
+    const body = (await res.json()) as { modules: UpgradeWire[] };
+    return body.modules;
+  }
+
+  test("does NOT offer an upgrade when the channel target is OLDER than installed (the live downgrade bug)", async () => {
+    // The exact live shape: rc operator installed 0.6.4-rc.15; channel resolved
+    // latest_version to the OLDER @latest 0.6.3. Strings differ, but it's a
+    // downgrade — upgrade_available MUST be false.
+    const mods = await modulesWith({ installedVersion: "0.6.4-rc.15", latest: "0.6.3" });
+    const vault = mods.find((m) => m.short === "vault");
+    expect(vault?.installed_version).toBe("0.6.4-rc.15");
+    expect(vault?.latest_version).toBe("0.6.3");
+    expect(vault?.upgrade_available).toBe(false);
+  });
+
+  test("offers an upgrade for a real rc → newer-rc move", async () => {
+    const mods = await modulesWith({ installedVersion: "0.6.4-rc.15", latest: "0.6.4-rc.16" });
+    const vault = mods.find((m) => m.short === "vault");
+    expect(vault?.upgrade_available).toBe(true);
+  });
+
+  test("offers an upgrade for rc → its own stable (stable > its rc per semver)", async () => {
+    const mods = await modulesWith({ installedVersion: "0.6.4-rc.15", latest: "0.6.4" });
+    const vault = mods.find((m) => m.short === "vault");
+    expect(vault?.upgrade_available).toBe(true);
+  });
+
+  test("offers an upgrade for a plain stable → newer stable", async () => {
+    const mods = await modulesWith({ installedVersion: "0.4.5", latest: "0.5.0" });
+    const vault = mods.find((m) => m.short === "vault");
+    expect(vault?.upgrade_available).toBe(true);
+  });
+
+  test("no upgrade when installed === latest", async () => {
+    const mods = await modulesWith({ installedVersion: "0.5.0", latest: "0.5.0" });
+    const vault = mods.find((m) => m.short === "vault");
+    expect(vault?.upgrade_available).toBe(false);
+  });
+
+  test("no upgrade when the npm probe failed (latest_version null)", async () => {
+    const mods = await modulesWith({ installedVersion: "0.5.0", latest: null });
+    const vault = mods.find((m) => m.short === "vault");
+    expect(vault?.latest_version).toBeNull();
+    expect(vault?.upgrade_available).toBe(false);
+  });
+
+  test("installed_version reflects the LIVE on-disk version, not a stale services.json cache (hub#243)", async () => {
+    // services.json cache lags the bun-linked checkout: cache says 0.5.4-rc.15
+    // (the live symptom) while package.json on disk is already 0.6.4-rc.15.
+    // The admin view must show what's actually installed.
+    const mods = await modulesWith({
+      installedVersion: "0.5.4-rc.15",
+      latest: "0.6.3",
+      readInstalledVersion: (dir) => (dir === "/install/dir/vault" ? "0.6.4-rc.15" : null),
+    });
+    const vault = mods.find((m) => m.short === "vault");
+    expect(vault?.installed_version).toBe("0.6.4-rc.15");
+    // And with the corrected current, @latest 0.6.3 is still a downgrade → no offer.
+    expect(vault?.upgrade_available).toBe(false);
+  });
+
+  test("falls back to the services.json version when the live read returns null", async () => {
+    const mods = await modulesWith({
+      installedVersion: "0.6.4-rc.15",
+      latest: "0.6.4-rc.16",
+      readInstalledVersion: () => null,
+    });
+    const vault = mods.find((m) => m.short === "vault");
+    expect(vault?.installed_version).toBe("0.6.4-rc.15");
+    expect(vault?.upgrade_available).toBe(true);
+  });
+
+  test("isUpgradeAvailable: semver-aware, fail-closed on unparseable + nulls", () => {
+    // strictly-newer → true
+    expect(isUpgradeAvailable("0.4.5", "0.5.0")).toBe(true);
+    expect(isUpgradeAvailable("0.6.4-rc.15", "0.6.4-rc.16")).toBe(true);
+    expect(isUpgradeAvailable("0.6.4-rc.15", "0.6.4")).toBe(true); // stable > its rc
+    // same / older → false
+    expect(isUpgradeAvailable("0.5.0", "0.5.0")).toBe(false);
+    expect(isUpgradeAvailable("0.6.4-rc.15", "0.6.3")).toBe(false); // the live downgrade
+    expect(isUpgradeAvailable("0.6.4", "0.6.4-rc.15")).toBe(false); // stable → its rc
+    // nulls → false (not installed / probe failed)
+    expect(isUpgradeAvailable(null, "0.5.0")).toBe(false);
+    expect(isUpgradeAvailable("0.5.0", null)).toBe(false);
+    // unparseable → false (fail-closed: never offer a move we can't verify)
+    expect(isUpgradeAvailable("not-a-version", "0.5.0")).toBe(false);
+    expect(isUpgradeAvailable("0.5.0", "garbage")).toBe(false);
+  });
+
+  test("defaultReadInstalledVersion reads package.json version + tolerates missing/bad files", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "phub-live-ver-"));
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ version: "0.6.4-rc.15" }));
+      expect(defaultReadInstalledVersion(tmp)).toBe("0.6.4-rc.15");
+      // Missing dir / no package.json → null.
+      expect(defaultReadInstalledVersion(join(tmp, "does-not-exist"))).toBeNull();
+      // Malformed JSON → null (no throw).
+      writeFileSync(join(tmp, "package.json"), "{ not json");
+      expect(defaultReadInstalledVersion(tmp)).toBeNull();
+      // No version field → null.
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ name: "x" }));
+      expect(defaultReadInstalledVersion(tmp)).toBeNull();
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   test("includes supervisor status + pid when a supervisor is injected", async () => {
