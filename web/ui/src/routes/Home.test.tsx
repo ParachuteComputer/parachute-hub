@@ -50,6 +50,7 @@ function makeModule(short: string, overrides: Partial<api.ModuleListing> = {}): 
     installed: true,
     installed_version: "1.0.0",
     latest_version: "1.0.0",
+    upgrade_available: false,
     supervisor_status: "running",
     pid: 1234,
     install_dir: `/home/.parachute/${short}`,

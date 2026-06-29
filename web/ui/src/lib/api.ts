@@ -710,6 +710,16 @@ export interface ModuleListing {
   installed: boolean;
   installed_version: string | null;
   latest_version: string | null;
+  /**
+   * Whether `latest_version` is a REAL upgrade — STRICTLY NEWER than
+   * `installed_version` under semver ordering (hub#243). Computed server-side
+   * via `compareVersions`; the SPA consumes it directly rather than re-deriving
+   * with a string `!==`, which framed a downgrade as an upgrade (an rc operator
+   * on `0.6.4-rc.15` was offered "upgrade to 0.6.3" — the older `@latest` —
+   * purely because the strings differed). `false` when not installed, the probe
+   * failed, the target is the same/older, or either version is unparseable.
+   */
+  upgrade_available: boolean;
   supervisor_status: "starting" | "running" | "stopped" | "crashed" | "restarting" | null;
   pid: number | null;
   install_dir: string | null;

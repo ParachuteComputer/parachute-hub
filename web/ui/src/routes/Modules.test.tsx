@@ -65,6 +65,10 @@ function moduleRow(short: string, overrides: Partial<api.ModuleListing> = {}): a
     installed: false,
     installed_version: null,
     latest_version: "1.0.0",
+    // Server-computed, semver-aware (hub#243). Defaults false; tests that
+    // exercise the Upgrade affordance pin it explicitly, mirroring the server
+    // which only sets it true when latest is STRICTLY NEWER than installed.
+    upgrade_available: false,
     supervisor_status: null,
     pid: null,
     install_dir: null,
@@ -616,13 +620,14 @@ describe("Modules — install flow", () => {
 });
 
 describe("Modules — upgrade affordance", () => {
-  it("shows 'Upgrade to vX' when installed_version < latest_version", async () => {
+  it("shows 'Upgrade to vX' when upgrade_available (semver-newer target)", async () => {
     vi.mocked(api.listModules).mockResolvedValue({
       modules: [
         moduleRow("vault", {
           installed: true,
           installed_version: "0.4.5",
           latest_version: "0.5.0",
+          upgrade_available: true,
           supervisor_status: "running",
         }),
       ],
@@ -634,6 +639,32 @@ describe("Modules — upgrade affordance", () => {
     const upgradeBtn = screen.getByRole("button", { name: /upgrade to v0\.5\.0/i });
     expect(upgradeBtn).toBeInTheDocument();
     expect(upgradeBtn).not.toBeDisabled();
+  });
+
+  it("shows 'Up to date' (disabled) when !upgrade_available even if version strings differ — rc ahead of @latest (hub#243 downgrade guard)", async () => {
+    // The live bug: rc operator on 0.6.4-rc.15, @latest dist-tag = 0.6.3. The
+    // strings differ but the target is OLDER — the server sets
+    // upgrade_available=false, so the SPA must NOT offer the downgrade.
+    vi.mocked(api.listModules).mockResolvedValue({
+      modules: [
+        moduleRow("vault", {
+          installed: true,
+          installed_version: "0.6.4-rc.15",
+          latest_version: "0.6.3",
+          upgrade_available: false,
+          supervisor_status: "running",
+        }),
+      ],
+      supervisor_available: true,
+      module_install_channel: "latest",
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getByText("Vault")).toBeInTheDocument());
+    // No "available" badge, and the button reads "Up to date" + is disabled.
+    expect(screen.queryByText(/v0\.6\.3 available/i)).not.toBeInTheDocument();
+    const upgradeBtn = screen.getByRole("button", { name: /up to date/i });
+    expect(upgradeBtn).toBeInTheDocument();
+    expect(upgradeBtn).toBeDisabled();
   });
 
   it("shows 'Up to date' (disabled) when installed_version == latest_version", async () => {
@@ -663,6 +694,7 @@ describe("Modules — upgrade affordance", () => {
           installed: true,
           installed_version: "0.4.5",
           latest_version: "0.5.0",
+          upgrade_available: true,
           supervisor_status: "running",
         }),
       ],
@@ -696,6 +728,7 @@ describe("Modules — upgrade affordance", () => {
           installed: true,
           installed_version: "0.4.5",
           latest_version: "0.5.0",
+          upgrade_available: true,
           supervisor_status: "running",
         }),
       ],

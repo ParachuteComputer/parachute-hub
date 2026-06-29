@@ -541,8 +541,11 @@ function ModuleRow({
   onUninstall,
 }: ModuleRowProps) {
   const canAct = supervisorAvailable && !syncBusy;
-  const upgradeAvailable =
-    mod.installed_version !== mod.latest_version && mod.latest_version !== null;
+  // Server-computed, semver-aware (hub#243). NEVER re-derive with a string
+  // `!==` — that framed a downgrade (rc operator on 0.6.4-rc.15 offered the
+  // older @latest 0.6.3) as an upgrade. `upgrade_available` is true ONLY when
+  // the channel-resolved target is STRICTLY NEWER than installed.
+  const upgradeAvailable = mod.upgrade_available;
   const openUrl = mod.management_url;
   // Configure → the module's OWN config UI (2026-06-09 modular-UI architecture,
   // P3). Rendered only when the module declares `configUiUrl`; the module owns

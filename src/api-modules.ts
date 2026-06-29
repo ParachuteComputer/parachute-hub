@@ -42,6 +42,9 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { compareVersions } from "./commands/upgrade.ts";
 import { validateHostAdminToken } from "./host-admin-token-validation.ts";
 import {
   type ModuleInstallChannel,
@@ -178,6 +181,40 @@ export interface ApiModulesDeps {
    * (hub#342 — drives the admin SPA Modules page's "Open" button).
    */
   readModuleManifest?: (installDir: string) => Promise<ModuleManifest | null>;
+  /**
+   * Read the LIVE installed version of a module from its install dir's
+   * `package.json` `version` (hub#243). The services.json `version` field is a
+   * CACHE the module writes on its own boot — on the bun-linked dev path it
+   * goes stale the moment the checkout is rebuilt to a newer version without a
+   * restart that re-stamps services.json. The admin Modules view reads
+   * `installed_version` straight from that cache, so it can show a stale version
+   * (the live symptom: services.json said 0.5.4-rc.15 while the linked checkout
+   * was already 0.6.4-rc.15). When this resolves a version, it WINS over the
+   * services.json cache for the `installed_version` field so the operator sees
+   * what's actually on disk. Returns null on any failure (no install dir,
+   * missing/unreadable package.json, no version) → fall back to the
+   * services.json cache, which is the only source for a not-yet-booted module.
+   *
+   * Production reads `<installDir>/package.json`; tests inject a fake.
+   */
+  readInstalledVersion?: (installDir: string) => string | null;
+}
+
+/**
+ * Default `readInstalledVersion`. Reads `<installDir>/package.json`'s `version`
+ * — the authoritative live version of a module's code on disk, which the
+ * bun-linked dev path keeps current while the services.json cache can lag
+ * (hub#243). Returns null on any failure so the caller falls back to the
+ * services.json `version`.
+ */
+export function defaultReadInstalledVersion(installDir: string): string | null {
+  try {
+    const raw = readFileSync(join(installDir, "package.json"), "utf8");
+    const parsed = JSON.parse(raw) as { version?: unknown };
+    return typeof parsed.version === "string" && parsed.version.length > 0 ? parsed.version : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -239,6 +276,24 @@ interface ModuleWireShape {
   installed: boolean;
   installed_version: string | null;
   latest_version: string | null;
+  /**
+   * Whether the channel-resolved `latest_version` is a REAL upgrade — i.e.
+   * STRICTLY NEWER than `installed_version` under semver ordering (hub#243).
+   * Computed server-side via `compareVersions` so the rc/prerelease ordering is
+   * correct and there's ONE tested source of truth (the SPA used to derive this
+   * client-side with a string `!==`, which framed a *downgrade* as an upgrade:
+   * an rc operator on `0.6.4-rc.15` was offered an "upgrade" to the older
+   * `@latest` `0.6.3` purely because the two strings differed).
+   *
+   * `false` when: not installed · no `latest_version` (probe failed) · target ≤
+   * installed (same or older — incl. the rc→older-stable downgrade) · either
+   * version is unparseable (`compareVersions` returns null → fail-closed: don't
+   * offer a move we can't verify is forward). `true` ONLY when the target
+   * parses AND sorts strictly above installed — so `0.6.4-rc.15` → stable
+   * `0.6.4` IS an upgrade (stable > its own rc per semver §11.4.3), but
+   * `0.6.4-rc.15` → `0.6.3` is NOT.
+   */
+  upgrade_available: boolean;
   supervisor_status: ModuleState["status"] | null;
   pid: number | null;
   /**
@@ -451,6 +506,8 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   // Lenient read so a single bad row written by a buggy module install
   // (e.g. app@0.2.0-rc.4) doesn't take down /api/modules — see hub#406.
   const manifest = readManifestLenient(deps.manifestPath);
+  // Live on-disk version reader (hub#243) — see `defaultReadInstalledVersion`.
+  const readInstalledVersion = deps.readInstalledVersion ?? defaultReadInstalledVersion;
   const installedByShort = new Map<
     string,
     {
@@ -476,6 +533,18 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
       uis?: Record<string, UiSubUnit>;
       mountPath?: string;
     } = { version: entry.version };
+    // Prefer the LIVE on-disk version over the services.json cache when we can
+    // read it (hub#243). `entry.version` is a cache the module stamps on its own
+    // boot; on the bun-linked dev path it lags after a rebuild-without-restart,
+    // so the admin view shows a stale "current" (the live symptom: cache said
+    // 0.5.4-rc.15 while the linked checkout was already 0.6.4-rc.15). The
+    // module's `<installDir>/package.json` `version` is authoritative for the
+    // code actually on disk. Falls back to the cache when there's no installDir
+    // or the package.json can't be read (e.g. a not-yet-booted seed row).
+    if (entry.installDir !== undefined) {
+      const live = readInstalledVersion(entry.installDir);
+      if (live !== null) value.version = live;
+    }
     if (entry.installDir !== undefined) value.installDir = entry.installDir;
     if (entry.uis !== undefined) value.uis = entry.uis;
     // First non-`.parachute` path is the module's user-facing mount
@@ -622,6 +691,10 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
       installed: installed !== undefined,
       installed_version: installed?.version ?? null,
       latest_version: latestByShort.get(short) ?? null,
+      upgrade_available: isUpgradeAvailable(
+        installed?.version ?? null,
+        latestByShort.get(short) ?? null,
+      ),
       supervisor_status: state?.status ?? null,
       pid: state?.pid ?? null,
       supervisor_start_error: state?.startError ?? null,
@@ -644,6 +717,9 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
 
   // Every supervised module's run-state — curated AND non-curated (hub#539).
   // Built from the same supervisor.list() snapshot already in `stateByShort`.
+  // `installed_version` here inherits the live-on-disk override already applied
+  // to `installedByShort[].version` in the manifest loop above (hub#243), so the
+  // `supervised` array reports the same corrected version as the `modules` rows.
   const supervised: SupervisedSnapshotWire[] = Array.from(stateByShort.values()).map((s) => ({
     short: s.short,
     installed: installedByShort.has(s.short),
@@ -840,6 +916,35 @@ function toUisWireShape(uis: Record<string, UiSubUnit> | undefined): UiSubUnitWi
     oauth_client_id: u.oauthClientId ?? null,
     status: u.status ?? null,
   }));
+}
+
+/**
+ * Whether `latest` is a REAL upgrade over `installed` — strictly newer under
+ * semver ordering (hub#243). The single tested source of truth for the
+ * "upgrade available?" decision, shared by the wire shape's `upgrade_available`
+ * field and (transitively) the admin SPA's Upgrade button.
+ *
+ * Returns `false` unless BOTH versions parse AND `latest` sorts strictly above
+ * `installed`:
+ *   - no installed version (not installed) → false.
+ *   - no latest version (probe failed / unknown package) → false.
+ *   - `compareVersions` can't parse either side → false (FAIL-CLOSED: never
+ *     offer a move we can't prove is forward).
+ *   - target ≤ installed → false. This is the load-bearing downgrade guard:
+ *     an rc operator on `0.6.4-rc.15` whose channel resolves `latest_version`
+ *     to the OLDER `@latest` `0.6.3` is NOT offered an "upgrade" (the live bug
+ *     — a downgrade framed as an upgrade by the old string `!==`).
+ *
+ * Reuses `commands/upgrade.ts:compareVersions`, the same comparator the CLI
+ * `parachute upgrade` downgrade guard uses, so the SPA offer and the CLI guard
+ * can't disagree about rc/prerelease ordering. Note `0.6.4-rc.15` → stable
+ * `0.6.4` IS strictly-newer (stable > its own rc per semver §11.4.3), so a real
+ * rc→its-stable promotion still surfaces as an upgrade.
+ */
+export function isUpgradeAvailable(installed: string | null, latest: string | null): boolean {
+  if (installed === null || latest === null) return false;
+  const cmp = compareVersions(latest, installed);
+  return cmp !== null && cmp > 0;
 }
 
 /**
