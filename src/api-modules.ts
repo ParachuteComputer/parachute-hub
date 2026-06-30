@@ -759,6 +759,15 @@ export const API_MODULES_CHANNEL_REQUIRED_SCOPE = "parachute:host:admin";
 export interface ApiModulesChannelDeps {
   db: Database;
   issuer: string;
+  /**
+   * SET of origins the hub answers on (loopback ∪ expose-state ∪ platform ∪
+   * per-request `issuer`), built via `buildHubBoundOrigins` — same posture as
+   * {@link ApiModulesDeps.knownIssuers}. The bearer's `iss` is validated
+   * against THIS set rather than the single `issuer`, so the operator token
+   * (public `iss` after `expose`) is accepted on loopback. Absent → falls back
+   * to `[issuer]` (the prior strict per-request behavior).
+   */
+  knownIssuers?: readonly string[];
 }
 
 export async function handleApiModulesChannel(
@@ -781,7 +790,11 @@ export async function handleApiModulesChannel(
 
   // Bearer validation + scope check.
   try {
-    const validated = await validateAccessToken(deps.db, bearer, deps.issuer);
+    const validated = await validateAccessToken(
+      deps.db,
+      bearer,
+      deps.knownIssuers ?? [deps.issuer],
+    );
     if (typeof validated.payload.sub !== "string" || validated.payload.sub.length === 0) {
       return jsonError(401, "unauthenticated", "bearer token has no sub claim");
     }

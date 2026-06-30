@@ -172,6 +172,134 @@ describe("requireScope", () => {
   });
 });
 
+describe("requireScope multi-origin issuer set (hub#516 parity)", () => {
+  // The hub answers on several legitimate origins after `parachute hub
+  // set-origin` / `expose` (loopback ∪ tunnel ∪ public). A credential minted
+  // under a still-valid prior origin must keep validating at admin-auth even
+  // when the per-request canonical issuer is now a different member of the set.
+  const LOOPBACK = "http://127.0.0.1:1939";
+  const TUNNEL = "https://brain.gitcoin.co";
+  const FOREIGN = "https://evil.example.com";
+
+  test("accepts a token whose iss is in the set but ≠ the per-request canonical", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        // Token minted under the TUNNEL origin (e.g. before `set-origin`)…
+        const token = await mintToken(db, ["parachute:host:admin"], { issuer: TUNNEL });
+        // …presented to admin-auth where the canonical per-request issuer is now
+        // LOOPBACK, but the bound-origin set still includes TUNNEL.
+        const ctx = await requireScope(db, reqWithAuth(`Bearer ${token}`), "parachute:host:admin", [
+          LOOPBACK,
+          TUNNEL,
+        ]);
+        expect(ctx.sub).toBe("user-test");
+        expect(ctx.scopes).toContain("parachute:host:admin");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("rejects 401 when iss is OUTSIDE the set", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const token = await mintToken(db, ["parachute:host:admin"], { issuer: FOREIGN });
+        let caught: AdminAuthError | null = null;
+        try {
+          await requireScope(db, reqWithAuth(`Bearer ${token}`), "parachute:host:admin", [
+            LOOPBACK,
+            TUNNEL,
+          ]);
+        } catch (err) {
+          caught = err as AdminAuthError;
+        }
+        expect(caught?.status).toBe(401);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("rejects 401 on signature failure regardless of the set (signature-first)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        // A hub-signed token, then rotate keys + retire so the original kid no
+        // longer verifies — the JWKS signature gate must fire before any iss
+        // membership check, so an in-set iss can't rescue an unverifiable token.
+        let caught: AdminAuthError | null = null;
+        try {
+          await requireScope(db, reqWithAuth("Bearer not-a-real-jwt"), "parachute:host:admin", [
+            LOOPBACK,
+            TUNNEL,
+          ]);
+        } catch (err) {
+          caught = err as AdminAuthError;
+        }
+        expect(caught?.status).toBe(401);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("single-string back-compat: in-set iss as a lone string still validates", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const token = await mintToken(db, ["parachute:host:admin"], { issuer: ISSUER });
+        // A single-element set behaves exactly like the prior single-string form.
+        const ctx = await requireScope(db, reqWithAuth(`Bearer ${token}`), "parachute:host:admin", [
+          ISSUER,
+        ]);
+        expect(ctx.sub).toBe("user-test");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("single-element set rejects a non-matching iss (no accidental widening)", async () => {
+    const h = makeHarness();
+    try {
+      const db = openHubDb(hubDbPath(h.dir));
+      try {
+        rotateSigningKey(db);
+        const token = await mintToken(db, ["parachute:host:admin"], { issuer: TUNNEL });
+        let caught: AdminAuthError | null = null;
+        try {
+          await requireScope(db, reqWithAuth(`Bearer ${token}`), "parachute:host:admin", [ISSUER]);
+        } catch (err) {
+          caught = err as AdminAuthError;
+        }
+        expect(caught?.status).toBe(401);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 describe("adminAuthErrorResponse", () => {
   test("403 → insufficient_scope with WWW-Authenticate", async () => {
     const res = adminAuthErrorResponse(new AdminAuthError(403, "needs admin"));

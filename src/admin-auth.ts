@@ -59,15 +59,24 @@ export function extractBearerToken(req: Request): string {
  * and check it carries `requiredScope`. Returns surfaced claims on success;
  * throws `AdminAuthError` (401 or 403) otherwise.
  *
- * `expectedIssuer` MUST be the hub's own origin — the same value baked into
- * tokens we sign. Defense in depth: even though we can only verify our own
- * keys, the `iss` mismatch reject keeps cross-issuer confusion impossible.
+ * `expectedIssuer` is the hub's own origin(s) — the same value(s) baked into
+ * tokens we sign. Pass a single string for a single-origin hub, or the SET of
+ * origins the hub legitimately answers on (`buildHubBoundOrigins`: loopback ∪
+ * expose-state ∪ platform ∪ per-request issuer) so a credential minted under
+ * a still-valid prior origin keeps validating across an origin switch — the
+ * same multi-origin posture the OAuth path and `validateHostAdminToken`
+ * already use. Defense in depth: even though we can only verify our own keys,
+ * the `iss`-∈-set reject keeps cross-issuer confusion impossible. SECURITY:
+ * the set is ONLY an additive `iss` membership relaxation — `validateAccessToken`
+ * verifies the signature against the hub's own key FIRST, so only tokens this
+ * hub minted ever reach the `iss` check; never pass a raw request Host, only a
+ * `buildHubBoundOrigins`-derived set.
  */
 export async function requireScope(
   db: Database,
   req: Request,
   requiredScope: string,
-  expectedIssuer: string,
+  expectedIssuer: string | readonly string[],
 ): Promise<AdminAuthContext> {
   const token = extractBearerToken(req);
 

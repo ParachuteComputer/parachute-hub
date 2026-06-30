@@ -2706,7 +2706,13 @@ export async function handleRegister(
   let sameHub = false;
   if (req.headers.get("authorization")) {
     try {
-      await requireScope(db, req, "hub:admin", deps.issuer);
+      // Validate the operator bearer's `iss` against the SET of origins the
+      // hub answers on (`deps.hubBoundOrigins` — loopback ∪ expose-state ∪
+      // platform ∪ per-request issuer), not just the single per-request
+      // `issuer`, so a host-admin credential minted under a still-valid prior
+      // origin keeps auto-approving across an origin switch (hub#516 parity).
+      // Falls back to `[deps.issuer]` when no set getter is wired (tests).
+      await requireScope(db, req, "hub:admin", deps.hubBoundOrigins?.() ?? deps.issuer);
       status = "approved";
       sameHub = true;
     } catch (err) {

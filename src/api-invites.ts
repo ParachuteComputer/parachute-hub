@@ -52,6 +52,16 @@ export interface ApiInvitesDeps {
   db: Database;
   /** Hub origin — JWT `iss` validation AND the base for the redemption URL. */
   issuer: string;
+  /**
+   * SET of origins the hub answers on (loopback ∪ expose-state ∪ platform ∪
+   * per-request `issuer`), built via `buildHubBoundOrigins`. The bearer's
+   * `iss` is validated against THIS set rather than the single `issuer`, so a
+   * credential minted under a still-valid prior origin keeps working across an
+   * origin switch (hub#516 parity). The redemption URL still uses the single
+   * canonical `issuer`. Absent → falls back to `[issuer]` (the prior strict
+   * per-request behavior; tests/non-HTTP callers unaffected).
+   */
+  knownIssuers?: readonly string[];
   manifestPath?: string;
   now?: () => Date;
 }
@@ -399,7 +409,12 @@ export async function handleCreateInvite(req: Request, deps: ApiInvitesDeps): Pr
   try {
     // `requireScope` returns the validated claims; the admin's `sub` is the
     // `created_by` audit anchor (guaranteed present — it throws otherwise).
-    const auth = await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+    const auth = await requireScope(
+      deps.db,
+      req,
+      HOST_ADMIN_SCOPE,
+      deps.knownIssuers ?? [deps.issuer],
+    );
     authUserId = auth.sub;
   } catch (err) {
     return adminAuthErrorResponse(err as AdminAuthError);
@@ -544,7 +559,7 @@ export async function handleCreateInvite(req: Request, deps: ApiInvitesDeps): Pr
 export async function handleListInvites(req: Request, deps: ApiInvitesDeps): Promise<Response> {
   if (req.method !== "GET") return jsonError(405, "method_not_allowed", "use GET");
   try {
-    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err as AdminAuthError);
   }
@@ -564,7 +579,7 @@ export async function handleRevokeInvite(
 ): Promise<Response> {
   if (req.method !== "DELETE") return jsonError(405, "method_not_allowed", "use DELETE");
   try {
-    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err as AdminAuthError);
   }

@@ -483,11 +483,26 @@ export interface ValidatedAccessToken {
  * this hub advertises — the same check vault performs against its own
  * `PARACHUTE_HUB_ORIGIN`. Defense in depth: tokens forged or replayed from
  * a different issuer get rejected at validation as well as issuance.
+ *
+ * `expectedIssuer` accepts a single string OR a SET of allowed issuers
+ * (`readonly string[]`), handed straight to jose's `issuer` option (which
+ * accepts `string | string[]`): the `iss` claim must equal the string, or be
+ * a member of the set. The set form is for the hub's own self-issued
+ * credentials, whose `iss` may be ANY origin the hub legitimately answers on
+ * (loopback ∪ expose-state ∪ platform ∪ per-request issuer — see
+ * `buildHubBoundOrigins`), so an origin switch doesn't reject a credential
+ * minted under a still-valid prior origin. SECURITY: this is ONLY an additive
+ * membership relaxation on `iss`. jose verifies the JWS signature against the
+ * hub's own public key FIRST and UNCONDITIONALLY — only tokens this hub
+ * minted can verify — before the `iss` claim is ever compared to the set. The
+ * set must come only from `buildHubBoundOrigins` (the hub's own origins),
+ * never a raw request Host. An empty/omitted value skips the `iss` check
+ * (signature-only); a single string is byte-identical to the prior behavior.
  */
 export async function validateAccessToken(
   db: Database,
   token: string,
-  expectedIssuer?: string,
+  expectedIssuer?: string | readonly string[],
 ): Promise<ValidatedAccessToken> {
   const header = decodeProtectedHeader(token);
   const kid = header.kid;
@@ -495,11 +510,15 @@ export async function validateAccessToken(
   const match = getAllPublicKeys(db).find((k) => k.kid === kid);
   if (!match) throw new Error(`validateAccessToken: unknown or expired kid ${kid}`);
   const pub = await importSPKI(match.publicKeyPem, SIGNING_ALGORITHM);
-  const { payload } = await jwtVerify(
-    token,
-    pub,
-    expectedIssuer ? { issuer: expectedIssuer } : undefined,
-  );
+  // `undefined` → no `iss` pin (signature-only, the internal-caller default).
+  // A string or a non-empty set is handed straight to jose, which checks
+  // membership AFTER the signature verify above. An empty array is passed
+  // through too and so fails closed (no `iss` can match) — same posture as
+  // `validateHostAdminToken`; callers offering an empty origin set get a
+  // rejection, not a silent widening.
+  const issuerOption =
+    expectedIssuer === undefined ? undefined : { issuer: expectedIssuer as string | string[] };
+  const { payload } = await jwtVerify(token, pub, issuerOption);
   // RFC 7009 revocation enforcement (#73). OAuth-issued tokens carry a
   // tokens row keyed by jti; if that row is marked revoked, the JWT is
   // dead even though its signature + expiry are still valid. Tokens that

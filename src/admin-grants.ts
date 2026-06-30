@@ -38,6 +38,15 @@ export interface AdminGrantsDeps {
   db: Database;
   /** Hub origin — passed through to JWT validation as the expected `iss`. */
   issuer: string;
+  /**
+   * SET of origins the hub answers on (loopback ∪ expose-state ∪ platform ∪
+   * per-request `issuer`), built via `buildHubBoundOrigins`. The bearer's
+   * `iss` is validated against THIS set rather than the single `issuer`, so a
+   * credential minted under a still-valid prior origin keeps working across an
+   * origin switch (hub#516 parity). Absent → falls back to `[issuer]` (the
+   * prior strict per-request behavior; tests/non-HTTP callers unaffected).
+   */
+  knownIssuers?: readonly string[];
 }
 
 export interface AdminGrantListing {
@@ -55,7 +64,7 @@ export async function handleListGrants(req: Request, deps: AdminGrantsDeps): Pro
   }
   let ctx: AdminAuthContext;
   try {
-    ctx = await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+    ctx = await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err as AdminAuthError);
   }
@@ -111,7 +120,7 @@ export async function handleRevokeGrant(
   }
   let ctx: AdminAuthContext;
   try {
-    ctx = await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+    ctx = await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err as AdminAuthError);
   }

@@ -370,6 +370,33 @@ describe("validateAccessToken", () => {
     }
   });
 
+  test("expectedIssuer accepts a SET — iss in the set validates, outside rejects", async () => {
+    const { db, cleanup } = makeDb();
+    try {
+      const { token } = await signAccessToken(db, {
+        sub: "u",
+        scopes: ["s"],
+        audience: "operator",
+        clientId: "c",
+        issuer: "https://tunnel.example",
+      });
+      // In-set (≠ first element) validates — additive membership on iss.
+      const { payload } = await validateAccessToken(db, token, [
+        "http://127.0.0.1:1939",
+        "https://tunnel.example",
+      ]);
+      expect(payload.iss).toBe("https://tunnel.example");
+      // Outside the set rejects.
+      await expect(
+        validateAccessToken(db, token, ["http://127.0.0.1:1939", "https://other.example"]),
+      ).rejects.toThrow();
+      // A single-element set that doesn't match also rejects (no widening).
+      await expect(validateAccessToken(db, token, ["http://127.0.0.1:1939"])).rejects.toThrow();
+    } finally {
+      cleanup();
+    }
+  });
+
   test("verifies a token signed by a recently-retired key (rotation tolerance)", async () => {
     const { db, cleanup } = makeDb();
     try {
