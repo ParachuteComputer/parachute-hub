@@ -119,7 +119,9 @@ describe("authorizationServerMetadata", () => {
     expect(scopesSupported).toContain("vault:read");
     expect(scopesSupported).toContain("vault:admin");
     expect(scopesSupported).toContain("scribe:transcribe"); // scribe is in the fixture manifest
-    expect(scopesSupported).toContain("hub:admin");
+    // hub:admin + scribe:admin are operator-only (non-requestable) — never advertised (2026-06-30)
+    expect(scopesSupported).not.toContain("hub:admin");
+    expect(scopesSupported).not.toContain("scribe:admin");
     // agent isn't in the fixture manifest → its scopes aren't advertised
     // (hub#…: optional-module scopes only surface when the module is installed).
     expect(scopesSupported).not.toContain("agent:send");
@@ -169,9 +171,10 @@ describe("authorizationServerMetadata", () => {
     // First-party still advertised — no regression
     expect(scopesSupported).toContain("vault:read");
     expect(scopesSupported).toContain("vault:admin");
-    expect(scopesSupported).toContain("hub:admin");
-    // NON_REQUESTABLE filter still applies even when the scope is declared
+    // NON_REQUESTABLE filter applies even when the scope is declared:
+    // host-* AND the service-admin scopes (hub:admin/scribe:admin) are filtered.
     expect(scopesSupported).not.toContain("parachute:host:admin");
+    expect(scopesSupported).not.toContain("hub:admin");
   });
 
   test("advertises an optional module's scopes only when it's installed", async () => {
@@ -209,7 +212,8 @@ describe("authorizationServerMetadata", () => {
     // core scopes survive
     expect(scopes).toContain("vault:read");
     expect(scopes).toContain("vault:admin");
-    expect(scopes).toContain("hub:admin");
+    // hub:admin is operator-only (non-requestable) — never advertised
+    expect(scopes).not.toContain("hub:admin");
     // uninstalled optional-module scopes are dropped
     expect(scopes).not.toContain("scribe:transcribe");
     expect(scopes).not.toContain("scribe:admin");
@@ -241,6 +245,10 @@ describe("authorizationServerMetadata", () => {
     });
     const scopes2 = ((await res2.json()) as Record<string, unknown>).scopes_supported as string[];
     expect(scopes2).toContain("scribe:transcribe");
+    // scribe:admin stays dropped EVEN WITH scribe installed — proving it's the
+    // requestability gate (non-requestable, 2026-06-30) doing the work here, not
+    // the optional-module-not-installed gate that drops scribe:transcribe above.
+    expect(scopes2).not.toContain("scribe:admin");
     expect(scopes2).not.toContain("agent:send"); // agent still not installed
   });
 });
@@ -7366,12 +7374,12 @@ describe("DCR same-hub auto-trust (hub#312)", () => {
     }
   });
 
-  test("authorize: same_hub=true + admin scope → consent screen (high-power sanity gate)", async () => {
-    // hub:admin is requestable via DCR (only `parachute:host:admin` and
-    // per-vault `vault:*:admin` are non-requestable). For same-hub
-    // clients we DO still show consent on admin scopes — the operator
-    // who registered the client may not want to grant their own session
-    // hub-wide admin access without an explicit click.
+  test("authorize: same_hub=true + hub:admin → invalid_scope (operator-only, even for same-hub) (2026-06-30)", async () => {
+    // hub:admin is now non-requestable via /oauth/authorize (a vault MCP
+    // connector pointed at the hub-level AS would otherwise be offered
+    // hub-wide admin). Even a trusted same-hub client with an owner session
+    // is rejected with invalid_scope — fails closed before consent. The
+    // legit hub-admin paths are operator-bearer/session, not authorize-flow.
     const { db, cleanup } = await makeDb();
     try {
       const user = await createUser(db, "owner", "pw");
@@ -7390,24 +7398,24 @@ describe("DCR same-hub auto-trust (hub#312)", () => {
           scope: "hub:admin",
           code_challenge: challenge,
           code_challenge_method: "S256",
+          state: "abc",
         }),
         { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
       );
       const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
-      // Consent rendered, not silent-approve.
-      expect(res.status).toBe(200);
-      expect(res.headers.get("content-type")).toContain("text/html");
-      const html = await res.text();
-      expect(html).toContain("hub:admin");
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.searchParams.get("error")).toBe("invalid_scope");
+      expect(loc.searchParams.get("error_description")).toContain("hub:admin");
     } finally {
       cleanup();
     }
   });
 
-  test("authorize: same_hub=true + mixed admin+non-admin → consent screen (any admin scope shows consent)", async () => {
-    // Defensive: a request asking for `vault:default:read hub:admin` must
-    // NOT silent-approve on the strength of the non-admin scope. Any
-    // admin scope present forces consent.
+  test("authorize: same_hub=true + mixed vault + hub:admin → invalid_scope (a non-requestable scope rejects the whole request) (2026-06-30)", async () => {
+    // A request mixing a requestable scope with hub:admin must NOT slip the
+    // non-requestable scope through on the strength of the others — the whole
+    // request is rejected with invalid_scope (same as parachute:host:admin).
     const { db, cleanup } = await makeDb();
     try {
       const user = await createUser(db, "owner", "pw");
@@ -7426,12 +7434,52 @@ describe("DCR same-hub auto-trust (hub#312)", () => {
           scope: "vault:default:read hub:admin",
           code_challenge: challenge,
           code_challenge_method: "S256",
+          state: "abc",
         }),
         { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
       );
       const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
-      expect(res.status).toBe(200);
-      expect(res.headers.get("content-type")).toContain("text/html");
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.searchParams.get("error")).toBe("invalid_scope");
+      expect(loc.searchParams.get("error_description")).toContain("hub:admin");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("authorize: explicit scribe:admin → invalid_scope (service-admin, operator-only) (2026-06-30)", async () => {
+    // Symmetry with hub:admin: the other service-admin scope is non-requestable
+    // too. Scribe's admin UI gets scribe:admin via the cookie-gated
+    // /admin/module-token/scribe path, never /oauth/authorize — so rejecting it
+    // here breaks no first-party path.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "scribe:admin",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "abc",
+        }),
+        { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.searchParams.get("error")).toBe("invalid_scope");
+      expect(loc.searchParams.get("error_description")).toContain("scribe:admin");
     } finally {
       cleanup();
     }

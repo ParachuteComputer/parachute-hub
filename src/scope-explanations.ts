@@ -127,13 +127,23 @@ export const FIRST_PARTY_SCOPES = Object.keys(SCOPE_EXPLANATIONS).sort();
  *      RFC 8414 §2 says `scopes_supported` is the list a client *can*
  *      request, so omitting these is the spec-compliant call.
  *
- * Why `parachute:host:admin` is on this list and `hub:admin` is not:
- * `parachute:host:admin` provisions and destroys vaults — cross-vault
- * data sovereignty that the operator alone owns. `hub:admin` is service
- * management (signing keys, registered clients, user accounts) which an
- * operator may legitimately delegate to a tooling app. The asymmetry is
- * intentional: the blast radius of compromised cross-vault admin doesn't
- * justify third-party requestability.
+ * Service-admin scopes (`hub:admin`, `scribe:admin`) are on this list as of
+ * 2026-06-30. They read as "delegable to a tooling app," but in practice a
+ * vault MCP connector (e.g. Claude) is pointed at the hub-level authorization
+ * server by the vault's protected-resource metadata, so the full hub catalog —
+ * including `hub:admin` (manage signing keys, registered clients, user
+ * accounts) — gets advertised on its consent screen and, if approved, minted
+ * into its token. That's wildly over-privileged for a vault reader (cf.
+ * hub#671, where the agent-grants client had to hardcode least-privilege to
+ * dodge exactly this). The scope-narrowing that should strip it only fires
+ * when the client echoes a resolvable RFC 8707 vault `resource`, which MCP
+ * clients often don't. Every legitimate hub-admin / scribe-admin use is
+ * operator-bearer or session based (operator token, DCR self-registration via
+ * `requireScope`, the admin SPA host-admin token) — none route through
+ * `/oauth/authorize` — so making these non-requestable fails closed against
+ * third-party requests without breaking any first-party operator path.
+ * `parachute:host:*` remains for the original reason: it provisions/destroys
+ * vaults (cross-vault sovereignty the operator alone owns).
  */
 export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
   "parachute:host:admin",
@@ -142,6 +152,9 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
   "parachute:host:expose",
   "parachute:host:auth",
   "parachute:host:vault",
+  // Service-admin scopes: operator-only, never requestable via /oauth/authorize.
+  "hub:admin",
+  "scribe:admin",
 ]);
 
 /**
@@ -269,8 +282,9 @@ export function isNonRequestableScope(scope: string): boolean {
   // Per-vault `vault:<name>:admin` is NO LONGER globally non-requestable
   // (single-consent change, 2026-05-29). It flows through the public OAuth
   // consent path and through `canGrant` rule 1, capped to the consenting
-  // user's held authority at the `issueAuthCodeRedirect` choke-point. Only
-  // the host-level operator scopes stay non-requestable here.
+  // user's held authority at the `issueAuthCodeRedirect` choke-point. The
+  // host-level operator scopes AND the service-admin scopes (hub:admin,
+  // scribe:admin) stay non-requestable here (see NON_REQUESTABLE_SCOPES).
   //
   // Item C — case-insensitive guard. The membership check is exact-string,
   // but Parachute scope tokens are canonically lowercase. A casing variant

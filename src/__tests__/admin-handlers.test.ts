@@ -8,6 +8,7 @@ import {
   handleAdminLoginPost,
   handleAdminLogoutPost,
 } from "../admin-handlers.ts";
+import { _resetUnlockStateForTest, requireUnlocked, setPin } from "../admin-lock.ts";
 import { CSRF_COOKIE_NAME, CSRF_FIELD_NAME } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { __resetForTests as resetRateLimit } from "../rate-limit.ts";
@@ -167,6 +168,33 @@ describe("handleAdminLoginPost", () => {
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/admin/permissions");
     expect(res.headers.get("set-cookie") ?? "").toContain("parachute_hub_session=");
+  });
+
+  test("Fix B: a fresh login with a PIN configured records an unlock (no immediate lock)", async () => {
+    // The admin-lock PIN guards the idle/grabbed tab — NOT the instant after a
+    // full login. The operator just proved their password; re-gating on the PIN
+    // the moment after is pure friction. A freshly-minted session must land
+    // within an unlock window so the SPA doesn't show the lock screen.
+    _resetUnlockStateForTest();
+    await createUser(harness.db, "admin", "pw", { passwordChanged: true });
+    await setPin(harness.db, "4827"); // lock feature ON
+    const { body, headers } = formBody({
+      [CSRF_FIELD_NAME]: TEST_CSRF,
+      username: "admin",
+      password: "pw",
+      next: "/admin/permissions",
+    });
+    const req = new Request("http://hub.test/admin/login", {
+      method: "POST",
+      headers: { ...headers, cookie: CSRF_COOKIE },
+      body,
+    });
+    const res = await handleAdminLoginPost(harness.db, req);
+    expect(res.status).toBe(302);
+    const sid = (res.headers.get("set-cookie") ?? "").match(/parachute_hub_session=([^;]+)/)?.[1];
+    expect(sid?.length).toBeTruthy();
+    // The just-minted session is unlocked — recordLoginUnlock ran during login.
+    expect(requireUnlocked(harness.db, sid ?? "").ok).toBe(true);
   });
 
   test("ignores an absolute-URL next= from the form", async () => {

@@ -49,7 +49,14 @@
 import type { Database } from "bun:sqlite";
 import { lockedResponse, requireUnlocked } from "./admin-lock.ts";
 import { signAccessToken } from "./jwt-sign.ts";
-import { findSession, parseSessionCookie } from "./sessions.ts";
+import { isHttpsRequest } from "./request-protocol.ts";
+import {
+  SESSION_TTL_MS,
+  buildSessionCookie,
+  findSession,
+  parseSessionCookie,
+  touchSession,
+} from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
 
 /** Short TTL — page-snapshot threats can't carry the token forever. */
@@ -115,6 +122,21 @@ export async function handleHostAdminToken(
     // sentinel matching admin OAuth tokens.
     vaultScope: [],
   });
+  // Sliding session renewal (THE frequent-re-login fix). The SPA re-mints here
+  // roughly every ~10 min while a tab is open; each successful mint pushes the
+  // session's `expires_at` forward, so an active operator isn't hard-logged-out
+  // at the 24h mark. A closed tab stops minting and still expires; the absolute
+  // ceiling in `touchSession` bounds a left-open-but-idle tab. The renewed
+  // Set-Cookie keeps the EXACT attributes session creation uses — HttpOnly,
+  // Secure-when-https, SameSite=Lax, Path=/, host-only (no Domain) — so the
+  // cookie's Max-Age tracks the extended expiry without broadening the cookie.
+  // This does NOT touch the admin-lock idle window (sliding there is
+  // heartbeat-only, by design — see admin-lock.ts); the two windows are
+  // independent.
+  touchSession(deps.db, sid);
+  const sessionCookie = buildSessionCookie(sid, Math.floor(SESSION_TTL_MS / 1000), {
+    secure: isHttpsRequest(req),
+  });
   return new Response(
     JSON.stringify({
       token: minted.token,
@@ -128,6 +150,7 @@ export async function handleHostAdminToken(
         // No browser cache — token rotates per-fetch, and a stale 200 from a
         // back/forward navigation could hand the SPA a long-expired JWT.
         "cache-control": "no-store",
+        "set-cookie": sessionCookie,
       },
     },
   );

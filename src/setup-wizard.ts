@@ -40,6 +40,7 @@
 import type { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { recordLoginUnlock } from "./admin-lock.ts";
 import { type OperationsRegistry, runInstall, specFor } from "./api-modules-ops.ts";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import {
@@ -1978,6 +1979,7 @@ export async function handleSetupAccountPost(
     // account creation the operator just completed.
     await ensureOperatorTokenForFirstAdmin(deps, user.id);
     const session = createSession(deps.db, { userId: user.id });
+    recordLoginUnlock(deps.db, session.id);
     const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
       secure: isHttpsRequest(req),
     });

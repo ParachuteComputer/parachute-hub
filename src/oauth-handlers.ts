@@ -23,6 +23,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
+import { recordLoginUnlock } from "./admin-lock.ts";
 import { renderTotpChallenge } from "./admin-login-ui.ts";
 import {
   AuthCodeExpiredError,
@@ -1501,6 +1502,7 @@ async function handleLoginSubmit(
   }
 
   const session = createSession(db, { userId: user.id });
+  recordLoginUnlock(db, session.id);
   const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
     secure: isHttpsRequest(req),
   });
