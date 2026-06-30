@@ -425,6 +425,7 @@ function oauthErrorRedirect(
 const OPTIONAL_MODULE_SCOPES: ReadonlyArray<readonly [prefix: string, short: string]> = [
   ["scribe:", "scribe"],
   ["agent:", "agent"],
+  ["surface:", "surface"],
 ];
 
 /**

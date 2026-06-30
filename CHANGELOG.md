@@ -6,6 +6,12 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.5-rc.1] - 2026-06-30
+
+### Added
+
+- **Hub-authenticated git smart-HTTP transport** (`/git/<name>/*`) — Phase 0a of the [Surface Git Transport](https://parachute.computer/design/2026-06-30-surface-git-transport/). The hub now runs an authenticated `git http-backend` endpoint backed by a per-surface bare repo, so an authenticated client can `git push` / `git clone` a hub-hosted surface repo. Auth gates on `surface:<name>:write` (push / `receive-pack`) and `surface:<name>:read` (fetch / `upload-pack`), validated through the existing multi-origin scope-guard path; `Authorization: Bearer <jwt>` and HTTP Basic `x-access-token:<jwt>` (older-git compat) are both accepted, with a `401 + WWW-Authenticate` challenge driving the credential-helper retry. Request + response bodies stream through the backend (no pack buffering). Bare repos auto-provision on first authenticated access; a placeholder `post-receive` hook logs the received refs (the build/serve hand-off to surface-host is Phase 0b — the substrate never executes pushed content). Adds `surface:read` / `surface:write` to the scope catalog (consent labels + advertised only when surface-host is installed).
+
 ## [0.7.2-rc.1] - 2026-06-23
 
 ### Fixed
