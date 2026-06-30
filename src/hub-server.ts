@@ -239,6 +239,7 @@ import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
 import { applyCorsHeaders, corsPreflightResponse, isCorsAllowedRoute } from "./cors.ts";
 import { ensureCsrfToken } from "./csrf.ts";
 import { readExposeState } from "./expose-state.ts";
+import { handleGitTransport } from "./git-transport.ts";
 import { HUB_DEFAULT_PORT, HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
 import {
   classifyDbError,
@@ -1213,6 +1214,12 @@ export interface HubFetchDeps {
    */
   manifestPath?: string;
   /**
+   * Directory holding the per-surface bare repos for the git-transport endpoint
+   * (`/git/<name>/*` → `<gitRoot>/<name>.git`). Tests point this at a tmpdir;
+   * production defaults to `<CONFIG_DIR>/hub/git`.
+   */
+  gitRoot?: string;
+  /**
    * Path to `connections.json` (the Connections store, P5). Tests point this
    * at a tmpdir; production defaults to `<CONFIG_DIR>/connections.json`.
    */
@@ -1983,6 +1990,7 @@ export function hubFetch(
   const getDb = deps?.getDb;
   const configuredIssuer = deps?.issuer;
   const manifestPath = deps?.manifestPath ?? SERVICES_MANIFEST_PATH;
+  const gitRoot = deps?.gitRoot ?? join(CONFIG_DIR, "hub", "git");
   const spaDistDir = deps?.spaDistDir ?? defaultSpaDistDir();
   const loopbackPort = deps?.loopbackPort;
   const loadExposeHubOrigin =
@@ -3799,6 +3807,24 @@ export function hubFetch(
       if (pathname.startsWith("/admin/")) {
         if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
         return serveSpa(spaDistDir, pathname, "/admin");
+      }
+
+      // /git/<name>/* — hub-authenticated git smart-HTTP transport (Surface
+      // Git Transport, Phase 0a). Placed BEFORE the generic services.json
+      // proxy so a `/git/` route is never shadowed by a module mount. The
+      // endpoint is AUTH-gated, not LAYER-gated: it's reachable from any
+      // exposure layer because the hub JWT (validated against the multi-origin
+      // iss-set) is the gate. It NEVER builds or executes the pushed tree — the
+      // hub only receives + stores bytes (the RCE-bearing build is surface-host's
+      // sandboxed job, Phase 0b). See src/git-transport.ts.
+      if (pathname.startsWith("/git/")) {
+        if (!getDb) return new Response("not found", { status: 404 });
+        return handleGitTransport(req, {
+          db: getDb(),
+          gitRoot,
+          knownIssuers: () => oauthDeps(req).hubBoundOrigins(),
+          peerAddr,
+        });
       }
 
       // Generic services.json-driven dispatch for non-vault modules. Reaches
