@@ -175,6 +175,22 @@ export function recordUnlock(
 }
 
 /**
+ * Open an unlock window for a session that JUST completed a full auth
+ * (password + any 2FA). The PIN's threat model is the idle/grabbed tab, NOT a
+ * third gate the instant after the auth boundary — re-prompting for the PIN
+ * the moment after a successful login is pure friction with no security gain
+ * (the user just proved a stronger factor). No-op when the lock feature is off.
+ *
+ * Called from every session-mint point (password login, OAuth login,
+ * account-setup, setup-wizard) so a freshly-authenticated session always lands
+ * working, never on the lock screen. Idle re-entry still re-locks as before.
+ */
+export function recordLoginUnlock(db: Database, sessionId: string, now: number = Date.now()): void {
+  if (!isLockConfigured(db)) return;
+  recordUnlock(sessionId, getIdleSeconds(db), now);
+}
+
+/**
  * Slide the unlock window forward by `idleSeconds` IF the session is currently
  * unlocked. Called on admin activity (heartbeat + every successful mint) so an
  * actively-used console doesn't lock mid-work. Does NOT create an unlock for a

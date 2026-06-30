@@ -4,8 +4,12 @@
  * with that cookie skip the login form and go straight to consent.
  *
  * Stored in `sessions` (one row per active session), so logout / forced
- * revocation is just a delete. Cookies are 24h; sliding extension is a
- * follow-up — for now, a session expires absolutely at `expires_at`.
+ * revocation is just a delete. Sessions are SLIDING: `expires_at` starts at
+ * `created_at + SESSION_TTL_MS`, and {@link touchSession} pushes it forward on
+ * genuine activity (the admin SPA re-mints `/admin/host-admin-token` every
+ * ~10 min while a tab is open). An idle session — no more mints — still
+ * expires at the original 24h mark, and {@link SESSION_MAX_LIFETIME_MS} caps
+ * total life so sliding can't keep a left-open tab alive forever.
  *
  * The cookie value is the session id directly. It's a 32-byte base64url
  * random; collision is statistically impossible. No HMAC needed because the
@@ -17,6 +21,15 @@ import { randomBytes } from "node:crypto";
 
 export const SESSION_COOKIE_NAME = "parachute_hub_session";
 export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Absolute ceiling on a session's total lifetime, independent of sliding
+ * renewal. Sliding ({@link touchSession}) keeps an active console signed in,
+ * but a left-open-but-idle tab whose background polls keep re-minting must
+ * still be force-logged-out eventually — this caps life at
+ * `created_at + SESSION_MAX_LIFETIME_MS` so renewal can't extend forever.
+ */
+export const SESSION_MAX_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface Session {
   id: string;
@@ -75,6 +88,31 @@ export function findSession(
   const session = rowToSession(row);
   if (now().getTime() > new Date(session.expiresAt).getTime()) return null;
   return session;
+}
+
+/**
+ * Slide a session's expiry forward to `now + SESSION_TTL_MS`, capped at
+ * `created_at + SESSION_MAX_LIFETIME_MS`. No-op when the session doesn't exist.
+ *
+ * This is what makes sessions sliding rather than fixed-24h: the admin SPA
+ * re-mints `/admin/host-admin-token` roughly every ~10 min while a tab is open,
+ * and each successful mint calls this — so an actively-used console isn't
+ * hard-logged-out at the 24h mark, while a closed tab (no more mints) still
+ * expires 24h after its last activity. The ceiling bounds a left-open-but-idle
+ * tab (background polls keep re-minting) so sliding can't run forever.
+ *
+ * Monotonic by construction: `now` only moves forward, so the slid value never
+ * undershoots a previously-written expiry; once it reaches the ceiling it stays
+ * pinned there. `now` is injectable for tests, matching {@link findSession}.
+ */
+export function touchSession(db: Database, id: string, now: () => Date = () => new Date()): void {
+  const row = db.query<Row, [string]>("SELECT * FROM sessions WHERE id = ?").get(id);
+  if (!row) return;
+  const nowMs = now().getTime();
+  const slidMs = nowMs + SESSION_TTL_MS;
+  const ceilingMs = new Date(row.created_at).getTime() + SESSION_MAX_LIFETIME_MS;
+  const newExpiresAt = new Date(Math.min(slidMs, ceilingMs)).toISOString();
+  db.prepare("UPDATE sessions SET expires_at = ? WHERE id = ?").run(newExpiresAt, id);
 }
 
 export function deleteSession(db: Database, id: string): void {

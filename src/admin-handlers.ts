@@ -11,6 +11,7 @@
  * (`parachute_hub_csrf` cookie + `__csrf` form field, constant-time compare).
  */
 import type { Database } from "bun:sqlite";
+import { recordLoginUnlock } from "./admin-lock.ts";
 import { renderAdminError, renderAdminLogin, renderTotpChallenge } from "./admin-login-ui.ts";
 import { CSRF_FIELD_NAME, ensureCsrfToken, verifyCsrfToken } from "./csrf.ts";
 import {
@@ -283,6 +284,7 @@ function mintSessionAndRedirect(
   extraCookies: string[] = [],
 ): Response {
   const session = createSession(db, { userId: user.id });
+  recordLoginUnlock(db, session.id);
   const sessionCookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
     secure: isHttpsRequest(req),
   });

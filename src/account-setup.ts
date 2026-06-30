@@ -62,6 +62,7 @@
  * scope-guard.
  */
 import type { Database } from "bun:sqlite";
+import { recordLoginUnlock } from "./admin-lock.ts";
 import { renderAdminError, renderInviteSetup } from "./admin-login-ui.ts";
 import { type RunResult, provisionVault } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
@@ -528,6 +529,7 @@ export async function handleAccountSetupPost(
 
   // (6) Sign the invitee in + land them on /account/.
   const session = createSession(deps.db, { userId });
+  recordLoginUnlock(deps.db, session.id);
   const sessionCookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000), {
     secure: isHttpsRequest(req),
   });

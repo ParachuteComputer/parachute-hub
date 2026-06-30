@@ -30,6 +30,7 @@ import {
   getIdleSeconds,
   isLockConfigured,
   isSessionUnlocked,
+  recordLoginUnlock,
   recordUnlock,
   refreshActivity,
   requireUnlocked,
@@ -209,6 +210,31 @@ describe("requireUnlocked gate", () => {
     recordUnlock("sid-1", 60, t0);
     // 61s later, with no intervening activity → expired → locked.
     expect(requireUnlocked(harness.db, "sid-1", t0 + 61_000).ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// recordLoginUnlock (Fix B) — unlock at the auth boundary so a fresh login
+// doesn't immediately hit the PIN lock screen.
+// ---------------------------------------------------------------------------
+
+describe("recordLoginUnlock", () => {
+  test("opens an unlock window when a PIN is configured", async () => {
+    await setPin(harness.db, "4827");
+    // A fresh session with a PIN set but no unlock is locked.
+    expect(requireUnlocked(harness.db, "sid-login").ok).toBe(false);
+    recordLoginUnlock(harness.db, "sid-login");
+    // After login → the freshly-authenticated session is unlocked.
+    expect(requireUnlocked(harness.db, "sid-login").ok).toBe(true);
+    expect(isSessionUnlocked("sid-login")).toBe(true);
+  });
+
+  test("no-op when the lock feature is OFF (no PIN) — records nothing", () => {
+    // Feature off → requireUnlocked is always ok anyway; the helper must not
+    // record a spurious window (meaningless, and would grow the map).
+    recordLoginUnlock(harness.db, "sid-no-pin");
+    expect(isSessionUnlocked("sid-no-pin")).toBe(false);
+    expect(requireUnlocked(harness.db, "sid-no-pin").ok).toBe(true);
   });
 });
 

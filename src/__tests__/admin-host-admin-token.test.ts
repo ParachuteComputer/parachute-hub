@@ -18,7 +18,13 @@ import { HOST_ADMIN_TOKEN_TTL_SECONDS, handleHostAdminToken } from "../admin-hos
 import { handleApiTokens } from "../api-tokens.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { validateAccessToken } from "../jwt-sign.ts";
-import { SESSION_TTL_MS, buildSessionCookie, createSession, deleteSession } from "../sessions.ts";
+import {
+  SESSION_TTL_MS,
+  buildSessionCookie,
+  createSession,
+  deleteSession,
+  findSession,
+} from "../sessions.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { createUser } from "../users.ts";
 
@@ -184,6 +190,57 @@ describe("handleHostAdminToken", () => {
     const body = (await res.json()) as { token: string };
     const validated = await validateAccessToken(harness.db, body.token, ISSUER);
     expect(validated.payload.sub).toBe(adminId);
+  });
+
+  // Sliding session renewal (Fix A) — a successful mint pushes the session's
+  // expiry forward and re-issues the cookie, so an active operator (the SPA
+  // re-mints ~every 10 min) isn't hard-logged-out at the 24h mark. The cookie
+  // must keep the EXACT attributes creation uses — not broadened.
+  test("200 renews the session cookie (HttpOnly/Secure/SameSite/host-only) and slides expiry", async () => {
+    const user = await createUser(harness.db, "operator", "hunter2");
+    // Create the session 12h in the past so the forward slide is observable.
+    const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000);
+    const session = createSession(harness.db, { userId: user.id, now: () => twelveHoursAgo });
+    const originalExpiry = new Date(session.expiresAt).getTime();
+    const cookie = buildSessionCookie(session.id, Math.floor(SESSION_TTL_MS / 1000));
+    rotateSigningKey(harness.db);
+
+    const res = await handleHostAdminToken(
+      new Request(`${ISSUER}/admin/host-admin-token`, { headers: { cookie } }),
+      { db: harness.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(200);
+
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    expect(setCookie).toContain("parachute_hub_session=");
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("Secure"); // ISSUER is https → Secure kept
+    expect(setCookie).toContain("SameSite=Lax");
+    expect(setCookie).toContain("Path=/");
+    expect(setCookie).not.toContain("Path=/oauth");
+    // Host-only: the renewed cookie must NOT add a Domain (no broadening).
+    expect(setCookie.toLowerCase()).not.toContain("domain=");
+
+    // The session's expiry slid forward (touchSession ran on the success path).
+    const found = findSession(harness.db, session.id);
+    expect(new Date(found?.expiresAt ?? 0).getTime()).toBeGreaterThan(originalExpiry);
+  });
+
+  test("renewed cookie omits Secure over plain HTTP (protocol-correct, not broadened)", async () => {
+    const { cookie } = await withSession();
+    rotateSigningKey(harness.db);
+    // HTTP origin → isHttpsRequest false → no Secure, so the browser keeps the
+    // cookie on http://localhost:1939 — mirrors how the session cookie is minted.
+    const res = await handleHostAdminToken(
+      new Request("http://hub.test/admin/host-admin-token", { headers: { cookie } }),
+      { db: harness.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(200);
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    expect(setCookie).toContain("parachute_hub_session=");
+    expect(setCookie).not.toContain("Secure");
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("SameSite=Lax");
   });
 
   // Regression for the end-to-end bug that motivated adding `:host:auth`
