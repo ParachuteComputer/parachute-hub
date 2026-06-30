@@ -31,6 +31,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { hubFetch } from "../hub-server.ts";
+import { setRootRedirect, setSetting } from "../hub-settings.ts";
 import { writeManifest } from "../services-manifest.ts";
 import { createUser } from "../users.ts";
 
@@ -101,9 +102,7 @@ describe("setup gate (no admin yet)", () => {
   test("/login POST still 503s setup_required when no admin exists (hub#644)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
-      const res = await hubFetch(h.dir, { getDb: () => db })(
-        req("/login", { method: "POST" }),
-      );
+      const res = await hubFetch(h.dir, { getDb: () => db })(req("/login", { method: "POST" }));
       expect(res.status).toBe(503);
       const body = (await res.json()) as Record<string, unknown>;
       expect(body.error).toBe("setup_required");
@@ -363,6 +362,115 @@ describe("setup gate (admin exists)", () => {
       // token field.
       expect(html).not.toContain('name="bootstrap_token"');
       expect(html).not.toContain('name="password_confirm"');
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("configurable bare-`/` redirect target", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+  });
+  afterEach(() => h.cleanup());
+
+  /** A set-up hub (admin + vault) so the bare-`/` redirect is reached. */
+  function setUpHub(db: ReturnType<typeof openHubDb>): void {
+    writeManifest(
+      {
+        services: [
+          {
+            name: "parachute-vault",
+            version: "0.1.0",
+            port: 1940,
+            paths: ["/vault/default"],
+            health: "/health",
+          },
+        ],
+      },
+      join(h.dir, "services.json"),
+    );
+  }
+
+  function handler(db: ReturnType<typeof openHubDb>) {
+    return hubFetch(h.dir, { getDb: () => db, manifestPath: join(h.dir, "services.json") });
+  }
+
+  test("a configured root_redirect retargets the bare-`/` 302", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      setUpHub(db);
+      setRootRedirect(db, "/surface/reading-room");
+      const res = await handler(db)(req("/"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/surface/reading-room");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("an unsafe stored root_redirect falls back to /admin (never an open redirect)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      setUpHub(db);
+      // A hand-edited sqlite row that bypassed write-side validation.
+      setSetting(db, "root_redirect", "//evil.com");
+      const res = await handler(db)(req("/"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("PARACHUTE_HUB_ROOT_REDIRECT env retargets the bare-`/` 302 (no DB row)", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    const prev = process.env.PARACHUTE_HUB_ROOT_REDIRECT;
+    process.env.PARACHUTE_HUB_ROOT_REDIRECT = "/surface/from-env";
+    try {
+      await createUser(db, "owner", "pw");
+      setUpHub(db);
+      const res = await handler(db)(req("/"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/surface/from-env");
+    } finally {
+      // Restore process.env to its pre-test state. `delete` (not assign-undefined,
+      // which would coerce to the string "undefined") removes a key we added.
+      if (prev === undefined) {
+        // biome-ignore lint/performance/noDelete: env-key cleanup, not a hot path
+        delete process.env.PARACHUTE_HUB_ROOT_REDIRECT;
+      } else {
+        process.env.PARACHUTE_HUB_ROOT_REDIRECT = prev;
+      }
+      db.close();
+    }
+  });
+
+  test("wizard funnel WINS: a configured root_redirect does NOT bypass setup on a fresh hub", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      // No admin yet → not-set-up hub. Even with a surface configured, the
+      // bare-`/` must funnel to the wizard, not a surface that can't work yet.
+      setRootRedirect(db, "/surface/reading-room");
+      const res = await handler(db)(req("/"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin/setup");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("default is unchanged: bare-`/` → /admin when nothing is configured", async () => {
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      setUpHub(db);
+      const res = await handler(db)(req("/"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin");
     } finally {
       db.close();
     }

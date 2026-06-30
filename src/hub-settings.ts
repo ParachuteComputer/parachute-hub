@@ -106,7 +106,23 @@ export type HubSettingKey =
   // Idle timeout for the admin screen-lock, in seconds. Optional override of
   // the built-in default (DEFAULT_ADMIN_LOCK_IDLE_SECONDS). Stored as a
   // stringified integer; absent / unparseable falls back to the default.
-  | "admin_lock_idle_seconds";
+  | "admin_lock_idle_seconds"
+  // hub: operator-settable target for the bare-`/` 302. Lets an operator
+  // point their hub's root at a surface (e.g. a team reading-room surface)
+  // instead of the default `/admin`. Stored as a SAME-ORIGIN relative path
+  // (must start with a single `/`, never `//` / `/\` / a scheme — see
+  // `isSafeRedirectPath`); validated on write (admin PUT + CLI) AND re-checked
+  // on read so a hand-edited sqlite row can never produce an open redirect.
+  //
+  // Precedence on each request (resolveRootRedirect): this row, then
+  // `PARACHUTE_HUB_ROOT_REDIRECT` env, then the `/admin` default. DB-first
+  // (unlike `module_install_channel`'s env-first) so an operator can flip the
+  // landing page from the admin SPA / CLI without a redeploy — the headline
+  // use case (custom-domain hub fronting a team surface). The fresh-hub
+  // wizard funnel + pre-admin 503 lockout run BEFORE this redirect, so a
+  // not-yet-set-up hub still lands on setup, not a surface that can't work
+  // yet.
+  | "root_redirect";
 
 export type SetupExposeMode = "localhost" | "tailnet" | "public";
 
@@ -430,4 +446,150 @@ export function setNotesRedirectDisabled(db: Database, value: boolean): void {
   } else {
     deleteSetting(db, "notes_redirect_disabled");
   }
+}
+
+// --- domain helpers: configurable bare-`/` redirect target ----------------
+
+/** Env override for the bare-`/` redirect target. Below the DB row, above the default. */
+export const PARACHUTE_HUB_ROOT_REDIRECT_ENV = "PARACHUTE_HUB_ROOT_REDIRECT";
+
+/** Fallback when neither DB row nor env is set — the admin shell (unchanged behavior). */
+export const DEFAULT_ROOT_REDIRECT = "/admin";
+
+/**
+ * Open-redirect guard for the configurable bare-`/` redirect target.
+ *
+ * The resolved value lands verbatim in a `Location:` header on the `/` 302,
+ * so an off-origin value would be a textbook open redirect. To be accepted it
+ * must be a SAME-ORIGIN relative path:
+ *
+ *   - starts with a single `/` (a site-relative path). This alone rejects
+ *     `https://evil.com`, `javascript:…`, and bare hostnames.
+ *   - second char is NOT `/` (a protocol-relative `//evil.com` sends the
+ *     browser to another origin) and NOT `\` (browsers normalize the
+ *     backslash, so `/\evil.com` resolves like `//evil.com`).
+ *   - contains no ASCII control chars or whitespace — a CR/LF would enable
+ *     header injection, and tab/newline are stripped by some browsers which
+ *     could re-expose a hidden `//` authority.
+ *   - resolves same-origin against a placeholder base (belt-and-suspenders:
+ *     `new URL(value, base).origin === base`) — catches any scheme/authority
+ *     shape the prefix checks missed.
+ *   - does NOT resolve to pathname `/` — that would re-enter this very route
+ *     and 302-loop forever (`/`, `/?x`, `/#y` all rejected).
+ *
+ * A query string / fragment on a real path is allowed (stays same-origin).
+ * Returns false for non-strings, empty, and every off-origin shape.
+ */
+export function isSafeRedirectPath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (value[0] !== "/") return false;
+  if (value[1] === "/" || value[1] === "\\") return false;
+  // Reject whitespace (\t \n \r space + Unicode separators U+2028/U+2029) and
+  // ASCII control chars. A CR/LF would enable header injection; stripped
+  // whitespace could re-expose a hidden `//` authority. `\s` covers the
+  // whitespace family (incl. Unicode); the charCode scan covers the remaining
+  // non-whitespace control chars (0x00-0x1f, 0x7f) without a control-char
+  // regex literal.
+  if (/\s/u.test(value)) return false;
+  for (let i = 0; i < value.length; i++) {
+    const c = value.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) return false;
+  }
+  try {
+    const base = "http://parachute.invalid";
+    const resolved = new URL(value, base);
+    if (resolved.origin !== base) return false;
+    // pathname "/" would match the bare-`/` route again -> infinite redirect.
+    if (resolved.pathname === "/") return false;
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Read the operator-set bare-`/` redirect target from hub_settings. Returns
+ * the raw stored value (or `null` when absent) WITHOUT re-validating — callers
+ * that need a safe value go through `resolveRootRedirect`, which re-checks the
+ * guard. The raw read is what the admin GET surfaces so the operator sees
+ * exactly what's stored (even if a hand-edit made it unsafe → ignored on use).
+ */
+export function getRootRedirect(db: Database): string | null {
+  return getSetting(db, "root_redirect") ?? null;
+}
+
+/**
+ * Write or clear the bare-`/` redirect target. Passing `null`/empty deletes
+ * the row, reverting to env / default precedence (mirrors `setHubOrigin`).
+ * The caller MUST have validated via `isSafeRedirectPath` — this trusts the
+ * input (typed-callsite contract); `resolveRootRedirect` re-guards on read as
+ * defense-in-depth regardless.
+ */
+export function setRootRedirect(db: Database, value: string | null): void {
+  if (value === null || value === "") {
+    deleteSetting(db, "root_redirect");
+    return;
+  }
+  setSetting(db, "root_redirect", value);
+}
+
+/** Which precedence layer the resolved redirect came from. */
+export type RootRedirectSource = "db" | "env" | "default";
+
+export interface ResolvedRootRedirect {
+  /** The safe same-origin path the `/` 302 should target. */
+  value: string;
+  /** Which layer it came from (for admin-UI attribution). */
+  source: RootRedirectSource;
+}
+
+/**
+ * Resolve the bare-`/` redirect target with source attribution.
+ *
+ * Precedence: hub_settings.root_redirect → `PARACHUTE_HUB_ROOT_REDIRECT` env
+ * → `/admin` default. Every layer is re-validated through `isSafeRedirectPath`;
+ * an unsafe value at any layer is warned + skipped so the chain can never
+ * produce an open redirect (worst case falls all the way to `/admin`).
+ *
+ * `db` may be `null` (hub-server running without state) — the DB layer is then
+ * skipped and resolution starts from env. The `env` / `warn` knobs are test
+ * seams (production uses `process.env` + `console.warn`).
+ */
+export function resolveRootRedirectDetailed(
+  db: Database | null,
+  opts: { env?: NodeJS.ProcessEnv; warn?: (msg: string) => void } = {},
+): ResolvedRootRedirect {
+  const env = opts.env ?? process.env;
+  const warn = opts.warn ?? ((msg: string) => console.warn(msg));
+
+  // 1. DB row (operator-set via the admin PUT / `parachute hub set-root-redirect`).
+  if (db) {
+    const fromDb = getSetting(db, "root_redirect");
+    if (fromDb !== undefined) {
+      if (isSafeRedirectPath(fromDb)) return { value: fromDb, source: "db" };
+      warn(
+        `[hub-settings] root_redirect="${fromDb}" in hub_settings is not a safe same-origin path — ignoring (falling through to env/default).`,
+      );
+    }
+  }
+
+  // 2. Env override.
+  const fromEnv = env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+  if (typeof fromEnv === "string" && fromEnv.length > 0) {
+    if (isSafeRedirectPath(fromEnv)) return { value: fromEnv, source: "env" };
+    warn(
+      `[hub-settings] ${PARACHUTE_HUB_ROOT_REDIRECT_ENV}="${fromEnv}" is not a safe same-origin path — falling back to "${DEFAULT_ROOT_REDIRECT}".`,
+    );
+  }
+
+  // 3. Default — unchanged behavior.
+  return { value: DEFAULT_ROOT_REDIRECT, source: "default" };
+}
+
+/** Convenience: just the resolved path (see `resolveRootRedirectDetailed`). */
+export function resolveRootRedirect(
+  db: Database | null,
+  opts: { env?: NodeJS.ProcessEnv; warn?: (msg: string) => void } = {},
+): string {
+  return resolveRootRedirectDetailed(db, opts).value;
 }

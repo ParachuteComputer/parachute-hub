@@ -12,8 +12,10 @@ import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
   DEFAULT_MODULE_INSTALL_CHANNEL,
+  DEFAULT_ROOT_REDIRECT,
   FIRST_CLIENT_AUTO_APPROVE_WINDOW_MS,
   MODULE_INSTALL_CHANNELS,
+  PARACHUTE_HUB_ROOT_REDIRECT_ENV,
   PARACHUTE_INSTALL_CHANNEL_ENV,
   PARACHUTE_MODULE_CHANNEL_ENV,
   SETUP_EXPOSE_MODES,
@@ -21,15 +23,20 @@ import {
   deleteSetting,
   getHubOrigin,
   getModuleInstallChannel,
+  getRootRedirect,
   getSetting,
   isFirstClientAutoApproveWindowOpen,
   isModuleInstallChannel,
   isNotesRedirectDisabled,
+  isSafeRedirectPath,
   isSetupExposeMode,
   openFirstClientAutoApproveWindow,
+  resolveRootRedirect,
+  resolveRootRedirectDetailed,
   setHubOrigin,
   setModuleInstallChannel,
   setNotesRedirectDisabled,
+  setRootRedirect,
   setSetting,
 } from "../hub-settings.ts";
 
@@ -611,5 +618,186 @@ describe("hub-settings — notes_redirect_disabled (parachute-app §16)", () => 
     } finally {
       db.close();
     }
+  });
+});
+
+describe("hub-settings — isSafeRedirectPath (open-redirect guard)", () => {
+  test("accepts plain same-origin relative paths", () => {
+    expect(isSafeRedirectPath("/admin")).toBe(true);
+    expect(isSafeRedirectPath("/surface/reading-room")).toBe(true);
+    expect(isSafeRedirectPath("/vault/default/")).toBe(true);
+    // Query + fragment stay same-origin → allowed.
+    expect(isSafeRedirectPath("/surface/x?view=reading#top")).toBe(true);
+    // Deep paths with hyphens/dots/underscores (regression: a botched
+    // whitespace regex once rejected `-`).
+    expect(isSafeRedirectPath("/a-b_c.d/e")).toBe(true);
+  });
+
+  test("rejects protocol-relative + backslash authority tricks", () => {
+    expect(isSafeRedirectPath("//evil.com")).toBe(false);
+    expect(isSafeRedirectPath("//evil.com/path")).toBe(false);
+    expect(isSafeRedirectPath("/\\evil.com")).toBe(false);
+    expect(isSafeRedirectPath("/\\\\evil.com")).toBe(false);
+  });
+
+  test("rejects absolute URLs + scheme payloads", () => {
+    expect(isSafeRedirectPath("https://evil.com")).toBe(false);
+    expect(isSafeRedirectPath("http://evil.com/x")).toBe(false);
+    // biome-ignore lint/suspicious/noExplicitAny: testing the runtime guard with a hostile string
+    expect(isSafeRedirectPath("javascript:alert(1)" as any)).toBe(false);
+    expect(isSafeRedirectPath("data:text/html,<script>1</script>")).toBe(false);
+  });
+
+  test("rejects values missing a leading slash", () => {
+    expect(isSafeRedirectPath("admin")).toBe(false);
+    expect(isSafeRedirectPath("evil.com")).toBe(false);
+    expect(isSafeRedirectPath("")).toBe(false);
+  });
+
+  test("rejects pathname-`/` targets (would 302-loop the bare-`/` route)", () => {
+    expect(isSafeRedirectPath("/")).toBe(false);
+    expect(isSafeRedirectPath("/?next=x")).toBe(false);
+    expect(isSafeRedirectPath("/#frag")).toBe(false);
+  });
+
+  test("rejects whitespace + control chars (header-injection / normalization)", () => {
+    expect(isSafeRedirectPath("/admin\r\nSet-Cookie: x=1")).toBe(false);
+    expect(isSafeRedirectPath("/ad min")).toBe(false);
+    expect(isSafeRedirectPath("/admin\t")).toBe(false);
+    expect(isSafeRedirectPath("/\tadmin")).toBe(false);
+    expect(isSafeRedirectPath("/admin ")).toBe(false);
+    // U+2028 line separator (stripped by some parsers) — built via charCode so
+    // the source file carries no irregular-whitespace literal.
+    expect(isSafeRedirectPath(`/admin${String.fromCharCode(0x2028)}x`)).toBe(false);
+  });
+
+  test("rejects non-string inputs", () => {
+    // biome-ignore lint/suspicious/noExplicitAny: exercising the runtime type guard
+    expect(isSafeRedirectPath(null as any)).toBe(false);
+    // biome-ignore lint/suspicious/noExplicitAny: exercising the runtime type guard
+    expect(isSafeRedirectPath(undefined as any)).toBe(false);
+    // biome-ignore lint/suspicious/noExplicitAny: exercising the runtime type guard
+    expect(isSafeRedirectPath(42 as any)).toBe(false);
+    // biome-ignore lint/suspicious/noExplicitAny: exercising the runtime type guard
+    expect(isSafeRedirectPath({} as any)).toBe(false);
+  });
+});
+
+describe("hub-settings — root_redirect storage + resolution", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hub-settings-root-redirect-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  // An empty env so the resolver's env layer is deterministic (the host's real
+  // PARACHUTE_HUB_ROOT_REDIRECT, if any, must not leak in).
+  const noEnv: NodeJS.ProcessEnv = {};
+  const silent = () => {};
+
+  test("getRootRedirect round-trips via setRootRedirect", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      expect(getRootRedirect(db)).toBeNull();
+      setRootRedirect(db, "/surface/reading-room");
+      expect(getRootRedirect(db)).toBe("/surface/reading-room");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("setRootRedirect(null) / empty clears the row", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setRootRedirect(db, "/surface/x");
+      setRootRedirect(db, null);
+      expect(getRootRedirect(db)).toBeNull();
+      setRootRedirect(db, "/surface/x");
+      setRootRedirect(db, "");
+      expect(getRootRedirect(db)).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("resolves to /admin default when neither DB nor env is set", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      expect(resolveRootRedirect(db, { env: noEnv })).toBe(DEFAULT_ROOT_REDIRECT);
+      expect(resolveRootRedirectDetailed(db, { env: noEnv })).toEqual({
+        value: "/admin",
+        source: "default",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("env override applies when no DB row", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      const env = { [PARACHUTE_HUB_ROOT_REDIRECT_ENV]: "/surface/from-env" };
+      expect(resolveRootRedirectDetailed(db, { env })).toEqual({
+        value: "/surface/from-env",
+        source: "env",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("DB row overrides env (DB is tier-1)", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setRootRedirect(db, "/surface/from-db");
+      const env = { [PARACHUTE_HUB_ROOT_REDIRECT_ENV]: "/surface/from-env" };
+      expect(resolveRootRedirectDetailed(db, { env })).toEqual({
+        value: "/surface/from-db",
+        source: "db",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("an unsafe DB row is ignored → falls through to env", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      // Simulate a hand-edited sqlite row that bypassed write-side validation.
+      setSetting(db, "root_redirect", "//evil.com");
+      const env = { [PARACHUTE_HUB_ROOT_REDIRECT_ENV]: "/surface/from-env" };
+      expect(resolveRootRedirect(db, { env, warn: silent })).toBe("/surface/from-env");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("an unsafe DB row with no env → falls all the way back to /admin", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setSetting(db, "root_redirect", "https://evil.com");
+      expect(resolveRootRedirect(db, { env: noEnv, warn: silent })).toBe("/admin");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("an unsafe env value is ignored → falls back to /admin", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      const env = { [PARACHUTE_HUB_ROOT_REDIRECT_ENV]: "//evil.com" };
+      expect(resolveRootRedirectDetailed(db, { env, warn: silent })).toEqual({
+        value: "/admin",
+        source: "default",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("a null db (no state) resolves from env / default only", () => {
+    expect(resolveRootRedirect(null, { env: noEnv })).toBe("/admin");
+    const env = { [PARACHUTE_HUB_ROOT_REDIRECT_ENV]: "/surface/from-env" };
+    expect(resolveRootRedirect(null, { env })).toBe("/surface/from-env");
   });
 });
