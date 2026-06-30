@@ -7448,6 +7448,43 @@ describe("DCR same-hub auto-trust (hub#312)", () => {
     }
   });
 
+  test("authorize: explicit scribe:admin → invalid_scope (service-admin, operator-only) (2026-06-30)", async () => {
+    // Symmetry with hub:admin: the other service-admin scope is non-requestable
+    // too. Scribe's admin UI gets scribe:admin via the cookie-gated
+    // /admin/module-token/scribe path, never /oauth/authorize — so rejecting it
+    // here breaks no first-party path.
+    const { db, cleanup } = await makeDb();
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const session = createSession(db, { userId: user.id });
+      const reg = registerClient(db, {
+        redirectUris: ["https://app.example/cb"],
+        status: "approved",
+        sameHub: true,
+      });
+      const { challenge } = makePkce();
+      const req = new Request(
+        authorizeUrl({
+          client_id: reg.client.clientId,
+          redirect_uri: "https://app.example/cb",
+          response_type: "code",
+          scope: "scribe:admin",
+          code_challenge: challenge,
+          code_challenge_method: "S256",
+          state: "abc",
+        }),
+        { headers: { cookie: buildSessionCookie(session.id, SESSION_COOKIE_TTL_S) } },
+      );
+      const res = handleAuthorizeGet(db, req, { issuer: ISSUER });
+      expect(res.status).toBe(302);
+      const loc = new URL(res.headers.get("location") ?? "");
+      expect(loc.searchParams.get("error")).toBe("invalid_scope");
+      expect(loc.searchParams.get("error_description")).toContain("scribe:admin");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("authorize: same_hub=true + unnamed vault verb → consent screen (picker needed)", async () => {
     // Unnamed `vault:read` needs the picker to narrow to
     // `vault:<name>:read` before mint. The same-hub gate must not
