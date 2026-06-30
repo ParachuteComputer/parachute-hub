@@ -87,7 +87,10 @@ function putReq(body: unknown, headers: Record<string, string> = {}): Request {
 // PARACHUTE_HUB_ROOT_REDIRECT must not leak into GET's resolved/source).
 const noEnv: NodeJS.ProcessEnv = {};
 
-function deps(h: Harness, overrides: Partial<Parameters<typeof handleApiSettingsRootRedirect>[1]> = {}) {
+function deps(
+  h: Harness,
+  overrides: Partial<Parameters<typeof handleApiSettingsRootRedirect>[1]> = {},
+) {
   return {
     db: h.db,
     issuer: ISSUER,
@@ -261,7 +264,13 @@ describe("PUT /api/settings/root-redirect", () => {
 
   test("rejects open-redirect payloads with 400 and writes nothing", async () => {
     const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);
-    for (const bad of ["//evil.com", "https://evil.com", "javascript:alert(1)", "/\\evil.com", "/"]) {
+    for (const bad of [
+      "//evil.com",
+      "https://evil.com",
+      "javascript:alert(1)",
+      "/\\evil.com",
+      "/",
+    ]) {
       const res = await handleApiSettingsRootRedirect(
         putReq({ root_redirect: bad }, { authorization: `Bearer ${bearer}` }),
         deps(h),
