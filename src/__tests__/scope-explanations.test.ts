@@ -129,11 +129,15 @@ describe("NON_REQUESTABLE_SCOPES (#96)", () => {
     expect(NON_REQUESTABLE_SCOPES.has("parachute:host:admin")).toBe(true);
   });
 
-  test("does NOT contain hub:admin (intentional asymmetry)", () => {
-    // hub:admin is service management an operator may legitimately delegate
-    // to a tooling app. parachute:host:admin is cross-vault data sovereignty
-    // and stays operator-only-mintable.
-    expect(NON_REQUESTABLE_SCOPES.has("hub:admin")).toBe(false);
+  test("contains the service-admin scopes hub:admin and scribe:admin (2026-06-30 over-permissioning fix)", () => {
+    // A vault MCP connector (e.g. Claude) is pointed at the hub-level AS by the
+    // vault's protected-resource metadata, so hub:admin/scribe:admin would be
+    // advertised on its consent screen + minted if approved — wildly
+    // over-privileged for a vault reader. Every legit use is operator-bearer /
+    // session (operator token, DCR self-registration, admin SPA), never
+    // /oauth/authorize — so these fail closed without breaking operator paths.
+    expect(NON_REQUESTABLE_SCOPES.has("hub:admin")).toBe(true);
+    expect(NON_REQUESTABLE_SCOPES.has("scribe:admin")).toBe(true);
   });
 
   test("every non-requestable scope is a known first-party scope", () => {
@@ -148,11 +152,16 @@ describe("isRequestableScope", () => {
     expect(isRequestableScope("parachute:host:admin")).toBe(false);
   });
 
-  test("true for hub:admin and other first-party scopes", () => {
-    expect(isRequestableScope("hub:admin")).toBe(true);
+  test("false for service-admin scopes hub:admin and scribe:admin (operator-only, 2026-06-30)", () => {
+    expect(isRequestableScope("hub:admin")).toBe(false);
+    expect(isRequestableScope("scribe:admin")).toBe(false);
+  });
+
+  test("true for non-admin first-party scopes", () => {
     expect(isRequestableScope("vault:read")).toBe(true);
     expect(isRequestableScope("vault:admin")).toBe(true);
     expect(isRequestableScope("agent:send")).toBe(true);
+    expect(isRequestableScope("scribe:transcribe")).toBe(true);
   });
 
   test("true for unknown scopes (third-party module scopes pass through)", () => {
@@ -194,8 +203,10 @@ describe("isRequestableScope", () => {
     expect(isNonRequestableScope("parachute:Host:Install")).toBe(true);
     // Canonical lowercase still works unchanged.
     expect(isNonRequestableScope("parachute:host:auth")).toBe(true);
-    // A non-host scope (even uppercased) stays requestable.
-    expect(isNonRequestableScope("HUB:ADMIN")).toBe(false);
+    // Service-admin scopes are non-requestable too, case-insensitively (2026-06-30).
+    expect(isNonRequestableScope("HUB:ADMIN")).toBe(true);
+    // A genuinely requestable scope (even uppercased) stays requestable.
+    expect(isNonRequestableScope("VAULT:READ")).toBe(false);
   });
 });
 
