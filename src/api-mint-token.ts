@@ -88,6 +88,17 @@ export interface ApiMintTokenDeps {
   /** Hub origin — written into the JWT `iss` of minted tokens AND used to validate the bearer. */
   issuer: string;
   /**
+   * SET of origins the hub legitimately answers on (loopback ∪ expose-state ∪
+   * platform ∪ per-request `issuer`), built via `buildHubBoundOrigins`. The
+   * caller's bearer `iss` is validated against THIS set rather than the single
+   * `issuer`, so a credential minted under a still-valid prior origin keeps
+   * minting across an origin switch (hub#516 parity — the live "mint refused"
+   * after `set-origin`). Minted tokens still carry the single canonical
+   * `issuer` as their `iss`. Absent → falls back to `[issuer]` (the prior
+   * strict per-request behavior; tests/non-HTTP callers unaffected).
+   */
+  knownIssuers?: readonly string[];
+  /**
    * Names of vault instances currently registered in services.json (item D /
    * hub#450). When provided, a `vault:<name>:admin` mint whose `<name>` is not
    * in this set is rejected with 400 — a typo'd name can no longer mint
@@ -133,7 +144,11 @@ export async function handleApiMintToken(req: Request, deps: ApiMintTokenDeps): 
   let bearerSub: string;
   let bearerScopes: string[];
   try {
-    const validated = await validateAccessToken(deps.db, bearer, deps.issuer);
+    const validated = await validateAccessToken(
+      deps.db,
+      bearer,
+      deps.knownIssuers ?? [deps.issuer],
+    );
     const sub = validated.payload.sub;
     if (typeof sub !== "string" || sub.length === 0) {
       return jsonError(401, "unauthenticated", "bearer token has no sub claim");

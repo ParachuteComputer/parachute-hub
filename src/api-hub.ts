@@ -53,6 +53,15 @@ export interface ApiHubDeps {
   /** Hub origin — used to validate the bearer's `iss`. */
   issuer: string;
   /**
+   * SET of origins the hub answers on (loopback ∪ expose-state ∪ platform ∪
+   * per-request `issuer`), built via `buildHubBoundOrigins`. The bearer's
+   * `iss` is validated against THIS set rather than the single `issuer`, so a
+   * credential minted under a still-valid prior origin keeps working across an
+   * origin switch (hub#516 parity). Absent → falls back to `[issuer]` (the
+   * prior strict per-request behavior; tests/non-HTTP callers unaffected).
+   */
+  knownIssuers?: readonly string[];
+  /**
    * Override the directory used to locate the hub's package.json and to
    * classify install source. Defaults to `dirname(import.meta.url)` —
    * which is `<repo>/src/` for normal layouts. Test seam.
@@ -96,7 +105,7 @@ export async function handleApiHub(req: Request, deps: ApiHubDeps): Promise<Resp
   // Bearer-gate on `parachute:host:admin`. Same shape as the other admin
   // endpoints — SPA mints via /admin/host-admin-token.
   try {
-    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err);
   }

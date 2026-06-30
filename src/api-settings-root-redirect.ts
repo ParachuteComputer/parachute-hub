@@ -45,6 +45,15 @@ export interface ApiSettingsRootRedirectDeps {
   /** Issuer the bearer token must validate against (the hub's resolved issuer). */
   issuer: string;
   /**
+   * SET of origins the hub answers on (loopback ∪ expose-state ∪ platform ∪
+   * per-request `issuer`), built via `buildHubBoundOrigins`. The bearer's
+   * `iss` is validated against THIS set rather than the single `issuer`, so a
+   * credential minted under a still-valid prior origin keeps working across an
+   * origin switch (hub#516 parity). Absent → falls back to `[issuer]` (the
+   * prior strict per-request behavior; tests/non-HTTP callers unaffected).
+   */
+  knownIssuers?: readonly string[];
+  /**
    * Env seam for the resolver's env layer. Defaults to `process.env`. Threaded
    * so the dispatcher (and tests) can resolve `PARACHUTE_HUB_ROOT_REDIRECT`
    * deterministically.
@@ -120,7 +129,11 @@ export async function handleApiSettingsRootRedirect(
 
   // Bearer validation + scope check.
   try {
-    const validated = await validateAccessToken(deps.db, bearer, deps.issuer);
+    const validated = await validateAccessToken(
+      deps.db,
+      bearer,
+      deps.knownIssuers ?? [deps.issuer],
+    );
     if (typeof validated.payload.sub !== "string" || validated.payload.sub.length === 0) {
       return jsonError(401, "unauthenticated", "bearer token has no sub claim");
     }

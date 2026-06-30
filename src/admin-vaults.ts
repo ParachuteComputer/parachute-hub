@@ -129,6 +129,15 @@ export interface CreateVaultDeps {
   db: Database;
   /** Hub origin used to validate JWT `iss` and to build the response `url`. */
   issuer: string;
+  /**
+   * SET of origins the hub legitimately answers on (loopback ∪ expose-state ∪
+   * platform ∪ per-request `issuer`), built via `buildHubBoundOrigins`. The
+   * admin bearer's `iss` is validated against THIS set rather than the single
+   * `issuer`, so a host-admin credential minted under a still-valid prior
+   * origin keeps working across an origin switch (hub#516 parity). Absent →
+   * falls back to `[issuer]` (the prior strict per-request behavior).
+   */
+  knownIssuers?: readonly string[];
   /** Override the services.json path. Defaults to `~/.parachute/services.json`. */
   manifestPath?: string;
   /**
@@ -442,7 +451,7 @@ export async function handleCreateVault(req: Request, deps: CreateVaultDeps): Pr
   // Auth gate: parachute:host:admin scope. Maps an AdminAuthError straight
   // to an RFC 6750 401/403 — the route handler doesn't care which.
   try {
-    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+    await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.knownIssuers ?? [deps.issuer]);
   } catch (err) {
     return adminAuthErrorResponse(err as AdminAuthError);
   }
@@ -530,6 +539,15 @@ export interface DeleteVaultDeps {
   db: Database;
   /** Hub origin — JWT `iss` validation + cascade mint issuer. */
   issuer: string;
+  /**
+   * SET of origins the hub legitimately answers on (loopback ∪ expose-state ∪
+   * platform ∪ per-request `issuer`), built via `buildHubBoundOrigins`. The
+   * admin bearer's `iss` is validated against THIS set rather than the single
+   * `issuer`, so a host-admin credential minted under a still-valid prior
+   * origin keeps working across an origin switch (hub#516 parity). Absent →
+   * falls back to `[issuer]` (the prior strict per-request behavior).
+   */
+  knownIssuers?: readonly string[];
   /** Override the services.json path. Defaults to `~/.parachute/services.json`. */
   manifestPath?: string;
   /** Absolute path to `connections.json` in the hub state dir. */
@@ -693,7 +711,12 @@ export async function handleDeleteVault(
   // Auth gate: parachute:host:admin — the same gate as POST /vaults.
   let adminSub: string;
   try {
-    const auth = await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.issuer);
+    const auth = await requireScope(
+      deps.db,
+      req,
+      HOST_ADMIN_SCOPE,
+      deps.knownIssuers ?? [deps.issuer],
+    );
     adminSub = auth.sub;
   } catch (err) {
     return adminAuthErrorResponse(err as AdminAuthError);

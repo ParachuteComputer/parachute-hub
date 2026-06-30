@@ -73,6 +73,15 @@ export interface ApiRevokeTokenDeps {
   db: Database;
   /** Hub origin — used to validate the bearer's `iss`. */
   issuer: string;
+  /**
+   * SET of origins the hub answers on (loopback ∪ expose-state ∪ platform ∪
+   * per-request `issuer`), built via `buildHubBoundOrigins`. The bearer's
+   * `iss` is validated against THIS set rather than the single `issuer`, so a
+   * credential minted under a still-valid prior origin keeps working across an
+   * origin switch (hub#516 parity). Absent → falls back to `[issuer]` (the
+   * prior strict per-request behavior; tests/non-HTTP callers unaffected).
+   */
+  knownIssuers?: readonly string[];
   /** Test seam for time. */
   now?: () => Date;
 }
@@ -102,7 +111,11 @@ export async function handleApiRevokeToken(
   // 2. Bearer validation (signature, issuer, expiry, hub-side revocation).
   let bearerScopes: string[];
   try {
-    const validated = await validateAccessToken(deps.db, bearer, deps.issuer);
+    const validated = await validateAccessToken(
+      deps.db,
+      bearer,
+      deps.knownIssuers ?? [deps.issuer],
+    );
     if (typeof validated.payload.sub !== "string" || validated.payload.sub.length === 0) {
       return jsonError(401, "unauthenticated", "bearer token has no sub claim");
     }

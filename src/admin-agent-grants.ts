@@ -131,6 +131,16 @@ export interface AgentGrantsDeps {
    * (`<hubOrigin>/oauth/agent-grant/callback`).
    */
   hubOrigin: string;
+  /**
+   * SET of origins the hub answers on (loopback ∪ expose-state ∪ platform ∪
+   * per-request issuer), built via `buildHubBoundOrigins`. The module's
+   * host-admin bearer `iss` is validated against THIS set rather than the
+   * single `hubOrigin`, so the agent module's credential minted under a
+   * still-valid prior origin keeps working across an origin switch (hub#516
+   * parity). Minted tokens still carry `hubOrigin`. Absent → falls back to
+   * `[hubOrigin]` (the prior strict per-request behavior).
+   */
+  knownIssuers?: readonly string[];
   /** Absolute path to `agent-grants.json` in the hub state dir. */
   storePath: string;
   /** Absolute path to `agent-oauth-flows.json` (the in-flight OAuth consents, 4b-2). */
@@ -249,7 +259,12 @@ async function requireModuleAuth(
   deps: AgentGrantsDeps,
 ): Promise<AdminAuthContext | Response> {
   try {
-    return await requireScope(deps.db, req, HOST_ADMIN_SCOPE, deps.hubOrigin);
+    return await requireScope(
+      deps.db,
+      req,
+      HOST_ADMIN_SCOPE,
+      deps.knownIssuers ?? [deps.hubOrigin],
+    );
   } catch (err) {
     return adminAuthErrorResponse(err as AdminAuthError);
   }

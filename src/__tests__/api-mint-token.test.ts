@@ -172,6 +172,81 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     }
   });
 
+  // hub#516 parity — the live "mint refused" after `parachute hub set-origin`.
+  // An operator/agent credential minted under a PRIOR origin (still a member of
+  // the hub's bound-origin set) must keep minting after the canonical issuer
+  // switches; the minted token still carries the new canonical issuer.
+  describe("multi-origin issuer set (set-origin parity)", () => {
+    const TUNNEL = "https://brain.gitcoin.co";
+
+    test("mints when the bearer's iss is in knownIssuers but ≠ the canonical issuer", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          // Operator token minted under the TUNNEL origin (pre-`set-origin`).
+          const op = await mintOperatorToken(db, userId, { issuer: TUNNEL });
+          const resp = await handleApiMintToken(
+            jsonRequest(
+              { scope: "scribe:transcribe", expires_in: 3600 },
+              { authorization: `Bearer ${op.token}` },
+            ),
+            // Canonical issuer is now ISSUER (loopback), but the bound set still
+            // includes TUNNEL — the still-valid prior origin.
+            { db, issuer: ISSUER, knownIssuers: [ISSUER, TUNNEL] },
+          );
+          expect(resp.status).toBe(200);
+          const body = (await resp.json()) as { token: string };
+          // The MINTED token carries the canonical issuer, not the bearer's.
+          const validated = await validateAccessToken(db, body.token, ISSUER);
+          expect(validated.payload.iss).toBe(ISSUER);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("rejects 401 when the bearer's iss is OUTSIDE knownIssuers", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: "https://evil.example.com" });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "scribe:transcribe" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER, knownIssuers: [ISSUER, TUNNEL] },
+          );
+          expect(resp.status).toBe(401);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+
+    test("back-compat: without knownIssuers, a non-canonical iss is still rejected", async () => {
+      const h = makeHarness();
+      try {
+        const { db, userId } = await bootstrap(h.dir);
+        try {
+          const op = await mintOperatorToken(db, userId, { issuer: TUNNEL });
+          const resp = await handleApiMintToken(
+            jsonRequest({ scope: "scribe:transcribe" }, { authorization: `Bearer ${op.token}` }),
+            { db, issuer: ISSUER }, // no knownIssuers → falls back to [ISSUER]
+          );
+          expect(resp.status).toBe(401);
+        } finally {
+          db.close();
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  });
+
   test("happy path: --scope-set=auth narrow operator token also passes the scope gate", async () => {
     const h = makeHarness();
     try {

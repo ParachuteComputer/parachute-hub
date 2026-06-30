@@ -48,6 +48,15 @@ export interface ApiSettingsHubOriginDeps {
   db: Database;
   issuer: string;
   /**
+   * SET of origins the hub answers on (loopback ∪ expose-state ∪ platform ∪
+   * per-request `issuer`), built via `buildHubBoundOrigins`. The bearer's
+   * `iss` is validated against THIS set rather than the single `issuer`, so a
+   * credential minted under a still-valid prior origin keeps working across an
+   * origin switch (hub#516 parity). Absent → falls back to `[issuer]` (the
+   * prior strict per-request behavior; tests/non-HTTP callers unaffected).
+   */
+  knownIssuers?: readonly string[];
+  /**
    * The currently-resolved issuer + its source layer. Computed by the
    * dispatcher (which has the request + `configuredIssuer` already in
    * hand) and threaded through so this handler doesn't have to re-do
@@ -186,7 +195,11 @@ export async function handleApiSettingsHubOrigin(
 
   // Bearer validation + scope check.
   try {
-    const validated = await validateAccessToken(deps.db, bearer, deps.issuer);
+    const validated = await validateAccessToken(
+      deps.db,
+      bearer,
+      deps.knownIssuers ?? [deps.issuer],
+    );
     if (typeof validated.payload.sub !== "string" || validated.payload.sub.length === 0) {
       return jsonError(401, "unauthenticated", "bearer token has no sub claim");
     }

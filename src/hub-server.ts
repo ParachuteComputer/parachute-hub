@@ -2801,6 +2801,7 @@ export function hubFetch(
           await handleDeleteClient(req, clientId, {
             db: getDb(),
             issuer: oauthDeps(req).issuer,
+            knownIssuers: oauthDeps(req).hubBoundOrigins(),
           }),
         );
       }
@@ -2842,6 +2843,7 @@ export function hubFetch(
         return handleCreateVault(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
         });
       }
 
@@ -2868,6 +2870,7 @@ export function hubFetch(
         return handleDeleteVault(req, name, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
           connectionsStorePath: deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
           agentOrigin,
@@ -3024,6 +3027,10 @@ export function hubFetch(
         const agentGrantsDeps: AgentGrantsDeps = {
           db: getDb(),
           hubOrigin: oauthDeps(req).issuer,
+          // hub#516 parity: validate the module's host-admin bearer `iss`
+          // against the hub's known-origin set (PUT /admin/grants is the only
+          // bearer-gated route here; the POST /approve|/revoke are cookie-authed).
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           storePath: deps?.agentGrantsStorePath ?? join(CONFIG_DIR, "agent-grants.json"),
           flowsStorePath:
             deps?.agentOAuthFlowsStorePath ?? join(CONFIG_DIR, "agent-oauth-flows.json"),
@@ -3116,6 +3123,7 @@ export function hubFetch(
         return handleHubUpgrade(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           configDir: CONFIG_DIR,
         });
       }
@@ -3124,6 +3132,7 @@ export function hubFetch(
         return handleHubUpgradeStatus(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           configDir: CONFIG_DIR,
         });
       }
@@ -3136,6 +3145,7 @@ export function hubFetch(
         return handleApiHub(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
         });
       }
 
@@ -3171,6 +3181,7 @@ export function hubFetch(
         return handleApiModulesChannel(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
         });
       }
 
@@ -3184,6 +3195,7 @@ export function hubFetch(
         return handleApiSettingsHubOrigin(req, {
           db,
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           resolvedIssuer: resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin),
           resolvedSource: resolveIssuerSource(db, configuredIssuer, loadExposeHubOrigin),
         });
@@ -3198,6 +3210,7 @@ export function hubFetch(
         return handleApiSettingsRootRedirect(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
         });
       }
 
@@ -3300,6 +3313,7 @@ export function hubFetch(
         return handleApiMintToken(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           knownVaultNames: mintKnownVaultNames,
         });
       }
@@ -3309,6 +3323,7 @@ export function hubFetch(
         return handleApiRevokeToken(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
         });
       }
 
@@ -3317,6 +3332,7 @@ export function hubFetch(
         return handleApiTokens(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
         });
       }
 
@@ -3325,6 +3341,7 @@ export function hubFetch(
         return handleListGrants(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
         });
       }
 
@@ -3337,6 +3354,7 @@ export function hubFetch(
         return handleRevokeGrant(req, clientId, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
         });
       }
 
@@ -3359,6 +3377,7 @@ export function hubFetch(
           return handleApproveClient(req, clientId, {
             db: getDb(),
             issuer: oauthDeps(req).issuer,
+            knownIssuers: oauthDeps(req).hubBoundOrigins(),
           });
         }
         const clientId = decodeURIComponent(tail);
@@ -3368,6 +3387,7 @@ export function hubFetch(
         return handleGetClient(req, clientId, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
         });
       }
 
@@ -3383,6 +3403,7 @@ export function hubFetch(
         const usersDeps = {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
         };
         if (req.method === "GET") return handleListUsers(req, usersDeps);
@@ -3394,6 +3415,7 @@ export function hubFetch(
         return handleListVaults(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
         });
       }
@@ -3413,6 +3435,7 @@ export function hubFetch(
           return handleResetUserPassword(req, id, {
             db: getDb(),
             issuer: oauthDeps(req).issuer,
+            knownIssuers: oauthDeps(req).hubBoundOrigins(),
             manifestPath,
           });
         }
@@ -3431,6 +3454,7 @@ export function hubFetch(
           return handleUpdateUserVaults(req, id, {
             db: getDb(),
             issuer: oauthDeps(req).issuer,
+            knownIssuers: oauthDeps(req).hubBoundOrigins(),
             manifestPath,
           });
         }
@@ -3444,6 +3468,7 @@ export function hubFetch(
         return handleDeleteUser(req, id, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
         });
       }
@@ -3453,7 +3478,12 @@ export function hubFetch(
       // lists (status-annotated), DELETE /:id revokes by sha256 hash.
       if (pathname === "/api/invites") {
         if (!getDb) return dbNotConfigured();
-        const invitesDeps = { db: getDb(), issuer: oauthDeps(req).issuer, manifestPath };
+        const invitesDeps = {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        };
         if (req.method === "GET") return handleListInvites(req, invitesDeps);
         if (req.method === "POST") return handleCreateInvite(req, invitesDeps);
         return new Response("method not allowed", { status: 405 });
@@ -3467,6 +3497,7 @@ export function hubFetch(
         return handleRevokeInvite(req, id, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
         });
       }
@@ -3479,6 +3510,7 @@ export function hubFetch(
         return handleListVaultCaps(req, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
         });
       }
@@ -3491,6 +3523,7 @@ export function hubFetch(
         return handleSetVaultCap(req, name, {
           db: getDb(),
           issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
           manifestPath,
         });
       }
