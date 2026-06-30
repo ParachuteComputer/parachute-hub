@@ -282,8 +282,9 @@ export function isNonRequestableScope(scope: string): boolean {
   // Per-vault `vault:<name>:admin` is NO LONGER globally non-requestable
   // (single-consent change, 2026-05-29). It flows through the public OAuth
   // consent path and through `canGrant` rule 1, capped to the consenting
-  // user's held authority at the `issueAuthCodeRedirect` choke-point. Only
-  // the host-level operator scopes stay non-requestable here.
+  // user's held authority at the `issueAuthCodeRedirect` choke-point. The
+  // host-level operator scopes AND the service-admin scopes (hub:admin,
+  // scribe:admin) stay non-requestable here (see NON_REQUESTABLE_SCOPES).
   //
   // Item C — case-insensitive guard. The membership check is exact-string,
   // but Parachute scope tokens are canonically lowercase. A casing variant

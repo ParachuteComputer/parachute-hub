@@ -101,9 +101,12 @@ export function findSession(
  * expires 24h after its last activity. The ceiling bounds a left-open-but-idle
  * tab (background polls keep re-minting) so sliding can't run forever.
  *
- * Monotonic by construction: `now` only moves forward, so the slid value never
- * undershoots a previously-written expiry; once it reaches the ceiling it stays
- * pinned there. `now` is injectable for tests, matching {@link findSession}.
+ * Monotonic in practice: the production wall clock only moves forward, so the
+ * slid value never undershoots a previously-written expiry; once it reaches the
+ * ceiling it stays pinned there. (The write is unconditional — it does not read
+ * the current expiry — so an injected backward `now` in tests would shorten the
+ * session: a conservative failure mode, not a security issue.) `now` is
+ * injectable for tests, matching {@link findSession}.
  */
 export function touchSession(db: Database, id: string, now: () => Date = () => new Date()): void {
   const row = db.query<Row, [string]>("SELECT * FROM sessions WHERE id = ?").get(id);
