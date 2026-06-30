@@ -32,7 +32,12 @@ import { validateHubOrigin } from "../api-settings-hub-origin.ts";
 import { restart } from "../commands/lifecycle.ts";
 import { CONFIG_DIR } from "../config.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { setHubOrigin } from "../hub-settings.ts";
+import {
+  DEFAULT_ROOT_REDIRECT,
+  isSafeRedirectPath,
+  setHubOrigin,
+  setRootRedirect,
+} from "../hub-settings.ts";
 import { type CommandResult, type Runner, defaultRunner } from "../tailscale/run.ts";
 import { isLoopbackOrigin } from "../vault-hub-origin-env.ts";
 
@@ -348,6 +353,81 @@ async function runCaddyReload(run: Runner): Promise<CommandResult> {
 }
 
 /**
+ * `parachute hub set-root-redirect <path>` — persist the operator's bare-`/`
+ * redirect target into `hub_settings.root_redirect` (tier-1 in
+ * `resolveRootRedirect`). Lets a headless box (the canonical use case is a
+ * custom-domain hub fronting a team surface) flip its landing page from `/admin`
+ * to a surface without a browser session OR a redeploy.
+ *
+ * `--clear` deletes the row, reverting to the env / `/admin` default.
+ *
+ * The path is validated through `isSafeRedirectPath` — the SAME open-redirect
+ * guard the admin PUT enforces — so the CLI can never plant an off-origin
+ * `Location` target either. Returns 0 on success, 1 on a usage / validation /
+ * DB-write failure.
+ */
+export async function hubSetRootRedirect(
+  args: readonly string[],
+  deps: HubCommandDeps = {},
+): Promise<number> {
+  const configDir = deps.configDir ?? CONFIG_DIR;
+  const log = deps.log ?? ((line) => console.log(line));
+  const err = (line: string) => console.error(line);
+  const openDb = deps.openDb ?? ((dir: string) => openHubDb(hubDbPath(dir)));
+
+  const clear = args.includes("--clear");
+  const positional = args.filter((a) => !a.startsWith("-"));
+
+  if (clear) {
+    if (positional.length > 0) {
+      err("parachute hub set-root-redirect: --clear takes no path argument");
+      return 1;
+    }
+    const db = openDb(configDir);
+    try {
+      setRootRedirect(db, null);
+    } finally {
+      db.close();
+    }
+    log(
+      `✓ Cleared the root redirect — \`/\` reverts to env / the ${DEFAULT_ROOT_REDIRECT} default.`,
+    );
+    return 0;
+  }
+
+  const raw = positional[0];
+  if (raw === undefined) {
+    err("usage: parachute hub set-root-redirect <path>   (or --clear)");
+    err("example: parachute hub set-root-redirect /surface/reading-room");
+    return 1;
+  }
+  if (positional.length > 1) {
+    err(`parachute hub set-root-redirect: unexpected argument "${positional[1]}"`);
+    err("usage: parachute hub set-root-redirect <path>   (or --clear)");
+    return 1;
+  }
+
+  if (!isSafeRedirectPath(raw)) {
+    err(`parachute hub set-root-redirect: "${raw}" is not a safe same-origin path`);
+    err("  It must start with a single `/` (no `//`, `/\\`, scheme, or whitespace) and");
+    err("  not be `/` itself. Example: /surface/reading-room");
+    return 1;
+  }
+
+  const db = openDb(configDir);
+  try {
+    setRootRedirect(db, raw);
+  } finally {
+    db.close();
+  }
+
+  log(`✓ Bare \`/\` now redirects to ${raw}.`);
+  log("  Stored in hub_settings.root_redirect — takes effect on the next request,");
+  log("  no restart needed. Clear it with: parachute hub set-root-redirect --clear");
+  return 0;
+}
+
+/**
  * `parachute hub <subcommand>` dispatcher. Mirrors `auth`'s shape (a thin
  * router over subcommand handlers, each catching its own errors).
  */
@@ -367,6 +447,16 @@ export async function hub(args: readonly string[], deps: HubCommandDeps = {}): P
       return 1;
     }
   }
+  if (sub === "set-root-redirect") {
+    try {
+      return await hubSetRootRedirect(args.slice(1), deps);
+    } catch (err) {
+      console.error(
+        `parachute hub set-root-redirect: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return 1;
+    }
+  }
   console.error(`parachute hub: unknown subcommand "${sub}"`);
   console.error("");
   console.error(hubHelp());
@@ -378,6 +468,7 @@ export function hubHelp(): string {
 
 Usage:
   parachute hub set-origin <url> [--no-caddy] [--no-restart]
+  parachute hub set-root-redirect <path> | --clear
 
 Subcommands:
   set-origin <url>    Persist the canonical public origin (OAuth issuer) to the
@@ -401,9 +492,19 @@ Subcommands:
                       Caddyfile rewrite + reload, or --no-restart to skip the
                       module restart.
 
+  set-root-redirect <path>
+                      Point the bare \`/\` 302 at a same-origin path instead of the
+                      default /admin (e.g. a team surface). Stored in
+                      hub_settings.root_redirect; takes effect on the next request,
+                      no restart. The path must start with a single \`/\` (no \`//\`,
+                      \`/\\\`, scheme, or whitespace). Pass --clear to revert to the
+                      env / /admin default. (Env equivalent: PARACHUTE_HUB_ROOT_REDIRECT.)
+
 Examples:
   parachute hub set-origin https://box.sslip.io
   parachute hub set-origin https://parachute.example.com
   parachute hub set-origin https://parachute.example.com --no-caddy
+  parachute hub set-root-redirect /surface/reading-room
+  parachute hub set-root-redirect --clear
 `;
 }

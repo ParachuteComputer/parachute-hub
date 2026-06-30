@@ -87,6 +87,7 @@
  *   /api/modules/:short/uninstall (POST)       → stop child + bun remove + drop row (sync)
  *   /api/modules/operations/:id   (GET)        → poll async op status
  *   /api/settings/hub-origin      (GET + PUT)  → canonical hub URL (host:admin)
+ *   /api/settings/root-redirect   (GET + PUT)  → bare-`/` redirect target (host:admin)
  *   /api/auth/mint-token          (POST)       → CLI/automation token mint (bearer)
  *   /api/auth/revoke-token        (POST)       → revoke registry-row token by jti
  *   /api/auth/tokens              (GET)        → paginated registry list
@@ -217,6 +218,7 @@ import { handleApiReady } from "./api-ready.ts";
 import { REVOCATION_LIST_MOUNT, handleRevocationList } from "./api-revocation-list.ts";
 import { handleApiRevokeToken } from "./api-revoke-token.ts";
 import { handleApiSettingsHubOrigin } from "./api-settings-hub-origin.ts";
+import { handleApiSettingsRootRedirect } from "./api-settings-root-redirect.ts";
 import { handleApiTokens } from "./api-tokens.ts";
 import {
   handleCreateUser,
@@ -246,7 +248,7 @@ import {
   startDbPathLivenessTimer,
 } from "./hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
-import { getHubOrigin } from "./hub-settings.ts";
+import { getHubOrigin, resolveRootRedirect } from "./hub-settings.ts";
 import { type RenderHubOpts, renderHub } from "./hub.ts";
 import { pemToJwk } from "./jwks.ts";
 import {
@@ -2479,23 +2481,32 @@ export function hubFetch(
         );
       }
 
-      // Bare `/` → `/admin` (admin-shell IA, R1). The home page and the admin
-      // SPA used to be two disconnected surfaces; `/` now funnels straight into
-      // the single coherent admin shell, whose Home/Overview carries the
-      // discovery content (hub-native sections, modules, user surfaces) that
-      // used to live here.
+      // Bare `/` → configurable target (default `/admin`, the admin-shell IA).
+      // The home page and the admin SPA used to be two disconnected surfaces;
+      // `/` funnels straight into the single coherent admin shell, whose
+      // Home/Overview carries the discovery content (hub-native sections,
+      // modules, user surfaces) that used to live here.
+      //
+      // The target is operator-configurable (resolveRootRedirect): a hub_settings
+      // `root_redirect` row → `PARACHUTE_HUB_ROOT_REDIRECT` env → `/admin`
+      // default. Lets an operator point their hub's root at a surface (e.g. a
+      // team reading-room) instead of the admin shell, without redeploying. The
+      // resolver re-validates every layer through the same-origin guard
+      // (`isSafeRedirectPath`) so a stored/env value can NEVER produce an open
+      // redirect — an unsafe value is ignored and falls back to `/admin`.
       //
       // Ordering matters: this sits AFTER the fresh-hub wizard funnel above
-      // (so a brand-new operator still lands on `/admin/setup`, not a 404 inside
-      // the shell) and AFTER the pre-admin lockout (so an admin-less hub still
-      // 503s API callers correctly). 302 (not 301) — `/` is reclaimed for
-      // future use, but a permanent redirect would get cached and we may want
-      // `/` back later.
+      // (so a brand-new operator still lands on `/admin/setup`, not a surface
+      // that can't work yet) and AFTER the pre-admin lockout (so an admin-less
+      // hub still 503s API callers correctly). 302 (not 301) — the target is
+      // operator-mutable, so a permanent/cached redirect would strand visitors
+      // on a stale destination after the operator flips it.
       //
-      // The signed-out path is preserved: a signed-out visitor lands on
-      // `/admin`, where the SPA's AuthIndicator shows a "Sign in" link that
-      // round-trips through `/login?next=/admin/...` and back. We don't pin the
-      // redirect on session state — the shell handles both auth states itself.
+      // The signed-out path is preserved when the target is `/admin`: a
+      // signed-out visitor lands on `/admin`, where the SPA's AuthIndicator
+      // shows a "Sign in" link that round-trips through `/login?next=/admin/...`
+      // and back. We don't pin the redirect on session state — the shell
+      // handles both auth states itself.
       //
       // `/hub.html` is INTENTIONALLY excluded: it still renders the discovery
       // page (used by the static `parachute expose --set-path=/` disk file and
@@ -2503,7 +2514,7 @@ export function hubFetch(
       if (pathname === "/") {
         return new Response(null, {
           status: 302,
-          headers: { location: "/admin" },
+          headers: { location: resolveRootRedirect(getDb ? getDb() : null) },
         });
       }
 
@@ -3175,6 +3186,18 @@ export function hubFetch(
           issuer: oauthDeps(req).issuer,
           resolvedIssuer: resolveIssuer(req, db, configuredIssuer, loadExposeHubOrigin),
           resolvedSource: resolveIssuerSource(db, configuredIssuer, loadExposeHubOrigin),
+        });
+      }
+
+      // Bare-`/` redirect target (configurable; default `/admin`). Admin SPA /
+      // CLI reads + writes the operator-set landing page. Same Bearer/scope
+      // posture as hub-origin; the open-redirect guard lives in the handler +
+      // resolver.
+      if (pathname === "/api/settings/root-redirect") {
+        if (!getDb) return dbNotConfigured();
+        return handleApiSettingsRootRedirect(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
         });
       }
 

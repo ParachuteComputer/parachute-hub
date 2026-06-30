@@ -12,9 +12,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hub, hubSetOrigin, rewriteCaddyfileHost } from "../commands/hub.ts";
+import { hub, hubSetOrigin, hubSetRootRedirect, rewriteCaddyfileHost } from "../commands/hub.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { getHubOrigin } from "../hub-settings.ts";
+import { getHubOrigin, getRootRedirect } from "../hub-settings.ts";
 import type { CommandResult } from "../tailscale/run.ts";
 
 describe("parachute hub set-origin", () => {
@@ -429,5 +429,72 @@ describe("parachute hub set-origin — Caddy automation", () => {
     // Host already matched → no reload.
     expect(runCalls).toEqual([]);
     expect(log.join("\n")).toContain("already points at old.example.com");
+  });
+});
+
+describe("parachute hub set-root-redirect", () => {
+  let dir: string;
+  let log: string[];
+  const collect = (line: string) => log.push(line);
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hub-set-root-redirect-"));
+    log = [];
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  /** Open the configDir's hub.db and read the persisted root_redirect. */
+  function persisted(): string | null {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      return getRootRedirect(db);
+    } finally {
+      db.close();
+    }
+  }
+
+  test("persists a safe same-origin path to hub_settings.root_redirect", async () => {
+    const code = await hubSetRootRedirect(["/surface/reading-room"], {
+      configDir: dir,
+      log: collect,
+    });
+    expect(code).toBe(0);
+    expect(persisted()).toBe("/surface/reading-room");
+  });
+
+  test("--clear deletes the row", async () => {
+    await hubSetRootRedirect(["/surface/x"], { configDir: dir, log: collect });
+    const code = await hubSetRootRedirect(["--clear"], { configDir: dir, log: collect });
+    expect(code).toBe(0);
+    expect(persisted()).toBeNull();
+  });
+
+  test("rejects an open-redirect path without writing", async () => {
+    for (const bad of ["//evil.com", "https://evil.com", "/\\evil.com", "/"]) {
+      const code = await hubSetRootRedirect([bad], { configDir: dir, log: collect });
+      expect(code).toBe(1);
+      expect(persisted()).toBeNull();
+    }
+  });
+
+  test("rejects a path with no leading slash without writing", async () => {
+    const code = await hubSetRootRedirect(["surface/x"], { configDir: dir, log: collect });
+    expect(code).toBe(1);
+    expect(persisted()).toBeNull();
+  });
+
+  test("usage error (exit 1) when no path + no --clear", async () => {
+    const code = await hubSetRootRedirect([], { configDir: dir, log: collect });
+    expect(code).toBe(1);
+    expect(persisted()).toBeNull();
+  });
+
+  test("routed through the `hub` dispatcher", async () => {
+    const code = await hub(["set-root-redirect", "/surface/via-dispatcher"], {
+      configDir: dir,
+      log: collect,
+    });
+    expect(code).toBe(0);
+    expect(persisted()).toBe("/surface/via-dispatcher");
   });
 });
