@@ -840,9 +840,10 @@ token list [<name>]        list deploy tokens (newest first), optionally narrowe
                            machine output. Never prints the token bytes.
 
 token revoke <jti>         revoke a deploy token by jti (find it via \`token list\`).
-                           The git endpoint rejects it within ~60s (revocation
-                           list poll). Idempotent. Refuses non-deploy-token jtis —
-                           use \`parachute auth revoke-token\` for those.
+                           Effective immediately — the git endpoint rejects it on
+                           the next push (per-request revocation check). Idempotent.
+                           Refuses non-deploy-token jtis — use
+                           \`parachute auth revoke-token\` for those.
 
 The remote-client setup (git-native, no \`gh\`, no parachute install needed):
 

@@ -414,7 +414,7 @@ async function runTokenRevoke(args: readonly string[], deps: SurfaceDeps): Promi
     switch (result.status) {
       case "revoked":
         console.log(
-          `Revoked surface deploy token ${jti}. The git endpoint rejects it within ~60s (revocation list poll).`,
+          `Revoked surface deploy token ${jti}. Effective immediately — the git endpoint rejects it on the next push.`,
         );
         return 0;
       case "already-revoked":
