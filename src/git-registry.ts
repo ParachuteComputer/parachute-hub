@@ -76,6 +76,19 @@ export function repoDirFor(gitRoot: string, name: string): string {
 }
 
 /**
+ * The client-facing git remote for a surface — `<hubOrigin>/git/<name>` — the URL
+ * an authorized client (agent / human / standalone Claude Code) clones + pushes to
+ * (the git-transport endpoint, `parseGitPath`). The trailing `/info/refs` git
+ * appends resolves to `parseGitPath("/git/<name>/info/refs")`, so no `.git` suffix
+ * is needed on the URL. Handed to a surface-grant holder as the `remoteUrl` in its
+ * `/material` (Phase 2 §6a) so the agent knows where to clone/push. NOTE: `name`
+ * is a `SURFACE_NAME_RE` slug (validated upstream) — no path traversal possible.
+ */
+export function surfaceGitRemoteUrl(hubOrigin: string, name: string): string {
+  return `${hubOrigin.replace(/\/+$/, "")}/git/${name}`;
+}
+
+/**
  * Read + parse the registry. A missing or corrupt file yields an empty registry
  * (the transport still fails closed on unregistered names — see
  * `isSurfaceRegistered`), never a throw: a torn registry.json must not take the

@@ -43,15 +43,21 @@ export type GrantInject = "env" | "mcp";
  *     `target` is the service key; `inject` hints how the agent side wires it
  *     (`env` → an env var, `mcp` → the service's MCP server, or both). Grant =
  *     an operator-pasted API token.
+ *   - `surface` — a Parachute SURFACE's hub-hosted git repo (Surface Git
+ *     Transport Phase 2, design 2026-06-30-surface-git-transport.md §6a).
+ *     `target` is the surface name; `access` the verb (`write` = clone+push,
+ *     `read` = clone only — write ⊇ read at the git-transport endpoint). Grant =
+ *     a hub-minted, revocable `surface:<target>:<access>` JWT the agent injects
+ *     into `git push`/`git clone` via a per-spawn GIT_ASKPASS (never `.git/config`).
  *   - `mcp`     — a remote MCP / remote vault. `target` is the MCP URL. Grant =
  *     an OAuth token — NOT implemented in 4b-1 (slice 2). Modeled here; the
  *     grant stays `pending` with a clear reason.
  */
 export interface ConnectionSpec {
-  readonly kind: "vault" | "service" | "mcp";
-  /** Vault name / service key / MCP URL, per `kind`. */
+  readonly kind: "vault" | "service" | "surface" | "mcp";
+  /** Vault name / service key / surface name / MCP URL, per `kind`. */
   readonly target: string;
-  /** Vault grants only — `read` (default) or `write`. */
+  /** Vault + surface grants — `read` (default) or `write`. */
   readonly access?: GrantAccess;
   /** Vault grants only — tag-scope (`scoped_tags`); empty/absent = vault-wide. */
   readonly tags?: readonly string[];
@@ -86,6 +92,16 @@ export type GrantMaterial =
       readonly kind: "service";
       /** The operator-pasted API token. */
       readonly token: string;
+    }
+  | {
+      readonly kind: "surface";
+      /** The minted `surface:<target>:<access>` JWT (write ⊇ read — one token
+       *  authenticates both `git clone` and `git push`). */
+      readonly token: string;
+      /** jti of the minted token — registered so revoke can drop it. */
+      readonly jti: string;
+      /** ISO expiry of the minted token. */
+      readonly expiresAt: string;
     }
   | {
       readonly kind: "mcp";
@@ -151,6 +167,10 @@ export function connectionKey(spec: ConnectionSpec): string {
   if (spec.kind === "service") {
     return `service:${target}`;
   }
+  if (spec.kind === "surface") {
+    const access = spec.access ?? "read";
+    return `surface:${target}:${access}`;
+  }
   // mcp — keyed on the URL only (its target).
   return `mcp:${target}`;
 }
@@ -181,7 +201,8 @@ function isConnectionSpec(v: unknown): v is ConnectionSpec {
   if (!v || typeof v !== "object") return false;
   const s = v as Record<string, unknown>;
   return (
-    (s.kind === "vault" || s.kind === "service" || s.kind === "mcp") && typeof s.target === "string"
+    (s.kind === "vault" || s.kind === "service" || s.kind === "surface" || s.kind === "mcp") &&
+    typeof s.target === "string"
   );
 }
 

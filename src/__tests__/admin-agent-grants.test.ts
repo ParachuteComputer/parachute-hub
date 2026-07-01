@@ -1658,3 +1658,313 @@ describe("revoke(mcp)", () => {
     expect(readGrants(harness.storePath).find((r) => r.id === id)?.material).toBeUndefined();
   });
 });
+
+// === surface grants (Surface Git Transport Phase 2, §6a) ===================
+
+describe("surface grants (Phase 2)", () => {
+  test("PUT: creates a pending surface grant (201) — no material, no self-grant", async () => {
+    const bearer = await moduleBearer();
+    const res = await dispatch(
+      bearerReq("PUT", "/admin/grants", bearer, {
+        agent: "surfacer",
+        connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+      }),
+    );
+    expect(res.status).toBe(201);
+    const body = await json(res);
+    // A note can only REQUEST — it lands pending with NO material until the
+    // operator approves. This IS the "a note can never GRANT" invariant.
+    expect(body.status).toBe("pending");
+    expect(body).not.toHaveProperty("material");
+    expect((body.connection as Record<string, unknown>).kind).toBe("surface");
+    expect((body.connection as Record<string, unknown>).access).toBe("write");
+  });
+
+  test("PUT: a pending surface grant's /material 409s (never grantable pre-approval)", async () => {
+    const bearer = await moduleBearer();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    const res = await dispatch(bearerReq("GET", `/admin/grants/${created.id}/material`, bearer));
+    expect(res.status).toBe(409);
+  });
+
+  test("PUT: rejects an invalid surface name (400)", async () => {
+    const bearer = await moduleBearer();
+    const res = await dispatch(
+      bearerReq("PUT", "/admin/grants", bearer, {
+        agent: "surfacer",
+        connection: { kind: "surface", target: "bad/name", access: "write" },
+      }),
+    );
+    expect(res.status).toBe(400);
+  });
+
+  test("PUT: rejects a bad surface access verb (400)", async () => {
+    const bearer = await moduleBearer();
+    const res = await dispatch(
+      bearerReq("PUT", "/admin/grants", bearer, {
+        agent: "surfacer",
+        connection: { kind: "surface", target: "gitcoin-brain", access: "admin" },
+      }),
+    );
+    expect(res.status).toBe(400);
+  });
+
+  test("approve: MINTS a registered surface:<name>:write token (operator-gated)", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.status).toBe("approved");
+    expect(body).not.toHaveProperty("material");
+    expect(body.approvedAt).toBeDefined();
+
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    const mat = stored?.material as { kind: string; token: string; jti: string };
+    expect(mat.kind).toBe("surface");
+    const claims = decodeJwt(mat.token) as Record<string, unknown>;
+    expect(claims.scope).toBe("surface:gitcoin-brain:write");
+    expect(claims.aud).toBe("surface.gitcoin-brain");
+    // registered → revocable
+    expect(findTokenRowByJti(harness.db, mat.jti)).not.toBeNull();
+  });
+
+  test("approve: is operator-only — a module Bearer cannot approve", async () => {
+    const bearer = await moduleBearer();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    // A host-admin Bearer is module-auth, NOT the operator cookie the approve
+    // path requires — so it 401s (a note/module can never self-approve).
+    const res = await dispatch(bearerReq("POST", `/admin/grants/${id}/approve`, bearer));
+    expect(res.status).toBe(401);
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("pending");
+  });
+
+  test("approve: a non-first-admin operator cannot approve (403)", async () => {
+    const bearer = await moduleBearer();
+    const friend = await friendCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, friend));
+    expect(res.status).toBe(403);
+    expect(readGrants(harness.storePath).find((r) => r.id === id)?.status).toBe("pending");
+  });
+
+  test("material: an approved surface grant returns { kind:surface, token, remoteUrl }", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const res = await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    expect(res.status).toBe(200);
+    const mat = await json(res);
+    expect(mat.kind).toBe("surface");
+    expect(typeof mat.token).toBe("string");
+    // The git remote the agent clones/pushes to — the git-transport endpoint.
+    expect(mat.remoteUrl).toBe(`${HUB_ORIGIN}/git/gitcoin-brain`);
+    const claims = decodeJwt(mat.token as string) as Record<string, unknown>;
+    expect(claims.scope).toBe("surface:gitcoin-brain:write");
+  });
+
+  test("a read-only surface grant mints surface:<name>:read", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "read" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const mat = await json(
+      await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer)),
+    );
+    expect(mat.remoteUrl).toBe(`${HUB_ORIGIN}/git/gitcoin-brain`);
+    const claims = decodeJwt(mat.token as string) as Record<string, unknown>;
+    expect(claims.scope).toBe("surface:gitcoin-brain:read");
+  });
+
+  test("a mixed-case surface name is canonicalized to lowercase (scope + remote + idempotency)", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "GitCoin-Brain", access: "write" },
+        }),
+      ),
+    );
+    // Stored target is normalized to lowercase, so the minted scope + the /material
+    // remote match a lowercase-registered surface and the agent's echoed-target key
+    // stays consistent (no mixed-case collapse mismatch).
+    expect((created.connection as Record<string, unknown>).target).toBe("gitcoin-brain");
+    // A second PUT with the lowercase twin is the SAME grant (idempotent), not a fork.
+    const twin = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    expect(twin.id).toBe(created.id);
+    expect(readGrants(harness.storePath).filter((r) => r.agent === "surfacer")).toHaveLength(1);
+    // Approve → the minted scope + the /material remote are both lowercase.
+    await dispatch(cookieReq("POST", `/admin/grants/${created.id as string}/approve`, cookie));
+    const mat = await json(
+      await dispatch(bearerReq("GET", `/admin/grants/${created.id as string}/material`, bearer)),
+    );
+    expect(mat.remoteUrl).toBe(`${HUB_ORIGIN}/git/gitcoin-brain`);
+    expect((decodeJwt(mat.token as string) as Record<string, unknown>).scope).toBe(
+      "surface:gitcoin-brain:write",
+    );
+  });
+
+  test("re-approval revokes the prior minted surface token", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const firstJti = (
+      readGrants(harness.storePath).find((r) => r.id === id)?.material as { jti: string }
+    ).jti;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const secondJti = (
+      readGrants(harness.storePath).find((r) => r.id === id)?.material as { jti: string }
+    ).jti;
+    expect(secondJti).not.toBe(firstJti);
+    expect(findTokenRowByJti(harness.db, firstJti)?.revokedAt).toBeTruthy();
+    expect(findTokenRowByJti(harness.db, secondJti)?.revokedAt).toBeFalsy();
+  });
+
+  test("revoke: drops the material AND revokes the minted token in the registry", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const jti = (
+      readGrants(harness.storePath).find((r) => r.id === id)?.material as { jti: string }
+    ).jti;
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${id}/revoke`, cookie));
+    expect(res.status).toBe(200);
+    const stored = readGrants(harness.storePath).find((r) => r.id === id);
+    expect(stored?.status).toBe("revoked");
+    expect(stored?.material).toBeUndefined();
+    expect(findTokenRowByJti(harness.db, jti)?.revokedAt).toBeTruthy();
+    // /material now 409s
+    const mat = await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer));
+    expect(mat.status).toBe(409);
+  });
+
+  test("reconcile prunes a surface grant that's no longer wanted", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const jti = (
+      readGrants(harness.storePath).find((r) => r.id === id)?.material as { jti: string }
+    ).jti;
+    // reconcile with NO live connections → prune (tears down the token too)
+    const res = await dispatch(
+      bearerReq("POST", "/admin/grants/reconcile", bearer, {
+        agent: "surfacer",
+        liveConnections: [],
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.pruned).toBe(1);
+    expect(getGrant(harness.storePath, id)).toBeNull();
+    expect(findTokenRowByJti(harness.db, jti)?.revokedAt).toBeTruthy();
+  });
+
+  test("reconcile KEEPS a surface grant that's still declared (spec-derived key match)", async () => {
+    const bearer = await moduleBearer();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    // The agent sends the SPEC (not a pre-computed key); the hub re-derives the
+    // key with its OWN connectionKey → the still-wanted grant is kept.
+    const res = await dispatch(
+      bearerReq("POST", "/admin/grants/reconcile", bearer, {
+        agent: "surfacer",
+        liveConnections: [{ kind: "surface", target: "gitcoin-brain", access: "write" }],
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect((await json(res)).pruned).toBe(0);
+    expect(getGrant(harness.storePath, id)).not.toBeNull();
+  });
+});

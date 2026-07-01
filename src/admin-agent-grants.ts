@@ -33,15 +33,18 @@
  *   GET  /admin/grants?agent=<name>          → { grants: [...] } — NO material on any row.
  *   GET  /admin/grants/<id>/material         → APPROVED grants only: the injectable
  *                                              secret. vault → { kind, token, mcpUrl };
- *                                              service → { kind, token, inject }.
+ *                                              service → { kind, token, inject };
+ *                                              surface → { kind, token, remoteUrl }.
  *                                              404 unknown id, 409 not approved.
  *
  * OPERATOR-AUTH (a first-admin session cookie; CSRF-belted by the dispatch in
  * hub-server.ts, exactly like /admin/connections POST/DELETE):
  *
  *   POST /admin/grants/<id>/approve          { token? } → vault: MINT now + store;
- *                                              service: store the pasted `token`. Returns
- *                                              the updated grant (no material).
+ *                                              surface: MINT a `surface:<name>:<verb>`
+ *                                              token now + store; service: store the
+ *                                              pasted `token`. Returns the updated
+ *                                              grant (no material).
  *   POST /admin/grants/<id>/revoke           → drop the stored material + status=revoked
  *                                              (the agent loses it next spawn).
  *
@@ -58,6 +61,7 @@ import {
   requireScope,
 } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
+import { SURFACE_NAME_RE, surfaceGitRemoteUrl } from "./git-registry.ts";
 import {
   type ConnectionSpec,
   type GrantAccess,
@@ -92,6 +96,12 @@ import { validateVaultName } from "./vault-name.ts";
  * table so revoke can drop it.
  */
 const VAULT_GRANT_TTL_SECONDS = 90 * 24 * 60 * 60;
+/**
+ * TTL of a minted surface grant token — 90 days, matching the vault grant posture
+ * (a headless agent re-fetches at spawn; a long-lived token spares a re-mint every
+ * turn). Registered in the tokens table so revoke can drop it (registered-mint rule).
+ */
+const SURFACE_GRANT_TTL_SECONDS = 90 * 24 * 60 * 60;
 const GRANT_CLIENT_ID = "parachute-hub-spa";
 
 /** Agent-name charset — lands in the grant id + a `?agent=` query. Conservative slug. */
@@ -367,8 +377,8 @@ function parseConnectionSpec(raw: unknown): { spec: ConnectionSpec } | { error: 
   }
   const c = raw as Record<string, unknown>;
   const kind = c.kind;
-  if (kind !== "vault" && kind !== "service" && kind !== "mcp") {
-    return { error: `connection.kind must be "vault", "service", or "mcp"` };
+  if (kind !== "vault" && kind !== "service" && kind !== "surface" && kind !== "mcp") {
+    return { error: `connection.kind must be "vault", "service", "surface", or "mcp"` };
   }
   const target = typeof c.target === "string" ? c.target.trim() : "";
   if (!target) return { error: "connection.target is required" };
@@ -433,6 +443,34 @@ function parseConnectionSpec(raw: unknown): { spec: ConnectionSpec } | { error: 
     return {
       spec: { kind: "service", target, ...(inject.length > 0 ? { inject } : {}) },
     };
+  }
+
+  if (kind === "surface") {
+    // A surface's hub-hosted git repo (Phase 2). `target` is the surface name —
+    // the SAME `SURFACE_NAME_RE` slug the git-transport URL parser + registry
+    // enforce (no slashes/dots → no path traversal in the git endpoint), so a
+    // grant can only ever name a well-formed surface. NORMALIZED to lowercase (the
+    // canonical form): `connectionKey` + `grantId` already lowercase, so the STORED
+    // target, the minted `surface:<name>:<verb>` scope, and the `/git/<name>` remote
+    // must lowercase too — else a mixed-case want (e.g. `GitCoin-Brain`) would collapse
+    // to the same grantId as its lowercase twin but mint a differently-cased scope,
+    // and the agent's status key (from its echoed target) would diverge. Surface names
+    // are lowercase-kebab by convention (surface-host registers them lowercase). The
+    // agent side lowercases at parse too (grants.ts parseSurfaceWant) so both repos'
+    // keys agree. `access` is `read` (default) or `write`; the agent always declares
+    // the verb explicitly (`surface:<name>:<verb>`).
+    if (!SURFACE_NAME_RE.test(target)) {
+      return { error: `connection.target "${target}" is not a valid surface name` };
+    }
+    const name = target.toLowerCase();
+    let access: GrantAccess = "read";
+    if (c.access !== undefined) {
+      if (c.access !== "read" && c.access !== "write") {
+        return { error: `connection.access must be "read" or "write"` };
+      }
+      access = c.access;
+    }
+    return { spec: { kind: "surface", target: name, access } };
   }
 
   // mcp — modeled, not grantable in 4b-1. Accept a URL target; the grant lands
@@ -519,6 +557,15 @@ async function grantMaterial(req: Request, id: string, deps: AgentGrantsDeps): P
       kind: "service",
       token: grant.material.token,
       inject: grant.connection.kind === "service" ? (grant.connection.inject ?? []) : [],
+    };
+  } else if (grant.material.kind === "surface") {
+    // The minted `surface:<name>:<verb>` token + the surface's git remote — the
+    // agent injects the token into `git clone`/`git push` (via GIT_ASKPASS) to
+    // the remote. One token covers clone AND push (write ⊇ read at the endpoint).
+    payload = {
+      kind: "surface",
+      token: grant.material.token,
+      remoteUrl: surfaceGitRemoteUrl(deps.hubOrigin, grant.connection.target),
     };
   } else {
     // mcp — refresh first if it's an OAuth grant near/past expiry. A refresh
@@ -711,6 +758,57 @@ async function approveGrant(req: Request, id: string, deps: AgentGrantsDeps): Pr
     };
     putGrant(deps.storePath, updated);
     console.log(`agent grant approved: id=${id} agent=${grant.agent} kind=vault scope=${scope}`);
+    return grantResponse(200, updated);
+  }
+
+  if (conn.kind === "surface") {
+    // Surface git grant (Phase 2, §6a step 3). The operator approving here IS the
+    // "a note can only REQUEST, never GRANT" gate: the module registered this
+    // pending, and only this operator-cookie + first-admin path mints the token.
+    // We deliberately do NOT require the surface to be REGISTERED at approve time:
+    // registration (surface-host discovering the `#surface` note) is async +
+    // declarative and may lag the grant; the git-transport already fails closed
+    // (404) on an unregistered name even with a valid token, so a pre-approved
+    // grant for a not-yet-declared surface is simply inert until it's declared —
+    // no escalation, and no ordering dependency between the two operator actions.
+    //
+    // Re-approval of an already-approved surface grant: revoke the prior minted
+    // token first so exactly one live token exists per grant (mirrors vault).
+    if (grant.material?.kind === "surface") {
+      try {
+        revokeTokenByJti(deps.db, grant.material.jti, now);
+      } catch {
+        // Best-effort — a missing registry row leaves nothing to revoke.
+      }
+    }
+    const access = conn.access ?? "read";
+    const scope = `surface:${conn.target}:${access}`;
+    let minted: { token: string; jti: string; expiresAt: string };
+    try {
+      minted = await mintSurfaceGrant(deps, op.userId, scope);
+    } catch (err) {
+      return jsonError(
+        500,
+        "mint_failed",
+        `failed to mint surface grant: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const updated: GrantRecord = {
+      id: grant.id,
+      agent: grant.agent,
+      connection: grant.connection,
+      status: "approved",
+      createdAt: grant.createdAt,
+      approvedAt,
+      material: {
+        kind: "surface",
+        token: minted.token,
+        jti: minted.jti,
+        expiresAt: minted.expiresAt,
+      },
+    };
+    putGrant(deps.storePath, updated);
+    console.log(`agent grant approved: id=${id} agent=${grant.agent} kind=surface scope=${scope}`);
     return grantResponse(200, updated);
   }
 
@@ -1184,6 +1282,9 @@ async function revokeGrant(req: Request, id: string, deps: AgentGrantsDeps): Pro
  *
  *   - vault   → revoke the minted token in the registry so it's dead immediately,
  *               not just absent from the next fetch.
+ *   - surface → same as vault: revoke the minted `surface:<name>:<verb>` token in
+ *               the registry so the git endpoint rejects it immediately (the
+ *               revocation list), not just on the agent's next fetch.
  *   - mcp     → best-effort revoke the refresh token at the issuer so the remote
  *               credential dies, not just our local copy. A static bearer (no
  *               refresh/revocation endpoint) is a no-op (operator rotates upstream).
@@ -1195,7 +1296,7 @@ async function tearDownGrantMaterial(
   deps: AgentGrantsDeps,
   now: Date,
 ): Promise<void> {
-  if (grant.material?.kind === "vault") {
+  if (grant.material?.kind === "vault" || grant.material?.kind === "surface") {
     try {
       revokeTokenByJti(deps.db, grant.material.jti, now);
     } catch {
@@ -1368,6 +1469,55 @@ async function mintVaultGrant(
     ...(scopedTags.length > 0
       ? { permissions: JSON.stringify({ scoped_tags: [...scopedTags] }) }
       : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  });
+  return { token: signed.token, jti: signed.jti, expiresAt: signed.expiresAt };
+}
+
+/**
+ * Mint the token for an approved SURFACE grant (Phase 2): a REGISTERED
+ * (created_via "agent_grant") `surface:<name>:<access>` JWT the git-transport
+ * endpoint validates (`validateAccessToken` → signature + `iss` ∈ hub-bound set +
+ * revocation, then `scopes.includes("surface:<name>:<verb>")`). Mirrors
+ * {@link mintVaultGrant} — same TTL posture + registered-mint discipline — minus
+ * the vault-only bits: NO `vaultScope` pin (surface isn't a per-user vault) and
+ * NO `scoped_tags`. Audience is `surface.<name>` for symmetry with `vault.<name>`;
+ * the git endpoint doesn't check `aud` (it keys purely off the URL path + the
+ * scope), so it's cosmetic but honest.
+ *
+ * The scope is signed VERBATIM (no `capScopesToUserAuthority` — that caps only the
+ * OAuth-consent/mint-token paths, never `signAccessToken`), so a
+ * `surface:<name>:write` grant mints exactly that authority. The operator-cookie +
+ * first-admin approve gate upstream is the governance (a note can only REQUEST).
+ */
+async function mintSurfaceGrant(
+  deps: AgentGrantsDeps,
+  userId: string,
+  scope: string,
+): Promise<{ token: string; jti: string; expiresAt: string }> {
+  // `surface:<name>:<verb>` — the audience takes the surface name (parallel to
+  // `vault.<name>`); split off the middle segment.
+  const surfaceName = scope.split(":")[1] ?? "";
+  const sign = deps.signToken ?? signAccessToken;
+  const signed = await sign(deps.db, {
+    sub: userId || "agent-grant",
+    scopes: [scope],
+    audience: `surface.${surfaceName}`,
+    clientId: GRANT_CLIENT_ID,
+    issuer: deps.hubOrigin,
+    ttlSeconds: SURFACE_GRANT_TTL_SECONDS,
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  });
+  // Register the long-lived mint so revoke can drop it (registered-mint rule —
+  // an unregistered long-lived token is unrevocable).
+  recordTokenMint(deps.db, {
+    jti: signed.jti,
+    createdVia: "agent_grant",
+    subject: "agent-grant",
+    ...(userId ? { userId } : {}),
+    clientId: GRANT_CLIENT_ID,
+    scopes: [scope],
+    expiresAt: signed.expiresAt,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
   return { token: signed.token, jti: signed.jti, expiresAt: signed.expiresAt };
