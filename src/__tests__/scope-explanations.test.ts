@@ -93,6 +93,22 @@ describe("explainScope", () => {
     expect(explainScope("vault:my-techne_2:admin")?.level).toBe("admin");
     expect(explainScope("vault:*:admin")?.level).toBe("admin");
   });
+
+  // Surface Git Transport Phase 1: named per-surface scopes
+  // (`surface:<name>:<verb>`) reach the consent screen via the 3→2-segment
+  // collapse, so explainScope MUST resolve them to the unnamed surface:read /
+  // surface:write labels — else the operator sees the raw scope string.
+  test("named surface scopes (surface:<name>:<verb>) reuse the unnamed-verb explanation", () => {
+    expect(explainScope("surface:gitcoin-brain:read")?.label).toBe(
+      SCOPE_EXPLANATIONS["surface:read"]?.label,
+    );
+    expect(explainScope("surface:gitcoin-brain:read")?.level).toBe("read");
+    expect(explainScope("surface:my-app_2:write")?.label).toBe(
+      SCOPE_EXPLANATIONS["surface:write"]?.label,
+    );
+    expect(explainScope("surface:my-app_2:write")?.level).toBe("write");
+    expect(explainScope("surface:*:write")?.level).toBe("write");
+  });
 });
 
 describe("scopeIsAdmin", () => {

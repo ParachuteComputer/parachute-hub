@@ -6,6 +6,23 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.5-rc.3] - 2026-06-30
+
+### Added
+
+- **Surface → bare-repo registry + declared-surface gate** — Phase 1 of the [Surface Git Transport](https://parachute.computer/design/2026-06-30-surface-git-transport/). New `POST/GET /admin/surfaces` endpoint (operator-authed on `parachute:host:admin`) lets surface-host register a surface it discovered from a vault `#surface` note; registering provisions the bare repo and records the `name → repo` mapping (`git-registry.ts`, persisted at `<hub>/git/registry.json`). The `/git/<name>/*` transport now serves — and only ever provisions a repo for — a **registered** surface: an authed request for an undeclared name 404s (the scope check still runs first, so the registry gate never leaks membership to an unauthorized caller). Already-provisioned Phase 0a bare repos are grandfathered in.
+
+### Changed
+
+- **Bare-repo provisioning is now async** (`Bun.spawn` + `await`, not the event-loop-blocking `spawnSync`) — a slow `git init` on the git-transport path no longer stalls the hub.
+- **Consent screen renders named surface scopes** — `explainScope` resolves `surface:<name>:read` / `surface:<name>:write` to the `surface:read` / `surface:write` labels (parallel to the vault named-verb branch), so `surface:gitcoin-brain:write` shows a real operator-facing label instead of the raw scope string.
+
+## [0.7.5-rc.2] - 2026-06-30
+
+### Added
+
+- **Deploy hand-off notify to surface-host on push** — Phase 0b of the [Surface Git Transport](https://parachute.computer/design/2026-06-30-surface-git-transport/). After a successful `git push` (`receive-pack`), the hub notifies surface-host over HTTP + a hub JWT (mints a short-lived `surface:admin` notify-auth + a `surface:<name>:read` pull token, POSTs `/surface/api/git-pushed`) so the module pulls + sandbox-builds + serves — never a shell-out that builds the pushed tree in the substrate.
+
 ## [0.7.5-rc.1] - 2026-06-30
 
 ### Added

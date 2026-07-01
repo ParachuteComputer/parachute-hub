@@ -342,12 +342,28 @@ export function isRequestableScope(scope: string): boolean {
  */
 const VAULT_VERB_RE = /^vault:[a-zA-Z0-9_*-]+:(read|write|admin)$/;
 
+/**
+ * Named per-surface scopes (`surface:<name>:<verb>` for verb ∈ {read, write}) —
+ * the Surface Git Transport grant shape (Decisions-locked #2: read = clone,
+ * write = push). The 3→2-segment collapse means the hub validates every
+ * `surface:<name>:<verb>` off the declared unnamed `surface:read`/`surface:write`,
+ * so the consent screen must render the named form with the SAME operator-facing
+ * label — else `surface:gitcoin-brain:write` shows raw. Parallel to
+ * `VAULT_VERB_RE`. (No named `admin` form: surface admin is the unnamed,
+ * module-level `surface:admin`.)
+ */
+const SURFACE_VERB_RE = /^surface:[a-zA-Z0-9_*-]+:(read|write)$/;
+
 export function explainScope(scope: string): ScopeExplanation | null {
   const direct = SCOPE_EXPLANATIONS[scope];
   if (direct) return direct;
   if (VAULT_VERB_RE.test(scope)) {
     const verb = scope.split(":")[2] as "read" | "write" | "admin";
     return SCOPE_EXPLANATIONS[`vault:${verb}`] ?? null;
+  }
+  if (SURFACE_VERB_RE.test(scope)) {
+    const verb = scope.split(":")[2] as "read" | "write";
+    return SCOPE_EXPLANATIONS[`surface:${verb}`] ?? null;
   }
   return null;
 }

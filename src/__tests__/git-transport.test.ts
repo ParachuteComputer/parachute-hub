@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ensureSurfaceRepo, isSurfaceRegistered, registerSurface } from "../git-registry.ts";
 import {
   type GitTransportDeps,
   extractToken,
@@ -61,6 +62,11 @@ function deps(h: Harness, extra?: Partial<GitTransportDeps>): GitTransportDeps {
     db: h.db,
     gitRoot: h.gitRoot,
     knownIssuers: () => [ISSUER],
+    // Default: treat every name as declared + provision on demand (the Phase-0a
+    // "feel it" behavior). The declaration-gate tests below override `isDeclared`
+    // or use the real registry.
+    isDeclared: () => true,
+    ensureRepo: (name) => ensureSurfaceRepo(h.gitRoot, name),
     ...extra,
   };
 }
@@ -343,6 +349,176 @@ describe("handleGitTransport — auth gate", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Declaration gate (Phase 1) — provision/serve only a REGISTERED surface
+// ---------------------------------------------------------------------------
+
+describe("handleGitTransport — declaration gate", () => {
+  /** Deps wired to the REAL registry (isSurfaceRegistered + ensureSurfaceRepo). */
+  function regDeps(h: Harness): GitTransportDeps {
+    return deps(h, {
+      isDeclared: (name) => isSurfaceRegistered(h.gitRoot, name),
+      ensureRepo: (name) => ensureSurfaceRepo(h.gitRoot, name),
+    });
+  }
+
+  test("404 for an authed write to an UNdeclared surface (no auto-provision)", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await mint(h, ["surface:foo:write"]);
+      const res = await handleGitTransport(
+        gitReq("/git/foo/info/refs?service=git-receive-pack", {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+        regDeps(h),
+      );
+      // A valid write token for an undeclared name is NOT enough — the registry
+      // gate 404s (indistinguishable from a bad path) and nothing is provisioned.
+      expect(res.status).toBe(404);
+      expect(existsSync(join(h.gitRoot, "foo.git"))).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a declared (registered) surface serves the push advertisement", async () => {
+    const h = await makeHarness();
+    try {
+      // Lifecycle: surface-host registers the discovered `#surface` first.
+      await registerSurface(h.gitRoot, "foo");
+      expect(existsSync(join(h.gitRoot, "foo.git"))).toBe(true);
+      const token = await mint(h, ["surface:foo:write"]);
+      const res = await handleGitTransport(
+        gitReq("/git/foo/info/refs?service=git-receive-pack", {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+        regDeps(h),
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("git-receive-pack-advertisement");
+      await res.text();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("grandfathering: an already-provisioned bare repo counts as declared", async () => {
+    const h = await makeHarness();
+    try {
+      // A Phase-0a repo that exists on disk but has no registry.json entry.
+      await ensureSurfaceRepo(h.gitRoot, "legacy");
+      expect(isSurfaceRegistered(h.gitRoot, "legacy")).toBe(true);
+      const token = await mint(h, ["surface:legacy:read"]);
+      const res = await handleGitTransport(
+        gitReq("/git/legacy/info/refs?service=git-upload-pack", {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+        regDeps(h),
+      );
+      expect(res.status).toBe(200);
+      await res.text();
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("gate runs AFTER auth: no token on an undeclared name still 401 (not 404)", async () => {
+    const h = await makeHarness();
+    try {
+      const res = await handleGitTransport(
+        gitReq("/git/foo/info/refs?service=git-upload-pack"),
+        regDeps(h),
+      );
+      // 401 (not 404) — an unauthenticated probe never learns registry membership.
+      expect(res.status).toBe(401);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("gate runs AFTER scope: wrong-surface token on an undeclared name is 403 (not 404)", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await mint(h, ["surface:other:write"]);
+      const res = await handleGitTransport(
+        gitReq("/git/foo/info/refs?service=git-receive-pack", {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+        regDeps(h),
+      );
+      // 403 (scope) before 404 (registry) — a valid-but-wrong token never learns
+      // membership either.
+      expect(res.status).toBe(403);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Direct transfer POST (no prior info/refs GET) — auth enforced at BOTH points
+// ---------------------------------------------------------------------------
+
+describe("handleGitTransport — direct transfer POST", () => {
+  test("401 on a direct POST to git-receive-pack with no credential", async () => {
+    const h = await makeHarness();
+    try {
+      const res = await handleGitTransport(
+        gitReq("/git/foo/git-receive-pack", {
+          method: "POST",
+          headers: { "content-type": "application/x-git-receive-pack-request" },
+        }),
+        deps(h),
+      );
+      // A client that skips the info/refs GET is still gated at the POST.
+      expect(res.status).toBe(401);
+      expect(res.headers.get("www-authenticate") ?? "").toContain("Bearer");
+      expect(existsSync(join(h.gitRoot, "foo.git"))).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("403 on a direct POST to git-receive-pack with only read scope", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await mint(h, ["surface:foo:read"]);
+      const res = await handleGitTransport(
+        gitReq("/git/foo/git-receive-pack", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/x-git-receive-pack-request",
+          },
+        }),
+        deps(h),
+      );
+      // receive-pack requires write; a read token is refused at the POST itself.
+      expect(res.status).toBe(403);
+      expect(existsSync(join(h.gitRoot, "foo.git"))).toBe(false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("401 on a direct POST to git-upload-pack with no credential", async () => {
+    const h = await makeHarness();
+    try {
+      const res = await handleGitTransport(
+        gitReq("/git/foo/git-upload-pack", {
+          method: "POST",
+          headers: { "content-type": "application/x-git-upload-pack-request" },
+        }),
+        deps(h),
+      );
+      expect(res.status).toBe(401);
+      expect(res.headers.get("www-authenticate") ?? "").toContain("Bearer");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Dispatch wiring through hubFetch
 // ---------------------------------------------------------------------------
 
@@ -425,6 +601,8 @@ describe("git push round-trip", () => {
           db: h.db,
           gitRoot: h.gitRoot,
           knownIssuers: () => [ISSUER],
+          isDeclared: (name) => isSurfaceRegistered(h.gitRoot, name),
+          ensureRepo: (name) => ensureSurfaceRepo(h.gitRoot, name),
           onPushed: (name) => {
             pushedNames.push(name);
             resolvePushed(name);
@@ -434,6 +612,9 @@ describe("git push round-trip", () => {
     const work = mkdtempSync(join(tmpdir(), "phub-git-work-"));
     try {
       const token = await mint(h, ["surface:foo:write"]);
+      // Declare the surface first (the Phase-1 lifecycle: surface-host registers
+      // a discovered `#surface` note before the push) — provisions the bare repo.
+      await registerSurface(h.gitRoot, "foo");
       const base = `http://127.0.0.1:${server.port}`;
 
       // Author a commit in a throwaway working repo.

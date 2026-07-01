@@ -11,10 +11,16 @@
  * versioned, authenticated, file-shaped content movement.
  *
  * What this layer does NOT do (by deliberate trust boundary, §7): it never
- * BUILDS or executes the pushed tree. The hub only receives + stores bytes;
- * the `post-receive` hook here is a Phase-0a placeholder that logs the refs.
- * Building pushed source is surface-host's sandboxed job (Phase 0b) — keeping
- * the RCE surface out of the substrate is the whole point of the split.
+ * BUILDS or executes the pushed tree. The hub only receives + stores bytes; the
+ * `post-receive` hook (written by git-registry.ts) is a placeholder that only
+ * logs the refs — the deploy hand-off is the hub's `onPushed` → HTTP + hub-JWT
+ * notify to surface-host. Building pushed source is surface-host's sandboxed job
+ * — keeping the RCE surface out of the substrate is the whole point of the split.
+ *
+ * Provisioning is gated on DECLARATION (Phase 1, §9/§10): the hub serves — and
+ * ever provisions a repo for — only a REGISTERED surface (`isDeclared`), never
+ * any arbitrary name a write token happens to name. surface-host discovers a
+ * `#surface` note and registers it via `POST /admin/surfaces` (git-registry.ts).
  *
  * The mechanism (grounded in git's smart-HTTP protocol):
  *   1. Discovery `GET /git/<name>/info/refs?service=git-(upload|receive)-pack`
@@ -35,9 +41,7 @@
  *      Never buffers whole packs.
  */
 import type { Database } from "bun:sqlite";
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { SURFACE_NAME_RE } from "./git-registry.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
 
 /** Logger seam — defaults to `console`. */
@@ -50,11 +54,26 @@ export interface GitTransportDeps {
   /** Hub DB handle — for signature/kid lookup + revocation in `validateAccessToken`. */
   db: Database;
   /**
-   * Directory holding the bare repos. Each surface lives at
-   * `<gitRoot>/<name>.git`. Production: `<CONFIG_DIR>/hub/git`. Tests point
-   * this at a tmpdir.
+   * Directory holding the bare repos (`GIT_PROJECT_ROOT` for `http-backend`).
+   * Each surface lives at `<gitRoot>/<name>.git`. Production: `<CONFIG_DIR>/hub/git`.
+   * Tests point this at a tmpdir.
    */
   gitRoot: string;
+  /**
+   * The declaration gate: is `<name>` a REGISTERED surface? Consulted AFTER the
+   * scope check passes — so an unauthorized probe always gets 401/403 and never
+   * learns registry membership; only a caller already holding a valid
+   * `surface:<name>:*` token can distinguish registered (proceeds) from
+   * unregistered (404). Production wires this to `isSurfaceRegistered(gitRoot, …)`
+   * (git-registry.ts), which grandfathers already-provisioned bare repos.
+   */
+  isDeclared: (name: string) => boolean | Promise<boolean>;
+  /**
+   * Idempotently ensure the bare repo for a registered `<name>` exists, returning
+   * its path. Only ever called for a name that passed `isDeclared`. Production
+   * wires this to `ensureSurfaceRepo(gitRoot, …)` (async; the Phase-1 async nit).
+   */
+  ensureRepo: (name: string) => Promise<string>;
   /**
    * The SET of origins this hub legitimately answers on
    * (`buildHubBoundOrigins` — loopback ∪ expose-state ∪ platform ∪ per-request
@@ -88,14 +107,11 @@ export interface GitTransportDeps {
   log?: GitTransportLog;
 }
 
-/**
- * Surface-name charset. Kebab/alnum only — NO slashes or dots, so a parsed
- * name can never escape `gitRoot` via path traversal. A trailing `.git` on the
- * URL segment is stripped before this check (so `/git/foo.git/...` and
- * `/git/foo/...` both resolve to `foo`). Bounded length keeps a hostile name
- * from ballooning a path.
- */
-const SURFACE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+// Surface-name charset (`SURFACE_NAME_RE`, imported from git-registry.ts): the
+// shared kebab/alnum-only allowlist — NO slashes or dots, so a parsed name can
+// never escape `gitRoot` via path traversal. A trailing `.git` on the URL
+// segment is stripped before the check (so `/git/foo.git/...` and `/git/foo/...`
+// both resolve to `foo`).
 
 /** Which authority a request needs, keyed purely off the git service/path. */
 type Access = "read" | "write";
@@ -212,56 +228,6 @@ function forbidden(scope: string): Response {
       "www-authenticate": `Bearer error="insufficient_scope", scope="${scope}"`,
     },
   });
-}
-
-/**
- * Ensure `<gitRoot>/<name>.git` exists as an exportable bare repo, creating it
- * on first authenticated access (Phase 1 will add a real registry; this keeps
- * it simple now). Returns the repo dir. Only ever called AFTER the auth gate
- * passes, so unauthenticated probing can never provision a repo.
- *
- * `http.receivepack = true` is REQUIRED for push: `git http-backend` enables
- * upload-pack from `GIT_HTTP_EXPORT_ALL` alone but refuses receive-pack unless
- * the repo opts in explicitly.
- */
-function ensureBareRepo(gitRoot: string, name: string, log: GitTransportLog): string {
-  const repoDir = join(gitRoot, `${name}.git`);
-  if (existsSync(repoDir)) return repoDir;
-  mkdirSync(gitRoot, { recursive: true });
-  const init = spawnSync("git", ["init", "--bare", repoDir], { encoding: "utf8" });
-  if (init.status !== 0) {
-    throw new Error(`git init --bare failed: ${init.stderr || init.error?.message || "unknown"}`);
-  }
-  const cfg = spawnSync("git", ["-C", repoDir, "config", "http.receivepack", "true"], {
-    encoding: "utf8",
-  });
-  if (cfg.status !== 0) {
-    throw new Error(`git config http.receivepack failed: ${cfg.stderr || "unknown"}`);
-  }
-  writePostReceiveHook(repoDir, name);
-  log.info(`[git-transport] provisioned bare repo for surface "${name}" at ${repoDir}`);
-  return repoDir;
-}
-
-/**
- * Phase-0a placeholder hook: log the received refs (to stdout, relayed to the
- * pusher as `remote:` lines, and appended to `post-receive.log` in the repo
- * dir for verification). Phase 0b replaces the body with an HTTP + hub-JWT
- * notify to surface-host (NEVER a shell-out that builds the pushed tree — §5/§7).
- */
-function writePostReceiveHook(repoDir: string, name: string): void {
-  const hook = `#!/bin/sh
-# Parachute Surface Git Transport — Phase 0a placeholder.
-# Logs received refs only. Phase 0b: notify surface-host over HTTP + a hub JWT
-# (never build the pushed tree in this process — that exec authority belongs to
-# the module's sandbox, not the substrate).
-while read -r oldrev newrev refname; do
-  printf '[parachute] surface %s received %s (%s..%s)\\n' "${name}" "$refname" "$oldrev" "$newrev"
-  printf '%s %s %s\\n' "$oldrev" "$newrev" "$refname" >> post-receive.log
-done
-`;
-  const hookPath = join(repoDir, "hooks", "post-receive");
-  writeFileSync(hookPath, hook, { mode: 0o755 });
 }
 
 /**
@@ -418,9 +384,30 @@ export async function handleGitTransport(req: Request, deps: GitTransportDeps): 
       : scopes.includes(readScope) || scopes.includes(writeScope);
   if (!ok) return forbidden(access === "write" ? writeScope : readScope);
 
-  // --- Provision (first access) + proxy -------------------------------------
+  // --- Declaration gate (AFTER auth, so it never leaks registry membership) --
+  // The scope check above already proved the caller is authorized for this
+  // surface; only now do we consult the registry. An unregistered name 404s
+  // (indistinguishable from a malformed path — we don't reveal which names
+  // exist), which is the Phase-1 tightening: a repo is provisioned/served only
+  // for a DECLARED surface, never any arbitrary name a write token was minted
+  // for. Grandfathering (an already-provisioned bare repo counts as declared)
+  // lives in `isSurfaceRegistered`.
+  let declared: boolean;
   try {
-    ensureBareRepo(deps.gitRoot, name, log);
+    declared = await deps.isDeclared(name);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`[git-transport] declaration check failed for "${name}": ${msg}`);
+    return new Response("internal error: could not resolve surface registry\n", {
+      status: 500,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  }
+  if (!declared) return new Response("not found", { status: 404 });
+
+  // --- Ensure repo (idempotent, async) + proxy ------------------------------
+  try {
+    await deps.ensureRepo(name);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`[git-transport] repo provisioning failed for "${name}": ${msg}`);
