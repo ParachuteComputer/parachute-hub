@@ -187,6 +187,7 @@ import {
 } from "./admin-handlers.ts";
 import { handleHostAdminToken } from "./admin-host-admin-token.ts";
 import { handleModuleToken } from "./admin-module-token.ts";
+import { routeAdminSurfaces } from "./admin-surfaces.ts";
 import { handleVaultAdminToken } from "./admin-vault-admin-token.ts";
 import { handleCreateVault, handleDeleteVault } from "./admin-vaults.ts";
 import { handleApiAccount } from "./api-account-2fa.ts";
@@ -240,6 +241,7 @@ import { applyCorsHeaders, corsPreflightResponse, isCorsAllowedRoute } from "./c
 import { ensureCsrfToken } from "./csrf.ts";
 import { readExposeState } from "./expose-state.ts";
 import { notifySurfacePushed } from "./git-notify.ts";
+import { ensureSurfaceRepo, isSurfaceRegistered } from "./git-registry.ts";
 import { handleGitTransport } from "./git-transport.ts";
 import { HUB_DEFAULT_PORT, HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
 import {
@@ -3792,6 +3794,29 @@ export function hubFetch(
         return new Response("not found", { status: 404 });
       }
 
+      // /admin/surfaces — the surface → bare-repo registry (Surface Git
+      // Transport Phase 1). surface-host discovers a `#surface` note (it reads
+      // the vault) and POSTs here to register it → the hub provisions the bare
+      // repo + records name→repo, which the /git/ endpoint then gates
+      // provisioning on. Operator-authed (parachute:host:admin — the operator
+      // token surface-host already reads). Placed BEFORE the /admin/* SPA
+      // fallback so its POST/GET aren't swallowed by the GET-only shell.
+      if (pathname === "/admin/surfaces") {
+        if (!getDb) return dbNotConfigured();
+        const od = oauthDeps(req);
+        const handled = await routeAdminSurfaces(req, {
+          db: getDb(),
+          gitRoot,
+          issuer: od.issuer,
+          knownIssuers: od.hubBoundOrigins(),
+        });
+        // routeAdminSurfaces returns null ONLY for a non-matching path, which
+        // can't happen inside this exact-match branch — so `handled` is always a
+        // Response here. The guard is a belt: a null would harmlessly fall to the
+        // /admin/* SPA below (which 405s a non-GET).
+        if (handled) return handled;
+      }
+
       // /admin/* SPA mount. All non-SPA admin handlers (host-admin-token,
       // vault-admin-token, login, logout, config, api/auth/*, api/grants,
       // grants/*) ran above and either matched or returned. Anything that
@@ -3827,6 +3852,12 @@ export function hubFetch(
           gitRoot,
           knownIssuers: () => oauthDeps(req).hubBoundOrigins(),
           peerAddr,
+          // Declaration gate (Phase 1): serve/provision ONLY a registered
+          // surface (grandfathering already-provisioned bare repos), never any
+          // arbitrary name a write token happens to carry. surface-host
+          // registers a discovered `#surface` note via /admin/surfaces.
+          isDeclared: (name) => isSurfaceRegistered(gitRoot, name),
+          ensureRepo: (name) => ensureSurfaceRepo(gitRoot, name),
           // Deploy hand-off (Phase 0b §5 step 5): on a successful push, notify
           // the surface module over HTTP + a hub JWT so it pulls + builds +
           // serves. NEVER a shell-out that builds the pushed tree — the hub
