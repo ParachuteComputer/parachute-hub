@@ -68,6 +68,23 @@ export interface GitTransportDeps {
   knownIssuers: () => readonly string[];
   /** Resolved peer address, surfaced to the backend as REMOTE_ADDR. */
   peerAddr?: string | null;
+  /**
+   * Fired AFTER a `git-receive-pack` POST subprocess exits 0 — i.e. a push
+   * landed (the refs are updated + the post-receive hook has run by the time
+   * `http-backend` exits). The deploy hand-off (design §5 step 5): the hub
+   * notifies surface-host over HTTP + a hub JWT, NEVER a shell-out that builds
+   * the pushed tree (that exec authority belongs to the module's sandbox, not
+   * this substrate). Fire-and-forget + best-effort: a notify failure never
+   * affects the push response the client already received. Keyed off the
+   * subprocess exit, not the streamed response, so it observes the true push
+   * outcome. Phase 0b wires this in hub-server.ts; tests inject a spy.
+   *
+   * Precision note: this fires on every SUCCESSFUL receive-pack, not strictly
+   * per ref-update — a no-op re-push (no new objects) still exits 0 and
+   * notifies. surface-host's re-pull→re-build→re-serve is idempotent, so the
+   * worst case is a redundant rebuild of identical bytes.
+   */
+  onPushed?: (name: string) => void | Promise<void>;
   log?: GitTransportLog;
 }
 
@@ -468,6 +485,31 @@ export async function handleGitTransport(req: Request, deps: GitTransportDeps): 
       // stderr drain is best-effort.
     }
   })();
+
+  // Deploy hand-off (§5 step 5). On a SUCCESSFUL push (receive-pack POST exits
+  // 0 → refs updated, post-receive ran), notify the surface module so it pulls
+  // + builds + serves. Fire-and-forget, observed off the subprocess exit (not
+  // the streamed response), and fully decoupled from the client's response:
+  // a notify error is logged, never surfaced to the pusher. The hub NEVER
+  // builds here — `onPushed` only sends an authenticated HTTP notify.
+  if (access === "write" && gitSubpath === "git-receive-pack" && deps.onPushed) {
+    const onPushed = deps.onPushed;
+    void (async () => {
+      let code: number;
+      try {
+        code = await proc.exited;
+      } catch {
+        return; // subprocess vanished — nothing to notify about
+      }
+      if (code !== 0) return;
+      try {
+        await onPushed(name);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`[git-transport] post-push notify failed for "${name}": ${msg}`);
+      }
+    })();
+  }
 
   return cgiResponse(proc.stdout as ReadableStream<Uint8Array>);
 }

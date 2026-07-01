@@ -285,6 +285,27 @@ describe("handleGitTransport — auth gate", () => {
     }
   });
 
+  test("onPushed does NOT fire for a fetch (upload-pack) advertisement", async () => {
+    const h = await makeHarness();
+    let pushed = 0;
+    try {
+      const token = await mint(h, ["surface:foo:read"]);
+      const res = await handleGitTransport(
+        gitReq("/git/foo/info/refs?service=git-upload-pack", {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+        deps(h, { onPushed: () => void pushed++ }),
+      );
+      expect(res.status).toBe(200);
+      await res.text();
+      // Give any (erroneous) background fire a tick to run.
+      await new Promise((r) => setTimeout(r, 50));
+      expect(pushed).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("write ⊇ read: a write token may also fetch", async () => {
     const h = await makeHarness();
     try {
@@ -389,15 +410,26 @@ async function gitAsync(
 describe("git push round-trip", () => {
   test("an authed push lands the ref in the bare repo + fires post-receive", async () => {
     const h = await makeHarness();
+    // Capture the onPushed deploy hand-off. Wire it through the low-level
+    // handler with a live server so we exercise the true subprocess-exit fire.
+    const pushedNames: string[] = [];
+    let resolvePushed: (name: string) => void = () => {};
+    const pushedOnce = new Promise<string>((r) => {
+      resolvePushed = r;
+    });
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
-      fetch: hubFetch(h.dir, {
-        getDb: () => h.db,
-        gitRoot: h.gitRoot,
-        issuer: ISSUER,
-        loopbackPort: 1939,
-      }),
+      fetch: (req) =>
+        handleGitTransport(req, {
+          db: h.db,
+          gitRoot: h.gitRoot,
+          knownIssuers: () => [ISSUER],
+          onPushed: (name) => {
+            pushedNames.push(name);
+            resolvePushed(name);
+          },
+        }),
     });
     const work = mkdtempSync(join(tmpdir(), "phub-git-work-"));
     try {
@@ -441,6 +473,16 @@ describe("git push round-trip", () => {
       const logPath = join(bare, "post-receive.log");
       expect(existsSync(logPath)).toBe(true);
       expect(readFileSync(logPath, "utf8")).toContain("refs/heads/main");
+
+      // The deploy hand-off fired with the surface name (the receive-pack
+      // subprocess exited 0). It's observed off the subprocess, which can lag
+      // the client's push return by a tick — await the signal.
+      const pushedName = await Promise.race([
+        pushedOnce,
+        new Promise<string>((_, rej) => setTimeout(() => rej(new Error("onPushed timeout")), 5000)),
+      ]);
+      expect(pushedName).toBe("foo");
+      expect(pushedNames).toEqual(["foo"]);
     } finally {
       server.stop(true);
       rmSync(work, { recursive: true, force: true });

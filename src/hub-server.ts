@@ -239,6 +239,7 @@ import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "./config.ts";
 import { applyCorsHeaders, corsPreflightResponse, isCorsAllowedRoute } from "./cors.ts";
 import { ensureCsrfToken } from "./csrf.ts";
 import { readExposeState } from "./expose-state.ts";
+import { notifySurfacePushed } from "./git-notify.ts";
 import { handleGitTransport } from "./git-transport.ts";
 import { HUB_DEFAULT_PORT, HUB_SVC, clearHubPort, writeHubPort } from "./hub-control.ts";
 import {
@@ -3819,11 +3820,26 @@ export function hubFetch(
       // sandboxed job, Phase 0b). See src/git-transport.ts.
       if (pathname.startsWith("/git/")) {
         if (!getDb) return new Response("not found", { status: 404 });
+        const db = getDb();
+        const issuer = oauthDeps(req).issuer;
         return handleGitTransport(req, {
-          db: getDb(),
+          db,
           gitRoot,
           knownIssuers: () => oauthDeps(req).hubBoundOrigins(),
           peerAddr,
+          // Deploy hand-off (Phase 0b §5 step 5): on a successful push, notify
+          // the surface module over HTTP + a hub JWT so it pulls + builds +
+          // serves. NEVER a shell-out that builds the pushed tree — the hub
+          // only sends the authenticated signal (git-notify.ts). Fire-and-
+          // forget; a notify failure is logged, never surfaced to the pusher.
+          onPushed: async (name) => {
+            await notifySurfacePushed(name, {
+              db,
+              issuer: issuer ?? `http://127.0.0.1:${loopbackPort ?? 1939}`,
+              resolveModuleOrigin: makeResolveModuleOrigin(manifestPath),
+              cloneBaseOrigin: `http://127.0.0.1:${loopbackPort ?? 1939}`,
+            });
+          },
         });
       }
 
