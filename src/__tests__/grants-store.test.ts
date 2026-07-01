@@ -202,6 +202,19 @@ describe("connectionKey / grantId derivation (idempotency)", () => {
     expect(k1).toBe("service:github");
   });
 
+  test("surface key includes the access verb", () => {
+    expect(connectionKey({ kind: "surface", target: "gitcoin-brain", access: "write" })).toBe(
+      "surface:gitcoin-brain:write",
+    );
+    expect(connectionKey({ kind: "surface", target: "gitcoin-brain", access: "read" })).toBe(
+      "surface:gitcoin-brain:read",
+    );
+    // access defaults to read (matches the vault default); target lowercased for the slug
+    expect(connectionKey({ kind: "surface", target: "Gitcoin-Brain" })).toBe(
+      "surface:gitcoin-brain:read",
+    );
+  });
+
   test("mcp key is the url target", () => {
     expect(connectionKey({ kind: "mcp", target: "https://x.test/mcp" })).toBe(
       "mcp:https://x.test/mcp",
