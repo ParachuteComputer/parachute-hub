@@ -23,7 +23,6 @@
  *     `<hub-origin>/account/2fa` (QR + backup codes).
  */
 
-import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import {
   DEFAULT_REAP_AGE_MS,
@@ -36,11 +35,9 @@ import {
   reapClient,
 } from "../clients.ts";
 import { CONFIG_DIR } from "../config.ts";
-import { readExposeState } from "../expose-state.ts";
 import { listGrantsForUser, revokeGrant } from "../grants.ts";
-import { HUB_DEFAULT_PORT, readHubPort } from "../hub-control.ts";
 import { openHubDb } from "../hub-db.ts";
-import { deriveHubOrigin } from "../hub-origin.ts";
+import { resolveHubIssuer } from "../hub-issuer.ts";
 import { inferAudience } from "../jwt-audience.ts";
 import {
   findTokenRowByJti,
@@ -304,27 +301,6 @@ export interface AuthDeps {
    * for `PARACHUTE_HUB_ORIGIN` so the token's iss matches what services see.
    */
   hubOrigin?: string;
-}
-
-/**
- * Resolve the hub origin used as `iss` for operator tokens. Mirrors
- * lifecycle.resolveHubOrigin's order, but falls back to the canonical
- * loopback (`http://127.0.0.1:1939`) instead of `undefined` — operator
- * tokens MUST carry an issuer, and on first-run before any expose has
- * happened the canonical loopback is what services will validate against.
- */
-function resolveHubIssuer(override: string | undefined, configDir: string): string {
-  if (override) {
-    const fromOverride = deriveHubOrigin({ override });
-    if (fromOverride) return fromOverride;
-  }
-  const state = readExposeState(join(configDir, "expose-state.json"));
-  if (state?.hubOrigin) return state.hubOrigin;
-  const exposeFqdn = state?.canonicalFqdn;
-  return (
-    deriveHubOrigin({ exposeFqdn, hubPort: readHubPort(configDir) }) ??
-    `http://127.0.0.1:${HUB_DEFAULT_PORT}`
-  );
 }
 
 function defaultRotateKey(): { kid: string; createdAt: string } {

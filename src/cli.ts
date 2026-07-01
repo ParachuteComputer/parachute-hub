@@ -1038,6 +1038,12 @@ async function main(argv: string[]): Promise<number> {
       return await mod.hub(rest);
     }
 
+    case "surface": {
+      const mod = await loadCommand("surface", () => import("./commands/surface.ts"));
+      if (!mod) return 1;
+      return await mod.surface(rest);
+    }
+
     case "vault": {
       const mod = await loadCommand("vault", () => import("./commands/vault.ts"));
       if (!mod) return 1;

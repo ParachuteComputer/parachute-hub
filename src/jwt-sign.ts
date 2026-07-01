@@ -179,7 +179,15 @@ export type TokenCreatedVia =
   // Agent-connector grants (Phase 4b-1) — a vault token the hub mints when the
   // operator approves an agent's `vault:<name>:<verb>` connection grant. Stored
   // in the agent-grants store; registered here so revoke can drop it.
-  | "agent_grant";
+  | "agent_grant"
+  // Surface DEPLOY tokens (Surface Git Transport Phase 3a) — a long-lived,
+  // scoped, revocable `surface:<name>:<read|write>` token an operator mints for
+  // an EXTERNAL/remote git client (a `claude -p` agent or any box) to push/pull
+  // a surface's hub-hosted repo. The PAT-equivalent: distinct from `agent_grant`
+  // (in-framework, approval-gated, per-turn-injected) and `cli_mint` (generic),
+  // so `parachute surface token list` can show exactly these. Registered here so
+  // `surface token revoke` (and the revocation list) can drop it.
+  | "surface_token";
 
 export interface SignedRefreshToken {
   /** Opaque token to return to the client. NOT recoverable from the DB. */
