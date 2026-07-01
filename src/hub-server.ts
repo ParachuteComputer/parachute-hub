@@ -3810,6 +3810,10 @@ export function hubFetch(
           issuer: od.issuer,
           knownIssuers: od.hubBoundOrigins(),
         });
+        // routeAdminSurfaces returns null ONLY for a non-matching path, which
+        // can't happen inside this exact-match branch — so `handled` is always a
+        // Response here. The guard is a belt: a null would harmlessly fall to the
+        // /admin/* SPA below (which 405s a non-GET).
         if (handled) return handled;
       }
 

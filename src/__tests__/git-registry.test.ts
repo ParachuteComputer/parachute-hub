@@ -173,6 +173,19 @@ describe("listSurfaces", () => {
       cleanup();
     }
   });
+
+  test("excludes a grandfathered disk-only repo (registry entries only)", async () => {
+    const { gitRoot, cleanup } = tmpGitRoot();
+    try {
+      await registerSurface(gitRoot, "registered");
+      await ensureSurfaceRepo(gitRoot, "grandfathered"); // repo exists, no entry
+      // isSurfaceRegistered grandfathers it (pushable), but listSurfaces does not.
+      expect(isSurfaceRegistered(gitRoot, "grandfathered")).toBe(true);
+      expect(listSurfaces(gitRoot).map((s) => s.name)).toEqual(["registered"]);
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("saveRegistry atomicity", () => {

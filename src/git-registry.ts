@@ -122,7 +122,13 @@ export function isSurfaceRegistered(gitRoot: string, name: string): boolean {
   return existsSync(repoDirFor(gitRoot, name));
 }
 
-/** Every registered surface, sorted by name (for `GET /admin/surfaces`). */
+/**
+ * Every registered surface, sorted by name (for `GET /admin/surfaces`). NOTE:
+ * this lists only registry.json entries — a grandfathered disk-only bare repo (a
+ * Phase-0a auto-provisioned repo with no entry) is still *pushable*
+ * (`isSurfaceRegistered` grandfathers it) but does NOT appear here until
+ * surface-host's next discovery pass re-registers it and writes its entry.
+ */
 export function listSurfaces(gitRoot: string): SurfaceRegistryEntry[] {
   const reg = loadRegistry(gitRoot);
   return Object.values(reg.surfaces).sort((a, b) => a.name.localeCompare(b.name));
