@@ -29,6 +29,8 @@ Usage:
   parachute migrate --to-supervised move a legacy detached install to the managed hub
   parachute migrate [--dry-run]     archive legacy files at ecosystem root
   parachute auth <cmd>              identity (set password, manage 2FA)
+  parachute surface token <cmd>     mint/list/revoke surface deploy tokens
+                                    (a git-native PAT for pushing to a surface)
   parachute hub set-origin <url>    set the canonical public hub origin (OAuth issuer)
                                     — for reverse-proxy / Caddy-direct boxes
   parachute vault <args...>         vault-specific ops (tokens, 2fa, config, init,
@@ -799,5 +801,67 @@ Examples:
   parachute migrate --yes             sweep without prompting
   parachute migrate --to-supervised   move to the supervised (serve-under-manager) model
   parachute migrate --teardown        remove the hub unit (roll back the cutover)
+`;
+}
+
+export function surfaceHelp(): string {
+  return `parachute surface — manage Parachute surfaces (Surface Git Transport)
+
+Usage:
+  parachute surface token mint <name> [--read|--write] [--ttl <dur> | --expires-in <s>] [--json]
+  parachute surface token list [<name>] [--json]
+  parachute surface token revoke <jti>
+
+Deploy tokens — a GitHub-PAT-equivalent, git-native:
+  A surface lives as a git repo the hub authenticates (\`/git/<name>\`). A deploy
+  token lets an EXTERNAL/remote git client — a \`claude -p\` agent, or any machine
+  — push/pull that repo with nothing but a static secret. No browser, no device
+  flow. Mint one, hand it over, and \`git push\` just works.
+
+  The token is scoped to ONE surface + one verb (read xor write), registered, and
+  revocable — so you can list your deploy tokens and kill a leaked one, exactly
+  like managing GitHub PATs. Default lifetime is 90 days (re-mint to renew).
+
+token mint <name>          mint a deploy token for surface <name>.
+  --write                  push access — \`surface:<name>:write\` (DEFAULT; a
+                           deploy token's job is to push). write also allows fetch.
+  --read                   clone/fetch only — \`surface:<name>:read\`.
+  --ttl <dur>              lifetime as a duration (90d / 24h / 30m / 60s).
+                           Default 90d; capped at 365d.
+  --expires-in <seconds>   lifetime in integer seconds (alternative to --ttl).
+  --json                   emit a JSON blob (token + jti + scope + remoteUrl +
+                           the git credential-helper one-liner) for scripted /
+                           agent config. Otherwise the token is printed to stdout
+                           (pipe-safe) and setup guidance to stderr.
+
+token list [<name>]        list deploy tokens (newest first), optionally narrowed
+                           to one surface. Shows jti, surface, access, status
+                           (active / revoked / expired), and expiry. --json for
+                           machine output. Never prints the token bytes.
+
+token revoke <jti>         revoke a deploy token by jti (find it via \`token list\`).
+                           Effective immediately — the git endpoint rejects it on
+                           the next push (per-request revocation check). Idempotent.
+                           Refuses non-deploy-token jtis — use
+                           \`parachute auth revoke-token\` for those.
+
+The remote-client setup (git-native, no \`gh\`, no parachute install needed):
+
+  # on the remote machine:
+  export PARACHUTE_SURFACE_TOKEN=<the-token>
+  git config --global credential.helper \\
+    '!f() { test "$1" = get && printf "username=x-access-token\\npassword=%s\\n" "$PARACHUTE_SURFACE_TOKEN"; }; f'
+  git clone https://<hub-origin>/git/<name> && cd <name>   # edit, then:
+  git push
+
+  \`parachute surface token mint\` prints this with your hub origin filled in.
+  A reusable \`git-credential-parachute\` helper script ships in the hub repo's
+  scripts/ for boxes that prefer a named helper on PATH.
+
+Auth:
+  mint / list / revoke require the on-disk operator token to carry
+  \`parachute:host:auth\` (the \`auth\` or \`admin\` scope-set) — the same gate as
+  \`parachute auth mint-token\`. Run \`parachute auth set-password\` (first run) or
+  \`parachute auth rotate-operator\` if you don't have one.
 `;
 }
