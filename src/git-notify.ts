@@ -49,8 +49,10 @@ const NOTIFY_TTL_SECONDS = 120;
 /**
  * pull-token TTL. Long enough for surface-host to `git clone --depth 1` a
  * source surface right after the notify lands, short enough that a leaked
- * token is near-useless. Well under the registered-mint threshold, so it stays
- * unregistered by design.
+ * token is near-useless. Both TTLs here MUST stay well under the hub's
+ * registered-mint threshold (admin-connections REGISTERED_MINT_TTL_THRESHOLD,
+ * 600s) so these fire-and-forget tokens remain unregistered-by-policy — bumping
+ * either past it without registering them would leak unrevocable tokens.
  */
 const PULL_TTL_SECONDS = 300;
 
