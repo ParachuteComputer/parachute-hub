@@ -1820,8 +1820,46 @@ describe("surface grants (Phase 2)", () => {
     const mat = await json(
       await dispatch(bearerReq("GET", `/admin/grants/${id}/material`, bearer)),
     );
+    expect(mat.remoteUrl).toBe(`${HUB_ORIGIN}/git/gitcoin-brain`);
     const claims = decodeJwt(mat.token as string) as Record<string, unknown>;
     expect(claims.scope).toBe("surface:gitcoin-brain:read");
+  });
+
+  test("a mixed-case surface name is canonicalized to lowercase (scope + remote + idempotency)", async () => {
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "GitCoin-Brain", access: "write" },
+        }),
+      ),
+    );
+    // Stored target is normalized to lowercase, so the minted scope + the /material
+    // remote match a lowercase-registered surface and the agent's echoed-target key
+    // stays consistent (no mixed-case collapse mismatch).
+    expect((created.connection as Record<string, unknown>).target).toBe("gitcoin-brain");
+    // A second PUT with the lowercase twin is the SAME grant (idempotent), not a fork.
+    const twin = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "surfacer",
+          connection: { kind: "surface", target: "gitcoin-brain", access: "write" },
+        }),
+      ),
+    );
+    expect(twin.id).toBe(created.id);
+    expect(readGrants(harness.storePath).filter((r) => r.agent === "surfacer")).toHaveLength(1);
+    // Approve → the minted scope + the /material remote are both lowercase.
+    await dispatch(cookieReq("POST", `/admin/grants/${created.id as string}/approve`, cookie));
+    const mat = await json(
+      await dispatch(bearerReq("GET", `/admin/grants/${created.id as string}/material`, bearer)),
+    );
+    expect(mat.remoteUrl).toBe(`${HUB_ORIGIN}/git/gitcoin-brain`);
+    expect((decodeJwt(mat.token as string) as Record<string, unknown>).scope).toBe(
+      "surface:gitcoin-brain:write",
+    );
   });
 
   test("re-approval revokes the prior minted surface token", async () => {

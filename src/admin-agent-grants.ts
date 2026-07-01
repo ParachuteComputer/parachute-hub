@@ -449,13 +449,20 @@ function parseConnectionSpec(raw: unknown): { spec: ConnectionSpec } | { error: 
     // A surface's hub-hosted git repo (Phase 2). `target` is the surface name —
     // the SAME `SURFACE_NAME_RE` slug the git-transport URL parser + registry
     // enforce (no slashes/dots → no path traversal in the git endpoint), so a
-    // grant can only ever name a well-formed surface. Case is PRESERVED (the
-    // slug is case-sensitive at the transport); connectionKey lowercases only
-    // for the idempotency slug. `access` is `read` (default) or `write`; the
-    // agent always declares the verb explicitly (`surface:<name>:<verb>`).
+    // grant can only ever name a well-formed surface. NORMALIZED to lowercase (the
+    // canonical form): `connectionKey` + `grantId` already lowercase, so the STORED
+    // target, the minted `surface:<name>:<verb>` scope, and the `/git/<name>` remote
+    // must lowercase too — else a mixed-case want (e.g. `GitCoin-Brain`) would collapse
+    // to the same grantId as its lowercase twin but mint a differently-cased scope,
+    // and the agent's status key (from its echoed target) would diverge. Surface names
+    // are lowercase-kebab by convention (surface-host registers them lowercase). The
+    // agent side lowercases at parse too (grants.ts parseSurfaceWant) so both repos'
+    // keys agree. `access` is `read` (default) or `write`; the agent always declares
+    // the verb explicitly (`surface:<name>:<verb>`).
     if (!SURFACE_NAME_RE.test(target)) {
       return { error: `connection.target "${target}" is not a valid surface name` };
     }
+    const name = target.toLowerCase();
     let access: GrantAccess = "read";
     if (c.access !== undefined) {
       if (c.access !== "read" && c.access !== "write") {
@@ -463,7 +470,7 @@ function parseConnectionSpec(raw: unknown): { spec: ConnectionSpec } | { error: 
       }
       access = c.access;
     }
-    return { spec: { kind: "surface", target, access } };
+    return { spec: { kind: "surface", target: name, access } };
   }
 
   // mcp — modeled, not grantable in 4b-1. Accept a URL target; the grant lands
