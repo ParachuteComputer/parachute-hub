@@ -783,6 +783,52 @@ export function wsCapBucketKey(req: Request, peerAddr: string | null): string {
 }
 
 /**
+ * Hop-by-hop headers (RFC 9110 §7.6.1) — connection-scoped, meaningful only
+ * on a single transport hop. An intermediary MUST NOT forward them, and the
+ * hub is exactly such an intermediary between the client and each loopback
+ * module.
+ *
+ * Forwarding a client's `Connection: close` verbatim was the P0 amplifier in
+ * the 2026-07-02 port exhaustion (hub#738): Bun's fetch honors the forwarded
+ * `Connection: close` and opens a FRESH ephemeral socket per proxied request
+ * instead of reusing its per-origin keep-alive pool. A hot client loop then
+ * converts request volume 1:1 into 30s TIME_WAIT entries (macOS: ~16k
+ * ephemeral ports), exhausting the range and taking out all host outbound.
+ * With these stripped, Bun reuses a handful of pooled sockets to each 127.0.0.1
+ * upstream regardless of what the client sends.
+ */
+const HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+] as const;
+
+/**
+ * Delete hop-by-hop headers from an outgoing proxy header bag (mutates in
+ * place). The `Connection` field-value can NAME further headers to drop
+ * (RFC 9110 §7.6.1 — e.g. `Connection: close, X-Custom`), so those tokens are
+ * collected and deleted before the standard set. WebSocket upgrades never
+ * reach the fetch-based proxy (the Bun-native bridge handles them before
+ * dispatch — see `proxyRequest`'s docstring), so dropping `Upgrade`/`Connection`
+ * here only ever touches non-declaring mounts, which see a plain request.
+ */
+export function stripHopByHopHeaders(headers: Headers): void {
+  const connectionValue = headers.get("connection");
+  if (connectionValue) {
+    for (const token of connectionValue.split(",")) {
+      const named = token.trim().toLowerCase();
+      if (named) headers.delete(named);
+    }
+  }
+  for (const name of HOP_BY_HOP_HEADERS) headers.delete(name);
+}
+
+/**
  * Forward a request to a loopback service on `127.0.0.1:<port>`. By default
  * the incoming pathname + query are preserved verbatim; pass `targetPath` to
  * rewrite the path (e.g. when the caller has stripped a mount prefix because
@@ -847,6 +893,12 @@ async function proxyRequest(
   // Host comes from the requester (tailnet FQDN); the loopback target wants
   // its own. Bun's fetch fills it in when omitted.
   headers.delete("host");
+  // Strip hop-by-hop headers before forwarding (RFC 9110 §7.6.1). Critically
+  // this drops a client-supplied `Connection: close`, which Bun's fetch would
+  // otherwise honor by disabling keep-alive and burning a fresh ephemeral
+  // socket per request — the P0 amplifier in hub#738. Bun refills the
+  // connection framing for the upstream hop itself.
+  stripHopByHopHeaders(headers);
   // Force upstreams to reply with uncompressed bodies. The chrome-strip
   // injector (workstream G) buffers + TextDecoders the HTML response to
   // inject the persistent chrome; without this, a gzip- or br-compressed
@@ -887,6 +939,13 @@ async function proxyRequest(
     method: req.method,
     headers,
     redirect: "manual",
+    // Forward the incoming request's abort signal to the upstream hop. When a
+    // client hangs up mid-response, this aborts the loopback fetch so the
+    // upstream stops streaming to a gone client and its socket is released
+    // back to the pool (or closed) instead of running the full body out and
+    // holding the connection — a secondary socket-retention leak alongside the
+    // TIME_WAIT churn (hub#738). `req.signal` is present on Bun.serve requests.
+    signal: req.signal,
   };
   if (req.method !== "GET" && req.method !== "HEAD") {
     init.body = req.body;
@@ -895,6 +954,14 @@ async function proxyRequest(
   try {
     return await fetch(upstream, init);
   } catch (err) {
+    // Client hung up mid-flight: the upstream fetch was aborted via req.signal
+    // (forwarded above), not an upstream failure. The client is gone, so the
+    // response is discarded — don't run the boot-readiness classifier or
+    // render a "module unreachable" page that would misclassify a normal
+    // disconnect. 499 = client closed request (nginx convention).
+    if (req.signal?.aborted) {
+      return new Response(null, { status: 499 });
+    }
     const msg = err instanceof Error ? err.message : String(err);
     // Classify the failure (transient boot-window vs persistent crash) and
     // render either an HTML page or a JSON error per the request's Accept.
