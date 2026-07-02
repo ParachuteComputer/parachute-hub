@@ -15,6 +15,7 @@ import {
   layerOf,
   parseArgs,
   resolveClientIp,
+  stripHopByHopHeaders,
 } from "../hub-server.ts";
 import { setNotesRedirectDisabled } from "../hub-settings.ts";
 import { clearNotesRedirectLogState } from "../notes-redirect.ts";
@@ -5958,6 +5959,153 @@ describe("substrate trust headers — X-Parachute-Layer / X-Parachute-Client-IP 
       expect(body.layer).toBe("tailnet");
     } finally {
       upstream.stop();
+      h.cleanup();
+    }
+  });
+});
+
+describe("stripHopByHopHeaders (hub#738)", () => {
+  test("drops the standard hop-by-hop set", () => {
+    const h = new Headers({
+      connection: "keep-alive",
+      "keep-alive": "timeout=5",
+      "proxy-authorization": "Basic xxx",
+      te: "trailers",
+      "transfer-encoding": "chunked",
+      upgrade: "h2c",
+      authorization: "Bearer keep-me",
+      "content-type": "application/json",
+    });
+    stripHopByHopHeaders(h);
+    expect(h.has("connection")).toBe(false);
+    expect(h.has("keep-alive")).toBe(false);
+    expect(h.has("proxy-authorization")).toBe(false);
+    expect(h.has("te")).toBe(false);
+    expect(h.has("transfer-encoding")).toBe(false);
+    expect(h.has("upgrade")).toBe(false);
+    // End-to-end headers survive.
+    expect(h.get("authorization")).toBe("Bearer keep-me");
+    expect(h.get("content-type")).toBe("application/json");
+  });
+
+  test("drops headers NAMED in the Connection field-value (RFC 9110 §7.6.1)", () => {
+    const h = new Headers({
+      connection: "close, X-Custom-Hop",
+      "x-custom-hop": "should-go",
+      "x-real-header": "should-stay",
+    });
+    stripHopByHopHeaders(h);
+    expect(h.has("connection")).toBe(false);
+    expect(h.has("x-custom-hop")).toBe(false);
+    expect(h.get("x-real-header")).toBe("should-stay");
+  });
+});
+
+describe("proxy upstream keep-alive (hub#738)", () => {
+  const fakeServer = (address: string) => ({ requestIP: () => ({ address }) });
+
+  function writeUpstreamService(h: Harness, port: number): void {
+    writeManifest(
+      {
+        services: [
+          {
+            name: "keepalive-svc",
+            port,
+            paths: ["/keepalive-svc"],
+            health: "/keepalive-svc/health",
+            version: "0.1.0",
+          },
+        ],
+      },
+      h.manifestPath,
+    );
+  }
+
+  test("200 proxied requests reuse a handful of upstream sockets even when the client sends Connection: close", async () => {
+    // Regression for hub#738: the proxy forwarded the client's hop-by-hop
+    // `Connection: close` verbatim, so Bun opened a FRESH ephemeral socket per
+    // proxied request instead of reusing its per-origin pool → 16k+ TIME_WAIT
+    // → host-wide port exhaustion (the 2026-07-02 incident, amplifying an agent
+    // reconciler 401 loop). We count the distinct client (ephemeral) ports the
+    // upstream sees: a working pool reuses one (occasionally a couple); the bug
+    // produced ~N distinct ports.
+    const seenPorts = new Set<number>();
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (r, server) => {
+        const ip = server.requestIP(r);
+        if (ip) seenPorts.add(ip.port);
+        return new Response("unauthorized", { status: 401 }); // the incident's 401 loop
+      },
+    });
+    const h = makeHarness();
+    try {
+      writeUpstreamService(h, upstream.port as number);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const N = 200;
+      for (let i = 0; i < N; i++) {
+        const res = await fetcher(
+          req("/keepalive-svc/x", { headers: { connection: "close" } }),
+          fakeServer("127.0.0.1"),
+        );
+        await res.arrayBuffer(); // fully drain so the socket returns to the pool
+      }
+      expect(seenPorts.size).toBeLessThanOrEqual(8);
+    } finally {
+      upstream.stop(true);
+      h.cleanup();
+    }
+  });
+
+  test("a client hang-up mid-stream aborts the upstream fetch (socket released, not left streaming to nobody)", async () => {
+    // Without forwarding req.signal, an aborted client left the upstream
+    // streaming its whole body to a gone client and holding the socket. We
+    // forward the signal so the upstream is torn down (cancel() fires or the
+    // enqueue loop errors) instead of running to completion.
+    let tornDown = false;
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () =>
+        new Response(
+          new ReadableStream({
+            async start(controller) {
+              try {
+                for (let i = 0; i < 40; i++) {
+                  controller.enqueue(new TextEncoder().encode(`chunk ${i}\n`));
+                  await Bun.sleep(10);
+                }
+                controller.close();
+              } catch {
+                tornDown = true; // enqueue threw after the peer dropped
+              }
+            },
+            cancel() {
+              tornDown = true; // Bun cancelled the source on disconnect
+            },
+          }),
+          { headers: { "content-type": "text/plain" } },
+        ),
+    });
+    const h = makeHarness();
+    try {
+      writeUpstreamService(h, upstream.port as number);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const ac = new AbortController();
+      const res = await fetcher(
+        req("/keepalive-svc/stream", { signal: ac.signal }),
+        fakeServer("127.0.0.1"),
+      );
+      const reader = res.body!.getReader();
+      await reader.read(); // consume one chunk, then hang up
+      ac.abort();
+      // Full stream is 40 * 10ms = 400ms; wait past it. With the signal
+      // forwarded the upstream tears down early; without, it runs to close.
+      await Bun.sleep(700);
+      expect(tornDown).toBe(true);
+    } finally {
+      upstream.stop(true);
       h.cleanup();
     }
   });
