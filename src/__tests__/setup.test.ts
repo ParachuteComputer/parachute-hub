@@ -119,9 +119,12 @@ describe("isOfferable (fresh-install OFFER, 2026-06-25)", () => {
     expect(isOfferable({ short: "agent", installed: false })).toBe(true);
   });
 
-  test("does NOT offer a deprecated module (notes / runner) on a fresh install", () => {
+  test("does NOT offer a deprecated module (notes) on a fresh install", () => {
     expect(isOfferable({ short: "notes", installed: false })).toBe(false);
-    expect(isOfferable({ short: "runner", installed: false })).toBe(false);
+    // runner is stronger than deprecated now: it left the registries entirely
+    // (2026-07-01), so it never reaches the survey → isOfferable never sees
+    // it. (The bare predicate would say true for an unknown short — the OFFER
+    // gate for runner is `knownServices()` no longer containing it.)
   });
 
   test("never offers an already-installed module regardless of tier", () => {
@@ -137,6 +140,9 @@ describe("setup", () => {
       // Pre-seed every first-party shortname so survey returns all-installed.
       // Distinct canonical ports per service — services-manifest.ts now
       // rejects duplicate ports between distinct services (hub#195).
+      // parachute-runner rides along as a LEGACY row (runner left the
+      // registries 2026-07-01): it must neither block the all-installed exit
+      // nor crash the survey.
       const seeds: Array<{ name: string; port: number }> = [
         { name: "parachute-vault", port: 1940 },
         { name: "parachute-notes", port: 1942 },
@@ -175,12 +181,13 @@ describe("setup", () => {
     }
   });
 
-  test("fresh box: the offered 'Available to install' list excludes deprecated notes/runner (2026-06-25)", async () => {
+  test("fresh box: the offered 'Available to install' list excludes deprecated notes + removed runner", async () => {
     const h = makeHarness();
     try {
       // 'all' picks every OFFERED service. With a clean services.json the survey
-      // sees every known short; the offered filter must drop notes + runner
-      // (deprecated) while keeping vault/scribe/surface/agent. Only vault +
+      // sees every known short; the offered filter must drop notes (deprecated,
+      // 2026-06-25) while runner never even reaches the survey (registry
+      // removal, 2026-07-01) — keeping vault/scribe/surface/agent. Only vault +
       // scribe have pre-install follow-up prompts (vault name, scribe provider);
       // surface + agent have none — so the scripted answers below are complete.
       const availability = scriptedAvailability([
@@ -221,10 +228,57 @@ describe("setup", () => {
   test("an already-installed deprecated module still shows in 'Already installed' + isn't re-offered (back-compat)", async () => {
     const h = makeHarness();
     try {
-      // Legacy operator with runner (deprecated) on disk. It must surface in the
-      // "Already installed" banner (so they know it's there + can manage it via
-      // `parachute <verb> runner`), and must NOT reappear in the fresh-install
-      // OFFER list.
+      // Legacy operator with notes-daemon (deprecated) on disk. It must surface
+      // in the "Already installed" banner (so they know it's there + can manage
+      // it via `parachute <verb> notes`), and must NOT reappear in the
+      // fresh-install OFFER list.
+      upsertService(
+        {
+          name: "parachute-notes",
+          version: "0.3.15",
+          port: 1942,
+          paths: ["/notes"],
+          health: "/notes/health",
+        },
+        h.manifestPath,
+      );
+      const availability = scriptedAvailability([
+        "surface", // pick a still-offered module
+      ]);
+      const code = await setup({
+        manifestPath: h.manifestPath,
+        configDir: h.configDir,
+        log: (l) => h.logs.push(l),
+        availability,
+        installFn: async (short, opts) => {
+          h.calls.push({ short, opts });
+          return 0;
+        },
+      });
+      expect(code).toBe(0);
+      const joined = h.logs.join("\n");
+      // Banner lists notes as already installed…
+      const installedBlock = joined.slice(
+        joined.indexOf("Already installed:"),
+        joined.indexOf("Available to install:"),
+      );
+      expect(installedBlock).toMatch(/\bnotes\b/);
+      // …but notes is NOT in the fresh-install offer.
+      const availableBlock = joined.slice(joined.indexOf("Available to install:"));
+      expect(availableBlock).not.toMatch(/\bnotes\b/);
+      expect(h.calls.map((c) => c.short)).not.toContain("notes");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a LEGACY parachute-runner row doesn't break setup and is never offered (registry removal 2026-07-01)", async () => {
+    const h = makeHarness();
+    try {
+      // runner left the registries entirely — the survey no longer knows the
+      // short, so the row is simply invisible to setup (not in "Already
+      // installed", not in the offer). The load-bearing assertions: setup
+      // still runs to completion and never tries to install runner.
       upsertService(
         {
           name: "parachute-runner",
@@ -250,16 +304,10 @@ describe("setup", () => {
       });
       expect(code).toBe(0);
       const joined = h.logs.join("\n");
-      // Banner lists runner as already installed…
-      const installedBlock = joined.slice(
-        joined.indexOf("Already installed:"),
-        joined.indexOf("Available to install:"),
-      );
-      expect(installedBlock).toMatch(/\brunner\b/);
-      // …but runner is NOT in the fresh-install offer.
       const availableBlock = joined.slice(joined.indexOf("Available to install:"));
       expect(availableBlock).not.toMatch(/\brunner\b/);
       expect(h.calls.map((c) => c.short)).not.toContain("runner");
+      expect(h.calls.map((c) => c.short)).toContain("surface");
     } finally {
       h.cleanup();
     }

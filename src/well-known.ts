@@ -88,7 +88,7 @@ export interface WellKnownServicesEntry {
    * Sub-units hosted under this module, surfaced as an array (the on-disk
    * shape is a map; the well-known shape is an array so consumers iterate
    * cleanly). Each entry promotes the map key into `name`. Absent on
-   * modules that don't declare `uis` (vault, scribe, notes, runner today).
+   * modules that don't declare `uis` (vault, scribe, notes today).
    * See `UiSubUnit` in services-manifest.ts + parachute-app design doc §12.
    */
   uis?: WellKnownUiSubUnit[];
@@ -318,8 +318,8 @@ export function buildWellKnown(opts: BuildWellKnownOpts): WellKnownDocument {
       // an array of records so JS consumers iterate cleanly without a second
       // Object.entries round-trip. `name` promotes the map key into a field
       // — same convention as `WellKnownVaultEntry`. Absent on the parent
-      // when the entry doesn't declare `uis`, so vault / notes / scribe /
-      // runner rows stay byte-identical to their pre-#313 shape.
+      // when the entry doesn't declare `uis`, so vault / notes / scribe
+      // rows stay byte-identical to their pre-#313 shape.
       //
       // Emitted on every path of a multi-path entry — today only vault has
       // multi-path entries, and vault doesn't declare `uis` yet, so the

@@ -123,7 +123,7 @@ function packageNameFor(entryName: string): string | undefined {
   if (short === undefined) return undefined;
   const fb = FIRST_PARTY_FALLBACKS[short];
   if (fb) return fb.package;
-  // KNOWN_MODULES (vault / scribe / runner — post hub#310 FALLBACK
+  // KNOWN_MODULES (vault / scribe / agent / surface — post hub#310 FALLBACK
   // retirement) carries the package name without an embedded manifest.
   return KNOWN_MODULES[short]?.package;
 }

@@ -65,7 +65,7 @@ export type Runner = (cmd: readonly string[]) => Promise<number>;
  * Rationale: the canonical Render deploy ships the hub container from
  * `main` (which tracks the rc chain per governance rule 2). Without this
  * env var the supervisor's `/admin/modules` install API would still
- * resolve `@latest` for vault / app / scribe / runner — leaving a hub-on-rc
+ * resolve `@latest` for vault / surface / scribe — leaving a hub-on-rc
  * cluster bootstrapping its other modules on stable, which silently
  * fragments the cluster's version axis. Setting `PARACHUTE_INSTALL_CHANNEL=rc`
  * at the platform level cascades the rc-ness across every module install,
@@ -135,6 +135,22 @@ export function resolveInstallChannel(opts: {
 const SERVICE_ALIASES: Record<string, string> = {
   lens: "notes",
   channel: "agent",
+};
+
+/**
+ * Former first-party shorts that were RETIRED from the registries (not
+ * renamed — no alias target). Without this guard the bare short would fall
+ * through resolveInstallTarget's "anything else is npm" arm and `bun add -g`
+ * an UNRELATED npm package that happens to share the name (`runner` is a
+ * real, non-Parachute package on npm). Install refuses with the message
+ * instead.
+ */
+const RETIRED_INSTALL_SHORTS: Record<string, string> = {
+  runner:
+    "parachute-runner was retired from the hub's module registry on 2026-07-01 " +
+    "(the module set of record is vault, hub, agent, scribe, surface). " +
+    "An existing install keeps running under `parachute serve`; to install it anyway, " +
+    "pass the explicit npm package name (@openparachute/runner) or a local checkout path.",
 };
 
 export interface InstallOpts {
@@ -625,7 +641,8 @@ async function readInstalledManifest(
  *   - **fallback**: notes / channel still ship a vendored manifest + extras
  *     in FIRST_PARTY_FALLBACKS. Missing `module.json` is non-fatal — the
  *     embedded manifest carries the install through.
- *   - **known**: vault / scribe / runner have retired their FALLBACK entries.
+ *   - **known**: vault / scribe / agent / surface have retired their FALLBACK
+ *     entries (runner had too, before its 2026-07-01 registry removal).
  *     We know the package + manifestName + imperative extras (init,
  *     postInstallFooter, urlForEntry, hasAuth) but NOT the static manifest;
  *     `module.json` is the contract and a missing one is a hard error,
@@ -671,6 +688,15 @@ function resolveInstallTarget(
   // absolute paths pass through unaltered.
   const aliased = SERVICE_ALIASES[input];
   const candidate = aliased ?? input;
+
+  // Retired shorts refuse BEFORE the npm fallback: `install runner` must not
+  // `bun add -g` npm's unrelated `runner` package. Explicit package names /
+  // paths still pass through the arms below.
+  const retiredMessage = RETIRED_INSTALL_SHORTS[candidate];
+  if (retiredMessage !== undefined) {
+    log(`✗ ${retiredMessage}`);
+    return null;
+  }
 
   const fb = FIRST_PARTY_FALLBACKS[candidate];
   if (fb) {
@@ -943,7 +969,7 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     manifest = installedManifest ?? target.fallback.manifest;
     extras = target.fallback.extras;
   } else if (target.kind === "known-module") {
-    // KNOWN_MODULES shorts (vault / scribe / runner) carry no vendored
+    // KNOWN_MODULES shorts (vault / scribe / agent / surface) carry no vendored
     // manifest (hub#310). The module's own `.parachute/module.json` is the
     // canonical source. When it's unreadable (legacy installs from before
     // module.json shipped, or test fixtures that mock the disk path without

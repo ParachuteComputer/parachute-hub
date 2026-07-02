@@ -143,7 +143,17 @@ export interface GrantRecord {
   readonly approvedAt?: string;
 }
 
+/**
+ * On-disk schema version stamped on every write (2026-07-01). Readers treat a
+ * file WITHOUT a `version` field as v1 — every agent-grants.json written
+ * before this field existed is a v1 file, so absence tolerance is the whole
+ * back-compat story. No migration logic exists today; the field is here so a
+ * FUTURE shape change can branch on it instead of sniffing record shapes.
+ */
+export const GRANTS_FILE_VERSION = 1;
+
 interface GrantsFile {
+  version: number;
   grants: GrantRecord[];
 }
 
@@ -194,7 +204,7 @@ export function grantId(agent: string, spec: ConnectionSpec): string {
 }
 
 function emptyFile(): GrantsFile {
-  return { grants: [] };
+  return { version: GRANTS_FILE_VERSION, grants: [] };
 }
 
 function isConnectionSpec(v: unknown): v is ConnectionSpec {
@@ -221,6 +231,9 @@ export function readGrants(storePath: string): GrantRecord[] {
     return [];
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  // `version` is deliberately NOT validated here: an absent field is a legacy
+  // v1 file (see GRANTS_FILE_VERSION) and there is only one version today.
+  // When v2 lands, this is where the migration branches.
   const arr = (parsed as { grants?: unknown }).grants;
   if (!Array.isArray(arr)) return [];
   // Lenient: drop a malformed row rather than failing the whole read (mirrors
@@ -245,7 +258,7 @@ export function readGrants(storePath: string): GrantRecord[] {
 
 function writeAll(storePath: string, records: GrantRecord[]): void {
   mkdirSync(dirname(storePath), { recursive: true });
-  const file: GrantsFile = { grants: records };
+  const file: GrantsFile = { version: GRANTS_FILE_VERSION, grants: records };
   // 0600 — UNLIKE connections.json, this file holds the granted secrets
   // (minted vault tokens + pasted service creds in `material`). `writeFileSync`'s
   // `mode` applies at CREATE time (passed to open(O_CREAT)), so a fresh file is

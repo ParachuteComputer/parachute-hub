@@ -66,7 +66,7 @@ export interface SetupOpts {
  * Survey row. Pre-install we know manifestName + the optional
  * `urlForEntry` quirk (vault wants `/mcp`, scribe wants the bare port); the
  * full ServiceSpec only exists post-install for KNOWN_MODULES shorts
- * (vault / scribe / runner — hub#310). The survey uses just these two
+ * (vault / scribe / … — hub#310). The survey uses just these two
  * fields, so a minimal shape avoids the spec round-trip pre-install.
  */
 interface ServiceChoice {
@@ -110,17 +110,19 @@ function defaultAvailability(): InteractiveAvailability {
 
 /**
  * Survey ALL known first-party shortnames (vault / notes / scribe / agent /
- * runner / surface) regardless of tier — `installed` is true when the service
+ * surface) regardless of tier — `installed` is true when the service
  * has a row in services.json. The fresh-install OFFER is narrowed downstream
  * by `isOfferable` (drops already-installed + `deprecated`-tier shorts —
- * notes / runner); agent (`experimental`) is flagged exploratory in its blurb
+ * notes); agent (`experimental`) is flagged exploratory in its blurb
  * but stays offered. Surveying everything keeps `installed` detection complete
  * (the "already installed" banner still lists a deprecated module an operator
- * has on disk).
+ * has on disk). A legacy `parachute-runner` row is NOT surveyed (runner left
+ * the registries 2026-07-01 — see the KNOWN_MODULES note in service-spec.ts);
+ * like any unknown row it neither blocks setup nor appears in the offer.
  *
  * The full ServiceSpec is only available pre-install for FIRST_PARTY_FALLBACKS
  * shorts (notes — it carries a vendored manifest). KNOWN_MODULES shorts
- * (vault / scribe / runner / agent / surface) ship `.parachute/module.json`
+ * (vault / scribe / agent / surface) ship `.parachute/module.json`
  * and self-register; pre-install we know manifestName + the urlForEntry quirk
  * from `KNOWN_MODULES[short].extras`, which is all the survey/summary needs.
  */
@@ -157,7 +159,7 @@ function surveyServices(manifestPath: string): ServiceChoice[] {
 /**
  * A surveyed service is OFFERED on a fresh setup iff it is not already
  * installed AND its discovery tier is not `deprecated` (2026-06-25). The
- * deprecated tier (notes-daemon, runner) stays resolvable + manageable for an
+ * deprecated tier (notes-daemon) stays resolvable + manageable for an
  * existing install — it just isn't pushed on a fresh box. `agent`
  * (`experimental`) is still offered. Exported so the setup tests can pin the
  * exclusion directly.
@@ -175,11 +177,10 @@ const BLURBS: Record<string, string> = {
   surface: "Parachute UI host — auto-installs Notes on first boot (the recommended UI path)",
   // `app` is the pre-2026-05-27 name for `surface`; kept for any legacy survey row.
   app: "Parachute UI host — auto-installs Notes on first boot (recommended over notes-daemon)",
-  // notes / runner are `deprecated` (not offered on a fresh setup) — these
-  // blurbs only render if a legacy install surfaces them in the survey.
+  // notes is `deprecated` (not offered on a fresh setup) — this blurb only
+  // renders if a legacy install surfaces it in the survey.
   notes: "Notes PWA — web/mobile UI on top of vault (notes-daemon; superseded by `surface`)",
   scribe: "audio transcription for dictation + recordings",
-  runner: "vault-as-job-substrate — scheduled claude -p against vault job notes",
   agent:
     "(exploratory) chat with your Claude Code sessions — a channel per session (renamed from channel)",
 };

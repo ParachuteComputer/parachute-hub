@@ -34,6 +34,34 @@ describe("install", () => {
     }
   });
 
+  test("refuses `install runner` with a retirement message — never bun-adds npm's unrelated `runner` package (2026-07-01)", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const logs: string[] = [];
+      const code = await install("runner", {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (l) => logs.push(l),
+      });
+      expect(code).toBe(1);
+      // The load-bearing bit: no `bun add -g runner` ever fires. Without the
+      // retired-short guard the bare short falls through the npm arm and
+      // installs an unrelated package that happens to be named `runner`.
+      expect(calls).toEqual([]);
+      expect(logs.join("\n")).toMatch(/retired from the hub's module registry/);
+      expect(logs.join("\n")).toMatch(/@openparachute\/runner/);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("runs bun add -g then init; seeds manifest when service didn't write one", async () => {
     const { path, cleanup } = makeTempPath();
     try {

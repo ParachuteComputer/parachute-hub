@@ -124,7 +124,7 @@ const UI_AUDIENCE_VALUES: readonly UiAudience[] = ["public", "hub-users", "opera
  * one shot without touching its siblings.
  *
  * Backwards-compat: this is purely additive. Modules that don't use `uis`
- * (vault, scribe, notes, runner today) continue to render as flat rows;
+ * (vault, scribe, notes today) continue to render as flat rows;
  * the field is optional throughout the read + write paths.
  */
 export interface UiSubUnit {

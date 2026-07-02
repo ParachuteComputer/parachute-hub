@@ -113,12 +113,22 @@ export interface ConnectionRecord {
   readonly requestedBy?: string;
 }
 
+/**
+ * On-disk schema version stamped on every write (2026-07-01). Readers treat a
+ * file WITHOUT a `version` field as v1 — every connections.json written before
+ * this field existed is a v1 file, so absence tolerance is the whole
+ * back-compat story. No migration logic exists today; the field is here so a
+ * FUTURE shape change can branch on it instead of sniffing record shapes.
+ */
+export const CONNECTIONS_FILE_VERSION = 1;
+
 interface ConnectionsFile {
+  version: number;
   connections: ConnectionRecord[];
 }
 
 function emptyFile(): ConnectionsFile {
-  return { connections: [] };
+  return { version: CONNECTIONS_FILE_VERSION, connections: [] };
 }
 
 /** Read the store. A missing/garbage file reads as empty (fresh hub). */
@@ -136,6 +146,9 @@ export function readConnections(storePath: string): ConnectionRecord[] {
     return [];
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  // `version` is deliberately NOT validated here: an absent field is a legacy
+  // v1 file (see CONNECTIONS_FILE_VERSION) and there is only one version
+  // today. When v2 lands, this is where the migration branches.
   const arr = (parsed as { connections?: unknown }).connections;
   if (!Array.isArray(arr)) return [];
   // Lenient: drop any malformed row rather than failing the whole read, so one
@@ -156,7 +169,7 @@ export function readConnections(storePath: string): ConnectionRecord[] {
 
 function writeAll(storePath: string, records: ConnectionRecord[]): void {
   mkdirSync(dirname(storePath), { recursive: true });
-  const file: ConnectionsFile = { connections: records };
+  const file: ConnectionsFile = { version: CONNECTIONS_FILE_VERSION, connections: records };
   // Written WITHOUT 0o600 because this file holds NO secrets — the provisioned
   // webhook bearer lives only in the vault trigger's row, never here; records
   // carry source/sink/trigger-name metadata only. Consistent with the default

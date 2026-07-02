@@ -218,9 +218,9 @@ describe("parseModulesPath", () => {
       short: "agent",
       rest: "install",
     });
-    // Other known modules (runner / surface) resolve too.
-    expect(parseModulesPath("/api/modules/runner/install")).toEqual({
-      short: "runner",
+    // Other known modules (surface) resolve too.
+    expect(parseModulesPath("/api/modules/surface/install")).toEqual({
+      short: "surface",
       rest: "install",
     });
   });
@@ -231,6 +231,11 @@ describe("parseModulesPath", () => {
     // module-ops switch never acts on them.
     expect(parseModulesPath("/api/modules/hub/install")).toBeUndefined();
     expect(parseModulesPath("/api/modules/random/install")).toBeUndefined();
+    // runner left the registries on 2026-07-01 — module-ops no longer
+    // addresses it by short, same as any third-party module. (A legacy
+    // install still boots under `parachute serve` via its installDir; see
+    // serve-boot tests.)
+    expect(parseModulesPath("/api/modules/runner/install")).toBeUndefined();
   });
 
   test("rejects malformed paths", () => {

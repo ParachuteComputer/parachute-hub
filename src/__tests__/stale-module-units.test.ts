@@ -55,7 +55,7 @@ function joined(calls: string[][]): string[] {
 describe("targetModuleShorts() — known module shorts, never hub/cloudflared", () => {
   test("includes the canonical module shorts and excludes hub", () => {
     const shorts = targetModuleShorts();
-    // The canonical knownServices() set: vault / scribe / runner / surface / notes / channel.
+    // The canonical knownServices() set: vault / scribe / surface / notes / agent.
     expect(shorts).toContain("vault");
     expect(shorts).toContain("scribe");
     expect(shorts).toContain("surface");

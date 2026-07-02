@@ -7,7 +7,7 @@
  *   - 401 when the cookie names a deleted session.
  *   - 405 on POST.
  *   - 200 + JWT carrying `aud: "<short>"` and `<short>:admin` for known modules
- *     (scribe / runner / surface).
+ *     (scribe / surface / agent).
  *   - 400 for `vault` (per-instance — points at /admin/vault-admin-token/<name>).
  *   - 404 for an unknown short.
  *   - First-admin gate: 403 for a signed-in non-first-admin (friend).
@@ -111,8 +111,10 @@ describe("handleModuleToken", () => {
   });
 
   // The known single-audience modules the generic mint serves. Each gets
-  // `<short>:admin` with `aud: <short>`.
-  for (const short of ["scribe", "runner", "surface", "agent"]) {
+  // `<short>:admin` with `aud: <short>`. (runner left this set with its
+  // 2026-07-01 registry removal — a LEGACY install still mints via the
+  // self-registration gate, pinned below.)
+  for (const short of ["scribe", "surface", "agent"]) {
     test(`200 mints a JWT carrying aud:${short} + ${short}:admin`, async () => {
       const { cookie, userId } = await withSession();
       rotateSigningKey(harness.db);
@@ -200,6 +202,41 @@ describe("handleModuleToken", () => {
     );
     return dir;
   }
+
+  test("200 mints for a LEGACY runner install via the self-registration gate (registry removal 2026-07-01)", async () => {
+    // runner is no longer a known short, so path 2 (bootstrap registry) is
+    // gone — but an existing install that self-registered (row + module.json)
+    // keeps minting `runner:admin` through path 1, exactly like a third-party
+    // module. Its config UI keeps working post-removal.
+    const { cookie } = await withSession();
+    rotateSigningKey(harness.db);
+    const installDir = writeManifestDir("parachute-runner");
+    try {
+      const services: ServiceEntry[] = [
+        {
+          name: "parachute-runner",
+          port: 1945,
+          paths: ["/runner"],
+          health: "/runner/healthz",
+          version: "0.2.0",
+          installDir,
+        },
+      ];
+      // The row matches by its literal services.json name (the third-party
+      // convention) — `runner` the bare short no longer resolves anywhere.
+      const req = new Request(urlFor("parachute-runner"), { headers: { cookie } });
+      const res = await handleModuleToken(req, "parachute-runner", depsWith(services));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { scopes: string[] };
+      expect(body.scopes).toEqual(["parachute-runner:admin"]);
+      // The bare `runner` short 404s — nothing known + no row named "runner".
+      const bareReq = new Request(urlFor("runner"), { headers: { cookie } });
+      const bareRes = await handleModuleToken(bareReq, "runner", depsWith(services));
+      expect(bareRes.status).toBe(404);
+    } finally {
+      rmSync(installDir, { recursive: true, force: true });
+    }
+  });
 
   test("200 mints for a self-registered third-party module (row + readable module.json)", async () => {
     const { cookie, userId } = await withSession();

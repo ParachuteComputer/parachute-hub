@@ -333,6 +333,66 @@ describe("bootSupervisedModules", () => {
     expect(recorder.calls).toEqual([]);
     expect(logs.some((l) => l.includes("no startCmd resolvable"))).toBe(true);
   });
+
+  test("a LEGACY parachute-runner row boots gracefully post-registry-removal (2026-07-01)", async () => {
+    // runner left the bootstrap registries (decision: Aaron 2026-07-01 — the
+    // module set of record is vault / hub / agent / scribe / surface). An
+    // existing operator's services.json still carries the row, and it must
+    // take the unknown/third-party path, never crash the boot sweep:
+    //   - with installDir + module.json → spawned via the module's own
+    //     declared startCmd (third-party convention);
+    //   - without installDir → logged + skipped (`no-spec`).
+    const installDir = join(h.dir, "runner-install");
+    mkdirSync(join(installDir, ".parachute"), { recursive: true });
+    writeFileSync(
+      join(installDir, ".parachute", "module.json"),
+      JSON.stringify({
+        name: "runner",
+        manifestName: "parachute-runner",
+        port: 1945,
+        paths: ["/runner", "/.parachute"],
+        health: "/runner/healthz",
+        startCmd: ["parachute-runner", "serve"],
+      }),
+    );
+    const withInstallDir: ServiceEntry = {
+      name: "parachute-runner",
+      port: 1945,
+      paths: ["/runner", "/.parachute"],
+      health: "/runner/healthz",
+      version: "0.2.0",
+      installDir,
+    };
+    writeManifest({ services: [withInstallDir] }, h.manifestPath);
+    const recorder = makeRecorder();
+    const sup = new Supervisor({ spawnFn: recorder.spawn });
+    const results = await bootSupervisedModules(sup, {
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0]?.status).toBe("started");
+    // The short is the row name now (no registry mapping survives), and the
+    // spawn cmd comes from the module's OWN module.json.
+    expect(results[0]?.short).toBe("parachute-runner");
+    expect(recorder.calls[0]?.cmd).toEqual(["parachute-runner", "serve"]);
+
+    // Same row WITHOUT installDir: skipped with reason, no crash.
+    const { installDir: _drop, ...bare } = withInstallDir;
+    writeManifest({ services: [bare] }, h.manifestPath);
+    const recorder2 = makeRecorder();
+    const sup2 = new Supervisor({ spawnFn: recorder2.spawn });
+    const logs: string[] = [];
+    const results2 = await bootSupervisedModules(sup2, {
+      manifestPath: h.manifestPath,
+      configDir: h.dir,
+      log: (l) => logs.push(l),
+    });
+    expect(results2).toHaveLength(1);
+    expect(results2[0]?.status).toBe("skipped");
+    expect(results2[0]?.reason).toBe("no-spec");
+    expect(recorder2.calls).toEqual([]);
+  });
 });
 
 // agent (then channel)#41 — a transiently-wrong (drifted) services.json port for a

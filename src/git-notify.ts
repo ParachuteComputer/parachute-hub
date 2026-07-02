@@ -31,6 +31,7 @@
  * validates when it comes back in over loopback.
  */
 import type { Database } from "bun:sqlite";
+import { REGISTERED_MINT_TTL_THRESHOLD_SECONDS } from "./admin-connections.ts";
 import { signAccessToken } from "./jwt-sign.ts";
 
 /** Provenance identity stamped on the hub-internal notify + pull tokens. */
@@ -43,18 +44,46 @@ const SURFACE_AUDIENCE = "surface";
 /**
  * notify-auth TTL. The POST is fired immediately; a small window covers a
  * momentarily-busy loopback without leaving a usable credential lying around.
+ *
+ * Exported for the TTL-policy guard test only.
  */
-const NOTIFY_TTL_SECONDS = 120;
+export const NOTIFY_TTL_SECONDS = 120;
 
 /**
  * pull-token TTL. Long enough for surface-host to `git clone --depth 1` a
  * source surface right after the notify lands, short enough that a leaked
  * token is near-useless. Both TTLs here MUST stay well under the hub's
- * registered-mint threshold (admin-connections REGISTERED_MINT_TTL_THRESHOLD,
- * 600s) so these fire-and-forget tokens remain unregistered-by-policy — bumping
- * either past it without registering them would leak unrevocable tokens.
+ * registered-mint threshold (`REGISTERED_MINT_TTL_THRESHOLD_SECONDS`, 600s —
+ * imported from admin-connections.ts, where the policy lives) so these
+ * fire-and-forget tokens remain unregistered-by-policy — bumping either past
+ * it without registering them would leak unrevocable tokens. Enforced by
+ * {@link assertUnregisteredMintTtl} at module load, not just this comment.
+ *
+ * Exported for the TTL-policy guard test only.
  */
-const PULL_TTL_SECONDS = 300;
+export const PULL_TTL_SECONDS = 300;
+
+/**
+ * Registered-mint policy guard (hub-module-boundary charter): a TTL minted
+ * WITHOUT a tokens-table registration must stay strictly under the
+ * registered-mint threshold. Throws at module load when a future edit bumps
+ * one of this file's fire-and-forget TTLs to/past the line — turning a silent
+ * "unrevocable token" policy leak into an immediate boot failure.
+ *
+ * Exported for tests; not for reuse as a general validator (registered mint
+ * sites legitimately exceed the threshold — they register the jti instead).
+ */
+export function assertUnregisteredMintTtl(name: string, ttlSeconds: number): void {
+  if (ttlSeconds >= REGISTERED_MINT_TTL_THRESHOLD_SECONDS) {
+    throw new Error(
+      `git-notify: ${name} (${ttlSeconds}s) must stay under the registered-mint threshold (${REGISTERED_MINT_TTL_THRESHOLD_SECONDS}s). Tokens minted here are fire-and-forget and never registered in the tokens table — at/above the threshold they'd be long-lived AND unrevocable. Either shorten the TTL or register the mint (see admin-connections.ts registered-mint rule).`,
+    );
+  }
+}
+
+// Module-load enforcement of the policy the comments above describe.
+assertUnregisteredMintTtl("NOTIFY_TTL_SECONDS", NOTIFY_TTL_SECONDS);
+assertUnregisteredMintTtl("PULL_TTL_SECONDS", PULL_TTL_SECONDS);
 
 /** Bound the notify HTTP call so a wedged surface-host can't hang the caller. */
 const NOTIFY_FETCH_TIMEOUT_MS = 10_000;

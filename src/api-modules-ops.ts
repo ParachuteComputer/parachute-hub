@@ -354,13 +354,13 @@ async function authorize(req: Request, deps: ApiModulesOpsDeps): Promise<Respons
  * reach the same spec the API handlers use without duplicating the
  * curated-table lookup.
  *
- * Two source paths (post-FALLBACK-retirement: vault/scribe/runner in
+ * Two source paths (post-FALLBACK-retirement: vault/scribe in
  * hub#310, channel in boundary D3):
  *
  *   - **FIRST_PARTY_FALLBACKS** (notes): vendored manifest is
  *     authoritative pre-install — the embedded `manifest.startCmd` /
  *     `manifest.paths` / etc. drive the install + spawn flow.
- *   - **KNOWN_MODULES** (vault / scribe / runner / channel / surface): no
+ *   - **KNOWN_MODULES** (vault / scribe / agent / surface): no
  *     vendored manifest.
  *     Pre-install we know only the npm package + manifestName + canonical
  *     port + imperative `extras` (init, postInstallFooter, urlForEntry,
@@ -831,7 +831,7 @@ export async function runInstall(
     });
   }
 
-  // KNOWN_MODULES shorts (vault / scribe / runner / channel / surface):
+  // KNOWN_MODULES shorts (vault / scribe / agent / surface):
   // module.json is the canonical source for startCmd. Re-resolve the spec
   // from `<installDir>/.parachute/module.json` when installDir is stamped so
   // the module is authoritative for its own spawn cmd. Falls back to the
