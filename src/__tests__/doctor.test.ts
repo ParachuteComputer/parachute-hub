@@ -753,3 +753,134 @@ describe("doctor --fix — canonical-port repair (confirm-gated, idempotent, non
     }
   });
 });
+
+describe("doctor — loopback-hijack check (hub#737)", () => {
+  test("no hub-instance.json → PASS (benign; the Hub check owns 'down') — #717", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      // No instance file seeded, no seams overridden — defaults read the empty
+      // sandbox and short-circuit before any real network/lsof.
+      const { code, checks } = await runDoctor(h, healthyDeps());
+      expect(byName(checks, "loopback-hijack")?.status).toBe("pass");
+      expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("loopback nonce matches ours + single listener → PASS", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readInstanceRecord: () => ({ instance: "n1", pid: 1, port: 1939, startedAt: "" }),
+          probeLoopbackInstance: async () => ({ reachable: true, status: 200, instance: "n1" }),
+          countHubListeners: () => 1,
+        }),
+      );
+      const c = byName(checks, "loopback-hijack");
+      expect(c?.status).toBe("pass");
+      expect(c?.detail).toContain("instance nonce");
+      expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("loopback nonce MISMATCH → FAIL with lsof/orb remediation + incident ref", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readInstanceRecord: () => ({ instance: "ours", pid: 1, port: 1939, startedAt: "" }),
+          probeLoopbackInstance: async () => ({
+            reachable: true,
+            status: 200,
+            instance: "rogue-hub",
+          }),
+          countHubListeners: () => 2,
+        }),
+      );
+      const c = byName(checks, "loopback-hijack");
+      expect(c?.status).toBe("fail");
+      expect(c?.detail).toContain("rogue-hub");
+      expect(c?.detail).toContain("2 listeners");
+      expect(c?.detail).toContain("hub#737");
+      expect(c?.fix).toContain("lsof -nP -iTCP:1939 -sTCP:LISTEN");
+      expect(c?.fix).toContain("orb list");
+      expect(code).toBe(1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("foreign process answering with NO nonce → FAIL (the OrbStack container-hub shape)", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readInstanceRecord: () => ({ instance: "ours", pid: 1, port: 1939, startedAt: "" }),
+          probeLoopbackInstance: async () => ({ reachable: true, status: 200 }),
+          countHubListeners: () => undefined, // lsof indeterminate — still FAILs on the nonce alone
+        }),
+      );
+      const c = byName(checks, "loopback-hijack");
+      expect(c?.status).toBe("fail");
+      expect(c?.detail).toContain("foreign process");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("nonce matches but a SECOND listener exists → WARN (latent shadow, not FAIL)", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { code, checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readInstanceRecord: () => ({ instance: "n1", pid: 1, port: 1939, startedAt: "" }),
+          probeLoopbackInstance: async () => ({ reachable: true, status: 200, instance: "n1" }),
+          countHubListeners: () => 2,
+        }),
+      );
+      const c = byName(checks, "loopback-hijack");
+      expect(c?.status).toBe("warn");
+      expect(c?.detail).toContain("2 listeners");
+      // WARN never fails the exit code.
+      expect(code).toBe(0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("record present but loopback unreachable → PASS (defers to the Hub check)", async () => {
+    const h = makeHarness();
+    try {
+      seedCurrentManifest(h.manifestPath);
+      seedOperatorToken(h.configDir);
+      const { checks } = await runDoctor(
+        h,
+        healthyDeps({
+          readInstanceRecord: () => ({ instance: "n1", pid: 1, port: 1939, startedAt: "" }),
+          probeLoopbackInstance: async () => ({ reachable: false }),
+        }),
+      );
+      expect(byName(checks, "loopback-hijack")?.status).toBe("pass");
+    } finally {
+      h.cleanup();
+    }
+  });
+});

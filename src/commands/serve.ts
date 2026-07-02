@@ -36,6 +36,13 @@ import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { readExposeState } from "../expose-state.ts";
 import { createDbHolder, defaultStatInode, startDbPathLivenessTimer } from "../hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import {
+  type HubInstanceRecord,
+  type HubSelfProbe,
+  armHubSelfProbe,
+  generateInstanceNonce,
+  writeHubInstanceFile,
+} from "../hub-instance.ts";
 import { hubFetch } from "../hub-server.ts";
 import { getHubOrigin } from "../hub-settings.ts";
 import { writeHubFile } from "../hub.ts";
@@ -513,6 +520,13 @@ export async function serve(opts: ServeOpts = {}): Promise<{
 
   const supervisor = opts.supervisor ?? new Supervisor();
 
+  // Per-boot instance nonce (hub#737). Minted BEFORE the listener so it can be
+  // threaded into `/health`; written to disk AFTER a successful bind (below) so
+  // a bind failure never leaves a stale identity file. It's the linchpin of
+  // loopback-hijack detection: `/health` echoes it, and external tools compare
+  // the disk copy to what a loopback `/health` actually returns.
+  const instanceNonce = generateInstanceNonce();
+
   // Claim the hub port FIRST — before booting a single supervised module. If
   // another hub/supervisor already owns it, `Bun.serve` throws here and we
   // exit immediately. The prior order (boot modules, *then* bind) let a
@@ -534,6 +548,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
           probeDbPath: () => dbHolder.probePath(),
           issuer,
           loopbackPort: port,
+          instanceNonce,
           supervisor,
         }),
       }),
@@ -542,6 +557,38 @@ export async function serve(opts: ServeOpts = {}): Promise<{
     const conflict = hubPortConflictMessage(err, port);
     if (conflict) throw new Error(conflict);
     throw err;
+  }
+
+  // We own the listener now — record this process's identity on disk (0644) so
+  // `parachute status` / `parachute doctor` can detect a loopback hijack by
+  // comparing this nonce to what a loopback `/health` returns. Best-effort:
+  // a write failure only degrades external detection, never blocks the hub.
+  const instanceRecord: HubInstanceRecord = {
+    instance: instanceNonce,
+    pid: process.pid,
+    port,
+    startedAt: new Date().toISOString(),
+  };
+  writeHubInstanceFile(instanceRecord, { configDir: CONFIG_DIR, log });
+
+  // Arm the loopback self-probe (hub#737): an immediate check right after the
+  // bind catches a hijack that's ALREADY present at boot (the OrbStack VM that
+  // relaunched at reboot and grabbed 127.0.0.1:<port> before us), then a
+  // low-frequency re-probe catches one that appears later. It logs loudly on a
+  // mismatch and records the verdict into hub-instance.json for external tools.
+  // Skipped alongside module boot in tests (`skipModuleBoot`) so the test path
+  // never spawns a real 5-minute timer / loopback fetch.
+  let selfProbe: HubSelfProbe | undefined;
+  if (!opts.skipModuleBoot) {
+    selfProbe = armHubSelfProbe(
+      { port, nonce: instanceNonce, record: instanceRecord, configDir: CONFIG_DIR },
+      { log },
+    );
+    // Fire the startup check without blocking serve's return — a hijack present
+    // at boot surfaces within the probe's bounded timeout, not on the next tick.
+    // `probeOnce` is non-throwing in production, but guard the floating promise
+    // against ever surfacing as an unhandled rejection.
+    void selfProbe.probeOnce().catch(() => {});
   }
 
   log(
@@ -618,6 +665,7 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       for (const state of supervisor.list()) {
         await supervisor.stop(state.short);
       }
+      selfProbe?.stop();
       livenessTimer.stop();
       await server.stop();
       dbHolder.get().close();

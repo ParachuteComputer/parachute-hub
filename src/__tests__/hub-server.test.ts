@@ -140,6 +140,27 @@ describe("hubFetch routing", () => {
     }
   });
 
+  test("/health echoes the instance nonce when set, omits it when absent (hub#737)", async () => {
+    const h = makeHarness();
+    try {
+      // With a nonce threaded in, /health carries it as `instance`.
+      const withNonce = (await (
+        await hubFetch(h.dir, { instanceNonce: "nonce-abc-123" })(req("/health"))
+      ).json()) as { service: string; instance?: string };
+      expect(withNonce.service).toBe("parachute-hub");
+      expect(withNonce.instance).toBe("nonce-abc-123");
+
+      // Without one (DB-less / dev entrypoint), the field is omitted — additive,
+      // so no strict /health consumer breaks.
+      const withoutNonce = (await (await hubFetch(h.dir, {})(req("/health"))).json()) as {
+        instance?: string;
+      };
+      expect(withoutNonce.instance).toBeUndefined();
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("/health surfaces db:error:path-gone when the proactive probe sees a wiped path (#610)", async () => {
     // The ghost-fd lie: SELECT 1 still succeeds against the unlinked inode, so
     // probeDbLiveness alone would report ok. probeDbPath stat()s the PATH and

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { status } from "../commands/status.ts";
+import type { SelfProbeState } from "../hub-instance.ts";
 import type { HubUnitDeps, HubUnitStateResult } from "../hub-unit.ts";
 import {
   type ModuleStatesResult,
@@ -86,6 +87,12 @@ interface SupervisorArmOpts {
    * network; specific tests override to mark a module live.
    */
   probeModuleHealth?: (port: number, health: string) => Promise<boolean>;
+  /**
+   * Loopback-hijack self-probe verdict read off `hub-instance.json` (hub#737).
+   * Defaults to "no verdict on disk" (undefined) so existing tests are
+   * unaffected; the hijack tests inject a `hijacked` / `ok` verdict.
+   */
+  readInstanceState?: (configDir: string) => SelfProbeState | undefined;
 }
 
 /** Drive `status` through the supervisor arm with fully stubbed seams. */
@@ -104,6 +111,7 @@ function supervisorOpts(configDir: string, path: string, o: SupervisorArmOpts) {
         (async () => o.moduleStates ?? { supervisorAvailable: true, modules: [] }),
       probeModuleHealth: o.probeModuleHealth ?? (async () => false),
       openDb: fakeOpenDb as unknown as (configDir: string) => import("bun:sqlite").Database,
+      readInstanceState: o.readInstanceState ?? (() => undefined),
     },
   };
 }
@@ -651,3 +659,77 @@ describe("status — Phase 3c supervisor arm: module rows", () => {
 // manager + supervisor. The supervisor-path readout is exercised throughout the
 // suites above; a box with no hub unit degrades gracefully (manager `no-unit` /
 // `/health` down → inactive rows), which the hub-row + module-row suites cover.
+
+describe("status — loopback-hijack override (hub#737)", () => {
+  test("selfProbe hijacked flips the hub row to failing despite a healthy /health", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const lines: string[] = [];
+      const opts = supervisorOpts(configDir, path, {
+        // The rogue answers /health 200, so the raw liveness probe says healthy —
+        // the on-disk self-probe verdict is what corrects the row.
+        managerState: { state: "active" },
+        hubHealthy: true,
+        moduleStates: { supervisorAvailable: true, modules: [] },
+        readInstanceState: () => ({
+          status: "hijacked",
+          checkedAt: "2026-07-02T00:00:00.000Z",
+          observedInstance: "rogue-hub",
+        }),
+      });
+      const code = await status({ ...opts, print: (l) => lines.push(l) });
+      expect(code).toBe(1);
+      const out = lines.join("\n");
+      const hubLine = lines.find((l) => l.includes("parachute-hub (internal)"));
+      expect(hubLine).toMatch(/\bfailing\b/);
+      expect(out).toContain("LOOPBACK HIJACK on :1939");
+      expect(out).toMatch(/lsof -nP -iTCP:1939 -sTCP:LISTEN/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("selfProbe ok leaves a healthy hub row untouched (active)", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const lines: string[] = [];
+      const opts = supervisorOpts(configDir, path, {
+        managerState: { state: "active" },
+        hubHealthy: true,
+        moduleStates: { supervisorAvailable: true, modules: [] },
+        readInstanceState: () => ({
+          status: "ok",
+          checkedAt: "2026-07-02T00:00:00.000Z",
+        }),
+      });
+      const code = await status({ ...opts, print: (l) => lines.push(l) });
+      expect(code).toBe(0);
+      const hubLine = lines.find((l) => l.includes("parachute-hub (internal)"));
+      expect(hubLine).toMatch(/\bactive\b/);
+      expect(lines.join("\n")).not.toContain("LOOPBACK HIJACK");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("no self-probe verdict on disk → no override (default read returns undefined)", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const lines: string[] = [];
+      // No readInstanceState override + no file on disk → the default reader
+      // returns undefined and the row is unchanged.
+      const code = await status({
+        ...supervisorOpts(configDir, path, {
+          managerState: { state: "active" },
+          hubHealthy: true,
+          moduleStates: { supervisorAvailable: true, modules: [] },
+        }),
+        print: (l) => lines.push(l),
+      });
+      expect(code).toBe(0);
+      expect(lines.join("\n")).not.toContain("LOOPBACK HIJACK");
+    } finally {
+      cleanup();
+    }
+  });
+});

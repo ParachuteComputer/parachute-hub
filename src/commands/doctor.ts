@@ -54,6 +54,13 @@ import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { type ExposeState, readExposeState } from "../expose-state.ts";
 import { HUB_SVC, readHubPort } from "../hub-control.ts";
 import {
+  HIJACK_INCIDENT_REF,
+  type HubInstanceRecord,
+  type LoopbackProbe,
+  probeLoopbackInstance,
+  readHubInstanceFile,
+} from "../hub-instance.ts";
+import {
   HUB_UNIT_DEFAULT_PORT,
   type HubUnitDeps,
   type HubUnitStateResult,
@@ -157,6 +164,25 @@ export interface DoctorDeps {
    * readline; tests inject a canned answer.
    */
   readLine?: (prompt: string) => Promise<string>;
+  /**
+   * Loopback-hijack check (hub#737): read THIS hub's on-disk identity
+   * (`hub-instance.json`, written by the running `serve`). Default
+   * {@link readHubInstanceFile}; tests inject a fixture record (or null).
+   */
+  readInstanceRecord?: (configDir: string) => HubInstanceRecord | null;
+  /**
+   * Loopback-hijack check: probe `127.0.0.1:<port>/health` and read its
+   * `instance`. Default {@link probeLoopbackInstance}; tests inject the
+   * matched / mismatched / unreachable outcomes.
+   */
+  probeLoopbackInstance?: (port: number) => Promise<LoopbackProbe>;
+  /**
+   * Loopback-hijack check: count LISTEN sockets on the hub port (a second
+   * listener is the OrbStack-shadow fingerprint). Default shells `lsof`;
+   * returns `undefined` when it can't determine a count (lsof absent / errored)
+   * so the check degrades to the instance comparison alone. Tests inject a count.
+   */
+  countHubListeners?: (port: number) => number | undefined;
 }
 
 export interface DoctorOpts {
@@ -217,6 +243,33 @@ async function defaultProbePublicHealth(origin: string): Promise<boolean> {
   }
 }
 
+/**
+ * Count LISTEN sockets on `port` via `lsof`. A hijack shows TWO (this hub's
+ * wildcard bind + the shadowing process's specific loopback bind). Bounded +
+ * best-effort: returns `undefined` on any failure (lsof absent, non-zero exit,
+ * unparseable) so the check degrades to the instance-comparison signal alone
+ * rather than false-flagging. Counts DISTINCT pids across the LISTEN rows.
+ */
+function defaultCountHubListeners(port: number): number | undefined {
+  try {
+    const proc = Bun.spawnSync(["lsof", "-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-FpP"], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    // lsof exits non-zero when there are zero matches — that's a real "0", not
+    // an error. Only treat a missing binary (spawn failure) as indeterminate.
+    if (proc.exitCode !== 0 && (proc.stdout?.length ?? 0) === 0) return 0;
+    const text = new TextDecoder().decode(proc.stdout ?? new Uint8Array());
+    const pids = new Set<string>();
+    for (const line of text.split("\n")) {
+      if (line.startsWith("p")) pids.add(line.slice(1));
+    }
+    return pids.size;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Both ends of the pipe must be a TTY for an interactive confirm to make sense. */
 function defaultIsInteractive(): boolean {
   return Boolean(process.stdin.isTTY && process.stdout.isTTY);
@@ -243,6 +296,9 @@ interface ResolvedDeps {
   now: () => Date;
   isInteractive: () => boolean;
   readLine: (prompt: string) => Promise<string>;
+  readInstanceRecord: (configDir: string) => HubInstanceRecord | null;
+  probeLoopbackInstance: (port: number) => Promise<LoopbackProbe>;
+  countHubListeners: (port: number) => number | undefined;
 }
 
 function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
@@ -257,6 +313,9 @@ function resolveDeps(d: DoctorDeps | undefined): ResolvedDeps {
     now: d?.now ?? (() => new Date()),
     isInteractive: d?.isInteractive ?? defaultIsInteractive,
     readLine: d?.readLine ?? defaultReadLine,
+    readInstanceRecord: d?.readInstanceRecord ?? readHubInstanceFile,
+    probeLoopbackInstance: d?.probeLoopbackInstance ?? probeLoopbackInstance,
+    countHubListeners: d?.countHubListeners ?? defaultCountHubListeners,
   };
 }
 
@@ -334,6 +393,110 @@ async function checkHubReachable(configDir: string, deps: ResolvedDeps): Promise
     status: "fail",
     detail: `hub is not running — nothing answered /health on http://127.0.0.1:${port}`,
     fix,
+  };
+}
+
+/**
+ * Loopback-hijack detection (hub#737) — the 2026-07-02 P0's root trigger. This
+ * hub binds `*:<port>` (wildcard); a foreign process that grabs a SPECIFIC
+ * `127.0.0.1:<port>` bind (classically an OrbStack VM auto-forwarding the port)
+ * WINS all loopback traffic, so every module's JWKS/API call silently reaches
+ * the wrong hub. Detection compares THIS hub's on-disk identity nonce
+ * (`hub-instance.json`, written by `serve`) to what a loopback `/health`
+ * actually returns:
+ *   - no instance file → the running hub predates nonce detection, or isn't
+ *     running under `serve` (the Hub check owns "down") → PASS (benign info,
+ *     never a false FAIL per #717).
+ *   - loopback not answering → defer to the Hub check → PASS (info).
+ *   - loopback nonce === ours → loopback reaches THIS hub. A second LISTEN on
+ *     the port (lsof) is a latent shadow → WARN; a single listener → PASS.
+ *   - loopback nonce ≠ ours (or missing) → ACTIVE HIJACK → FAIL with the exact
+ *     lsof/orb remediation + the incident reference. Detect-only (no `--fix`).
+ * Never throws — every read is bounded + degrades to a benign verdict.
+ */
+async function checkLoopbackHijack(configDir: string, deps: ResolvedDeps): Promise<CheckResult> {
+  const port = readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT;
+  const title = `No loopback hijack on :${port}`;
+
+  let record: HubInstanceRecord | null = null;
+  try {
+    record = deps.readInstanceRecord(configDir);
+  } catch {
+    record = null;
+  }
+  if (!record) {
+    return {
+      name: "loopback-hijack",
+      title,
+      status: "pass",
+      detail:
+        "no hub-instance.json — the running hub predates loopback-nonce detection or isn't running under `parachute serve` (see the Hub check)",
+    };
+  }
+
+  let probe: LoopbackProbe;
+  try {
+    probe = await deps.probeLoopbackInstance(port);
+  } catch {
+    probe = { reachable: false };
+  }
+  if (!probe.reachable) {
+    return {
+      name: "loopback-hijack",
+      title,
+      status: "pass",
+      detail: `loopback /health on 127.0.0.1:${port} didn't answer — nothing to compare (the Hub check covers a down hub)`,
+    };
+  }
+
+  // Reachable but a DIFFERENT identity answers → active hijack.
+  if (probe.instance !== record.instance) {
+    let listeners: number | undefined;
+    try {
+      listeners = deps.countHubListeners(port);
+    } catch {
+      listeners = undefined;
+    }
+    const who = probe.instance
+      ? `a different hub (instance ${probe.instance})`
+      : "a foreign process (its /health carries no hub instance nonce)";
+    const listenerNote =
+      listeners !== undefined && listeners > 1
+        ? ` lsof shows ${listeners} listeners on the port.`
+        : "";
+    return {
+      name: "loopback-hijack",
+      title,
+      status: "fail",
+      detail: `loopback 127.0.0.1:${port} is answered by ${who}, NOT this hub (instance ${record.instance}) — module JWKS/API calls are reaching the wrong hub.${listenerNote} Incident: ${HIJACK_INCIDENT_REF}`,
+      fix: `lsof -nP -iTCP:${port} -sTCP:LISTEN  # find the shadow; then \`orb list\` and stop any VM auto-forwarding ${port}`,
+    };
+  }
+
+  // Loopback reaches us. A second listener is a latent shadow that could win the
+  // next reboot — WARN so the operator clears it before it flips to a FAIL.
+  let listeners: number | undefined;
+  try {
+    listeners = deps.countHubListeners(port);
+  } catch {
+    listeners = undefined;
+  }
+  if (listeners !== undefined && listeners > 1) {
+    return {
+      name: "loopback-hijack",
+      title,
+      status: "warn",
+      detail: `loopback reaches this hub, but lsof shows ${listeners} listeners on :${port} — a second bind is a latent shadow that could win loopback after a restart`,
+      fix: `lsof -nP -iTCP:${port} -sTCP:LISTEN  # identify + stop the extra listener (e.g. \`orb list\`)`,
+    };
+  }
+  return {
+    name: "loopback-hijack",
+    title,
+    status: "pass",
+    detail: `loopback 127.0.0.1:${port}/health returns this hub's instance nonce${
+      listeners === 1 ? " (single listener)" : ""
+    }`,
   };
 }
 
@@ -1017,7 +1180,8 @@ async function runChecks(
   const hub = await checkHubReachable(configDir, deps);
   const hubHealthy = hub.status === "pass";
 
-  const [modules, bins, exposure] = await Promise.all([
+  const [hijack, modules, bins, exposure] = await Promise.all([
+    checkLoopbackHijack(configDir, deps),
     checkModulesAlive(manifest, hubHealthy, deps),
     checkModuleBins(manifest, deps),
     checkExposure(configDir, deps),
@@ -1032,7 +1196,7 @@ async function runChecks(
   const add = (group: Group, checks: CheckResult[]) => {
     for (const c of checks) grouped.push({ ...c, group });
   };
-  add("Hub", [hub]);
+  add("Hub", [hub, hijack]);
   add("Modules", [...modules, ...bins]);
   add("Configuration", [manifestCheck, portDrift, operator]);
   add("Migration", migration);
@@ -1208,8 +1372,7 @@ async function fixPortDrift(
   const canonicalByName = new Map(drifted.map((d) => [d.name, d.canonical]));
   const next = {
     services: parsed.services.map((row) => {
-      const canonical =
-        typeof row.name === "string" ? canonicalByName.get(row.name) : undefined;
+      const canonical = typeof row.name === "string" ? canonicalByName.get(row.name) : undefined;
       return canonical === undefined ? row : { ...row, port: canonical };
     }),
   };
