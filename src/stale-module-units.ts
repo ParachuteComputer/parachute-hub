@@ -22,7 +22,7 @@
  * SCOPE + OWNERSHIP SAFETY (the hard constraint): we ONLY ever disable a unit
  * whose name EXACTLY matches `parachute-<short>.service` (systemd) or
  * `computer.parachute.<short>` (launchd) for a KNOWN module short
- * (`knownServices()` — vault / scribe / runner / surface / notes / channel). We
+ * (`knownServices()` — vault / scribe / surface / notes / agent). We
  * NEVER disable an arbitrary or unrecognized unit — an unknown unit is invisible
  * to this sweep by construction (we look up exact names, never enumerate-and-
  * match-loosely). On top of that we EXPLICITLY exclude the units the supervised
@@ -98,7 +98,7 @@ function isProtectedLaunchdLabel(label: string): boolean {
 /**
  * The module shorts whose stale standalone autostart units the sweep targets.
  * Derived from `knownServices()` (the canonical FIRST_PARTY_FALLBACKS +
- * KNOWN_MODULES list — vault / scribe / runner / surface / notes / channel), so
+ * KNOWN_MODULES list — vault / scribe / surface / notes / agent), so
  * a future module is covered automatically. `hub` is deliberately NOT in that
  * list — the hub unit is the supervised model itself; we never disable it. As a
  * defensive double-check we also drop any short whose derived unit name lands in

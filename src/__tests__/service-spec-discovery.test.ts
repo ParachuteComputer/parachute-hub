@@ -6,6 +6,7 @@ import {
   findServiceByShort,
   focusForShort,
   isKnownModuleShort,
+  shortNameForManifest,
 } from "../service-spec.ts";
 
 // 2026-06-09 modular-UI architecture (P2): discovery is driven by the union of
@@ -26,7 +27,7 @@ describe("discoverableShorts", () => {
 
   test("includes agent (the module the whitelist used to hide) + the core set", () => {
     const shorts = discoverableShorts();
-    for (const s of ["vault", "scribe", "surface", "runner", "agent", "notes"]) {
+    for (const s of ["vault", "scribe", "surface", "agent", "notes"]) {
       expect(shorts).toContain(s);
     }
   });
@@ -55,10 +56,8 @@ describe("focusForShort", () => {
     expect(focusForShort("surface")).toBe("core");
     // agent stays a legit experimental preview — still offered on a fresh install.
     expect(focusForShort("agent")).toBe("experimental");
-    // notes (notes-daemon, deprecated 2026-05-22) + runner (per Aaron
-    // 2026-06-25, not for new installs) are `deprecated`: still resolvable +
-    // shown-if-installed, but NOT offered on a fresh setup.
-    expect(focusForShort("runner")).toBe("deprecated");
+    // notes (notes-daemon, deprecated 2026-05-22) is `deprecated`: still
+    // resolvable + shown-if-installed, but NOT offered on a fresh setup.
     expect(focusForShort("notes")).toBe("deprecated");
   });
 
@@ -74,18 +73,42 @@ describe("focusForShort", () => {
   test("deprecated shorts stay resolvable (discoverable) — back-compat for existing installs", () => {
     // The deprecated tier de-emphasizes + drops the fresh-install OFFER; it does
     // NOT remove the short from the resolution surface, so an existing
-    // notes/runner install keeps routing + lifecycle.
+    // notes install keeps routing + lifecycle.
     const shorts = discoverableShorts();
     expect(shorts).toContain("notes");
-    expect(shorts).toContain("runner");
     expect(isKnownModuleShort("notes")).toBe(true);
-    expect(isKnownModuleShort("runner")).toBe(true);
+  });
+});
+
+// Runner registry removal (decision: Aaron 2026-07-01 — the module set of
+// record is vault / hub / agent / scribe / surface). Runner is fully out of
+// the bootstrap registries: not discoverable, not a known short, and its
+// manifest name no longer resolves. It is NOT in RETIRED_MODULES (that would
+// GC a legacy operator's services.json row on load) — an existing install is
+// handled as an unknown/third-party row instead (see serve-boot tests).
+describe("runner registry removal (2026-07-01)", () => {
+  test("runner is no longer a known/discoverable short", () => {
+    expect(isKnownModuleShort("runner")).toBe(false);
+    expect(discoverableShorts()).not.toContain("runner");
+    expect("runner" in KNOWN_MODULES).toBe(false);
+    expect("runner" in FIRST_PARTY_FALLBACKS).toBe(false);
+  });
+
+  test("parachute-runner no longer resolves to a short — legacy rows are third-party-shaped", () => {
+    // Consumers (status / serve-boot / api-modules) fall back to the row's
+    // own name when this returns undefined, which is what keeps an existing
+    // runner install rendering + booting instead of crashing.
+    expect(shortNameForManifest("parachute-runner")).toBeUndefined();
+  });
+
+  test("an unlisted runner short defaults to the experimental tier, like any third-party", () => {
+    expect(focusForShort("runner")).toBe("experimental");
   });
 });
 
 describe("isKnownModuleShort", () => {
   test("true for every known module (the install/config gate)", () => {
-    for (const s of ["vault", "scribe", "surface", "runner", "agent", "notes"]) {
+    for (const s of ["vault", "scribe", "surface", "agent", "notes"]) {
       expect(isKnownModuleShort(s)).toBe(true);
     }
   });

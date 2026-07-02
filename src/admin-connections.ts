@@ -1797,8 +1797,12 @@ function sessionUser(req: Request, deps: ConnectionsDeps): { userId: string } {
  * the rule found this engine minting ~90-day tokens with no registry row — an
  * unrevocable-by-construction credential (`api-revoke-token` 404s unknown
  * jtis; the revocation list only carries registered jtis).
+ *
+ * Exported so other unregistered-by-policy mint sites (git-notify.ts's
+ * fire-and-forget notify/pull tokens) can statically assert their TTLs stay
+ * under this policy line instead of restating `600` in a comment.
  */
-const REGISTERED_MINT_TTL_THRESHOLD_SECONDS = 10 * 60;
+export const REGISTERED_MINT_TTL_THRESHOLD_SECONDS = 10 * 60;
 
 interface MintSpec {
   scopes: string[];

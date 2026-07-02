@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { notifySurfacePushed } from "../git-notify.ts";
+import { REGISTERED_MINT_TTL_THRESHOLD_SECONDS } from "../admin-connections.ts";
+import {
+  NOTIFY_TTL_SECONDS,
+  PULL_TTL_SECONDS,
+  assertUnregisteredMintTtl,
+  notifySurfacePushed,
+} from "../git-notify.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import { validateAccessToken } from "../jwt-sign.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
@@ -36,6 +42,28 @@ function fetchSpy(status = 200, body = '{"ok":true}') {
   }) as unknown as typeof fetch;
   return { impl, calls };
 }
+
+describe("unregistered-mint TTL policy guard", () => {
+  test("the shipped TTLs sit strictly under the registered-mint threshold", () => {
+    // The import of git-notify.ts at the top of this file already ran the
+    // module-load asserts — reaching here means they passed. Pin the values
+    // explicitly too, so a bumped TTL fails with a readable diff.
+    expect(NOTIFY_TTL_SECONDS).toBeLessThan(REGISTERED_MINT_TTL_THRESHOLD_SECONDS);
+    expect(PULL_TTL_SECONDS).toBeLessThan(REGISTERED_MINT_TTL_THRESHOLD_SECONDS);
+  });
+
+  test("the guard throws at/above the threshold and passes just under it", () => {
+    expect(() =>
+      assertUnregisteredMintTtl("PULL_TTL_SECONDS", REGISTERED_MINT_TTL_THRESHOLD_SECONDS),
+    ).toThrow(/registered-mint/);
+    expect(() =>
+      assertUnregisteredMintTtl("PULL_TTL_SECONDS", REGISTERED_MINT_TTL_THRESHOLD_SECONDS + 1),
+    ).toThrow(/PULL_TTL_SECONDS/);
+    expect(() =>
+      assertUnregisteredMintTtl("NOTIFY_TTL_SECONDS", REGISTERED_MINT_TTL_THRESHOLD_SECONDS - 1),
+    ).not.toThrow();
+  });
+});
 
 describe("notifySurfacePushed", () => {
   test("no surface module installed → no-op, no fetch", async () => {

@@ -322,7 +322,7 @@ const NOTES_FALLBACK: FirstPartyFallback = {
  * Indexed by short name (the `parachute install <X>` token).
  *
  * Only notes remains — see the block comment above for the rationale
- * (vault/scribe/runner/agent now self-register and ship their own
+ * (vault/scribe/agent now self-register and ship their own
  * module.json). Other code paths consult both this table AND `KNOWN_MODULES`
  * (which carries the post-self-register-retirement entries) via the helpers
  * in this file (`shortNameForManifest`, `knownServices`, …).
@@ -437,27 +437,17 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
       ],
     },
   },
-  runner: {
-    short: "runner",
-    package: "@openparachute/runner",
-    manifestName: "parachute-runner",
-    canonicalPort: 1945,
-    displayName: "Runner",
-    tagline:
-      "Vault-as-job-substrate engine — spawns claude -p against vault job notes on schedule.",
-    canonicalPaths: ["/runner", "/.parachute"],
-    canonicalHealth: "/runner/healthz",
-    canonicalStripPrefix: false,
-    extras: {
-      // Backward-compat startCmd — same rationale as scribe / vault above.
-      startCmd: () => ["parachute-runner", "serve"],
-      // Runner's HTTP routes (everything past `/healthz`) gate on a
-      // hub-issued JWT carrying `runner:admin` scope (see runner's
-      // `src/auth.ts`). Surfaces in `parachute status` as auth-required by
-      // default, same posture as vault.
-      hasAuth: true,
-    },
-  },
+  // NOTE (2026-07-01): `runner` was REMOVED from this registry (decision:
+  // Aaron 2026-07-01 — the module set of record is vault / hub / agent /
+  // scribe / surface). Runner is no longer offered, installable, or
+  // lifecycle-addressable by short name from the hub's bootstrap registries.
+  // Existing installs stay GRACEFUL: a legacy `parachute-runner` services.json
+  // row is handled exactly like any unknown/third-party row — `parachute
+  // status` renders it (short falls back to the row name), `parachute serve`
+  // boots it via `<installDir>/.parachute/module.json` when installDir is
+  // stamped and logs-and-skips otherwise. Deliberately NOT added to
+  // RETIRED_MODULES: that registry GC-drops rows on load, which would break
+  // routing for operators still running the runner daemon.
   agent: {
     short: "agent",
     package: "@openparachute/agent",
@@ -474,7 +464,7 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
     canonicalStripPrefix: true,
     extras: {
       // Backward-compat startCmd for rows without installDir — same rationale
-      // as scribe / vault / runner. The bare binary IS the daemon (agent's
+      // as scribe / vault. The bare binary IS the daemon (agent's
       // package.json bin maps `parachute-agent` → src/daemon.ts).
       startCmd: () => ["parachute-agent"],
       // Agent gates its endpoints behind hub-issued JWTs (agent:* scopes).
@@ -498,14 +488,14 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
     canonicalHealth: "/surface/healthz",
     canonicalStripPrefix: false,
     extras: {
-      // Backward-compat startCmd — same rationale as scribe / vault / runner
+      // Backward-compat startCmd — same rationale as scribe / vault
       // above. Post-self-register, lifecycle reads module.json's startCmd via
       // `composeKnownModuleSpec` and that path wins.
       startCmd: () => ["parachute-surface", "serve"],
       // Surface's admin + per-UI surfaces gate behind hub-issued JWTs (design
       // doc §6 same-hub auto-trust + scope `surface:admin`). Surfaces in
-      // `parachute status` as auth-required by default, same posture as vault
-      // + runner.
+      // `parachute status` as auth-required by default, same posture as
+      // vault.
       hasAuth: true,
     },
   },
@@ -646,10 +636,11 @@ export function knownServices(): string[] {
  *   - `experimental` — agent (legit preview; still OFFERED on a fresh install)
  *     + any unlisted third-party short.
  *   - `deprecated` — notes (notes-daemon deprecated 2026-05-22; notes-ui moved
- *     into parachute-surface) + runner (per Aaron 2026-06-25: not for new
- *     installs). Still RESOLVABLE (discoverableShorts unchanged) and
- *     SHOWN-IF-INSTALLED so an existing operator can manage/uninstall, but NOT
- *     OFFERED on a fresh setup.
+ *     into parachute-surface). Still RESOLVABLE (discoverableShorts unchanged)
+ *     and SHOWN-IF-INSTALLED so an existing operator can manage/uninstall, but
+ *     NOT OFFERED on a fresh setup. `runner` used to sit here too (deprecated
+ *     2026-06-25) until its full registry removal on 2026-07-01 — see the note
+ *     in KNOWN_MODULES.
  *
  * **Show all installed; never hide** — `focus` groups + labels; the one
  * behavioral lever is the fresh-install OFFER, which drops `deprecated` shorts.
@@ -660,7 +651,6 @@ const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
   hub: "core",
   surface: "core",
   agent: "experimental",
-  runner: "deprecated",
   notes: "deprecated",
 };
 
@@ -671,7 +661,7 @@ const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
  * returns undefined — the Modules screen always has a tier to group by.
  *
  * Tier semantics: `core`/`experimental` are both OFFERED on a fresh install;
- * `deprecated` (notes / runner) is NOT offered on a fresh setup but stays
+ * `deprecated` (notes) is NOT offered on a fresh setup but stays
  * resolvable + shown-if-installed (the `isKnownModuleShort` /
  * `discoverableShorts` resolution surface is unchanged). The fresh-install
  * filters in `setup.ts` + `api-modules.ts` consult this tier to drop
@@ -689,14 +679,16 @@ export function focusForShort(short: string, declared?: ModuleFocus): ModuleFocu
  * `CURATED_MODULES` whitelist (2026-06-09 modular-UI architecture, P2): every
  * module the hub can resolve a package/manifest for is discoverable + installable,
  * regardless of `focus` tier. Deduped, with FIRST_PARTY_FALLBACKS shorts first
- * (notes) then KNOWN_MODULES (vault / scribe / runner / agent / surface).
+ * (notes) then KNOWN_MODULES (vault / scribe / agent / surface).
  *
- * `notes` (and `runner`) are intentionally included — still resolvable
- * (vendored fallback / KNOWN_MODULES) for legacy installs; they surface as
- * `deprecated` (2026-06-25) and aren't OFFERED on a fresh install. The
- * fresh-install OFFER (setup wizard + admin SPA) filters by tier
- * (`focus !== "deprecated"`); `discoverableShorts` itself stays the full
- * resolution surface so existing installs keep working.
+ * `notes` is intentionally included — still resolvable (vendored fallback)
+ * for legacy installs; it surfaces as `deprecated` (2026-06-25) and isn't
+ * OFFERED on a fresh install. The fresh-install OFFER (setup wizard + admin
+ * SPA) filters by tier (`focus !== "deprecated"`); `discoverableShorts`
+ * itself stays the full resolution surface so existing installs keep working.
+ * `runner` is NOT here anymore (registry removal 2026-07-01 — see the
+ * KNOWN_MODULES note); a legacy runner install is handled as an
+ * unknown/third-party row.
  */
 export function discoverableShorts(): string[] {
   const seen = new Set<string>();
@@ -750,7 +742,7 @@ export function canonicalPortForManifest(manifestName: string): number | undefin
  * spec with embedded manifest + extras — the vendored manifest is the
  * source of truth pre-install and the install path preserves it through.
  *
- * KNOWN_MODULES shorts (vault / scribe / runner / agent / surface — post
+ * KNOWN_MODULES shorts (vault / scribe / agent / surface — post
  * FALLBACK retirement) return a **minimal** spec carrying `package`, `manifestName`,
  * and the imperative `extras` fields
  * (`init`, `hasAuth`, `urlForEntry`, `postInstallFooter`). They do NOT carry
@@ -860,7 +852,7 @@ const LEGACY_MANIFEST_ALIASES: Record<string, string> = {
 
 /** Short name for a given manifest name, e.g. `parachute-vault` → `vault`.
  *  Consults both FIRST_PARTY_FALLBACKS (notes) and KNOWN_MODULES
- *  (vault / scribe / runner / agent / surface — post-FALLBACK-retirement).
+ *  (vault / scribe / agent / surface — post-FALLBACK-retirement).
  *  Returns undefined for unknown manifests. */
 export function shortNameForManifest(manifestName: string): string | undefined {
   for (const [short, fb] of Object.entries(FIRST_PARTY_FALLBACKS)) {
@@ -887,7 +879,7 @@ export function shortNameForManifest(manifestName: string): string | undefined {
  * here — `shortNameForManifest` only knows the canonical `parachute-vault`, so
  * `findServiceByShort(services, "vault")` returns undefined even when a vault is
  * installed. Vault rows are resolved by mount path via `findVaultUpstream`; this
- * helper is for single-instance modules (agent / scribe / runner / surface).
+ * helper is for single-instance modules (agent / scribe / surface).
  */
 export function findServiceByShort<T extends { name: string }>(
   services: readonly T[],
@@ -901,7 +893,7 @@ export function findServiceByShort<T extends { name: string }>(
  * manifest data the caller has on hand (typically read from
  * `<installDir>/.parachute/module.json`).
  *
- * Used at install-time and lifecycle-time for vault / scribe / runner —
+ * Used at install-time and lifecycle-time for vault / scribe / surface —
  * where hub no longer vendors the manifest (services.json + module.json
  * are authoritative) but still needs the imperative `extras` bits
  * (`init`, `postInstallFooter`, `urlForEntry`, `hasAuth`) the CLI install

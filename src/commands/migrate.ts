@@ -77,6 +77,11 @@ export const ARCHIVE_PREFIX = ".archive-";
 export function safelistEntries(): Set<string> {
   return new Set<string>([
     ...knownServices(),
+    // `runner` left the registries on 2026-07-01 (module set of record:
+    // vault / hub / agent / scribe / surface) but legacy installs still have
+    // a `~/.parachute/runner/` dir — keep it safelisted so it doesn't count
+    // as unrecognized-root noise in `migrateNotice`.
+    "runner",
     "hub",
     "services.json",
     "expose-state.json",

@@ -4,7 +4,7 @@
  *
  * Why this exists (2026-06-09 modular-UI architecture, P3): modules now own
  * their config/admin UIs and declare `configUiUrl` in `module.json` (scribe
- * `/scribe/admin`, runner `/runner/admin`, surface `/surface/admin/`, …). The
+ * `/scribe/admin`, surface `/surface/admin/`, …). The
  * hub frames/links those surfaces consistently (the Modules page "Configure"
  * action). Each module-owned config UI, served behind the hub proxy to a
  * logged-in portal operator, needs an admin-scoped hub Bearer to call its own
@@ -16,7 +16,7 @@
  *
  * Scope + audience: `<short>:admin`, audience = `<short>` (the bare service
  * prefix). Modules validate the JWT's `aud` against their literal short name
- * (`scribe`, `runner`, `surface`, `agent`) — the same shape `inferAudience`
+ * (`scribe`, `surface`, `agent`) — the same shape `inferAudience`
  * stamps for the public OAuth flow, so a hub-minted and an OAuth-minted admin
  * token are indistinguishable to the module. This mirrors the per-request
  * `<short>:admin` proxy token `api-modules-config.ts` used to mint; the

@@ -7,11 +7,12 @@
  * the lenient-read posture.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type ConnectionSpec,
+  GRANTS_FILE_VERSION,
   type GrantRecord,
   connectionKey,
   getGrant,
@@ -90,6 +91,37 @@ describe("round-trip", () => {
     expect(listGrantsForAgent(storePath, "agentone")).toHaveLength(1);
     expect(listGrantsForAgent(storePath, "AGENTTWO")).toHaveLength(1);
     expect(listGrantsForAgent(storePath, "nope")).toHaveLength(0);
+  });
+});
+
+describe("file versioning (2026-07-01 — future-migration seam)", () => {
+  test("every write stamps version: 1 and a rewrite preserves it", () => {
+    putGrant(storePath, rec());
+    const first = JSON.parse(readFileSync(storePath, "utf8")) as { version?: unknown };
+    expect(first.version).toBe(GRANTS_FILE_VERSION);
+    expect(first.version).toBe(1);
+    // Round-trip through the store API keeps stamping it.
+    putGrant(storePath, rec({ id: "second", agent: "agent2" }));
+    const second = JSON.parse(readFileSync(storePath, "utf8")) as { version?: unknown };
+    expect(second.version).toBe(1);
+    expect(readGrants(storePath)).toHaveLength(2);
+  });
+
+  test("a LEGACY file without version loads fine (treated as v1)", () => {
+    const legacy = rec();
+    writeFileSync(storePath, JSON.stringify({ grants: [legacy] }));
+    const back = readGrants(storePath);
+    expect(back).toHaveLength(1);
+    expect(back[0]).toEqual(legacy);
+    // First write-through upgrades the file to the versioned shape without
+    // losing the legacy record.
+    putGrant(storePath, rec({ id: "new-row", agent: "agent2" }));
+    const upgraded = JSON.parse(readFileSync(storePath, "utf8")) as {
+      version?: unknown;
+      grants: unknown[];
+    };
+    expect(upgraded.version).toBe(1);
+    expect(upgraded.grants).toHaveLength(2);
   });
 });
 

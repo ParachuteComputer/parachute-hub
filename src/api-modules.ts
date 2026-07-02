@@ -18,7 +18,7 @@
  * `focus` ("core" | "experimental" | "deprecated") comes from each module's
  * `module.json` when declared, else `focusForShort`'s default map. The SPA
  * groups core first, de-emphasizes experimental, and de-emphasizes
- * `deprecated` (notes-daemon / runner) further — it NEVER hides an installed
+ * `deprecated` (notes-daemon) further — it NEVER hides an installed
  * module (so an existing operator can still manage / uninstall a deprecated
  * one). This is what makes a running, self-registered module (channel) visible
  * + installable; the old `CURATED_MODULES = ["vault","scribe"]` whitelist made
@@ -67,7 +67,7 @@ import {
 } from "./service-spec.ts";
 // `FIRST_PARTY_FALLBACKS` and `KNOWN_MODULES` are both consulted by
 // `lookupModule` below — the former for notes (vendored manifest still
-// required) and the latter for vault/scribe/runner/agent (post-FALLBACK
+// required) and the latter for vault/scribe/agent/surface (post-FALLBACK
 // retirement, hub#310). The local helper hides the split from the rest of
 // this file. `discoverableShorts` enumerates their UNION — the
 // self-registration-driven discovery surface that replaced the old
@@ -83,7 +83,7 @@ import type { ModuleStartError, ModuleState, Supervisor } from "./supervisor.ts"
 /**
  * Resolve a known module to the display + install bootstrap data the admin SPA
  * renders. Reads from FIRST_PARTY_FALLBACKS (notes) first,
- * KNOWN_MODULES (vault / scribe / runner / channel / surface) second.
+ * KNOWN_MODULES (vault / scribe / agent / surface) second.
  *
  * Returns `undefined` if the short is in neither table — a genuinely
  * third-party module discovered only via services.json / the supervisor. The
@@ -249,10 +249,10 @@ interface ModuleWireShape {
    * Discovery tier (2026-06-09 modular-UI architecture; `deprecated` added
    * 2026-06-25). `core` modules render in the headline group; `experimental`
    * modules render in a de-emphasized "Experimental" group; `deprecated`
-   * modules (notes-daemon / runner) render in a further-de-emphasized
+   * modules (notes-daemon) render in a further-de-emphasized
    * "Deprecated" group — never hidden when installed. Resolved from the
    * module's `module.json` `focus` when declared, else `focusForShort`'s
-   * default map (vault/scribe/hub/surface → core, notes/runner → deprecated,
+   * default map (vault/scribe/hub/surface → core, notes → deprecated,
    * others → experimental).
    */
   focus: ModuleFocus;
@@ -269,7 +269,7 @@ interface ModuleWireShape {
    * The fresh-install OFFER (2026-06-25): whether the hub presents this module
    * in the "available to install fresh" set. `available && focus !==
    * "deprecated"`. The SPA's "Install a module" catalog filters on this so
-   * notes-daemon / runner aren't pushed on a fresh box; an already-installed
+   * notes-daemon isn't pushed on a fresh box; an already-installed
    * deprecated module still surfaces (in the Installed section) for management.
    */
   available_to_install: boolean;
@@ -315,8 +315,8 @@ interface ModuleWireShape {
   install_dir: string | null;
   /**
    * Hierarchical sub-units beneath this module (hub#313). Empty when the
-   * module's services.json row doesn't declare `uis` (vault, scribe, notes,
-   * runner today). Used by parachute-app to surface each hosted UI as its
+   * module's services.json row doesn't declare `uis` (vault, scribe, notes
+   * today). Used by parachute-app to surface each hosted UI as its
    * own discoverable sub-row under the App module. Per parachute-app
    * design doc §12.
    */
@@ -336,8 +336,8 @@ interface ModuleWireShape {
    *      the operator UI (App today).
    *   3. Null when the module hasn't declared either field — the SPA
    *      renders a disabled "Open" tooltip (pointing at Configure when
-   *      `config_ui_url` is set — runner's shape today — or "module
-   *      hasn't shipped an admin UI yet" otherwise).
+   *      `config_ui_url` is set — or "module hasn't shipped an admin UI
+   *      yet" otherwise).
    *
    * Always an absolute path on the hub origin (leading `/`) — the SPA
    * navigates same-origin, no need to worry about cross-origin
@@ -660,7 +660,7 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
   // module's manifest-declared `focus` (when installed + declared) wins; else
   // the `focusForShort` default map. Sort: `core` group first (with the
   // CURATED_MODULES recommended-install order floated to the top of that
-  // group), then `experimental`, then `deprecated` (notes / runner) last — the
+  // group), then `experimental`, then `deprecated` (notes) last — the
   // SPA renders the groups; `focus` never hides an installed module.
   const recommendedOrder = new Map<string, number>(
     (CURATED_MODULES as readonly string[]).map((s, i) => [s, i]),
@@ -684,7 +684,7 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
       // package) is not hub-installable → false.
       available: m !== undefined,
       // Fresh-install OFFER (2026-06-25): installable AND not deprecated. A
-      // deprecated short (notes / runner) stays `available` (re-installable
+      // deprecated short (notes) stays `available` (re-installable
       // for back-compat) but is dropped from the offer set so the SPA's
       // "Install a module" catalog doesn't push it on a fresh box.
       available_to_install: m !== undefined && focus !== "deprecated",
@@ -867,7 +867,7 @@ let warnedLegacyVaultAdminCandidate = false;
  *   - `undefined` candidate → `undefined` (the module didn't declare it).
  *   - Absolute http(s) URL → returned verbatim (off-origin escape hatch).
  *   - Leading-`/` path → ORIGIN-ABSOLUTE, returned verbatim. Single-instance
- *     modules (surface, scribe, runner, agent) declare their full hub-origin
+ *     modules (surface, scribe, agent) declare their full hub-origin
  *     path this way (`/surface/admin/`, `/scribe/admin`, `/agent/admin`);
  *     vault's daemon-level surface is `/vault/admin/`.
  *   - Relative path (no leading slash) → MOUNT-JOINED: the per-instance form

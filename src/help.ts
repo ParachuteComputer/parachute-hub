@@ -103,8 +103,8 @@ Flags:
 Environment:
   PARACHUTE_INSTALL_CHANNEL=rc|latest
                             cluster-wide default channel. Lets a Render deploy
-                            running the hub at \`@rc\` cascade rc to vault / app /
-                            scribe / runner installed via the admin SPA — without
+                            running the hub at \`@rc\` cascade rc to vault / surface /
+                            scribe installed via the admin SPA — without
                             an explicit \`--channel\` per call. Loses to \`--channel\`
                             and \`--tag\`. Defaults to \`latest\` when unset.
 
@@ -144,7 +144,7 @@ What it does:
   Fresh-install front door, one command for both laptops AND remote
   servers (EC2, DigitalOcean, Hetzner, any VPS). The admin SPA already
   walks operators through the rest (install vault, set up the admin
-  user, install scribe / runner / app); this command's only job is to
+  user, install scribe / surface); this command's only job is to
   get you to that wizard.
 
   Idempotent — every re-run is safe:

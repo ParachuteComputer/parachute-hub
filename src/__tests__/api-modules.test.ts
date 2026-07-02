@@ -222,10 +222,11 @@ describe("GET /api/modules", () => {
     // by the UNION of the bootstrap registries (KNOWN_MODULES ∪
     // FIRST_PARTY_FALLBACKS), NOT a curated whitelist. Every known module
     // surfaces — core (vault/scribe/surface) in the headline tier, agent as
-    // `experimental`, and notes/runner as `deprecated` (2026-06-25, still
+    // `experimental`, and notes as `deprecated` (2026-06-25, still
     // resolvable but not offered for fresh installs) — so the agent-not-installed
     // class (running but invisible) can't recur while deprecated modules stop
-    // being pushed on a fresh box.
+    // being pushed on a fresh box. runner left the registries entirely on
+    // 2026-07-01 and must NOT surface on a fresh catalog.
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
@@ -250,31 +251,31 @@ describe("GET /api/modules", () => {
     // ahead of every experimental module, which lead the deprecated ones.
     expect(shorts.indexOf("vault")).toBeLessThan(shorts.indexOf("scribe"));
     expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("agent"));
-    // agent (experimental) sorts ahead of notes/runner (deprecated).
-    expect(shorts.indexOf("agent")).toBeLessThan(shorts.indexOf("runner"));
+    // agent (experimental) sorts ahead of notes (deprecated).
     expect(shorts.indexOf("agent")).toBeLessThan(shorts.indexOf("notes"));
     // Every known module is discoverable — vault/scribe/surface (core),
-    // agent (experimental), notes/runner (deprecated).
-    for (const s of ["vault", "scribe", "surface", "agent", "runner", "notes"]) {
+    // agent (experimental), notes (deprecated). runner is gone (2026-07-01
+    // registry removal) — a fresh box never sees it.
+    for (const s of ["vault", "scribe", "surface", "agent", "notes"]) {
       expect(shorts).toContain(s);
     }
+    expect(shorts).not.toContain("runner");
+    expect(shorts).not.toContain("parachute-runner");
     // Focus tier resolves from the default map.
     const byShort = new Map(body.modules.map((m) => [m.short, m]));
     expect(byShort.get("vault")?.focus).toBe("core");
     expect(byShort.get("scribe")?.focus).toBe("core");
     expect(byShort.get("surface")?.focus).toBe("core");
     expect(byShort.get("agent")?.focus).toBe("experimental");
-    expect(byShort.get("runner")?.focus).toBe("deprecated");
     expect(byShort.get("notes")?.focus).toBe("deprecated");
     // `available` stays true for every known module (re-installable), but the
     // fresh-install OFFER (`available_to_install`) drops the deprecated tier —
-    // notes/runner aren't pushed on a fresh box; agent (experimental) still is.
+    // notes isn't pushed on a fresh box; agent (experimental) still is.
     expect(body.modules.every((m) => m.available)).toBe(true);
     expect(byShort.get("vault")?.available_to_install).toBe(true);
     expect(byShort.get("scribe")?.available_to_install).toBe(true);
     expect(byShort.get("surface")?.available_to_install).toBe(true);
     expect(byShort.get("agent")?.available_to_install).toBe(true);
-    expect(byShort.get("runner")?.available_to_install).toBe(false);
     expect(byShort.get("notes")?.available_to_install).toBe(false);
     expect(body.modules.every((m) => !m.installed)).toBe(true);
     expect(body.modules.every((m) => m.latest_version === "0.9.9")).toBe(true);
@@ -282,11 +283,13 @@ describe("GET /api/modules", () => {
     expect(body.supervisor_available).toBe(false);
   });
 
-  test("an installed deprecated module (runner) still surfaces for management but is not offered for fresh install (2026-06-25)", async () => {
-    // A legacy operator with runner on disk: the row must remain visible
-    // (installed: true) + manageable, in the `deprecated` tier — but
-    // `available_to_install` is false so the SPA's install catalog won't push
-    // it. Mirrors the notes-daemon back-compat posture.
+  test("an installed LEGACY runner row still surfaces as a third-party row post-registry-removal (2026-07-01)", async () => {
+    // A legacy operator with runner on disk: post-removal the row no longer
+    // resolves to a known short, so it surfaces under its own manifest name
+    // (`parachute-runner`) exactly like a third-party module — visible
+    // (installed: true), never offered (`available` false: no install package
+    // known to the hub), and NEVER crashes the catalog. This is the graceful
+    // existing-install posture the removal preserves.
     writeManifest(h.manifestPath, [
       {
         name: "parachute-runner",
@@ -313,13 +316,18 @@ describe("GET /api/modules", () => {
         available_to_install: boolean;
       }>;
     };
-    const runner = body.modules.find((m) => m.short === "runner");
+    // No known short resolves anymore — the row surfaces under its own
+    // manifest name, the third-party fallback convention.
+    expect(body.modules.find((m) => m.short === "runner")).toBeUndefined();
+    const runner = body.modules.find((m) => m.short === "parachute-runner");
     expect(runner).toBeDefined();
     expect(runner?.installed).toBe(true);
     expect(runner?.installed_version).toBe("0.2.0");
-    expect(runner?.focus).toBe("deprecated");
-    // Still hub-installable (re-install path) but NOT offered fresh.
-    expect(runner?.available).toBe(true);
+    // Unlisted shorts default to the experimental tier (no special-casing
+    // survives the removal).
+    expect(runner?.focus).toBe("experimental");
+    // No install package known to the hub → not installable, never offered.
+    expect(runner?.available).toBe(false);
     expect(runner?.available_to_install).toBe(false);
   });
 
