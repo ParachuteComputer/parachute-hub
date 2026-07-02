@@ -690,13 +690,21 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
   // reads `active`), so trust the running serve's own on-disk self-probe verdict
   // instead — read from disk, never over the hijacked loopback. A `hijacked`
   // verdict flips the row to `failing` with the loud, actionable note.
+  //
+  // GATED ON `hubHealthy` (review fix): the instance file is written per-boot
+  // and only cleared on a *graceful* stop, so a hard-killed hub can leave a
+  // stale `hijacked` verdict on disk. `hubHealthy` is true exactly when
+  // SOMETHING is answering the loopback port right now — which is precisely the
+  // live-hijack condition (the rogue keeps answering 200), so gating here never
+  // suppresses a real hijack, but it does keep a stopped hub (nothing answering)
+  // from rendering a phantom hijack over its normal down-hub row.
   let selfProbe: SelfProbeState | undefined;
   try {
     selfProbe = sup.readInstanceState(configDir);
   } catch {
     selfProbe = undefined;
   }
-  if (selfProbe?.status === "hijacked") {
+  if (hubHealthy && selfProbe?.status === "hijacked") {
     hub.stateLabel = "failing";
     hub.healthy = false;
     hub.skipped = false;

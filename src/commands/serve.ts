@@ -40,6 +40,7 @@ import {
   type HubInstanceRecord,
   type HubSelfProbe,
   armHubSelfProbe,
+  clearHubInstanceFile,
   generateInstanceNonce,
   writeHubInstanceFile,
 } from "../hub-instance.ts";
@@ -668,6 +669,9 @@ export async function serve(opts: ServeOpts = {}): Promise<{
       selfProbe?.stop();
       livenessTimer.stop();
       await server.stop();
+      // Clear our on-disk identity so a cleanly-stopped hub leaves no stale
+      // self-probe verdict for `status` / `doctor` to read (hub#737 review).
+      clearHubInstanceFile(CONFIG_DIR);
       dbHolder.get().close();
     },
   };

@@ -8,6 +8,7 @@ import {
   type SelfProbeState,
   armHubSelfProbe,
   classifyLoopback,
+  clearHubInstanceFile,
   generateInstanceNonce,
   hijackAlertMessage,
   hubInstancePath,
@@ -75,6 +76,20 @@ describe("nonce + instance file", () => {
       expect(readHubInstanceFile(configDir)).toBeNull(); // malformed
       writeFileSync(hubInstancePath(configDir), JSON.stringify({ port: 1939 }));
       expect(readHubInstanceFile(configDir)).toBeNull(); // no instance field
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("clearHubInstanceFile removes the file (graceful-shutdown hygiene) + no-ops when absent", () => {
+    const { configDir, cleanup } = makeDir();
+    try {
+      writeHubInstanceFile(record(), { configDir });
+      expect(readHubInstanceFile(configDir)).not.toBeNull();
+      clearHubInstanceFile(configDir);
+      expect(readHubInstanceFile(configDir)).toBeNull();
+      // Idempotent — clearing an already-absent file must not throw.
+      expect(() => clearHubInstanceFile(configDir)).not.toThrow();
     } finally {
       cleanup();
     }

@@ -32,7 +32,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR } from "./config.ts";
 
@@ -91,18 +91,39 @@ export function writeHubInstanceFile(
   opts: { configDir?: string; log?: (line: string) => void } = {},
 ): boolean {
   const path = hubInstancePath(opts.configDir);
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
   try {
     const dir = dirname(path);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
     writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o644 });
     renameSync(tmp, path);
     return true;
   } catch (err) {
+    // Don't leave a half-written tmp behind if the rename (or write) failed.
+    try {
+      if (existsSync(tmp)) rmSync(tmp, { force: true });
+    } catch {
+      // Best-effort cleanup — nothing more we can do.
+    }
     opts.log?.(
       `parachute serve: could not write ${path} (${err instanceof Error ? err.message : String(err)}); loopback-hijack detection for external tools is degraded, hub start continues.`,
     );
     return false;
+  }
+}
+
+/**
+ * Remove the instance file (best-effort). Called on graceful shutdown so a
+ * cleanly-stopped hub doesn't leave a stale identity/self-probe verdict on disk
+ * for `status` / `doctor` to read as a phantom. A hard kill (SIGKILL) can't run
+ * this — the readers additionally gate on live hub liveness, so a leftover file
+ * from a hard kill never surfaces as a false hijack.
+ */
+export function clearHubInstanceFile(configDir: string = CONFIG_DIR): void {
+  try {
+    rmSync(hubInstancePath(configDir), { force: true });
+  } catch {
+    // Best-effort — a missing / unremovable file is not worth surfacing.
   }
 }
 

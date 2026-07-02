@@ -689,6 +689,36 @@ describe("status — loopback-hijack override (hub#737)", () => {
     }
   });
 
+  test("hub down + STALE hijacked verdict on disk → NO phantom hijack, normal down-hub row", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const lines: string[] = [];
+      // A hard-killed hub can leave a stale `hijacked` verdict in hub-instance.json
+      // (it's only cleared on a graceful stop). With nothing answering loopback
+      // (hubHealthy=false), status must render the ordinary down-hub row, not a
+      // phantom LOOPBACK HIJACK warning.
+      const opts = supervisorOpts(configDir, path, {
+        managerState: { state: "inactive" },
+        hubHealthy: false,
+        readInstanceState: () => ({
+          status: "hijacked",
+          checkedAt: "2026-07-02T00:00:00.000Z",
+          observedInstance: "rogue-from-a-past-run",
+        }),
+      });
+      const code = await status({ ...opts, print: (l) => lines.push(l) });
+      const out = lines.join("\n");
+      expect(out).not.toContain("LOOPBACK HIJACK");
+      const hubLine = lines.find((l) => l.includes("parachute-hub (internal)"));
+      expect(hubLine).toMatch(/\binactive\b/);
+      // An inactive hub is `skipped` (expected-stopped), so exit 0 — the point is
+      // simply that no phantom hijack was injected on top of the normal row.
+      expect(code).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("selfProbe ok leaves a healthy hub row untouched (active)", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
