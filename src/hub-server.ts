@@ -1329,6 +1329,17 @@ export interface HubFetchDeps {
    */
   loopbackPort?: number;
   /**
+   * This serve process's per-boot instance nonce (hub#737). When present it's
+   * echoed as `instance` in `/health` so an external reader can tell whether a
+   * loopback `/health` actually reached THIS hub or a foreign process that has
+   * shadowed the port (the OrbStack loopback-hijack class). `serve` mints it,
+   * writes it to `~/.parachute/hub-instance.json`, and threads it here; absent
+   * on the DB-less / test / `bun src/hub-server.ts` paths, where `/health`
+   * simply omits the field (additive — no consumer parses `/health` for
+   * `instance` strictly).
+   */
+  instanceNonce?: string;
+  /**
    * Test seam for reading `expose-state.json`'s `hubOrigin`. Production reads
    * the operator's `~/.parachute/expose-state.json` via `readExposeState`;
    * tests inject a fake to drive tailnet/funnel origins into the bound set
@@ -2381,7 +2392,17 @@ export function hubFetch(
           }
         }
         return new Response(
-          JSON.stringify({ status: "ok", service: "parachute-hub", version: pkg.version, db }),
+          JSON.stringify({
+            status: "ok",
+            service: "parachute-hub",
+            version: pkg.version,
+            db,
+            // Per-boot instance nonce (hub#737): lets an external reader detect a
+            // loopback hijack (foreign process shadowing 127.0.0.1:<port>) by
+            // comparing this to the nonce serve wrote to hub-instance.json.
+            // Omitted when unset (DB-less / test / dev-entrypoint paths).
+            ...(deps?.instanceNonce ? { instance: deps.instanceNonce } : {}),
+          }),
           {
             headers: {
               "content-type": "application/json",

@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { CONFIG_DIR, SERVICES_MANIFEST_PATH } from "../config.ts";
 import { readHubPort } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { type SelfProbeState, readHubInstanceFile } from "../hub-instance.ts";
 import {
   HUB_UNIT_DEFAULT_PORT,
   type HubUnitDeps,
@@ -90,6 +91,16 @@ export interface StatusOpts {
     openDb?: (configDir: string) => Database;
     /** Loopback hub base URL override (default derives from the hub port). */
     baseUrl?: string;
+    /**
+     * Read the running serve process's last loopback self-probe verdict from
+     * `hub-instance.json` (hub#737). Read from DISK, not over loopback — during
+     * a hijack the loopback /health (and the module-ops API) reach the WRONG
+     * hub, so the on-disk verdict the real serve wrote is the only trustworthy
+     * source. A `hijacked` verdict overrides the hub row (which would otherwise
+     * read `active` off the rogue's 200). Default {@link readHubInstanceFile}'s
+     * `selfProbe`; tests inject a state (or undefined).
+     */
+    readInstanceState?: (configDir: string) => SelfProbeState | undefined;
   };
 }
 
@@ -386,6 +397,7 @@ interface ResolvedStatusSupervisor {
   probeModuleHealth: (port: number, health: string) => Promise<boolean>;
   openDb: (configDir: string) => Database;
   baseUrl: string | undefined;
+  readInstanceState: (configDir: string) => SelfProbeState | undefined;
 }
 
 /**
@@ -402,6 +414,8 @@ function resolveStatusSupervisor(opts: StatusOpts["supervisor"]): ResolvedStatus
     probeModuleHealth: opts?.probeModuleHealth ?? defaultProbeModuleHealth,
     openDb: opts?.openDb ?? ((configDir) => openHubDb(hubDbPath(configDir))),
     baseUrl: opts?.baseUrl,
+    readInstanceState:
+      opts?.readInstanceState ?? ((configDir) => readHubInstanceFile(configDir)?.selfProbe),
   };
 }
 
@@ -671,8 +685,35 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
     port,
     hubHealthy,
   });
+  // Loopback-hijack override (hub#737). During a hijack the loopback `/health`
+  // the hub row's liveness probe hit belongs to the ROGUE hub (a 200 → the row
+  // reads `active`), so trust the running serve's own on-disk self-probe verdict
+  // instead — read from disk, never over the hijacked loopback. A `hijacked`
+  // verdict flips the row to `failing` with the loud, actionable note.
+  //
+  // GATED ON `hubHealthy` (review fix): the instance file is written per-boot
+  // and only cleared on a *graceful* stop, so a hard-killed hub can leave a
+  // stale `hijacked` verdict on disk. `hubHealthy` is true exactly when
+  // SOMETHING is answering the loopback port right now — which is precisely the
+  // live-hijack condition (the rogue keeps answering 200), so gating here never
+  // suppresses a real hijack, but it does keep a stopped hub (nothing answering)
+  // from rendering a phantom hijack over its normal down-hub row.
+  let selfProbe: SelfProbeState | undefined;
+  try {
+    selfProbe = sup.readInstanceState(configDir);
+  } catch {
+    selfProbe = undefined;
+  }
+  if (hubHealthy && selfProbe?.status === "hijacked") {
+    hub.stateLabel = "failing";
+    hub.healthy = false;
+    hub.skipped = false;
+    hub.healthDetail = "loopback hijacked — /health answered by a foreign process";
+    hub.managerNote = `LOOPBACK HIJACK on :${port} — module JWKS/API calls are NOT reaching this hub. Run \`parachute doctor\` and \`lsof -nP -iTCP:${port} -sTCP:LISTEN\`.`;
+  }
   // If the degraded-read note never landed on a module row (empty manifest),
-  // surface it on the hub row so the operator still sees the actionable hint.
+  // surface it on the hub row so the operator still sees the actionable hint —
+  // unless the hijack note already claimed it (the hijack is the bigger signal).
   if (moduleReadNote && !hub.managerNote) hub.managerNote = moduleReadNote;
   rows.push(hub);
   return rows;
