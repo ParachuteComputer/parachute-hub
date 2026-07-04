@@ -47,7 +47,7 @@ export interface WellKnownVaultEntry {
   version: string;
   /**
    * Where the vault's admin SPA lives. Path-or-URL per
-   * `parachute-patterns/patterns/module-json-extensibility.md`. Hub renders
+   * `docs/contracts/module-json-extensibility.md`. Hub renders
    * a "Manage" link when present. Sourced from the vault module's
    * `.parachute/module.json:managementUrl`.
    */

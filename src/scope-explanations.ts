@@ -18,7 +18,7 @@
  * hardcoded here.
  *
  * Source of truth for the scope shape:
- * `parachute-patterns/patterns/oauth-scopes.md`.
+ * `docs/contracts/oauth-scopes.md`.
  */
 
 export interface ScopeExplanation {

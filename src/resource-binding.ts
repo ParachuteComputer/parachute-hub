@@ -25,7 +25,7 @@
  * vault's named scopes, lock the picker to `<name>`, and mint named scopes so
  * `inferAudience` stamps `aud=vault.<name>`.
  *
- * Source of truth for scope shape: `parachute-patterns/patterns/oauth-scopes.md`.
+ * Source of truth for scope shape: `docs/contracts/oauth-scopes.md`.
  */
 
 import { VAULT_VERBS } from "./jwt-audience.ts";

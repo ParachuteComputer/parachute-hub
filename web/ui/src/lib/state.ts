@@ -1,6 +1,6 @@
 /**
  * Unified state vocabulary per
- * [parachute-patterns/patterns/design-system.md §6](../../../parachute-patterns/patterns/design-system.md)
+ * [docs/contracts/design-system.md §6](../../../../docs/contracts/design-system.md)
  * (workstream F). Four canonical states — `active` / `pending` / `inactive`
  * / `failing` — shared across the CLI's `parachute status` rollup, the
  * admin SPA's module + UI sub-unit badges, and the well-known doc.

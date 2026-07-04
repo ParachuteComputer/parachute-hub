@@ -484,7 +484,7 @@ const DISCOVERY_SCRIPT = `<script>
   // The previous SERVICE_LABELS / SERVICE_ORDER / isVaultName hardcoding
   // is retired: vault has no uiUrl, so the "skip vault" rule emerges
   // from data rather than a name check; ordering is alphabetical-by-
-  // displayName per the module-json-extensibility pattern doc.
+  // displayName per docs/contracts/module-json-extensibility.md.
 
   // Admin entries: always visible. Even a fresh hub with zero vaults wants
   // the operator to find /admin/vaults. Hardcoded — they live in the
@@ -617,7 +617,7 @@ const DISCOVERY_SCRIPT = `<script>
       });
     }
 
-    // Alphabetical-by-displayName per the module-json-extensibility pattern.
+    // Alphabetical-by-displayName per docs/contracts/module-json-extensibility.md.
     // Stable for shared-prefix labels (Notes, Notes-Lite would sort that way).
     const tiles = Array.from(byShort.values()).sort((a, b) =>
       a.title.localeCompare(b.title),
@@ -630,7 +630,7 @@ const DISCOVERY_SCRIPT = `<script>
       empty.innerHTML =
         'No services with a UI declared yet. Modules surface their UIs by ' +
         'declaring <code>uiUrl</code> in <code>module.json</code> ' +
-        '(see the module-json-extensibility pattern).';
+        '(see parachute-hub/docs/contracts/module-json-extensibility.md).';
       servicesGrid.appendChild(empty);
       return;
     }

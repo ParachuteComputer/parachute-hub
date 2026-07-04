@@ -11,7 +11,7 @@
 # per tag push. Independent release cadences; hub doesn't have to bump when
 # scope-guard / depcheck ship and vice versa.
 #
-# Tag conventions (matches parachute-patterns governance rule 2):
+# Tag conventions (matches governance rule 2, https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md):
 #   - rc:     v<X>.<Y>.<Z>-rc.<N>   (e.g. v0.5.13-rc.33)
 #                                    (scope-guard-v0.4.0-rc.2)
 #                                    (depcheck-v0.1.0-rc.1)

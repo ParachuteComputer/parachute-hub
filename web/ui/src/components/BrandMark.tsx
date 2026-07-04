@@ -6,7 +6,7 @@
  * Bun server) and can't easily import from server-side .ts modules.
  * Keep this file BYTE-IDENTICAL to the PATHS constant in
  * `src/brand.ts`. The audit script in
- * `parachute-patterns/scripts/audit-canonical-refs.sh` covers brand-mark
+ * `parachute-workspace/scripts/audit-canonical-refs.sh` covers brand-mark
  * drift; if you change the paths here, change them there too (or the
  * other way around).
  *

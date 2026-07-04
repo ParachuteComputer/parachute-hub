@@ -332,7 +332,7 @@ What it does:
   modules installed.
 
   The STATE column rolls process state + probe result into one of four
-  canonical labels (per parachute-patterns/patterns/design-system.md §6):
+  canonical labels (per parachute-hub/docs/contracts/design-system.md §6):
     active    supervised, running, last probe ok
     pending   supervised, needs operator action (OAuth / config) —
               not reachable from \`parachute status\` today; surfaces in

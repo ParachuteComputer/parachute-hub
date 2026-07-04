@@ -141,7 +141,7 @@ describe("ApproveClient", () => {
   // when given a `return_to` query parameter. The unauth share-link case
   // (no return_to) still renders the dead-end success state. See
   // AUDIT-UI-UX.md §5 row D and
-  // parachute-patterns/patterns/oauth-dcr-approval.md "SPA approve page
+  // docs/contracts/oauth-dcr-approval.md "SPA approve page
   // (two cases, one route)".
   describe("workstream D — OAuth resume via return_to", () => {
     // `window.location.assign` doesn't work in jsdom by default; spy on

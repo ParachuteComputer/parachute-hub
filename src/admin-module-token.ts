@@ -132,7 +132,7 @@ export async function handleModuleToken(
   //      installDir carries a readable module.json. This is the canonical
   //      gate — any module (first- or third-party) that completed
   //      self-registration mints with zero hub code changes, per
-  //      `parachute-patterns/patterns/hub-module-boundary.md` (the seam,
+  //      `docs/contracts/hub-module-boundary.md` (the seam,
   //      mechanism 1).
   //   2. KNOWN bootstrap short (KNOWN_MODULES ∪ FIRST_PARTY_FALLBACKS): kept
   //      as a fallback so a first-party module mid-install (row not yet

@@ -7,7 +7,7 @@
  * mark or the tagline copy happens in ONE place; every consumer follows.
  *
  * Source of truth for the brand mark + tagline lives in the design-system
- * pattern doc (`parachute-patterns/patterns/design-system.md` §2). This file
+ * contract doc (`docs/contracts/design-system.md` §2). This file
  * is the hub's vendored copy of that mark so the chrome injector + the
  * server-rendered surfaces can render without fetching anything at runtime.
  * Keep this file's SVG path corpus in sync with the design-system doc; the

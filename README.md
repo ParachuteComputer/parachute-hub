@@ -4,7 +4,7 @@
 
 The hub coordinates the modules running on your machine: it installs them, supervises them as child processes (the hub itself runs under your platform's process manager — launchd / systemd / the container runtime), exposes them over Tailscale, serves the discovery document at `/.well-known/parachute.json`, and (soon) issues OAuth tokens. Each module (vault, surface, scribe, …) stays a standalone package; the hub stitches them together.
 
-> Previously published as `@openparachute/cli`. Renamed 2026-04-26 to better reflect the role — see [parachute-patterns/hub-as-issuer](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/hub-as-issuer.md). The `parachute` binary name is unchanged.
+> Previously published as `@openparachute/cli`. Renamed 2026-04-26 to better reflect the role — see [docs/contracts/hub-as-issuer.md](https://github.com/ParachuteComputer/parachute-hub/blob/main/docs/contracts/hub-as-issuer.md). The `parachute` binary name is unchanged.
 
 ## Install
 

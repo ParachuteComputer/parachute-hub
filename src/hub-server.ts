@@ -1419,7 +1419,7 @@ async function loadManagementUrls(
  * earlier "vaults browse via Notes — no tile" rule retired with PR 1 of
  * workstream C; operators administer per-vault tokens / config / MCP via
  * the vault admin SPA, which is a different audience from Notes' content
- * browse. See [`module-ui-declaration.md` §"Use vs admin"](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/module-ui-declaration.md#use-vs-admin--both-can-be-true).
+ * browse. See [`module-ui-declaration.md` §"Use vs admin"](https://github.com/ParachuteComputer/parachute-hub/blob/main/docs/contracts/module-ui-declaration.md#use-vs-admin--both-can-be-true).
  *
  * `loadManagementUrls` continues to handle vault's `managementUrl` for
  * the hub admin SPA's vault-list "Manage" link — a different surface
