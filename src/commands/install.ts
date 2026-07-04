@@ -955,7 +955,7 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   // first-party we fall back to the vendored manifest when absent; for
   // third-party (npm / local-path) the manifest is the contract — its
   // absence hard-errors here. See
-  // `parachute-patterns/patterns/module-json-extensibility.md`.
+  // `docs/contracts/module-json-extensibility.md`.
   const installDir = resolveInstallDir(target, findGlobalInstall);
   const installedManifest = await readInstalledManifest(target, installDir, {
     readManifest,
@@ -990,7 +990,7 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     if (!installedManifest) {
       log(`✗ ${target.packageName} does not ship .parachute/module.json — not a Parachute module.`);
       log(
-        "  Authors: see parachute-patterns/patterns/module-json-extensibility.md for the contract.",
+        "  Authors: see parachute-hub/docs/contracts/module-json-extensibility.md for the contract.",
       );
       return 1;
     }

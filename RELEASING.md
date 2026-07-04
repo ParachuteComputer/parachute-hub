@@ -11,7 +11,7 @@ Pushing a tag triggers CI which runs `bun run typecheck` + `bun test ./src`, the
 
 ## Tag conventions
 
-Per [parachute-patterns governance rule 2](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md):
+Per [governance rule 2](https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md):
 
 | Tag shape | Example | npm `dist-tag` | ghcr image tags (hub only) |
 |---|---|---|---|
@@ -24,7 +24,7 @@ The workflow auto-detects rc vs stable from the `-rc.` substring in the tag.
 
 ## Release flow
 
-Per [governance rule 2 (updated 2026-05-24)](https://github.com/ParachuteComputer/parachute-patterns/blob/main/patterns/governance.md), PRs do NOT bump version per-commit. Bump + tag together only when you intend to ship.
+Per [governance rule 2 (updated 2026-05-24)](https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md), PRs do NOT bump version per-commit. Bump + tag together only when you intend to ship.
 
 ### Releasing hub
 

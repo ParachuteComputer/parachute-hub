@@ -39,7 +39,7 @@
  * UX is preserved.
  *
  * Two cases, one route — `return_to` is the discriminator. The pattern
- * doc is `parachute-patterns/patterns/oauth-dcr-approval.md` §"SPA
+ * doc is `docs/contracts/oauth-dcr-approval.md` §"SPA
  * approve page (two cases, one route)".
  *
  * Validation reuses `isSafeAuthorizeReturnTo` from oauth-handlers.ts so

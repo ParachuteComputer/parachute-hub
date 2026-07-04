@@ -25,8 +25,8 @@ export type PublicExposure = "allowed" | "loopback" | "auth-required";
 
 /**
  * Visible-to-discovery state of a UI sub-unit. Aligns with the four-state
- * supervisor vocabulary in [parachute-patterns/patterns/design-system.md
- * §6](../parachute-patterns/patterns/design-system.md) (workstream F).
+ * supervisor vocabulary in [docs/contracts/design-system.md
+ * §6](../docs/contracts/design-system.md) (workstream F).
  * Absent → hub treats the sub-unit as "active" (the discovery default).
  *
  *   "active"   — UI is installed, OAuth client is approved, ready to serve.
@@ -827,7 +827,7 @@ function dropLegacyShortNameRows(raw: unknown, where: string): { raw: unknown; c
   });
 
   console.error(
-    `${where}: dropped legacy short-name row(s) [${dropped.join(", ")}] in favor of same-port manifestName row(s). This is the parachute-app#13 / parachute-runner#4 self-register fixup. See parachute-patterns/patterns/services-json-row-conventions.md.`,
+    `${where}: dropped legacy short-name row(s) [${dropped.join(", ")}] in favor of same-port manifestName row(s). This is the parachute-app#13 / parachute-runner#4 self-register fixup. See parachute-hub/docs/contracts/services-json-row-conventions.md.`,
   );
 
   return {

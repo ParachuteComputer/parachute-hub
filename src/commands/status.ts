@@ -112,8 +112,8 @@ function formatRow(cells: string[], widths: number[]): string {
 }
 
 /**
- * Canonical user-facing state vocabulary, per [parachute-patterns/patterns/
- * design-system.md §6](../parachute-patterns/patterns/design-system.md)
+ * Canonical user-facing state vocabulary, per [docs/contracts/
+ * design-system.md §6](../../docs/contracts/design-system.md)
  * (workstream F). Replaces the pre-F two-column `PROCESS` (running/stopped)
  * + `HEALTH` (ok/down/http <code>) split with a single rollup column the
  * SPA, well-known doc, and CLI all share.

@@ -206,7 +206,8 @@ export interface UpgradeOpts {
    * `@latest` otherwise.
    *
    * Per governance rule 2 (pre-1.0 RC versioning,
-   * `parachute-patterns/patterns/governance.md`), operators on the dev
+   * https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md),
+   * operators on the dev
    * chain run `@rc`; `@latest` is the explicit-stable channel. The default
    * `parachute upgrade` (pre hub#332) hard-coded `@latest`, which silently
    * downgraded rc operators when `@latest` pointed at a prior stable.
@@ -324,7 +325,8 @@ function resolveUpgradeSupervisor(opts: UpgradeOpts["supervisor"]): {
 
 /**
  * Channel detection from a semver-ish version string. Pre-1.0 governance
- * (parachute-patterns/patterns/governance.md rule 2) ships rc chains as
+ * (https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md
+ * rule 2) ships rc chains as
  * `<x>.<y>.<z>-rc.<N>` (or sometimes `-rc` with no N). Anything matching that
  * trailing suffix is the rc channel; everything else is the stable channel.
  */

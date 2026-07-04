@@ -4606,7 +4606,7 @@ describe("parseArgs — issuer env precedence (hub#365)", () => {
 
 describe("hubFetch persistent chrome strip injection (workstream G)", () => {
   // Pins the proxy-side wiring of the chrome strip from
-  // `parachute-patterns/patterns/design-system.md` §7 — every proxied
+  // `docs/contracts/design-system.md` §7 — every proxied
   // text/html response gets the strip injected after the first `<body>`,
   // with opt-outs for `/surface/notes/*` (the Notes PWA owns its own chrome).
   // The pure rewrite + opt-out logic is covered in chrome-strip.test.ts;

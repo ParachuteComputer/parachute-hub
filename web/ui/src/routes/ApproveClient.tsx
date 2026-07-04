@@ -3,7 +3,7 @@
  * client approval. Two distinct cases land here, distinguished by the
  * presence of the `return_to` query parameter (workstream D, see
  * AUDIT-UI-UX.md §5 row D and the
- * `parachute-patterns/patterns/oauth-dcr-approval.md` "SPA approve page
+ * `docs/contracts/oauth-dcr-approval.md` "SPA approve page
  * (two cases, one route)" section).
  *
  * **Case 1 — OAuth resume** (`?return_to=/oauth/authorize?...`). The

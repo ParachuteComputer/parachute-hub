@@ -6,7 +6,7 @@
  * so an operator always knows where they are and how to navigate back to the
  * hub root. The structural fix to the "where-am-I confusion" called out in
  * `AUDIT-UI-UX.md` §2.5 + §5 row G, with the HTML + CSS shape pinned in
- * `parachute-patterns/patterns/design-system.md` §7.
+ * `docs/contracts/design-system.md` §7.
  *
  * Injection mechanism: buffer-and-replace on the first `<body...>` tag.
  * Responses larger than `MAX_INJECT_SIZE_BYTES` are passed through unchanged
@@ -90,7 +90,7 @@ const BRAND_MARK_SVG = brandMarkSvg(16, "chrome-1");
  * hasn't yet adopted the canonical palette tokens. Once a surface declares
  * `:root { --bg-soft: ...; }` of its own, those win via cascade.
  *
- * Sourced from `parachute-patterns/patterns/design-system.md` §7 verbatim,
+ * Sourced from `docs/contracts/design-system.md` §7 verbatim,
  * with the `:host` token shim added for cross-surface portability.
  */
 const CHROME_STYLE = `

@@ -3,7 +3,7 @@
  * module. Author-controlled, shipped in the published artifact, read by the
  * CLI on `parachute install <package>`.
  *
- * The shape mirrors `parachute-patterns/patterns/module-json-extensibility.md`.
+ * The shape mirrors `docs/contracts/module-json-extensibility.md`.
  * Third-party modules are first-class: no `@openparachute/` scope or
  * `parachute-*` prefix required — `module.json` is what makes a package a
  * module. First-party modules will eventually ship their own `module.json`
@@ -271,7 +271,7 @@ export interface ModuleManifest {
   readonly configSchema?: ConfigSchema;
   /**
    * Where the module's admin UI lives. Hub renders a "Manage" link when set
-   * (see `parachute-patterns/patterns/module-json-extensibility.md`).
+   * (see `docs/contracts/module-json-extensibility.md`).
    *
    * Three shapes (unified URL-resolution semantics — B4 of the 2026-06-09
    * hub-module-boundary migration):
@@ -293,7 +293,7 @@ export interface ModuleManifest {
   /**
    * Where the module's primary user-facing UI lives. Hub renders a tile on
    * the discovery page (`/`) Services section when set (see
-   * `parachute-patterns/patterns/module-json-extensibility.md` and the
+   * `docs/contracts/module-json-extensibility.md` and the
    * `loadUiUrls` resolver in `hub-server.ts`).
    *
    * Two shapes — same rules as `managementUrl`:

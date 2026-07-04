@@ -12,7 +12,7 @@ import {
 
 describe("SCOPE_EXPLANATIONS", () => {
   test("covers every canonical first-party scope from oauth-scopes.md", () => {
-    // Source of truth: parachute-patterns/patterns/oauth-scopes.md.
+    // Source of truth: docs/contracts/oauth-scopes.md.
     const expected = [
       "vault:read",
       "vault:write",

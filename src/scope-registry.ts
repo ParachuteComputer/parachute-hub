@@ -7,7 +7,7 @@
  * downstream service should be rejected, but defense-in-depth says don't
  * sign claims you don't understand. This module is the gate.
  *
- * Source of truth for scope shape: `parachute-patterns/patterns/oauth-scopes.md`.
+ * Source of truth for scope shape: `docs/contracts/oauth-scopes.md`.
  *
  * Declared scopes come from two places:
  *   1. `FIRST_PARTY_SCOPES` — the canonical Parachute scopes hardcoded in
