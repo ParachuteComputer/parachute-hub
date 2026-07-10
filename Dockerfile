@@ -55,6 +55,7 @@ WORKDIR /app
 COPY package.json bun.lock ./
 COPY packages/scope-guard/package.json packages/scope-guard/
 COPY packages/depcheck/package.json packages/depcheck/
+COPY packages/door-contract/package.json packages/door-contract/
 COPY web/ui/package.json web/ui/bun.lock web/ui/
 
 # Install with the lockfile pinned. `--frozen-lockfile` matches CI; the

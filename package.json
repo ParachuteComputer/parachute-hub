@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/hub",
-  "version": "0.7.7-rc.2",
+  "version": "0.7.7-rc.3",
   "description": "parachute — the local hub for the Parachute ecosystem (discovery, ports, lifecycle, soon OAuth).",
   "license": "AGPL-3.0",
   "publishConfig": {
@@ -28,8 +28,10 @@
   "scripts": {
     "start": "bun src/cli.ts",
     "build:depcheck": "[ ! -f packages/depcheck/package.json ] || [ -f packages/depcheck/dist/index.js ] || bun run --cwd packages/depcheck build",
-    "prepare": "bun run build:depcheck",
-    "pretest": "bun run build:depcheck",
+    "build:door-contract": "[ ! -f packages/door-contract/package.json ] || [ -f packages/door-contract/dist/index.js ] || bun run --cwd packages/door-contract build",
+    "build:packages": "bun run build:depcheck && bun run build:door-contract",
+    "prepare": "bun run build:packages",
+    "pretest": "bun run build:packages",
     "test": "bun test ./src",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
@@ -40,6 +42,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
+    "@openparachute/door-contract": "workspace:*",
     "@types/bun": "latest",
     "@types/qrcode": "^1.5.6"
   },

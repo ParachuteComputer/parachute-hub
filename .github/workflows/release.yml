@@ -77,6 +77,12 @@ jobs:
         # runtime hub resolves depcheck via the `bun`→src export condition, so
         # this is only needed for the type-level resolution.
         run: bun run --cwd packages/depcheck build
+      - name: build door-contract
+        # Same reason as depcheck: hub's `tsc` typecheck + the door-contract
+        # parity test resolve `@openparachute/door-contract` from its built
+        # `dist/`. The frozen-lockfile install doesn't build it, so build it
+        # explicitly before typecheck + tests.
+        run: bun run --cwd packages/door-contract build
       - name: typecheck
         run: bun run typecheck
       - name: hub tests
@@ -90,6 +96,11 @@ jobs:
         # Same rationale — depcheck is consumed by hub, so a regression here
         # would break hub too. Cheap to run on every tag.
         run: bun test ./packages/depcheck/src
+      - name: door-contract tests
+        # The shared OAuth-issuer + /account/* contract corpus (consumed
+        # test-only by hub's door-contract-parity suite; the hosted cloud door
+        # adopts it in Phase B). Cheap; gates the contract on every tag.
+        run: bun test ./packages/door-contract/src
 
   publish-hub-npm:
     name: publish hub to npm

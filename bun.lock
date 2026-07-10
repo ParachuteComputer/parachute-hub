@@ -6,13 +6,14 @@
       "name": "@openparachute/hub",
       "dependencies": {
         "@node-rs/argon2": "^2.0.2",
-        "@openparachute/depcheck": "0.1.0-rc.1",
+        "@openparachute/depcheck": "0.1.1",
         "jose": "^6.2.2",
         "otpauth": "^9.5.0",
         "qrcode": "^1.5.4",
       },
       "devDependencies": {
         "@biomejs/biome": "^1.9.4",
+        "@openparachute/door-contract": "workspace:*",
         "@types/bun": "latest",
         "@types/qrcode": "^1.5.6",
       },
@@ -22,14 +23,21 @@
     },
     "packages/depcheck": {
       "name": "@openparachute/depcheck",
-      "version": "0.1.0-rc.1",
+      "version": "0.1.1",
+      "peerDependencies": {
+        "typescript": "^5",
+      },
+    },
+    "packages/door-contract": {
+      "name": "@openparachute/door-contract",
+      "version": "0.1.0",
       "peerDependencies": {
         "typescript": "^5",
       },
     },
     "packages/scope-guard": {
       "name": "@openparachute/scope-guard",
-      "version": "0.4.0-rc.2",
+      "version": "0.5.0",
       "dependencies": {
         "jose": "^6.2.2",
       },
@@ -98,6 +106,8 @@
     "@node-rs/argon2-win32-x64-msvc": ["@node-rs/argon2-win32-x64-msvc@2.0.2", "", { "os": "win32", "cpu": "x64" }, "sha512-cJxWXanH4Ew9CfuZ4IAEiafpOBCe97bzoKowHCGk5lG/7kR4WF/eknnBlHW9m8q7t10mKq75kruPLtbSDqgRTw=="],
 
     "@openparachute/depcheck": ["@openparachute/depcheck@workspace:packages/depcheck"],
+
+    "@openparachute/door-contract": ["@openparachute/door-contract@workspace:packages/door-contract"],
 
     "@openparachute/scope-guard": ["@openparachute/scope-guard@workspace:packages/scope-guard"],
 
