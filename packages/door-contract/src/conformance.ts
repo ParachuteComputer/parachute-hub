@@ -73,6 +73,46 @@ export function checkTokenResponseInvariants(
   return issues;
 }
 
+/**
+ * Validate a door's `GET /.well-known/parachute-account` descriptor. Door-specific
+ * values (`signup_path`, `app_client_id`, `plans`) are the door's own; this pins
+ * the SHAPE + the cross-field invariants BOTH doors must hold: `issuer`/`door`
+ * match the caller's expected pair, `account_endpoint` is derived (`${issuer}/account`),
+ * `signup_path` is an absolute path, `app_client_id` is present, `capabilities`
+ * carries the three booleans, and `plans` is an array.
+ */
+export function checkAccountDescriptor(
+  actual: Record<string, unknown>,
+  expected: { issuer: string; door: "hub" | "cloud" },
+): ConformanceIssue[] {
+  const issues: ConformanceIssue[] = [];
+  const push = (detail: string) => issues.push({ vector: "parachute-account", detail });
+  if (actual.issuer !== expected.issuer)
+    push(`issuer must be ${JSON.stringify(expected.issuer)}, got ${JSON.stringify(actual.issuer)}`);
+  if (actual.door !== expected.door)
+    push(`door must be ${JSON.stringify(expected.door)}, got ${JSON.stringify(actual.door)}`);
+  const wantEndpoint = `${expected.issuer}/account`;
+  if (actual.account_endpoint !== wantEndpoint)
+    push(
+      `account_endpoint must be ${JSON.stringify(wantEndpoint)}, got ${JSON.stringify(actual.account_endpoint)}`,
+    );
+  if (typeof actual.signup_path !== "string" || !actual.signup_path.startsWith("/"))
+    push(`signup_path must be an absolute path, got ${JSON.stringify(actual.signup_path)}`);
+  if (typeof actual.app_client_id !== "string" || actual.app_client_id.length === 0)
+    push("app_client_id must be a non-empty string");
+  const caps = actual.capabilities;
+  if (typeof caps !== "object" || caps === null) {
+    push("capabilities must be an object");
+  } else {
+    for (const k of ["vault_create", "vault_rename", "vault_delete"] as const) {
+      if (typeof (caps as Record<string, unknown>)[k] !== "boolean")
+        push(`capabilities.${k} must be a boolean`);
+    }
+  }
+  if (!Array.isArray(actual.plans)) push("plans must be an array");
+  return issues;
+}
+
 /** The `/account/*` route vectors — the contract every door mounts. */
 export const ACCOUNT_ROUTE_VECTORS: readonly AccountRoute[] = ACCOUNT_ROUTES;
 

@@ -8,6 +8,7 @@ import {
   REFRESH_TOKEN_TTL_MS,
   TOKEN_TYPE,
   accountScope,
+  checkAccountDescriptor,
   checkAuthorizationServerMetadata,
   checkProtectedResourceMetadata,
   checkTokenResponseInvariants,
@@ -16,6 +17,16 @@ import {
   hasAccountScope,
   parseAccountScope,
 } from "../index.js";
+
+const CONFORMANT_DESCRIPTOR = {
+  issuer: "https://cloud.parachute.computer",
+  door: "cloud" as const,
+  account_endpoint: "https://cloud.parachute.computer/account",
+  signup_path: "/signup",
+  app_client_id: "parachute-app",
+  capabilities: { vault_create: true, vault_rename: false, vault_delete: false },
+  plans: [{ id: "entry", name: "Entry", vaults: 1, price_month: 1 }],
+};
 
 // The corpus is pinned as the single source of truth. These values are what
 // each door currently duplicates; if a real contract change is intended, it
@@ -149,5 +160,45 @@ describe("account route table", () => {
     expect(byKey("POST", "/account/vaults")?.scope).toBe("admin");
     expect(byKey("DELETE", "/account/vaults/<name>")?.scope).toBe("admin");
     expect(byKey("GET", "/account/vaults")?.scope).toBe("read");
+  });
+});
+
+describe("parachute-account descriptor (C4)", () => {
+  const expected = { issuer: "https://cloud.parachute.computer", door: "cloud" as const };
+
+  test("a conformant descriptor reports zero issues", () => {
+    expect(checkAccountDescriptor(CONFORMANT_DESCRIPTOR, expected)).toEqual([]);
+  });
+
+  test("account_endpoint must derive from the issuer", () => {
+    const bad = { ...CONFORMANT_DESCRIPTOR, account_endpoint: "https://elsewhere.example/account" };
+    const issues = checkAccountDescriptor(bad, expected);
+    expect(issues.length).toBe(1);
+    expect(issues[0]?.detail).toContain("account_endpoint");
+  });
+
+  test("issuer / door / signup_path / app_client_id / capabilities / plans are all pinned", () => {
+    expect(
+      checkAccountDescriptor({ ...CONFORMANT_DESCRIPTOR, issuer: "https://evil.example" }, expected)
+        .length,
+    ).toBe(1); // issuer (account_endpoint is checked vs the EXPECTED issuer)
+    expect(checkAccountDescriptor({ ...CONFORMANT_DESCRIPTOR, door: "hub" }, expected).length).toBe(
+      1,
+    );
+    expect(
+      checkAccountDescriptor({ ...CONFORMANT_DESCRIPTOR, signup_path: "signup" }, expected).length,
+    ).toBe(1); // not absolute
+    expect(
+      checkAccountDescriptor({ ...CONFORMANT_DESCRIPTOR, app_client_id: "" }, expected).length,
+    ).toBe(1);
+    expect(
+      checkAccountDescriptor(
+        { ...CONFORMANT_DESCRIPTOR, capabilities: { vault_create: true, vault_delete: false } },
+        expected,
+      ).length,
+    ).toBe(1); // missing vault_rename boolean
+    expect(
+      checkAccountDescriptor({ ...CONFORMANT_DESCRIPTOR, plans: "nope" }, expected).length,
+    ).toBe(1);
   });
 });

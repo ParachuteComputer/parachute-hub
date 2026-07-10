@@ -70,14 +70,55 @@ export const ACCOUNT_ROUTES: readonly AccountRoute[] = [
   },
 ] as const;
 
-/** The public capabilities descriptor served at `/.well-known/parachute-account`. */
+/** One plan/tier the door advertises (cloud's `PLAN_SPECS`; empty for self-host). */
+export interface AccountPlanSummary {
+  /** Stable plan id (e.g. `"entry"`). */
+  id: string;
+  /** Human label (e.g. `"Entry"`). */
+  name: string;
+  /** Max vaults this plan allows. */
+  vaults: number;
+  /** Monthly price in whole USD; `0`/omitted = free or self-host. */
+  price_month?: number;
+}
+
+/** Which account-lifecycle operations the door's `/account/*` API supports. */
+export interface AccountCapabilities {
+  /** `POST /account/vaults` creates a vault. */
+  vault_create: boolean;
+  /**
+   * A vault's canonical name can change after creation. Cloud: `false` — the
+   * vault `name` is the immutable global slug / DO address / URL (a future
+   * rename would set a separate mutable display name, never the slug).
+   */
+  vault_rename: boolean;
+  /** `DELETE /account/vaults/<name>` tears a vault down (cloud v1: `false`). */
+  vault_delete: boolean;
+}
+
+/**
+ * The public descriptor served at `GET /.well-known/parachute-account` — the
+ * door's self-description a client fetches to learn where to sign up, where the
+ * account API lives, which first-party client to use, and what the door can do.
+ * Both doors serve their own instance (cloud advertises `signup_path:"/signup"`,
+ * the self-host hub `"/account/setup"`); clients read `signup_path` etc. rather
+ * than hardcoding. Public + wildcard-CORS, no auth.
+ */
 export interface ParachuteAccountDescriptor {
-  /** The account door's issuer origin. */
+  /** The account door's issuer origin (no trailing slash). */
   issuer: string;
   /** Which door this is. */
   door: "hub" | "cloud";
-  /** The `/account/*` routes this door mounts. */
+  /** The `/account/*` API base — always `${issuer}/account`. */
   account_endpoint: string;
+  /** Where a brand-new user begins sign-up (cloud `"/signup"`, hub `"/account/setup"`). */
+  signup_path: string;
+  /** The reserved first-party `client_id` a native app should use (cloud `"parachute-app"`). */
+  app_client_id: string;
+  /** Which account-lifecycle operations this door supports. */
+  capabilities: AccountCapabilities;
+  /** The plan/tier ladder this door offers (empty for self-host). */
+  plans: AccountPlanSummary[];
 }
 
 /** A vault as returned by `GET /account/vaults`. */
