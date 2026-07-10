@@ -22,6 +22,9 @@ describe("SCOPE_EXPLANATIONS", () => {
       "agent:send",
       "hub:admin",
       "parachute:host:admin",
+      // Account scopes (Parachute App campaign, Phase 2).
+      "account:self:admin",
+      "account:self:read",
     ];
     for (const s of expected) {
       expect(SCOPE_EXPLANATIONS[s]).toBeDefined();
@@ -156,6 +159,14 @@ describe("NON_REQUESTABLE_SCOPES (#96)", () => {
     expect(NON_REQUESTABLE_SCOPES.has("scribe:admin")).toBe(true);
   });
 
+  test("contains the account scopes (App campaign Phase 2 — cookie-minted only)", () => {
+    // account:self:{admin,read} are minted exclusively by POST /account/token
+    // (cookie→bearer), never via /oauth/authorize — a third-party app pointed at
+    // the hub AS must not be able to consent its way to account authority.
+    expect(NON_REQUESTABLE_SCOPES.has("account:self:admin")).toBe(true);
+    expect(NON_REQUESTABLE_SCOPES.has("account:self:read")).toBe(true);
+  });
+
   test("every non-requestable scope is a known first-party scope", () => {
     for (const s of NON_REQUESTABLE_SCOPES) {
       expect(FIRST_PARTY_SCOPES).toContain(s);
@@ -193,6 +204,17 @@ describe("isRequestableScope", () => {
     expect(isRequestableScope("vault:default:admin")).toBe(true);
     expect(isRequestableScope("vault:work:admin")).toBe(true);
     expect(isRequestableScope("vault:my-techne_2:admin")).toBe(true);
+  });
+
+  test("account scopes are non-requestable (cookie-minted only, App campaign)", () => {
+    expect(isRequestableScope("account:self:admin")).toBe(false);
+    expect(isRequestableScope("account:self:read")).toBe(false);
+    // explainScope resolves them (direct SCOPE_EXPLANATIONS keys) with the
+    // right levels, so scopeIsAdmin recognizes the admin form.
+    expect(explainScope("account:self:admin")?.level).toBe("admin");
+    expect(explainScope("account:self:read")?.level).toBe("read");
+    expect(scopeIsAdmin("account:self:admin")).toBe(true);
+    expect(scopeIsAdmin("account:self:read")).toBe(false);
   });
 
   test("host-level operator scopes stay non-requestable", () => {
