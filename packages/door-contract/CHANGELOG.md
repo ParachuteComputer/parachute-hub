@@ -1,5 +1,16 @@
 # @openparachute/door-contract
 
+## 0.2.0
+
+C4 (Parachute App campaign, parachute-cloud#116) — the account-door descriptor.
+Extends `ParachuteAccountDescriptor` (served at `GET /.well-known/parachute-account`)
+with `signup_path`, `app_client_id`, `capabilities` (`AccountCapabilities`), and
+`plans` (`AccountPlanSummary[]`) so a client learns where to sign up, which
+first-party client to use, what the door can do, and its plan ladder without
+hardcoding. Adds the `checkAccountDescriptor(actual, {issuer, door})` conformance
+helper (mirrors `checkAuthorizationServerMetadata`) so both doors' descriptors
+are pinned. Additive; no breaking changes.
+
 ## 0.1.0
 
 Initial extraction (Cloud+Hub shared-core campaign, parachute-cloud#116,

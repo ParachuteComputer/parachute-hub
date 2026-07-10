@@ -59,6 +59,8 @@ export {
   type AccountRoute,
   ACCOUNT_ROUTES,
   type ParachuteAccountDescriptor,
+  type AccountPlanSummary,
+  type AccountCapabilities,
   type AccountVaultSummary,
   type CreateVaultRequest,
   type MintVaultTokenRequest,
@@ -70,5 +72,6 @@ export {
   checkAuthorizationServerMetadata,
   checkProtectedResourceMetadata,
   checkTokenResponseInvariants,
+  checkAccountDescriptor,
   ACCOUNT_ROUTE_VECTORS,
 } from "./conformance.js";
