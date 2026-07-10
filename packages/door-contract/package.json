@@ -1,0 +1,39 @@
+{
+  "name": "@openparachute/door-contract",
+  "version": "0.1.0",
+  "description": "The Parachute door contract: shared OAuth-issuer + /account/* wire types, constants, and conformance vectors that both doors (self-host hub + hosted cloud) implement.",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "//": "exports MUST match scope-guard/depcheck: NO `bun`→src condition. npm does not honor publishConfig.exports, so a `bun`→src condition would ship in the published package and Bun consumers (hub) would resolve src/index.ts which the tarball doesn't include (files: dist only) → 'Cannot find module'. dist is built locally + shipped, so `import`→dist resolves under both Bun and Node. (Caught on the depcheck rc.1→rc.2 deploy.)",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ParachuteComputer/parachute-hub.git",
+    "directory": "packages/door-contract"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "bun run build",
+    "test": "bun test src",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
