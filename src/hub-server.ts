@@ -33,6 +33,7 @@
  *   /.well-known/parachute.json                → built dynamically from services.json
  *   /.well-known/parachute-revocation.json     → revoked-jti list (hub#212 Phase 1)
  *   /.well-known/jwks.json                     → JWKS from hub.db
+ *   /.well-known/parachute-account             → account-door capabilities descriptor (public, H2)
  *   /.well-known/oauth-authorization-server    → RFC 8414 metadata (issuer, endpoints)
  *
  *   # OAuth issuer.
@@ -49,6 +50,13 @@
  *                                                 tokens/grants/user_vaults/invites/
  *                                                 connections sweep, CLI remove,
  *                                                 supervisor restart)
+ *   # /account/* — the Bearer-gated account-door REST facade (Phase 2, H2).
+ *   # account:self:admin OR parachute:host:admin (mutations); +:read (reads).
+ *   /account                      (GET)        → account bootstrap {id,email,door} (Bearer only)
+ *   /account/vaults               (GET/POST)   → list / create vault (create returns vault_token)
+ *   /account/vaults/<name>        (DELETE)     → teardown (wraps /vaults/<name> cascade)
+ *   /account/vaults/<name>/token  (POST)       → per-vault scoped token mint
+ *   /account/vaults/<name>/caps   (GET/PUT)    → read / set the storage cap
  *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
  *   /admin/agent-token            (GET)        → agent UI bearer mint (cookie-gated)
@@ -170,6 +178,18 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pkg from "../package.json" with { type: "json" };
+import {
+  ACCOUNT_MUTATION_SCOPES,
+  type AccountApiDeps,
+  handleAccountCapabilities,
+  handleAccountCreateVault,
+  handleAccountGetVaultCaps,
+  handleAccountListVaults,
+  handleAccountMintVaultToken,
+  handleAccountRoot,
+  handleAccountSetVaultCaps,
+  requireAnyScope,
+} from "./account-api.ts";
 import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.ts";
 import { handleAccountToken } from "./account-token.ts";
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
@@ -180,6 +200,7 @@ import {
   handleOAuthGrantCallback,
 } from "./admin-agent-grants.ts";
 import { handleAgentToken } from "./admin-agent-token.ts";
+import { adminAuthErrorResponse } from "./admin-auth.ts";
 import { handleApproveClient, handleDeleteClient, handleGetClient } from "./admin-clients.ts";
 import {
   type ConnectionsDeps,
@@ -2820,6 +2841,24 @@ export function hubFetch(
         return new Response(res.body, { status: res.status, headers: merged });
       }
 
+      // GET /.well-known/parachute-account — the account-door capabilities
+      // descriptor (Phase 2, H2). Public, no auth, wildcard CORS (the app pulls
+      // it cross-origin to render honestly per door: billing:false + plans:[] on
+      // self-host means no upgrade UI). See account-api.handleAccountCapabilities.
+      if (pathname === "/.well-known/parachute-account") {
+        const corsHeaders = {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, OPTIONS",
+        };
+        if (req.method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        const res = handleAccountCapabilities(req, { issuer: oauthDeps(req).issuer });
+        const merged = new Headers(res.headers);
+        for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
+        return new Response(res.body, { status: res.status, headers: merged });
+      }
+
       // OAuth surface — every handler return is wrapped in `applyCorsHeaders`
       // so third-party SPAs can fetch these endpoints cross-origin (the entire
       // point of OAuth DCR: arbitrary SPAs register → authorize → exchange
@@ -3803,6 +3842,114 @@ export function hubFetch(
           db,
           hubOrigin,
           ...(managementUrl !== undefined ? { managementUrl } : {}),
+        });
+      }
+
+      // ====================================================================
+      // /account/* — the Bearer-gated account-door REST facade (Phase 2, H2).
+      // The normalized account API both doors mount (the hosted cloud door
+      // mounts the twin). Bearer-authed, machine-to-machine — no session
+      // cookie — so these precede the session-cookie `/account/vault-token/`
+      // + `/account/` HTML routes below. Mutations accept account:self:admin
+      // OR parachute:host:admin; reads also accept account:self:read. See
+      // `account-api.ts`.
+      // ====================================================================
+      if (pathname === "/account/vaults") {
+        if (!getDb) return dbNotConfigured();
+        const accountDeps: AccountApiDeps = {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        };
+        if (req.method === "GET") return handleAccountListVaults(req, accountDeps);
+        if (req.method === "POST") return handleAccountCreateVault(req, accountDeps);
+        return new Response("method not allowed", { status: 405 });
+      }
+      if (pathname.startsWith("/account/vaults/")) {
+        if (!getDb) return dbNotConfigured();
+        const rest = pathname.slice("/account/vaults/".length);
+        const accountDeps: AccountApiDeps = {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
+        };
+        // POST /account/vaults/<name>/token — per-vault scoped token mint.
+        if (rest.endsWith("/token")) {
+          const name = decodeURIComponent(rest.slice(0, -"/token".length));
+          return handleAccountMintVaultToken(req, name, accountDeps);
+        }
+        // GET/PUT /account/vaults/<name>/caps — read / set the storage cap.
+        if (rest.endsWith("/caps")) {
+          const name = decodeURIComponent(rest.slice(0, -"/caps".length));
+          if (req.method === "GET") return handleAccountGetVaultCaps(req, name, accountDeps);
+          if (req.method === "PUT") return handleAccountSetVaultCaps(req, name, accountDeps);
+          return new Response("method not allowed", { status: 405 });
+        }
+        // DELETE /account/vaults/<name> — teardown via the full identity
+        // cascade. Gate with the account-scope set here (accept account:self:admin
+        // OR parachute:host:admin), then delegate to `handleDeleteVault`, which
+        // re-gates parachute:host:admin — the superset account token carries it,
+        // so this is belt-and-suspenders, not a second authorization.
+        if (req.method === "DELETE") {
+          const name = decodeURIComponent(rest);
+          if (!name || name.includes("/")) return new Response("not found", { status: 404 });
+          try {
+            await requireAnyScope(
+              getDb(),
+              req,
+              ACCOUNT_MUTATION_SCOPES,
+              oauthDeps(req).hubBoundOrigins(),
+            );
+          } catch (err) {
+            return adminAuthErrorResponse(err);
+          }
+          const services = readManifestLenient(manifestPath).services;
+          const agentEntry = findServiceByShort(services, "agent");
+          const agentOrigin = agentEntry ? `http://127.0.0.1:${agentEntry.port}` : null;
+          const resolveVaultOrigin = (vaultName: string): string | null => {
+            const match = findVaultUpstream(
+              readManifestLenient(manifestPath).services,
+              `/vault/${vaultName}`,
+            );
+            return match ? `http://127.0.0.1:${match.port}` : null;
+          };
+          const supervisor = deps?.supervisor;
+          return handleDeleteVault(req, name, {
+            db: getDb(),
+            issuer: oauthDeps(req).issuer,
+            knownIssuers: oauthDeps(req).hubBoundOrigins(),
+            manifestPath,
+            connectionsStorePath:
+              deps?.connectionsStorePath ?? join(CONFIG_DIR, "connections.json"),
+            agentOrigin,
+            resolveVaultOrigin,
+            resolveModuleOrigin: makeResolveModuleOrigin(manifestPath),
+            ...(supervisor
+              ? {
+                  restartVaultModule: async () => {
+                    await supervisor.restart("vault");
+                  },
+                }
+              : {}),
+          });
+        }
+        return new Response("method not allowed", { status: 405 });
+      }
+      // GET /account (Bearer) — account bootstrap {account_id,email,door}. Only
+      // intercepts when an Authorization header is present, so the cookie-authed
+      // HTML account home at `/account`/`/account/` below stays unaffected.
+      if (
+        (pathname === "/account" || pathname === "/account/") &&
+        req.headers.get("authorization")
+      ) {
+        if (!getDb) return dbNotConfigured();
+        return handleAccountRoot(req, {
+          db: getDb(),
+          issuer: oauthDeps(req).issuer,
+          knownIssuers: oauthDeps(req).hubBoundOrigins(),
+          manifestPath,
         });
       }
 
