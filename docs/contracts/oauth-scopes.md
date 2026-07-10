@@ -37,6 +37,8 @@ Parachute OAuth tokens carry **whitespace-separated scope strings**
 | `surface:<name>:read` | Fetch/clone the named surface's hub-hosted git repo (Surface Git Transport) |
 | `surface:<name>:write` | Push to the named surface's repo (write ⊇ read at the git endpoint) |
 | `surface:admin` | surface-host module admin — the hub↔surface-host notify bearer + the credential endpoint |
+| `account:<id>:read` | Read the account: list the owner's vaults, read their caps/usage (Parachute App campaign, Phase 2 — the `/account/*` door contract). Cookie-minted only via `POST /account/token`; **not requestable** from third-party clients. On self-host `<id>` is the sentinel `self` (account ≡ box). |
+| `account:<id>:admin` | Every account mutation: create/delete/import vaults, mint per-vault tokens, set caps. `admin ⊇ read`. Cookie-minted only via `POST /account/token`; **not requestable**. |
 
 Third-party modules declare their own namespace (`my-service:read`, etc.)
 and the hub renders consent for those scopes the same way.
@@ -57,6 +59,7 @@ enforced by the agent daemon. See
 ```
 admin ⊇ write ⊇ read       (vault)
 write ⊇ read               (surface:<name>, at the git endpoint)
+admin ⊇ read               (account:<id>, at the /account/* validator)
 ```
 
 - `vault:<name>:admin` satisfies any check for `vault:<name>:write` or

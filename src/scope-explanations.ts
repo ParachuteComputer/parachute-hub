@@ -112,7 +112,33 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     label: "Administer vaults on this host (create, configure, delete).",
     level: "admin",
   },
+  // Account scopes (Parachute App campaign, Phase 2 — the `/account/*` door
+  // contract). `account:<id>:admin` authorizes every account mutation
+  // (create/delete/import vaults, mint per-vault tokens, set caps); `:read`
+  // authorizes the read side (list vaults, read caps/usage). On a self-host
+  // hub `<id>` is the sentinel `self` (account ≡ box). These are minted ONLY
+  // by the cookie→bearer `POST /account/token` exchange, NEVER via the public
+  // OAuth flow — they're in NON_REQUESTABLE_SCOPES below, like the host scopes.
+  // Listed here (a) so `NON_REQUESTABLE_SCOPES ⊆ FIRST_PARTY_SCOPES` holds and
+  // (b) so scope-guard's `admin ⊇ read` inheritance recognizes the grammar
+  // (`account:self:admin` satisfies `account:self:read`).
+  "account:self:admin": {
+    label:
+      "Manage your Parachute account — create, delete, and configure your vaults, and mint access tokens for them.",
+    level: "admin",
+  },
+  "account:self:read": {
+    label: "View your Parachute account — list your vaults and read their settings and usage.",
+    level: "read",
+  },
 };
+
+/** Account scope strings (Parachute App campaign, Phase 2). Exported so the
+ * `POST /account/token` mint and the `/account/*` route gates reference the
+ * canonical constants rather than re-literaling the strings. `self` is the
+ * self-host account sentinel (account ≡ box). */
+export const ACCOUNT_SELF_ADMIN_SCOPE = "account:self:admin";
+export const ACCOUNT_SELF_READ_SCOPE = "account:self:read";
 
 /**
  * Sorted list of every first-party scope the hub recognizes. Used as the
@@ -170,6 +196,13 @@ export const NON_REQUESTABLE_SCOPES: ReadonlySet<string> = new Set([
   // Service-admin scopes: operator-only, never requestable via /oauth/authorize.
   "hub:admin",
   "scribe:admin",
+  // Account scopes (Parachute App campaign, Phase 2): cookie-minted only via
+  // `POST /account/token`, NEVER OAuth-requestable. A third-party app pointed
+  // at the hub AS must not be able to consent its way to account authority
+  // (create/delete vaults, mint per-vault tokens) — the account credential is
+  // exclusively the same-origin app's cookie→bearer exchange.
+  ACCOUNT_SELF_ADMIN_SCOPE,
+  ACCOUNT_SELF_READ_SCOPE,
 ]);
 
 /**

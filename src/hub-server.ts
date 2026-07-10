@@ -116,6 +116,13 @@
  *                                                 (forceChangePasswordGate); only this
  *                                                 route and /logout stay reachable
  *                                                 pre-rotation.
+ *   /account/token                (POST)       → cookie→account-bearer mint (App
+ *                                                 campaign Phase 2 H1): session cookie →
+ *                                                 short-lived JWT carrying the account
+ *                                                 superset {account:self:admin,
+ *                                                 parachute:host:admin, parachute:host:auth}
+ *                                                 aud="account"; first-admin-gated,
+ *                                                 CSRF + same-origin belt; stateless
  *   /account/2fa                  (GET + POST) → user self-service 2FA enroll/disenroll
  *                                                 (hub#473; QR + backup codes)
  *   /account/vault-token/<name>   (POST)       → friend mints a scoped
@@ -164,6 +171,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pkg from "../package.json" with { type: "json" };
 import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.ts";
+import { handleAccountToken } from "./account-token.ts";
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
 import { handleAccountVaultTokenPost } from "./account-vault-token.ts";
 import {
@@ -3719,6 +3727,27 @@ export function hubFetch(
       if (getDb && (pathname === "/account" || pathname.startsWith("/account/"))) {
         const gate = forceChangePasswordGate(getDb(), req);
         if (gate) return gate;
+      }
+
+      // /account/token — cookie→account-bearer mint (Parachute App campaign,
+      // Phase 2 H1). POST-only. Exchanges the `parachute_hub_session` cookie for
+      // a short-lived JWT carrying the account superset
+      // {account:self:admin, parachute:host:admin, parachute:host:auth} with
+      // aud="account" — the same-origin app's bootstrap into holding the account
+      // credential (it never touches /oauth/authorize, so never hits consent).
+      // First-admin-gated (account ≡ box), CSRF double-submit + the same-origin
+      // Origin belt below. Stateless (no tokens row); revocation = logout.
+      if (pathname === "/account/token") {
+        if (!getDb) return dbNotConfigured();
+        // Origin belt (hub#632 posture): a cookie-authed POST mint gets the
+        // strict same-origin check as defense-in-depth over the body's CSRF
+        // token. A Bearer-authed caller (none expected here) would bypass the
+        // belt but still fail the cookie-only session gate inside the handler.
+        {
+          const rejected = assertSameOriginForCookieMutation(req, oauthDeps(req).hubBoundOrigins());
+          if (rejected) return rejected;
+        }
+        return handleAccountToken(req, { db: getDb(), issuer: oauthDeps(req).issuer });
       }
 
       // /account/2fa — user self-service TOTP 2FA enroll / disenroll (hub#473).
