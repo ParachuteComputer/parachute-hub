@@ -119,6 +119,15 @@ export interface ParachuteAccountDescriptor {
   capabilities: AccountCapabilities;
   /** The plan/tier ladder this door offers (empty for self-host). */
   plans: AccountPlanSummary[];
+  /**
+   * A vault-URL template with a literal `{name}` PLACEHOLDER the client
+   * substitutes to preview a vault's address pre-creation ("it will live at …")
+   * — door-agnostic, so a client never hardcodes cloud's path form vs a hub's.
+   * NOT a base prefix: cloud serves both path (`…/vault/{name}`) and subdomain
+   * (`{name}.<base>`) shapes, so only the door can render the right template.
+   * Optional (a door that can't express one omits it).
+   */
+  vault_url_template?: string;
 }
 
 /** A vault as returned by `GET /account/vaults`. */

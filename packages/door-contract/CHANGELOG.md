@@ -1,5 +1,13 @@
 # @openparachute/door-contract
 
+## 0.3.0
+
+Adds the optional `vault_url_template` field to `ParachuteAccountDescriptor` — a
+`{name}`-placeholder template a client substitutes to preview a vault's address
+pre-creation, door-agnostically (cloud has both path + subdomain forms, so only
+the door can render the right one). `checkAccountDescriptor` validates it only
+when present (must be a string containing `{name}`). Additive; no breaking change.
+
 ## 0.2.0
 
 C4 (Parachute App campaign, parachute-cloud#116) — the account-door descriptor.
