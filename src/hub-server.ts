@@ -114,6 +114,13 @@
  *                                                 (hub#473; reached after a correct
  *                                                 password for a 2FA-enrolled user)
  *   /logout                       (POST)       → end admin session
+ *   /account/session               (GET)        → same-origin boot oracle {signed_in,
+ *                                                 csrf,...} (hub-parity P1); cookie-gated,
+ *                                                 NOT Bearer — mounted ABOVE the
+ *                                                 force-change-password gate below (a pure
+ *                                                 state oracle, so a pre-rotation user can
+ *                                                 still read it to drive the rotation
+ *                                                 ceremony itself)
  *   /account/change-password      (GET + POST) → user self-service change-password
  *                                                 (force-redirect target for users
  *                                                 with password_changed=false; also
@@ -122,7 +129,8 @@
  *                                                 + the per-vault proxy is hard-gated
  *                                                 per-request on password_changed===true
  *                                                 (forceChangePasswordGate); only this
- *                                                 route and /logout stay reachable
+ *                                                 route, /logout, and /account/session
+ *                                                 (P1, also above the gate) stay reachable
  *                                                 pre-rotation.
  *   /account/token                (POST)       → cookie→account-bearer mint (App
  *                                                 campaign Phase 2 H1): session cookie →
@@ -190,6 +198,7 @@ import {
   handleAccountSetVaultCaps,
   requireAnyScope,
 } from "./account-api.ts";
+import { type AccountSessionDeps, handleAccountSession } from "./account-session.ts";
 import { handleAccountSetupGet, handleAccountSetupPost } from "./account-setup.ts";
 import { handleAccountToken } from "./account-token.ts";
 import { handleAccountVaultAdminTokenPost } from "./account-vault-admin-token.ts";
@@ -3744,6 +3753,20 @@ export function hubFetch(
         if (req.method === "GET") return handleAccountChangePasswordGet(req, accountDeps);
         if (req.method === "POST") return handleAccountChangePasswordPost(req, accountDeps);
         return new Response("method not allowed", { status: 405 });
+      }
+
+      // /account/session — the same-origin boot oracle (hub-parity P1). A
+      // PURE STATE ORACLE, not a mutating surface, so it is mounted ABOVE the
+      // force-change-password gate immediately below: a pre-rotation user
+      // must still be able to read `{signed_in, csrf}` to drive the rotation
+      // ceremony itself, rather than get walled off before it can even ask.
+      // `/account/token` (below the gate) stays gated — a pre-rotation user
+      // hits its 403 `force_change_password` there instead. See
+      // `account-session.ts`.
+      if (pathname === "/account/session") {
+        if (!getDb) return dbNotConfigured();
+        const sessionDeps: AccountSessionDeps = { db: getDb() };
+        return handleAccountSession(req, sessionDeps);
       }
 
       // Per-request force-change-password gate (P0-1 / hub#469). CHOKE POINT 1:

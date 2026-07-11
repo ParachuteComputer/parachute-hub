@@ -5,13 +5,15 @@ import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
   SESSION_COOKIE_NAME,
-  SESSION_MAX_LIFETIME_MS,
+  SESSION_SLIDE_THRESHOLD_MS,
+  SESSION_TTL_MS,
   buildSessionClearCookie,
   buildSessionCookie,
   createSession,
   deleteSession,
   findSession,
   parseSessionCookie,
+  shouldSlideSession,
   touchSession,
 } from "../sessions.ts";
 import { createUser } from "../users.ts";
@@ -57,11 +59,11 @@ describe("createSession + findSession", () => {
     try {
       const epoch = new Date("2026-01-01T00:00:00Z");
       const s = createSession(db, { userId, now: () => epoch });
-      // Past TTL (24h).
-      const later = new Date(epoch.getTime() + 25 * 3600 * 1000);
+      // Past TTL (90 days).
+      const later = new Date(epoch.getTime() + SESSION_TTL_MS + 3600 * 1000);
       expect(findSession(db, s.id, () => later)).toBeNull();
       // Still valid one second before expiry.
-      const justBefore = new Date(epoch.getTime() + 24 * 3600 * 1000 - 1000);
+      const justBefore = new Date(epoch.getTime() + SESSION_TTL_MS - 1000);
       expect(findSession(db, s.id, () => justBefore)?.id).toBe(s.id);
     } finally {
       cleanup();
@@ -78,60 +80,64 @@ describe("touchSession (sliding renewal)", () => {
     try {
       const t0 = new Date("2026-01-01T00:00:00Z");
       const s = createSession(db, { userId, now: () => t0 });
-      // Original expiry: t0 + 24h.
-      expect(new Date(s.expiresAt).getTime()).toBe(t0.getTime() + DAY);
-      // Touch 1h later → expiry becomes (t0 + 1h) + 24h.
+      // Original expiry: t0 + 90d.
+      expect(new Date(s.expiresAt).getTime()).toBe(t0.getTime() + SESSION_TTL_MS);
+      // Touch 1h later → expiry becomes (t0 + 1h) + 90d.
       const t1 = new Date(t0.getTime() + HOUR);
       touchSession(db, s.id, () => t1);
       const found = findSession(db, s.id, () => t1);
-      expect(new Date(found?.expiresAt ?? 0).getTime()).toBe(t1.getTime() + DAY);
+      expect(new Date(found?.expiresAt ?? 0).getTime()).toBe(t1.getTime() + SESSION_TTL_MS);
     } finally {
       cleanup();
     }
   });
 
-  test("a touched session outlives the ORIGINAL 24h expiry", async () => {
+  test("a touched session outlives the ORIGINAL 90d expiry", async () => {
     const { db, userId, cleanup } = await makeDb();
     try {
       const t0 = new Date("2026-01-01T00:00:00Z");
       const s = createSession(db, { userId, now: () => t0 });
-      // Activity at +12h slides expiry to +36h.
-      touchSession(db, s.id, () => new Date(t0.getTime() + 12 * HOUR));
-      // At +30h — PAST the original +24h — the session is still alive.
-      const at30h = new Date(t0.getTime() + 30 * HOUR);
-      expect(findSession(db, s.id, () => at30h)?.id).toBe(s.id);
+      // Activity at +45d slides expiry to +135d.
+      touchSession(db, s.id, () => new Date(t0.getTime() + 45 * DAY));
+      // At +100d — PAST the original +90d — the session is still alive.
+      const at100d = new Date(t0.getTime() + 100 * DAY);
+      expect(findSession(db, s.id, () => at100d)?.id).toBe(s.id);
     } finally {
       cleanup();
     }
   });
 
-  test("an UNtouched session still expires at the original 24h", async () => {
+  test("an UNtouched session still expires at the original 90d", async () => {
     const { db, userId, cleanup } = await makeDb();
     try {
       const t0 = new Date("2026-01-01T00:00:00Z");
       const s = createSession(db, { userId, now: () => t0 });
-      // No touch — at +25h it's gone (today's absolute-TTL behavior preserved
-      // for idle / closed tabs that stop re-minting).
-      const at25h = new Date(t0.getTime() + 25 * HOUR);
-      expect(findSession(db, s.id, () => at25h)).toBeNull();
+      // No touch — one day past the 90d TTL it's gone (idle / closed tabs
+      // that stop re-minting still lapse at the full TTL).
+      const past = new Date(t0.getTime() + SESSION_TTL_MS + DAY);
+      expect(findSession(db, s.id, () => past)).toBeNull();
     } finally {
       cleanup();
     }
   });
 
-  test("caps at created_at + SESSION_MAX_LIFETIME_MS (sliding can't run forever)", async () => {
+  test("NO ceiling (Q4) — an actively-touched session rolls forward indefinitely", async () => {
+    // The old SESSION_MAX_LIFETIME_MS (30d) absolute cap is gone: repeatedly
+    // touching a session keeps sliding its expiry to now + 90d with no upper
+    // bound, matching cloud's rolling posture (an idle session still lapses
+    // at the TTL; an active one never does).
     const { db, userId, cleanup } = await makeDb();
     try {
       const t0 = new Date("2026-01-01T00:00:00Z");
       const s = createSession(db, { userId, now: () => t0 });
-      const ceiling = t0.getTime() + SESSION_MAX_LIFETIME_MS;
-      // A touch near the ceiling would slide to now + 24h, but the cap pins it.
-      const nearCeiling = new Date(ceiling - HOUR); // raw slide would be ceiling + 23h
-      touchSession(db, s.id, () => nearCeiling);
-      const found = findSession(db, s.id, () => nearCeiling);
-      expect(new Date(found?.expiresAt ?? 0).getTime()).toBe(ceiling);
-      // Past the ceiling the session is dead even though it was just "active".
-      expect(findSession(db, s.id, () => new Date(ceiling + 1000))).toBeNull();
+      // Touch well past where the old 30-day ceiling would have pinned it.
+      const farOut = new Date(t0.getTime() + 200 * DAY);
+      touchSession(db, s.id, () => farOut);
+      const found = findSession(db, s.id, () => farOut);
+      expect(new Date(found?.expiresAt ?? 0).getTime()).toBe(farOut.getTime() + SESSION_TTL_MS);
+      // Still alive nearly 90 more days out, right up to the fresh slide's TTL.
+      const stillAlive = new Date(farOut.getTime() + SESSION_TTL_MS - DAY);
+      expect(findSession(db, s.id, () => stillAlive)?.id).toBe(s.id);
     } finally {
       cleanup();
     }
@@ -141,6 +147,47 @@ describe("touchSession (sliding renewal)", () => {
     const { db, cleanup } = await makeDb();
     try {
       expect(() => touchSession(db, "no-such-session")).not.toThrow();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("shouldSlideSession (bounded slide, G3 twin)", () => {
+  test("false for a freshly-created session (full TTL remaining)", async () => {
+    const { db, userId, cleanup } = await makeDb();
+    try {
+      const t0 = new Date("2026-01-01T00:00:00Z");
+      const s = createSession(db, { userId, now: () => t0 });
+      expect(shouldSlideSession(s, () => t0)).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("false just before crossing the slide threshold", async () => {
+    const { db, userId, cleanup } = await makeDb();
+    try {
+      const t0 = new Date("2026-01-01T00:00:00Z");
+      const s = createSession(db, { userId, now: () => t0 });
+      // Elapsed just UNDER the threshold (30d) → remaining life still above
+      // (TTL - threshold) → not yet due to slide.
+      const justBefore = new Date(t0.getTime() + SESSION_SLIDE_THRESHOLD_MS - 1000);
+      expect(shouldSlideSession(s, () => justBefore)).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("true once remaining life drops below the slide threshold", async () => {
+    const { db, userId, cleanup } = await makeDb();
+    try {
+      const t0 = new Date("2026-01-01T00:00:00Z");
+      const s = createSession(db, { userId, now: () => t0 });
+      // Elapsed just OVER the threshold (30d) → remaining life below
+      // (TTL - threshold) → due to slide.
+      const justAfter = new Date(t0.getTime() + SESSION_SLIDE_THRESHOLD_MS + 1000);
+      expect(shouldSlideSession(s, () => justAfter)).toBe(true);
     } finally {
       cleanup();
     }
