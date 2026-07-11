@@ -47,13 +47,20 @@ export function validateVaultScopes(requested: unknown, vaultName: string): Vaul
   if (requested === undefined || requested === null) {
     return { ok: true, scopes: defaultVaultScopes(vaultName) };
   }
-  if (!Array.isArray(requested)) return { ok: false, reason: "invalid_request" };
+  // Whole-array structural check FIRST (byte-exact with hub's `parseScopesBody`,
+  // which does `!Array.isArray || requested.some(non-string)` before the per-entry
+  // scope loop): a non-array, or ANY non-string entry, is `invalid_request` — even
+  // when a well-formed-but-wrong scope string sits earlier in the array. Without
+  // this pre-scan a mixed array like `["vault:other:read", 123]` would positionally
+  // report `invalid_scope`, flipping hub's wire code on adoption (P2/P3).
+  if (!Array.isArray(requested) || requested.some((s) => typeof s !== "string")) {
+    return { ok: false, reason: "invalid_request" };
+  }
   if (requested.length === 0) {
     return { ok: true, scopes: defaultVaultScopes(vaultName) };
   }
   const scopes = new Set<string>();
-  for (const s of requested) {
-    if (typeof s !== "string") return { ok: false, reason: "invalid_request" };
+  for (const s of requested as string[]) {
     const parts = s.split(":");
     if (parts.length !== 3) return { ok: false, reason: "invalid_scope" };
     const [resource, name, verb] = parts as [string, string, string];

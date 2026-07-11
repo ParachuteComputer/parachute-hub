@@ -594,6 +594,16 @@ describe("validateVaultScopes (P0)", () => {
     });
   });
 
+  test("a mixed array (a wrong scope BEFORE a non-string) is invalid_request, not invalid_scope", () => {
+    // Byte-exact with hub's whole-array non-string pre-scan: a non-string entry
+    // ANYWHERE makes the request invalid_request even if a bad-but-well-formed
+    // scope string sits earlier. Guards P2/P3 adoption against an error-code flip.
+    expect(validateVaultScopes(["vault:other:read", 123], "moss")).toEqual({
+      ok: false,
+      reason: "invalid_request",
+    });
+  });
+
   test("one bad entry among good ones rejects the WHOLE request (no partial grant)", () => {
     expect(validateVaultScopes(["vault:moss:read", "vault:other:read"], "moss")).toEqual({
       ok: false,
