@@ -1,5 +1,50 @@
 # @openparachute/door-contract
 
+## 0.4.0
+
+The auth block + the session/token wire canon (hub-parity P0). `signup_path` and
+`app_client_id` on `ParachuteAccountDescriptor` move from required to OPTIONAL
+(a door advertises each only when it applies — hub's `signup_path` only while an
+active public invite exists (Q2), a door with no reserved native client omits
+`app_client_id`); `checkAccountDescriptor` validates both only when present. Adds
+`AccountAuthDescriptor` (`methods`, `signin_path`) + optional `auth` on the
+descriptor — drives the app's front-door branch (magic-link form vs a
+ceremony-hop to the door's own sign-in page); optional in 0.4.0 so cloud@main
+keeps typechecking pre-P3, required from 0.5.0. `AccountRoute` gains
+`optional?: boolean`; `GET /account` and the `/account/vaults/<name>/caps`
+routes are now marked optional in `ACCOUNT_ROUTES` (hub-only — cloud routes
+`GET /account` to its SPA shell and derives caps from plan, not a per-vault
+knob). New wire types written down once from the app's pinned shapes:
+`AccountSessionResponse` (`GET /account/session`), `AccountTokenMintResponse`
+(`POST /account/token`), `VaultTokenMintResponse`
+(`POST /account/vaults/<name>/token`) — each with a matching `check*`
+conformance helper. `ACCOUNT_ERROR_CODES` pins the shared `/account/*` error
+vocabulary both doors already mirror. New `vault-scopes.ts`:
+`validateVaultScopes(requested, vaultName)`, the ONE shared scope-shape
+validator replacing hub's `parseScopesBody` scope logic and cloud's local
+`validateVaultScopes` (cross-repo derived-key lesson) — absent/null/empty
+requests default to `vault:<name>:{read,write}`, every entry must be exactly
+`vault:<name>:{read|write|admin}`, results are de-duplicated. Additive to the
+type surface; no existing call signature changes.
+
+Review-fold (P0 review):
+- `validateVaultScopes` now returns `{ ok: false; reason: "invalid_request" |
+  "invalid_scope" }` on rejection (was a bare `{ ok: false }`) — the `reason`
+  carries the door's wire error code so a door adopting the shared validator
+  (P2/P3) keeps its exact HTTP error without re-deriving the split
+  (`invalid_request` = non-array / non-string entry; `invalid_scope` =
+  well-formed string naming the wrong resource/vault/verb, matching hub's
+  `parseScopesBody`). New `VaultScopesReason` type. Nothing consumes the
+  validator yet, so this is pure additive design.
+- `ACCOUNT_ERROR_CODES` was born incomplete; added the codes both doors already
+  emit but the pin missed: `account_suspended`, `not_found` (cloud),
+  `method_not_allowed`, `server_error` (hub). Now the real union.
+- Hardened the new conformance checkers: `checkAccountSessionResponse` requires
+  `email`/`username` to be a string when present (not merely present);
+  `checkVaultTokenMintResponse` requires the `vault:<name>` services entry to
+  carry a string `url`; `isParseableTimestamp` now enforces true ISO-8601
+  (rejecting `Date.parse`-lenient locale strings like `"January 1, 2026"`).
+
 ## 0.3.0
 
 Adds the optional `vault_url_template` field to `ParachuteAccountDescriptor` — a

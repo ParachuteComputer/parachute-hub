@@ -58,6 +58,7 @@ export {
 export {
   type AccountRoute,
   ACCOUNT_ROUTES,
+  type AccountAuthDescriptor,
   type ParachuteAccountDescriptor,
   type AccountPlanSummary,
   type AccountCapabilities,
@@ -65,7 +66,17 @@ export {
   type CreateVaultRequest,
   type MintVaultTokenRequest,
   type AccountBootstrap,
+  type AccountSessionResponse,
+  type AccountTokenMintResponse,
+  type VaultTokenMintResponse,
+  ACCOUNT_ERROR_CODES,
+  type AccountErrorCode,
 } from "./account-contract.js";
+
+export {
+  type VaultScopesResult,
+  validateVaultScopes,
+} from "./vault-scopes.js";
 
 export {
   type ConformanceIssue,
@@ -73,5 +84,8 @@ export {
   checkProtectedResourceMetadata,
   checkTokenResponseInvariants,
   checkAccountDescriptor,
+  checkAccountSessionResponse,
+  checkAccountTokenMintResponse,
+  checkVaultTokenMintResponse,
   ACCOUNT_ROUTE_VECTORS,
 } from "./conformance.js";

@@ -19,6 +19,12 @@ export interface AccountRoute {
   /** The minimum account verb the route requires. */
   scope: AccountVerb;
   summary: string;
+  /**
+   * When `true`, this route is not mounted by every door — a door may omit it
+   * without breaking the contract (e.g. it's superseded, or the door's
+   * equivalent lives elsewhere). Absent/`false` = every door mounts this route.
+   */
+  optional?: boolean;
 }
 
 /**
@@ -31,6 +37,10 @@ export const ACCOUNT_ROUTES: readonly AccountRoute[] = [
     path: "/account",
     scope: "read",
     summary: "Account bootstrap (id, email, door).",
+    // Optional: hub-only. Cloud routes a browser GET /account to the SPA
+    // shell (the app's Account screen), not a worker JSON handler (#146) — the
+    // app bootstraps via GET /account/session + GET /account/summary instead.
+    optional: true,
   },
   {
     method: "GET",
@@ -61,12 +71,17 @@ export const ACCOUNT_ROUTES: readonly AccountRoute[] = [
     path: "/account/vaults/<name>/caps",
     scope: "read",
     summary: "Read a vault's storage caps.",
+    // Optional: hub-only. Cloud's caps are plan-derived (no per-vault storage
+    // cap knob to read back) — there is nothing for cloud to mount here.
+    optional: true,
   },
   {
     method: "PUT",
     path: "/account/vaults/<name>/caps",
     scope: "admin",
     summary: "Set a vault's storage caps.",
+    // Optional: hub-only, same reason as the GET above.
+    optional: true,
   },
 ] as const;
 
@@ -97,6 +112,17 @@ export interface AccountCapabilities {
 }
 
 /**
+ * How a person signs IN at this door — drives the app's front-door branch
+ * (magic-link email form vs a ceremony-hop card to the door's own sign-in page).
+ */
+export interface AccountAuthDescriptor {
+  /** Sign-in methods, most-preferred first. */
+  methods: ("magic_link" | "password")[];
+  /** Absolute path of the door's sign-in ceremony; honors `?next=<path>`. */
+  signin_path: string;
+}
+
+/**
  * The public descriptor served at `GET /.well-known/parachute-account` — the
  * door's self-description a client fetches to learn where to sign up, where the
  * account API lives, which first-party client to use, and what the door can do.
@@ -111,10 +137,26 @@ export interface ParachuteAccountDescriptor {
   door: "hub" | "cloud";
   /** The `/account/*` API base — always `${issuer}/account`. */
   account_endpoint: string;
-  /** Where a brand-new user begins sign-up (cloud `"/signup"`, hub `"/account/setup"`). */
-  signup_path: string;
-  /** The reserved first-party `client_id` a native app should use (cloud `"parachute-app"`). */
-  app_client_id: string;
+  /**
+   * How a person signs IN at this door. Optional in 0.4.0 so cloud@main keeps
+   * typechecking while it lands its own twin (P3); P7 flips this required once
+   * both doors serve it.
+   */
+  auth?: AccountAuthDescriptor;
+  /**
+   * Present only when the door currently offers self-serve signup (cloud:
+   * always, `/signup`; hub: only while an active multi-use public invite
+   * exists — Q2). Absent = no self-serve path right now (an operator-shared
+   * link is the only way in).
+   */
+  signup_path?: string;
+  /**
+   * The reserved first-party `client_id` a native app should use (cloud
+   * `"parachute-app"`). The hosted flow never OAuths its home door (C4-C5
+   * §7.6); retained for cross-origin native clients that do. Optional because
+   * a door with no such reserved client has nothing to advertise here.
+   */
+  app_client_id?: string;
   /** Which account-lifecycle operations this door supports. */
   capabilities: AccountCapabilities;
   /** The plan/tier ladder this door offers (empty for self-host). */
@@ -157,3 +199,74 @@ export interface AccountBootstrap {
   email?: string;
   door: "hub" | "cloud";
 }
+
+/**
+ * `GET /account/session` — the same-origin boot oracle (both doors). Public
+ * per-request state check the app polls on first load (and while it waits for
+ * a magic-link click); NOT gated on the account Bearer — it drives the cookie
+ * session directly.
+ */
+export interface AccountSessionResponse {
+  signed_in: boolean;
+  /** Anonymous-capable CSRF (G2) — present on BOTH branches. */
+  csrf: string;
+  /**
+   * Signed-in branch. Cloud always has email; hub email is nullable-by-history
+   * (`users.email`, migration v15) so hub sends `username` and email-when-present.
+   */
+  email?: string;
+  username?: string;
+  account_created_at?: string;
+}
+
+/**
+ * `POST /account/token` success (both doors; NOT RFC-6749 — deliberate: this is
+ * the account-scoped credential a same-origin session mints, not an OAuth grant).
+ */
+export interface AccountTokenMintResponse {
+  token: string;
+  expires_at: string;
+  scopes: string[];
+  aud: "account";
+}
+
+/** `POST /account/vaults/<name>/token` success (both doors). */
+export interface VaultTokenMintResponse {
+  vault_token: string;
+  expires_at: string;
+  services: Record<string, { url: string; version?: string }>;
+}
+
+/**
+ * The shared `/account/*` error vocabulary — the UNION of codes both doors
+ * actually emit on the account surface (verified against hub `account-api.ts`
+ * and cloud `workers/identity/src/account-api.ts`), not an aspirational subset.
+ * Auth-gate failures use `{error, error_description}` (OAuth-style, matching the
+ * token endpoint); resource-level failures use `{error, message}`. When a door
+ * adds a new code, add it here in the same PR so this stays the real union.
+ */
+export const ACCOUNT_ERROR_CODES = [
+  "invalid_request",
+  "invalid_name",
+  "reserved",
+  "vault_taken",
+  "not_owner",
+  "vault_not_found",
+  "vault_limit_reached",
+  "invalid_scope",
+  "not_implemented",
+  "insufficient_scope",
+  "invalid_token",
+  "unauthenticated",
+  "csrf_failed",
+  "foreign_origin",
+  "force_change_password",
+  // Emitted today but missing from the original pin (found by the P0 review):
+  "account_suspended", // cloud — suspended account hits any /account/* route
+  "method_not_allowed", // hub — wrong verb on an account route
+  "not_found", // cloud — unknown /account/vaults/<name> subroute
+  "server_error", // hub — vault provisioning failed for a non-name reason
+] as const;
+
+/** One member of {@link ACCOUNT_ERROR_CODES}. */
+export type AccountErrorCode = (typeof ACCOUNT_ERROR_CODES)[number];
