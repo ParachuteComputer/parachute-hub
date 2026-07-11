@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   ACCESS_TOKEN_TTL_SECONDS,
+  ACCOUNT_ERROR_CODES,
   ACCOUNT_ROUTES,
   ACCOUNT_SELF_ADMIN_SCOPE,
   ACCOUNT_SELF_READ_SCOPE,
@@ -9,13 +10,17 @@ import {
   TOKEN_TYPE,
   accountScope,
   checkAccountDescriptor,
+  checkAccountSessionResponse,
+  checkAccountTokenMintResponse,
   checkAuthorizationServerMetadata,
   checkProtectedResourceMetadata,
   checkTokenResponseInvariants,
+  checkVaultTokenMintResponse,
   expectedAuthorizationServerMetadata,
   expectedProtectedResourceMetadata,
   hasAccountScope,
   parseAccountScope,
+  validateVaultScopes,
 } from "../index.js";
 
 const CONFORMANT_DESCRIPTOR = {
@@ -208,7 +213,10 @@ describe("parachute-account descriptor (C4)", () => {
     // Present + valid → conformant.
     expect(
       checkAccountDescriptor(
-        { ...CONFORMANT_DESCRIPTOR, vault_url_template: "https://u.parachute.computer/vault/{name}" },
+        {
+          ...CONFORMANT_DESCRIPTOR,
+          vault_url_template: "https://u.parachute.computer/vault/{name}",
+        },
         expected,
       ),
     ).toEqual([]);
@@ -219,5 +227,298 @@ describe("parachute-account descriptor (C4)", () => {
     );
     expect(bad.length).toBe(1);
     expect(bad[0]?.detail).toContain("vault_url_template");
+  });
+
+  test("signup_path / app_client_id are OPTIONAL (P0) — absent is still conformant", () => {
+    const { signup_path, app_client_id, ...withoutOptionalFields } = CONFORMANT_DESCRIPTOR;
+    expect(checkAccountDescriptor(withoutOptionalFields, expected)).toEqual([]);
+  });
+
+  test("signup_path, when present, must still be an absolute path", () => {
+    const issues = checkAccountDescriptor(
+      { ...CONFORMANT_DESCRIPTOR, signup_path: "signup" },
+      expected,
+    );
+    expect(issues.length).toBe(1);
+    expect(issues[0]?.detail).toContain("signup_path");
+  });
+
+  test("app_client_id, when present, must still be non-empty", () => {
+    const issues = checkAccountDescriptor(
+      { ...CONFORMANT_DESCRIPTOR, app_client_id: "" },
+      expected,
+    );
+    expect(issues.length).toBe(1);
+    expect(issues[0]?.detail).toContain("app_client_id");
+  });
+
+  test("auth is OPTIONAL (P0) — absent is conformant, present + valid is conformant", () => {
+    const { signup_path, app_client_id, ...base } = CONFORMANT_DESCRIPTOR;
+    expect(checkAccountDescriptor(base, expected)).toEqual([]);
+    expect(
+      checkAccountDescriptor(
+        { ...base, auth: { methods: ["magic_link"], signin_path: "/login" } },
+        expected,
+      ),
+    ).toEqual([]);
+  });
+
+  test("auth, when present, pins methods + signin_path", () => {
+    const { signup_path, app_client_id, ...base } = CONFORMANT_DESCRIPTOR;
+    expect(
+      checkAccountDescriptor({ ...base, auth: { methods: [], signin_path: "/login" } }, expected)
+        .length,
+    ).toBe(1); // empty methods
+    expect(
+      checkAccountDescriptor(
+        { ...base, auth: { methods: ["carrier_pigeon"], signin_path: "/login" } },
+        expected,
+      ).length,
+    ).toBe(1); // unknown method
+    expect(
+      checkAccountDescriptor(
+        { ...base, auth: { methods: ["password"], signin_path: "login" } },
+        expected,
+      ).length,
+    ).toBe(1); // not absolute
+    expect(checkAccountDescriptor({ ...base, auth: "nope" }, expected).length).toBe(1); // not an object
+  });
+});
+
+describe("account route table — optional flag (P0)", () => {
+  test("GET /account and the caps routes are marked optional (hub-only)", () => {
+    const byKey = (m: string, p: string) =>
+      ACCOUNT_ROUTES.find((r) => r.method === m && r.path === p);
+    expect(byKey("GET", "/account")?.optional).toBe(true);
+    expect(byKey("GET", "/account/vaults/<name>/caps")?.optional).toBe(true);
+    expect(byKey("PUT", "/account/vaults/<name>/caps")?.optional).toBe(true);
+  });
+
+  test("the core vault-lifecycle routes are NOT optional — every door mounts them", () => {
+    const byKey = (m: string, p: string) =>
+      ACCOUNT_ROUTES.find((r) => r.method === m && r.path === p);
+    expect(byKey("GET", "/account/vaults")?.optional).toBeUndefined();
+    expect(byKey("POST", "/account/vaults")?.optional).toBeUndefined();
+    expect(byKey("DELETE", "/account/vaults/<name>")?.optional).toBeUndefined();
+    expect(byKey("POST", "/account/vaults/<name>/token")?.optional).toBeUndefined();
+  });
+});
+
+describe("ACCOUNT_ERROR_CODES", () => {
+  test("pins the shared /account/* error vocabulary", () => {
+    expect(ACCOUNT_ERROR_CODES).toEqual([
+      "invalid_request",
+      "invalid_name",
+      "reserved",
+      "vault_taken",
+      "not_owner",
+      "vault_not_found",
+      "vault_limit_reached",
+      "invalid_scope",
+      "not_implemented",
+      "insufficient_scope",
+      "invalid_token",
+      "unauthenticated",
+      "csrf_failed",
+      "foreign_origin",
+      "force_change_password",
+    ]);
+  });
+});
+
+describe("checkAccountSessionResponse (P0)", () => {
+  test("signed-out: a conformant body reports zero issues", () => {
+    expect(
+      checkAccountSessionResponse({ signed_in: false, csrf: "tok" }, { signedIn: false }),
+    ).toEqual([]);
+  });
+
+  test("signed-out: csrf must still be present (the G2 anonymous-CSRF invariant)", () => {
+    const issues = checkAccountSessionResponse({ signed_in: false, csrf: "" }, { signedIn: false });
+    expect(issues.length).toBe(1);
+    expect(issues[0]?.detail).toContain("csrf");
+  });
+
+  test("signed-out: an identity field leaking through is an issue", () => {
+    const issues = checkAccountSessionResponse(
+      { signed_in: false, csrf: "tok", username: "leaked" },
+      { signedIn: false },
+    );
+    expect(issues.length).toBe(1);
+    expect(issues[0]?.detail).toContain("username");
+  });
+
+  test("signed-in: a conformant body (username, no email) reports zero issues", () => {
+    expect(
+      checkAccountSessionResponse(
+        {
+          signed_in: true,
+          csrf: "tok",
+          username: "aaron",
+          account_created_at: "2026-01-01T00:00:00Z",
+        },
+        { signedIn: true },
+      ),
+    ).toEqual([]);
+  });
+
+  test("signed-in: a conformant body (email, no username) also reports zero issues", () => {
+    expect(
+      checkAccountSessionResponse(
+        { signed_in: true, csrf: "tok", email: "a@example.com" },
+        { signedIn: true },
+      ),
+    ).toEqual([]);
+  });
+
+  test("signed-in: neither email nor username present is an issue", () => {
+    const issues = checkAccountSessionResponse(
+      { signed_in: true, csrf: "tok" },
+      { signedIn: true },
+    );
+    expect(issues.length).toBe(1);
+    expect(issues[0]?.detail).toContain("email/username");
+  });
+
+  test("signed-in: a non-ISO account_created_at is an issue", () => {
+    const issues = checkAccountSessionResponse(
+      { signed_in: true, csrf: "tok", username: "aaron", account_created_at: "not-a-date" },
+      { signedIn: true },
+    );
+    expect(issues.length).toBe(1);
+    expect(issues[0]?.detail).toContain("account_created_at");
+  });
+
+  test("signed_in mismatched against the expected branch is an issue", () => {
+    const issues = checkAccountSessionResponse(
+      { signed_in: true, csrf: "tok", username: "aaron" },
+      { signedIn: false },
+    );
+    expect(issues.some((i) => i.detail.includes("signed_in"))).toBe(true);
+  });
+});
+
+describe("checkAccountTokenMintResponse (P0)", () => {
+  const GREEN = {
+    token: "t.o.k",
+    expires_at: "2026-01-01T00:15:00Z",
+    scopes: ["account:self:admin"],
+    aud: "account",
+  };
+
+  test("a conformant body reports zero issues", () => {
+    expect(checkAccountTokenMintResponse(GREEN)).toEqual([]);
+  });
+
+  test("empty token is an issue", () => {
+    expect(checkAccountTokenMintResponse({ ...GREEN, token: "" }).length).toBe(1);
+  });
+
+  test("non-ISO expires_at is an issue (future-ness is NOT pinned — clock-free)", () => {
+    expect(checkAccountTokenMintResponse({ ...GREEN, expires_at: "whenever" }).length).toBe(1);
+    // A timestamp in the PAST still passes — only parseability is pinned.
+    expect(checkAccountTokenMintResponse({ ...GREEN, expires_at: "2000-01-01T00:00:00Z" })).toEqual(
+      [],
+    );
+  });
+
+  test("empty scopes array is an issue", () => {
+    expect(checkAccountTokenMintResponse({ ...GREEN, scopes: [] }).length).toBe(1);
+  });
+
+  test("wrong aud is an issue", () => {
+    expect(checkAccountTokenMintResponse({ ...GREEN, aud: "vault.default" }).length).toBe(1);
+  });
+});
+
+describe("checkVaultTokenMintResponse (P0)", () => {
+  const GREEN = {
+    vault_token: "v.t.k",
+    expires_at: "2026-01-01T00:15:00Z",
+    services: { "vault:moss": { url: "https://example.com/vault/moss" } },
+  };
+
+  test("a conformant body reports zero issues", () => {
+    expect(checkVaultTokenMintResponse(GREEN, "moss")).toEqual([]);
+  });
+
+  test("empty vault_token is an issue", () => {
+    expect(checkVaultTokenMintResponse({ ...GREEN, vault_token: "" }, "moss").length).toBe(1);
+  });
+
+  test("non-ISO expires_at is an issue", () => {
+    expect(checkVaultTokenMintResponse({ ...GREEN, expires_at: "whenever" }, "moss").length).toBe(
+      1,
+    );
+  });
+
+  test("services missing the vault:<name> key is an issue", () => {
+    expect(
+      checkVaultTokenMintResponse({ ...GREEN, services: { "vault:other": { url: "x" } } }, "moss")
+        .length,
+    ).toBe(1);
+  });
+});
+
+describe("validateVaultScopes (P0)", () => {
+  test("absent (undefined) defaults to read+write", () => {
+    expect(validateVaultScopes(undefined, "moss")).toEqual({
+      ok: true,
+      scopes: ["vault:moss:read", "vault:moss:write"],
+    });
+  });
+
+  test("null defaults to read+write", () => {
+    expect(validateVaultScopes(null, "moss")).toEqual({
+      ok: true,
+      scopes: ["vault:moss:read", "vault:moss:write"],
+    });
+  });
+
+  test("empty array defaults to read+write", () => {
+    expect(validateVaultScopes([], "moss")).toEqual({
+      ok: true,
+      scopes: ["vault:moss:read", "vault:moss:write"],
+    });
+  });
+
+  test("a valid single-scope request round-trips", () => {
+    expect(validateVaultScopes(["vault:moss:admin"], "moss")).toEqual({
+      ok: true,
+      scopes: ["vault:moss:admin"],
+    });
+  });
+
+  test("duplicate entries are de-duplicated", () => {
+    expect(validateVaultScopes(["vault:moss:read", "vault:moss:read"], "moss")).toEqual({
+      ok: true,
+      scopes: ["vault:moss:read"],
+    });
+  });
+
+  test("a foreign vault name rejects the whole request", () => {
+    expect(validateVaultScopes(["vault:other:read"], "moss")).toEqual({ ok: false });
+  });
+
+  test("a non-vault resource (account:*) rejects the whole request", () => {
+    expect(validateVaultScopes(["account:self:admin"], "moss")).toEqual({ ok: false });
+  });
+
+  test("an unknown verb rejects the whole request", () => {
+    expect(validateVaultScopes(["vault:moss:execute"], "moss")).toEqual({ ok: false });
+  });
+
+  test("a non-string entry rejects the whole request", () => {
+    expect(validateVaultScopes([123], "moss")).toEqual({ ok: false });
+  });
+
+  test("a non-array, non-nullish value rejects the whole request", () => {
+    expect(validateVaultScopes("vault:moss:read", "moss")).toEqual({ ok: false });
+  });
+
+  test("one bad entry among good ones rejects the WHOLE request (no partial grant)", () => {
+    expect(validateVaultScopes(["vault:moss:read", "vault:other:read"], "moss")).toEqual({
+      ok: false,
+    });
   });
 });

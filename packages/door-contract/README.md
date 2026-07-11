@@ -23,7 +23,8 @@ owns the **door/issuer** side.
 | `tokens.ts` | `ACCESS_TOKEN_TTL_SECONDS`, `REFRESH_TOKEN_TTL_MS`, `REFRESH_GRACE_MS`, `TOKEN_TYPE`, `SIGNING_ALG` + `AccessTokenClaims` / `TokenResponse` |
 | `scopes.ts` | the `account:<id>:<verb>` grammar (`admin ⊇ read`) + `hasAccountScope` |
 | `discovery.ts` | RFC 8414 / 9728 metadata vectors: `expected*Metadata(issuer, …)` |
-| `account-contract.ts` | the `/account/*` route table (`ACCOUNT_ROUTES`) + request/response types |
+| `account-contract.ts` | the `/account/*` route table (`ACCOUNT_ROUTES`) + request/response types, the `AccountAuthDescriptor` block, and `ACCOUNT_ERROR_CODES` |
+| `vault-scopes.ts` | `validateVaultScopes(requested, vaultName)` — the shared per-vault-mint scope validator |
 | `conformance.ts` | the shared corpus + `check*` helpers a door's suite drives against its live handlers |
 
 ## Usage — a door's conformance suite
