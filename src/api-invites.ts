@@ -32,6 +32,7 @@ import type { Database } from "bun:sqlite";
 import { type AdminAuthError, adminAuthErrorResponse, requireScope } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
+import { setSetting } from "./hub-settings.ts";
 import {
   DEFAULT_INVITE_TTL_SECONDS,
   type Invite,
@@ -543,6 +544,16 @@ export async function handleCreateInvite(req: Request, deps: ApiInvitesDeps): Pr
     vaultCapBytes: effectiveVaultCapBytes,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
+  // Q2 (hub-parity P2, the raw-token reality): a multi-use link IS the
+  // public signup page (the operator mints it to broadcast) — persisting
+  // ITS raw token so the account descriptor can advertise `signup_path`
+  // does NOT weaken the hash-only posture of single-use friend invites,
+  // which never write this row. The newest public link wins (overwrites any
+  // prior value); `activePublicSignupPath` (invites.ts) re-validates
+  // liveness on every read and lazily clears a revoked/exhausted/expired one.
+  if (maxUses > 1) {
+    setSetting(deps.db, "public_signup_token", issued.rawToken, deps.now ?? (() => new Date()));
+  }
   const status = inviteStatus(issued.invite, now);
   return new Response(
     JSON.stringify({

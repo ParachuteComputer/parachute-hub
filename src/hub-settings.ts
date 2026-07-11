@@ -122,7 +122,21 @@ export type HubSettingKey =
   // wizard funnel + pre-admin 503 lockout run BEFORE this redirect, so a
   // not-yet-set-up hub still lands on setup, not a surface that can't work
   // yet.
-  | "root_redirect";
+  | "root_redirect"
+  // hub-parity P2 (Q2): the RAW token of the newest PUBLIC (multi-use,
+  // `max_uses > 1`) invite — persisted so `GET /.well-known/parachute-account`
+  // can advertise `signup_path` without being able to reconstruct it from the
+  // `invites` table (which stores only `sha256(token)`, see invites.ts's
+  // module doc). Written by `api-invites.ts`'s `handleCreateInvite` right
+  // after a successful multi-use `issueInvite`; read (and lazily cleared once
+  // stale) by `invites.ts`'s `activePublicSignupPath`.
+  //
+  // This does NOT weaken the hash-only posture of single-use friend invites
+  // (`max_uses === 1`, the default) — those NEVER write this row. A
+  // multi-use link is, by construction, the operator's deliberately PUBLIC
+  // signup page (minted to broadcast), so persisting its raw token is no
+  // more sensitive than the link itself already being handed out widely.
+  | "public_signup_token";
 
 export type SetupExposeMode = "localhost" | "tailnet" | "public";
 

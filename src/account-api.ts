@@ -33,6 +33,11 @@
  * ownership gate the cloud twin runs per-vault is trivially satisfied here.
  */
 import type { Database } from "bun:sqlite";
+import {
+  type AccountBootstrap,
+  type ParachuteAccountDescriptor,
+  validateVaultScopes,
+} from "@openparachute/door-contract";
 import { ACCOUNT_VAULT_TOKEN_TTL_SECONDS } from "./account-home-ui.ts";
 import {
   type AdminAuthContext,
@@ -42,6 +47,7 @@ import {
 } from "./admin-auth.ts";
 import { HOST_ADMIN_SCOPE, provisionVault } from "./admin-vaults.ts";
 import { SERVICES_MANIFEST_PATH } from "./config.ts";
+import { activePublicSignupPath } from "./invites.ts";
 import { inferAudience } from "./jwt-audience.ts";
 import { recordTokenMint, signAccessToken, validateAccessToken } from "./jwt-sign.ts";
 import { ACCOUNT_SELF_ADMIN_SCOPE, ACCOUNT_SELF_READ_SCOPE } from "./scope-explanations.ts";
@@ -102,10 +108,14 @@ export interface AccountApiDeps {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-function json(status: number, body: unknown): Response {
+function json(status: number, body: unknown, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json", "cache-control": "no-store" },
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      ...extraHeaders,
+    },
   });
 }
 
@@ -200,43 +210,69 @@ function servicesBlock(meta: VaultMeta): Record<string, { url: string; version: 
 // ---------------------------------------------------------------------------
 
 /**
- * The self-host door descriptor. Public, no auth — it is what lets the app
- * render honestly per door (D2): `billing:false` + `plans:[]` means the app
- * shows no billing/upgrade UI on self-host; `caps_writable:true` means the
- * operator can PUT caps freely (the cloud twin is plan-derived → false).
+ * The self-host door descriptor — the canonical `ParachuteAccountDescriptor`
+ * (door-contract 0.4.0) both doors serve, so a client (the app) branches its
+ * front door without hardcoding per-door shapes. Public, no auth, wildcard
+ * CORS (the app pulls it cross-origin).
  *
- * `import`/`export` describe the self-host DOOR's portability capability
- * (which it has). The `/account/vaults/<name>/export` + `/account/vaults/import`
- * REST endpoints are a follow-on to this PR (H2 ships the vault-lifecycle +
- * caps core); the flags stay true because the door supports portability.
+ * `features`/`caps_writable` are hub EXTRAS beyond the shared contract — the
+ * shared conformance checker (`checkAccountDescriptor`) walks expected keys
+ * only, so these ride along without breaking cross-door conformance.
+ * `billing:false` + `plans:[]` (Q7, parked) mean the app shows no
+ * billing/upgrade UI on self-host; `caps_writable:true` means the operator
+ * can PUT caps freely (the cloud twin is plan-derived → false).
+ *
+ * `signup_path` is conditional (Q2): present only while an active multi-use
+ * public invite exists (`activePublicSignupPath`, invites.ts) — an operator-
+ * shared link is otherwise the only way in, so the app must not render a
+ * "create account" affordance when there is nowhere for it to go.
  */
-export function handleAccountCapabilities(req: Request, deps: { issuer: string }): Response {
+export function handleAccountCapabilities(
+  req: Request,
+  deps: { db: Database; issuer: string; now?: () => Date },
+): Response {
   if (req.method !== "GET") return methodNotAllowed("GET");
-  const descriptor = {
-    door: "self-host",
-    issuer: deps.issuer.replace(/\/$/, ""),
-    account_token: { endpoint: "/account/token", method: "POST", scheme: "cookie" },
+  const issuer = deps.issuer.replace(/\/$/, "");
+  const now = deps.now ? deps.now() : new Date();
+  const signupPath = activePublicSignupPath(deps.db, now);
+  const descriptor: ParachuteAccountDescriptor & {
     features: {
-      vault_create: true,
-      vault_delete: true,
-      import: true,
-      export: true,
-      billing: false,
-      plans: [] as string[],
-      modules: true,
-      expose: true,
-    },
+      modules: boolean;
+      expose: boolean;
+      import: boolean;
+      export: boolean;
+      billing: boolean;
+    };
+    caps_writable: boolean;
+  } = {
+    issuer,
+    door: "hub",
+    account_endpoint: `${issuer}/account`,
+    auth: { methods: ["password"], signin_path: "/login" },
+    ...(signupPath ? { signup_path: signupPath } : {}),
+    vault_url_template: `${issuer}/vault/{name}`,
+    capabilities: { vault_create: true, vault_rename: false, vault_delete: true },
+    plans: [],
+    // Hub EXTRAS (kept — see the doc comment above).
+    features: { modules: true, expose: true, import: true, export: true, billing: false },
     caps_writable: true,
-    limits: { vaults_max: null as number | null },
   };
-  return json(200, descriptor);
+  return json(200, descriptor, {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, OPTIONS",
+  });
 }
 
 // ---------------------------------------------------------------------------
 // GET /account — account bootstrap
 // ---------------------------------------------------------------------------
 
-/** `{ account_id, email, door }`. On self-host the account id is `self`. */
+/**
+ * The contract's `AccountBootstrap` — `{ id, email?, door }`. On self-host the
+ * account id is the sentinel `self`; `email` is present only when the
+ * operator row has one (`users.email` is nullable-by-history, migration
+ * v15 — the door-contract type models it as optional, not nullable).
+ */
 export async function handleAccountRoot(req: Request, deps: AccountApiDeps): Promise<Response> {
   if (req.method !== "GET") return methodNotAllowed("GET");
   let ctx: AdminAuthContext;
@@ -246,11 +282,12 @@ export async function handleAccountRoot(req: Request, deps: AccountApiDeps): Pro
     return adminAuthErrorResponse(err);
   }
   const user = getUserById(deps.db, ctx.sub);
-  return json(200, {
-    account_id: "self",
-    email: user?.email ?? null,
-    door: "self-host",
-  });
+  const body: AccountBootstrap = {
+    id: "self",
+    door: "hub",
+    ...(user?.email ? { email: user.email } : {}),
+  };
+  return json(200, body);
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +406,19 @@ export async function handleAccountCreateVault(
     const error = provisioned.status === 400 ? "invalid_name" : "server_error";
     return json(provisioned.status, { error, message: provisioned.message });
   }
+  // Q6 (hub-parity P2): this facade no longer answers 200-idempotent on an
+  // existing name — it converges on cloud's exact 409 `vault_taken` shape.
+  // `provisionVault` itself is UNCHANGED (still idempotent for its other
+  // caller, the invite-redeem flow, which doesn't route through this
+  // facade) — only this facade's wire answer changes. A scripted consumer
+  // that relied on 200-on-existing must follow up with
+  // `POST /account/vaults/<name>/token` to get a usable token.
+  if (!provisioned.created) {
+    return json(409, {
+      error: "vault_taken",
+      message: "That vault name is already taken.",
+    });
+  }
 
   const entry = provisioned.entry;
   const meta: VaultMeta = { name: entry.name, url: entry.url, version: entry.version };
@@ -387,16 +437,12 @@ export async function handleAccountCreateVault(
       : {}),
     services: servicesBlock(meta),
   };
-  // 201 on a fresh create; 200 on an idempotent re-POST of an existing vault
-  // (no fresh token — `vault_token` is "" and the app mints via /token).
-  return json(provisioned.created ? 201 : 200, body);
+  return json(201, body);
 }
 
 // ---------------------------------------------------------------------------
 // POST /account/vaults/<name>/token — per-vault token mint
 // ---------------------------------------------------------------------------
-
-const MINTABLE_VERBS = new Set(["read", "write", "admin"]);
 
 interface ScopesBody {
   ok: true;
@@ -404,8 +450,17 @@ interface ScopesBody {
 }
 
 /**
- * Parse + validate the requested `scopes`. Each must be `vault:<name>:<verb>`
- * for THIS vault with a mintable verb. Omitted / empty → default read+write.
+ * Parse + validate the requested `scopes`. The JSON-parse tolerance (optional
+ * body, optional content-type, swallow a malformed body) stays LOCAL — it's
+ * HTTP plumbing the shared validator knows nothing about (it's pure, no
+ * `Request`). The scope-SHAPE logic (array check, per-entry
+ * `vault:<name>:<verb>` grammar, empty/absent → default read+write) is the
+ * shared `validateVaultScopes` (door-contract 0.4.0) — the ONE implementation
+ * cloud's twin also imports, replacing the two hand-synced copies. Its reason
+ * taxonomy (`invalid_request` | `invalid_scope`) was built byte-exact with
+ * this function's prior behavior (see vault-scopes.ts's doc comment), so this
+ * swap is a behavioral no-op for the hub — verified by rerunning this file's
+ * existing test cases unchanged (account-api.test.ts).
  */
 async function parseScopesBody(req: Request, vaultName: string): Promise<ScopesBody | BodyErr> {
   const defaultScopes = [`vault:${vaultName}:read`, `vault:${vaultName}:write`];
@@ -422,34 +477,24 @@ async function parseScopesBody(req: Request, vaultName: string): Promise<ScopesB
   }
   if (!raw || typeof raw !== "object") return { ok: true, scopes: defaultScopes };
   const requested = (raw as Record<string, unknown>).scopes;
-  if (requested === undefined || requested === null) return { ok: true, scopes: defaultScopes };
-  if (!Array.isArray(requested) || requested.some((s) => typeof s !== "string")) {
-    return {
-      ok: false,
-      status: 400,
-      error: "invalid_request",
-      message: '"scopes" must be an array of strings',
-    };
+
+  const result = validateVaultScopes(requested, vaultName);
+  if (!result.ok) {
+    return result.reason === "invalid_request"
+      ? {
+          ok: false,
+          status: 400,
+          error: "invalid_request",
+          message: '"scopes" must be an array of strings',
+        }
+      : {
+          ok: false,
+          status: 400,
+          error: "invalid_scope",
+          message: `every scope must be vault:${vaultName}:{read|write|admin}`,
+        };
   }
-  const scopes = requested as string[];
-  if (scopes.length === 0) return { ok: true, scopes: defaultScopes };
-  for (const s of scopes) {
-    const parts = s.split(":");
-    if (
-      parts.length !== 3 ||
-      parts[0] !== "vault" ||
-      parts[1] !== vaultName ||
-      !MINTABLE_VERBS.has(parts[2] ?? "")
-    ) {
-      return {
-        ok: false,
-        status: 400,
-        error: "invalid_scope",
-        message: `scope "${s}" must be vault:${vaultName}:{read|write|admin}`,
-      };
-    }
-  }
-  return { ok: true, scopes };
+  return { ok: true, scopes: result.scopes };
 }
 
 export async function handleAccountMintVaultToken(

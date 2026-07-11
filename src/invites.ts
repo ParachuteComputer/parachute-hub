@@ -57,6 +57,7 @@
  */
 import type { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
+import { deleteSetting, getSetting } from "./hub-settings.ts";
 
 /** Default invite lifetime — long enough to deliver out-of-band (no email), short enough to bound a leaked link. */
 export const DEFAULT_INVITE_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -501,4 +502,36 @@ export function revokeInvitesForVault(
     )
     .run(now.toISOString(), vaultName);
   return Number(res.changes);
+}
+
+/**
+ * Q2 (hub-parity P2) — the account descriptor's conditional `signup_path`.
+ * The hub cannot derive a redemption URL from the `invites` table (only
+ * `sha256(token)` is stored, never the raw value — see the module doc), so
+ * this reads back the ONE raw token persisted at mint time for a
+ * deliberately PUBLIC (multi-use) invite (`api-invites.ts`'s
+ * `handleCreateInvite`, which writes `hub_settings.public_signup_token`
+ * after `issueInvite` when `maxUses > 1`) and re-validates it's still live.
+ *
+ * Returns `/account/setup/<token>` when the persisted invite is still
+ * `"pending"` AND still multi-use (`maxUses > 1`); `null` on ANY miss
+ * (never set, redeemed, revoked, exhausted, or expired) — and lazily clears
+ * the stale setting in that case. No separate revoke/exhaust/expire hook is
+ * needed: `inviteStatus` already derives all four terminal states from the
+ * invite's own columns, so every miss flows through this one status check.
+ *
+ * A single-use invite (`maxUses === 1`) never reaches here in a way that
+ * would matter — `handleCreateInvite` only ever writes the setting for
+ * `maxUses > 1` — but the `maxUses > 1` re-check is kept anyway as
+ * defense-in-depth against a hand-edited settings row.
+ */
+export function activePublicSignupPath(db: Database, now: Date = new Date()): string | null {
+  const raw = getSetting(db, "public_signup_token");
+  if (!raw) return null;
+  const invite = findInviteByRawToken(db, raw);
+  if (!invite || inviteStatus(invite, now) !== "pending" || invite.maxUses <= 1) {
+    deleteSetting(db, "public_signup_token");
+    return null;
+  }
+  return `/account/setup/${encodeURIComponent(raw)}`;
 }
