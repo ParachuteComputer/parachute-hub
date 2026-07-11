@@ -201,4 +201,23 @@ describe("parachute-account descriptor (C4)", () => {
       checkAccountDescriptor({ ...CONFORMANT_DESCRIPTOR, plans: "nope" }, expected).length,
     ).toBe(1);
   });
+
+  test("vault_url_template is OPTIONAL but must carry {name} when present", () => {
+    // Omitted → still conformant (the CONFORMANT_DESCRIPTOR has none).
+    expect(checkAccountDescriptor(CONFORMANT_DESCRIPTOR, expected)).toEqual([]);
+    // Present + valid → conformant.
+    expect(
+      checkAccountDescriptor(
+        { ...CONFORMANT_DESCRIPTOR, vault_url_template: "https://u.parachute.computer/vault/{name}" },
+        expected,
+      ),
+    ).toEqual([]);
+    // Present without the {name} placeholder → one issue.
+    const bad = checkAccountDescriptor(
+      { ...CONFORMANT_DESCRIPTOR, vault_url_template: "https://u.parachute.computer/vault/" },
+      expected,
+    );
+    expect(bad.length).toBe(1);
+    expect(bad[0]?.detail).toContain("vault_url_template");
+  });
 });

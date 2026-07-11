@@ -110,6 +110,12 @@ export function checkAccountDescriptor(
     }
   }
   if (!Array.isArray(actual.plans)) push("plans must be an array");
+  // Optional: a door MAY omit `vault_url_template`, but when present it must be a
+  // string carrying the literal `{name}` placeholder (it's a template, not a URL).
+  if (actual.vault_url_template !== undefined) {
+    if (typeof actual.vault_url_template !== "string" || !actual.vault_url_template.includes("{name}"))
+      push('vault_url_template, when present, must be a string containing "{name}"');
+  }
   return issues;
 }
 
