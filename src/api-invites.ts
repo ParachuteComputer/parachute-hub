@@ -544,14 +544,22 @@ export async function handleCreateInvite(req: Request, deps: ApiInvitesDeps): Pr
     vaultCapBytes: effectiveVaultCapBytes,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
-  // Q2 (hub-parity P2, the raw-token reality): a multi-use link IS the
-  // public signup page (the operator mints it to broadcast) — persisting
-  // ITS raw token so the account descriptor can advertise `signup_path`
-  // does NOT weaken the hash-only posture of single-use friend invites,
-  // which never write this row. The newest public link wins (overwrites any
-  // prior value); `activePublicSignupPath` (invites.ts) re-validates
-  // liveness on every read and lazily clears a revoked/exhausted/expired one.
-  if (maxUses > 1) {
+  // Q2 (hub-parity P2, the raw-token reality): a multi-use PROVISIONING link
+  // IS the public signup page (the operator mints it to broadcast, and each
+  // redeemer gets their OWN new vault) — persisting ITS raw token so the
+  // account descriptor can advertise `signup_path` does NOT weaken the
+  // hash-only posture of single-use friend invites, which never write this row.
+  // The `provisionVault` guard is load-bearing security, not cosmetic: a
+  // multi-use SHARED-vault invite (`provision_vault=false` + an existing
+  // vault_name — "many users join one team vault", coherent per the mint gates
+  // above) must NEVER be auto-published on the anonymous, wildcard-CORS
+  // descriptor, or its team-vault-write link leaks to anyone who fetches the
+  // exposed hub. Only multi-use + provisioning = genuine public signup (the
+  // same conjunction the vault-cap heuristic above already treats as such).
+  // The newest public link wins (overwrites any prior value);
+  // `activePublicSignupPath` (invites.ts) re-validates liveness on every read
+  // and lazily clears a revoked/exhausted/expired one.
+  if (maxUses > 1 && provisionVault) {
     setSetting(deps.db, "public_signup_token", issued.rawToken, deps.now ?? (() => new Date()));
   }
   const status = inviteStatus(issued.invite, now);

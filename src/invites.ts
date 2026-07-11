@@ -514,22 +514,31 @@ export function revokeInvitesForVault(
  * after `issueInvite` when `maxUses > 1`) and re-validates it's still live.
  *
  * Returns `/account/setup/<token>` when the persisted invite is still
- * `"pending"` AND still multi-use (`maxUses > 1`); `null` on ANY miss
- * (never set, redeemed, revoked, exhausted, or expired) — and lazily clears
- * the stale setting in that case. No separate revoke/exhaust/expire hook is
- * needed: `inviteStatus` already derives all four terminal states from the
- * invite's own columns, so every miss flows through this one status check.
+ * `"pending"`, still multi-use (`maxUses > 1`), AND provisioning
+ * (`provisionVault` — each redeemer gets their own new vault); `null` on ANY
+ * miss (never set, redeemed, revoked, exhausted, expired, or a non-provisioning
+ * shared-vault link) — and lazily clears the stale setting in that case. No
+ * separate revoke/exhaust/expire hook is needed: `inviteStatus` already derives
+ * all four terminal states from the invite's own columns, so every miss flows
+ * through this one status check.
  *
- * A single-use invite (`maxUses === 1`) never reaches here in a way that
- * would matter — `handleCreateInvite` only ever writes the setting for
- * `maxUses > 1` — but the `maxUses > 1` re-check is kept anyway as
- * defense-in-depth against a hand-edited settings row.
+ * The `maxUses > 1` AND `provisionVault` re-checks are defense-in-depth mirrors
+ * of `handleCreateInvite`'s write condition (which only persists for a
+ * multi-use provisioning link): even a hand-edited settings row pointing at a
+ * single-use OR a shared-vault (`provision_vault=false`) invite must never be
+ * advertised as public signup — a shared-vault link would leak team-vault write
+ * on the anonymous, wildcard-CORS descriptor.
  */
 export function activePublicSignupPath(db: Database, now: Date = new Date()): string | null {
   const raw = getSetting(db, "public_signup_token");
   if (!raw) return null;
   const invite = findInviteByRawToken(db, raw);
-  if (!invite || inviteStatus(invite, now) !== "pending" || invite.maxUses <= 1) {
+  if (
+    !invite ||
+    inviteStatus(invite, now) !== "pending" ||
+    invite.maxUses <= 1 ||
+    !invite.provisionVault
+  ) {
     deleteSetting(db, "public_signup_token");
     return null;
   }

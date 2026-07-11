@@ -282,6 +282,39 @@ describe("handleAccountCapabilities", () => {
       h.cleanup();
     }
   });
+
+  test("signup_path is NOT set for a multi-use NON-provisioning invite (B1: a team link must never leak on the public descriptor)", async () => {
+    const h = makeHarness();
+    try {
+      const admin = await createUser(h.db, "operator", "any-password", {
+        allowMulti: true,
+        passwordChanged: true,
+      });
+      const adminToken = await bearer(h, [HOST_ADMIN_SCOPE], admin.id);
+      // A multi-use link with provision_vault=false is a team invite (here
+      // account-only; a shared-vault one additionally pins an existing
+      // vault_name and would hand out team-vault WRITE) — NOT a public signup
+      // that gives each redeemer their own fresh vault. It must never be
+      // persisted to public_signup_token nor advertised via the anonymous,
+      // wildcard-CORS descriptor. Same `provisionVault` guard covers both the
+      // account-only and shared-vault non-provisioning shapes.
+      const mintRes = await handleCreateInvite(
+        jsonReq("/api/invites", adminToken, "POST", { max_uses: 3, provision_vault: false }),
+        { db: h.db, issuer: ISSUER },
+      );
+      expect(mintRes.status).toBe(201);
+      // The raw token was NOT persisted (the write-side guard)...
+      expect(getSetting(h.db, "public_signup_token")).toBeUndefined();
+      // ...and the public descriptor advertises no signup_path.
+      const desc = handleAccountCapabilities(
+        new Request(`${ISSUER}/.well-known/parachute-account`),
+        { db: h.db, issuer: ISSUER },
+      );
+      expect(((await desc.json()) as Record<string, unknown>).signup_path).toBeUndefined();
+    } finally {
+      h.cleanup();
+    }
+  });
 });
 
 // ===========================================================================
