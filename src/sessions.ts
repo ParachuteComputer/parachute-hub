@@ -13,9 +13,12 @@
  * `account-session.ts`). There is NO absolute ceiling: an ACTIVELY-used
  * session rolls forward indefinitely, while an idle one (no more touches)
  * still lapses at the 90-day mark. Was 24h sliding / 30d hard cap through
- * 2026-07; the cap is gone — the kill switches that bound a rolling session
- * are logout (deletes the row), the admin screen-lock (idle PIN), and
- * (P6-era) per-user delete, not a lifetime ceiling.
+ * 2026-07; the cap is gone. The ONLY thing that terminates a session row today
+ * is logout (which deletes it). Note what does NOT: the admin screen-lock gates
+ * token MINTS (it does not touch or expire the session row), and per-user
+ * session revocation does not exist yet (P6-era). So an actively-used session
+ * — including a stolen cookie — currently lives on until 90 idle days or an
+ * explicit logout; a per-user revoke lever is the standing gap to close.
  *
  * The cookie value is the session id directly. It's a 32-byte base64url
  * random; collision is statistically impossible. No HMAC needed because the
