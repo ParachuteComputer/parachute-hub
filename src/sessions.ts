@@ -4,12 +4,18 @@
  * with that cookie skip the login form and go straight to consent.
  *
  * Stored in `sessions` (one row per active session), so logout / forced
- * revocation is just a delete. Sessions are SLIDING: `expires_at` starts at
- * `created_at + SESSION_TTL_MS`, and {@link touchSession} pushes it forward on
- * genuine activity (the admin SPA re-mints `/admin/host-admin-token` every
- * ~10 min while a tab is open). An idle session — no more mints — still
- * expires at the original 24h mark, and {@link SESSION_MAX_LIFETIME_MS} caps
- * total life so sliding can't keep a left-open tab alive forever.
+ * revocation is just a delete. Sessions are ROLLING (hub-parity P1, Q4 —
+ * adopts cloud's posture): `expires_at` starts at `created_at + SESSION_TTL_MS`
+ * (90 days), and {@link touchSession} pushes it forward on genuine activity
+ * (the admin SPA re-mints `/admin/host-admin-token` every ~10 min while a tab
+ * is open; `GET /account/session`, the app's boot/poll oracle, slides once it
+ * crosses {@link SESSION_SLIDE_THRESHOLD_MS} of its life — see
+ * `account-session.ts`). There is NO absolute ceiling: an ACTIVELY-used
+ * session rolls forward indefinitely, while an idle one (no more touches)
+ * still lapses at the 90-day mark. Was 24h sliding / 30d hard cap through
+ * 2026-07; the cap is gone — the kill switches that bound a rolling session
+ * are logout (deletes the row), the admin screen-lock (idle PIN), and
+ * (P6-era) per-user delete, not a lifetime ceiling.
  *
  * The cookie value is the session id directly. It's a 32-byte base64url
  * random; collision is statistically impossible. No HMAC needed because the
@@ -20,16 +26,25 @@ import type { Database } from "bun:sqlite";
 import { randomBytes } from "node:crypto";
 
 export const SESSION_COOKIE_NAME = "parachute_hub_session";
-export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+/**
+ * Session lifetime — 90 days (hub-parity P1, Q4: adopts cloud's rolling
+ * posture). A session (and its cookie Max-Age) lasts 90 days from its last
+ * slide; {@link findSession} still expires it hard past this, and logout
+ * deletes the row outright. Was 24h (sliding, 30d hard cap) prior to this PR.
+ */
+export const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
 /**
- * Absolute ceiling on a session's total lifetime, independent of sliding
- * renewal. Sliding ({@link touchSession}) keeps an active console signed in,
- * but a left-open-but-idle tab whose background polls keep re-minting must
- * still be force-logged-out eventually — this caps life at
- * `created_at + SESSION_MAX_LIFETIME_MS` so renewal can't extend forever.
+ * Roll a session forward once it has been used past this much of its life
+ * (30 days) — so an ACTIVE session stays alive indefinitely, while an idle one
+ * still expires at the full 90-day TTL. Callers that slide on every touch
+ * (the admin SPA's host-admin-token re-mint) don't need this threshold; it's
+ * for a POLLING caller like `GET /account/session` (the app's `/check-email`
+ * screen hits it every few seconds) that must NOT rewrite the row on every
+ * request — see `shouldSlideSession` there. Mirrors cloud's
+ * `SESSION_REFRESH_THRESHOLD_MS` (`workers/identity/src/sessions.ts`).
  */
-export const SESSION_MAX_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+export const SESSION_SLIDE_THRESHOLD_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface Session {
   id: string;
@@ -91,35 +106,53 @@ export function findSession(
 }
 
 /**
- * Slide a session's expiry forward to `now + SESSION_TTL_MS`, capped at
- * `created_at + SESSION_MAX_LIFETIME_MS`. No-op when the session doesn't exist.
+ * Slide a session's expiry forward to `now + SESSION_TTL_MS`. No-op when the
+ * session doesn't exist. NO ceiling (hub-parity P1, Q4) — cloud's posture,
+ * adopted here: an ACTIVELY-used session rolls forward forever; a closed tab
+ * / idle client (no more touches) still expires `SESSION_TTL_MS` after its
+ * last activity. The old absolute cap (`SESSION_MAX_LIFETIME_MS`, 30d) is
+ * removed — the bounds on a rolling session are logout, the admin
+ * screen-lock, and (P6-era) per-user delete, not a lifetime ceiling.
  *
- * This is what makes sessions sliding rather than fixed-24h: the admin SPA
- * re-mints `/admin/host-admin-token` roughly every ~10 min while a tab is open,
- * and each successful mint calls this — so an actively-used console isn't
- * hard-logged-out at the 24h mark, while a closed tab (no more mints) still
- * expires 24h after its last activity. The ceiling bounds a left-open-but-idle
- * tab (background polls keep re-minting) so sliding can't run forever.
+ * This is what makes sessions sliding rather than fixed-TTL: the admin SPA
+ * re-mints `/admin/host-admin-token` roughly every ~10 min while a tab is
+ * open, and each successful mint calls this unconditionally; `GET
+ * /account/session` (the app's boot/poll oracle) instead calls this only
+ * past `SESSION_SLIDE_THRESHOLD_MS` of remaining life (bounded slide — see
+ * `account-session.ts`), since it's polled every few seconds and an
+ * unconditional touch there would rewrite the row on every poll.
  *
  * Monotonic in practice: the production wall clock only moves forward, so the
- * slid value never undershoots a previously-written expiry; once it reaches the
- * ceiling it stays pinned there. (The write is unconditional — it does not read
- * the current expiry — so an injected backward `now` in tests would shorten the
- * session: a conservative failure mode, not a security issue.) `now` is
- * injectable for tests, matching {@link findSession}.
+ * slid value never undershoots a previously-written expiry. (The write is
+ * unconditional — it does not read the current expiry — so an injected
+ * backward `now` in tests would shorten the session: a conservative failure
+ * mode, not a security issue.) `now` is injectable for tests, matching
+ * {@link findSession}.
  */
 export function touchSession(db: Database, id: string, now: () => Date = () => new Date()): void {
   const row = db.query<Row, [string]>("SELECT * FROM sessions WHERE id = ?").get(id);
   if (!row) return;
-  const nowMs = now().getTime();
-  const slidMs = nowMs + SESSION_TTL_MS;
-  const ceilingMs = new Date(row.created_at).getTime() + SESSION_MAX_LIFETIME_MS;
-  const newExpiresAt = new Date(Math.min(slidMs, ceilingMs)).toISOString();
+  const newExpiresAt = new Date(now().getTime() + SESSION_TTL_MS).toISOString();
   db.prepare("UPDATE sessions SET expires_at = ? WHERE id = ?").run(newExpiresAt, id);
 }
 
 export function deleteSession(db: Database, id: string): void {
   db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+}
+
+/**
+ * Should this live session be rolled forward? True once it has been used past
+ * {@link SESSION_SLIDE_THRESHOLD_MS} of its life — i.e. its remaining life has
+ * dropped below `SESSION_TTL_MS - SESSION_SLIDE_THRESHOLD_MS`. A
+ * freshly-created/-slid session is NOT slid; one that's crossed the threshold
+ * is. Pure — the caller (`account-session.ts`'s bounded slide, the G3 twin of
+ * cloud's `shouldSlideSession`) does the write ({@link touchSession}) + cookie
+ * re-issue only when this returns true, bounding both to ~once per threshold
+ * per session even under frequent polling.
+ */
+export function shouldSlideSession(session: Session, now: () => Date = () => new Date()): boolean {
+  const remainingMs = new Date(session.expiresAt).getTime() - now().getTime();
+  return remainingMs < SESSION_TTL_MS - SESSION_SLIDE_THRESHOLD_MS;
 }
 
 /**

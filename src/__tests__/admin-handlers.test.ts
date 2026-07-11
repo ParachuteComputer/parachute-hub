@@ -603,4 +603,29 @@ describe("handleAdminLogoutPost (#113)", () => {
     expect(res.headers.get("location")).toBe("/login");
     expect(res.headers.get("set-cookie") ?? "").toContain("parachute_hub_session=;");
   });
+
+  // App-wire pin (hub-parity P1, §8-M4): the app's `logout()` posts form-
+  // encoded, not JSON (`parachute-app/src/lib/account/client.ts:246-258`:
+  // `content-type: application/x-www-form-urlencoded`, body
+  // `new URLSearchParams({ __csrf: csrf }).toString()`, credentials included).
+  // No hub code changed for this — the existing formData()-based handler
+  // already accepts exactly this shape; this test freezes the byte-shape so a
+  // future refactor of the handler can't silently drop form-body support out
+  // from under the app.
+  test("app-wire pin — form-encoded body matching client.ts's exact logout() shape", async () => {
+    const cookie = await cookieForUser(harness.db, "appuser", "pw");
+    const sid = cookie.match(/parachute_hub_session=([^;]+)/)?.[1] ?? "";
+    const req = new Request("http://hub.test/logout", {
+      method: "POST",
+      headers: {
+        cookie,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ [CSRF_FIELD_NAME]: TEST_CSRF }).toString(),
+    });
+    const res = await handleAdminLogoutPost(harness.db, req);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/login");
+    expect(findSession(harness.db, sid)).toBeNull();
+  });
 });
