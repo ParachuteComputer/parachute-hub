@@ -142,7 +142,10 @@ describe("setup", () => {
       // rejects duplicate ports between distinct services (hub#195).
       // parachute-runner rides along as a LEGACY row (runner left the
       // registries 2026-07-01): it must neither block the all-installed exit
-      // nor crash the survey.
+      // nor crash the survey. parachute-app (hub-parity P5, 2026-07-11) is
+      // included so this fixture stays truly "everything installed" — without
+      // it, `app` is a genuinely offered-but-uninstalled service and the
+      // non-tty exit code flips from 0 to 1 (nothing left vs. work-to-offer).
       const seeds: Array<{ name: string; port: number }> = [
         { name: "parachute-vault", port: 1940 },
         { name: "parachute-notes", port: 1942 },
@@ -150,6 +153,7 @@ describe("setup", () => {
         { name: "parachute-agent", port: 1941 },
         { name: "parachute-runner", port: 1945 },
         { name: "parachute-surface", port: 1946 },
+        { name: "parachute-app", port: 1944 },
       ];
       for (const s of seeds) {
         upsertService(

@@ -82,7 +82,7 @@ import type { ModuleStartError, ModuleState, Supervisor } from "./supervisor.ts"
 
 /**
  * Resolve a known module to the display + install bootstrap data the admin SPA
- * renders. Reads from FIRST_PARTY_FALLBACKS (notes) first,
+ * renders. Reads from FIRST_PARTY_FALLBACKS (notes / app) first,
  * KNOWN_MODULES (vault / scribe / agent / surface) second.
  *
  * Returns `undefined` if the short is in neither table — a genuinely

@@ -11,7 +11,13 @@ import type { ServiceEntry } from "./services-manifest.ts";
  *   1941  parachute-agent    exploration (renamed from parachute-channel)
  *   1942  parachute-notes    committed core (PWA bundle)
  *   1943  parachute-scribe   committed core
- *   1944–1949  unassigned
+ *   1944  parachute-app      the super-surface front door (PWA bundle,
+ *                            hub-parity P5) — see the PORT_RESERVATIONS
+ *                            comment below for why this is a DIFFERENT
+ *                            module from the pre-2026-05-27 `app`
+ *   1945  unassigned
+ *   1946  parachute-surface  UI host (renamed from `app` 2026-05-27)
+ *   1947–1949  unassigned
  *
  * Hub pins 1939: `parachute expose` composes hub targets as
  * `http://127.0.0.1:1939/` and that URL has to be stable across machines for
@@ -67,12 +73,24 @@ export const PORT_RESERVATIONS: readonly PortReservation[] = [
   { port: 1941, name: "parachute-agent", status: "assigned" },
   { port: 1942, name: "parachute-notes", status: "assigned" },
   { port: 1943, name: "parachute-scribe", status: "assigned" },
-  { port: 1944, name: "unassigned", status: "reserved" },
+  // hub-parity P5 (2026-07-11): parachute-app's canonical slot — the NEW
+  // super-surface front door (@openparachute/parachute-app), landing as a
+  // FIRST_PARTY_FALLBACKS entry (short "app") with its own hub-side static-
+  // serve shim (notes-serve.ts --package). This is a DIFFERENT, unrelated
+  // module from the pre-2026-05-27 `app` package described in the 1946
+  // comment below — the two just happen to share the name across a rename.
+  // Status `assigned` keeps the fallback-port walker (`assignPort` in
+  // port-assign.ts) from handing this port to a colliding third-party
+  // module.
+  { port: 1944, name: "parachute-app", status: "assigned" },
   { port: 1945, name: "unassigned", status: "reserved" },
-  // hub#323: parachute-app's canonical slot. Status `assigned` keeps the
-  // fallback-port walker (`assignPort` in port-assign.ts) from handing this
-  // port out to a colliding third-party module. The matching KNOWN_MODULES
-  // row carries the canonicalPort + paths for status/expose surfaces.
+  // hub#323 (historical): this WAS `parachute-app`'s canonical slot back
+  // when "app" meant the UI-host module. That module renamed to
+  // `parachute-surface` 2026-05-27 (patterns#102); port 1944 above is the
+  // different, new parachute-app (super-surface) from hub-parity P5. Status
+  // `assigned` keeps the fallback-port walker from handing 1946 to a
+  // colliding third-party module. The matching KNOWN_MODULES row carries
+  // the canonicalPort + paths for status/expose surfaces.
   { port: 1946, name: "parachute-surface", status: "assigned" },
   { port: 1947, name: "unassigned", status: "reserved" },
   { port: 1948, name: "unassigned", status: "reserved" },
@@ -278,9 +296,15 @@ export function composeServiceSpec(opts: {
 //     — its startCmd is composed from the services.json entry's port + mount,
 //     which is hub-side logic, not something notes itself runs. (The archive
 //     isn't done — notes-daemon Phase 3 retirement hasn't landed.)
+//   - app: the NEW super-surface front door (@openparachute/parachute-app,
+//     hub-parity P5, 2026-07-11) — same shape as notes: a frontend bundle
+//     with no server of its own, served by the SAME hub-side shim
+//     (`notes-serve.ts --package @openparachute/parachute-app`). Unrelated
+//     to the pre-2026-05-27 `app` package that renamed to `surface` (see
+//     the KNOWN_MODULES.surface tagline + the RETIRED_MODULES note below).
 //
-// The remaining entry keeps its "FALLBACK: Delete when …" marker so the
-// next cleanup pass is a one-grep operation.
+// Each entry keeps its "FALLBACK: Delete when …" marker so the next cleanup
+// pass is a one-grep operation.
 // ---------------------------------------------------------------------------
 
 // FALLBACK: Delete when @openparachute/notes ships .parachute/module.json AND
@@ -317,11 +341,58 @@ const NOTES_FALLBACK: FirstPartyFallback = {
   },
 };
 
+// FALLBACK: Delete when @openparachute/parachute-app ships
+// .parachute/module.json AND self-registers its services.json row at boot.
+// As of hub-parity P5 the app repo doesn't carry the real module.json yet —
+// only a stale `dist/.parachute/info` artifact (name: "parachute-notes")
+// left over from seeding the app off notes-ui, which is a DIFFERENT file
+// (module-manifest.ts's runtime `/.parachute/info`, not the static
+// `.parachute/module.json` contract this fallback stands in for) and
+// doesn't block this fallback path. parachute-app is a frontend bundle (the
+// super-surface front door) with no server of its own, so — same as notes —
+// its startCmd is hub-side logic composed from the services.json entry
+// (port + mount), running through the SAME `notes-serve.ts` shim
+// generalized in hub-parity P5 via `--package`.
+const APP_FALLBACK: FirstPartyFallback = {
+  package: "@openparachute/parachute-app",
+  manifest: {
+    name: "app",
+    manifestName: "parachute-app",
+    displayName: "Parachute",
+    tagline: "The Parachute app — your parachute's front door.",
+    port: 1944,
+    paths: ["/app"],
+    health: "/app/health",
+  },
+  extras: {
+    startCmd: (entry) => {
+      const first = entry.paths[0] ?? "/app";
+      const mount = first === "/" ? "" : first.replace(/\/+$/, "");
+      return [
+        "bun",
+        NOTES_SERVE_PATH,
+        "--port",
+        String(entry.port),
+        "--mount",
+        mount,
+        "--package",
+        "@openparachute/parachute-app",
+      ];
+    },
+    postInstallFooter: () => [
+      "",
+      "Open your Parachute at <origin>/app — it signs in with your hub account.",
+      "The hub's front page (`/`) now opens the app too, unless you've already",
+      "set a custom root redirect (`parachute hub set-root-redirect` or the admin SPA).",
+    ],
+  },
+};
+
 /**
  * Vendored manifests + extras for first-party modules that still need them.
  * Indexed by short name (the `parachute install <X>` token).
  *
- * Only notes remains — see the block comment above for the rationale
+ * notes + app remain — see the block comment above for the rationale
  * (vault/scribe/agent now self-register and ship their own
  * module.json). Other code paths consult both this table AND `KNOWN_MODULES`
  * (which carries the post-self-register-retirement entries) via the helpers
@@ -329,6 +400,7 @@ const NOTES_FALLBACK: FirstPartyFallback = {
  */
 export const FIRST_PARTY_FALLBACKS: Record<string, FirstPartyFallback> = {
   notes: NOTES_FALLBACK,
+  app: APP_FALLBACK,
 };
 
 /**
@@ -520,8 +592,15 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
  *     legacy operators. `notes` (the daemon) is the canonical
  *     "deprecating-but-not-retired" case as of 2026-05-22: do not add
  *     until its Phase 3 retirement lands.
- *   - Entries stay forever. Removing an entry would let a stale row
- *     reappear silently on legacy installs.
+ *   - Entries stay forever — UNLESS the retired name is later reclaimed by a
+ *     genuinely new, unrelated module that needs to self-register under it
+ *     for real (see the `app` / `parachute-app` un-retirement note below).
+ *     That's the one case where removal is correct: keeping a retirement
+ *     entry alongside a live FIRST_PARTY_FALLBACKS/KNOWN_MODULES entry of
+ *     the SAME name would make `dropRetiredModuleRows` GC the live module's
+ *     own services.json row on every read — an outright regression, not a
+ *     conservative default. Ordinary "this module is genuinely gone"
+ *     entries (no successor reusing the name) still stay forever.
  */
 export const RETIRED_MODULES: Record<string, { retiredAt: string; replacement?: string }> = {
   // NOTE (2026-06-17, channel→agent rename): the `agent` / `parachute-agent`
@@ -538,21 +617,24 @@ export const RETIRED_MODULES: Record<string, { retiredAt: string; replacement?: 
   // which is harmless / arguably correct since paraclaw was the original
   // "agent".)
   //
-  // The `parachute-app` row name retires 2026-05-27 along with the
-  // app → surface rename (patterns#102). Operators upgrading from
-  // 0.5.13-stable will have a `parachute-app` row in services.json
-  // pointing at the now-removed @openparachute/app package; this entry
-  // drops it on load + steers them at `parachute install surface`.
-  // The short-name `app` form is included for legacy rows that used
-  // the short name as the `name` field.
-  app: {
-    retiredAt: "2026-05-27",
-    replacement: "parachute-surface (renamed from parachute-app — `parachute install surface`)",
-  },
-  "parachute-app": {
-    retiredAt: "2026-05-27",
-    replacement: "parachute-surface (renamed from parachute-app — `parachute install surface`)",
-  },
+  // NOTE (2026-07-11, hub-parity P5 — `app` / `parachute-app` UN-RETIRED):
+  // this table carried `app` + `parachute-app` (retired 2026-05-27, the
+  // app → surface rename, patterns#102) from hub#219 through hub-parity P4.
+  // They are REMOVED as of this note: a NEW, unrelated module — the real
+  // `@openparachute/parachute-app` super-surface front door (see
+  // FIRST_PARTY_FALLBACKS.app + PORT_RESERVATIONS' port-1944 comment) —
+  // claims the `parachute-app` manifestName (and the bare `app` short) for
+  // real. Keeping these entries would make `dropRetiredModuleRows`
+  // unconditionally GC the new module's services.json row on every read,
+  // breaking it outright — see the curation-rule exception above. An
+  // operator with a genuinely stale PRE-2026-05-27 `app`/`parachute-app` row
+  // (from the old, now-defunct @openparachute/app package) is handled the
+  // same as any other unrecognized row once un-retired: `parachute status`
+  // renders it, and `parachute serve` boots it via installDir's
+  // module.json if present and logs-and-skips otherwise — the same
+  // graceful fallback the `runner` registry removal (2026-07-01, see
+  // KNOWN_MODULES below) relies on. In practice the real parachute-app
+  // module's own first boot overwrites any stale row sharing its name.
 };
 
 /**
@@ -632,7 +714,8 @@ export function knownServices(): string[] {
  * manifest-declared `focus`; this map is the fallback when `module.json` omits
  * it (and the bootstrap value before a module is installed).
  *
- *   - `core` — vault / scribe / hub / surface (the product surface).
+ *   - `core` — vault / scribe / hub / surface / app (the product surface;
+ *     `app` joined 2026-07-11, hub-parity P5 — the super-surface front door).
  *   - `experimental` — agent (legit preview; still OFFERED on a fresh install)
  *     + any unlisted third-party short.
  *   - `deprecated` — notes (notes-daemon deprecated 2026-05-22; notes-ui moved
@@ -650,6 +733,7 @@ const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
   scribe: "core",
   hub: "core",
   surface: "core",
+  app: "core",
   agent: "experimental",
   notes: "deprecated",
 };
@@ -738,7 +822,7 @@ export function canonicalPortForManifest(manifestName: string): number | undefin
 /**
  * Resolve the runtime spec for a known short name.
  *
- * FIRST_PARTY_FALLBACKS shorts (notes) return a fully-composed
+ * FIRST_PARTY_FALLBACKS shorts (notes / app) return a fully-composed
  * spec with embedded manifest + extras — the vendored manifest is the
  * source of truth pre-install and the install path preserves it through.
  *
@@ -851,7 +935,7 @@ const LEGACY_MANIFEST_ALIASES: Record<string, string> = {
 };
 
 /** Short name for a given manifest name, e.g. `parachute-vault` → `vault`.
- *  Consults both FIRST_PARTY_FALLBACKS (notes) and KNOWN_MODULES
+ *  Consults both FIRST_PARTY_FALLBACKS (notes / app) and KNOWN_MODULES
  *  (vault / scribe / agent / surface — post-FALLBACK-retirement).
  *  Returns undefined for unknown manifests. */
 export function shortNameForManifest(manifestName: string): string | undefined {

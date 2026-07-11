@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RETIRED_MODULES } from "../service-spec.ts";
 import {
   type ServiceEntry,
   ServicesManifestError,
@@ -1024,6 +1025,14 @@ describe("claw → agent migration", () => {
 // file so the next read is clean.
 describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
   test("drops the short-name row when a same-port manifestName row exists", () => {
+    // Fixture uses `surface` (the ACTUAL short-name twin of `parachute-surface`
+    // per the structural rule: b.name === `parachute-${a.name}`) rather than
+    // `app`. Pre-hub-parity-P5 this test used `app` here, but that only
+    // passed because `app` was ALSO in RETIRED_MODULES at the time — the
+    // unconditional retired-module GC (not this structural short-name rule)
+    // was doing the dropping. Now that `app`/`parachute-app` are un-retired
+    // (hub-parity P5, a new unrelated module claims them), this fixture is
+    // corrected to actually exercise `dropLegacyShortNameRows`.
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1038,7 +1047,7 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
               version: "0.2.0",
             },
             {
-              name: "app",
+              name: "surface",
               port: 1946,
               paths: ["/surface"],
               health: "/surface/healthz",
@@ -1195,6 +1204,9 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
   });
 
   test("idempotent — second read leaves the cleaned file alone", () => {
+    // See the fixture note on the first test in this describe block — `app`
+    // is renamed to `surface` here for the same reason (un-retired 2026-07-11,
+    // hub-parity P5).
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1209,7 +1221,7 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
               version: "0.2.0",
             },
             {
-              name: "app",
+              name: "surface",
               port: 1946,
               paths: ["/surface"],
               health: "/surface/healthz",
@@ -1232,21 +1244,37 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
 
 // Retired-module row cleanup (hub#334 — Aaron's actual reproducer on
 // 2026-05-22). His services.json originally carried a stale `agent` row at
-// 1946 colliding with `parachute-app`'s canonical slot. NOTE: post the
-// 2026-06-17 channel→agent rename, `agent` is a LIVE module again, so these
-// fixtures use the still-retired `app` (parachute-app) name to exercise the
-// same GC. The legacy-short-name de-dupe doesn't help — a retired short
-// isn't the short-name twin of the colliding row. The retired-module GC
-// fires unconditionally on rows whose name appears in `RETIRED_MODULES`,
-// regardless of port collision.
+// 1946 colliding with `parachute-app`'s canonical slot. The legacy-short-name
+// de-dupe doesn't help — a retired short isn't the short-name twin of the
+// colliding row. The retired-module GC fires unconditionally on rows whose
+// name appears in `RETIRED_MODULES`, regardless of port collision.
+//
+// NOTE (2026-07-11, hub-parity P5): the original fixtures used `agent` —
+// which was a RETIRED_MODULES entry until the 2026-06-17 channel→agent
+// rename re-assigned that name to the live (renamed-from-channel) module —
+// and were later updated to use `app` (parachute-app, retired 2026-05-27).
+// `app`/`parachute-app` are now THEMSELVES un-retired (a new, unrelated
+// module — the real parachute-app super-surface — claims the name for
+// real; see service-spec.ts's RETIRED_MODULES comment). So these tests now
+// inject a throwaway synthetic retired entry via a describe-scoped
+// beforeEach/afterEach rather than depending on production RETIRED_MODULES
+// having a spare non-live name to spend on test fixtures — this mechanism
+// has now been renamed out from under these tests twice.
 describe("retired-module row de-dupe (hub#334)", () => {
-  // NOTE: the original fixtures used `agent` — which was a RETIRED_MODULES
-  // entry until the 2026-06-17 channel→agent rename re-assigned that name to
-  // the live (renamed-from-channel) module. These tests now use `app`
-  // (parachute-app, retired 2026-05-27 — still in RETIRED_MODULES) so they
-  // keep exercising the retired-module GC mechanism on a name that is still
-  // genuinely retired.
-  test("drops a row whose name is in RETIRED_MODULES (app)", () => {
+  const RETIRED_FIXTURE_NAME = "legacy-test-retired-module";
+
+  beforeEach(() => {
+    RETIRED_MODULES[RETIRED_FIXTURE_NAME] = {
+      retiredAt: "2020-01-01",
+      replacement: "n/a — test-only fixture, not a real retirement",
+    };
+  });
+
+  afterEach(() => {
+    delete RETIRED_MODULES[RETIRED_FIXTURE_NAME];
+  });
+
+  test("drops a row whose name is in RETIRED_MODULES", () => {
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1254,10 +1282,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "app",
+              name: RETIRED_FIXTURE_NAME,
               port: 1946,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/legacy"],
+              health: "/legacy/health",
               version: "0.1.4",
             },
           ],
@@ -1275,7 +1303,7 @@ describe("retired-module row de-dupe (hub#334)", () => {
 
   test("retirement is unconditional — no other rows required", () => {
     // Verifies dropRetiredModuleRows doesn't depend on a collision
-    // partner (unlike dropLegacyShortNameRows). An app row sitting
+    // partner (unlike dropLegacyShortNameRows). A retired row sitting
     // alone is still stale.
     const { path, cleanup } = makeTempPath();
     try {
@@ -1284,10 +1312,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "app",
+              name: RETIRED_FIXTURE_NAME,
               port: 9999,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/legacy"],
+              health: "/legacy/health",
               version: "0.1.4",
             },
           ],
@@ -1329,10 +1357,9 @@ describe("retired-module row de-dupe (hub#334)", () => {
   });
 
   test("Aaron's reproducer — retired row + parachute-surface at same port resolves cleanly", () => {
-    // The motivating bug for hub#334 (originally an `agent` row; `agent` is
-    // a live module again post-rename, so this uses the still-retired `app`).
-    // With dropRetiredModuleRows running before validateManifest, the stale
-    // retired row is GC'd and the duplicate-port gate doesn't trip downstream.
+    // The motivating bug for hub#334. With dropRetiredModuleRows running
+    // before validateManifest, the stale retired row is GC'd and the
+    // duplicate-port gate doesn't trip downstream.
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1340,10 +1367,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "app",
+              name: RETIRED_FIXTURE_NAME,
               port: 1946,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/legacy"],
+              health: "/legacy/health",
               version: "0.1.4",
             },
             {
@@ -1366,12 +1393,11 @@ describe("retired-module row de-dupe (hub#334)", () => {
 
   test("interaction — retired row + legacy short-name pair both cleaned, correct order", () => {
     // Drop order matters: retired-module cleanup runs first, then
-    // legacy-short-name cleanup. This test ensures both passes
-    // compose correctly on a services.json that exercises both
-    // shapes simultaneously. The `app` row is unconditional retire
-    // (the original `agent` fixture is a live module again post-rename);
-    // the parachute-runner + runner pair triggers legacy-short-name
-    // dedup at port 1945.
+    // legacy-short-name cleanup. This test ensures both passes compose
+    // correctly on a services.json that exercises both shapes
+    // simultaneously. The retired-fixture row is unconditional retire; the
+    // parachute-runner + runner pair triggers legacy-short-name dedup at
+    // port 1945.
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1379,10 +1405,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "app",
+              name: RETIRED_FIXTURE_NAME,
               port: 1946,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/legacy"],
+              health: "/legacy/health",
               version: "0.1.4",
             },
             {
@@ -1405,6 +1431,290 @@ describe("retired-module row de-dupe (hub#334)", () => {
       const m = readManifest(path);
       const names = m.services.map((s) => s.name).sort();
       expect(names).toEqual(["parachute-runner"]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Stale OLD-UI-host `app`/`parachute-app` row heal (hub-parity P5, B1). The
+// name `parachute-app` used to belong to the UI-host that renamed to
+// `parachute-surface` 2026-05-27; hub-parity P5 reuses the name for the NEW
+// super-surface app (mount /app, port 1944), so the RETIRED_MODULES entry that
+// used to GC the old row was removed. `healStaleUiHostAppRows` is its
+// shape-gated replacement for operators upgrading DIRECTLY from a pre-rename
+// release who still carry the stale `/surface`/1946 row. The load-bearing
+// assertion: a stale old-app row does NOT survive to spawn a crash-looping
+// unit, while the NEW app row (paths:["/app"], port 1944) is left intact.
+describe("stale OLD-UI-host app row heal (hub-parity P5, B1)", () => {
+  test("heals (drops) a stale `parachute-app` row with the old /surface + 1946 shape", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      // The stale row is gone — it never survives to spawn a crash-looping
+      // `--package @openparachute/parachute-app` unit the operator never
+      // installed.
+      expect(m.services).toHaveLength(0);
+      // Rewritten clean on disk too.
+      const onDisk = JSON.parse(readFileSync(path, "utf8"));
+      expect(onDisk.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("heals a bare-short `app` row with the old shape (the pre-rename self-register name)", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("heals on port 1946 even if the stale row's paths got mangled (port discriminant)", () => {
+    // Corroborating OR-clause: a stale row squatting the old canonical 1946
+    // is healed even if paths[0] isn't /surface-rooted anymore.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/whatever"],
+              health: "/whatever/health",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("leaves the NEW app row (paths:['/app'], port 1944) intact — structurally disjoint", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1944,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.4.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.name).toBe("parachute-app");
+      expect(m.services[0]?.port).toBe(1944);
+      expect(m.services[0]?.paths).toEqual(["/app"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("never heals a /app-mounted app row, whatever its port (new-app protection)", () => {
+    // Defensive: even if a new-app row somehow drifted onto a weird port, its
+    // `/app` mount alone protects it from the heal.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.4.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.paths).toEqual(["/app"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("coexistence — stale old-app + real parachute-surface both at 1946: stale healed, surface keeps /surface", () => {
+    // The load-bearing coexistence case. Without the heal, the two rows collide
+    // on port 1946 and trip the duplicate-port gate (or the stale row hijacks
+    // /surface). With the heal running first, the stale row is dropped by shape
+    // and surface survives clean.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+            {
+              name: "parachute-surface",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.2.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.name).toBe("parachute-surface");
+      expect(m.services[0]?.paths).toEqual(["/surface"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("double-write reproducer — stale `parachute-app` + `app` both at 1946/'/surface' → both healed", () => {
+    // A pre-rename operator hit by the 2026-05-22 double-write carries BOTH
+    // rows. The heal drops both by shape (running ahead of dropLegacyShortNameRows,
+    // which would otherwise keep the `parachute-app` half — still stale).
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+            {
+              name: "app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("coexistence — NEW app (/app, 1944) + real surface (/surface, 1946): both survive", () => {
+    // The steady-state post-P5 world: the new app and surface installed side by
+    // side. Neither is healed; both route on their own mounts.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1944,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.4.0",
+            },
+            {
+              name: "parachute-surface",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.2.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      const names = m.services.map((s) => s.name).sort();
+      expect(names).toEqual(["parachute-app", "parachute-surface"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("readManifestLenient heals the same stale old-app shape", () => {
+    // The lenient reader shares the same raw-JSON heal pipeline — verify the
+    // crash-loop row is dropped there too (the supervisor's boot path reads
+    // lenient).
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.8",
+            },
+          ],
+        }),
+      );
+      const m = readManifestLenient(path, { warn: () => {} });
+      expect(m.services.map((s) => s.name)).toEqual(["parachute-vault"]);
     } finally {
       cleanup();
     }

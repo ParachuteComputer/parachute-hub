@@ -110,7 +110,7 @@ function defaultAvailability(): InteractiveAvailability {
 
 /**
  * Survey ALL known first-party shortnames (vault / notes / scribe / agent /
- * surface) regardless of tier — `installed` is true when the service
+ * surface / app) regardless of tier — `installed` is true when the service
  * has a row in services.json. The fresh-install OFFER is narrowed downstream
  * by `isOfferable` (drops already-installed + `deprecated`-tier shorts —
  * notes); agent (`experimental`) is flagged exploratory in its blurb
@@ -121,7 +121,7 @@ function defaultAvailability(): InteractiveAvailability {
  * like any unknown row it neither blocks setup nor appears in the offer.
  *
  * The full ServiceSpec is only available pre-install for FIRST_PARTY_FALLBACKS
- * shorts (notes — it carries a vendored manifest). KNOWN_MODULES shorts
+ * shorts (notes / app — both carry a vendored manifest). KNOWN_MODULES shorts
  * (vault / scribe / agent / surface) ship `.parachute/module.json`
  * and self-register; pre-install we know manifestName + the urlForEntry quirk
  * from `KNOWN_MODULES[short].extras`, which is all the survey/summary needs.
@@ -175,8 +175,13 @@ export function isOfferable(choice: { short: string; installed: boolean }): bool
 const BLURBS: Record<string, string> = {
   vault: "knowledge graph (MCP) — your owner-authenticated note + tag store",
   surface: "Parachute UI host — auto-installs Notes on first boot (the recommended UI path)",
-  // `app` is the pre-2026-05-27 name for `surface`; kept for any legacy survey row.
-  app: "Parachute UI host — auto-installs Notes on first boot (recommended over notes-daemon)",
+  // hub-parity P5 (2026-07-11): `app` is now the NEW super-surface front
+  // door (@openparachute/parachute-app) — a real FIRST_PARTY_FALLBACKS
+  // entry, not a legacy survey row. It is UNRELATED to the pre-2026-05-27
+  // `app` package that renamed to `surface` (that blurb lives under the
+  // `surface` key above); the two just happen to share the short name
+  // across a rename.
+  app: "the super-surface front door — one app to sign in, browse your vault, and manage your hub/cloud",
   // notes is `deprecated` (not offered on a fresh setup) — this blurb only
   // renders if a legacy install surfaces it in the survey.
   notes: "Notes PWA — web/mobile UI on top of vault (notes-daemon; superseded by `surface`)",

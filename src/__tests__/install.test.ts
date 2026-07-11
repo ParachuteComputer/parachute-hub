@@ -1,8 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultStartLifecycleOpts, install } from "../commands/install.ts";
+import { hubDbPath, openHubDb } from "../hub-db.ts";
+import {
+  PARACHUTE_HUB_ROOT_REDIRECT_ENV,
+  getRootRedirect,
+  setRootRedirect,
+} from "../hub-settings.ts";
 import { findService, upsertService } from "../services-manifest.ts";
 
 function makeTempPath(): { path: string; configDir: string; cleanup: () => void } {
@@ -408,7 +414,7 @@ describe("install", () => {
   test("ADOPT-KILLS an attributable same-module orphan on the canonical port + reclaims it (#609)", async () => {
     // Wipe-recovery: `rm -rf ~/.parachute` + re-`init` leaves the supervised
     // vault child running on :1940. The fresh install must reclaim the canonical
-    // port (adopt-kill the attributable orphan) rather than port-walk to 1944.
+    // port (adopt-kill the attributable orphan) rather than port-walk to 1945.
     const { path, configDir, cleanup } = makeTempPath();
     try {
       const logs: string[] = [];
@@ -1636,9 +1642,10 @@ describe("install", () => {
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
-      // First reservation slot is 1944.
+      // First reservation slot is now 1945 — 1944 is parachute-app's
+      // canonical (assigned, non-walkable) slot as of hub-parity P5.
       const entry = findService("parachute-vault", path);
-      expect(entry?.port).toBe(1944);
+      expect(entry?.port).toBe(1945);
       expect(logs.join("\n")).toMatch(/canonical port 1940 is in use/);
       // .env is not touched.
       const envPath = join(configDir, "vault", ".env");
@@ -1940,7 +1947,8 @@ describe("install", () => {
       expect(startCalls).toEqual(["someapp"]);
       // Log lines speak in the canonical short name too. Port comes from
       // assignServicePort (third-party gets the first unassigned canonical
-      // slot, currently 1944), not the manifest's port hint.
+      // slot, currently 1945 — 1944 is parachute-app's canonical assigned
+      // slot as of hub-parity P5), not the manifest's port hint.
       const joined = logs.join("\n");
       expect(joined).toMatch(/Seeded services\.json entry for someapp/);
       expect(joined).toMatch(/someapp registered on port \d+/);
@@ -2314,5 +2322,179 @@ describe("hub#573 — install auto-start converges on supervised detection", () 
     expect(opts.manifestPath).toBe("/tmp/services.json");
     expect(opts.configDir).toBe("/tmp/cfg");
     expect(opts.log).toBe(log);
+  });
+});
+
+// hub-parity P5 (2026-07-11): `parachute install app` defaults the hub's
+// bare `/` redirect to the app's front door — SET-IF-UNSET ONLY. Every test
+// here injects `rootRedirectDb` (a hub.db opened in the same disposable
+// tempdir `makeTempPath()` already isolates) so no real
+// `~/.parachute/hub.db` is ever touched — never drive this against the
+// operator's live install.
+describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
+  // The write gates on `resolveRootRedirectDetailed(db).source === "default"`,
+  // which consults `PARACHUTE_HUB_ROOT_REDIRECT`. Neutralize any ambient value
+  // (Aaron's box, CI) so the default-tier tests are deterministic; the
+  // env-set test below manages its own value inside its own body.
+  let savedEnv: string | undefined;
+  beforeEach(() => {
+    savedEnv = process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+    delete process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+  });
+  afterEach(() => {
+    if (savedEnv === undefined) {
+      delete process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+    } else {
+      process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV] = savedEnv;
+    }
+  });
+
+  test("fresh install (no prior root_redirect) sets it to /app/", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const db = openHubDb(hubDbPath(configDir));
+      const logs: string[] = [];
+      try {
+        const code = await install("app", {
+          runner: async () => 0,
+          manifestPath: path,
+          configDir,
+          startService: async () => 0,
+          isLinked: () => false,
+          portProbe: async () => false,
+          rootRedirectDb: db,
+          log: (l) => logs.push(l),
+        });
+        expect(code).toBe(0);
+        expect(getRootRedirect(db)).toBe("/app/");
+        expect(logs.join("\n")).toMatch(/front page.*now opens the app at \/app\//);
+      } finally {
+        db.close();
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a pre-set root_redirect is left alone — never clobbered", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const db = openHubDb(hubDbPath(configDir));
+      const logs: string[] = [];
+      try {
+        setRootRedirect(db, "/surface/reading-room");
+        const code = await install("app", {
+          runner: async () => 0,
+          manifestPath: path,
+          configDir,
+          startService: async () => 0,
+          isLinked: () => false,
+          portProbe: async () => false,
+          rootRedirectDb: db,
+          log: (l) => logs.push(l),
+        });
+        expect(code).toBe(0);
+        // The operator's prior choice survives byte-for-byte.
+        expect(getRootRedirect(db)).toBe("/surface/reading-room");
+        // The set-if-unset write's OWN log line (distinct from the static
+        // postInstallFooter boilerplate, which always prints "now opens the
+        // app too, unless you've already..." regardless of whether the write
+        // fired) must NOT appear — the write itself was skipped.
+        expect(logs.join("\n")).not.toMatch(/now opens the app at \/app\//);
+      } finally {
+        db.close();
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("installing a different module never touches root_redirect", async () => {
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const db = openHubDb(hubDbPath(configDir));
+      try {
+        const code = await install("notes", {
+          runner: async () => 0,
+          manifestPath: path,
+          configDir,
+          startService: async () => 0,
+          isLinked: () => false,
+          portProbe: async () => false,
+          rootRedirectDb: db,
+          log: () => {},
+        });
+        expect(code).toBe(0);
+        expect(getRootRedirect(db)).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("an ENV-configured redirect (no DB row) is left alone — never clobbered (N1)", async () => {
+    // Container deploys pin the landing page via PARACHUTE_HUB_ROOT_REDIRECT,
+    // not a DB row. Gating on `getRootRedirect(db) === null` (DB only) would
+    // miss this and write `/app/`, which — since the DB row wins over env on
+    // read — silently overrides their configured landing. The fix gates on
+    // `resolveRootRedirectDetailed(db).source === "default"`, which sees the
+    // env tier. So: env set → no DB row written.
+    const { path, configDir, cleanup } = makeTempPath();
+    const prevEnv = process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+    try {
+      process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV] = "/surface/team-room";
+      const db = openHubDb(hubDbPath(configDir));
+      const logs: string[] = [];
+      try {
+        const code = await install("app", {
+          runner: async () => 0,
+          manifestPath: path,
+          configDir,
+          startService: async () => 0,
+          isLinked: () => false,
+          portProbe: async () => false,
+          rootRedirectDb: db,
+          log: (l) => logs.push(l),
+        });
+        expect(code).toBe(0);
+        // No DB row written — the env-configured landing survives.
+        expect(getRootRedirect(db)).toBeNull();
+        expect(logs.join("\n")).not.toMatch(/now opens the app at \/app\//);
+      } finally {
+        db.close();
+      }
+    } finally {
+      if (prevEnv === undefined) {
+        delete process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+      } else {
+        process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV] = prevEnv;
+      }
+      cleanup();
+    }
+  });
+
+  test("production gate: without rootRedirectDb + a tempdir manifestPath, the write is skipped (not attempted)", async () => {
+    // Mirrors the existing `guidanceProbeAllowed` discriminant elsewhere in
+    // install.ts: a test with a tempdir manifestPath and no explicit opt-in
+    // must never open the real ~/.parachute/hub.db. There's nothing to open
+    // here at all — the assertion is simply that install still completes
+    // cleanly with the DB-touching branch skipped.
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const code = await install("app", {
+        runner: async () => 0,
+        manifestPath: path,
+        configDir,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: () => {},
+      });
+      expect(code).toBe(0);
+    } finally {
+      cleanup();
+    }
   });
 });
