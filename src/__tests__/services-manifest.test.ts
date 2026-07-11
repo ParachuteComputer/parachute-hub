@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RETIRED_MODULES } from "../service-spec.ts";
 import {
   type ServiceEntry,
   ServicesManifestError,
@@ -1024,6 +1025,14 @@ describe("claw → agent migration", () => {
 // file so the next read is clean.
 describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
   test("drops the short-name row when a same-port manifestName row exists", () => {
+    // Fixture uses `surface` (the ACTUAL short-name twin of `parachute-surface`
+    // per the structural rule: b.name === `parachute-${a.name}`) rather than
+    // `app`. Pre-hub-parity-P5 this test used `app` here, but that only
+    // passed because `app` was ALSO in RETIRED_MODULES at the time — the
+    // unconditional retired-module GC (not this structural short-name rule)
+    // was doing the dropping. Now that `app`/`parachute-app` are un-retired
+    // (hub-parity P5, a new unrelated module claims them), this fixture is
+    // corrected to actually exercise `dropLegacyShortNameRows`.
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1038,7 +1047,7 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
               version: "0.2.0",
             },
             {
-              name: "app",
+              name: "surface",
               port: 1946,
               paths: ["/surface"],
               health: "/surface/healthz",
@@ -1195,6 +1204,9 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
   });
 
   test("idempotent — second read leaves the cleaned file alone", () => {
+    // See the fixture note on the first test in this describe block — `app`
+    // is renamed to `surface` here for the same reason (un-retired 2026-07-11,
+    // hub-parity P5).
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1209,7 +1221,7 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
               version: "0.2.0",
             },
             {
-              name: "app",
+              name: "surface",
               port: 1946,
               paths: ["/surface"],
               health: "/surface/healthz",
@@ -1232,21 +1244,37 @@ describe("legacy short-name row de-dupe (parachute-app#13 / runner#4)", () => {
 
 // Retired-module row cleanup (hub#334 — Aaron's actual reproducer on
 // 2026-05-22). His services.json originally carried a stale `agent` row at
-// 1946 colliding with `parachute-app`'s canonical slot. NOTE: post the
-// 2026-06-17 channel→agent rename, `agent` is a LIVE module again, so these
-// fixtures use the still-retired `app` (parachute-app) name to exercise the
-// same GC. The legacy-short-name de-dupe doesn't help — a retired short
-// isn't the short-name twin of the colliding row. The retired-module GC
-// fires unconditionally on rows whose name appears in `RETIRED_MODULES`,
-// regardless of port collision.
+// 1946 colliding with `parachute-app`'s canonical slot. The legacy-short-name
+// de-dupe doesn't help — a retired short isn't the short-name twin of the
+// colliding row. The retired-module GC fires unconditionally on rows whose
+// name appears in `RETIRED_MODULES`, regardless of port collision.
+//
+// NOTE (2026-07-11, hub-parity P5): the original fixtures used `agent` —
+// which was a RETIRED_MODULES entry until the 2026-06-17 channel→agent
+// rename re-assigned that name to the live (renamed-from-channel) module —
+// and were later updated to use `app` (parachute-app, retired 2026-05-27).
+// `app`/`parachute-app` are now THEMSELVES un-retired (a new, unrelated
+// module — the real parachute-app super-surface — claims the name for
+// real; see service-spec.ts's RETIRED_MODULES comment). So these tests now
+// inject a throwaway synthetic retired entry via a describe-scoped
+// beforeEach/afterEach rather than depending on production RETIRED_MODULES
+// having a spare non-live name to spend on test fixtures — this mechanism
+// has now been renamed out from under these tests twice.
 describe("retired-module row de-dupe (hub#334)", () => {
-  // NOTE: the original fixtures used `agent` — which was a RETIRED_MODULES
-  // entry until the 2026-06-17 channel→agent rename re-assigned that name to
-  // the live (renamed-from-channel) module. These tests now use `app`
-  // (parachute-app, retired 2026-05-27 — still in RETIRED_MODULES) so they
-  // keep exercising the retired-module GC mechanism on a name that is still
-  // genuinely retired.
-  test("drops a row whose name is in RETIRED_MODULES (app)", () => {
+  const RETIRED_FIXTURE_NAME = "legacy-test-retired-module";
+
+  beforeEach(() => {
+    RETIRED_MODULES[RETIRED_FIXTURE_NAME] = {
+      retiredAt: "2020-01-01",
+      replacement: "n/a — test-only fixture, not a real retirement",
+    };
+  });
+
+  afterEach(() => {
+    delete RETIRED_MODULES[RETIRED_FIXTURE_NAME];
+  });
+
+  test("drops a row whose name is in RETIRED_MODULES", () => {
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1254,10 +1282,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "app",
+              name: RETIRED_FIXTURE_NAME,
               port: 1946,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/legacy"],
+              health: "/legacy/health",
               version: "0.1.4",
             },
           ],
@@ -1275,7 +1303,7 @@ describe("retired-module row de-dupe (hub#334)", () => {
 
   test("retirement is unconditional — no other rows required", () => {
     // Verifies dropRetiredModuleRows doesn't depend on a collision
-    // partner (unlike dropLegacyShortNameRows). An app row sitting
+    // partner (unlike dropLegacyShortNameRows). A retired row sitting
     // alone is still stale.
     const { path, cleanup } = makeTempPath();
     try {
@@ -1284,10 +1312,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "app",
+              name: RETIRED_FIXTURE_NAME,
               port: 9999,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/legacy"],
+              health: "/legacy/health",
               version: "0.1.4",
             },
           ],
@@ -1329,10 +1357,9 @@ describe("retired-module row de-dupe (hub#334)", () => {
   });
 
   test("Aaron's reproducer — retired row + parachute-surface at same port resolves cleanly", () => {
-    // The motivating bug for hub#334 (originally an `agent` row; `agent` is
-    // a live module again post-rename, so this uses the still-retired `app`).
-    // With dropRetiredModuleRows running before validateManifest, the stale
-    // retired row is GC'd and the duplicate-port gate doesn't trip downstream.
+    // The motivating bug for hub#334. With dropRetiredModuleRows running
+    // before validateManifest, the stale retired row is GC'd and the
+    // duplicate-port gate doesn't trip downstream.
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1340,10 +1367,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "app",
+              name: RETIRED_FIXTURE_NAME,
               port: 1946,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/legacy"],
+              health: "/legacy/health",
               version: "0.1.4",
             },
             {
@@ -1366,12 +1393,11 @@ describe("retired-module row de-dupe (hub#334)", () => {
 
   test("interaction — retired row + legacy short-name pair both cleaned, correct order", () => {
     // Drop order matters: retired-module cleanup runs first, then
-    // legacy-short-name cleanup. This test ensures both passes
-    // compose correctly on a services.json that exercises both
-    // shapes simultaneously. The `app` row is unconditional retire
-    // (the original `agent` fixture is a live module again post-rename);
-    // the parachute-runner + runner pair triggers legacy-short-name
-    // dedup at port 1945.
+    // legacy-short-name cleanup. This test ensures both passes compose
+    // correctly on a services.json that exercises both shapes
+    // simultaneously. The retired-fixture row is unconditional retire; the
+    // parachute-runner + runner pair triggers legacy-short-name dedup at
+    // port 1945.
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(
@@ -1379,10 +1405,10 @@ describe("retired-module row de-dupe (hub#334)", () => {
         JSON.stringify({
           services: [
             {
-              name: "app",
+              name: RETIRED_FIXTURE_NAME,
               port: 1946,
-              paths: ["/app"],
-              health: "/app/health",
+              paths: ["/legacy"],
+              health: "/legacy/health",
               version: "0.1.4",
             },
             {

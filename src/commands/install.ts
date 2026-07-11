@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
@@ -15,6 +16,8 @@ import {
   defaultSleep,
   readHubPort,
 } from "../hub-control.ts";
+import { hubDbPath, openHubDb } from "../hub-db.ts";
+import { getRootRedirect, setRootRedirect } from "../hub-settings.ts";
 import { type HubUnitDeps, defaultHubUnitDeps, isHubUnitInstalled } from "../hub-unit.ts";
 import {
   type ModuleManifest,
@@ -408,6 +411,16 @@ export interface InstallOpts {
    * origin for stable assertions.
    */
   wellKnownOrigin?: string;
+  /**
+   * Test seam for the `app`-only set-if-unset root-redirect write (hub-parity
+   * P5). Production opens `openHubDb(hubDbPath(configDir))` fresh and closes
+   * it after the write; passing this injects an already-open DB (e.g. a
+   * tempdir `hub.db`) so a test never touches the real `~/.parachute/hub.db`.
+   * Passing this ALSO opts a tempdir-manifestPath test INTO the write path —
+   * mirrors `guidanceCtx`'s discriminant: without it, the production gate
+   * (`manifestPath === SERVICES_MANIFEST_PATH`) skips the write entirely.
+   */
+  rootRedirectDb?: Database;
 }
 
 async function defaultRunner(cmd: readonly string[]): Promise<number> {
@@ -1348,6 +1361,31 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     const startCode = await startService(short);
     if (startCode !== 0) {
       log(`⚠ ${short} didn't start cleanly. Run manually: parachute start ${short}`);
+    }
+  }
+
+  // App-only: default the hub's bare `/` redirect to the app's front door on
+  // first install (hub-parity P5, 2026-07-11) — SET-IF-UNSET ONLY, never
+  // clobbering an operator's existing choice (`parachute hub
+  // set-root-redirect` or the admin SPA PUT both still win on any later run,
+  // and either can change it back). Gated on the same production-vs-test
+  // discriminant the guidance probe below uses: a test driving install
+  // against a tempdir manifestPath never opens the real
+  // `~/.parachute/hub.db` unless it opts in via `opts.rootRedirectDb`.
+  if (short === "app") {
+    const dbProbeAllowed =
+      opts.rootRedirectDb !== undefined || manifestPath === SERVICES_MANIFEST_PATH;
+    if (dbProbeAllowed) {
+      const db = opts.rootRedirectDb ?? openHubDb(hubDbPath(configDir));
+      try {
+        if (getRootRedirect(db) === null) {
+          setRootRedirect(db, "/app/");
+          log("✓ The hub's front page (`/`) now opens the app at /app/.");
+          log("  Change it any time: `parachute hub set-root-redirect <path>` or the admin SPA.");
+        }
+      } finally {
+        if (!opts.rootRedirectDb) db.close();
+      }
     }
   }
 

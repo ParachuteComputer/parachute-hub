@@ -3,7 +3,26 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assignPort, assignServicePort } from "../port-assign.ts";
-import { CANONICAL_PORT_MAX, CANONICAL_PORT_MIN } from "../service-spec.ts";
+import { CANONICAL_PORT_MAX, CANONICAL_PORT_MIN, PORT_RESERVATIONS } from "../service-spec.ts";
+
+describe("PORT_RESERVATIONS (registry shape)", () => {
+  test("every port in the canonical range appears exactly once", () => {
+    const ports = PORT_RESERVATIONS.map((r) => r.port);
+    expect(new Set(ports).size).toBe(ports.length);
+    expect(ports.slice().sort((a, b) => a - b)).toEqual(ports);
+    for (const p of ports) {
+      expect(p).toBeGreaterThanOrEqual(CANONICAL_PORT_MIN);
+      expect(p).toBeLessThanOrEqual(CANONICAL_PORT_MAX);
+    }
+  });
+
+  test("1944 (parachute-app, hub-parity P5) doesn't collide with any other reservation", () => {
+    const owners = PORT_RESERVATIONS.filter((r) => r.port === 1944);
+    expect(owners).toHaveLength(1);
+    expect(owners[0]?.name).toBe("parachute-app");
+    expect(owners[0]?.status).toBe("assigned");
+  });
+});
 
 function makeTempDir(): { dir: string; cleanup: () => void } {
   const dir = mkdtempSync(join(tmpdir(), "pcli-port-assign-"));
@@ -25,16 +44,20 @@ describe("assignPort (pure)", () => {
   });
 
   test("walks the unassigned reservation range when canonical is occupied", () => {
-    // 1940 is taken; canonical reserved range starts at 1944 → first hit.
+    // 1940 is taken. 1944 is now `parachute-app`'s canonical slot (hub-parity
+    // P5, status "assigned") so the walker skips it; the first RESERVED
+    // (walkable) slot is 1945.
     const result = assignPort(1940, [1940]);
-    expect(result.port).toBe(1944);
+    expect(result.port).toBe(1945);
     expect(result.source).toBe("fallback-in-range");
     expect(result.warning).toMatch(/canonical port 1940 is in use/);
-    expect(result.warning).toMatch(/1944/);
+    expect(result.warning).toMatch(/1945/);
   });
 
   test("skips reservations that are also occupied", () => {
-    // Canonical 1940 + the first three reserved slots are all in use.
+    // Canonical 1940 is in use. 1944 is assigned (parachute-app, skipped
+    // regardless of `occupied`); 1945 is reserved-but-occupied; 1946 is
+    // assigned (parachute-surface, skipped); 1947 is reserved-and-free.
     const result = assignPort(1940, [1940, 1944, 1945, 1946]);
     expect(result.port).toBe(1947);
     expect(result.source).toBe("fallback-in-range");
@@ -60,19 +83,21 @@ describe("assignPort (pure)", () => {
   });
 
   test("third-party (no canonical slot) jumps straight to the reservation range", () => {
+    // 1944 is assigned (parachute-app, hub-parity P5) so the walker skips it;
+    // the first RESERVED (walkable) slot is 1945.
     const result = assignPort(undefined, []);
-    expect(result.port).toBe(1944);
+    expect(result.port).toBe(1945);
     expect(result.source).toBe("fallback-in-range");
     expect(result.warning).toMatch(/no canonical slot/);
-    expect(result.warning).toMatch(/1944/);
+    expect(result.warning).toMatch(/1945/);
   });
 
   test("third-party with reservations occupied walks further in the range", () => {
-    // PORT_RESERVATIONS post-hub#323: 1944 reserved, 1945 reserved, 1946
-    // assigned (parachute-app — KNOWN_MODULES carries the canonical slot
-    // so the fallback walker doesn't hand it to a third party), 1947
-    // reserved. With 1944 + 1945 occupied, the walker skips the assigned
-    // 1946 slot and lands on the next reserved-and-free port — 1947.
+    // PORT_RESERVATIONS: 1944 assigned (parachute-app), 1945 reserved, 1946
+    // assigned (parachute-surface — both carry canonical slots so the
+    // fallback walker doesn't hand them to a third party), 1947 reserved.
+    // With 1944 + 1945 occupied, the walker skips the assigned 1946 slot and
+    // lands on the next reserved-and-free port — 1947.
     const result = assignPort(undefined, [1944, 1945]);
     expect(result.port).toBe(1947);
     expect(result.source).toBe("fallback-in-range");
@@ -145,7 +170,9 @@ describe("assignServicePort (hub#206 — services.json is authoritative)", () =>
         canonical: 1940,
         occupied: [1940],
       });
-      expect(result.port).toBe(1944);
+      // 1944 is parachute-app's assigned (non-walkable) slot as of
+      // hub-parity P5 — the first walkable reserved slot is 1945.
+      expect(result.port).toBe(1945);
       expect(result.source).toBe("fallback-in-range");
       expect(result.warning).toMatch(/canonical port 1940 is in use/);
       // .env stays bit-for-bit identical.
@@ -162,7 +189,9 @@ describe("assignServicePort (hub#206 — services.json is authoritative)", () =>
       const result = assignServicePort({
         occupied: [],
       });
-      expect(result.port).toBe(1944);
+      // 1944 is parachute-app's assigned (non-walkable) slot as of
+      // hub-parity P5 — the first walkable reserved slot is 1945.
+      expect(result.port).toBe(1945);
       expect(result.source).toBe("fallback-in-range");
       expect(existsSync(envPath)).toBe(false);
     } finally {

@@ -1,15 +1,19 @@
 #!/usr/bin/env bun
 
 /**
- * Tiny static-file server for the @openparachute/notes PWA bundle.
+ * Tiny static-file server for a Parachute PWA bundle — originally written
+ * for @openparachute/notes, generalized in hub-parity P5 (2026-07-11) to
+ * also serve @openparachute/parachute-app (the super-surface front door,
+ * port 1944, mount `/app`) via the same shim. Any package matching this
+ * shape (a prebuilt SPA `dist/` with no server of its own) can reuse it.
  *
- * Notes is a SPA — no backend of its own. `parachute start notes` invokes
- * this shim with the installed `dist/` path so the PWA is served at a
- * known port and can be reverse-proxied by `parachute expose` alongside
- * the other services.
+ * A served bundle is a SPA — no backend of its own. `parachute start
+ * <svc>` invokes this shim with the installed `dist/` path so the PWA is
+ * served at a known port and can be reverse-proxied by `parachute expose`
+ * alongside the other services.
  *
  * Invoked as:
- *   bun <this-file> --port <n> [--dist <path>] [--mount <prefix>]
+ *   bun <this-file> --port <n> [--dist <path>] [--mount <prefix>] [--package <npmName>]
  *
  * `--mount` (default `/notes`) is the path prefix the reverse proxy hands
  * us. We strip it before resolving against `dist/` so a request for
@@ -17,27 +21,43 @@
  * `{dist}/notes/sw.js`. Without the strip, the SW + .webmanifest both
  * SPA-fall-back to index.html with content-type text/html, and the PWA
  * install prompt never fires. Pass `--mount ""` (or `--mount /`) when the
- * bundle is served at the origin root.
+ * bundle is served at the origin root. THIS IS LOAD-BEARING for every
+ * package served by this shim, not just notes — keep it exactly as-is.
  *
- * If --dist is omitted, we resolve @openparachute/notes's dist directory
- * via Bun.resolveSync. If that fails (package not installed globally, or
+ * `--package` (default `@openparachute/notes`, back-compat) names the npm
+ * package whose `dist/` we resolve when `--dist` is omitted. Passed by
+ * FIRST_PARTY_FALLBACKS entries whose startCmd composes this shim for a
+ * package other than notes (e.g. `app`'s `--package @openparachute/parachute-app`).
+ *
+ * If --dist is omitted, we resolve the package's dist directory via
+ * Bun.resolveSync. If that fails (package not installed globally, or
  * package doesn't ship dist/), exit 1 with a clear error.
+ *
+ * `/health` (post-mount-strip) always answers 2xx — the doctor/status
+ * probe (`probeModuleHealth`) only cares about the status code, but we
+ * answer explicitly rather than relying on the SPA-shell catch-all so a
+ * missing/corrupt `dist/index.html` can't take the health check down with it.
  */
 
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
+/** Back-compat default — the shim's original (and still primary) consumer. */
+const DEFAULT_PACKAGE = "@openparachute/notes";
+
 interface Args {
   port: number;
   dist?: string;
   mount: string;
+  pkg: string;
 }
 
 function parseArgs(argv: string[]): Args {
   let port = 5173;
   let dist: string | undefined;
   let mount = "/notes";
+  let pkg = DEFAULT_PACKAGE;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--port") {
@@ -56,11 +76,15 @@ function parseArgs(argv: string[]): Args {
       const v = argv[++i];
       if (v === undefined) throw new Error("--mount requires a value");
       mount = normalizeMount(v);
+    } else if (a === "--package") {
+      const v = argv[++i];
+      if (!v) throw new Error("--package requires a value");
+      pkg = v;
     } else {
       throw new Error(`unknown argument: ${a}`);
     }
   }
-  return { port, dist, mount };
+  return { port, dist, mount, pkg };
 }
 
 export function normalizeMount(raw: string): string {
@@ -70,22 +94,22 @@ export function normalizeMount(raw: string): string {
 
 /**
  * Candidate base directories that `Bun.resolveSync` walks from when looking
- * for `@openparachute/notes/package.json`. Order matters:
+ * for `<package>/package.json`. Order matters:
  *
- *   1. `process.cwd()` — works when notes-serve is invoked from inside the
- *      notes checkout (e.g. via `installDir` cwd in lifecycle.ts) or from
- *      any project that depends on `@openparachute/notes`.
+ *   1. `process.cwd()` — works when the shim is invoked from inside the
+ *      package's own checkout (e.g. via `installDir` cwd in lifecycle.ts) or
+ *      from any project that depends on the package.
  *   2. `~/.bun/install/global/node_modules` — modern Bun's global-install
- *      layout. This is where `bun add -g @openparachute/notes` lands the
- *      package, and where `bun link @openparachute/notes` symlinks it.
+ *      layout. This is where `bun add -g <package>` lands the package, and
+ *      where `bun link <package>` symlinks it.
  *   3. `~/.bun/install/global` — defensive fallback for older Bun layouts.
  *
- * Hub itself does NOT depend on `@openparachute/notes`, so when
- * `parachute start notes` is run from the hub repo dir, the cwd-relative
- * resolve walks ancestral node_modules and finds nothing. Bun does not
- * auto-consult the global install dir, so bun-linked installs fail to
- * resolve without (2)/(3). hub#194: Aaron hit silent 502 on tailnet
- * `/notes/` because of this — fixed by trying the global install dirs.
+ * Hub itself does NOT depend on the served package, so when `parachute
+ * start <svc>` is run from the hub repo dir, the cwd-relative resolve walks
+ * ancestral node_modules and finds nothing. Bun does not auto-consult the
+ * global install dir, so bun-linked installs fail to resolve without
+ * (2)/(3). hub#194: Aaron hit silent 502 on tailnet `/notes/` because of
+ * this — fixed by trying the global install dirs.
  *
  * Exported (and parameterized via `cwd`/`home`) so tests can drive the
  * resolution order against a real fixture install without monkey-patching
@@ -98,6 +122,8 @@ export function notesDistCandidates(cwd: string, home: string): string[] {
 export interface ResolveNotesDistDeps {
   cwd?: string;
   home?: string;
+  /** npm package name to resolve. Defaults to `@openparachute/notes` (back-compat). */
+  pkg?: string;
   /** Override `Bun.resolveSync` for tests. */
   resolveSync?: (specifier: string, base: string) => string;
   existsSync?: (path: string) => boolean;
@@ -106,6 +132,7 @@ export interface ResolveNotesDistDeps {
 export function resolveNotesDistFrom(deps: ResolveNotesDistDeps = {}): string {
   const cwd = deps.cwd ?? process.cwd();
   const home = deps.home ?? homedir();
+  const pkg = deps.pkg ?? DEFAULT_PACKAGE;
   const resolveSync = deps.resolveSync ?? Bun.resolveSync;
   const exists = deps.existsSync ?? existsSync;
   const candidates = notesDistCandidates(cwd, home);
@@ -113,7 +140,7 @@ export function resolveNotesDistFrom(deps: ResolveNotesDistDeps = {}): string {
   for (const base of candidates) {
     let pkgPath: string;
     try {
-      pkgPath = resolveSync("@openparachute/notes/package.json", base);
+      pkgPath = resolveSync(`${pkg}/package.json`, base);
     } catch (err) {
       resolveErrors.push(`  - ${base}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
@@ -126,18 +153,18 @@ export function resolveNotesDistFrom(deps: ResolveNotesDistDeps = {}): string {
       // other candidates — they'd resolve to the same package and report
       // the same problem.
       throw new Error(
-        `@openparachute/notes resolved at ${root} has no dist/ directory at ${dist}. The package may not ship a prebuilt bundle — ask the notes maintainer to add a prepublishOnly build step.`,
+        `${pkg} resolved at ${root} has no dist/ directory at ${dist}. The package may not ship a prebuilt bundle — ask the ${pkg} maintainer to add a prepublishOnly build step.`,
       );
     }
     return dist;
   }
   throw new Error(
-    `Could not resolve @openparachute/notes from any of:\n${resolveErrors.join("\n")}\nIs the package installed? Try \`bun add -g @openparachute/notes\` or \`parachute install notes\`.`,
+    `Could not resolve ${pkg} from any of:\n${resolveErrors.join("\n")}\nIs the package installed? Try \`bun add -g ${pkg}\` or the matching \`parachute install <short>\`.`,
   );
 }
 
-function resolveNotesDist(): string {
-  return resolveNotesDistFrom();
+function resolveNotesDist(pkg: string): string {
+  return resolveNotesDistFrom({ pkg });
 }
 
 function mimeFor(path: string): string | undefined {
@@ -159,6 +186,17 @@ export function notesFetch(dist: string, mount: string): (req: Request) => Respo
     let pathname = url.pathname;
     if (mount && (pathname === mount || pathname.startsWith(`${mount}/`))) {
       pathname = pathname.slice(mount.length) || "/";
+    }
+    if (pathname === "/health") {
+      // Explicit rather than falling through to the SPA shell: the doctor /
+      // status probe (`probeModuleHealth`) only checks for a 2xx status, but
+      // answering directly means a missing/corrupt `dist/index.html` can't
+      // take the health check down with it. Every FIRST_PARTY_FALLBACKS
+      // entry served by this shim declares `health` under its own mount
+      // (e.g. `/notes/health`, `/app/health`) — this answers all of them.
+      return new Response(JSON.stringify({ status: "ok" }), {
+        headers: { "content-type": "application/json" },
+      });
     }
     if (pathname === "/" || pathname.endsWith("/")) {
       return spaShell();
@@ -200,17 +238,21 @@ export function notesServeOptions(
 }
 
 if (import.meta.main) {
-  const { port, dist: distArg, mount } = parseArgs(process.argv.slice(2));
+  const { port, dist: distArg, mount, pkg } = parseArgs(process.argv.slice(2));
 
   let dist: string;
   try {
-    dist = distArg ?? resolveNotesDist();
+    dist = distArg ?? resolveNotesDist(pkg);
   } catch (err) {
-    console.error(`parachute-notes-serve: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(
+      `parachute-static-serve (${pkg}): ${err instanceof Error ? err.message : String(err)}`,
+    );
     process.exit(1);
   }
 
   Bun.serve(notesServeOptions(port, dist, mount));
 
-  console.log(`notes static-serve listening on :${port} (dist=${dist}, mount=${mount || "/"})`);
+  console.log(
+    `static-serve listening on :${port} (pkg=${pkg}, dist=${dist}, mount=${mount || "/"})`,
+  );
 }
