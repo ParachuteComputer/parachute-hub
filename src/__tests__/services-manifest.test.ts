@@ -1437,6 +1437,290 @@ describe("retired-module row de-dupe (hub#334)", () => {
   });
 });
 
+// Stale OLD-UI-host `app`/`parachute-app` row heal (hub-parity P5, B1). The
+// name `parachute-app` used to belong to the UI-host that renamed to
+// `parachute-surface` 2026-05-27; hub-parity P5 reuses the name for the NEW
+// super-surface app (mount /app, port 1944), so the RETIRED_MODULES entry that
+// used to GC the old row was removed. `healStaleUiHostAppRows` is its
+// shape-gated replacement for operators upgrading DIRECTLY from a pre-rename
+// release who still carry the stale `/surface`/1946 row. The load-bearing
+// assertion: a stale old-app row does NOT survive to spawn a crash-looping
+// unit, while the NEW app row (paths:["/app"], port 1944) is left intact.
+describe("stale OLD-UI-host app row heal (hub-parity P5, B1)", () => {
+  test("heals (drops) a stale `parachute-app` row with the old /surface + 1946 shape", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      // The stale row is gone — it never survives to spawn a crash-looping
+      // `--package @openparachute/parachute-app` unit the operator never
+      // installed.
+      expect(m.services).toHaveLength(0);
+      // Rewritten clean on disk too.
+      const onDisk = JSON.parse(readFileSync(path, "utf8"));
+      expect(onDisk.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("heals a bare-short `app` row with the old shape (the pre-rename self-register name)", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("heals on port 1946 even if the stale row's paths got mangled (port discriminant)", () => {
+    // Corroborating OR-clause: a stale row squatting the old canonical 1946
+    // is healed even if paths[0] isn't /surface-rooted anymore.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/whatever"],
+              health: "/whatever/health",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("leaves the NEW app row (paths:['/app'], port 1944) intact — structurally disjoint", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1944,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.4.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.name).toBe("parachute-app");
+      expect(m.services[0]?.port).toBe(1944);
+      expect(m.services[0]?.paths).toEqual(["/app"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("never heals a /app-mounted app row, whatever its port (new-app protection)", () => {
+    // Defensive: even if a new-app row somehow drifted onto a weird port, its
+    // `/app` mount alone protects it from the heal.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "app",
+              port: 1946,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.4.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.paths).toEqual(["/app"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("coexistence — stale old-app + real parachute-surface both at 1946: stale healed, surface keeps /surface", () => {
+    // The load-bearing coexistence case. Without the heal, the two rows collide
+    // on port 1946 and trip the duplicate-port gate (or the stale row hijacks
+    // /surface). With the heal running first, the stale row is dropped by shape
+    // and surface survives clean.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+            {
+              name: "parachute-surface",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.2.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(1);
+      expect(m.services[0]?.name).toBe("parachute-surface");
+      expect(m.services[0]?.paths).toEqual(["/surface"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("double-write reproducer — stale `parachute-app` + `app` both at 1946/'/surface' → both healed", () => {
+    // A pre-rename operator hit by the 2026-05-22 double-write carries BOTH
+    // rows. The heal drops both by shape (running ahead of dropLegacyShortNameRows,
+    // which would otherwise keep the `parachute-app` half — still stale).
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+            {
+              name: "app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      expect(m.services).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("coexistence — NEW app (/app, 1944) + real surface (/surface, 1946): both survive", () => {
+    // The steady-state post-P5 world: the new app and surface installed side by
+    // side. Neither is healed; both route on their own mounts.
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1944,
+              paths: ["/app"],
+              health: "/app/health",
+              version: "0.4.0",
+            },
+            {
+              name: "parachute-surface",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.2.0",
+            },
+          ],
+        }),
+      );
+      const m = readManifest(path);
+      const names = m.services.map((s) => s.name).sort();
+      expect(names).toEqual(["parachute-app", "parachute-surface"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("readManifestLenient heals the same stale old-app shape", () => {
+    // The lenient reader shares the same raw-JSON heal pipeline — verify the
+    // crash-loop row is dropped there too (the supervisor's boot path reads
+    // lenient).
+    const { path, cleanup } = makeTempPath();
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          services: [
+            {
+              name: "parachute-app",
+              port: 1946,
+              paths: ["/surface"],
+              health: "/surface/healthz",
+              version: "0.1.4",
+            },
+            {
+              name: "parachute-vault",
+              port: 1940,
+              paths: ["/vault/default"],
+              health: "/vault/default/health",
+              version: "0.4.8",
+            },
+          ],
+        }),
+      );
+      const m = readManifestLenient(path, { warn: () => {} });
+      expect(m.services.map((s) => s.name)).toEqual(["parachute-vault"]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 describe("readManifestLenient — skips bad entries instead of throwing (hub#406)", () => {
   test("returns the healthy entries when one row has port=0 (the rc.4 app bug)", () => {
     // Reproduces what hub saw 2026-05-26: a fresh deploy installed

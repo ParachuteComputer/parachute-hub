@@ -1,10 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultStartLifecycleOpts, install } from "../commands/install.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { getRootRedirect, setRootRedirect } from "../hub-settings.ts";
+import {
+  PARACHUTE_HUB_ROOT_REDIRECT_ENV,
+  getRootRedirect,
+  setRootRedirect,
+} from "../hub-settings.ts";
 import { findService, upsertService } from "../services-manifest.ts";
 
 function makeTempPath(): { path: string; configDir: string; cleanup: () => void } {
@@ -2328,6 +2332,23 @@ describe("hub#573 — install auto-start converges on supervised detection", () 
 // `~/.parachute/hub.db` is ever touched — never drive this against the
 // operator's live install.
 describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
+  // The write gates on `resolveRootRedirectDetailed(db).source === "default"`,
+  // which consults `PARACHUTE_HUB_ROOT_REDIRECT`. Neutralize any ambient value
+  // (Aaron's box, CI) so the default-tier tests are deterministic; the
+  // env-set test below manages its own value inside its own body.
+  let savedEnv: string | undefined;
+  beforeEach(() => {
+    savedEnv = process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+    delete process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+  });
+  afterEach(() => {
+    if (savedEnv === undefined) {
+      delete process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+    } else {
+      process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV] = savedEnv;
+    }
+  });
+
   test("fresh install (no prior root_redirect) sets it to /app/", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
@@ -2409,6 +2430,47 @@ describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
         db.close();
       }
     } finally {
+      cleanup();
+    }
+  });
+
+  test("an ENV-configured redirect (no DB row) is left alone — never clobbered (N1)", async () => {
+    // Container deploys pin the landing page via PARACHUTE_HUB_ROOT_REDIRECT,
+    // not a DB row. Gating on `getRootRedirect(db) === null` (DB only) would
+    // miss this and write `/app/`, which — since the DB row wins over env on
+    // read — silently overrides their configured landing. The fix gates on
+    // `resolveRootRedirectDetailed(db).source === "default"`, which sees the
+    // env tier. So: env set → no DB row written.
+    const { path, configDir, cleanup } = makeTempPath();
+    const prevEnv = process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+    try {
+      process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV] = "/surface/team-room";
+      const db = openHubDb(hubDbPath(configDir));
+      const logs: string[] = [];
+      try {
+        const code = await install("app", {
+          runner: async () => 0,
+          manifestPath: path,
+          configDir,
+          startService: async () => 0,
+          isLinked: () => false,
+          portProbe: async () => false,
+          rootRedirectDb: db,
+          log: (l) => logs.push(l),
+        });
+        expect(code).toBe(0);
+        // No DB row written — the env-configured landing survives.
+        expect(getRootRedirect(db)).toBeNull();
+        expect(logs.join("\n")).not.toMatch(/now opens the app at \/app\//);
+      } finally {
+        db.close();
+      }
+    } finally {
+      if (prevEnv === undefined) {
+        delete process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+      } else {
+        process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV] = prevEnv;
+      }
       cleanup();
     }
   });

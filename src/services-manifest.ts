@@ -623,7 +623,8 @@ export function readManifestLenient(
     );
     return { services: [] };
   }
-  const afterRetired = dropRetiredModuleRows(raw, path);
+  const healed = healStaleUiHostAppRows(raw, path);
+  const afterRetired = dropRetiredModuleRows(healed.raw, path);
   const cleaned = dropLegacyShortNameRows(afterRetired.raw, path);
   // `typeof null === "object"` in JS, so the `!cleaned.raw` part of this
   // guard is load-bearing for the null case — not a typo or redundancy.
@@ -671,21 +672,28 @@ export function readManifest(path: string = SERVICES_MANIFEST_PATH): ServicesMan
       `failed to parse ${path}: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  // Retired-module + legacy short-name row cleanup runs BEFORE shape
+  // Row-heal + retired-module + legacy short-name cleanup all run BEFORE shape
   // validation because the bugs they heal (rows that conflict on port with
   // a current row) would otherwise throw inside `validateManifest`'s
-  // duplicate-port gate. Order matters: drop retired-module rows FIRST so
-  // their absence can unmask a `parachute-<X>` ↔ `<X>` pair underneath that
-  // `dropLegacyShortNameRows` then handles. The reverse order would leave
-  // a retired row that the short-name pass doesn't recognize. Both passes
-  // mutate the raw JSON object's `services` array; we re-validate against
-  // the cleaned shape. See `dropRetiredModuleRows` + `dropLegacyShortNameRows`
-  // for the full discipline.
-  const afterRetired = dropRetiredModuleRows(raw, path);
+  // duplicate-port gate. Order matters:
+  //   1. `healStaleUiHostAppRows` FIRST — a pre-rename operator can carry BOTH
+  //      a `parachute-app` AND an `app` stale row (2026-05-22 double-write
+  //      reproducer); dropping by OLD-UI-host shape here clears both, whereas
+  //      `dropLegacyShortNameRows` would keep the `parachute-app` half. Runs
+  //      ahead of the retired-module pass too (the `app`/`parachute-app`
+  //      RETIRED_MODULES entries were removed in hub-parity P5 — the names are
+  //      the NEW app's now — so this shape-gated heal is their replacement).
+  //   2. `dropRetiredModuleRows` — drop genuinely-retired rows so their
+  //      absence can unmask a `parachute-<X>` ↔ `<X>` pair underneath that
+  //   3. `dropLegacyShortNameRows` then handles.
+  // Each pass mutates the raw JSON object's `services` array; we re-validate
+  // against the cleaned shape. See the three helpers for the full discipline.
+  const healed = healStaleUiHostAppRows(raw, path);
+  const afterRetired = dropRetiredModuleRows(healed.raw, path);
   const cleaned = dropLegacyShortNameRows(afterRetired.raw, path);
   const validated = validateManifest(cleaned.raw, path);
   const migrated = migrateClawToAgent(validated);
-  const changed = afterRetired.changed || cleaned.changed || migrated.changed;
+  const changed = healed.changed || afterRetired.changed || cleaned.changed || migrated.changed;
   if (changed) writeManifest(migrated.manifest, path);
   return migrated.manifest;
 }
@@ -736,6 +744,91 @@ function dropRetiredModuleRows(raw: unknown, where: string): { raw: unknown; cha
     const replacementLine = d.replacement ? ` Replacement: ${d.replacement}.` : "";
     console.error(
       `${where}: dropped stale row for retired module '${d.name}' (retired ${d.retiredAt}).${replacementLine} If the ${d.name} daemon is still running, stop it (e.g. \`ps aux | grep ${d.name}\` then \`kill <pid>\`).`,
+    );
+  }
+
+  return {
+    raw: { ...(raw as Record<string, unknown>), services: nextServices },
+    changed: true,
+  };
+}
+
+/**
+ * Heal stale OLD-UI-host `app`/`parachute-app` rows on load (hub-parity P5,
+ * 2026-07-11).
+ *
+ * Context: the name `parachute-app` originally belonged to the UI-host module
+ * that renamed to `parachute-surface` on 2026-05-27 (patterns#102). Its
+ * retirement used to be handled by a `RETIRED_MODULES` entry that
+ * `dropRetiredModuleRows` GC'd unconditionally. Hub-parity P5 REUSES the
+ * `parachute-app` manifestName (+ the bare `app` short) for a genuinely NEW,
+ * unrelated module — the super-surface front door — so that retirement entry
+ * had to be removed (keeping it would GC the new module's own row on every
+ * read). This heal is the surgically narrow replacement for the ONE case the
+ * removed retirement still needs to cover: an operator upgrading DIRECTLY from
+ * a pre-rename release (~0.5.13-stable) who skipped every intermediate boot
+ * that would have GC'd their stale row. Without a heal, that stale row would:
+ *   - crash-loop on boot — `reconcilePortToCanonical` rewrites its port to
+ *     1944, then the supervisor spawns the app static-serve shim against a
+ *     `@openparachute/parachute-app` that isn't installed → exit 1 → a
+ *     forever-restarting "app" unit the operator never installed;
+ *   - hijack `/surface/*` if a real `parachute-surface` row is also present
+ *     (both claim `/surface`);
+ *   - and, after `parachute install app`, keep its stale `/surface` mount so
+ *     the app serves under `/surface` while the install's `root_redirect=/app/`
+ *     points the front page at a 404.
+ *
+ * Discriminant (structural — pinned against the OLD-UI-host row shape verified
+ * in `git show origin/main`'s retired-`app` + legacy-short-name test fixtures:
+ * `port: 1946`, `paths: ["/surface"]`, `health: "/surface/..."`):
+ *   - `name` is exactly `"app"` or `"parachute-app"`, AND
+ *   - it is NOT the NEW app's own row (the new app mounts at `/app` — never
+ *     healed regardless of port), AND
+ *   - it carries the OLD-UI-host signature: `paths[0]` is `/surface`-rooted OR
+ *     `port === 1946` (the old canonical slot; now `parachute-surface`'s).
+ *
+ * The NEW app row (`paths: ["/app"]`, port 1944) is structurally disjoint on
+ * BOTH clauses, so it is always left intact. Matches `dropRetiredModuleRows`'s
+ * behavior: a plain DROP + a stderr warning steering the operator to
+ * `parachute install surface` (the same replacement the retirement named).
+ *
+ * Operates on raw JSON (before `validateManifest`) because a stale row can
+ * collide on port 1946 with a real `parachute-surface` row and would otherwise
+ * trip the duplicate-port gate before this heal runs. Runs FIRST in the load
+ * pipeline (ahead of `dropRetiredModuleRows` / `dropLegacyShortNameRows`): a
+ * pre-rename operator can carry BOTH a `parachute-app` and an `app` stale row
+ * (the 2026-05-22 double-write reproducer) — dropping by shape here clears
+ * both, whereas `dropLegacyShortNameRows` would keep the `parachute-app` half.
+ */
+function healStaleUiHostAppRows(raw: unknown, where: string): { raw: unknown; changed: boolean } {
+  if (!raw || typeof raw !== "object") return { raw, changed: false };
+  const services = (raw as Record<string, unknown>).services;
+  if (!Array.isArray(services)) return { raw, changed: false };
+
+  const dropped: string[] = [];
+  const nextServices = services.filter((row) => {
+    if (!row || typeof row !== "object") return true;
+    const rec = row as Record<string, unknown>;
+    const name = rec.name;
+    if (name !== "app" && name !== "parachute-app") return true;
+    const paths = rec.paths;
+    const first = Array.isArray(paths) && typeof paths[0] === "string" ? paths[0] : undefined;
+    // NEW super-surface app mounts at `/app` (port 1944) — never heal it,
+    // whatever its port happens to be after a reconcile/collision walk.
+    if (first === "/app" || first?.startsWith("/app/")) return true;
+    const port = rec.port;
+    const oldSurfaceMount = first === "/surface" || first?.startsWith("/surface/") === true;
+    const oldCanonicalPort = port === 1946;
+    if (!oldSurfaceMount && !oldCanonicalPort) return true;
+    dropped.push(String(name));
+    return false;
+  });
+
+  if (dropped.length === 0) return { raw, changed: false };
+
+  for (const name of dropped) {
+    console.error(
+      `${where}: dropped stale pre-rename '${name}' row (the OLD UI-host module, renamed to parachute-surface 2026-05-27). The name now belongs to the new Parachute app (mount /app, port 1944). If an old daemon is still running, stop it; install the current UI host with \`parachute install surface\`.`,
     );
   }
 

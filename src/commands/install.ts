@@ -17,7 +17,7 @@ import {
   readHubPort,
 } from "../hub-control.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { getRootRedirect, setRootRedirect } from "../hub-settings.ts";
+import { resolveRootRedirectDetailed, setRootRedirect } from "../hub-settings.ts";
 import { type HubUnitDeps, defaultHubUnitDeps, isHubUnitInstalled } from "../hub-unit.ts";
 import {
   type ModuleManifest,
@@ -1368,17 +1368,23 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
   // first install (hub-parity P5, 2026-07-11) — SET-IF-UNSET ONLY, never
   // clobbering an operator's existing choice (`parachute hub
   // set-root-redirect` or the admin SPA PUT both still win on any later run,
-  // and either can change it back). Gated on the same production-vs-test
-  // discriminant the guidance probe below uses: a test driving install
-  // against a tempdir manifestPath never opens the real
-  // `~/.parachute/hub.db` unless it opts in via `opts.rootRedirectDb`.
+  // and either can change it back). "Unset" means the resolved redirect is
+  // still the built-in `/admin` DEFAULT — i.e. NEITHER the DB row NOR the
+  // `PARACHUTE_HUB_ROOT_REDIRECT` env var (container deploys pin their landing
+  // page there) has set it. Gating on `getRootRedirect(db) === null` would
+  // miss the env tier and silently override an env-configured operator, since
+  // the DB row we'd write wins over env on read (`resolveRootRedirectDetailed`
+  // is DB-first). Gated on the same production-vs-test discriminant the
+  // guidance probe below uses: a test driving install against a tempdir
+  // manifestPath never opens the real `~/.parachute/hub.db` unless it opts in
+  // via `opts.rootRedirectDb`.
   if (short === "app") {
     const dbProbeAllowed =
       opts.rootRedirectDb !== undefined || manifestPath === SERVICES_MANIFEST_PATH;
     if (dbProbeAllowed) {
       const db = opts.rootRedirectDb ?? openHubDb(hubDbPath(configDir));
       try {
-        if (getRootRedirect(db) === null) {
+        if (resolveRootRedirectDetailed(db).source === "default") {
           setRootRedirect(db, "/app/");
           log("✓ The hub's front page (`/`) now opens the app at /app/.");
           log("  Change it any time: `parachute hub set-root-redirect <path>` or the admin SPA.");
