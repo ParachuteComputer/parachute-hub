@@ -2862,7 +2862,13 @@ export function hubFetch(
         if (req.method === "OPTIONS") {
           return new Response(null, { status: 204, headers: corsHeaders });
         }
-        const res = handleAccountCapabilities(req, { issuer: oauthDeps(req).issuer });
+        if (!getDb) {
+          return new Response('{"error":"account descriptor unavailable: db not configured"}', {
+            status: 503,
+            headers: { "content-type": "application/json", ...corsHeaders },
+          });
+        }
+        const res = handleAccountCapabilities(req, { db: getDb(), issuer: oauthDeps(req).issuer });
         const merged = new Headers(res.headers);
         for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
         return new Response(res.body, { status: res.status, headers: merged });
@@ -3960,9 +3966,10 @@ export function hubFetch(
         }
         return new Response("method not allowed", { status: 405 });
       }
-      // GET /account (Bearer) — account bootstrap {account_id,email,door}. Only
-      // intercepts when an Authorization header is present, so the cookie-authed
-      // HTML account home at `/account`/`/account/` below stays unaffected.
+      // GET /account (Bearer) — account bootstrap {id,email,door} (the
+      // door-contract's AccountBootstrap). Only intercepts when an
+      // Authorization header is present, so the cookie-authed HTML account
+      // home at `/account`/`/account/` below stays unaffected.
       if (
         (pathname === "/account" || pathname === "/account/") &&
         req.headers.get("authorization")
