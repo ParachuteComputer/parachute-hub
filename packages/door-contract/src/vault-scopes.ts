@@ -22,8 +22,21 @@
 /** The three verbs mintable on a per-vault token. */
 const MINTABLE_VAULT_VERBS = new Set(["read", "write", "admin"]);
 
-/** A conformant scopes array, or the sentinel rejection. */
-export type VaultScopesResult = { ok: true; scopes: string[] } | { ok: false };
+/**
+ * Why a scopes request was rejected — carries the door's wire error code so a
+ * door adopting this validator keeps its exact HTTP error without re-deriving
+ * the split (hub's `parseScopesBody` distinguishes these two today):
+ *   - `invalid_request` — the value is structurally wrong: not an array, or an
+ *     entry that isn't a string. "You sent me garbage."
+ *   - `invalid_scope` — every entry is a string, but at least one isn't
+ *     `vault:<vaultName>:{read|write|admin}`. "Well-formed, but not mintable here."
+ */
+export type VaultScopesReason = "invalid_request" | "invalid_scope";
+
+/** A conformant scopes array, or the sentinel rejection with its wire reason. */
+export type VaultScopesResult =
+  | { ok: true; scopes: string[] }
+  | { ok: false; reason: VaultScopesReason };
 
 /**
  * Validate a requested `scopes` value against `vaultName`. `requested` is
@@ -34,18 +47,18 @@ export function validateVaultScopes(requested: unknown, vaultName: string): Vaul
   if (requested === undefined || requested === null) {
     return { ok: true, scopes: defaultVaultScopes(vaultName) };
   }
-  if (!Array.isArray(requested)) return { ok: false };
+  if (!Array.isArray(requested)) return { ok: false, reason: "invalid_request" };
   if (requested.length === 0) {
     return { ok: true, scopes: defaultVaultScopes(vaultName) };
   }
   const scopes = new Set<string>();
   for (const s of requested) {
-    if (typeof s !== "string") return { ok: false };
+    if (typeof s !== "string") return { ok: false, reason: "invalid_request" };
     const parts = s.split(":");
-    if (parts.length !== 3) return { ok: false };
+    if (parts.length !== 3) return { ok: false, reason: "invalid_scope" };
     const [resource, name, verb] = parts as [string, string, string];
     if (resource !== "vault" || name !== vaultName || !MINTABLE_VAULT_VERBS.has(verb)) {
-      return { ok: false };
+      return { ok: false, reason: "invalid_scope" };
     }
     scopes.add(s);
   }

@@ -154,9 +154,18 @@ export function checkAccountDescriptor(
   return issues;
 }
 
-/** `true` when `value` is a string `Date.parse` can turn into a real instant. */
+/**
+ * `true` when `value` is a real ISO-8601 instant — a `T`-separated date-time
+ * with a `Z` or numeric offset, as both doors emit via `Date.toISOString()`.
+ * Deliberately STRICTER than bare `Date.parse` (which accepts "Jan 1 2026" and
+ * other locale strings): the wire contract is ISO-8601, so the checker enforces
+ * ISO-8601 rather than whatever a given JS engine's `Date.parse` tolerates.
+ */
+const ISO_8601_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 function isParseableTimestamp(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && !Number.isNaN(Date.parse(value));
+  return (
+    typeof value === "string" && ISO_8601_INSTANT_RE.test(value) && !Number.isNaN(Date.parse(value))
+  );
 }
 
 /**
@@ -189,6 +198,10 @@ export function checkAccountSessionResponse(
   } else {
     if (actual.email === undefined && actual.username === undefined)
       push("at least one of email/username must be present when signed in");
+    for (const k of ["email", "username"] as const) {
+      if (actual[k] !== undefined && typeof actual[k] !== "string")
+        push(`${k}, when present, must be a string, got ${JSON.stringify(actual[k])}`);
+    }
     if (actual.account_created_at !== undefined && !isParseableTimestamp(actual.account_created_at))
       push(
         `account_created_at, when present, must be ISO-8601-parseable, got ${JSON.stringify(actual.account_created_at)}`,
@@ -239,6 +252,14 @@ export function checkVaultTokenMintResponse(
   const key = `vault:${vaultName}`;
   if (typeof services !== "object" || services === null || !(key in services)) {
     push(`services must be an object carrying the key ${JSON.stringify(key)}`);
+  } else {
+    const entry = (services as Record<string, unknown>)[key];
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      typeof (entry as Record<string, unknown>).url !== "string"
+    )
+      push(`services[${JSON.stringify(key)}] must carry a string "url"`);
   }
   return issues;
 }

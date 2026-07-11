@@ -238,11 +238,12 @@ export interface VaultTokenMintResponse {
 }
 
 /**
- * The shared `/account/*` error vocabulary. Auth-gate failures use
- * `{error, error_description}` (OAuth-style, matching the token endpoint);
- * resource-level failures use `{error, message}`. Both doors already
- * deliberately mirror this list (hub `account-api.ts` header, cloud
- * `account-api.ts:82-96`) — pinned here so it can't silently drift.
+ * The shared `/account/*` error vocabulary — the UNION of codes both doors
+ * actually emit on the account surface (verified against hub `account-api.ts`
+ * and cloud `workers/identity/src/account-api.ts`), not an aspirational subset.
+ * Auth-gate failures use `{error, error_description}` (OAuth-style, matching the
+ * token endpoint); resource-level failures use `{error, message}`. When a door
+ * adds a new code, add it here in the same PR so this stays the real union.
  */
 export const ACCOUNT_ERROR_CODES = [
   "invalid_request",
@@ -260,6 +261,11 @@ export const ACCOUNT_ERROR_CODES = [
   "csrf_failed",
   "foreign_origin",
   "force_change_password",
+  // Emitted today but missing from the original pin (found by the P0 review):
+  "account_suspended", // cloud — suspended account hits any /account/* route
+  "method_not_allowed", // hub — wrong verb on an account route
+  "not_found", // cloud — unknown /account/vaults/<name> subroute
+  "server_error", // hub — vault provisioning failed for a non-name reason
 ] as const;
 
 /** One member of {@link ACCOUNT_ERROR_CODES}. */

@@ -322,7 +322,23 @@ describe("ACCOUNT_ERROR_CODES", () => {
       "csrf_failed",
       "foreign_origin",
       "force_change_password",
+      "account_suspended",
+      "method_not_allowed",
+      "not_found",
+      "server_error",
     ]);
+  });
+
+  test("carries the codes each door actually emits (the union, not a subset)", () => {
+    // Regression against the born-incomplete pin the P0 review caught.
+    for (const code of [
+      "account_suspended", // cloud
+      "method_not_allowed", // hub
+      "not_found", // cloud
+      "server_error", // hub
+    ] as const) {
+      expect(ACCOUNT_ERROR_CODES).toContain(code);
+    }
   });
 });
 
@@ -380,9 +396,37 @@ describe("checkAccountSessionResponse (P0)", () => {
     expect(issues[0]?.detail).toContain("email/username");
   });
 
+  test("signed-in: a non-string email (present but not a string) is an issue", () => {
+    const issues = checkAccountSessionResponse(
+      { signed_in: true, csrf: "tok", email: 42 },
+      { signedIn: true },
+    );
+    expect(issues.some((i) => i.detail.includes("email"))).toBe(true);
+  });
+
+  test("signed-in: a null username (present but not a string) is an issue", () => {
+    const issues = checkAccountSessionResponse(
+      { signed_in: true, csrf: "tok", username: null },
+      { signedIn: true },
+    );
+    // null is present (!== undefined) but not a string → the non-string check flags it.
+    expect(issues.some((i) => i.detail.includes("username"))).toBe(true);
+  });
+
   test("signed-in: a non-ISO account_created_at is an issue", () => {
     const issues = checkAccountSessionResponse(
       { signed_in: true, csrf: "tok", username: "aaron", account_created_at: "not-a-date" },
+      { signedIn: true },
+    );
+    expect(issues.length).toBe(1);
+    expect(issues[0]?.detail).toContain("account_created_at");
+  });
+
+  test("signed-in: a Date.parse-able but non-ISO account_created_at is an issue (strict ISO-8601)", () => {
+    // "January 1, 2026" is Date.parse-able but not ISO-8601 — the tightened
+    // checker must reject it, where the old bare-Date.parse checker passed it.
+    const issues = checkAccountSessionResponse(
+      { signed_in: true, csrf: "tok", username: "aaron", account_created_at: "January 1, 2026" },
       { signedIn: true },
     );
     expect(issues.length).toBe(1);
@@ -458,6 +502,17 @@ describe("checkVaultTokenMintResponse (P0)", () => {
         .length,
     ).toBe(1);
   });
+
+  test("the vault:<name> entry present but without a string url is an issue", () => {
+    // {} conforms to the key-presence check but violates the type's `url: string`.
+    expect(
+      checkVaultTokenMintResponse({ ...GREEN, services: { "vault:moss": {} } }, "moss").length,
+    ).toBe(1);
+    expect(
+      checkVaultTokenMintResponse({ ...GREEN, services: { "vault:moss": { url: 42 } } }, "moss")
+        .length,
+    ).toBe(1);
+  });
 });
 
 describe("validateVaultScopes (P0)", () => {
@@ -496,29 +551,53 @@ describe("validateVaultScopes (P0)", () => {
     });
   });
 
-  test("a foreign vault name rejects the whole request", () => {
-    expect(validateVaultScopes(["vault:other:read"], "moss")).toEqual({ ok: false });
+  // The rejection `reason` carries each door's wire error code — a well-formed
+  // scope string that names the wrong resource/vault/verb is `invalid_scope`;
+  // a structurally-broken value (non-array, or a non-string entry) is
+  // `invalid_request`. This split preserves hub's `parseScopesBody` semantics.
+  test("a foreign vault name rejects with invalid_scope", () => {
+    expect(validateVaultScopes(["vault:other:read"], "moss")).toEqual({
+      ok: false,
+      reason: "invalid_scope",
+    });
   });
 
-  test("a non-vault resource (account:*) rejects the whole request", () => {
-    expect(validateVaultScopes(["account:self:admin"], "moss")).toEqual({ ok: false });
+  test("a non-vault resource (account:*) rejects with invalid_scope", () => {
+    expect(validateVaultScopes(["account:self:admin"], "moss")).toEqual({
+      ok: false,
+      reason: "invalid_scope",
+    });
   });
 
-  test("an unknown verb rejects the whole request", () => {
-    expect(validateVaultScopes(["vault:moss:execute"], "moss")).toEqual({ ok: false });
+  test("an unknown verb rejects with invalid_scope", () => {
+    expect(validateVaultScopes(["vault:moss:execute"], "moss")).toEqual({
+      ok: false,
+      reason: "invalid_scope",
+    });
   });
 
-  test("a non-string entry rejects the whole request", () => {
-    expect(validateVaultScopes([123], "moss")).toEqual({ ok: false });
+  test("a malformed (wrong part-count) scope string rejects with invalid_scope", () => {
+    expect(validateVaultScopes(["vault:moss"], "moss")).toEqual({
+      ok: false,
+      reason: "invalid_scope",
+    });
   });
 
-  test("a non-array, non-nullish value rejects the whole request", () => {
-    expect(validateVaultScopes("vault:moss:read", "moss")).toEqual({ ok: false });
+  test("a non-string entry rejects with invalid_request", () => {
+    expect(validateVaultScopes([123], "moss")).toEqual({ ok: false, reason: "invalid_request" });
+  });
+
+  test("a non-array, non-nullish value rejects with invalid_request", () => {
+    expect(validateVaultScopes("vault:moss:read", "moss")).toEqual({
+      ok: false,
+      reason: "invalid_request",
+    });
   });
 
   test("one bad entry among good ones rejects the WHOLE request (no partial grant)", () => {
     expect(validateVaultScopes(["vault:moss:read", "vault:other:read"], "moss")).toEqual({
       ok: false,
+      reason: "invalid_scope",
     });
   });
 });

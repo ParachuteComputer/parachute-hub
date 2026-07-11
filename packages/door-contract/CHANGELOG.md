@@ -27,6 +27,24 @@ requests default to `vault:<name>:{read,write}`, every entry must be exactly
 `vault:<name>:{read|write|admin}`, results are de-duplicated. Additive to the
 type surface; no existing call signature changes.
 
+Review-fold (P0 review):
+- `validateVaultScopes` now returns `{ ok: false; reason: "invalid_request" |
+  "invalid_scope" }` on rejection (was a bare `{ ok: false }`) — the `reason`
+  carries the door's wire error code so a door adopting the shared validator
+  (P2/P3) keeps its exact HTTP error without re-deriving the split
+  (`invalid_request` = non-array / non-string entry; `invalid_scope` =
+  well-formed string naming the wrong resource/vault/verb, matching hub's
+  `parseScopesBody`). New `VaultScopesReason` type. Nothing consumes the
+  validator yet, so this is pure additive design.
+- `ACCOUNT_ERROR_CODES` was born incomplete; added the codes both doors already
+  emit but the pin missed: `account_suspended`, `not_found` (cloud),
+  `method_not_allowed`, `server_error` (hub). Now the real union.
+- Hardened the new conformance checkers: `checkAccountSessionResponse` requires
+  `email`/`username` to be a string when present (not merely present);
+  `checkVaultTokenMintResponse` requires the `vault:<name>` services entry to
+  carry a string `url`; `isParseableTimestamp` now enforces true ISO-8601
+  (rejecting `Date.parse`-lenient locale strings like `"January 1, 2026"`).
+
 ## 0.3.0
 
 Adds the optional `vault_url_template` field to `ParachuteAccountDescriptor` — a
