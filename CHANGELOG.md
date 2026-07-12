@@ -6,6 +6,16 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.7-rc.10] - 2026-07-11
+
+### Added
+
+- **`/surface/parachute` recognized as the app's surface mount (W2-12 coordination)** — the app's surface identity renamed from `notes` to `parachute`; the hub learns the new mount **purely additively**, changing no live route (existing `/surface/notes` notes-ui installs are untouched — mounts are per-install on-disk identities, nothing moves until an operator re-installs):
+  - `chrome-strip.ts`: `/surface/parachute/` joins `/surface/notes/` on the chrome opt-out list (both coexist; the app owns its own chrome under either identity).
+  - **Conditional `/surface/notes/*` → `/surface/parachute/*` 301 alias** (`surface-notes-alias.ts`, dispatched just before the generic services proxy) — the "never 404 an old bookmark after an in-place upgrade" safety net. Fires ONLY when the manifest's `uis{}` sub-unit mounts show `/surface/notes` gone and `/surface/parachute` present; sub-path tail + query string preserved. **Inert today** on both branches: an existing install either still mounts `/surface/notes` (legacy-present → no redirect) or has no `/surface/parachute` mount (target-absent → no redirect). Caveat this exists for: re-adding the renamed package over the old `notes` instance (`instance_name=notes`, no `mount_path`) flips the mount to `/surface/parachute` and would orphan every `/surface/notes/*` bookmark.
+  - Discovery-page "Get started" tiles are now **driven by the well-known `uis[]`** (one tile per active sub-unit, `displayName`/`tagline`/`path` from the doc) instead of the hardcoded "Open Notes" → `/surface/notes/` tile; the hardcode survives only as a fallback for surface-host rows that predate `uis{}` self-registration, so existing installs' discovery page is unchanged.
+  - Docstring sweep (`hub-server.ts` route table, `hub-settings.ts`, `chrome-strip.ts`): `/surface/notes` = legacy notes-ui mount, `/surface/parachute` = the app's surface mount.
+
 ## [0.7.5-rc.3] - 2026-06-30
 
 ### Added

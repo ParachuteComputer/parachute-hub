@@ -99,6 +99,20 @@ describe("shouldInjectChrome", () => {
     expect(shouldInjectChrome("/surface/notes-archive/")).toBe(true);
   });
 
+  test("default: opts out the app's surface mount at /surface/parachute/* (W2-12)", () => {
+    expect(shouldInjectChrome("/surface/parachute")).toBe(false);
+    expect(shouldInjectChrome("/surface/parachute/")).toBe(false);
+    expect(shouldInjectChrome("/surface/parachute/index.html")).toBe(false);
+    expect(shouldInjectChrome("/surface/parachute/assets/index-XXX.js")).toBe(false);
+  });
+
+  test("the /surface/parachute/ opt-out does not over-match sibling paths", () => {
+    // `/surface/parachutes` must NOT match `/surface/parachute/` — the slash
+    // boundary check applies to the new entry the same as the legacy one.
+    expect(shouldInjectChrome("/surface/parachutes")).toBe(true);
+    expect(shouldInjectChrome("/surface/parachute-club/")).toBe(true);
+  });
+
   test("custom opt-out list is honored", () => {
     expect(shouldInjectChrome("/foo/bar", ["/foo/"])).toBe(false);
     expect(shouldInjectChrome("/baz", ["/foo/"])).toBe(true);
@@ -111,8 +125,11 @@ describe("shouldInjectChrome", () => {
     expect(shouldInjectChrome("/foo/bar", ["/foo"])).toBe(false);
   });
 
-  test("the canonical opt-out list contains /surface/notes/", () => {
+  test("the canonical opt-out list contains BOTH /surface/notes/ and /surface/parachute/", () => {
+    // W2-12 is additive: the legacy notes-ui mount keeps its opt-out for
+    // existing installs; the renamed app-surface mount gets its own.
     expect(CHROME_OPT_OUT_PREFIXES).toContain("/surface/notes/");
+    expect(CHROME_OPT_OUT_PREFIXES).toContain("/surface/parachute/");
   });
 });
 

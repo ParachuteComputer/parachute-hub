@@ -17,7 +17,12 @@
  * is the canonical opt-out — it owns its own chrome (see design-system §7
  * "Where NOT to inject" + AUDIT §4: "Notes is the proof this can work: own
  * application, looks distinctively Notes, reads as Parachute because the
- * tokens are continuous").
+ * tokens are continuous"). `/surface/parachute/*` (W2-12) is the same
+ * application under its post-rename surface identity — the parachute-app
+ * super-surface mounted as a surface — and owns its own chrome for the
+ * same reason. `/surface/notes/` stays on the list for existing notes-ui
+ * installs (legacy mount); the two entries coexist, they don't replace
+ * each other.
  *
  * H5 (surface-runtime design): the opt-out generalized — when a UI
  * sub-unit's declared `audience` resolves `public` at the proxy's audience
@@ -53,10 +58,17 @@ import { CSRF_FIELD_NAME, ensureCsrfToken } from "./csrf.ts";
  * prefix" or "pathname startsWith prefix" — the same shape as
  * `findServiceUpstream`'s mount comparison.
  *
- * `/surface/notes/` covers the Notes PWA bundled by parachute-app. Notes is a
- * destination, not chrome; it owns its own header (see design-system.md §7).
+ * `/surface/notes/` covers the legacy notes-ui mount (existing installs keep
+ * this identity on disk). `/surface/parachute/` covers the app's surface
+ * mount — the same application under its renamed surface identity (W2-12).
+ * Both are destinations, not chrome; each owns its own header (see
+ * design-system.md §7). Additive: neither entry replaces the other, so an
+ * install serving either mount (or, transiently, both) gets the opt-out.
  */
-export const CHROME_OPT_OUT_PREFIXES: readonly string[] = ["/surface/notes/"];
+export const CHROME_OPT_OUT_PREFIXES: readonly string[] = [
+  "/surface/notes/",
+  "/surface/parachute/",
+];
 
 /**
  * Buffer size cap. Responses larger than this are passed through unchanged.

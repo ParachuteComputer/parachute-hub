@@ -541,43 +541,76 @@ const DISCOVERY_SCRIPT = `<script>
   /**
    * Render the "Get started" section (hub#342) above the Services grid.
    *
-   * One hardcoded target, conditional on its prerequisite being installed:
-   *   - "Open Notes" → /surface/notes/  (requires parachute-surface installed;
-   *     Surface auto-bootstraps Notes-as-UI per parachute-surface §17, so the
-   *     mere presence of Surface means /surface/notes/ is live)
+   * Driven by the uis[] sub-unit arrays the well-known doc already carries
+   * (W2-12 — retires the hardcoded "Open Notes" → /surface/notes/ tile):
+   * one tile per ACTIVE uis[] entry across every services[] row, each
+   * carrying its own displayName + tagline + mount path. Under the app's
+   * notes→parachute surface-identity rename this stays correct whichever
+   * mount an install serves — an existing notes-ui install renders its
+   * "notes" entry at /surface/notes, a post-rename install renders its
+   * "parachute" entry at /surface/parachute, no hub-side name knowledge
+   * required. Entries named "parachute" / "notes" sort first (they're the
+   * end-user "browse my content" CTA — the audience that needs the
+   * strongest above-the-fold prompt); the rest follow alphabetically.
+   *
+   * Legacy fallback: a surface-host row that predates uis{}
+   * self-registration carries no uis[] even while it serves notes-ui at
+   * /surface/notes (the hub proxies /surface/* blind — mounts are
+   * surface-host's on-disk state, not the manifest's). When no uis[]
+   * entries exist anywhere but parachute-surface IS installed, keep
+   * rendering the pre-W2-12 "Open Notes" tile so those installs' discovery
+   * page is untouched. The fallback dies naturally the first time the
+   * surface-host re-registers with uis{}.
    *
    * The earlier "Browse Vault" tile retired in workstream C (2026-05-25)
-   * once vault declared uiUrl in its module.json (per patterns#96). With
-   * the multi-instance prefix lifted into buildWellKnown, every vault
-   * instance now renders its own tile in the Services grid below — one
-   * per instance, with the actual instance name in the discovery doc
-   * rather than a hub-side guess at "first vault."
+   * once vault declared uiUrl in its module.json (per patterns#96) — vault
+   * instances render in the Services grid below.
    *
-   * Notes stays here because Notes is the end-user CTA (the audience
-   * that needs the strongest above-the-fold prompt); the Services grid
-   * positions it equally with admin tiles, which underweights the
-   * "browse my content" path for a returning operator.
-   *
-   * If the prerequisite is not met (fresh install pre-wizard, no app)
-   * the section stays hidden. The hardcoded shape mirrors the wizard's
-   * own done-screen "Start using your vault" tile — same architectural
-   * shape (single obvious entry point) at a different surface.
-   *
-   * Not driven by /api/modules because discovery is unauth — the
-   * services list from /.well-known/parachute.json is sufficient
-   * (it carries the same install-detection signal we need, no
-   * Bearer required).
+   * If nothing qualifies (fresh install pre-wizard, no app) the section
+   * stays hidden. Not driven by /api/modules because discovery is unauth —
+   * the services list from /.well-known/parachute.json is sufficient (it
+   * carries the uis[] fan-out, no Bearer required).
    */
   function renderGetStarted(services) {
     if (!getStartedGrid || !getStartedSection) return;
-    const tiles = [];
-    const hasSurface = services.some((s) => s && s.name === 'parachute-surface');
-    if (hasSurface) {
-      tiles.push({
-        title: 'Open Notes',
-        desc: 'Browse + capture in the Notes app — reads from your vault.',
-        href: '/surface/notes/',
-      });
+    const uiEntries = [];
+    const seenPaths = new Set();
+    for (const svc of services) {
+      if (!svc || !Array.isArray(svc.uis)) continue;
+      for (const ui of svc.uis) {
+        if (!ui || typeof ui.path !== 'string' || ui.path === '') continue;
+        // Absent status means active (services-manifest.ts UiSubUnitStatus).
+        if (ui.status && ui.status !== 'active') continue;
+        // Multi-path parent rows repeat the same uis[] on every path —
+        // de-duplicate by mount (well-known.ts's documented consumer duty).
+        if (seenPaths.has(ui.path)) continue;
+        seenPaths.add(ui.path);
+        uiEntries.push(ui);
+      }
+    }
+    const rank = (ui) => (ui.name === 'parachute' ? 0 : ui.name === 'notes' ? 1 : 2);
+    uiEntries.sort(
+      (a, b) =>
+        rank(a) - rank(b) ||
+        (a.displayName || a.name || '').localeCompare(b.displayName || b.name || ''),
+    );
+    const tiles = uiEntries.map((ui) => ({
+      title: ui.displayName || ui.name || ui.path,
+      desc: ui.tagline || '',
+      // Trailing slash keeps relative asset URLs resolving under the mount
+      // (same reason the retired hardcode pointed at /surface/notes/).
+      href: ui.path.endsWith('/') ? ui.path : ui.path + '/',
+    }));
+    if (tiles.length === 0) {
+      // Legacy fallback (see docstring): pre-uis surface-host installs.
+      const hasSurface = services.some((s) => s && s.name === 'parachute-surface');
+      if (hasSurface) {
+        tiles.push({
+          title: 'Open Notes',
+          desc: 'Browse + capture in the Notes app — reads from your vault.',
+          href: '/surface/notes/',
+        });
+      }
     }
     if (tiles.length === 0) {
       getStartedSection.setAttribute('hidden', '');

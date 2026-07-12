@@ -239,6 +239,35 @@ describe("renderHub — signed-out slimming (operator feedback)", () => {
   });
 });
 
+describe("renderHub — Get started tiles are uis[]-driven (W2-12)", () => {
+  // The tile logic runs client-side inside the discovery IIFE; these pins
+  // assert the emitted script's SHAPE (the JS-parses check above guards its
+  // validity). The section is uis[]-driven — one tile per active uis[]
+  // sub-unit, whichever mount identity (/surface/notes or
+  // /surface/parachute) an install serves — with the pre-W2-12 hardcoded
+  // "Open Notes" tile demoted to a fallback for surface-host rows that
+  // predate uis{} self-registration.
+  const html = renderHub({
+    session: { displayName: "operator", csrfToken: "csrf-w212" },
+  });
+
+  test("the discovery script iterates uis[] sub-units", () => {
+    expect(html).toContain("svc.uis");
+    // Inactive sub-units are skipped; absent status counts as active.
+    expect(html).toContain("ui.status");
+  });
+
+  test("the legacy 'Open Notes' hardcode survives only as the no-uis fallback", () => {
+    // Still present (pre-uis surface-host installs keep their CTA) …
+    expect(html).toContain("Open Notes");
+    expect(html).toContain("'/surface/notes/'");
+    // … but no longer keyed on the bare presence of parachute-surface as
+    // the PRIMARY path: the uis[] loop renders first, the hasSurface check
+    // only backstops an empty tile list.
+    expect(html).toContain("Legacy fallback");
+  });
+});
+
 describe("renderHub — signed-in indicator (rc.13)", () => {
   test("session user → 'Signed in as <name>' + inline POST form with CSRF", () => {
     const html = renderHub({

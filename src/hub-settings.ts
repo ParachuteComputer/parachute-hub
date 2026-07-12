@@ -92,6 +92,16 @@ export type HubSettingKey =
   // the deprecation window. Stored as the literal string "true" /
   // "false"; any other value parses as "redirect on" (the migration
   // default — operators must opt out, not opt in).
+  //
+  // Mount vocabulary post-W2-12: `/surface/notes` is the LEGACY notes-ui
+  // mount (what existing installs serve — this redirect's target);
+  // `/surface/parachute` is the app's surface mount under its renamed
+  // identity. A separate CONDITIONAL alias (surface-notes-alias.ts, no
+  // hub_settings row — it keys off the manifest's uis{} mounts) bridges
+  // `/surface/notes/*` → `/surface/parachute/*` only on installs where
+  // the legacy mount is gone and the new one exists, so the two
+  // redirects compose for post-rename installs: /notes/x →
+  // /surface/notes/x → /surface/parachute/x.
   | "notes_redirect_disabled"
   // Admin-UI screen-lock PIN (hub admin-lock feature). The argon2id hash of
   // the operator's lock PIN. Absent row = lock feature OFF (today's behavior

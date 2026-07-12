@@ -24,9 +24,18 @@
  *   /admin/login, /admin/logout                → 301 → /login, /logout
  *
  *   # Notes-as-app migration Phase 2 (parachute-app design doc §16).
+ *   # `/surface/notes` = the legacy notes-ui mount (existing installs);
+ *   # `/surface/parachute` = the app's surface mount post-W2-12 rename.
  *   /notes, /notes/, /notes/*                  → 301 → /surface/notes[/...]
  *                                                (opt-out via
  *                                                 hub_settings.notes_redirect_disabled)
+ *   /surface/notes[/...]                       → 301 → /surface/parachute[/...]
+ *                                                CONDITIONAL (W2-12, dispatched just
+ *                                                before the generic services proxy):
+ *                                                only when uis{} mounts show
+ *                                                /surface/notes gone + /surface/parachute
+ *                                                present — inert on existing notes-ui
+ *                                                installs (surface-notes-alias.ts)
  *
  *   # Discovery + well-known.
  *   /, /hub.html                               → hub.html (the discovery page)
@@ -333,6 +342,7 @@ import {
 } from "./setup-wizard.ts";
 import { getAllPublicKeys } from "./signing-keys.ts";
 import type { Supervisor } from "./supervisor.ts";
+import { isSurfaceNotesPath, maybeRedirectSurfaceNotes } from "./surface-notes-alias.ts";
 import { handleTwoFactorGet, handleTwoFactorPost } from "./two-factor-handlers.ts";
 import { getUserById, userCount } from "./users.ts";
 import { sanitizePublicOrigin } from "./vault-hub-origin-env.ts";
@@ -4173,6 +4183,28 @@ export function hubFetch(
       // `/`, `/admin/*`, `/oauth/*`, `/.well-known/*`, `/hub/*`, `/vault/*`,
       // `/api/*` are excluded by ordering, not by an explicit denylist (#182).
       //
+      // W2-12 — conditional `/surface/notes/*` → `/surface/parachute/*`
+      // alias, the "never 404 an old bookmark after an in-place upgrade"
+      // safety net for the app's notes→parachute surface-identity rename.
+      // Fires ONLY when the manifest's `uis{}` sub-units show the legacy
+      // `/surface/notes` mount gone AND a `/surface/parachute` mount
+      // present (see surface-notes-alias.ts for the full condition +
+      // inert-today proof). On every existing notes-ui install the
+      // condition fails and dispatch falls through to the generic proxy
+      // below unchanged. Reads the same lenient manifest source
+      // `resolveUiMount` consumes — hoisted to one read shared by both.
+      const manifestServices = readManifestLenient(manifestPath).services;
+      if (isSurfaceNotesPath(pathname)) {
+        const aliasTarget = maybeRedirectSurfaceNotes(pathname, url.search, manifestServices);
+        if (aliasTarget !== undefined) {
+          logNotesRedirect(pathname, aliasTarget);
+          return new Response("", {
+            status: 301,
+            headers: { location: aliasTarget },
+          });
+        }
+      }
+
       // H3 — per-UI audience gate. When the path falls under a declared UI
       // sub-unit (a `uis{}` entry on the matched service row — surface-hosted
       // UI mounts like /surface/<name>/*), the sub-unit's audience is
@@ -4187,7 +4219,7 @@ export function hubFetch(
       // which also means a 'surface'/'public' mount on a loopback-only row
       // stays unreachable from tailnet/funnel: exposure is orthogonal to
       // audience.
-      const uiMatch = resolveUiMount(readManifestLenient(manifestPath).services, pathname);
+      const uiMatch = resolveUiMount(manifestServices, pathname);
       if (uiMatch) {
         const cloaked =
           effectivePublicExposure(uiMatch.entry) === "loopback" &&
