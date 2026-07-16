@@ -208,21 +208,12 @@ describe("parseModulesPath", () => {
     });
   });
 
-  test("accepts any KNOWN module short — agent install now resolves (was the bug)", () => {
-    // Post-2026-06-09 (modular-UI architecture, P2) the install-path gate is
-    // `isKnownModuleShort` (KNOWN_MODULES ∪ FIRST_PARTY_FALLBACKS), NOT the old
-    // CURATED_MODULES whitelist. agent (renamed from channel 2026-06-17) is in
-    // KNOWN_MODULES, so its install path now resolves — fixing the
-    // running-but-uninstallable bug.
-    expect(parseModulesPath("/api/modules/agent/install")).toEqual({
-      short: "agent",
-      rest: "install",
-    });
-    // Other known modules (surface) resolve too.
+  test("accepts supported module shorts and rejects retired Agent", () => {
     expect(parseModulesPath("/api/modules/surface/install")).toEqual({
       short: "surface",
       rest: "install",
     });
+    expect(parseModulesPath("/api/modules/agent/install")).toBeUndefined();
   });
 
   test("rejects unknown shorts (the hub itself + genuinely third-party rows)", () => {
@@ -1019,16 +1010,12 @@ describe("POST /api/modules/:short/start", () => {
     expect(calls).toEqual([]);
   });
 
-  test("channel#41: start reconciles a drifted services.json port back to canonical (API path)", async () => {
-    // The live signature: the agent (then channel) row carried 19415 instead of
-    // canonical 1941. The API start path (admin SPA / `parachute start agent`)
-    // must apply the SAME reconcile the boot path does — otherwise an
-    // operator-triggered start re-strands the module on the dead port.
+  test("start reconciles a supported module's drifted port back to canonical", async () => {
     writeManifest(h.manifestPath, [
       {
-        name: "parachute-agent",
+        name: "parachute-scribe",
         port: 19415,
-        paths: ["/agent"],
+        paths: ["/scribe"],
         health: "/health",
         version: "0.0.0-linked",
       },
@@ -1038,8 +1025,8 @@ describe("POST /api/modules/:short/start", () => {
     const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
 
     const res = await handleStart(
-      postReq("/api/modules/agent/start", { authorization: `Bearer ${bearer}` }),
-      "agent",
+      postReq("/api/modules/scribe/start", { authorization: `Bearer ${bearer}` }),
+      "scribe",
       {
         db: h.db,
         issuer: ISSUER,
@@ -1051,20 +1038,15 @@ describe("POST /api/modules/:short/start", () => {
     );
 
     expect(res.status).toBe(200);
-    // The supervisor child gets PORT=1941 (canonical), not the drifted 19415 —
-    // so it binds + the readiness probe checks the right port.
     expect(spawns.length).toBe(1);
-    expect(spawns[0]?.short).toBe("agent");
-    expect(spawns[0]?.env?.PORT).toBe("1941");
-    // services.json row is rewritten to 1941 → the reverse-proxy (which reads
-    // services.json) routes /agent/* to the live port.
+    expect(spawns[0]?.short).toBe("scribe");
+    expect(spawns[0]?.env?.PORT).toBe("1943");
     const onDisk = JSON.parse(readFileSync(h.manifestPath, "utf8")) as {
       services: { name: string; port: number }[];
     };
-    expect(onDisk.services.find((s) => s.name === "parachute-agent")?.port).toBe(1941);
-    // The reconcile event logged on the API path too (deps.log wired — #41 review).
+    expect(onDisk.services.find((s) => s.name === "parachute-scribe")?.port).toBe(1943);
     expect(
-      logs.some((l) => l.includes("reconciled") && l.includes("19415") && l.includes("1941")),
+      logs.some((l) => l.includes("reconciled") && l.includes("19415") && l.includes("1943")),
     ).toBe(true);
   });
 });

@@ -24,11 +24,10 @@
  * The admin SPA + every module config UI get their working Bearer from one of
  * the cookie-gated mint endpoints:
  *   - `GET /admin/host-admin-token`        (the SPA's own Bearer)
- *   - `GET /admin/agent-token`             (agent chat + config UIs)
  *   - `GET /admin/vault-admin-token/<name>`(per-vault admin SPA)
  *   - `GET /admin/module-token/<short>`    (generic module config UI Bearer)
  *
- * All four share the exact `parseSessionCookie → findSession → [isFirstAdmin]
+ * All three share the exact `parseSessionCookie → findSession → [isFirstAdmin]
  * → signAccessToken` shape. Inserting {@link requireUnlocked} into each makes
  * the lock cascade to EVERY admin surface with no per-module changes: when
  * locked, the mint returns 423 and the relevant UI shows the lock screen / its

@@ -8,7 +8,7 @@ import type { ServiceEntry } from "./services-manifest.ts";
  *
  *   1939  parachute-hub      internal static + proxy, CLI-managed
  *   1940  parachute-vault    committed core
- *   1941  parachute-agent    exploration (renamed from parachute-channel)
+ *   1941  unassigned
  *   1942  parachute-notes    committed core (PWA bundle)
  *   1943  parachute-scribe   committed core
  *   1944  parachute-app      the super-surface front door (PWA bundle,
@@ -70,7 +70,7 @@ export interface PortReservation {
 export const PORT_RESERVATIONS: readonly PortReservation[] = [
   { port: 1939, name: "parachute-hub", status: "assigned" },
   { port: 1940, name: "parachute-vault", status: "assigned" },
-  { port: 1941, name: "parachute-agent", status: "assigned" },
+  { port: 1941, name: "unassigned", status: "reserved" },
   { port: 1942, name: "parachute-notes", status: "assigned" },
   { port: 1943, name: "parachute-scribe", status: "assigned" },
   // hub-parity P5 (2026-07-11): parachute-app's canonical slot — the NEW
@@ -510,8 +510,8 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
     },
   },
   // NOTE (2026-07-01): `runner` was REMOVED from this registry (decision:
-  // Aaron 2026-07-01 — the module set of record is vault / hub / agent /
-  // scribe / surface). Runner is no longer offered, installable, or
+  // Aaron 2026-07-01 — the module set of record is vault / hub / scribe /
+  // surface). Runner is no longer offered, installable, or
   // lifecycle-addressable by short name from the hub's bootstrap registries.
   // Existing installs stay GRACEFUL: a legacy `parachute-runner` services.json
   // row is handled exactly like any unknown/third-party row — `parachute
@@ -520,29 +520,7 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
   // stamped and logs-and-skips otherwise. Deliberately NOT added to
   // RETIRED_MODULES: that registry GC-drops rows on load, which would break
   // routing for operators still running the runner daemon.
-  agent: {
-    short: "agent",
-    package: "@openparachute/agent",
-    manifestName: "parachute-agent",
-    canonicalPort: 1941,
-    displayName: "Agent",
-    // Mirrors agent's own module.json (the canonical fields below do too —
-    // keep in sync if agent's declaration changes). Renamed from `channel`
-    // 2026-06-17 (parachute-channel → parachute-agent); the module is the
-    // same webhook-fan-out + MCP bridge daemon, on the same port 1941.
-    tagline: "Chat with your Claude Code sessions — a channel per session.",
-    canonicalPaths: ["/agent"],
-    canonicalHealth: "/health",
-    canonicalStripPrefix: true,
-    extras: {
-      // Backward-compat startCmd for rows without installDir — same rationale
-      // as scribe / vault. The bare binary IS the daemon (agent's
-      // package.json bin maps `parachute-agent` → src/daemon.ts).
-      startCmd: () => ["parachute-agent"],
-      // Agent gates its endpoints behind hub-issued JWTs (agent:* scopes).
-      hasAuth: true,
-    },
-  },
+
   surface: {
     short: "surface",
     package: "@openparachute/surface",
@@ -603,20 +581,14 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
  *     entries (no successor reusing the name) still stay forever.
  */
 export const RETIRED_MODULES: Record<string, { retiredAt: string; replacement?: string }> = {
-  // NOTE (2026-06-17, channel→agent rename): the `agent` / `parachute-agent`
-  // names were retired here on 2026-05-20 (the Claude-in-containers module).
-  // They are NOW RE-ASSIGNED to the renamed channel module (parachute-channel
-  // → parachute-agent). Keeping these as RETIRED entries would make
-  // `dropRetiredModuleRows` drop the NEW agent module's services.json row on
-  // load — breaking the live module. The names are no longer retired; they
-  // belong to the active agent module. The retired containers code now lives
-  // under `parachute-agent-legacy` (GitHub) and is not installable, so there
-  // is no live `agent` daemon to GC. (The historical `claw → agent`
-  // migration in services-manifest.ts still rewrites stale paraclaw rows to
-  // `name: "agent"` — they now resolve to the LIVE agent module's mount,
-  // which is harmless / arguably correct since paraclaw was the original
-  // "agent".)
-  //
+  agent: { retiredAt: "2026-07-15", replacement: "Vault and Surface" },
+  channel: { retiredAt: "2026-07-15", replacement: "Vault and Surface" },
+  "parachute-agent": { retiredAt: "2026-07-15", replacement: "Vault and Surface" },
+  "parachute-channel": { retiredAt: "2026-07-15", replacement: "Vault and Surface" },
+  // Agent was removed from Hub on 2026-07-15. All historical service-row
+  // identities are retired so normal manifest reads stop routing or supervising
+  // the deprecated daemon. Generic AI-agent authorization grants/tokens are a
+  // separate Hub capability and remain supported.
   // NOTE (2026-07-11, hub-parity P5 — `app` / `parachute-app` UN-RETIRED):
   // this table carried `app` + `parachute-app` (retired 2026-05-27, the
   // app → surface rename, patterns#102) from hub#219 through hub-parity P4.
@@ -716,8 +688,7 @@ export function knownServices(): string[] {
  *
  *   - `core` — vault / scribe / hub / surface / app (the product surface;
  *     `app` joined 2026-07-11, hub-parity P5 — the super-surface front door).
- *   - `experimental` — agent (legit preview; still OFFERED on a fresh install)
- *     + any unlisted third-party short.
+ *   - `experimental` — any unlisted third-party short.
  *   - `deprecated` — notes (notes-daemon deprecated 2026-05-22; notes-ui moved
  *     into parachute-surface). Still RESOLVABLE (discoverableShorts unchanged)
  *     and SHOWN-IF-INSTALLED so an existing operator can manage/uninstall, but
@@ -734,7 +705,7 @@ const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
   hub: "core",
   surface: "core",
   app: "core",
-  agent: "experimental",
+
   notes: "deprecated",
 };
 
@@ -931,7 +902,6 @@ export async function getSpecFromInstallDir(
  */
 const LEGACY_MANIFEST_ALIASES: Record<string, string> = {
   "parachute-lens": "notes",
-  "parachute-channel": "agent",
 };
 
 /** Short name for a given manifest name, e.g. `parachute-vault` → `vault`.

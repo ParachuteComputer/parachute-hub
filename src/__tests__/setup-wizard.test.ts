@@ -2066,19 +2066,16 @@ describe("handleSetupVaultPost", () => {
   test("scribe transcribe=local resolves to the host platform's backend (the Linux trap fix)", async () => {
     // The bug: `local` mapped UNCONDITIONALLY to parakeet-mlx (macOS-only),
     // silently broken on every Linux box. After the fix it resolves to the
-    // platform backend. We assert against the actual host so it's correct on
-    // both Mac (parakeet-mlx) and Linux CI (onnx-asr). The RAM gate only kicks
-    // in below 2 GB — CI/dev boxes clear it, so the choice stays `local`.
-    const { platformLocalProvider } = await import("../scribe-config.ts");
-    const expected = platformLocalProvider(process.platform);
+    // platform backend. The expectation uses the same host RAM decision so
+    // constrained CI boxes correctly assert the cloud fallback instead.
+    const { decideLocalProvider, readAvailableRamMib } = await import("../scribe-config.ts");
+    const decision = decideLocalProvider(process.platform, readAvailableRamMib());
     const { response } = await postVaultWithFields(h, { scribe_provider: "local" });
     expect(response.status).toBe(303);
     const cfg = readScribeConfig(h.dir);
-    if (expected !== null) {
-      // On a supported platform with enough RAM, `local` resolves to the
-      // platform backend — NOT a hardcoded parakeet-mlx on Linux.
-      expect(cfg?.transcribe).toEqual({ provider: expected });
-    }
+    expect(cfg?.transcribe).toEqual({
+      provider: decision.ok ? decision.provider : decision.steerTo,
+    });
   });
 });
 

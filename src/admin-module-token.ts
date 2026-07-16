@@ -8,15 +8,14 @@
  * hub frames/links those surfaces consistently (the Modules page "Configure"
  * action). Each module-owned config UI, served behind the hub proxy to a
  * logged-in portal operator, needs an admin-scoped hub Bearer to call its own
- * `<short>:admin`-gated endpoints — the same shape the agent config UI gets
- * from `/admin/agent-token` and the vault admin SPA gets from
- * `/admin/vault-admin-token/<name>`. This is the GENERIC mint that covers every
- * other self-registered single-audience module, so the hub doesn't grow a
+ * `<short>:admin`-gated endpoints. This generic mint covers every
+ * self-registered single-audience module, while the vault admin SPA uses
+ * `/admin/vault-admin-token/<name>`, so the hub doesn't grow a
  * bespoke per-module mint endpoint as each module ships a config UI.
  *
  * Scope + audience: `<short>:admin`, audience = `<short>` (the bare service
  * prefix). Modules validate the JWT's `aud` against their literal short name
- * (`scribe`, `surface`, `agent`) — the same shape `inferAudience`
+ * (`scribe`, `surface`, or a third-party short) — the same shape `inferAudience`
  * stamps for the public OAuth flow, so a hub-minted and an OAuth-minted admin
  * token are indistinguishable to the module. This mirrors the per-request
  * `<short>:admin` proxy token `api-modules-config.ts` used to mint; the
@@ -32,7 +31,7 @@
  *
  * Gate: the session must belong to the first admin (the single hub admin under
  * the Phase 1 multi-user model — `users.ts:isFirstAdmin`), exactly like
- * host-admin-token / vault-admin-token / agent-token. A friend account holds
+ * host-admin-token and vault-admin-token. A friend account holds
  * a valid session but must not mint a module admin Bearer.
  *
  * Tokens are short-lived (10 min — matches the sibling admin-token mints); the
@@ -45,12 +44,12 @@ import {
   type ModuleManifest,
   readModuleManifest as defaultReadModuleManifest,
 } from "./module-manifest.ts";
-import { findServiceByShort, isKnownModuleShort } from "./service-spec.ts";
+import { RETIRED_MODULES, findServiceByShort, isKnownModuleShort } from "./service-spec.ts";
 import type { ServiceEntry } from "./services-manifest.ts";
 import { findSession, parseSessionCookie } from "./sessions.ts";
 import { isFirstAdmin } from "./users.ts";
 
-/** Short TTL — matches host/vault/agent admin-token. UI re-fetches on near-expiry. */
+/** Short TTL — matches sibling admin-token mints. UI re-fetches on near-expiry. */
 export const MODULE_TOKEN_TTL_SECONDS = 10 * 60;
 const MODULE_TOKEN_CLIENT_ID = "parachute-hub-spa";
 
@@ -114,6 +113,12 @@ export async function handleModuleToken(
   }
   if (!MODULE_SHORT_RE.test(short)) {
     return jsonError(400, "invalid_request", `module short "${short}" is not a valid identifier`);
+  }
+  // Retirement wins over the generic self-registration trust path. Otherwise a
+  // stale row plus readable module.json could keep minting after Hub support is
+  // deliberately removed.
+  if (RETIRED_MODULES[short]) {
+    return jsonError(404, "not_found", `no module "${short}" known to this hub`);
   }
   // Vault is per-instance — its admin scope needs a vault name. Route the caller
   // to the dedicated per-vault endpoint rather than minting a useless bare

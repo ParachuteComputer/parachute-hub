@@ -68,6 +68,71 @@ describe("install", () => {
     }
   });
 
+  test("refuses `install agent` without invoking bun or the deprecated binary", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const calls: string[][] = [];
+      const logs: string[] = [];
+      const code = await install("agent", {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        manifestPath: path,
+        startService: async () => 0,
+        isLinked: () => false,
+        portProbe: async () => false,
+        log: (line) => logs.push(line),
+      });
+      expect(code).toBe(1);
+      expect(calls).toEqual([]);
+      expect(logs.join("\n")).toMatch(/parachute-agent was retired/);
+      expect(logs.join("\n")).toMatch(/Vault and Surface/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("refuses explicit retired Agent npm package names before invoking bun", async () => {
+    for (const packageName of [
+      "@openparachute/agent",
+      "@openparachute/agent@0.9.0",
+      "@openparachute/channel",
+    ]) {
+      const calls: string[][] = [];
+      const logs: string[] = [];
+      const code = await install(packageName, {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        log: (line) => logs.push(line),
+      });
+      expect(code).toBe(1);
+      expect(calls).toEqual([]);
+      expect(logs.join("\n")).toMatch(/parachute-agent was retired/);
+    }
+  });
+
+  test("refuses a local checkout whose package metadata is a retired Agent package", async () => {
+    const pkgDir = mkdtempSync(join(tmpdir(), "pcli-retired-agent-"));
+    try {
+      const calls: string[][] = [];
+      const code = await install(pkgDir, {
+        runner: async (cmd) => {
+          calls.push([...cmd]);
+          return 0;
+        },
+        readPackageName: () => "@openparachute/agent",
+        log: () => {},
+      });
+      expect(code).toBe(1);
+      expect(calls).toEqual([]);
+    } finally {
+      rmSync(pkgDir, { recursive: true, force: true });
+    }
+  });
+
   test("runs bun add -g then init; seeds manifest when service didn't write one", async () => {
     const { path, cleanup } = makeTempPath();
     try {
@@ -1642,10 +1707,10 @@ describe("install", () => {
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
-      // First reservation slot is now 1945 — 1944 is parachute-app's
-      // canonical (assigned, non-walkable) slot as of hub-parity P5.
+      // Agent retirement released 1941, so it is now the first unassigned
+      // canonical slot available to the fallback walker.
       const entry = findService("parachute-vault", path);
-      expect(entry?.port).toBe(1945);
+      expect(entry?.port).toBe(1941);
       expect(logs.join("\n")).toMatch(/canonical port 1940 is in use/);
       // .env is not touched.
       const envPath = join(configDir, "vault", ".env");
@@ -1869,6 +1934,33 @@ describe("install", () => {
     } finally {
       cleanup();
       rmSync(pkgDir, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses third-party metadata that declares a retired Agent manifest identity", async () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const logs: string[] = [];
+      const code = await install("@vendor/agent-wrapper", {
+        runner: async () => 0,
+        manifestPath: path,
+        isLinked: () => false,
+        log: (line) => logs.push(line),
+        readManifest: async () => ({
+          name: "claw",
+          manifestName: "@vendor/agent-wrapper",
+          port: 1952,
+          paths: ["/claw"],
+          health: "/claw/health",
+        }),
+        findGlobalInstall: () =>
+          "/fake/bun-globals/node_modules/@vendor/agent-wrapper/package.json",
+      });
+      expect(code).toBe(1);
+      expect(findService("claw", path)).toBeUndefined();
+      expect(logs.join("\n")).toMatch(/parachute-agent was retired/);
+    } finally {
+      cleanup();
     }
   });
 

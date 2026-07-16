@@ -692,10 +692,9 @@ export function readManifest(path: string = SERVICES_MANIFEST_PATH): ServicesMan
   const afterRetired = dropRetiredModuleRows(healed.raw, path);
   const cleaned = dropLegacyShortNameRows(afterRetired.raw, path);
   const validated = validateManifest(cleaned.raw, path);
-  const migrated = migrateClawToAgent(validated);
-  const changed = healed.changed || afterRetired.changed || cleaned.changed || migrated.changed;
-  if (changed) writeManifest(migrated.manifest, path);
-  return migrated.manifest;
+  const changed = healed.changed || afterRetired.changed || cleaned.changed;
+  if (changed) writeManifest(validated, path);
+  return validated;
 }
 
 /**
@@ -732,7 +731,12 @@ function dropRetiredModuleRows(raw: unknown, where: string): { raw: unknown; cha
     if (!row || typeof row !== "object") return true;
     const name = (row as Record<string, unknown>).name;
     if (typeof name !== "string") return true;
-    const retired = RETIRED_MODULES[name];
+    // `claw` is too generic to reserve globally, but the historical Agent row
+    // had a structural identity: name=claw mounted at /claw. Retire only that
+    // shape; an unrelated third-party `claw` on another mount remains valid.
+    const paths = (row as Record<string, unknown>).paths;
+    const retiredClawShape = name === "claw" && Array.isArray(paths) && paths[0] === "/claw";
+    const retired = RETIRED_MODULES[name] ?? (retiredClawShape ? RETIRED_MODULES.agent : undefined);
     if (retired === undefined) return true;
     dropped.push({ name, retiredAt: retired.retiredAt, replacement: retired.replacement });
     return false;
@@ -927,43 +931,6 @@ function dropLegacyShortNameRows(raw: unknown, where: string): { raw: unknown; c
     raw: { ...(raw as Record<string, unknown>), services: nextServices },
     changed: true,
   };
-}
-
-/**
- * Migrate legacy `claw` entries to `agent` in-place. Paraclaw was renamed
- * to parachute-agent across the ecosystem (npm package, mount path, short
- * name); operators who upgraded hub but still have the old paraclaw row
- * in services.json would otherwise see a tile labelled "Claw" and a hub
- * route at `/claw` while their newly-upgraded daemon listens on `/agent`.
- *
- * Idempotent. Only rewrites when both `name === "claw"` AND the first path
- * is `/claw` — narrow enough that a deliberately-named third-party module
- * (e.g. `name: "claw"` on a different mount) is left alone. Health and any
- * `/claw`-rooted paths are rewritten in lockstep.
- */
-function migrateClawToAgent(manifest: ServicesManifest): {
-  manifest: ServicesManifest;
-  changed: boolean;
-} {
-  let changed = false;
-  const services = manifest.services.map((entry) => {
-    if (entry.name !== "claw" || entry.paths[0] !== "/claw") return entry;
-    changed = true;
-    const next: ServiceEntry = {
-      ...entry,
-      name: "agent",
-      paths: entry.paths.map((p) => rewriteClawPath(p)),
-      health: rewriteClawPath(entry.health),
-    };
-    return next;
-  });
-  return { manifest: { services }, changed };
-}
-
-function rewriteClawPath(p: string): string {
-  if (p === "/claw") return "/agent";
-  if (p.startsWith("/claw/")) return `/agent${p.slice("/claw".length)}`;
-  return p;
 }
 
 export function writeManifest(

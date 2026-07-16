@@ -326,7 +326,7 @@ field. Same rule as `hasAuth` / `init` / `urlForEntry`.
 
 **Why this lives with the module, not the hub.** Per-module admin UIs
 need to render module-internal API shapes — vault's name list, scribe's
-job queue, parachute-agent's bot wiring. Putting the UI in the hub leaks those
+job queue, or a third-party module's settings. Putting the UI in the hub leaks those
 shapes into the portal and breaks the modular contract. Putting it
 under the module's own origin keeps the boundary clean: hub stays a
 thin directory + link-out; each module owns its admin surface

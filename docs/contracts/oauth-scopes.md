@@ -33,7 +33,6 @@ Parachute OAuth tokens carry **whitespace-separated scope strings**
 | `scribe:admin` | Manage scribe config |
 | `hub:admin` | Manage hub services catalog + OAuth config (Reserved; not yet enforced) |
 | `parachute:host:admin` | Drive the hub's vault instance-lifecycle *transactions* (`POST /vaults` / `DELETE /vaults/<name>`) and other host-level admin (operator-only-mintable; not requestable from third-party clients). The provisioning *UX* lives in vault's own surface — see [`hub-module-boundary.md`](./hub-module-boundary.md). |
-| `agent:send` | Send a message to a Parachute agent (the `parachute-agent` module, ex-channel; hub also mints `agent:read` / `agent:admin` via `/admin/agent-token`) |
 | `surface:<name>:read` | Fetch/clone the named surface's hub-hosted git repo (Surface Git Transport) |
 | `surface:<name>:write` | Push to the named surface's repo (write ⊇ read at the git endpoint) |
 | `surface:admin` | surface-host module admin — the hub↔surface-host notify bearer + the credential endpoint |
@@ -43,16 +42,11 @@ Parachute OAuth tokens carry **whitespace-separated scope strings**
 Third-party modules declare their own namespace (`my-service:read`, etc.)
 and the hub renders consent for those scopes the same way.
 
-**Reclaimed `agent:*` namespace.** `agent:read` / `agent:write` /
-`agent:admin` were the launch scopes for the *containers* agent, retired
-with that module 2026-05-20 (see
-[`trust-gradient-isolation.md`](./trust-gradient-isolation.md); the repo
-is `paraclaw` today). No `agent:*` bearer was ever in the wild, and the
-namespace **has since been reclaimed** by the live `parachute-agent`
-module (the renamed `parachute-channel`, 2026-06-17): `channel:*` scopes
-became `agent:read` / `agent:send` / `agent:admin`, minted by the hub and
-enforced by the agent daemon. See
-[`../migrations/2026-06-17-channel-to-agent.md`](../migrations/2026-06-17-channel-to-agent.md).
+**Retired `agent:*` namespace.** Historical Agent modules used
+`agent:read` / `agent:send` / `agent:admin`. The module and its dedicated
+token-mint endpoint are retired; these scopes are no longer issued by Hub.
+Migration records remain under
+[`../migrations/`](../migrations/) for operators archiving old installs.
 
 ## Inheritance
 
@@ -234,9 +228,6 @@ The parser already knows to split on `:`; the matcher is what gains the
 - `parachute-scribe` — scopes declared under `x-scopes` in the config
   schema; enforcement follows once hub starts issuing JWTs. See scribe's
   CLAUDE.md ("Scopes declared, not yet enforced").
-- `parachute-agent` — `agent:read` / `agent:send` / `agent:admin`
-  enforced (the daemon validates hub-issued JWTs; hub mints via
-  `/admin/agent-token`). Renamed from `channel:*` 2026-06-17.
 - `parachute-surface` (surface-host) — declares `surface:read` /
   `surface:write` / `surface:admin` in `.parachute/module.json`; the
   per-surface `surface:<name>:<verb>` form is enforced by the **hub** at

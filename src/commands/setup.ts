@@ -186,8 +186,6 @@ const BLURBS: Record<string, string> = {
   // renders if a legacy install surfaces it in the survey.
   notes: "Notes PWA — web/mobile UI on top of vault (notes-daemon; superseded by `surface`)",
   scribe: "audio transcription for dictation + recordings",
-  agent:
-    "(exploratory) chat with your Claude Code sessions — a channel per session (renamed from channel)",
 };
 
 function blurbFor(choice: ServiceChoice): string {

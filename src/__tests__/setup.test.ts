@@ -185,18 +185,14 @@ describe("setup", () => {
     }
   });
 
-  test("fresh box: the offered 'Available to install' list excludes deprecated notes + removed runner", async () => {
+  test("fresh box: the offered list excludes deprecated notes and removed Agent/runner", async () => {
     const h = makeHarness();
     try {
-      // 'all' picks every OFFERED service. With a clean services.json the survey
-      // sees every known short; the offered filter must drop notes (deprecated,
-      // 2026-06-25) while runner never even reaches the survey (registry
-      // removal, 2026-07-01) — keeping vault/scribe/surface/agent. Only vault +
-      // scribe have pre-install follow-up prompts (vault name, scribe provider);
-      // surface + agent have none — so the scripted answers below are complete.
+      // 'all' picks every offered service. The clean-box offer excludes notes
+      // (deprecated) and retired Agent/runner, keeping vault/scribe/surface/app.
       const availability = scriptedAvailability([
-        "all", // pick everything offered
-        "default", // vault name (vault is in the offered set)
+        "all",
+        "default", // vault name
         "1", // scribe provider
       ]);
       const code = await setup({
@@ -210,20 +206,19 @@ describe("setup", () => {
         },
       });
       expect(code).toBe(0);
-      // The "Available to install" banner must NOT list notes / runner.
       const joined = h.logs.join("\n");
       const availableBlock = joined.slice(joined.indexOf("Available to install:"));
       expect(availableBlock).not.toMatch(/\bnotes\b/);
       expect(availableBlock).not.toMatch(/\brunner\b/);
-      // …and `install()` is never invoked for the deprecated shorts.
+      expect(availableBlock).not.toMatch(/\bagent\b/);
       const installedShorts = h.calls.map((c) => c.short);
       expect(installedShorts).not.toContain("notes");
       expect(installedShorts).not.toContain("runner");
-      // The non-deprecated set is still offered + installed.
+      expect(installedShorts).not.toContain("agent");
       expect(installedShorts).toContain("vault");
       expect(installedShorts).toContain("scribe");
       expect(installedShorts).toContain("surface");
-      expect(installedShorts).toContain("agent");
+      expect(installedShorts).toContain("app");
     } finally {
       h.cleanup();
     }

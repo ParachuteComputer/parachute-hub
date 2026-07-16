@@ -502,7 +502,7 @@ describe("doctor — canonical-port-drift detection (read-only)", () => {
   test("a non-canonical port + a duplicate-port pair → port-drift WARNs naming the services", async () => {
     const h = makeHarness();
     try {
-      // scribe drifted off 1943 onto 1944; agent also squats 1944 (a collision).
+      // Scribe drifted off 1943 onto Surface's canonical 1946 (a collision).
       writeManifestRows(h.manifestPath, [
         {
           name: "parachute-vault",
@@ -511,21 +511,17 @@ describe("doctor — canonical-port-drift detection (read-only)", () => {
           health: "/h",
           version: "1",
         },
-        { name: "parachute-scribe", port: 1944, paths: ["/scribe"], health: "/h", version: "1" },
-        { name: "parachute-agent", port: 1944, paths: ["/agent"], health: "/h", version: "1" },
+        { name: "parachute-scribe", port: 1946, paths: ["/scribe"], health: "/h", version: "1" },
+        { name: "parachute-surface", port: 1946, paths: ["/surface"], health: "/h", version: "1" },
       ]);
       seedOperatorToken(h.configDir);
       const { code, checks } = await runDoctor(h, healthyDeps());
       const pd = byName(checks, "port-drift");
       expect(pd?.status).toBe("warn");
-      // Names the drifted service AND the colliding pair.
       expect(pd?.detail).toContain("scribe");
-      expect(pd?.detail).toContain("1944");
-      expect(pd?.detail).toContain("parachute-scribe + parachute-agent");
+      expect(pd?.detail).toContain("1946");
+      expect(pd?.detail).toContain("parachute-scribe + parachute-surface");
       expect(pd?.fix).toBe("parachute doctor --fix");
-      // Drift is advisory — exit stays 0 (a WARN, not a FAIL). The duplicate
-      // rows also trip modules-alive (both can't bind 1944) but that's expected
-      // for this fixture; we only assert on port-drift here.
       expect([0, 1]).toContain(code);
     } finally {
       h.cleanup();
@@ -732,22 +728,19 @@ describe("doctor --fix — canonical-port repair (confirm-gated, idempotent, non
   test("--fix reports a duplicate-port collision but does not auto-resolve it", async () => {
     const h = makeHarness();
     try {
-      // Two services collide on 1944; neither is on its canonical slot. The
-      // diff fixes the canonical drift; the collision is reported, not guessed.
+      // Two supported services collide on unassigned 1945; both are off canonical.
       writeManifestRows(h.manifestPath, [
-        { name: "parachute-scribe", port: 1944, paths: ["/scribe"], health: "/h", version: "1" },
-        { name: "parachute-agent", port: 1944, paths: ["/agent"], health: "/h", version: "1" },
+        { name: "parachute-scribe", port: 1945, paths: ["/scribe"], health: "/h", version: "1" },
+        { name: "parachute-surface", port: 1945, paths: ["/surface"], health: "/h", version: "1" },
       ]);
       const { code, lines } = await runFix(h, {}, { yes: true });
       const text = lines.join("\n");
       expect(text.toLowerCase()).toContain("shared by");
-      expect(text).toContain("parachute-scribe + parachute-agent");
-      // scribe → 1943 and agent → 1941 are both off 1944, so after the rewrite
-      // they no longer collide; fix applied, exit 0.
+      expect(text).toContain("parachute-scribe + parachute-surface");
       expect(code).toBe(0);
       const rows = readRows(h.manifestPath);
       expect(rows.find((r) => r.name === "parachute-scribe")?.port).toBe(1943);
-      expect(rows.find((r) => r.name === "parachute-agent")?.port).toBe(1941);
+      expect(rows.find((r) => r.name === "parachute-surface")?.port).toBe(1946);
     } finally {
       h.cleanup();
     }

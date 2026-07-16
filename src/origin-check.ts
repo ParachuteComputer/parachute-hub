@@ -198,8 +198,8 @@ const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
  *
  * NOT belted, and why:
  *   - GET/HEAD/OPTIONS — read-shaped; the mint GETs
- *     (`/admin/host-admin-token`, `/admin/agent-token`,
- *     `/admin/module-token/<short>`, `/admin/vault-admin-token/<name>`)
+ *     (`/admin/host-admin-token`, `/admin/module-token/<short>`,
+ *     `/admin/vault-admin-token/<name>`)
  *     enforce GET-only with a 405 and their response bodies are unreadable
  *     cross-origin (no CORS on these routes).
  *   - Bearer-authed requests — a cross-site page cannot attach an

@@ -46,7 +46,7 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
       "Read and write everything, plus admin: config & settings, triggers & automation, GitHub backup, and minting access tokens.",
     level: "admin",
   },
-  // Optional-module scopes (scribe / agent / surface). These are in
+  // Optional-module scopes (scribe / surface). These are in
   // FIRST_PARTY_SCOPES (= Object.keys(this map)) but the modules may not be
   // installed — so they're GATED in `OPTIONAL_MODULE_SCOPES` (oauth-handlers.ts)
   // and only advertised in `scopes_supported` when the service is in
@@ -61,10 +61,7 @@ export const SCOPE_EXPLANATIONS: Record<string, ScopeExplanation> = {
     label: "Manage Scribe configuration (provider keys, models, quotas).",
     level: "admin",
   },
-  "agent:send": {
-    label: "Post messages to your Agent.",
-    level: "send",
-  },
+
   // Surface Git Transport scopes (surface-host). `surface:read` = clone/fetch a
   // surface's hub-hosted git repo; `surface:write` = push to it. Named forms
   // (`surface:<name>:<verb>`) collapse to these via the 3→2-segment rule in
