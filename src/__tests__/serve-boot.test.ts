@@ -395,46 +395,39 @@ describe("bootSupervisedModules", () => {
   });
 });
 
-// agent (then channel)#41 — a transiently-wrong (drifted) services.json port for a
-// fixed-port first-party module self-perpetuates: the supervisor injects PORT /
-// probes / proxies from that row, so the wrong port strands the module forever.
-// The boot path snaps it back to canonical before spawn AND persists the fix so
-// the reverse-proxy (which reads services.json) routes correctly.
-describe("reconcilePortToCanonical (channel#41 — module now agent)", () => {
+// A transiently wrong services.json port for a fixed-port first-party module can
+// self-perpetuate through supervisor env, probes, and proxy routing. The boot path
+// snaps supported modules back to canonical and persists the fix.
+describe("reconcilePortToCanonical", () => {
   let h: Harness;
   beforeEach(() => {
     h = makeHarness();
   });
   afterEach(() => h.cleanup());
 
-  // The live-observed signature: the agent (then channel) row carried 19415 instead of its
-  // canonical 1941.
-  const DRIFTED_CHANNEL: ServiceEntry = {
-    name: "parachute-agent",
+  const DRIFTED_SCRIBE: ServiceEntry = {
+    name: "parachute-scribe",
     port: 19415,
-    paths: ["/agent"],
+    paths: ["/scribe"],
     health: "/health",
     version: "0.1.0",
   };
 
   test("snaps a drifted fixed-port row back to canonical + persists it", () => {
-    writeManifest({ services: [DRIFTED_CHANNEL] }, h.manifestPath);
+    writeManifest({ services: [DRIFTED_SCRIBE] }, h.manifestPath);
     const logs: string[] = [];
 
-    const reconciled = reconcilePortToCanonical(DRIFTED_CHANNEL, h.manifestPath, (l) =>
+    const reconciled = reconcilePortToCanonical(DRIFTED_SCRIBE, h.manifestPath, (l) =>
       logs.push(l),
     );
 
-    // Returned entry carries canonical (agent → 1941).
-    expect(reconciled.port).toBe(1941);
-    // And it's PERSISTED — the proxy reads services.json, so the row itself must
-    // now point at 1941 or `/agent/*` keeps routing to the dead 19415.
+    expect(reconciled.port).toBe(1943);
     const onDisk = readManifestLenient(h.manifestPath).services.find(
-      (s) => s.name === "parachute-agent",
+      (s) => s.name === "parachute-scribe",
     );
-    expect(onDisk?.port).toBe(1941);
+    expect(onDisk?.port).toBe(1943);
     expect(
-      logs.some((l) => l.includes("reconciled") && l.includes("19415") && l.includes("1941")),
+      logs.some((l) => l.includes("reconciled") && l.includes("19415") && l.includes("1943")),
     ).toBe(true);
   });
 
@@ -460,31 +453,30 @@ describe("reconcilePortToCanonical (channel#41 — module now agent)", () => {
   });
 
   test("does NOT steal the canonical port when another row already holds it", () => {
-    // Another row legitimately occupies 1941 — reconciling would trip the
-    // write-side duplicate-port guard and isn't the agent module's to take. Leave the
-    // drift; the supervisor's squatter detection surfaces it.
+    // Another row occupies Scribe's canonical 1943, so reconciliation must not
+    // steal it; leave the drift for squatter diagnostics.
     const squatter: ServiceEntry = {
       name: "parachute-vault",
-      port: 1941, // unusual, but it owns this slot right now
+      port: 1943,
       paths: ["/vault/default"],
       health: "/vault/default/health",
       version: "0.4.5",
     };
-    writeManifest({ services: [squatter, DRIFTED_CHANNEL] }, h.manifestPath);
+    writeManifest({ services: [squatter, DRIFTED_SCRIBE] }, h.manifestPath);
     const logs: string[] = [];
 
-    const out = reconcilePortToCanonical(DRIFTED_CHANNEL, h.manifestPath, (l) => logs.push(l));
+    const out = reconcilePortToCanonical(DRIFTED_SCRIBE, h.manifestPath, (l) => logs.push(l));
 
     expect(out.port).toBe(19415); // unchanged
     const onDisk = readManifestLenient(h.manifestPath).services.find(
-      (s) => s.name === "parachute-agent",
+      (s) => s.name === "parachute-scribe",
     );
     expect(onDisk?.port).toBe(19415); // not rewritten
     expect(logs.some((l) => l.includes("held by another row"))).toBe(true);
   });
 
-  test("boot path injects PORT=canonical + persists the fix for a drifted agent row", async () => {
-    writeManifest({ services: [DRIFTED_CHANNEL] }, h.manifestPath);
+  test("boot path injects and persists the supported module's canonical port", async () => {
+    writeManifest({ services: [DRIFTED_SCRIBE] }, h.manifestPath);
     const recorder = makeRecorder();
     const sup = new Supervisor({ spawnFn: recorder.spawn });
 
@@ -493,15 +485,12 @@ describe("reconcilePortToCanonical (channel#41 — module now agent)", () => {
       configDir: h.dir,
     });
 
-    // The supervisor child gets PORT=1941 (so it binds + the readiness probe
-    // checks the right port), not the drifted 19415.
-    expect(recorder.calls[0]?.short).toBe("agent");
-    expect(recorder.calls[0]?.env?.PORT).toBe("1941");
-    // services.json row is reconciled → proxy routes /agent/* to 1941.
+    expect(recorder.calls[0]?.short).toBe("scribe");
+    expect(recorder.calls[0]?.env?.PORT).toBe("1943");
     const onDisk = readManifestLenient(h.manifestPath).services.find(
-      (s) => s.name === "parachute-agent",
+      (s) => s.name === "parachute-scribe",
     );
-    expect(onDisk?.port).toBe(1941);
+    expect(onDisk?.port).toBe(1943);
   });
 
   test("boot path leaves a non-drifted vault row's port untouched", async () => {

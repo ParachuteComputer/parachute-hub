@@ -351,15 +351,15 @@ interface ModuleWireShape {
    * `.parachute/module.json` `configUiUrl`, joined against its mount path the
    * same way `management_url` resolves `managementUrl`/`uiUrl`. Drives the
    * Modules page's consistent **Configure** action — clicking lands the
-   * operator on the module's own config UI (agent `/agent/admin`, scribe
-   * `/scribe/admin`, …), which mints its admin Bearer from the hub's
-   * cookie-gated `/admin/module-token/<short>` (or `/admin/agent-token`).
+   * operator on the module's own config UI (for example `/scribe/admin`),
+   * which mints its admin Bearer from the hub's cookie-gated
+   * `/admin/module-token/<short>`.
    *
    * Null when the module hasn't declared `configUiUrl` — the SPA omits the
    * Configure action for that module rather than rendering a dead button.
    * Distinct from `management_url`: a module may declare one, both, or
-   * neither. Agent declares `configUiUrl: "/agent/admin"` + `uiUrl`;
-   * vault declares `managementUrl` (its admin SPA is the config surface).
+   * neither. Vault declares `managementUrl` (its admin SPA is the config
+   * surface).
    */
   config_ui_url: string | null;
 }

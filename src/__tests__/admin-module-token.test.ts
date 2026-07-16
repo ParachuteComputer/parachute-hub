@@ -7,7 +7,7 @@
  *   - 401 when the cookie names a deleted session.
  *   - 405 on POST.
  *   - 200 + JWT carrying `aud: "<short>"` and `<short>:admin` for known modules
- *     (scribe / surface / agent).
+ *     (scribe / surface).
  *   - 400 for `vault` (per-instance — points at /admin/vault-admin-token/<name>).
  *   - 404 for an unknown short.
  *   - First-admin gate: 403 for a signed-in non-first-admin (friend).
@@ -114,7 +114,7 @@ describe("handleModuleToken", () => {
   // `<short>:admin` with `aud: <short>`. (runner left this set with its
   // 2026-07-01 registry removal — a LEGACY install still mints via the
   // self-registration gate, pinned below.)
-  for (const short of ["scribe", "surface", "agent"]) {
+  for (const short of ["scribe", "surface"]) {
     test(`200 mints a JWT carrying aud:${short} + ${short}:admin`, async () => {
       const { cookie, userId } = await withSession();
       rotateSigningKey(harness.db);
@@ -321,7 +321,7 @@ describe("handleModuleToken", () => {
     expect(body.error).toBe("use_vault_admin_token");
   });
 
-  test("first-party row resolves through the manifest-name map (parachute-agent ↔ agent)", async () => {
+  test("retired Agent identifiers do not mint even when stale rows are supplied", async () => {
     const { cookie } = await withSession();
     rotateSigningKey(harness.db);
     const installDir = writeManifestDir("agent");
@@ -335,40 +335,20 @@ describe("handleModuleToken", () => {
           version: "0.1.0",
           installDir,
         },
-      ];
-      const req = new Request(urlFor("agent"), { headers: { cookie } });
-      const res = await handleModuleToken(req, "agent", depsWith(services));
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { scopes: string[] };
-      expect(body.scopes).toEqual(["agent:admin"]);
-    } finally {
-      rmSync(installDir, { recursive: true, force: true });
-    }
-  });
-
-  test("a legacy parachute-channel row still resolves to short `agent` (rename back-compat)", async () => {
-    // Un-upgraded operators carry a `parachute-channel` services.json row;
-    // LEGACY_MANIFEST_ALIASES maps it to short `agent` so the agent config UI
-    // can still mint its admin Bearer until the daemon re-registers.
-    const { cookie } = await withSession();
-    rotateSigningKey(harness.db);
-    const installDir = writeManifestDir("agent");
-    try {
-      const services: ServiceEntry[] = [
         {
           name: "parachute-channel",
-          port: 1941,
-          paths: ["/agent"],
+          port: 1942,
+          paths: ["/channel"],
           health: "/health",
           version: "0.1.0",
           installDir,
         },
       ];
-      const req = new Request(urlFor("agent"), { headers: { cookie } });
-      const res = await handleModuleToken(req, "agent", depsWith(services));
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { scopes: string[] };
-      expect(body.scopes).toEqual(["agent:admin"]);
+      for (const short of ["agent", "parachute-agent", "parachute-channel"]) {
+        const req = new Request(urlFor(short), { headers: { cookie } });
+        const res = await handleModuleToken(req, short, depsWith(services));
+        expect(res.status).toBe(404);
+      }
     } finally {
       rmSync(installDir, { recursive: true, force: true });
     }

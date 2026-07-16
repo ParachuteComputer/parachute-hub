@@ -68,8 +68,6 @@
  *   /account/vaults/<name>/caps   (GET/PUT)    → read / set the storage cap
  *   /admin/host-admin-token       (GET)        → SPA bearer mint (cookie-gated)
  *   /admin/vault-admin-token/<n>  (GET)        → per-vault bearer mint (cookie-gated)
- *   /admin/agent-token            (GET)        → agent UI bearer mint (cookie-gated)
- *   /admin/channel-token          (GET)        → 301 → /admin/agent-token (legacy; channel→agent rename 2026-06-17)
  *   /admin/module-token/<short>   (GET)        → generic module config-UI bearer mint <short>:admin (cookie-gated)
  *   /api/connections/catalog      (GET)        → events/actions across installed modules (cookie-gated)
  *   /admin/connections            (POST/GET)   → connection provision/list (cookie-gated; POST CSRF-belted)
@@ -217,7 +215,7 @@ import {
   handleAgentGrants,
   handleOAuthGrantCallback,
 } from "./admin-agent-grants.ts";
-import { handleAgentToken } from "./admin-agent-token.ts";
+
 import { adminAuthErrorResponse } from "./admin-auth.ts";
 import { handleApproveClient, handleDeleteClient, handleGetClient } from "./admin-clients.ts";
 import {
@@ -2360,27 +2358,6 @@ export function hubFetch(
         }
       }
 
-      // `/channel/*` 301-redirects to `/agent/*` — back-compat for the
-      // 2026-06-17 channel→agent module rename. Operator bookmarks, an
-      // un-upgraded chat/config UI's deep links, and any externally-shared
-      // `/channel/mcp/<name>` URL keep resolving for one release cycle while
-      // the module's canonical mount moves to `/agent`. Method-agnostic, same
-      // shape as the `/notes/*` redirect above (the agent's read-write surface
-      // is its own daemon API, not the hub mount, so a re-issued GET is fine).
-      // Matches `/channel` exactly and any `/channel/...` subpath, but NOT a
-      // longer-prefix module like a hypothetical `/channelthing` — the guard is
-      // exact-or-slash-delimited. Query string is preserved. (The generic
-      // services-proxy fallthrough below would otherwise 404 a `/channel/*`
-      // request once the module self-registers under `/agent`.)
-      if (pathname === "/channel" || pathname.startsWith("/channel/")) {
-        const dest = new URL(req.url);
-        dest.pathname = `/agent${pathname.slice("/channel".length)}`;
-        return new Response("", {
-          status: 301,
-          headers: { location: dest.pathname + dest.search },
-        });
-      }
-
       // CORS preflight for the public OAuth + discovery surface. Browsers
       // issue OPTIONS before any non-simple cross-origin request — third-party
       // SPAs hitting `/oauth/register` (RFC 7591 DCR), `/oauth/token`,
@@ -3073,31 +3050,13 @@ export function hubFetch(
         });
       }
 
-      // Back-compat: the agent module's admin-token mint moved from
-      // `/admin/channel-token` to `/admin/agent-token` in the 2026-06-17
-      // channel→agent rename. 301-redirect the old path so operator bookmarks
-      // + any un-upgraded UI fallback keep working for one release cycle.
-      if (pathname === "/admin/channel-token") {
-        const dest = new URL(req.url);
-        dest.pathname = "/admin/agent-token";
-        return Response.redirect(dest.toString(), 301);
-      }
-
-      if (pathname === "/admin/agent-token") {
-        if (!getDb) return dbNotConfigured();
-        return handleAgentToken(req, {
-          db: getDb(),
-          issuer: oauthDeps(req).issuer,
-        });
-      }
-
       // Generic per-module config-UI bearer mint (2026-06-09 modular-UI
       // architecture, P3). `<short>:admin` for any single-audience module —
       // the admin scope each module-owned config UI needs to call its own
-      // endpoints. Cookie-gated to the first-admin operator, exactly like
-      // /admin/agent-token + /admin/vault-admin-token. Gated on
-      // self-registration (services.json row + readable module.json) with the
-      // bootstrap registries as a fallback (boundary C5) — a genuinely
+      // endpoints. Cookie-gated to the first-admin operator, matching the
+      // host/vault admin-token endpoints. Gated on self-registration
+      // (services.json row + readable module.json) with the bootstrap
+      // registries as a fallback (boundary C5) — a genuinely
       // third-party module mints here with zero hub code changes. Vault is
       // per-instance and routed to /admin/vault-admin-token/<name> instead.
       if (pathname.startsWith("/admin/module-token/")) {
@@ -3115,9 +3074,7 @@ export function hubFetch(
 
       // Note: the legacy `/admin/channels` bespoke vault-channel orchestration
       // endpoint (pre-Connections, hub#624 era) was retired in boundary D1 —
-      // superseded by the general engine below. The agent module's own admin
-      // page (renamed from channel 2026-06-17) drives `/admin/connections` +
-      // `/admin/agent-token`.
+      // superseded by the general engine below.
 
       // Connections — the GENERAL module event→action engine (2026-06-09
       // modular-UI architecture, P5). `/api/connections/catalog` (GET) returns
@@ -3420,7 +3377,7 @@ export function hubFetch(
       // the 2026-06-09 modular-UI architecture P3. Config is module-owned +
       // hub-framed now: the Modules page "Configure" action opens the module's
       // OWN config UI (`configUiUrl`), which mints its admin Bearer from the
-      // cookie-gated `/admin/module-token/<short>` (or `/admin/agent-token`).
+      // cookie-gated `/admin/module-token/<short>`.
 
       // Per-module action endpoints: /api/modules/:short/{install,restart,upgrade,uninstall}.
       if (pathname.startsWith("/api/modules/")) {

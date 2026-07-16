@@ -993,6 +993,29 @@ describe("hubFetch routing", () => {
     }
   });
 
+  test("retired Agent token endpoints neither mint nor redirect", async () => {
+    const h = makeHarness();
+    try {
+      const dist = join(h.dir, "dist");
+      mkdirIfMissing(dist);
+      writeFileSync(join(dist, "index.html"), "<!doctype html><title>admin shell</title>");
+      const fetcher = hubFetch(h.dir, { spaDistDir: dist });
+
+      for (const path of ["/admin/agent-token", "/admin/channel-token"]) {
+        const post = await fetcher(req(path, { method: "POST" }));
+        expect(post.status).toBe(405);
+        expect(post.headers.get("location")).toBeNull();
+
+        const get = await fetcher(req(path));
+        expect(get.status).toBe(200);
+        expect(get.headers.get("location")).toBeNull();
+        expect(await get.text()).toContain("admin shell");
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   // 301 back-compat redirects (closes hub#231): pre-rename SPA URLs
   // 301-redirect to the new /admin/* mount. Tests cover every entry in the
   // dispatch — operator bookmarks landing on any of these still work.
@@ -1244,6 +1267,20 @@ describe("hubFetch routing", () => {
       writeManifest({ services: [] }, h.manifestPath);
       const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(req("/notesy"));
       expect(res.status).toBe(404);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("retired /channel/* paths no longer redirect to /agent/*", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest({ services: [] }, h.manifestPath);
+      const res = await hubFetch(h.dir, { manifestPath: h.manifestPath })(
+        req("/channel/mcp/default?q=1"),
+      );
+      expect(res.status).toBe(404);
+      expect(res.headers.get("location")).toBeNull();
     } finally {
       h.cleanup();
     }

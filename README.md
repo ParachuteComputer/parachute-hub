@@ -342,23 +342,23 @@ Parachute services reserve a block of loopback ports in the canonical range **19
 | ---- | ------------------ |
 | 1939 | parachute-hub (internal proxy + static) |
 | 1940 | parachute-vault    |
-| 1941 | parachute-agent *(renamed from parachute-channel 2026-06-17)* |
-| 1942 | *parachute-notes (archived 2026-05-24 — notes-daemon retired; Notes now bundled in parachute-surface. Slot reclaimable; see [`parachute-notes/DEPRECATED.md`](https://github.com/ParachuteComputer/parachute-notes/blob/main/DEPRECATED.md))* |
+| 1941 | *unassigned (released when parachute-agent retired)* |
+| 1942 | parachute-notes *(archived, reservation retained)* |
 | 1943 | parachute-scribe   |
-| 1944 | *parachute-agent-legacy (the Claude-in-containers module retired 2026-05-20; slot held — NOT the 1941 agent module, which is the renamed channel)* |
-| 1945 | parachute-runner *(shipped; exploration-tier, not committed-core)* |
+| 1944 | parachute-app |
+| 1945 | *unassigned (CLI fallback)* |
 | 1946 | parachute-surface *(committed core; UI host — bundles Notes, hosts custom surfaces)* |
 | 1947–1949 | *unassigned (CLI fallback range)* |
 
 The hub pins 1939 — no fallback. If something else is on 1939 when you run `parachute expose`, the command fails with a pointer to `lsof -iTCP:1939` rather than walking up into another service's slot.
 
-**The CLI is the port authority.** `parachute install <svc>` picks the port at install time and writes `PORT=<port>` into `~/.parachute/<svc>/.env`; lifecycle.start merges that .env into the spawn env so the next daemon boot binds the port the CLI assigned. The algorithm:
+**The CLI is the port authority.** `parachute install <svc>` selects the service port and persists it in `~/.parachute/services.json`. On supervised boot, that manifest entry is authoritative: the hub injects its port into the child environment and ignores a stale per-module `.env` `PORT`. The algorithm:
 
 1. Prefer the canonical slot (e.g. vault → 1940).
-2. On collision, walk the unassigned range (1947–1949).
+2. On collision, walk the unassigned canonical range starting at 1941.
 3. Range exhausted: assign past 1949 with a warning.
 
-Idempotent: an existing `PORT=` in `~/.parachute/<svc>/.env` wins, so re-installs and operator-edited ports survive across upgrades. Services keep their compiled-in fallbacks (vault → 1940 etc.) so a stand-alone `bun run` still works without a CLI-managed .env.
+The resulting `services.json` entry is authoritative for supervised starts. Services retain compiled-in defaults for stand-alone execution without a Hub-managed manifest.
 
 `parachute expose` probes every service's port at bringup. A service that isn't responding still gets exposed, but you get a `⚠ parachute-<svc> (port …) is not responding` line so proxied requests never silently 502 without explanation.
 

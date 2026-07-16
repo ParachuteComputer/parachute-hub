@@ -250,15 +250,11 @@ describe("GET /api/modules", () => {
     // The core tier leads, in the recommended install order (vault → scribe),
     // ahead of every experimental module, which lead the deprecated ones.
     expect(shorts.indexOf("vault")).toBeLessThan(shorts.indexOf("scribe"));
-    expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("agent"));
-    // agent (experimental) sorts ahead of notes (deprecated).
-    expect(shorts.indexOf("agent")).toBeLessThan(shorts.indexOf("notes"));
-    // Every known module is discoverable — vault/scribe/surface (core),
-    // agent (experimental), notes (deprecated). runner is gone (2026-07-01
-    // registry removal) — a fresh box never sees it.
-    for (const s of ["vault", "scribe", "surface", "agent", "notes"]) {
+    expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("notes"));
+    for (const s of ["vault", "scribe", "surface", "app", "notes"]) {
       expect(shorts).toContain(s);
     }
+    expect(shorts).not.toContain("agent");
     expect(shorts).not.toContain("runner");
     expect(shorts).not.toContain("parachute-runner");
     // Focus tier resolves from the default map.
@@ -266,7 +262,8 @@ describe("GET /api/modules", () => {
     expect(byShort.get("vault")?.focus).toBe("core");
     expect(byShort.get("scribe")?.focus).toBe("core");
     expect(byShort.get("surface")?.focus).toBe("core");
-    expect(byShort.get("agent")?.focus).toBe("experimental");
+    expect(byShort.get("app")?.focus).toBe("core");
+    expect(byShort.get("agent")).toBeUndefined();
     expect(byShort.get("notes")?.focus).toBe("deprecated");
     // `available` stays true for every known module (re-installable), but the
     // fresh-install OFFER (`available_to_install`) drops the deprecated tier —
@@ -275,7 +272,7 @@ describe("GET /api/modules", () => {
     expect(byShort.get("vault")?.available_to_install).toBe(true);
     expect(byShort.get("scribe")?.available_to_install).toBe(true);
     expect(byShort.get("surface")?.available_to_install).toBe(true);
-    expect(byShort.get("agent")?.available_to_install).toBe(true);
+    expect(byShort.get("app")?.available_to_install).toBe(true);
     expect(byShort.get("notes")?.available_to_install).toBe(false);
     expect(body.modules.every((m) => !m.installed)).toBe(true);
     expect(body.modules.every((m) => m.latest_version === "0.9.9")).toBe(true);
@@ -369,13 +366,7 @@ describe("GET /api/modules", () => {
     expect(scribe?.available).toBe(true);
   });
 
-  test("agent (running + self-registered) appears as installed + experimental — regression for the channel-not-installed bug", async () => {
-    // THE bug this PR fixes (2026-06-09 modular-UI architecture, P2): agent (renamed from channel 2026-06-17)
-    // was running, proxied, supervised, and self-registered in services.json
-    // yet invisible on the Modules screen — because the old CURATED_MODULES =
-    // ["vault","scribe"] whitelist gated discovery. Now discovery is driven by
-    // self-registration ∪ the known registries, so a self-registered agent
-    // row surfaces as installed, in the experimental tier, with its run-state.
+  test("retired Agent rows do not surface in the module catalog", async () => {
     writeManifest(h.manifestPath, [
       {
         name: "parachute-agent",
@@ -385,32 +376,16 @@ describe("GET /api/modules", () => {
         version: "0.3.1",
       },
     ]);
-    const { supervisor } = makeIdleSupervisor();
-    await supervisor.start({ short: "agent", cmd: ["parachute-agent"] });
-
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
     const res = await handleApiModules(getReq({ authorization: `Bearer ${bearer}` }), {
       db: h.db,
       issuer: ISSUER,
       manifestPath: h.manifestPath,
-      supervisor,
       fetchLatestVersion: async () => null,
     });
-    const body = (await res.json()) as {
-      modules: Array<{
-        short: string;
-        focus: "core" | "experimental";
-        installed: boolean;
-        installed_version: string | null;
-        supervisor_status: string | null;
-      }>;
-    };
-    const agent = body.modules.find((m) => m.short === "agent");
-    expect(agent).toBeDefined();
-    expect(agent?.installed).toBe(true);
-    expect(agent?.installed_version).toBe("0.3.1");
-    expect(agent?.focus).toBe("experimental");
-    expect(agent?.supervisor_status).toBe("running");
+    const body = (await res.json()) as { modules: Array<{ short: string }> };
+    expect(body.modules.find((m) => m.short === "agent")).toBeUndefined();
+    expect(body.modules.find((m) => m.short === "parachute-agent")).toBeUndefined();
   });
 
   test("every self-registered + known module appears in `modules` — no running-but-invisible class", async () => {
@@ -834,20 +809,15 @@ describe("GET /api/modules", () => {
     expect(vault?.management_url).toBe("/vault/default/admin");
   });
 
-  test("populates config_ui_url from a module's configUiUrl (2026-06-09 modular-UI P3)", async () => {
-    // Agent declares `configUiUrl: "/agent/admin"` (a single-instance,
-    // origin-absolute path) + `uiUrl: "/agent/ui"`. The hub surfaces
-    // both: `config_ui_url` drives the Modules page Configure action,
-    // `management_url` drives Open. configUiUrl resolves identically to
-    // managementUrl (same B4 unified semantics).
+  test("populates config_ui_url from a third-party module manifest", async () => {
     writeManifest(h.manifestPath, [
       {
-        name: "agent",
-        port: 1941,
-        paths: ["/agent"],
+        name: "widgets",
+        port: 1947,
+        paths: ["/widgets"],
         health: "/health",
         version: "0.1.0",
-        installDir: "/install/dir/agent",
+        installDir: "/install/dir/widgets",
       },
     ]);
     const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
@@ -857,17 +827,17 @@ describe("GET /api/modules", () => {
       manifestPath: h.manifestPath,
       fetchLatestVersion: async () => null,
       readModuleManifest: async (installDir) => {
-        if (installDir === "/install/dir/agent") {
+        if (installDir === "/install/dir/widgets") {
           return {
-            name: "agent",
-            manifestName: "parachute-agent",
-            displayName: "Agent",
+            name: "widgets",
+            manifestName: "widgets",
+            displayName: "Widgets",
             tagline: "",
-            port: 1941,
-            paths: ["/agent"],
+            port: 1947,
+            paths: ["/widgets"],
             health: "/health",
-            uiUrl: "/agent/ui",
-            configUiUrl: "/agent/admin",
+            uiUrl: "/widgets/ui",
+            configUiUrl: "/widgets/admin",
           } as unknown as Awaited<
             ReturnType<typeof import("../module-manifest.ts").readModuleManifest>
           >;
@@ -883,11 +853,9 @@ describe("GET /api/modules", () => {
         management_url: string | null;
       }>;
     };
-    const agent = body.modules.find((m) => m.short === "agent");
-    // Origin-absolute — verbatim, never double-prepends `/agent`.
-    expect(agent?.config_ui_url).toBe("/agent/admin");
-    // uiUrl (no managementUrl) drives the Open action's management_url.
-    expect(agent?.management_url).toBe("/agent/ui");
+    const widgets = body.modules.find((m) => m.short === "widgets");
+    expect(widgets?.config_ui_url).toBe("/widgets/admin");
+    expect(widgets?.management_url).toBe("/widgets/ui");
   });
 
   test("config_ui_url is null when the module declares no configUiUrl", async () => {

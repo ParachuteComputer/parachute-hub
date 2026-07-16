@@ -1,6 +1,6 @@
 # @openparachute/scope-guard
 
-Hub-issued JWT validation for Parachute resource servers (vault, scribe, parachute-agent, third-party modules).
+Hub-issued JWT validation for Parachute resource servers (vault, scribe, surface, and third-party modules).
 
 The Parachute hub mints OAuth access tokens as RS256 JWTs and publishes its public keys at `/.well-known/jwks.json`. This library is the consumer-side mirror: every resource server uses the same verifier so the trust kernel doesn't drift between modules.
 
@@ -43,7 +43,7 @@ async function enforceAuth(req: Request, vaultName: string) {
 
 ## Design
 
-See [`parachute-hub/docs/design/2026-04-29-scope-guard-library.md`](https://github.com/ParachuteComputer/parachute-hub/blob/main/docs/design/2026-04-29-scope-guard-library.md) for full rationale, alternatives considered, and the migration sequence (vault → scribe → parachute-agent).
+See [`parachute-hub/docs/design/2026-04-29-scope-guard-library.md`](https://github.com/ParachuteComputer/parachute-hub/blob/main/docs/design/2026-04-29-scope-guard-library.md) for the original rationale, alternatives, and migration history.
 
 The lib lives as a sub-package of `parachute-hub` because the hub owns the JWT-issuance side and the scope vocabulary. It's published independently to npm as `@openparachute/scope-guard`.
 

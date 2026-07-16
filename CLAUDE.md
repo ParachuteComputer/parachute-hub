@@ -117,7 +117,7 @@ Every PR here is reviewer-gated — no direct-to-main, even for one-line fixes. 
 - Bin name: `parachute`
 - Config root: `~/.parachute/` (override with `PARACHUTE_HOME`)
 - Per-service dirs: `~/.parachute/<short>/` (e.g. `~/.parachute/vault/`)
-- Short names (map to `manifestName` via `SERVICE_SPECS`): `vault`, `notes`, `scribe`, `agent`. `agent` was renamed from `channel` 2026-06-17 (parachute-channel → parachute-agent); `channel` is a transition install alias for `agent` (one release cycle). `lens` is a transition alias for `notes` on `parachute install` (one release cycle, residue from the brief Notes→Lens→Notes round-trip on 2026-04-19/22); removed post-launch.
+- Active first-party short names: `vault`, `scribe`, and `surface`. `notes` remains a deprecated compatibility install. Historical `agent`, `channel`, `claw`, and `parachute-agent` identities are retired; old directories remain migration/archive inputs only. `lens` remains a transition alias for `notes` until the Notes compatibility path is removed.
 
 ## License
 

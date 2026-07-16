@@ -418,13 +418,9 @@ function oauthErrorRedirect(
  * Keyed on the SHORT name (resolved from each services.json row via
  * `shortNameForManifest`) rather than the raw manifest name so a row written
  * under a legacy manifest name still counts as installed — e.g. an un-upgraded
- * `parachute-channel` row aliases to short `agent` (channel→agent rename
- * 2026-06-17), so `agent:send` is still correctly advertised until the daemon
- * re-registers under `parachute-agent`.
  */
 const OPTIONAL_MODULE_SCOPES: ReadonlyArray<readonly [prefix: string, short: string]> = [
   ["scribe:", "scribe"],
-  ["agent:", "agent"],
   ["surface:", "surface"],
 ];
 
@@ -1903,13 +1899,7 @@ export async function handleApproveClientPost(
     // Headers logged are non-sensitive (Origin/Referer/Host are public);
     // the bound set is hub's own configuration. Body content not logged.
     console.warn(
-      `[oauth] approve POST same-origin check failed. headers: ` +
-        `origin=${JSON.stringify(req.headers.get("origin"))} ` +
-        `referer=${JSON.stringify(req.headers.get("referer"))} ` +
-        `host=${JSON.stringify(req.headers.get("host"))} ` +
-        `xff-host=${JSON.stringify(req.headers.get("x-forwarded-host"))} ` +
-        `xff-proto=${JSON.stringify(req.headers.get("x-forwarded-proto"))}. ` +
-        `bound origins: ${JSON.stringify(bound)}`,
+      `[oauth] approve POST same-origin check failed. headers: origin=${JSON.stringify(req.headers.get("origin"))} referer=${JSON.stringify(req.headers.get("referer"))} host=${JSON.stringify(req.headers.get("host"))} xff-host=${JSON.stringify(req.headers.get("x-forwarded-host"))} xff-proto=${JSON.stringify(req.headers.get("x-forwarded-proto"))}. bound origins: ${JSON.stringify(bound)}`,
     );
     return htmlError(
       "Cross-origin request rejected",

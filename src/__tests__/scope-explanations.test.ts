@@ -19,7 +19,6 @@ describe("SCOPE_EXPLANATIONS", () => {
       "vault:admin",
       "scribe:transcribe",
       "scribe:admin",
-      "agent:send",
       "hub:admin",
       "parachute:host:admin",
       // Account scopes (Parachute App campaign, Phase 2).
@@ -187,7 +186,6 @@ describe("isRequestableScope", () => {
   test("true for non-admin first-party scopes", () => {
     expect(isRequestableScope("vault:read")).toBe(true);
     expect(isRequestableScope("vault:admin")).toBe(true);
-    expect(isRequestableScope("agent:send")).toBe(true);
     expect(isRequestableScope("scribe:transcribe")).toBe(true);
   });
 

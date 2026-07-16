@@ -66,7 +66,7 @@ describe("mintOperatorToken", () => {
     }
   });
 
-  test("admin scope-set includes hub:admin + parachute:host:* + vault/scribe/agent admins (#213)", () => {
+  test("admin scope-set includes hub:admin + parachute:host:* + vault/scribe admin scopes (#213)", () => {
     // OPERATOR_TOKEN_SCOPES === OPERATOR_TOKEN_SCOPE_SETS.admin (back-compat
     // alias). The pre-#213 set was 5 scopes; #213 added the fine-grained
     // parachute:host:install/start/expose/auth/vault scopes to the admin
@@ -81,7 +81,6 @@ describe("mintOperatorToken", () => {
       "parachute:host:vault",
       "vault:admin",
       "scribe:admin",
-      "agent:send",
     ]);
   });
 });

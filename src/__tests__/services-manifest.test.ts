@@ -404,9 +404,9 @@ describe("services-manifest", () => {
             slug: {
               displayName: "S",
               path: "/app/s",
-              // biome-ignore lint/suspicious/noExplicitAny: deliberately
-              // writing the pre-F legacy alias to pin the normalization
-              // boundary; the schema accepts it on read.
+              // Deliberately write the pre-F legacy alias to pin the
+              // normalization boundary; the schema accepts it on read.
+              // biome-ignore lint/suspicious/noExplicitAny: legacy fixture value
               status: "pending-oauth" as any,
             },
           },
@@ -872,20 +872,7 @@ describe("services-manifest", () => {
   });
 });
 
-describe("claw → agent migration", () => {
-  // Paraclaw was renamed to parachute-agent across the ecosystem (npm
-  // package, mount path, short name). The migration was a transitional
-  // read-time rewrite that aliased legacy `name: "claw"` rows to
-  // `name: "agent"` so operators on the old shape kept routing.
-  //
-  // History: parachute-agent (the Claude-in-containers module) was retired
-  // 2026-05-20 (hub#334 added `agent` to RETIRED_MODULES), which briefly made
-  // this a one-step retirement path (claw → agent → GC'd). The 2026-06-17
-  // channel→agent rename RE-ASSIGNED `agent`/`parachute-agent` to the renamed
-  // channel module, so those names left RETIRED_MODULES — `agent` is a live
-  // module again. The claw → agent rewrite still runs; the migrated row now
-  // PERSISTS (it routes to the live agent module). The tests below assert the
-  // rewrite + the persistence.
+describe("historical Agent row retirement", () => {
   const claw: ServiceEntry = {
     name: "claw",
     port: 1944,
@@ -893,70 +880,37 @@ describe("claw → agent migration", () => {
     health: "/claw/health",
     version: "0.1.0",
   };
-  const agent: ServiceEntry = {
-    name: "agent",
-    port: 1944,
-    paths: ["/agent"],
-    health: "/agent/health",
-    version: "0.1.0",
-  };
 
-  test("rewrites name + paths + health when both name=claw and paths[0]=/claw", () => {
+  test("strict reads retire the structural claw row immediately and persist the cleanup", () => {
     const { path, cleanup } = makeTempPath();
     try {
       writeFileSync(path, `${JSON.stringify({ services: [claw] }, null, 2)}\n`);
-      const got = readManifest(path);
-      // Migration ran in this read (claw → agent on raw entries), then
-      // the row was rewritten to disk. Post the 2026-06-17 channel→agent
-      // rename, `agent` is once again a LIVE module (the renamed channel
-      // module), so it is NO LONGER GC'd by RETIRED_MODULES — the migrated
-      // row persists and routes to the live agent module's mount.
-      expect(got.services).toEqual([agent]);
-      const reread = JSON.parse(readFileSync(path, "utf8")) as {
-        services: ServiceEntry[];
+      expect(readManifest(path).services).toEqual([]);
+      const persisted = JSON.parse(readFileSync(path, "utf8")) as { services: ServiceEntry[] };
+      expect(persisted.services).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("lenient hot-path reads also hide structural claw and bare channel rows", () => {
+    const { path, cleanup } = makeTempPath();
+    try {
+      const channel: ServiceEntry = {
+        name: "channel",
+        port: 1941,
+        paths: ["/channel"],
+        health: "/channel/health",
+        version: "0.1.0",
       };
-      expect(reread.services[0]?.name).toBe("agent");
-      expect(reread.services[0]?.paths).toEqual(["/agent"]);
-      expect(reread.services[0]?.health).toBe("/agent/health");
+      writeFileSync(path, `${JSON.stringify({ services: [claw, channel] }, null, 2)}\n`);
+      expect(readManifestLenient(path, { warn: () => {} }).services).toEqual([]);
     } finally {
       cleanup();
     }
   });
 
-  test("the migrated agent row PERSISTS on the next read (agent is live again post-rename)", () => {
-    // Pre-rename this was a one-step retirement path (claw → agent → GC'd).
-    // After the channel→agent rename (2026-06-17) `agent`/`parachute-agent`
-    // are re-assigned to the live module, so the row is NOT dropped — a
-    // stale paraclaw row now ends up pointing at the live agent module
-    // (harmless / arguably correct, since paraclaw was the original "agent").
-    const { path, cleanup } = makeTempPath();
-    try {
-      writeFileSync(path, `${JSON.stringify({ services: [claw] }, null, 2)}\n`);
-      const first = readManifest(path);
-      expect(first.services).toEqual([agent]);
-      const second = readManifest(path);
-      expect(second.services).toEqual([agent]);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("an already-agent entry round-trips unchanged (agent live again post-rename)", () => {
-    // Pre-hub#334 this verified the migration was idempotent; hub#334 made it
-    // GC the agent row (agent was retired). After the channel→agent rename
-    // (2026-06-17) agent is live again, so the row round-trips unchanged —
-    // back to the original idempotent behavior.
-    const { path, cleanup } = makeTempPath();
-    try {
-      writeFileSync(path, `${JSON.stringify({ services: [agent] }, null, 2)}\n`);
-      const got = readManifest(path);
-      expect(got.services).toEqual([agent]);
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("mixed manifest: vault and scribe are untouched, only claw migrates", () => {
+  test("mixed manifests retain supported rows while dropping historical Agent shapes", () => {
     const { path, cleanup } = makeTempPath();
     try {
       const scribe: ServiceEntry = {
@@ -967,38 +921,13 @@ describe("claw → agent migration", () => {
         version: "0.1.0",
       };
       writeFileSync(path, `${JSON.stringify({ services: [vault, claw, scribe] }, null, 2)}\n`);
-      const got = readManifest(path);
-      // First read: claw migrates to agent (retired GC didn't see `claw`
-      // on the way in). Vault + scribe round-trip unchanged.
-      expect(got.services).toHaveLength(3);
-      expect(got.services[0]).toEqual(vault);
-      expect(got.services[1]).toEqual(agent);
-      expect(got.services[2]).toEqual(scribe);
+      expect(readManifest(path).services).toEqual([vault, scribe]);
     } finally {
       cleanup();
     }
   });
 
-  test("preserves nested /claw paths when present (e.g. /claw/api)", () => {
-    const { path, cleanup } = makeTempPath();
-    try {
-      const clawNested: ServiceEntry = {
-        name: "claw",
-        port: 1944,
-        paths: ["/claw", "/claw/api"],
-        health: "/claw/api/health",
-        version: "0.1.0",
-      };
-      writeFileSync(path, `${JSON.stringify({ services: [clawNested] }, null, 2)}\n`);
-      const got = readManifest(path);
-      expect(got.services[0]?.paths).toEqual(["/agent", "/agent/api"]);
-      expect(got.services[0]?.health).toBe("/agent/api/health");
-    } finally {
-      cleanup();
-    }
-  });
-
-  test("leaves a row alone if name is claw but mount is something else (deliberate third-party reuse)", () => {
+  test("leaves a row alone if name is claw but mount is something else", () => {
     const { path, cleanup } = makeTempPath();
     try {
       const oddClaw: ServiceEntry = {
@@ -1010,6 +939,7 @@ describe("claw → agent migration", () => {
       };
       writeFileSync(path, `${JSON.stringify({ services: [oddClaw] }, null, 2)}\n`);
       expect(readManifest(path).services).toEqual([oddClaw]);
+      expect(readManifestLenient(path, { warn: () => {} }).services).toEqual([oddClaw]);
     } finally {
       cleanup();
     }

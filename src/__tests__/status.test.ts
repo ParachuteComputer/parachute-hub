@@ -225,11 +225,6 @@ describe("status — per-module URL deep-links (manifestRowBase / urlForEntry)",
     expect(out).toMatch(/:5173\/notes/);
   });
 
-  test("channel row prints port + /channel mount", async () => {
-    const out = await urlFor("parachute-channel", 1943, ["/channel"]);
-    expect(out).toMatch(/:1943\/channel/);
-  });
-
   test("unknown third-party service falls back to bare host:port + paths[0]", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {

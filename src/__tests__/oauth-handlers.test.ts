@@ -122,8 +122,7 @@ describe("authorizationServerMetadata", () => {
     // hub:admin + scribe:admin are operator-only (non-requestable) — never advertised (2026-06-30)
     expect(scopesSupported).not.toContain("hub:admin");
     expect(scopesSupported).not.toContain("scribe:admin");
-    // agent isn't in the fixture manifest → its scopes aren't advertised
-    // (hub#…: optional-module scopes only surface when the module is installed).
+    // Retired Agent scopes are no longer part of the first-party catalog.
     expect(scopesSupported).not.toContain("agent:send");
   });
 
@@ -164,7 +163,7 @@ describe("authorizationServerMetadata", () => {
     const body = (await res.json()) as Record<string, unknown>;
     const scopesSupported = body.scopes_supported as string[];
     // Third-party scopes show up (`widget:*` / `mymodule:*` aren't gated
-    // optional-module prefixes — only scribe:/agent: are, see OPTIONAL_MODULE_SCOPES).
+    // optional-module prefixes — only scribe:/surface: are, see OPTIONAL_MODULE_SCOPES).
     expect(scopesSupported).toContain("widget:read");
     expect(scopesSupported).toContain("widget:write");
     expect(scopesSupported).toContain("mymodule:do-thing");
@@ -178,10 +177,10 @@ describe("authorizationServerMetadata", () => {
   });
 
   test("advertises an optional module's scopes only when it's installed", async () => {
-    // FIRST_PARTY_SCOPES carries scribe:* + agent:send statically. On a
+    // FIRST_PARTY_SCOPES carries scribe:* statically. On a
     // vault-only hub they must NOT be advertised — a discovery client (e.g.
     // claude.ai's connector UI) lists the catalog verbatim, so a friend
-    // connecting one vault was shown Scribe + Agent access the hub can't
+    // connecting one vault was shown Scribe access the hub can't
     // honor. Vault + hub are core and always advertised.
     const declared = new Set<string>([
       "vault:read",
@@ -189,7 +188,6 @@ describe("authorizationServerMetadata", () => {
       "vault:admin",
       "scribe:transcribe",
       "scribe:admin",
-      "agent:send",
       "hub:admin",
     ]);
     const vaultOnly = {
@@ -217,7 +215,6 @@ describe("authorizationServerMetadata", () => {
     // uninstalled optional-module scopes are dropped
     expect(scopes).not.toContain("scribe:transcribe");
     expect(scopes).not.toContain("scribe:admin");
-    expect(scopes).not.toContain("agent:send");
 
     // ...but once scribe is installed, its scopes ARE advertised again.
     const withScribe = {
@@ -249,7 +246,6 @@ describe("authorizationServerMetadata", () => {
     // requestability gate (non-requestable, 2026-06-30) doing the work here, not
     // the optional-module-not-installed gate that drops scribe:transcribe above.
     expect(scopes2).not.toContain("scribe:admin");
-    expect(scopes2).not.toContain("agent:send"); // agent still not installed
   });
 });
 

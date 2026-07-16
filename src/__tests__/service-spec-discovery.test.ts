@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   FIRST_PARTY_FALLBACKS,
   KNOWN_MODULES,
+  PORT_RESERVATIONS,
+  RETIRED_MODULES,
   discoverableShorts,
   findServiceByShort,
   focusForShort,
@@ -25,20 +27,18 @@ describe("discoverableShorts", () => {
     expect(shorts.length).toBe(new Set(shorts).size);
   });
 
-  test("includes agent (the module the whitelist used to hide) + the core set", () => {
+  test("includes the supported module set and excludes retired Agent", () => {
     const shorts = discoverableShorts();
-    for (const s of ["vault", "scribe", "surface", "agent", "notes"]) {
+    for (const s of ["vault", "scribe", "surface", "app", "notes"]) {
       expect(shorts).toContain(s);
     }
+    expect(shorts).not.toContain("agent");
   });
 
   test("FIRST_PARTY_FALLBACKS shorts lead KNOWN_MODULES shorts (registry order)", () => {
     const shorts = discoverableShorts();
-    // notes (the remaining FALLBACK — agent moved to KNOWN_MODULES in
-    // boundary D3) appears before vault (KNOWN_MODULES) in the union.
+    // notes (a FALLBACK) appears before vault (KNOWN_MODULES) in the union.
     expect(shorts.indexOf("notes")).toBeLessThan(shorts.indexOf("vault"));
-    // agent rides in KNOWN_MODULES now but is still discoverable.
-    expect(shorts).toContain("agent");
   });
 });
 
@@ -106,9 +106,30 @@ describe("runner registry removal (2026-07-01)", () => {
   });
 });
 
+describe("Agent module retirement (2026-07-15)", () => {
+  test("is no longer known, discoverable, or resolvable", () => {
+    expect(isKnownModuleShort("agent")).toBe(false);
+    expect(discoverableShorts()).not.toContain("agent");
+    expect("agent" in KNOWN_MODULES).toBe(false);
+    expect(shortNameForManifest("parachute-agent")).toBeUndefined();
+    expect(shortNameForManifest("parachute-channel")).toBeUndefined();
+  });
+
+  test("retires every historical row name and releases port 1941", () => {
+    expect(RETIRED_MODULES.agent).toBeDefined();
+    expect(RETIRED_MODULES["parachute-agent"]).toBeDefined();
+    expect(RETIRED_MODULES["parachute-channel"]).toBeDefined();
+    expect(PORT_RESERVATIONS.find((entry) => entry.port === 1941)).toEqual({
+      port: 1941,
+      name: "unassigned",
+      status: "reserved",
+    });
+  });
+});
+
 describe("isKnownModuleShort", () => {
   test("true for every known module (the install/config gate)", () => {
-    for (const s of ["vault", "scribe", "surface", "agent", "notes"]) {
+    for (const s of ["vault", "scribe", "surface", "app", "notes"]) {
       expect(isKnownModuleShort(s)).toBe(true);
     }
   });
@@ -119,12 +140,6 @@ describe("isKnownModuleShort", () => {
   });
 });
 
-// Regression: services.json rows carry the MANIFEST name (`parachute-agent`),
-// not the bare short (`agent`). The connection/channels wiring used to do
-// `services.find((s) => s.name === "agent")`, which never matched the on-disk
-// row → agentOrigin null → a spurious "agent module is not installed" when
-// linking a vault-backed channel. findServiceByShort resolves through the
-// short↔manifest map so the lookup hits the real row.
 describe("findServiceByShort", () => {
   const services = [
     { name: "parachute-vault-default", port: 1940 },
@@ -132,29 +147,9 @@ describe("findServiceByShort", () => {
     { name: "parachute-scribe", port: 1943 },
   ];
 
-  test("matches a row by its manifest name via the short↔manifest map", () => {
-    const found = findServiceByShort(services, "agent");
-    expect(found?.name).toBe("parachute-agent");
-    expect(found?.port).toBe(1941);
-  });
-
-  test("the naive `name === short` comparison would have missed it (the bug)", () => {
-    // The exact pre-fix predicate: a bare short never matches a manifest-named row.
-    expect(services.find((s) => s.name === "agent")).toBeUndefined();
-    // The fix finds it.
-    expect(findServiceByShort(services, "agent")).toBeDefined();
-  });
-
-  test("resolves a legacy parachute-channel row to short `agent` (rename back-compat)", () => {
-    // Un-upgraded operators carry a `parachute-channel` row; the
-    // LEGACY_MANIFEST_ALIASES fallback keeps it routing to the agent module
-    // until the daemon re-registers under `parachute-agent`.
-    const legacy = [{ name: "parachute-channel", port: 1941 }];
-    expect(findServiceByShort(legacy, "agent")?.port).toBe(1941);
-  });
-
-  test("resolves scribe too, and returns undefined for an absent module", () => {
+  test("resolves supported modules and not retired Agent rows", () => {
     expect(findServiceByShort(services, "scribe")?.port).toBe(1943);
+    expect(findServiceByShort(services, "agent")).toBeUndefined();
     expect(findServiceByShort(services, "runner")).toBeUndefined();
   });
 });

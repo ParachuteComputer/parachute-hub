@@ -21,7 +21,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { handleAgentToken } from "../admin-agent-token.ts";
+
 import { handleHostAdminToken } from "../admin-host-admin-token.ts";
 import {
   DEFAULT_ADMIN_LOCK_IDLE_SECONDS,
@@ -239,10 +239,10 @@ describe("recordLoginUnlock", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The cascade: a locked session refuses ALL four admin-token mints.
+// The cascade: a locked session refuses every admin-token mint.
 // ---------------------------------------------------------------------------
 
-describe("lock cascade through the four admin-token mints", () => {
+describe("lock cascade through the admin-token mints", () => {
   test("host-admin-token: 200 when no PIN, 423 when locked, 200 after unlock", async () => {
     const { cookie, sessionId } = await withAdmin();
     rotateSigningKey(harness.db);
@@ -260,17 +260,6 @@ describe("lock cascade through the four admin-token mints", () => {
     // Unlock → 200.
     recordUnlock(sessionId, getIdleSeconds(harness.db));
     expect((await handleHostAdminToken(mk(), { db: harness.db, issuer: ISSUER })).status).toBe(200);
-  });
-
-  test("agent-token cascades (423 when locked)", async () => {
-    const { cookie } = await withAdmin();
-    rotateSigningKey(harness.db);
-    await setPin(harness.db, "4827");
-    const res = await handleAgentToken(
-      new Request(`${ISSUER}/admin/agent-token`, { headers: { cookie } }),
-      { db: harness.db, issuer: ISSUER },
-    );
-    expect(res.status).toBe(423);
   });
 
   test("vault-admin-token cascades (423 when locked)", async () => {

@@ -106,7 +106,11 @@ export function safelistEntries(): Set<string> {
  * list once enough operator cycles have passed to be confident no
  * install is still on the Lens-era code path.
  */
-export const KNOWN_ARCHIVABLE_DIRS: ReadonlySet<string> = new Set<string>(["lens"]);
+export const KNOWN_ARCHIVABLE_DIRS: ReadonlySet<string> = new Set<string>([
+  "lens",
+  "agent",
+  "channel",
+]);
 
 /**
  * Known-cruft rules. Each rule names a label (the friendly description in

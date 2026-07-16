@@ -36,6 +36,7 @@ import {
   type FirstPartyFallback,
   KNOWN_MODULES,
   type KnownModule,
+  RETIRED_MODULES,
   type ServiceSpec,
   composeServiceSpec,
   isCanonicalPort,
@@ -129,15 +130,9 @@ export function resolveInstallChannel(opts: {
  * launch sinks in and `parachute install lens` has stopped appearing
  * in support threads.
  *
- * `channel → agent` (2026-06-17): parachute-channel was renamed to
- * parachute-agent. `parachute install channel` keeps resolving to the
- * agent module for one release cycle so operators mid-upgrade aren't
- * stranded. Remove alongside the `parachute-channel → agent` legacy
- * manifest alias in service-spec.ts.
  */
 const SERVICE_ALIASES: Record<string, string> = {
   lens: "notes",
-  channel: "agent",
 };
 
 /**
@@ -148,13 +143,40 @@ const SERVICE_ALIASES: Record<string, string> = {
  * real, non-Parachute package on npm). Install refuses with the message
  * instead.
  */
+const AGENT_RETIRED_MESSAGE =
+  "parachute-agent was retired from the hub on 2026-07-15. " +
+  "Parachute product development is focused on Vault and Surface.";
+
 const RETIRED_INSTALL_SHORTS: Record<string, string> = {
+  agent: AGENT_RETIRED_MESSAGE,
+  channel:
+    "parachute-channel (later parachute-agent) was retired from the hub on 2026-07-15. " +
+    "Parachute product development is focused on Vault and Surface.",
   runner:
     "parachute-runner was retired from the hub's module registry on 2026-07-01 " +
-    "(the module set of record is vault, hub, agent, scribe, surface). " +
+    "(the module set of record is vault, hub, scribe, surface, app). " +
     "An existing install keeps running under `parachute serve`; to install it anyway, " +
     "pass the explicit npm package name (@openparachute/runner) or a local checkout path.",
 };
+
+const RETIRED_AGENT_PACKAGES = [
+  "@openparachute/agent",
+  "@openparachute/parachute-agent",
+  "@openparachute/channel",
+  "@openparachute/parachute-channel",
+] as const;
+
+function isRetiredAgentPackage(packageName: string): boolean {
+  return RETIRED_AGENT_PACKAGES.some(
+    (retired) => packageName === retired || packageName.startsWith(`${retired}@`),
+  );
+}
+
+function isRetiredAgentManifest(manifest: ModuleManifest): boolean {
+  if (RETIRED_MODULES[manifest.name] !== undefined) return true;
+  if (manifest.manifestName && RETIRED_MODULES[manifest.manifestName] !== undefined) return true;
+  return manifest.name === "claw" && manifest.paths[0] === "/claw";
+}
 
 export interface InstallOpts {
   runner?: Runner;
@@ -747,12 +769,20 @@ function resolveInstallTarget(
       log(`✗ ${input} has no readable package.json — can't install as a Parachute module.`);
       return null;
     }
+    if (isRetiredAgentPackage(packageName)) {
+      log(`✗ ${AGENT_RETIRED_MESSAGE}`);
+      return null;
+    }
     return { kind: "local-path", absPath: input, packageName };
   }
 
   // Anything else is treated as an npm package (bare or @scope/name). The
   // module.json contract gates this — third-party packages without a
   // manifest fail post-install with a clear error, not silently.
+  if (isRetiredAgentPackage(input)) {
+    log(`✗ ${AGENT_RETIRED_MESSAGE}`);
+    return null;
+  }
   return { kind: "npm", packageName: input };
 }
 
@@ -975,6 +1005,10 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     log,
   });
   if (installedManifest === "error") return 1;
+  if (installedManifest && isRetiredAgentManifest(installedManifest)) {
+    log(`✗ ${target.packageName}: ${AGENT_RETIRED_MESSAGE}`);
+    return 1;
+  }
 
   let manifest: ModuleManifest;
   let extras: FirstPartyExtras | undefined;
@@ -982,7 +1016,7 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
     manifest = installedManifest ?? target.fallback.manifest;
     extras = target.fallback.extras;
   } else if (target.kind === "known-module") {
-    // KNOWN_MODULES shorts (vault / scribe / agent / surface) carry no vendored
+    // KNOWN_MODULES shorts (vault / scribe / surface) carry no vendored
     // manifest (hub#310). The module's own `.parachute/module.json` is the
     // canonical source. When it's unreadable (legacy installs from before
     // module.json shipped, or test fixtures that mock the disk path without
