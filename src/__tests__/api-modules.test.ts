@@ -175,6 +175,18 @@ describe("GET /api/modules", () => {
     expect(body.error).toBe("insufficient_scope");
   });
 
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer", async () => {
+    const bearer = await mintBearer(h, [API_MODULES_REQUIRED_SCOPE]);
+    const res = await handleApiModules(getReq({ authorization: `bearer ${bearer}` }), {
+      db: h.db,
+      issuer: ISSUER,
+      manifestPath: h.manifestPath,
+      fetchLatestVersion: async () => null,
+    });
+    expect(res.status).toBe(200);
+  });
+
   // hub#516: `parachute status` reads /api/modules on loopback presenting the
   // operator token, whose `iss` is the PUBLIC origin after `expose`. The
   // host-admin bearer's iss is validated against `knownIssuers` (loopback ∪
@@ -1464,6 +1476,18 @@ describe("PUT /api/modules/channel — hub#275 channel toggle", () => {
       issuer: ISSUER,
     });
     expect(res.status).toBe(401);
+  });
+
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer", async () => {
+    const bearer = await mintBearer(h, [API_MODULES_CHANNEL_REQUIRED_SCOPE]);
+    const res = await handleApiModulesChannel(
+      putReq({ channel: "rc" }, { authorization: `bearer ${bearer}` }),
+      { db: h.db, issuer: ISSUER },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { channel: string };
+    expect(body.channel).toBe("rc");
   });
 
   test("403 on bearer without parachute:host:admin", async () => {

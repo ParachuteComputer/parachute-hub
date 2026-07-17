@@ -376,7 +376,8 @@ export async function fetchModuleStates(deps: DriveModuleOpDeps): Promise<Module
   try {
     res = await doFetch(`${baseUrl}/api/modules`, {
       method: "GET",
-      // `/api/modules` parses the scheme-cased `Bearer ` prefix; match it exactly.
+      // `/api/modules` parses the Bearer scheme case-insensitively (RFC 7235,
+      // V1.4/C1.3 parity); we still emit the canonical `Bearer ` prefix.
       headers: { authorization: `Bearer ${bearer}` },
       // Bound the read so a wedged hub handler degrades `status` rather than
       // hanging it. AbortSignal.timeout fires `AbortError` once the ceiling

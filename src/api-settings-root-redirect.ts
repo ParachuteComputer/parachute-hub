@@ -119,7 +119,8 @@ export async function handleApiSettingsRootRedirect(
   // Bearer presence + parsing — identical shape to api-settings-hub-origin
   // for consistency across hub-internal admin endpoints.
   const auth = req.headers.get("authorization");
-  if (!auth || !auth.startsWith("Bearer ")) {
+  // Bearer scheme is case-insensitive per RFC 7235; token passed verbatim (V1.4/C1.3 parity).
+  if (!auth || !/^Bearer\s+/i.test(auth)) {
     return jsonError(401, "unauthenticated", "Authorization: Bearer <token> required");
   }
   const bearer = auth.slice("Bearer ".length).trim();

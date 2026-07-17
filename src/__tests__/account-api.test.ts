@@ -3,7 +3,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkAccountDescriptor, validateVaultScopes } from "@openparachute/door-contract";
+import {
+  ACCOUNT_ERROR_CODES,
+  checkAccountDescriptor,
+  checkVaultTokenMintResponse,
+  validateVaultScopes,
+} from "@openparachute/door-contract";
 import {
   handleAccountCapabilities,
   handleAccountCreateVault,
@@ -376,6 +381,13 @@ describe("account API — auth gates", () => {
     try {
       const res = await handleAccountListVaults(withBearer("/account/vaults", null), deps(h));
       expect(res.status).toBe(401);
+      // H1.3 — pin the CURRENT shape: auth-gate failures on /account/* emit
+      // {error, error_description} (door-contract account-contract.ts:244-246),
+      // via the shared `adminAuthErrorResponse` translator.
+      const body = (await res.json()) as { error: string; error_description: string };
+      expect(body.error).toBe("invalid_token");
+      expect(typeof body.error_description).toBe("string");
+      expect(ACCOUNT_ERROR_CODES as readonly string[]).toContain(body.error);
     } finally {
       h.cleanup();
     }
@@ -387,6 +399,10 @@ describe("account API — auth gates", () => {
       const token = await bearer(h, ["vault:beta:read"]);
       const res = await handleAccountListVaults(withBearer("/account/vaults", token), deps(h));
       expect(res.status).toBe(403);
+      const body = (await res.json()) as { error: string; error_description: string };
+      expect(body.error).toBe("insufficient_scope");
+      expect(typeof body.error_description).toBe("string");
+      expect(ACCOUNT_ERROR_CODES as readonly string[]).toContain(body.error);
     } finally {
       h.cleanup();
     }
@@ -594,6 +610,10 @@ describe("handleAccountMintVaultToken", () => {
       };
       expect(body.vault_token.length).toBeGreaterThan(0);
       expect(body.services["vault:field-notes"]?.url).toBe(`${ISSUER}/vault/field-notes`);
+      // H1.2 — door-contract conformance against the live
+      // `POST /account/vaults/<name>/token` success body (V1.4/C1.4 twin
+      // coverage, hub half).
+      expect(checkVaultTokenMintResponse(body, "field-notes")).toEqual([]);
       const validated = await validateAccessToken(h.db, body.vault_token, ISSUER);
       expect(validated.payload.aud).toBe("vault.field-notes");
       expect(validated.payload.scope).toBe("vault:field-notes:read vault:field-notes:write");
@@ -632,7 +652,14 @@ describe("handleAccountMintVaultToken", () => {
         deps(h),
       );
       expect(res.status).toBe(404);
-      expect(((await res.json()) as { error: string }).error).toBe("vault_not_found");
+      const body = (await res.json()) as { error: string; message: string };
+      expect(body.error).toBe("vault_not_found");
+      // H1.3 — pin the CURRENT shape: resource-level failures on /account/*
+      // emit {error, message} (door-contract account-contract.ts:244-246) —
+      // distinct from the auth-gate's {error, error_description} above.
+      expect(typeof body.message).toBe("string");
+      expect(body.message.length).toBeGreaterThan(0);
+      expect(ACCOUNT_ERROR_CODES as readonly string[]).toContain(body.error);
     } finally {
       h.cleanup();
     }

@@ -195,6 +195,18 @@ describe("GET /api/settings/root-redirect", () => {
     expect(body).toEqual({ root_redirect: null, resolved: "/admin", source: "default" });
   });
 
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer", async () => {
+    const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);
+    const res = await handleApiSettingsRootRedirect(
+      getReq({ authorization: `bearer ${bearer}` }),
+      deps(h),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toEqual({ root_redirect: null, resolved: "/admin", source: "default" });
+  });
+
   test("reflects a stored value with source=db", async () => {
     setRootRedirect(h.db, "/surface/reading-room");
     const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);

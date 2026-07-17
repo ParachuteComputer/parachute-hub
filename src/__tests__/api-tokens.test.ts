@@ -139,6 +139,50 @@ describe("GET /api/auth/tokens (admin token list — Phase 2 backend)", () => {
     }
   });
 
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const resp = await handleApiTokens(
+          getRequest("", { authorization: `bearer ${op.token}` }),
+          {
+            db,
+            issuer: ISSUER,
+          },
+        );
+        expect(resp.status).toBe(200);
+        const body = (await resp.json()) as { tokens: unknown[] };
+        expect(body.tokens).toHaveLength(1);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("mixed-case bearer scheme (BeArEr) authenticates identically to canonical Bearer", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const resp = await handleApiTokens(
+          getRequest("", { authorization: `BeArEr ${op.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(200);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("happy path: empty registry returns empty array", async () => {
     const h = makeHarness();
     try {

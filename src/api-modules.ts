@@ -462,7 +462,8 @@ export async function handleApiModules(req: Request, deps: ApiModulesDeps): Prom
 
   // Bearer presence + parsing.
   const auth = req.headers.get("authorization");
-  if (!auth || !auth.startsWith("Bearer ")) {
+  // Bearer scheme is case-insensitive per RFC 7235; token passed verbatim (V1.4/C1.3 parity).
+  if (!auth || !/^Bearer\s+/i.test(auth)) {
     return jsonError(401, "unauthenticated", "Authorization: Bearer <token> required");
   }
   const bearer = auth.slice("Bearer ".length).trim();
@@ -780,7 +781,8 @@ export async function handleApiModulesChannel(
 
   // Bearer presence + parsing.
   const auth = req.headers.get("authorization");
-  if (!auth || !auth.startsWith("Bearer ")) {
+  // Bearer scheme is case-insensitive per RFC 7235; token passed verbatim (V1.4/C1.3 parity).
+  if (!auth || !/^Bearer\s+/i.test(auth)) {
     return jsonError(401, "unauthenticated", "Authorization: Bearer <token> required");
   }
   const bearer = auth.slice("Bearer ".length).trim();
