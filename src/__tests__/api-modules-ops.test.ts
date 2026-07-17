@@ -300,6 +300,29 @@ describe("POST /api/modules/:short/install", () => {
     expect(body.error_description).toContain("parachute:host:admin");
   });
 
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer", async () => {
+    const { supervisor } = makeIdleSupervisor();
+    const { run } = alwaysOkRun();
+    const bearer = await mintBearer(h, [API_MODULES_OPS_REQUIRED_SCOPE]);
+    const res = await handleInstall(
+      postReq("/api/modules/vault/install", { authorization: `bearer ${bearer}` }),
+      "vault",
+      {
+        db: h.db,
+        issuer: ISSUER,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        supervisor,
+        run,
+        isLinked: TEST_DEFAULT_NOT_LINKED,
+      },
+    );
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { operation_id: string };
+    expect(body.operation_id).toBeDefined();
+  });
+
   test("202 + operation_id, runs bun add + seeds services.json + spawns", async () => {
     const { supervisor, spawns } = makeIdleSupervisor();
     const { run, calls } = alwaysOkRun();

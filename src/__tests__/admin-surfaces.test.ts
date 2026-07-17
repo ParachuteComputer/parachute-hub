@@ -151,6 +151,27 @@ describe("routeAdminSurfaces — register + list", () => {
     }
   });
 
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer", async () => {
+    const h = await makeHarness();
+    try {
+      const token = await mint(h, ["parachute:host:admin"]);
+      const res = await routeAdminSurfaces(
+        req(
+          "POST",
+          { authorization: `bearer ${token}`, "content-type": "application/json" },
+          { name: "brain", mount: "/surface/brain", mode: "prod" },
+        ),
+        deps(h),
+      );
+      expect(res?.status).toBe(200);
+      const body = (await res?.json()) as { ok: boolean };
+      expect(body.ok).toBe(true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("POST with a missing name → 400", async () => {
     const h = await makeHarness();
     try {

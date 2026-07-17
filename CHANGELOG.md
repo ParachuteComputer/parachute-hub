@@ -6,6 +6,19 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.7-rc.12] - 2026-07-17
+
+Contracts-brief H1 (cross-door contract-parity program, hub wave) — distinct from campaign #116's "H1" (merged #746). Bearer scheme-casing unification + the hub half of the door-contract live conformance suite + a shape-inconsistency catalog.
+
+### Changed
+
+- **Bearer scheme is now case-insensitive at every remaining hub call site** (RFC 7235 §2.1 — the auth-scheme token is case-insensitive; the token itself is passed verbatim, never case-folded). Converts the last 12 case-sensitive `startsWith("Bearer ")` sites (`api-hub-upgrade.ts`, `api-tokens.ts`, `api-revoke-token.ts`, `api-settings-root-redirect.ts`, `api-modules.ts` ×2, `api-modules-ops.ts`, `api-mint-token.ts`, `api-settings-hub-origin.ts`, `admin-surfaces.ts`, `admin-connections.ts` ×2, `audience-gate.ts`) to a case-insensitive `/^Bearer\s+/i` scheme test, keeping each site's existing extraction/error flow otherwise byte-identical — parity with parachute-vault's V1.4 and parachute-cloud's C1.3, which made the same change on their doors. `module-ops-client.ts`'s stale comment (claiming receivers parse the scheme-cased prefix) is corrected. The hub already had a documented case-insensitive helper (`extractBearerToken`, `admin-auth.ts`) for a subset of routes; this closes the gap on the rest.
+
+### Added
+
+- **Door-contract live-handler conformance — hub half of X1.** Wires 5 more of `@openparachute/door-contract`'s conformance checkers to REAL hub handler responses (joining the 2 already wired): `checkTokenResponseInvariants` against a live `POST /oauth/token` success body, `checkAuthorizationServerMetadata` against the live `/.well-known/oauth-authorization-server` handler, `checkProtectedResourceMetadata` against the live `/.well-known/oauth-protected-resource` handler (RFC 9728 — the hub DOES serve this, closes hub#393), `checkAccountTokenMintResponse` against the live `POST /account/token` handler, and `checkVaultTokenMintResponse` against the live `POST /account/vaults/<name>/token` handler. All 7 checkers in the package are now wired on the hub side — none deferred.
+- **`/account/*` error-shape contract pinned (not changed).** Representative tests across `account-token.ts`, `account-session.ts`, and `account-api.ts` pin the CURRENT wire shape: auth-gate failures emit `{error, error_description}`, resource-level failures emit `{error, message}`, and emitted error codes are checked against door-contract's `ACCOUNT_ERROR_CODES` union. A handful of shape inconsistencies were found and deliberately left unpinned/unfixed — see the PR body's decisions-needed section (`account-token.ts`'s 405 vs `account-session.ts`'s 405 disagree on shape; `account-token.ts`'s `not_admin` code isn't yet in the shared vocabulary; `api-revocation-list.ts` emits `{error}` alone).
+
 ## [0.7.7-rc.10] - 2026-07-11
 
 ### Added

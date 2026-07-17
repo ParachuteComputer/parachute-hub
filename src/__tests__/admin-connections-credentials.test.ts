@@ -556,6 +556,26 @@ describe("credential connection — renewal (proof of possession)", () => {
     expect(rec.provisioned.mintedJtis).toEqual([out.credential.jti!]);
   });
 
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer", async () => {
+    const { fetchImpl, calls } = mockFetch({ "POST /api/credential": () => ok({ ok: true }) });
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const cred = await provision(deps, calls);
+
+    const res = await handleConnections(
+      new Request(`http://127.0.0.1/admin/connections/${cred.connection_id}/renew`, {
+        method: "POST",
+        headers: { authorization: `bearer ${cred.token}` },
+      }),
+      `/${cred.connection_id}/renew`,
+      deps,
+    );
+    expect(res.status).toBe(200);
+    const out = (await res.json()) as { ok: boolean; credential: DeliveredCredential };
+    expect(out.ok).toBe(true);
+    expect(out.credential.op).toBe("renewed");
+  });
+
   test("renewed credential can renew again (the chain extends)", async () => {
     const { fetchImpl, calls } = mockFetch({ "POST /api/credential": () => ok({ ok: true }) });
     const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
@@ -939,6 +959,27 @@ describe("credential connection — claim/reconcile (surface#113)", () => {
     expect(readConnections(harness.storePath)[0]!.provisioned.mintedJtis).toEqual([
       out.credential.jti!,
     ]);
+  });
+
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("claim: mixed-case bearer scheme (BeArEr) authenticates identically to canonical Bearer", async () => {
+    const { fetchImpl } = mockFetch({});
+    const deps = credDeps(fetchImpl, modulesOf(SURFACE_MANIFEST));
+    const direct = await mintDirectDelivered({ vault: "default", verb: "read", tags: ["boulder"] });
+
+    const claim = await handleConnections(
+      new Request(`http://127.0.0.1/admin/connections/${CLAIM_ID}/claim`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `BeArEr ${direct.token}` },
+        body: JSON.stringify(SURFACE_CLAIM),
+      }),
+      `/${CLAIM_ID}/claim`,
+      deps,
+    );
+    expect(claim.status).toBe(202);
+    const claimBody = (await claim.json()) as { ok: boolean; status: string };
+    expect(claimBody.ok).toBe(true);
+    expect(claimBody.status).toBe("pending");
   });
 
   test("the live docs shape: an UNTAGGED write credential is claimable verbatim (create's write-requires-tags guards NEW grants; the operator's approve sanctions the existing shape)", async () => {

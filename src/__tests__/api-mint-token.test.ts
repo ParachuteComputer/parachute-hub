@@ -172,6 +172,31 @@ describe("POST /api/auth/mint-token (hub#212 Phase 1)", () => {
     }
   });
 
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const resp = await handleApiMintToken(
+          jsonRequest(
+            { scope: "scribe:transcribe", expires_in: 3600 },
+            { authorization: `bearer ${op.token}` },
+          ),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(200);
+        const body = (await resp.json()) as { scope: string };
+        expect(body.scope).toBe("scribe:transcribe");
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   // hub#516 parity — the live "mint refused" after `parachute hub set-origin`.
   // An operator/agent credential minted under a PRIOR origin (still a member of
   // the hub's bound-origin set) must keep minting after the canonical issuer

@@ -235,7 +235,8 @@ export async function gateUiAudience(
   if (session) return null;
 
   const auth = req.headers.get("authorization");
-  if (auth?.startsWith("Bearer ")) {
+  // Bearer scheme is case-insensitive per RFC 7235; token passed verbatim (V1.4/C1.3 parity).
+  if (auth && /^Bearer\s+/i.test(auth)) {
     const token = auth.slice("Bearer ".length).trim();
     try {
       const validated = await validateHostAdminToken(db, token, [...deps.knownIssuers()]);

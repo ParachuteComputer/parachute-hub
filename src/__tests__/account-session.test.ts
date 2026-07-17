@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkAccountSessionResponse } from "@openparachute/door-contract";
+import { ACCOUNT_ERROR_CODES, checkAccountSessionResponse } from "@openparachute/door-contract";
 import { handleAccountSession } from "../account-session.ts";
 import { CSRF_COOKIE_NAME, buildCsrfCookie, generateCsrfToken, parseCsrfCookie } from "../csrf.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
@@ -227,6 +227,14 @@ describe("handleAccountSession — method + headers", () => {
     const res = handleAccountSession(getReq(undefined, "POST"), { db: harness.db });
     expect(res.status).toBe(405);
     expect(res.headers.get("allow")).toBe("GET");
+    // H1.3 — pin the CURRENT shape: resource-level failures on /account/*
+    // emit {error, message} (door-contract account-contract.ts:244-246). This
+    // is account-session.ts's own `methodNotAllowed`, distinct from
+    // account-token.ts's {error, error_description} 405 (see H1.1/H1.3 PR
+    // notes — a decisions-needed inconsistency, not fixed here).
+    const body = (await res.json()) as { error: string; message: string };
+    expect(body).toEqual({ error: "method_not_allowed", message: "use GET" });
+    expect(ACCOUNT_ERROR_CODES as readonly string[]).toContain(body.error);
   });
 
   test("cache-control: no-store on the 200 path", async () => {

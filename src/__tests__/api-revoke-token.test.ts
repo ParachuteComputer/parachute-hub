@@ -263,6 +263,29 @@ describe("POST /api/auth/revoke-token (closes hub#220)", () => {
     }
   });
 
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer", async () => {
+    const h = makeHarness();
+    try {
+      const { db, userId } = await bootstrap(h.dir);
+      try {
+        const op = await mintOperatorToken(db, userId, { issuer: ISSUER });
+        const jti = await seedToken(db, userId);
+        const resp = await handleApiRevokeToken(
+          jsonRequest({ jti }, { authorization: `bearer ${op.token}` }),
+          { db, issuer: ISSUER },
+        );
+        expect(resp.status).toBe(200);
+        const body = (await resp.json()) as { jti: string };
+        expect(body.jti).toBe(jti);
+      } finally {
+        db.close();
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
   test("idempotent: re-revoking returns 200 with the original revoked_at", async () => {
     const h = makeHarness();
     try {

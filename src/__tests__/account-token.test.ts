@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ACCOUNT_ERROR_CODES, checkAccountTokenMintResponse } from "@openparachute/door-contract";
 // The `/account/*` validator (H2 / cloud) hand-rolls its scope check via
 // scope-guard's hasScope — hub never imports scope-guard at runtime (the
 // issuer/validator boundary), but the test asserts the RS-side inheritance
@@ -118,6 +119,14 @@ describe("handleAccountToken", () => {
     const req = new Request(`${ISSUER}/account/token`, { headers: { cookie } });
     const res = await handleAccountToken(req, { db: harness.db, issuer: ISSUER });
     expect(res.status).toBe(405);
+    // H1.3 — pin the CURRENT shape: account-token.ts emits {error,
+    // error_description} uniformly (its own local `jsonError`), including for
+    // this 405 — DIFFERENT from account-session.ts's 405, which emits {error,
+    // message} (see that file's test). A decisions-needed inconsistency
+    // across /account/*, not fixed here.
+    const body = (await res.json()) as { error: string; error_description: string };
+    expect(body).toEqual({ error: "method_not_allowed", error_description: "use POST" });
+    expect(ACCOUNT_ERROR_CODES as readonly string[]).toContain(body.error);
   });
 
   test("401 when no session cookie is present (unauthenticated → refused)", async () => {
@@ -126,8 +135,13 @@ describe("handleAccountToken", () => {
     const req = postReq("", { [CSRF_FIELD_NAME]: "anything" });
     const res = await handleAccountToken(req, { db: harness.db, issuer: ISSUER });
     expect(res.status).toBe(401);
-    const body = (await res.json()) as { error: string };
+    const body = (await res.json()) as { error: string; error_description: string };
     expect(body.error).toBe("unauthenticated");
+    // H1.3 — pin the CURRENT shape: auth-gate failures on /account/* emit
+    // {error, error_description} (door-contract account-contract.ts:244-246).
+    expect(typeof body.error_description).toBe("string");
+    expect(body.error_description.length).toBeGreaterThan(0);
+    expect(ACCOUNT_ERROR_CODES as readonly string[]).toContain(body.error);
   });
 
   test("401 when the cookie names a deleted session", async () => {
@@ -146,8 +160,11 @@ describe("handleAccountToken", () => {
     rotateSigningKey(harness.db);
     const res = await handleAccountToken(postReq(cookie, {}), { db: harness.db, issuer: ISSUER });
     expect(res.status).toBe(403);
-    const body = (await res.json()) as { error: string };
+    const body = (await res.json()) as { error: string; error_description: string };
     expect(body.error).toBe("csrf_failed");
+    // H1.3 — pin the {error, error_description} shape + ACCOUNT_ERROR_CODES membership.
+    expect(typeof body.error_description).toBe("string");
+    expect(ACCOUNT_ERROR_CODES as readonly string[]).toContain(body.error);
   });
 
   test("403 csrf_failed when the body token doesn't match the cookie token", async () => {
@@ -176,6 +193,10 @@ describe("handleAccountToken", () => {
     const body = (await res.json()) as { error: string; error_description: string };
     expect(body.error).toBe("not_admin");
     expect(body.error_description).toContain("/account/");
+    // H1.3 — DECISIONS-NEEDED (cataloged, not fixed here): "not_admin" is a
+    // real emitted /account/* error code but is NOT a member of door-contract's
+    // ACCOUNT_ERROR_CODES union — a gap in the shared vocabulary. See the PR
+    // body's decisions-needed section rather than asserting membership here.
   });
 
   test("200 mints the account superset with aud=account, validating against the hub keys", async () => {
@@ -201,6 +222,9 @@ describe("handleAccountToken", () => {
       "parachute:host:auth",
     ]);
     expect(body.aud).toBe(ACCOUNT_TOKEN_AUDIENCE);
+    // H1.2 — door-contract conformance against the live `POST /account/token`
+    // success body (V1.4/C1.4 twin coverage, hub half).
+    expect(checkAccountTokenMintResponse(body)).toEqual([]);
 
     // TTL is roughly the 10-min window.
     const skew = new Date(body.expires_at).getTime() - Date.now();

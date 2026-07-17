@@ -258,6 +258,18 @@ describe("GET /api/settings/hub-origin", () => {
     expect(body.resolved_issuer).toBe("http://localhost"); // request origin from getReq()
   });
 
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer", async () => {
+    const bearer = await mintBearer(h, [API_SETTINGS_HUB_ORIGIN_REQUIRED_SCOPE]);
+    const res = await handleApiSettingsHubOrigin(
+      getReq({ authorization: `bearer ${bearer}` }),
+      deps(h),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { hub_origin: string | null };
+    expect(body.hub_origin).toBeNull();
+  });
+
   test("returns env source + env-resolved issuer when configuredIssuer is set", async () => {
     const bearer = await mintBearer(h, [API_SETTINGS_HUB_ORIGIN_REQUIRED_SCOPE]);
     const res = await handleApiSettingsHubOrigin(getReq({ authorization: `Bearer ${bearer}` }), {

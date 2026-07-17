@@ -3,6 +3,11 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  checkAuthorizationServerMetadata,
+  checkProtectedResourceMetadata,
+  checkTokenResponseInvariants,
+} from "@openparachute/door-contract";
 import { handleAdminLoginPost, handleAdminLoginTotpPost } from "../admin-handlers.ts";
 import { approveClient, getClient, registerClient } from "../clients.ts";
 import { CSRF_COOKIE_NAME } from "../csrf.ts";
@@ -124,6 +129,10 @@ describe("authorizationServerMetadata", () => {
     expect(scopesSupported).not.toContain("scribe:admin");
     // Retired Agent scopes are no longer part of the first-party catalog.
     expect(scopesSupported).not.toContain("agent:send");
+    // H1.2 — door-contract conformance: the static RFC 8414 fields (endpoints,
+    // response/grant types, PKCE method, token-auth methods) match the shared
+    // contract exactly (V1.4/C1.4 twin coverage, hub half).
+    expect(checkAuthorizationServerMetadata(body, ISSUER, scopesSupported)).toEqual([]);
   });
 
   test("does NOT advertise non-requestable operator-only scopes", async () => {
@@ -261,6 +270,8 @@ describe("protectedResourceMetadata (RFC 9728, closes hub#393)", () => {
     expect(body.resource).toBe(ISSUER);
     expect(body.authorization_servers).toEqual([ISSUER]);
     expect(body.bearer_methods_supported).toEqual(["header"]);
+    // H1.2 — door-contract conformance (V1.4/C1.4 twin coverage, hub half).
+    expect(checkProtectedResourceMetadata(body, ISSUER)).toEqual([]);
     expect(Array.isArray(body.scopes_supported)).toBe(true);
     expect(body.resource_documentation).toMatch(/parachute\.computer/);
   });
@@ -2316,6 +2327,10 @@ describe("handleToken — full OAuth dance", () => {
       expect(tokenBody.token_type).toBe("Bearer");
       expect(tokenBody.scope).toBe("vault:default:read");
       expect(tokenBody.refresh_token.length).toBeGreaterThan(20);
+      // H1.2 — door-contract conformance: token_type/expires_in/scope/access_token
+      // invariants against a REAL `POST /oauth/token` success body (V1.4/C1.4 twin
+      // coverage, hub half).
+      expect(checkTokenResponseInvariants(tokenBody, "vault:default:read")).toEqual([]);
 
       // JWT must verify against the hub's signing keys, with the right sub +
       // aud (named `vault:default:read` → "vault.default" — RFC 8707-style

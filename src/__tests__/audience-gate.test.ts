@@ -217,6 +217,30 @@ describe("audience gate matrix (H3)", () => {
     }
   });
 
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("audience: hub-users — lowercase/mixed-case bearer scheme authenticates identically to canonical Bearer", async () => {
+    const upstream = startEchoUpstream();
+    try {
+      writeServices(surfaceEntry(upstream.port, { audience: "hub-users" }));
+      const f = fetcher();
+      const bearer = await mintBearer(["vault:default:read", "vault:default:write"]);
+
+      const lower = await f(
+        req("/surface/notes/x", { headers: { authorization: `bearer ${bearer}` } }),
+        fakeServer("127.0.0.1"),
+      );
+      expect(lower?.status).toBe(200);
+
+      const mixed = await f(
+        req("/surface/notes/x", { headers: { authorization: `BeArEr ${bearer}` } }),
+        fakeServer("127.0.0.1"),
+      );
+      expect(mixed?.status).toBe(200);
+    } finally {
+      upstream.stop();
+    }
+  });
+
   test("audience: hub-users — Bearer with NON-satisfying scopes → 403; garbage Bearer → 401", async () => {
     const upstream = startEchoUpstream();
     try {

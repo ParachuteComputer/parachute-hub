@@ -510,6 +510,17 @@ describe("GET /api/hub/upgrade/status", () => {
     const res = await handleHubUpgradeStatus(getStatusReq({}), deps);
     expect(res.status).toBe(401);
   });
+
+  // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
+  test("lowercase bearer scheme authenticates identically to canonical Bearer (404, not 401)", async () => {
+    const bearer = await mintBearer(harness, ["parachute:host:admin"]);
+    const { deps } = baseDeps(harness);
+    const res = await handleHubUpgradeStatus(
+      getStatusReq({ authorization: `bearer ${bearer}` }),
+      deps,
+    );
+    expect(res.status).toBe(404);
+  });
 });
 
 describe("detectHubUpgradeMode — §5.3 heuristic", () => {
