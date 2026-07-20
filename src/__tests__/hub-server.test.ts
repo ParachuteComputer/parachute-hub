@@ -6531,6 +6531,26 @@ describe("hubFetch — root_mode serve-app", () => {
     }
   });
 
+  test("a malformed percent-encoded asset path 404s (not 500) through the real dispatch", async () => {
+    const h = makeHarness();
+    const db = await setupCompleteDb(h);
+    try {
+      setRootMode(db, "serve-app");
+      const dist = makeAppDist(h.dir);
+      // `%ZZ` is an invalid escape — decodeURIComponent throws. Without the
+      // guard in serveAppAtRoot this escapes to the dispatch outer catch → 500.
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist,
+      })(req("/assets/%ZZ", { headers: { accept: "text/html" } }));
+      expect(res.status).toBe(404);
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
   test("app-not-installed falls back to the redirect (with resolveAppDist → null)", async () => {
     const h = makeHarness();
     const db = await setupCompleteDb(h);

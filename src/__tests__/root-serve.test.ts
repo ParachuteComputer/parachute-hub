@@ -99,6 +99,18 @@ describe("serveAppAtRoot", () => {
     rmSync(join(dist, "index.html"));
     expect(serveAppAtRoot(dist, get("/", "text/html"), "/")).toBeNull();
   });
+
+  test("malformed percent-encoding → null (no URIError thrown → branded 404, not 500)", () => {
+    // decodeURIComponent throws URIError on a bad escape; the guard must swallow
+    // it and fall through so the dispatch never 500s on a garbage asset URL.
+    for (const p of ["/assets/%ZZ", "/foo%", "/%E0%A4%A", "/bar%2"]) {
+      expect(() => serveAppAtRoot(dist, get(p, "*/*"), p)).not.toThrow();
+      expect(serveAppAtRoot(dist, get(p, "*/*"), p)).toBeNull();
+    }
+    // Even an HTML navigation with bad encoding falls through (redirect-mode
+    // parity) rather than shelling.
+    expect(serveAppAtRoot(dist, get("/foo%", "text/html"), "/foo%")).toBeNull();
+  });
 });
 
 describe("makeAppDistResolver", () => {

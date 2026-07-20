@@ -125,8 +125,20 @@ export function serveAppAtRoot(dist: string, req: Request, pathname: string): Re
   if (pathname === "/" || pathname.endsWith("/")) return spaShell();
 
   // An existing dist file: /assets/*, /icon.svg, /manifest.webmanifest, /sw.js …
+  // Malformed percent-encoding (e.g. `/foo%`, `/assets/%ZZ`) makes
+  // `decodeURIComponent` throw a URIError. Catch it and fall through to the
+  // branded 404 (redirect-mode parity) — WITHOUT the guard the throw escapes to
+  // the dispatch outer catch, which classifies a non-DB error as "other" and
+  // re-throws → a bare 500. This path is reachable pre-auth on a public expose,
+  // so a garbage-encoded asset URL must 404, never 500.
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
   // Path-traversal guard: the joined path must stay strictly under dist/.
-  const filePath = join(dist, decodeURIComponent(pathname));
+  const filePath = join(dist, decodedPath);
   if (filePath.startsWith(`${dist}/`) && existsSync(filePath) && statSync(filePath).isFile()) {
     const mime = mimeFor(filePath);
     return new Response(
