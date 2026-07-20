@@ -17,7 +17,7 @@ import {
   resolveClientIp,
   stripHopByHopHeaders,
 } from "../hub-server.ts";
-import { setNotesRedirectDisabled } from "../hub-settings.ts";
+import { setNotesRedirectDisabled, setRootMode } from "../hub-settings.ts";
 import { clearNotesRedirectLogState } from "../notes-redirect.ts";
 import { mintOperatorToken } from "../operator-token.ts";
 import { pidPath } from "../process-state.ts";
@@ -6414,6 +6414,270 @@ describe("hubFetch proxied-page security headers (hub#643 Tier-1)", () => {
       expect(body.ok).toBe(true);
     } finally {
       upstream.stop();
+      h.cleanup();
+    }
+  });
+});
+
+// root_mode = serve-app: the hub serves the installed app's dist AT `/`, with
+// the fresh-hub funnel + pre-admin 503 + every hub-owned route preempting it.
+describe("hubFetch — root_mode serve-app", () => {
+  // A fixture app dist (index.html + assets). Distinct marker text so a test can
+  // tell an app-served body from an admin-SPA / discovery body.
+  function makeAppDist(dir: string): string {
+    const dist = join(dir, "app-dist");
+    mkdirSync(join(dist, "assets"), { recursive: true });
+    writeFileSync(join(dist, "index.html"), "<!doctype html><title>PARACHUTE-APP-SHELL</title>");
+    writeFileSync(join(dist, "assets", "app-xyz.js"), "console.log('serve-app')");
+    writeFileSync(join(dist, "manifest.webmanifest"), '{"name":"Parachute"}');
+    return dist;
+  }
+
+  // A distinct admin-SPA fixture so `/admin` reachability is provable (its body
+  // must NOT be the app shell).
+  function makeAdminDist(dir: string): string {
+    const dist = join(dir, "admin-dist");
+    mkdirSync(dist, { recursive: true });
+    writeFileSync(join(dist, "index.html"), "<!doctype html><title>ADMIN-SPA</title>");
+    return dist;
+  }
+
+  // Seed admin + a vault so the fresh-hub wizard funnel is bypassed (the
+  // "setup complete" state where serve-app should actually engage).
+  async function setupCompleteDb(h: Harness): Promise<ReturnType<typeof openHubDb>> {
+    writeManifest({ services: [vaultEntry("default")] }, h.manifestPath);
+    const db = openHubDb(hubDbPath(h.dir));
+    await createUser(db, "owner", "pw");
+    return db;
+  }
+
+  test("serves the app index.html at `/` (200, text/html, no redirect, no chrome)", async () => {
+    const h = makeHarness();
+    const db = await setupCompleteDb(h);
+    try {
+      setRootMode(db, "serve-app");
+      const dist = makeAppDist(h.dir);
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist,
+      })(req("/"));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const body = await res.text();
+      expect(body).toContain("PARACHUTE-APP-SHELL");
+      // No identity chrome injected on the root-served app HTML.
+      expect(body).not.toContain('class="auth-indicator"');
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("serves an app asset from dist (/assets/*) with an inferred content-type", async () => {
+    const h = makeHarness();
+    const db = await setupCompleteDb(h);
+    try {
+      setRootMode(db, "serve-app");
+      const dist = makeAppDist(h.dir);
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist,
+      })(req("/assets/app-xyz.js", { headers: { accept: "*/*" } }));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type") ?? "").toMatch(/javascript/);
+      expect(await res.text()).toContain("serve-app");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("SPA-fallback: an unclaimed HTML deep link gets the app shell", async () => {
+    const h = makeHarness();
+    const db = await setupCompleteDb(h);
+    try {
+      setRootMode(db, "serve-app");
+      const dist = makeAppDist(h.dir);
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist,
+      })(req("/some/app/deep/link", { headers: { accept: "text/html" } }));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("PARACHUTE-APP-SHELL");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("a non-HTML unclaimed path keeps the branded 404 (not the app shell)", async () => {
+    const h = makeHarness();
+    const db = await setupCompleteDb(h);
+    try {
+      setRootMode(db, "serve-app");
+      const dist = makeAppDist(h.dir);
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist,
+      })(req("/definitely/not/a/file.json", { headers: { accept: "application/json" } }));
+      expect(res.status).toBe(404);
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("app-not-installed falls back to the redirect (with resolveAppDist → null)", async () => {
+    const h = makeHarness();
+    const db = await setupCompleteDb(h);
+    try {
+      setRootMode(db, "serve-app");
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => null, // app not installed
+      })(req("/"));
+      // Falls through to the redirect (default /admin).
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  // --- Precedence: the funnels + hub-owned routes preempt serve-app ---------
+
+  test("fresh-hub wizard funnel WINS over serve-app (no admin → `/` 302 /admin/setup)", async () => {
+    const h = makeHarness();
+    // NO admin user, NO vault → needsWizard. serve-app is set + app resolvable.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      setRootMode(db, "serve-app");
+      const dist = makeAppDist(h.dir);
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist,
+      })(req("/"));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin/setup");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("pre-admin 503 lockout WINS over serve-app (no admin → /api/* 503 setup_required)", async () => {
+    const h = makeHarness();
+    const db = openHubDb(hubDbPath(h.dir)); // no admin
+    try {
+      setRootMode(db, "serve-app");
+      const dist = makeAppDist(h.dir);
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist,
+      })(req("/api/hub"));
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { error?: string };
+      expect(body.error).toBe("setup_required");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("/admin stays reachable in serve-app mode (dispatched before the tail, not the app shell)", async () => {
+    const h = makeHarness();
+    const db = await setupCompleteDb(h);
+    try {
+      setRootMode(db, "serve-app");
+      const appDist = makeAppDist(h.dir);
+      const adminDist = makeAdminDist(h.dir);
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        spaDistDir: adminDist,
+        resolveAppDist: () => appDist,
+      })(req("/admin"));
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toContain("ADMIN-SPA");
+      expect(body).not.toContain("PARACHUTE-APP-SHELL");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("reserved /api|/oauth|/.well-known unclaimed paths keep the branded 404 (not the app shell)", async () => {
+    const h = makeHarness();
+    const db = await setupCompleteDb(h);
+    try {
+      setRootMode(db, "serve-app");
+      const dist = makeAppDist(h.dir);
+      const handler = hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist,
+      });
+      // A browser navigation (Accept: text/html) to an unmatched /api path must
+      // NOT be shelled — it keeps the branded 404 for the API namespace.
+      const res = await handler(req("/api/nonexistent", { headers: { accept: "text/html" } }));
+      expect(res.status).toBe(404);
+      expect(await res.text()).not.toContain("PARACHUTE-APP-SHELL");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  // --- Regression pin: redirect mode is byte-identical to before ------------
+
+  test("redirect mode (default) is inert even with resolveAppDist wired — `/` still 302s /admin", async () => {
+    const h = makeHarness();
+    const db = await setupCompleteDb(h); // no root_mode set → default redirect
+    try {
+      const dist = makeAppDist(h.dir);
+      const handler = hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist, // wired but must stay inert in redirect mode
+      });
+      const rootRes = await handler(req("/"));
+      expect(rootRes.status).toBe(302);
+      expect(rootRes.headers.get("location")).toBe("/admin");
+      // The 404 tail is unchanged too: an unclaimed HTML path is the branded
+      // 404 page, NOT the app shell.
+      const tailRes = await handler(req("/random/unclaimed", { headers: { accept: "text/html" } }));
+      expect(tailRes.status).toBe(404);
+      expect(await tailRes.text()).not.toContain("PARACHUTE-APP-SHELL");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+
+  test("a non-GET `/` in serve-app mode keeps its 302 (only GET serves the app)", async () => {
+    const h = makeHarness();
+    const db = await setupCompleteDb(h);
+    try {
+      setRootMode(db, "serve-app");
+      const dist = makeAppDist(h.dir);
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist,
+      })(req("/", { method: "POST" }));
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/admin");
+    } finally {
+      db.close();
       h.cleanup();
     }
   });

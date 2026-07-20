@@ -133,6 +133,25 @@ export type HubSettingKey =
   // not-yet-set-up hub still lands on setup, not a surface that can't work
   // yet.
   | "root_redirect"
+  // hub: how the hub answers its origin root. `"redirect"` (default / absent)
+  // is the historical behavior — the bare `/` 302s to `root_redirect` (a safe
+  // same-origin path, default `/admin`). `"serve-app"` makes the hub SERVE the
+  // installed Parachute app's built bundle AT the origin root (index.html at
+  // `/`, its assets from the same dist, SPA-fallback for HTML deep links) — the
+  // same front-door experience as the hosted door, no redirect hop. The app's
+  // build is root-based (absolute `/assets`, PWA scope `/`, root OAuth redirect
+  // URIs) so serving its dist verbatim at `/` is asset-correct with no rebuild.
+  //
+  // Precedence on each request (resolveRootMode): this row, then
+  // `PARACHUTE_HUB_ROOT_MODE` env, then the `"redirect"` default. DB-first (like
+  // `root_redirect`) so an operator can flip the front door from the admin SPA /
+  // CLI without a redeploy. When `serve-app` is set but the app isn't installed
+  // (its dist can't be resolved), the hub FALLS BACK to redirect behavior (using
+  // `root_redirect` → env → `/admin`) with a one-time log line — so an operator
+  // who set the mode before installing the app never sees a broken root. The
+  // fresh-hub wizard funnel + pre-admin 503 lockout still run BEFORE this, so a
+  // not-yet-set-up hub lands on setup, never a half-working app shell.
+  | "root_mode"
   // hub-parity P2 (Q2): the RAW token of the newest PUBLIC (multi-use,
   // `max_uses > 1`) invite — persisted so `GET /.well-known/parachute-account`
   // can advertise `signup_path` without being able to reconstruct it from the
@@ -616,4 +635,122 @@ export function resolveRootRedirect(
   opts: { env?: NodeJS.ProcessEnv; warn?: (msg: string) => void } = {},
 ): string {
   return resolveRootRedirectDetailed(db, opts).value;
+}
+
+// --- domain helpers: root mode (redirect vs serve the app at `/`) ---------
+
+/**
+ * How the hub answers its origin root.
+ *
+ *   - `"redirect"` — historical behavior: the bare `/` 302s to the resolved
+ *     `root_redirect` (default `/admin`). Every unclaimed path keeps the
+ *     branded 404.
+ *   - `"serve-app"` — the hub serves the installed Parachute app's built
+ *     bundle AT the origin root (index.html at `/`, its assets from the same
+ *     dist, SPA-fallback for HTML deep links), matching the hosted door's
+ *     front-door experience. Falls back to `redirect` when the app isn't
+ *     installed (dist unresolvable).
+ */
+export type RootMode = "redirect" | "serve-app";
+
+/** Exported so the API handler + the CLI can share validation. */
+export const ROOT_MODES: readonly RootMode[] = ["redirect", "serve-app"];
+
+export function isRootMode(s: unknown): s is RootMode {
+  return typeof s === "string" && ROOT_MODES.includes(s as RootMode);
+}
+
+/** Env override for the root mode. Below the DB row, above the default. */
+export const PARACHUTE_HUB_ROOT_MODE_ENV = "PARACHUTE_HUB_ROOT_MODE";
+
+/** Fallback when neither DB row nor env is set — historical redirect behavior. */
+export const DEFAULT_ROOT_MODE: RootMode = "redirect";
+
+/**
+ * Read the raw stored root mode from hub_settings (or `null` when absent),
+ * WITHOUT applying env / default precedence — mirrors `getRootRedirect`. The
+ * admin GET surfaces this raw value so the operator sees exactly what's stored.
+ */
+export function getRootMode(db: Database): RootMode | null {
+  const raw = getSetting(db, "root_mode");
+  if (raw === undefined) return null;
+  return isRootMode(raw) ? raw : null;
+}
+
+/**
+ * Write or clear the root mode. Passing `null` (or the `"redirect"` default)
+ * deletes the row, reverting to env / default precedence — the absent-row
+ * state IS the redirect default, so leaving an explicit `"redirect"` in the
+ * row would be a footgun if a future default flip ever made absence mean
+ * something else (mirrors `setRootRedirect` / `setHubOrigin` semantics). The
+ * caller must have validated via `isRootMode`; the typed signature enforces it
+ * at TypeScript-clean call sites.
+ */
+export function setRootMode(db: Database, mode: RootMode | null): void {
+  if (mode === null || mode === DEFAULT_ROOT_MODE) {
+    deleteSetting(db, "root_mode");
+    return;
+  }
+  setSetting(db, "root_mode", mode);
+}
+
+/** Which precedence layer the resolved mode came from. */
+export type RootModeSource = "db" | "env" | "default";
+
+export interface ResolvedRootMode {
+  /** The mode the origin root should apply. */
+  value: RootMode;
+  /** Which layer it came from (for admin-UI attribution + install set-if-unset). */
+  source: RootModeSource;
+}
+
+/**
+ * Resolve the root mode with source attribution.
+ *
+ * Precedence: hub_settings.root_mode → `PARACHUTE_HUB_ROOT_MODE` env →
+ * `"redirect"` default. An invalid value at any layer is warned + skipped so a
+ * hand-edited row / typo'd env can never wedge the root (worst case falls to
+ * the redirect default — today's behavior).
+ *
+ * `db` may be `null` (hub-server running without state) — the DB layer is then
+ * skipped and resolution starts from env. The `env` / `warn` knobs are test
+ * seams (production uses `process.env` + `console.warn`).
+ */
+export function resolveRootModeDetailed(
+  db: Database | null,
+  opts: { env?: NodeJS.ProcessEnv; warn?: (msg: string) => void } = {},
+): ResolvedRootMode {
+  const env = opts.env ?? process.env;
+  const warn = opts.warn ?? ((msg: string) => console.warn(msg));
+
+  // 1. DB row (operator-set via the admin PUT / `parachute hub set-root-mode`).
+  if (db) {
+    const fromDb = getSetting(db, "root_mode");
+    if (fromDb !== undefined) {
+      if (isRootMode(fromDb)) return { value: fromDb, source: "db" };
+      warn(
+        `[hub-settings] root_mode="${fromDb}" in hub_settings is not a valid mode (expected one of ${ROOT_MODES.join(", ")}) — ignoring (falling through to env/default).`,
+      );
+    }
+  }
+
+  // 2. Env override.
+  const fromEnv = env[PARACHUTE_HUB_ROOT_MODE_ENV];
+  if (typeof fromEnv === "string" && fromEnv.length > 0) {
+    if (isRootMode(fromEnv)) return { value: fromEnv, source: "env" };
+    warn(
+      `[hub-settings] ${PARACHUTE_HUB_ROOT_MODE_ENV}="${fromEnv}" is not a valid mode — falling back to "${DEFAULT_ROOT_MODE}".`,
+    );
+  }
+
+  // 3. Default — historical redirect behavior.
+  return { value: DEFAULT_ROOT_MODE, source: "default" };
+}
+
+/** Convenience: just the resolved mode (see `resolveRootModeDetailed`). */
+export function resolveRootMode(
+  db: Database | null,
+  opts: { env?: NodeJS.ProcessEnv; warn?: (msg: string) => void } = {},
+): RootMode {
+  return resolveRootModeDetailed(db, opts).value;
 }

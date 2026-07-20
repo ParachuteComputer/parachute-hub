@@ -18,10 +18,11 @@ import { join } from "node:path";
 import {
   API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE,
   handleApiSettingsRootRedirect,
+  validateRootMode,
   validateRootRedirect,
 } from "../api-settings-root-redirect.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { getRootRedirect, setRootRedirect } from "../hub-settings.ts";
+import { getRootMode, getRootRedirect, setRootMode, setRootRedirect } from "../hub-settings.ts";
 import { recordTokenMint, signAccessToken } from "../jwt-sign.ts";
 import { rotateSigningKey } from "../signing-keys.ts";
 import { createUser } from "../users.ts";
@@ -192,7 +193,14 @@ describe("GET /api/settings/root-redirect", () => {
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
-    expect(body).toEqual({ root_redirect: null, resolved: "/admin", source: "default" });
+    expect(body).toEqual({
+      root_redirect: null,
+      resolved: "/admin",
+      source: "default",
+      root_mode: null,
+      resolved_mode: "redirect",
+      mode_source: "default",
+    });
   });
 
   // H1.1 — Bearer scheme is case-insensitive per RFC 7235 (V1.4/C1.3 parity).
@@ -204,7 +212,14 @@ describe("GET /api/settings/root-redirect", () => {
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
-    expect(body).toEqual({ root_redirect: null, resolved: "/admin", source: "default" });
+    expect(body).toEqual({
+      root_redirect: null,
+      resolved: "/admin",
+      source: "default",
+      root_mode: null,
+      resolved_mode: "redirect",
+      mode_source: "default",
+    });
   });
 
   test("reflects a stored value with source=db", async () => {
@@ -219,6 +234,9 @@ describe("GET /api/settings/root-redirect", () => {
       root_redirect: "/surface/reading-room",
       resolved: "/surface/reading-room",
       source: "db",
+      root_mode: null,
+      resolved_mode: "redirect",
+      mode_source: "default",
     });
   });
 
@@ -233,6 +251,9 @@ describe("GET /api/settings/root-redirect", () => {
       root_redirect: null,
       resolved: "/surface/from-env",
       source: "env",
+      root_mode: null,
+      resolved_mode: "redirect",
+      mode_source: "default",
     });
   });
 });
@@ -251,7 +272,10 @@ describe("PUT /api/settings/root-redirect", () => {
       deps(h),
     );
     expect(put.status).toBe(200);
-    expect((await put.json()) as unknown).toEqual({ root_redirect: "/surface/reading-room" });
+    expect((await put.json()) as unknown).toEqual({
+      root_redirect: "/surface/reading-room",
+      root_mode: null,
+    });
     expect(getRootRedirect(h.db)).toBe("/surface/reading-room");
 
     const get = await handleApiSettingsRootRedirect(
@@ -294,7 +318,7 @@ describe("PUT /api/settings/root-redirect", () => {
     }
   });
 
-  test("400 on a body without a root_redirect field", async () => {
+  test("400 on a body with neither root_redirect nor root_mode", async () => {
     const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);
     const res = await handleApiSettingsRootRedirect(
       putReq({ wrong: "x" }, { authorization: `Bearer ${bearer}` }),
@@ -310,5 +334,124 @@ describe("PUT /api/settings/root-redirect", () => {
       deps(h),
     );
     expect(res.status).toBe(400);
+  });
+});
+
+describe("validateRootMode — pure validator", () => {
+  test("null + empty string → normalized null (clear)", () => {
+    expect(validateRootMode(null)).toEqual({ ok: true, normalized: null });
+    expect(validateRootMode("")).toEqual({ ok: true, normalized: null });
+  });
+
+  test("valid modes normalize verbatim", () => {
+    expect(validateRootMode("redirect")).toEqual({ ok: true, normalized: "redirect" });
+    expect(validateRootMode("serve-app")).toEqual({ ok: true, normalized: "serve-app" });
+  });
+
+  test("rejects unknown modes + non-strings", () => {
+    for (const bad of ["serveapp", "SERVE-APP", "app", 42, {}]) {
+      expect(validateRootMode(bad).ok).toBe(false);
+    }
+  });
+});
+
+describe("root_mode over the endpoint", () => {
+  let h: Harness;
+  beforeEach(async () => {
+    h = await makeHarness();
+  });
+  afterEach(() => h.cleanup());
+
+  test("GET reflects a stored serve-app mode with mode_source=db", async () => {
+    setRootMode(h.db, "serve-app");
+    const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);
+    const res = await handleApiSettingsRootRedirect(
+      getReq({ authorization: `Bearer ${bearer}` }),
+      deps(h),
+    );
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.root_mode).toBe("serve-app");
+    expect(body.resolved_mode).toBe("serve-app");
+    expect(body.mode_source).toBe("db");
+  });
+
+  test("GET surfaces an env-sourced mode while the stored row is null", async () => {
+    const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);
+    const res = await handleApiSettingsRootRedirect(
+      getReq({ authorization: `Bearer ${bearer}` }),
+      deps(h, { env: { PARACHUTE_HUB_ROOT_MODE: "serve-app" } }),
+    );
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.root_mode).toBeNull();
+    expect(body.resolved_mode).toBe("serve-app");
+    expect(body.mode_source).toBe("env");
+  });
+
+  test("PUT stores serve-app + GET reflects it on the next request (no restart)", async () => {
+    const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);
+    const put = await handleApiSettingsRootRedirect(
+      putReq({ root_mode: "serve-app" }, { authorization: `Bearer ${bearer}` }),
+      deps(h),
+    );
+    expect(put.status).toBe(200);
+    expect((await put.json()) as unknown).toEqual({ root_redirect: null, root_mode: "serve-app" });
+    expect(getRootMode(h.db)).toBe("serve-app");
+  });
+
+  test("PUT redirect / null clears the row back to the default", async () => {
+    setRootMode(h.db, "serve-app");
+    const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);
+    // Writing the default "redirect" deletes the row (footgun-guard parity).
+    const res = await handleApiSettingsRootRedirect(
+      putReq({ root_mode: "redirect" }, { authorization: `Bearer ${bearer}` }),
+      deps(h),
+    );
+    expect(res.status).toBe(200);
+    expect(getRootMode(h.db)).toBeNull();
+  });
+
+  test("PUT rejects an invalid mode with 400 + writes nothing", async () => {
+    const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);
+    const res = await handleApiSettingsRootRedirect(
+      putReq({ root_mode: "serveapp" }, { authorization: `Bearer ${bearer}` }),
+      deps(h),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe("invalid_root_mode");
+    expect(getRootMode(h.db)).toBeNull();
+  });
+
+  test("PUT applies both root_mode + root_redirect in one call", async () => {
+    const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);
+    const res = await handleApiSettingsRootRedirect(
+      putReq(
+        { root_mode: "serve-app", root_redirect: "/surface/fallback" },
+        { authorization: `Bearer ${bearer}` },
+      ),
+      deps(h),
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()) as unknown).toEqual({
+      root_redirect: "/surface/fallback",
+      root_mode: "serve-app",
+    });
+    expect(getRootMode(h.db)).toBe("serve-app");
+    expect(getRootRedirect(h.db)).toBe("/surface/fallback");
+  });
+
+  test("a rejected mode does NOT half-apply a valid redirect in the same call", async () => {
+    const bearer = await mintBearer(h, [API_SETTINGS_ROOT_REDIRECT_REQUIRED_SCOPE]);
+    const res = await handleApiSettingsRootRedirect(
+      putReq(
+        { root_mode: "bogus", root_redirect: "/surface/should-not-land" },
+        { authorization: `Bearer ${bearer}` },
+      ),
+      deps(h),
+    );
+    expect(res.status).toBe(400);
+    // Both-validated-before-either-applied: the redirect was NOT written.
+    expect(getRootRedirect(h.db)).toBeNull();
+    expect(getRootMode(h.db)).toBeNull();
   });
 });

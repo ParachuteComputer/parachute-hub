@@ -5,8 +5,11 @@ import { join } from "node:path";
 import { defaultStartLifecycleOpts, install } from "../commands/install.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
+  PARACHUTE_HUB_ROOT_MODE_ENV,
   PARACHUTE_HUB_ROOT_REDIRECT_ENV,
+  getRootMode,
   getRootRedirect,
+  setRootMode,
   setRootRedirect,
 } from "../hub-settings.ts";
 import { findService, upsertService } from "../services-manifest.ts";
@@ -2417,31 +2420,38 @@ describe("hub#573 — install auto-start converges on supervised detection", () 
   });
 });
 
-// hub-parity P5 (2026-07-11): `parachute install app` defaults the hub's
-// bare `/` redirect to the app's front door — SET-IF-UNSET ONLY. Every test
-// here injects `rootRedirectDb` (a hub.db opened in the same disposable
-// tempdir `makeTempPath()` already isolates) so no real
-// `~/.parachute/hub.db` is ever touched — never drive this against the
+// `parachute install app` defaults the hub's origin root to SERVE the app
+// (root_mode = serve-app) on first install — SET-IF-UNSET ONLY, and only when
+// the root behavior is entirely pristine default (no mode row/env AND no
+// redirect row/env). Supersedes the prior hub-parity P5 behavior (which wrote
+// root_redirect = /app/). Every test here injects `rootRedirectDb` (a hub.db
+// opened in the same disposable tempdir `makeTempPath()` already isolates) so no
+// real `~/.parachute/hub.db` is ever touched — never drive this against the
 // operator's live install.
-describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
-  // The write gates on `resolveRootRedirectDetailed(db).source === "default"`,
-  // which consults `PARACHUTE_HUB_ROOT_REDIRECT`. Neutralize any ambient value
-  // (Aaron's box, CI) so the default-tier tests are deterministic; the
-  // env-set test below manages its own value inside its own body.
-  let savedEnv: string | undefined;
+describe("app-only serve-app set-if-unset default", () => {
+  // The write gates on the RESOLVED mode + redirect being `default` (no DB row,
+  // no env). Neutralize any ambient PARACHUTE_HUB_ROOT_MODE / _REDIRECT (Aaron's
+  // box, CI) so the default-tier tests are deterministic; the env-set tests
+  // below manage their own values inside their own bodies.
+  let savedRedirectEnv: string | undefined;
+  let savedModeEnv: string | undefined;
   beforeEach(() => {
-    savedEnv = process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+    savedRedirectEnv = process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+    savedModeEnv = process.env[PARACHUTE_HUB_ROOT_MODE_ENV];
     delete process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
+    delete process.env[PARACHUTE_HUB_ROOT_MODE_ENV];
   });
   afterEach(() => {
-    if (savedEnv === undefined) {
-      delete process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
-    } else {
-      process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV] = savedEnv;
+    for (const [name, saved] of [
+      [PARACHUTE_HUB_ROOT_REDIRECT_ENV, savedRedirectEnv],
+      [PARACHUTE_HUB_ROOT_MODE_ENV, savedModeEnv],
+    ] as const) {
+      if (saved === undefined) delete process.env[name];
+      else process.env[name] = saved;
     }
   });
 
-  test("fresh install (no prior root_redirect) sets it to /app/", async () => {
+  test("fresh install (pristine root) flips root_mode to serve-app", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       const db = openHubDb(hubDbPath(configDir));
@@ -2458,8 +2468,10 @@ describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
           log: (l) => logs.push(l),
         });
         expect(code).toBe(0);
-        expect(getRootRedirect(db)).toBe("/app/");
-        expect(logs.join("\n")).toMatch(/front page.*now opens the app at \/app\//);
+        expect(getRootMode(db)).toBe("serve-app");
+        // The redirect row is NOT written — serve-app takes over `/` directly.
+        expect(getRootRedirect(db)).toBeNull();
+        expect(logs.join("\n")).toMatch(/front page.*now serves the Parachute app/);
       } finally {
         db.close();
       }
@@ -2468,7 +2480,7 @@ describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
     }
   });
 
-  test("a pre-set root_redirect is left alone — never clobbered", async () => {
+  test("a pre-set root_redirect is left alone — mode NOT flipped", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       const db = openHubDb(hubDbPath(configDir));
@@ -2486,13 +2498,10 @@ describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
           log: (l) => logs.push(l),
         });
         expect(code).toBe(0);
-        // The operator's prior choice survives byte-for-byte.
+        // The operator's prior choice survives byte-for-byte; no mode flip.
         expect(getRootRedirect(db)).toBe("/surface/reading-room");
-        // The set-if-unset write's OWN log line (distinct from the static
-        // postInstallFooter boilerplate, which always prints "now opens the
-        // app too, unless you've already..." regardless of whether the write
-        // fired) must NOT appear — the write itself was skipped.
-        expect(logs.join("\n")).not.toMatch(/now opens the app at \/app\//);
+        expect(getRootMode(db)).toBeNull();
+        expect(logs.join("\n")).not.toMatch(/now serves the Parachute app/);
       } finally {
         db.close();
       }
@@ -2501,7 +2510,40 @@ describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
     }
   });
 
-  test("installing a different module never touches root_redirect", async () => {
+  test("an existing install with the old /app/ redirect keeps redirecting (back-compat)", async () => {
+    // A hub that ran the PRIOR app-install code has root_redirect = /app/ in its
+    // DB (source = db → not default). Re-running `install app` must NOT flip it
+    // to serve-app — it keeps 302-ing to /app/, exactly as before. This is the
+    // "existing installs unchanged" guarantee.
+    const { path, configDir, cleanup } = makeTempPath();
+    try {
+      const db = openHubDb(hubDbPath(configDir));
+      const logs: string[] = [];
+      try {
+        setRootRedirect(db, "/app/");
+        const code = await install("app", {
+          runner: async () => 0,
+          manifestPath: path,
+          configDir,
+          startService: async () => 0,
+          isLinked: () => false,
+          portProbe: async () => false,
+          rootRedirectDb: db,
+          log: (l) => logs.push(l),
+        });
+        expect(code).toBe(0);
+        expect(getRootMode(db)).toBeNull();
+        expect(getRootRedirect(db)).toBe("/app/");
+        expect(logs.join("\n")).not.toMatch(/now serves the Parachute app/);
+      } finally {
+        db.close();
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("installing a different module never touches the root settings", async () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       const db = openHubDb(hubDbPath(configDir));
@@ -2518,6 +2560,7 @@ describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
         });
         expect(code).toBe(0);
         expect(getRootRedirect(db)).toBeNull();
+        expect(getRootMode(db)).toBeNull();
       } finally {
         db.close();
       }
@@ -2526,13 +2569,12 @@ describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
     }
   });
 
-  test("an ENV-configured redirect (no DB row) is left alone — never clobbered (N1)", async () => {
+  test("an ENV-configured redirect (no DB row) is left alone — no mode flip (N1)", async () => {
     // Container deploys pin the landing page via PARACHUTE_HUB_ROOT_REDIRECT,
-    // not a DB row. Gating on `getRootRedirect(db) === null` (DB only) would
-    // miss this and write `/app/`, which — since the DB row wins over env on
-    // read — silently overrides their configured landing. The fix gates on
-    // `resolveRootRedirectDetailed(db).source === "default"`, which sees the
-    // env tier. So: env set → no DB row written.
+    // not a DB row. Flipping to serve-app would silently override their
+    // configured landing (serve-app wins over redirect at `/`). The gate reads
+    // the RESOLVED redirect source; with the env set that's `env`, not
+    // `default`, so we leave it alone.
     const { path, configDir, cleanup } = makeTempPath();
     const prevEnv = process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
     try {
@@ -2551,9 +2593,10 @@ describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
           log: (l) => logs.push(l),
         });
         expect(code).toBe(0);
-        // No DB row written — the env-configured landing survives.
+        // No mode row written — the env-configured landing survives.
+        expect(getRootMode(db)).toBeNull();
         expect(getRootRedirect(db)).toBeNull();
-        expect(logs.join("\n")).not.toMatch(/now opens the app at \/app\//);
+        expect(logs.join("\n")).not.toMatch(/now serves the Parachute app/);
       } finally {
         db.close();
       }
@@ -2562,6 +2605,43 @@ describe("app-only root-redirect set-if-unset (hub-parity P5)", () => {
         delete process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV];
       } else {
         process.env[PARACHUTE_HUB_ROOT_REDIRECT_ENV] = prevEnv;
+      }
+      cleanup();
+    }
+  });
+
+  test("an ENV-configured mode (no DB row) is left alone — no clobber", async () => {
+    // PARACHUTE_HUB_ROOT_MODE=redirect on a container that deliberately wants
+    // the redirect front door. The gate sees the resolved mode source as `env`,
+    // not `default`, so it does NOT write a serve-app row.
+    const { path, configDir, cleanup } = makeTempPath();
+    const prevEnv = process.env[PARACHUTE_HUB_ROOT_MODE_ENV];
+    try {
+      process.env[PARACHUTE_HUB_ROOT_MODE_ENV] = "redirect";
+      const db = openHubDb(hubDbPath(configDir));
+      const logs: string[] = [];
+      try {
+        const code = await install("app", {
+          runner: async () => 0,
+          manifestPath: path,
+          configDir,
+          startService: async () => 0,
+          isLinked: () => false,
+          portProbe: async () => false,
+          rootRedirectDb: db,
+          log: (l) => logs.push(l),
+        });
+        expect(code).toBe(0);
+        expect(getRootMode(db)).toBeNull();
+        expect(logs.join("\n")).not.toMatch(/now serves the Parachute app/);
+      } finally {
+        db.close();
+      }
+    } finally {
+      if (prevEnv === undefined) {
+        delete process.env[PARACHUTE_HUB_ROOT_MODE_ENV];
+      } else {
+        process.env[PARACHUTE_HUB_ROOT_MODE_ENV] = prevEnv;
       }
       cleanup();
     }

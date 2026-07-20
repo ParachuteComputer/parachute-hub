@@ -382,8 +382,9 @@ const APP_FALLBACK: FirstPartyFallback = {
     postInstallFooter: () => [
       "",
       "Open your Parachute at <origin>/app — it signs in with your hub account.",
-      "The hub's front page (`/`) now opens the app too, unless you've already",
-      "set a custom root redirect (`parachute hub set-root-redirect` or the admin SPA).",
+      "The hub's front page (`/`) now serves the app directly too, unless you've",
+      "already customized the root (`parachute hub set-root-mode` / `set-root-redirect`",
+      "or the admin SPA).",
     ],
   },
 };

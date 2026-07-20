@@ -6,6 +6,21 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.7-rc.13] - 2026-07-20
+
+Serve the Parachute app at the origin root — the self-hosted mirror of the hosted door. Hitting a self-host URL now lands in the app directly (no redirect hop), configurable, with every existing funnel preserved.
+
+### Added
+
+- **`root_mode = serve-app`: the hub can SERVE the installed Parachute app AT `/`.** A new `hub_settings.root_mode` setting (`redirect` | `serve-app`, resolved `DB → PARACHUTE_HUB_ROOT_MODE env → redirect default`, mirroring `root_redirect`). In `serve-app` mode the bare `/` and unclaimed HTML deep links serve the installed `@openparachute/parachute-app` bundle's `index.html`, and its assets (`/assets/*`, `/icon.svg`, `/manifest.webmanifest`, `/sw.js`) serve straight from the same installed `dist/` — no rebuild, because the app's build is root-based (absolute `/assets`, PWA scope `/`, root OAuth redirect URIs). The app dist is resolved through the SAME `resolveNotesDistFrom` machinery the `/app` mount uses, so root-serve and `/app` hand back byte-identical bundle files. No identity chrome is injected on any root-served response (the public/surface opt-out precedent). New `src/root-serve.ts` (`makeAppDistResolver` + `serveAppAtRoot`).
+  - **Precedence is fully preserved (load-bearing):** the fresh-hub setup wizard funnel and the pre-admin 503 lockout still fire BEFORE the root handler, and every hub-owned route (`/admin`, `/oauth`, `/.well-known`, `/vault`, `/git`, `/api`, service mounts) dispatches BEFORE the SPA-fallback tail. The tail is strictly the "would have been the branded 404 for an unclaimed HTML GET" position; a non-GET, a non-HTML unclaimed request, or a reserved `/api|/oauth|/.well-known` prefix keeps the branded 404. When `serve-app` is set but the app isn't installed (dist unresolvable), `/` falls back to the redirect behavior with a one-time log line.
+- **`PUT/GET /api/settings/root-redirect` extended for the mode.** GET now also returns `root_mode` + `resolved_mode` + `mode_source`; PUT accepts `root_redirect` and/or `root_mode` (at least one, both validated before either is applied). A body with only `root_redirect` — the pre-serve-app shape — works unchanged. Same `parachute:host:admin` Bearer gate.
+- **`parachute hub set-root-mode <redirect|serve-app>` (and `--clear`).** CLI parity with the admin PUT, mirroring `set-root-redirect`. Env equivalent: `PARACHUTE_HUB_ROOT_MODE`.
+
+### Changed
+
+- **`parachute install app` now defaults the hub's origin root to SERVE the app** (`root_mode = serve-app`) instead of writing `root_redirect = /app/`. SET-IF-UNSET ONLY, and only when the root behavior is entirely pristine default (no mode row/env AND no redirect row/env). Existing installs are unchanged: a hub that already ran the prior app-install code has `root_redirect = /app/` (non-default), so it is NOT flipped — it keeps 302-ing to `/app/`. An operator's custom landing surface / pinned env / explicit mode is likewise left untouched.
+
 ## [0.7.7-rc.12] - 2026-07-17
 
 Contracts-brief H1 (cross-door contract-parity program, hub wave) — distinct from campaign #116's "H1" (merged #746). Bearer scheme-casing unification + the hub half of the door-contract live conformance suite + a shape-inconsistency catalog.

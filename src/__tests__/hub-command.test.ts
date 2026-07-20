@@ -12,9 +12,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hub, hubSetOrigin, hubSetRootRedirect, rewriteCaddyfileHost } from "../commands/hub.ts";
+import {
+  hub,
+  hubSetOrigin,
+  hubSetRootMode,
+  hubSetRootRedirect,
+  rewriteCaddyfileHost,
+} from "../commands/hub.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
-import { getHubOrigin, getRootRedirect } from "../hub-settings.ts";
+import { getHubOrigin, getRootMode, getRootRedirect } from "../hub-settings.ts";
 import type { CommandResult } from "../tailscale/run.ts";
 
 describe("parachute hub set-origin", () => {
@@ -496,5 +502,67 @@ describe("parachute hub set-root-redirect", () => {
     });
     expect(code).toBe(0);
     expect(persisted()).toBe("/surface/via-dispatcher");
+  });
+});
+
+describe("parachute hub set-root-mode", () => {
+  let dir: string;
+  let log: string[];
+  const collect = (line: string) => log.push(line);
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hub-set-root-mode-"));
+    log = [];
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function persisted(): string | null {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      return getRootMode(db);
+    } finally {
+      db.close();
+    }
+  }
+
+  test("persists serve-app to hub_settings.root_mode", async () => {
+    const code = await hubSetRootMode(["serve-app"], { configDir: dir, log: collect });
+    expect(code).toBe(0);
+    expect(persisted()).toBe("serve-app");
+    expect(log.join("\n")).toMatch(/serves the Parachute app/);
+  });
+
+  test("`redirect` stores as absence (the default), clearing any row", async () => {
+    await hubSetRootMode(["serve-app"], { configDir: dir, log: collect });
+    const code = await hubSetRootMode(["redirect"], { configDir: dir, log: collect });
+    expect(code).toBe(0);
+    expect(persisted()).toBeNull();
+  });
+
+  test("--clear deletes the row", async () => {
+    await hubSetRootMode(["serve-app"], { configDir: dir, log: collect });
+    const code = await hubSetRootMode(["--clear"], { configDir: dir, log: collect });
+    expect(code).toBe(0);
+    expect(persisted()).toBeNull();
+  });
+
+  test("rejects an unknown mode without writing", async () => {
+    for (const bad of ["serveapp", "SERVE-APP", "app", "/surface/x"]) {
+      const code = await hubSetRootMode([bad], { configDir: dir, log: collect });
+      expect(code).toBe(1);
+      expect(persisted()).toBeNull();
+    }
+  });
+
+  test("usage error (exit 1) when no mode + no --clear", async () => {
+    const code = await hubSetRootMode([], { configDir: dir, log: collect });
+    expect(code).toBe(1);
+    expect(persisted()).toBeNull();
+  });
+
+  test("routed through the `hub` dispatcher", async () => {
+    const code = await hub(["set-root-mode", "serve-app"], { configDir: dir, log: collect });
+    expect(code).toBe(0);
+    expect(persisted()).toBe("serve-app");
   });
 });
