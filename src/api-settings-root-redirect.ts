@@ -1,19 +1,24 @@
 /**
- * `GET|PUT /api/settings/root-redirect` — operator-settable target for the
- * bare-`/` 302.
+ * `GET|PUT /api/settings/root-redirect` — operator-settable behavior for the
+ * hub's origin root: the `root_mode` (redirect vs. serve the app) and the
+ * bare-`/` 302 target.
  *
  * The hub's root (`/`) redirects to `/admin` by default. This endpoint lets an
  * operator point it at a surface instead (e.g. a custom-domain hub fronting a
- * team reading-room surface) without redeploying. The stored value resolves
- * tier-1 in `resolveRootRedirect` (hub-settings.ts):
+ * team reading-room surface), OR flip `root_mode` to `serve-app` so the hub
+ * serves the installed Parachute app AT the origin root (the hosted-door
+ * experience), all without redeploying. The stored values resolve tier-1 in
+ * `resolveRootRedirect` / `resolveRootMode` (hub-settings.ts):
  *
- *   1. hub_settings.root_redirect (this endpoint writes here)
- *   2. PARACHUTE_HUB_ROOT_REDIRECT env
- *   3. `/admin` default (unchanged behavior)
+ *   root_redirect:  hub_settings.root_redirect → PARACHUTE_HUB_ROOT_REDIRECT env → `/admin`
+ *   root_mode:      hub_settings.root_mode     → PARACHUTE_HUB_ROOT_MODE env     → `redirect`
  *
- * The endpoint surfaces both the stored value *and* the resolved value + source
- * so the SPA can render "current: /surface/x (from env)" while the input shows
- * the empty stored row — same separation rationale as `/api/settings/hub-origin`.
+ * The endpoint surfaces both the stored values *and* the resolved values +
+ * sources so the SPA can render "current: /surface/x (from env)" while the
+ * input shows the empty stored row — same separation rationale as
+ * `/api/settings/hub-origin`. PUT accepts `root_redirect` and/or `root_mode`
+ * (at least one); a body with only `root_redirect` (the pre-serve-app shape)
+ * works unchanged.
  *
  * OPEN-REDIRECT SAFETY is the highest-stakes part: the resolved value lands in a
  * `Location:` header, so an off-origin value would be a textbook open redirect.
@@ -29,10 +34,17 @@
 
 import type { Database } from "bun:sqlite";
 import {
+  ROOT_MODES,
+  type RootMode,
+  type RootModeSource,
   type RootRedirectSource,
+  getRootMode,
   getRootRedirect,
+  isRootMode,
   isSafeRedirectPath,
+  resolveRootModeDetailed,
   resolveRootRedirectDetailed,
+  setRootMode,
   setRootRedirect,
 } from "./hub-settings.ts";
 import { validateAccessToken } from "./jwt-sign.ts";
@@ -68,11 +80,19 @@ interface GetResponseBody {
   resolved: string;
   /** Which precedence layer the resolved value came from. */
   source: RootRedirectSource;
+  /** Raw stored value from hub_settings.root_mode, or null. */
+  root_mode: RootMode | null;
+  /** Resolved root mode (precedence-aware): "redirect" (302) or "serve-app". */
+  resolved_mode: RootMode;
+  /** Which precedence layer the resolved mode came from. */
+  mode_source: RootModeSource;
 }
 
 interface PutResponseBody {
-  /** Echo of the now-stored value (null if cleared). */
+  /** Echo of the now-stored redirect (null if cleared / not part of this PUT). */
   root_redirect: string | null;
+  /** Echo of the now-stored mode (null if cleared / default). */
+  root_mode: RootMode | null;
 }
 
 /**
@@ -104,6 +124,30 @@ export function validateRootRedirect(value: unknown): ValidateOutcome {
       description:
         "root_redirect must be a same-origin relative path (start with a single `/`, no `//`/`/\\`/scheme, no whitespace, and not `/` itself)",
     };
+  }
+  return { ok: true, normalized: value };
+}
+
+/** Validation outcome for `root_mode` — string (a valid mode) or null (clear). */
+type ValidateModeOutcome =
+  | { ok: true; normalized: RootMode | null }
+  | { ok: false; description: string };
+
+/**
+ * Validate the body's `root_mode` field. Accepts:
+ *   - `null` (or empty string) → clear the stored value, revert to env/default
+ *     (the `redirect` default).
+ *   - `"redirect"` | `"serve-app"` — a valid {@link RootMode}.
+ * Everything else → 400 with an operator-friendly description.
+ */
+export function validateRootMode(value: unknown): ValidateModeOutcome {
+  if (value === null) return { ok: true, normalized: null };
+  if (typeof value !== "string") {
+    return { ok: false, description: `root_mode must be a string or null (got ${typeof value})` };
+  }
+  if (value.length === 0) return { ok: true, normalized: null };
+  if (!isRootMode(value)) {
+    return { ok: false, description: `root_mode must be one of ${ROOT_MODES.join(", ")}` };
   }
   return { ok: true, normalized: value };
 }
@@ -156,10 +200,14 @@ export async function handleApiSettingsRootRedirect(
 
   if (req.method === "GET") {
     const resolved = resolveRootRedirectDetailed(deps.db, { env: deps.env });
+    const resolvedMode = resolveRootModeDetailed(deps.db, { env: deps.env });
     const body: GetResponseBody = {
       root_redirect: getRootRedirect(deps.db),
       resolved: resolved.value,
       source: resolved.source,
+      root_mode: getRootMode(deps.db),
+      resolved_mode: resolvedMode.value,
+      mode_source: resolvedMode.source,
     };
     return new Response(JSON.stringify(body), {
       status: 200,
@@ -167,7 +215,12 @@ export async function handleApiSettingsRootRedirect(
     });
   }
 
-  // PUT — parse + validate body.
+  // PUT — parse + validate body. Either `root_redirect` OR `root_mode` (or
+  // both) may be present; at least one is required. Each is validated +
+  // applied independently, so an operator can flip just the mode, just the
+  // redirect target, or both in one call. Back-compat: a body with only
+  // `root_redirect` (the pre-serve-app shape the admin SPA / CLI already send)
+  // works unchanged.
   let parsed: unknown;
   try {
     parsed = await req.json();
@@ -177,17 +230,40 @@ export async function handleApiSettingsRootRedirect(
   if (typeof parsed !== "object" || parsed === null) {
     return jsonError(400, "invalid_request", "request body must be a JSON object");
   }
-  if (!("root_redirect" in parsed)) {
-    return jsonError(400, "invalid_request", "request body must include a `root_redirect` field");
-  }
-  const result = validateRootRedirect((parsed as { root_redirect: unknown }).root_redirect);
-  if (!result.ok) {
-    return jsonError(400, "invalid_root_redirect", result.description);
+  const hasRedirect = "root_redirect" in parsed;
+  const hasMode = "root_mode" in parsed;
+  if (!hasRedirect && !hasMode) {
+    return jsonError(
+      400,
+      "invalid_request",
+      "request body must include a `root_redirect` and/or `root_mode` field",
+    );
   }
 
-  setRootRedirect(deps.db, result.normalized);
+  // Validate BOTH before applying EITHER — a partial write (redirect stored,
+  // mode rejected) would leave the operator's config half-applied.
+  let redirectNormalized: string | null | undefined;
+  if (hasRedirect) {
+    const result = validateRootRedirect((parsed as { root_redirect: unknown }).root_redirect);
+    if (!result.ok) return jsonError(400, "invalid_root_redirect", result.description);
+    redirectNormalized = result.normalized;
+  }
+  let modeNormalized: RootMode | null | undefined;
+  if (hasMode) {
+    const result = validateRootMode((parsed as { root_mode: unknown }).root_mode);
+    if (!result.ok) return jsonError(400, "invalid_root_mode", result.description);
+    modeNormalized = result.normalized;
+  }
 
-  const body: PutResponseBody = { root_redirect: result.normalized };
+  if (redirectNormalized !== undefined) setRootRedirect(deps.db, redirectNormalized);
+  if (modeNormalized !== undefined) setRootMode(deps.db, modeNormalized);
+
+  // Echo the now-current stored values (re-read so an untouched field reflects
+  // what's actually in the row, not `undefined`).
+  const body: PutResponseBody = {
+    root_redirect: getRootRedirect(deps.db),
+    root_mode: getRootMode(deps.db),
+  };
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: { "content-type": "application/json" },

@@ -38,7 +38,15 @@
  *                                                installs (surface-notes-alias.ts)
  *
  *   # Discovery + well-known.
- *   /, /hub.html                               → hub.html (the discovery page)
+ *   /                                          → root_mode-dependent: `redirect`
+ *                                                (default) 302s to root_redirect
+ *                                                (default /admin); `serve-app`
+ *                                                serves the installed app's dist
+ *                                                index.html AT `/` (no chrome).
+ *                                                Fresh-hub wizard funnel + pre-
+ *                                                admin 503 still preempt it.
+ *   /hub.html                                  → hub.html (the discovery page;
+ *                                                unaffected by root_mode)
  *   /.well-known/parachute.json                → built dynamically from services.json
  *   /.well-known/parachute-revocation.json     → revoked-jti list (hub#212 Phase 1)
  *   /.well-known/jwks.json                     → JWKS from hub.db
@@ -171,7 +179,13 @@
  *   # Generic services.json-driven proxy (non-vault modules: notes, scribe, agent).
  *   /<service-mount>/*                         → proxy via services.json longest-prefix
  *
- *   anything else                              → 404
+ *   # serve-app tail (only when root_mode = serve-app): an unclaimed GET is
+ *   # handed to the app's root-based dist — an existing bundle file (/assets/*,
+ *   # /icon.svg, /manifest.webmanifest, /sw.js) serves that file; an HTML deep
+ *   # link gets the SPA shell. Inert in redirect mode (the 404 below is
+ *   # byte-identical to before). See root-serve.ts.
+ *   anything else                              → 404 (or app asset / SPA shell
+ *                                                in serve-app mode)
  *
  * Invoked as:
  *   bun <this-file> --port <n> --well-known-dir <path> [--db <path>] [--issuer <url>]
@@ -297,7 +311,7 @@ import {
   startDbPathLivenessTimer,
 } from "./hub-db-liveness.ts";
 import { hubDbPath, openHubDb } from "./hub-db.ts";
-import { getHubOrigin, resolveRootRedirect } from "./hub-settings.ts";
+import { getHubOrigin, resolveRootMode, resolveRootRedirect } from "./hub-settings.ts";
 import { type RenderHubOpts, renderHub } from "./hub.ts";
 import { pemToJwk } from "./jwks.ts";
 import {
@@ -321,6 +335,7 @@ import { clearPid, writePid } from "./process-state.ts";
 import { toResponse as proxyErrorToResponse, renderProxyError } from "./proxy-error-ui.ts";
 import { classifyUpstream } from "./proxy-state.ts";
 import { isHttpsRequest } from "./request-protocol.ts";
+import { makeAppDistResolver, serveAppAtRoot } from "./root-serve.ts";
 import {
   FIRST_PARTY_FALLBACKS,
   KNOWN_MODULES,
@@ -1420,6 +1435,15 @@ export interface HubFetchDeps {
    * tracker between fetch fn and bridge handlers is impossible.
    */
   wsConnectionTracker?: WsConnectionTracker;
+  /**
+   * Resolve the installed app's `dist/` directory for `root_mode = serve-app`.
+   * Returns the dist dir, or `null` when the app isn't installed (→ serve-app
+   * falls back to the redirect). Production defaults to a memoizing resolver
+   * over the real `@openparachute/parachute-app` package (`makeAppDistResolver`);
+   * tests inject a fixture dir or a `() => null` to drive the not-installed
+   * fallback without a real global install.
+   */
+  resolveAppDist?: () => string | null;
 }
 
 /**
@@ -2119,6 +2143,13 @@ export function hubFetch(
   const manifestPath = deps?.manifestPath ?? SERVICES_MANIFEST_PATH;
   const gitRoot = deps?.gitRoot ?? join(CONFIG_DIR, "hub", "git");
   const spaDistDir = deps?.spaDistDir ?? defaultSpaDistDir();
+  // `root_mode = serve-app` resolver (memoizing over the real app package by
+  // default; tests inject their own). Instantiated once per hubFetch so the
+  // success-memoization spans the serve process's lifetime.
+  const resolveAppDist = deps?.resolveAppDist ?? makeAppDistResolver();
+  // One-shot log guard: when serve-app is set but the app can't be resolved we
+  // fall back to the redirect and say so ONCE, not on every `/` hit.
+  let warnedAppServeFallback = false;
   const loopbackPort = deps?.loopbackPort;
   const loadExposeHubOrigin =
     deps?.loadExposeHubOrigin ??
@@ -2636,6 +2667,24 @@ export function hubFetch(
       // page (used by the static `parachute expose --set-path=/` disk file and
       // any bookmark to the explicit `.html`). Only the bare `/` redirects.
       if (pathname === "/") {
+        // `root_mode = serve-app`: serve the installed app's shell AT the origin
+        // root (no redirect hop), the self-hosted mirror of the hosted door.
+        // GET only — a non-GET `/` keeps its 302 below. Runs AFTER the fresh-hub
+        // wizard funnel + pre-admin 503 above (a not-yet-set-up hub still lands
+        // on setup, never a half-working app shell). Falls back to the redirect
+        // when the app isn't installed (dist unresolvable), with a one-time log.
+        if (req.method === "GET" && resolveRootMode(getDb ? getDb() : null) === "serve-app") {
+          const dist = resolveAppDist();
+          if (dist) {
+            const served = serveAppAtRoot(dist, req, "/");
+            if (served) return served;
+          } else if (!warnedAppServeFallback) {
+            warnedAppServeFallback = true;
+            console.warn(
+              "[hub] root_mode=serve-app but the Parachute app is not installed (its dist could not be resolved) — falling back to the root redirect. Install it with `parachute install app`.",
+            );
+          }
+        }
         return new Response(null, {
           status: 302,
           headers: { location: resolveRootRedirect(getDb ? getDb() : null) },
@@ -4208,6 +4257,25 @@ export function hubFetch(
             ? [uiMatch.mount]
             : undefined,
         );
+      }
+
+      // serve-app tail (`root_mode = serve-app`). This is exactly the "would
+      // have been the branded 404" point: every hub-owned prefix above (/,
+      // /admin, /oauth, /.well-known, /vault, /git, /api, service mounts) has
+      // already had its turn, so anything here is genuinely unclaimed. Hand an
+      // unclaimed GET to the app's root-based dist — an existing bundle file
+      // (/assets/*, /icon.svg, /manifest.webmanifest, /sw.js) serves that file;
+      // an HTML deep link the app routes client-side gets the SPA shell.
+      // `serveAppAtRoot` returns null (→ branded 404 below) for a non-GET, a
+      // non-HTML unclaimed request, or a reserved /api|/oauth|/.well-known
+      // prefix. NO chrome injection — the app owns its whole page. In redirect
+      // mode this branch is inert and the tail stays byte-identical to before.
+      if (req.method === "GET" && resolveRootMode(getDb ? getDb() : null) === "serve-app") {
+        const dist = resolveAppDist();
+        if (dist) {
+          const served = serveAppAtRoot(dist, req, pathname);
+          if (served) return served;
+        }
       }
 
       // Branded fall-through 404 (closes hub#392) — the operator who mistyped

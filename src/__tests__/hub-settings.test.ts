@@ -12,30 +12,38 @@ import { join } from "node:path";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
   DEFAULT_MODULE_INSTALL_CHANNEL,
+  DEFAULT_ROOT_MODE,
   DEFAULT_ROOT_REDIRECT,
   FIRST_CLIENT_AUTO_APPROVE_WINDOW_MS,
   MODULE_INSTALL_CHANNELS,
+  PARACHUTE_HUB_ROOT_MODE_ENV,
   PARACHUTE_HUB_ROOT_REDIRECT_ENV,
   PARACHUTE_INSTALL_CHANNEL_ENV,
   PARACHUTE_MODULE_CHANNEL_ENV,
+  ROOT_MODES,
   SETUP_EXPOSE_MODES,
   consumeFirstClientAutoApproveWindow,
   deleteSetting,
   getHubOrigin,
   getModuleInstallChannel,
+  getRootMode,
   getRootRedirect,
   getSetting,
   isFirstClientAutoApproveWindowOpen,
   isModuleInstallChannel,
   isNotesRedirectDisabled,
+  isRootMode,
   isSafeRedirectPath,
   isSetupExposeMode,
   openFirstClientAutoApproveWindow,
+  resolveRootMode,
+  resolveRootModeDetailed,
   resolveRootRedirect,
   resolveRootRedirectDetailed,
   setHubOrigin,
   setModuleInstallChannel,
   setNotesRedirectDisabled,
+  setRootMode,
   setRootRedirect,
   setSetting,
 } from "../hub-settings.ts";
@@ -363,9 +371,9 @@ describe("hub-settings — module install channel bootstrap", () => {
       // First read with env=rc — env wins, returns "rc". DB stays empty
       // (no auto-write to DB when env is set, per the design that
       // preserves the SPA's last-write as the env-unset fallback).
-      expect(
-        getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } }),
-      ).toBe("rc");
+      expect(getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } })).toBe(
+        "rc",
+      );
       // Second read with env=latest — env wins again (would have returned
       // "rc" under the old DB-after-first-seed behavior).
       expect(
@@ -386,9 +394,9 @@ describe("hub-settings — module install channel bootstrap", () => {
     const db = openHubDb(hubDbPath(dir));
     try {
       // PARACHUTE_INSTALL_CHANNEL — canonical name (matches install.ts).
-      expect(
-        getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } }),
-      ).toBe("rc");
+      expect(getModuleInstallChannel(db, { env: { [PARACHUTE_INSTALL_CHANNEL_ENV]: "rc" } })).toBe(
+        "rc",
+      );
       // PARACHUTE_MODULE_CHANNEL — legacy alias, still recognized.
       const db2 = openHubDb(join(mkdtempSync(join(tmpdir(), "phub-hsalt-")), "hub.db"));
       try {
@@ -799,5 +807,101 @@ describe("hub-settings — root_redirect storage + resolution", () => {
     expect(resolveRootRedirect(null, { env: noEnv })).toBe("/admin");
     const env = { [PARACHUTE_HUB_ROOT_REDIRECT_ENV]: "/surface/from-env" };
     expect(resolveRootRedirect(null, { env })).toBe("/surface/from-env");
+  });
+});
+
+describe("hub-settings — root_mode storage + resolution", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hub-settings-root-mode-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const noEnv: NodeJS.ProcessEnv = {};
+  const silent = () => {};
+
+  test("isRootMode + ROOT_MODES", () => {
+    expect(ROOT_MODES).toEqual(["redirect", "serve-app"]);
+    expect(isRootMode("redirect")).toBe(true);
+    expect(isRootMode("serve-app")).toBe(true);
+    expect(isRootMode("serveapp")).toBe(false);
+    expect(isRootMode(42)).toBe(false);
+  });
+
+  test("getRootMode round-trips serve-app via setRootMode", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      expect(getRootMode(db)).toBeNull();
+      setRootMode(db, "serve-app");
+      expect(getRootMode(db)).toBe("serve-app");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("setRootMode(null) and setRootMode('redirect') both clear the row (default = absence)", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setRootMode(db, "serve-app");
+      setRootMode(db, null);
+      expect(getRootMode(db)).toBeNull();
+      setRootMode(db, "serve-app");
+      setRootMode(db, "redirect"); // the default is stored as absence
+      expect(getRootMode(db)).toBeNull();
+      expect(getSetting(db, "root_mode")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("resolves to the redirect default when neither DB nor env is set", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      expect(resolveRootMode(db, { env: noEnv })).toBe(DEFAULT_ROOT_MODE);
+      expect(resolveRootModeDetailed(db, { env: noEnv })).toEqual({
+        value: "redirect",
+        source: "default",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("env override applies when no DB row; DB overrides env (DB is tier-1)", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      const env = { [PARACHUTE_HUB_ROOT_MODE_ENV]: "serve-app" };
+      expect(resolveRootModeDetailed(db, { env })).toEqual({ value: "serve-app", source: "env" });
+      setRootMode(db, "serve-app");
+      // A DB "serve-app" over an env "redirect" resolves to db.
+      expect(
+        resolveRootModeDetailed(db, { env: { [PARACHUTE_HUB_ROOT_MODE_ENV]: "redirect" } }),
+      ).toEqual({ value: "serve-app", source: "db" });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("an invalid DB row / env value is ignored → falls back to the redirect default", () => {
+    const db = openHubDb(hubDbPath(dir));
+    try {
+      setSetting(db, "root_mode", "bogus"); // hand-edited row bypassing write validation
+      expect(resolveRootMode(db, { env: noEnv, warn: silent })).toBe("redirect");
+      expect(getRootMode(db)).toBeNull(); // getRootMode also guards the invalid value
+      const env = { [PARACHUTE_HUB_ROOT_MODE_ENV]: "nonsense" };
+      expect(resolveRootModeDetailed(db, { env, warn: silent })).toEqual({
+        value: "redirect",
+        source: "default",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("a null db (no state) resolves from env / default only", () => {
+    expect(resolveRootMode(null, { env: noEnv })).toBe("redirect");
+    expect(resolveRootMode(null, { env: { [PARACHUTE_HUB_ROOT_MODE_ENV]: "serve-app" } })).toBe(
+      "serve-app",
+    );
   });
 });

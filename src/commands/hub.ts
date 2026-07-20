@@ -34,8 +34,11 @@ import { CONFIG_DIR } from "../config.ts";
 import { hubDbPath, openHubDb } from "../hub-db.ts";
 import {
   DEFAULT_ROOT_REDIRECT,
+  ROOT_MODES,
+  isRootMode,
   isSafeRedirectPath,
   setHubOrigin,
+  setRootMode,
   setRootRedirect,
 } from "../hub-settings.ts";
 import { type CommandResult, type Runner, defaultRunner } from "../tailscale/run.ts";
@@ -428,6 +431,84 @@ export async function hubSetRootRedirect(
 }
 
 /**
+ * `parachute hub set-root-mode <redirect|serve-app>` — persist how the hub
+ * answers its origin root into `hub_settings.root_mode` (tier-1 in
+ * `resolveRootMode`).
+ *
+ *   - `redirect` (the default) — the bare `/` 302s to `root_redirect` (default
+ *     `/admin`). This is what `--clear` reverts to.
+ *   - `serve-app` — the hub SERVES the installed Parachute app AT the origin
+ *     root (the hosted-door experience), no redirect hop. Requires the app to
+ *     be installed (`parachute install app`); if it isn't, `/` falls back to
+ *     the redirect until it is.
+ *
+ * Takes effect on the next request, no restart. Returns 0 on success, 1 on a
+ * usage / validation / DB-write failure. Mirrors `hubSetRootRedirect`'s shape.
+ */
+export async function hubSetRootMode(
+  args: readonly string[],
+  deps: HubCommandDeps = {},
+): Promise<number> {
+  const configDir = deps.configDir ?? CONFIG_DIR;
+  const log = deps.log ?? ((line) => console.log(line));
+  const err = (line: string) => console.error(line);
+  const openDb = deps.openDb ?? ((dir: string) => openHubDb(hubDbPath(dir)));
+
+  const clear = args.includes("--clear");
+  const positional = args.filter((a) => !a.startsWith("-"));
+
+  if (clear) {
+    if (positional.length > 0) {
+      err("parachute hub set-root-mode: --clear takes no mode argument");
+      return 1;
+    }
+    const db = openDb(configDir);
+    try {
+      setRootMode(db, null);
+    } finally {
+      db.close();
+    }
+    log("✓ Cleared the root mode — `/` reverts to the redirect default.");
+    return 0;
+  }
+
+  const raw = positional[0];
+  if (raw === undefined) {
+    err(`usage: parachute hub set-root-mode <${ROOT_MODES.join("|")}>   (or --clear)`);
+    err("example: parachute hub set-root-mode serve-app");
+    return 1;
+  }
+  if (positional.length > 1) {
+    err(`parachute hub set-root-mode: unexpected argument "${positional[1]}"`);
+    err(`usage: parachute hub set-root-mode <${ROOT_MODES.join("|")}>   (or --clear)`);
+    return 1;
+  }
+  if (!isRootMode(raw)) {
+    err(`parachute hub set-root-mode: "${raw}" is not a valid mode`);
+    err(`  Expected one of: ${ROOT_MODES.join(", ")}. Example: serve-app`);
+    return 1;
+  }
+
+  const db = openDb(configDir);
+  try {
+    setRootMode(db, raw);
+  } finally {
+    db.close();
+  }
+
+  if (raw === "serve-app") {
+    log("✓ Bare `/` now serves the Parachute app (root_mode=serve-app).");
+    log("  Requires the app to be installed (`parachute install app`); otherwise `/`");
+    log("  falls back to the redirect. Takes effect on the next request, no restart.");
+    log("  Revert with: parachute hub set-root-mode redirect  (or --clear)");
+  } else {
+    log("✓ Bare `/` now uses redirect mode (the default).");
+    log("  Stored in hub_settings.root_mode — takes effect on the next request.");
+  }
+  return 0;
+}
+
+/**
  * `parachute hub <subcommand>` dispatcher. Mirrors `auth`'s shape (a thin
  * router over subcommand handlers, each catching its own errors).
  */
@@ -457,6 +538,16 @@ export async function hub(args: readonly string[], deps: HubCommandDeps = {}): P
       return 1;
     }
   }
+  if (sub === "set-root-mode") {
+    try {
+      return await hubSetRootMode(args.slice(1), deps);
+    } catch (err) {
+      console.error(
+        `parachute hub set-root-mode: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return 1;
+    }
+  }
   console.error(`parachute hub: unknown subcommand "${sub}"`);
   console.error("");
   console.error(hubHelp());
@@ -469,6 +560,7 @@ export function hubHelp(): string {
 Usage:
   parachute hub set-origin <url> [--no-caddy] [--no-restart]
   parachute hub set-root-redirect <path> | --clear
+  parachute hub set-root-mode <redirect|serve-app> | --clear
 
 Subcommands:
   set-origin <url>    Persist the canonical public origin (OAuth issuer) to the
@@ -500,11 +592,23 @@ Subcommands:
                       \`/\\\`, scheme, or whitespace). Pass --clear to revert to the
                       env / /admin default. (Env equivalent: PARACHUTE_HUB_ROOT_REDIRECT.)
 
+  set-root-mode <mode>
+                      How the hub answers its origin root: \`redirect\` (default —
+                      the bare \`/\` 302s to the set-root-redirect target) or
+                      \`serve-app\` (the hub SERVES the installed Parachute app AT
+                      \`/\`, the hosted-door experience, no redirect hop). serve-app
+                      needs the app installed (\`parachute install app\`); until then
+                      \`/\` falls back to the redirect. Stored in hub_settings.root_mode;
+                      takes effect on the next request, no restart. Pass --clear to
+                      revert to the redirect default. (Env equivalent: PARACHUTE_HUB_ROOT_MODE.)
+
 Examples:
   parachute hub set-origin https://box.sslip.io
   parachute hub set-origin https://parachute.example.com
   parachute hub set-origin https://parachute.example.com --no-caddy
   parachute hub set-root-redirect /surface/reading-room
   parachute hub set-root-redirect --clear
+  parachute hub set-root-mode serve-app
+  parachute hub set-root-mode --clear
 `;
 }
