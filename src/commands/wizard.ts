@@ -156,8 +156,24 @@ interface FetchSetupResult {
 /**
  * Default readline prompt. Lives at module scope so tests can inject a
  * deterministic alternative through `opts.prompt`.
+ *
+ * Non-TTY guard (headless-hardening): Bun's `readline/promises` `question()`
+ * NEVER settles when stdin is closed / not a terminal (cloud-init, `ssh
+ * <host> 'parachute setup-wizard …'`, the e2e container's `run.sh`-exec'd
+ * stages.sh) — it busy-waits forever, wedging the wizard until the outer job
+ * timeout kills it. So when stdin is not interactive we FAIL FAST with an
+ * actionable message naming the flag that would have answered the prompt,
+ * rather than blocking on a prompt no one can ever answer. Account / vault /
+ * expose are required steps, so a missing answer here is fatal (the
+ * transcription step, being optional, defaults to "none" instead — see
+ * wizard-transcription.ts).
  */
 async function defaultPrompt(question: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      `stdin is not interactive, so the wizard cannot prompt for: ${question.trim()}\nRe-run non-interactively by passing the corresponding flag (e.g. --account-username / --account-password / --vault-mode / --vault-name / --expose-mode / --transcribe-mode), or run in a real terminal.`,
+    );
+  }
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     return await rl.question(question);
@@ -224,6 +240,14 @@ async function setupFetch(
     // Don't auto-follow — the wizard returns 303 to /admin/setup, and
     // we want to inspect the Location header rather than chase it.
     redirect: "manual",
+    // Per-request 30s ceiling so a wedged hub call TRIPS instead of
+    // suspending forever. `pollOperation` (below) bounds the whole op with
+    // POLL_TIMEOUT_MS, but that deadline is only checked BETWEEN fetches — a
+    // single fetch that never resolves would defeat it. AbortSignal.timeout
+    // makes each individual call fail-fast; a real hub responds in well under
+    // 30s. Test-injected fetch stubs ignore the signal, so this is inert in
+    // unit tests.
+    signal: AbortSignal.timeout(30_000),
   });
   const bodyText = await res.text();
   // Collect Set-Cookie. Try `getAll` first (Bun + node18+ supported it
@@ -783,7 +807,16 @@ export async function runCliWizard(opts: RunCliWizardOpts): Promise<number> {
     await walkTranscriptionStep({
       configDir: opts.configDir,
       log,
-      prompt,
+      // Only forward a REAL injected prompt seam — NOT the resolved
+      // `prompt` (which is the throwing `defaultPrompt` when the caller
+      // supplied none). Passing the default here would defeat
+      // `resolveChoice`'s `opts.prompt === undefined` non-TTY guard: on a
+      // headless box with no `--transcribe-mode`, the transcription step
+      // would call the throwing default mid-wizard instead of defaulting to
+      // `none`. With the seam forwarded only when present, headless runs hit
+      // the guard (default none) and interactive/test runs still get their
+      // reader.
+      ...(opts.prompt !== undefined ? { prompt: opts.prompt } : {}),
       ...(opts.transcribeMode !== undefined ? { transcribeMode: opts.transcribeMode } : {}),
       ...(opts.transcribeApiKey !== undefined ? { transcribeApiKey: opts.transcribeApiKey } : {}),
       ...(opts.transcribeRunCommand !== undefined ? { runCommand: opts.transcribeRunCommand } : {}),

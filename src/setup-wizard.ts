@@ -41,6 +41,7 @@ import type { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { recordLoginUnlock } from "./admin-lock.ts";
+import { provisionVault } from "./admin-vaults.ts";
 import { type OperationsRegistry, runInstall, specFor } from "./api-modules-ops.ts";
 import { CURATED_MODULES, type CuratedModuleShort } from "./api-modules.ts";
 import {
@@ -307,15 +308,34 @@ export function deriveWizardState(deps: {
   // phantom `vaults[]` row at SEED_VERSION); both surfaces must agree that a
   // placeholder is not a real vault.
   const vaultIsPlaceholder = vaultEntry !== undefined && vaultEntry.version === SEED_VERSION;
+  // hub#607-followup (the e2e wizard-skip bug): the SEED_VERSION check alone is
+  // NOT sufficient to distinguish "real vault" from "module installed, no
+  // instance". When the hub boot-spawns the vault module child, vault's
+  // `selfRegister` writes its services.json row at the REAL package version
+  // (e.g. 0.7.4-rc.1) but with `paths: []` (no vault instance created yet) —
+  // defeating the SEED_VERSION sentinel. A bare `version !== SEED_VERSION`
+  // check then read that empty-paths row as a real vault, so the wizard
+  // SILENTLY SKIPPED its vault step and `--vault-mode create --vault-name` was
+  // ignored (the operator finished setup with no vault). Make the check
+  // INSTANCE-aware: a real vault also requires at least one mount path. This is
+  // the SAME empty-paths discrimination `findExistingVault` /
+  // `listVaultInstanceNames` already use (#478) — a servable instance carries a
+  // canonical `/vault/<name>` path; a self-registered-but-uncreated row has
+  // `paths: []` and must read as "no real vault yet." A SEED_VERSION seed row
+  // carries `/vault/default`, so it's caught by `vaultIsPlaceholder` above and
+  // unaffected by this clause.
+  const vaultHasInstancePath = vaultEntry !== undefined && vaultEntry.paths.length > 0;
   // INVARIANT (B5 re-enterable vault step): hasRealVault means "a real
-  // instance row exists" — placeholder excluded here, skip-marker excluded
-  // below (skip flips hasVault, never hasRealVault). THREE sites key on this
-  // same placeholder logic and must move together: this derivation,
-  // handleSetupGet's `?step=vault` re-entry gate, and handleSetupVaultPost's
-  // already-provisioned short-circuit. Changing one without the others
-  // either re-opens a provisioning form over a real vault or dead-ends the
-  // post-skip re-entry path.
-  const hasRealVault = vaultEntry !== undefined && !vaultIsPlaceholder;
+  // instance row exists" — placeholder excluded here, empty-paths excluded via
+  // vaultHasInstancePath, skip-marker excluded below (skip flips hasVault,
+  // never hasRealVault). THREE sites key on this same `hasRealVault` value and
+  // must move together: this derivation, handleSetupGet's `?step=vault`
+  // re-entry gate, and handleSetupVaultPost's already-provisioned short-circuit
+  // — all three read `deriveWizardState(...).hasRealVault`, so tightening it
+  // here moves all three at once. Changing the meaning here without checking
+  // those consumers either re-opens a provisioning form over a real vault or
+  // dead-ends the post-skip re-entry path.
+  const hasRealVault = vaultEntry !== undefined && !vaultIsPlaceholder && vaultHasInstancePath;
   // hub#168 Cut 2: `setup_vault_skipped === "true"` advances the wizard
   // past the vault step even when no vault row exists. The operator
   // explicitly chose Skip; the module is installed (Cut 1) but no
@@ -416,6 +436,14 @@ export interface SetupWizardDeps {
   registry?: OperationsRegistry;
   /** Test seam: stub `bun add` / `bun remove` runner. */
   run?: (cmd: readonly string[]) => Promise<number>;
+  /**
+   * Test seam: provision a vault for the already-supervised short-circuit in
+   * `handleSetupVaultPost`. Production omits this and uses the real
+   * {@link provisionVault} (which shells to `parachute-vault create <name>
+   * --json`). Tests inject a stub so the short-circuit can be asserted without
+   * spawning the vault CLI.
+   */
+  provisionVaultImpl?: typeof provisionVault;
   /**
    * Test seam: stub the bun-link detection used by `runInstall` to
    * short-circuit `bun add -g` when a package is already linked
@@ -2305,45 +2333,130 @@ export async function handleSetupVaultPost(req: Request, deps: SetupWizardDeps):
   const registry = deps.registry;
   const vaultSpec = specFor(FIRST_VAULT_SHORT);
 
-  // Idempotent short-circuit: if the supervisor is already running (or
-  // mid-spawn) for vault — i.e. a previous POST already kicked off
-  // `runInstall` and beat us to spawning — return a synthesized
-  // succeeded op instead of firing a second `bun add -g`. Mirrors the
-  // pattern in `handleInstall` (api-modules-ops.ts). Without this,
-  // two concurrent POSTs both pass `state.hasVault === false` (the
-  // services.json seed is the only signal that step exits, and it's
-  // written by `runInstall` *after* `bun add` returns), and each
-  // fires its own install — wasted work and a possible race on the
-  // seed/spawn writes. Low risk on first-boot in practice, but the
-  // fix is cheap and matches the API surface's posture.
+  // Already-supervised handling: is the vault MODULE child already under the
+  // supervisor (running / starting / restarting)? Two ways that happens:
+  //   (a) the concurrent-POST race this guard was written for — a prior POST
+  //       already fired `runInstall` and beat us to spawning the module; and
+  //   (b) the boot-spawned-child case the Tier-1 e2e exposed — the hub started
+  //       the vault module on boot so it could `selfRegister`, but NO vault
+  //       INSTANCE has been created yet (its services.json row carries
+  //       `paths: []`, which is exactly why `hasRealVault` was false above and
+  //       we reached this create path).
+  // When the module is already supervised we must NOT fire a second
+  // `bun add -g` / `runInstall`. The three create/import sub-cases are handled
+  // below (import → reject; create+registered → provision the instance;
+  // create+unregistered → let the in-flight install create it).
   const supervisorState = deps.supervisor.get(FIRST_VAULT_SHORT);
-  if (
+  const alreadySupervised =
     supervisorState?.status === "running" ||
     supervisorState?.status === "starting" ||
-    supervisorState?.status === "restarting"
-  ) {
+    supervisorState?.status === "restarting";
+
+  // MUST-FIX (review of #768): import-during-setup on an already-supervised box
+  // isn't supported yet. On such a box (now the normal init'd-box path that
+  // reaches this vault form) `provisionVault` only creates an EMPTY vault —
+  // running it for an IMPORT request and reporting success would leave the
+  // operator with an empty vault named after their import target plus a false
+  // "vault created" banner (a data-integrity footgun). Reject with an
+  // actionable message instead. Known limitation — see CHANGELOG; the fuller
+  // fix (run the mirror-import follow-up after provision) is deferred because
+  // it isn't exercised by the e2e and can't be verified end-to-end here.
+  if (alreadySupervised && rawMode === "import") {
+    const detail =
+      "importing a vault during setup isn't supported yet on a box whose vault module is already running. Create the vault here instead, then import into it with `parachute vault …` or the admin UI.";
     if (registry) {
-      const op = registry.create("install", FIRST_VAULT_SHORT);
+      const rejectOp = registry.create("install", FIRST_VAULT_SHORT);
       registry.update(
-        op.id,
-        { status: "succeeded" },
-        `${FIRST_VAULT_SHORT} already supervised (status=${supervisorState.status})`,
+        rejectOp.id,
+        { status: "failed", error: detail },
+        `vault import unsupported on an already-supervised box: ${detail}`,
       );
       if (form.isJson) {
-        return jsonOkResponse({ op_id: op.id, step: "vault", message: "vault already supervised" });
+        return jsonOkResponse({ op_id: rejectOp.id, step: "vault", message: detail });
       }
-      return redirect(`/admin/setup?op=${encodeURIComponent(op.id)}`);
+      return redirect(`/admin/setup?op=${encodeURIComponent(rejectOp.id)}`);
     }
     if (form.isJson) {
-      return jsonOkResponse({ step: "vault", message: "vault already supervised" });
+      return jsonErrorResponse(409, "Import not supported here", detail);
     }
-    return redirect("/admin/setup");
+    return badRequestPage("Import not supported here", detail);
   }
+
+  // NIT (reviewer N2): only provision if vault is ALREADY registered in
+  // services.json. If it isn't, we're in the narrow pre-seed window of a
+  // CONCURRENT create POST whose `runInstall` spawned the module but hasn't
+  // written its row yet — firing `provisionVault` here would run
+  // `parachute install vault` a SECOND time. In that case we synthesize
+  // success below and let the in-flight install create the vault.
+  const vaultAlreadyRegistered =
+    findService(vaultSpec.manifestName, deps.manifestPath) !== undefined;
 
   const op = registry
     ? registry.create("install", FIRST_VAULT_SHORT)
     : { id: cryptoRandomId(), status: "pending" as const, log: [] as string[] };
-  if (registry) {
+
+  if (alreadySupervised && vaultAlreadyRegistered) {
+    // Case (b): supervised module, real-version row with `paths: []` (no
+    // instance). Provision the named vault via the shipped admin-SPA path
+    // (`parachute-vault create <name> --json`, idempotent + name-validated).
+    // FIRE-AND-FORGET, matching the normal `void runInstall` path: return the
+    // op_id immediately and mark the op from the BACKGROUND result. This keeps
+    // the POST fast so the CLI's 30s per-request ceiling only bounds the quick
+    // POST/poll round-trip — a slow cold `parachute-vault create` on a sluggish
+    // VPS is polled to completion within POLL_TIMEOUT_MS (5 min), never aborted
+    // mid-create. No `bun add -g` fires (module already supervised).
+    const provision = deps.provisionVaultImpl ?? provisionVault;
+    if (registry) {
+      registry.update(
+        op.id,
+        { status: "running" },
+        `${FIRST_VAULT_SHORT} already supervised (status=${supervisorState?.status}) — creating vault "${vaultName}"`,
+      );
+      void provision(vaultName, { issuer: deps.issuer, manifestPath: deps.manifestPath })
+        .then((provisioned) => {
+          if (provisioned.ok) {
+            registry.update(
+              op.id,
+              { status: "succeeded" },
+              provisioned.created
+                ? `vault "${vaultName}" created`
+                : `vault "${vaultName}" already exists`,
+            );
+          } else {
+            registry.update(
+              op.id,
+              { status: "failed", error: provisioned.message },
+              `vault create failed: ${provisioned.message}`,
+            );
+          }
+        })
+        .catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          registry.update(op.id, { status: "failed", error: msg }, `vault create failed: ${msg}`);
+        });
+    } else {
+      // No registry (test-only path): provision synchronously so the vault is
+      // actually created; there's no op to poll.
+      const provisioned = await provision(vaultName, {
+        issuer: deps.issuer,
+        manifestPath: deps.manifestPath,
+      });
+      if (!provisioned.ok) {
+        console.warn(`[setup-wizard] vault create failed: ${provisioned.message}`);
+      }
+    }
+  } else if (alreadySupervised) {
+    // Case (a): supervised but NOT yet registered — the pre-seed window of a
+    // concurrent create POST. Synthesize success; the in-flight `runInstall`
+    // creates the vault (reviewer N2 — the original guard's job).
+    if (registry) {
+      registry.update(
+        op.id,
+        { status: "succeeded" },
+        `${FIRST_VAULT_SHORT} already supervised (status=${supervisorState?.status}) — a concurrent install is provisioning the vault`,
+      );
+    }
+  } else if (registry) {
     // hub#267: thread the typed name through `PARACHUTE_VAULT_NAME` so
     // vault's first-boot path (vault#342) names the created vault
     // accordingly.
