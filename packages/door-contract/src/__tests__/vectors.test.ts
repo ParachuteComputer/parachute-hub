@@ -7,6 +7,11 @@ import {
   ACCOUNT_SELF_READ_SCOPE,
   ACCOUNT_VAULTS_UNNARROWED,
   ACCOUNT_VAULTS_VERB,
+  COMPOSED_MODULE_SEGMENT,
+  COMPOSED_VAULTS_SEGMENT,
+  COMPOSED_VAULTS_WILDCARD,
+  COMPOSED_VAULT_CREATE_VERB,
+  COMPOSED_VERB_RANK,
   REFRESH_GRACE_MS,
   REFRESH_TOKEN_TTL_MS,
   TOKEN_TYPE,
@@ -20,12 +25,20 @@ import {
   checkProtectedResourceMetadata,
   checkTokenResponseInvariants,
   checkVaultTokenMintResponse,
+  composedAccountGrant,
+  composedModuleScope,
+  composedVaultCreateScope,
+  composedVaultScope,
+  composedVerbSatisfies,
+  composedWildcardVaultsScope,
   expectedAuthorizationServerMetadata,
   expectedProtectedResourceMetadata,
   hasAccountScope,
+  isComposedVaultVerb,
   isRequestableAccountScope,
   parseAccountScope,
   parseAccountVaultsScope,
+  parseComposedAccountScope,
   validateVaultScopes,
 } from "../index.js";
 
@@ -164,6 +177,319 @@ describe("account-vaults scope grammar (Wave A)", () => {
     // No account-vaults scope at all → null.
     expect(accountVaultsGrant([], "self")).toBeNull();
     expect(accountVaultsGrant(["account:self:admin", "vault:work:read"], "self")).toBeNull();
+  });
+});
+
+describe("composed account-scope grammar (unified /mcp — Phase 1)", () => {
+  test("constants + builders round-trip to the wire strings", () => {
+    expect(COMPOSED_VAULTS_WILDCARD).toBe("*");
+    expect(COMPOSED_VAULTS_SEGMENT).toBe("vaults");
+    expect(COMPOSED_VAULT_CREATE_VERB).toBe("vault-create");
+    expect(COMPOSED_MODULE_SEGMENT).toBe("mod");
+    expect(composedWildcardVaultsScope("self", "read")).toBe("account:self:vaults:*:read");
+    expect(composedVaultScope("u_1", "work", "write")).toBe("account:u_1:vaults:work:write");
+    expect(composedVaultCreateScope("u_1")).toBe("account:u_1:vault-create");
+    expect(composedModuleScope("u_1", "scribe", "admin")).toBe("account:u_1:mod:scribe:admin");
+  });
+
+  test("the composed verb ladder is admin ⊇ write ⊇ read", () => {
+    expect(COMPOSED_VERB_RANK).toEqual({ read: 0, write: 1, admin: 2 });
+    for (const v of ["read", "write", "admin"]) expect(isComposedVaultVerb(v)).toBe(true);
+    for (const v of ["", "READ", "vaults", "delete", "*"])
+      expect(isComposedVaultVerb(v)).toBe(false);
+    // admin satisfies everything; write satisfies write+read; read only read.
+    expect(composedVerbSatisfies("admin", "read")).toBe(true);
+    expect(composedVerbSatisfies("admin", "write")).toBe(true);
+    expect(composedVerbSatisfies("admin", "admin")).toBe(true);
+    expect(composedVerbSatisfies("write", "read")).toBe(true);
+    expect(composedVerbSatisfies("write", "write")).toBe(true);
+    expect(composedVerbSatisfies("write", "admin")).toBe(false);
+    expect(composedVerbSatisfies("read", "read")).toBe(true);
+    expect(composedVerbSatisfies("read", "write")).toBe(false);
+    expect(composedVerbSatisfies("read", "admin")).toBe(false);
+  });
+
+  // The composed grammar is carried on the aud="account" token; NONE of its new
+  // forms may ever be requested — consent is the sole author. The legacy Wave A
+  // blanket stays requestable (unchanged); every new form is refused.
+  test("isRequestableAccountScope refuses every NEW composed form (consent-only)", () => {
+    for (const scope of [
+      "account:self:vaults:*:read", // wildcard
+      "account:self:vaults:*:write",
+      "account:self:vaults:*:admin",
+      "account:self:vaults:work:read", // per-vault 5-part
+      "account:u_1:vaults:work:write",
+      "account:self:vault-create", // create capability
+      "account:self:mod:scribe:read", // module
+      "account:u_1:mod:notes:admin",
+    ]) {
+      expect(isRequestableAccountScope(scope)).toBe(false);
+    }
+    // The one legacy requestable form is untouched.
+    expect(isRequestableAccountScope("account:vaults")).toBe(true);
+    expect(isRequestableAccountScope("account:self:vaults")).toBe(true);
+  });
+
+  test("parseComposedAccountScope — wildcard vault grant", () => {
+    expect(parseComposedAccountScope("account:self:vaults:*:read")).toEqual({
+      kind: "wildcard-vaults",
+      id: "self",
+      verb: "read",
+    });
+    expect(parseComposedAccountScope("account:u_1:vaults:*:admin")).toEqual({
+      kind: "wildcard-vaults",
+      id: "u_1",
+      verb: "admin",
+    });
+  });
+
+  test("parseComposedAccountScope — per-vault (5-part) grant", () => {
+    expect(parseComposedAccountScope("account:self:vaults:work:write")).toEqual({
+      kind: "vault",
+      id: "self",
+      vault: "work",
+      verb: "write",
+    });
+    expect(parseComposedAccountScope("account:u_1:vaults:moss:read")).toEqual({
+      kind: "vault",
+      id: "u_1",
+      vault: "moss",
+      verb: "read",
+    });
+  });
+
+  test("parseComposedAccountScope — vault-create capability", () => {
+    expect(parseComposedAccountScope("account:self:vault-create")).toEqual({
+      kind: "vault-create",
+      id: "self",
+    });
+    expect(parseComposedAccountScope("account:u_1:vault-create")).toEqual({
+      kind: "vault-create",
+      id: "u_1",
+    });
+  });
+
+  test("parseComposedAccountScope — module grant", () => {
+    expect(parseComposedAccountScope("account:self:mod:scribe:admin")).toEqual({
+      kind: "module",
+      id: "self",
+      module: "scribe",
+      verb: "admin",
+    });
+    expect(parseComposedAccountScope("account:u_1:mod:notes:read")).toEqual({
+      kind: "module",
+      id: "u_1",
+      module: "notes",
+      verb: "read",
+    });
+  });
+
+  test("parseComposedAccountScope — legacy Wave A forms parse identically", () => {
+    // The recognizer is a SUPERSET so a single pass extracts <id> from legacy
+    // grants too (existing tokens/refresh families must keep parsing).
+    expect(parseComposedAccountScope("account:self:vaults")).toEqual({
+      kind: "legacy-blanket",
+      id: "self",
+    });
+    expect(parseComposedAccountScope("account:u_1:vaults:work")).toEqual({
+      kind: "legacy-vault",
+      id: "u_1",
+      vault: "work",
+    });
+  });
+
+  test("parseComposedAccountScope — builders round-trip through the parser", () => {
+    expect(parseComposedAccountScope(composedWildcardVaultsScope("self", "admin"))).toEqual({
+      kind: "wildcard-vaults",
+      id: "self",
+      verb: "admin",
+    });
+    expect(parseComposedAccountScope(composedVaultScope("u_9", "moss", "read"))).toEqual({
+      kind: "vault",
+      id: "u_9",
+      vault: "moss",
+      verb: "read",
+    });
+    expect(parseComposedAccountScope(composedVaultCreateScope("u_9"))).toEqual({
+      kind: "vault-create",
+      id: "u_9",
+    });
+    expect(parseComposedAccountScope(composedModuleScope("u_9", "scribe", "write"))).toEqual({
+      kind: "module",
+      id: "u_9",
+      module: "scribe",
+      verb: "write",
+    });
+  });
+
+  // §1.4 guardrail: the mint gate id-checks only what the parser recognizes; a
+  // form parsing to null would SKIP the cross-account check. Every new family
+  // (and a FOREIGN-id instance of each) must yield an extractable `id` so the
+  // later mint gate can reject a foreign-id composed scope.
+  test("§1.4 — every new family exposes an extractable id (mint-gate coverage)", () => {
+    const foreign = [
+      "account:attacker:vaults:*:admin",
+      "account:attacker:vaults:secret:write",
+      "account:attacker:vault-create",
+      "account:attacker:mod:scribe:admin",
+      "account:attacker:vaults", // legacy blanket
+      "account:attacker:vaults:secret", // legacy narrowed
+    ];
+    for (const scope of foreign) {
+      const parsed = parseComposedAccountScope(scope);
+      expect(parsed).not.toBeNull();
+      expect(parsed?.id).toBe("attacker"); // extractable → gate can reject foreign id
+    }
+  });
+
+  test("parseComposedAccountScope — `*` is ONLY the wildcard, never a vault name", () => {
+    // 5-part `vaults:*:<verb>` → wildcard (above). A 4-part legacy narrowed form
+    // with `*` in the vault slot is NOT a real vault → fail closed.
+    expect(parseComposedAccountScope("account:self:vaults:*")).toBeNull();
+    // And a `*` module name (empty-ish sentinel misuse) still parses as a literal
+    // module string only in the 5-part mod family — `*` is not special there.
+    expect(parseComposedAccountScope("account:self:mod:*:read")).toEqual({
+      kind: "module",
+      id: "self",
+      module: "*",
+      verb: "read",
+    });
+  });
+
+  test("parseComposedAccountScope — the account-verb ladder is NOT a composed form", () => {
+    // `account:<id>:{read,admin}` belong to parseAccountScope, not here.
+    expect(parseComposedAccountScope("account:self:admin")).toBeNull();
+    expect(parseComposedAccountScope("account:self:read")).toBeNull();
+    // `write` is not even an account verb — still null.
+    expect(parseComposedAccountScope("account:self:write")).toBeNull();
+  });
+
+  test("parseComposedAccountScope — garbage / casing / whitespace fail closed → null", () => {
+    for (const scope of [
+      "", // empty
+      "account", // bare
+      "account:", // trailing empty id
+      "account::vaults:*:read", // empty id
+      "account:self", // 2-part
+      "vault:work:read", // non-account resource
+      "Account:self:vaults:*:read", // resource casing
+      "account:self:Vaults:*:read", // family casing
+      "account:self:vaults:*:READ", // verb casing
+      "account:self:vaults:*:delete", // unknown verb
+      "account:self:vaults::read", // empty vault (5-part)
+      "account:self:mod::read", // empty module
+      "account:self:MOD:scribe:read", // module-family casing
+      "account:self:widgets:x:read", // unknown 5-part family
+      "account:self:vaults:*:read:extra", // over-long (6-part)
+      "account:self:mod:scribe:read:extra", // over-long
+      " account:self:vault-create", // leading whitespace
+      "account:self:vault-create ", // trailing whitespace on the verb-slot
+      "account:self:Vault-Create", // create casing
+    ]) {
+      expect(parseComposedAccountScope(scope)).toBeNull();
+    }
+  });
+
+  test("composedAccountGrant — wildcard coverage keeps the highest verb", () => {
+    expect(composedAccountGrant(["account:self:vaults:*:read"], "self")).toEqual({
+      wildcard: "read",
+      vaults: new Map(),
+      create: false,
+      modules: new Map(),
+    });
+    // read + admin wildcards → admin wins (highest rung), order-independent.
+    expect(
+      composedAccountGrant(["account:self:vaults:*:read", "account:self:vaults:*:admin"], "self")
+        .wildcard,
+    ).toBe("admin");
+    expect(
+      composedAccountGrant(["account:self:vaults:*:admin", "account:self:vaults:*:read"], "self")
+        .wildcard,
+    ).toBe("admin");
+  });
+
+  test("composedAccountGrant — explicit per-vault map (highest verb per name)", () => {
+    const cov = composedAccountGrant(
+      [
+        "account:self:vaults:work:read",
+        "account:self:vaults:work:admin", // raises work → admin
+        "account:self:vaults:moss:write",
+      ],
+      "self",
+    );
+    expect(cov.wildcard).toBeNull();
+    expect(cov.vaults).toEqual(
+      new Map([
+        ["work", "admin"],
+        ["moss", "write"],
+      ]),
+    );
+    expect(cov.create).toBe(false);
+    expect(cov.modules.size).toBe(0);
+  });
+
+  test("composedAccountGrant — the create flag", () => {
+    expect(composedAccountGrant(["account:self:vault-create"], "self").create).toBe(true);
+    expect(composedAccountGrant(["account:self:vaults:work:read"], "self").create).toBe(false);
+  });
+
+  test("composedAccountGrant — module map (highest verb per module)", () => {
+    const cov = composedAccountGrant(
+      [
+        "account:self:mod:scribe:read",
+        "account:self:mod:scribe:write", // raises scribe → write
+        "account:self:mod:notes:admin",
+      ],
+      "self",
+    );
+    expect(cov.modules).toEqual(
+      new Map([
+        ["scribe", "write"],
+        ["notes", "admin"],
+      ]),
+    );
+  });
+
+  test("composedAccountGrant — a mixed composed set derives all four axes", () => {
+    const cov = composedAccountGrant(
+      [
+        "account:self:vaults:*:read",
+        "account:self:vaults:work:admin",
+        "account:self:vault-create",
+        "account:self:mod:scribe:write",
+        // legacy verb-less forms are NOT folded into composed coverage.
+        "account:self:vaults",
+        "account:self:vaults:archive",
+      ],
+      "self",
+    );
+    expect(cov.wildcard).toBe("read");
+    expect(cov.vaults).toEqual(new Map([["work", "admin"]])); // NOT "archive" (legacy)
+    expect(cov.create).toBe(true);
+    expect(cov.modules).toEqual(new Map([["scribe", "write"]]));
+  });
+
+  test("composedAccountGrant — foreign-id scopes are ignored (grant for A never covers B)", () => {
+    const cov = composedAccountGrant(
+      [
+        "account:u_2:vaults:*:admin", // foreign wildcard
+        "account:u_2:vaults:work:admin", // foreign vault
+        "account:u_2:vault-create", // foreign create
+        "account:u_2:mod:scribe:admin", // foreign module
+        "account:u_1:vaults:mine:read", // this id
+      ],
+      "u_1",
+    );
+    expect(cov.wildcard).toBeNull();
+    expect(cov.vaults).toEqual(new Map([["mine", "read"]]));
+    expect(cov.create).toBe(false);
+    expect(cov.modules.size).toBe(0);
+  });
+
+  test("composedAccountGrant — an empty / non-composed set yields empty coverage", () => {
+    const empty = { wildcard: null, vaults: new Map(), create: false, modules: new Map() };
+    expect(composedAccountGrant([], "self")).toEqual(empty);
+    expect(composedAccountGrant(["account:self:admin", "vault:work:read"], "self")).toEqual(empty);
   });
 });
 

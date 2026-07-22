@@ -176,3 +176,251 @@ export function accountVaultsGrant(
   }
   return vaults.length > 0 ? { vaults } : null;
 }
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The COMPOSED account-scope grammar (unified `/mcp` — Phase 1).
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * The ratified unified-MCP design collapses the many per-resource MCP endpoints
+ * into ONE `/mcp` gateway. Its OAuth consent composes a single grant spanning the
+ * account, its vaults (a wildcard over every owned vault, a set of named vaults,
+ * or one vault — each at a verb), the "create new vaults" capability, and future
+ * modules. The whole composed grant rides on ONE `aud="account"` token; the
+ * gateway decomposes it per-call into 60s single-audience mints.
+ *
+ * Because the composed grant is decomposed by the gateway (never handed to a
+ * resource server directly), ALL composed vault/module authority is encoded
+ * INSIDE the `account:` namespace — deliberately NOT as a raw `vault:<name>:<verb>`
+ * scope, which `inferAudience` would stamp as a vault audience and route around
+ * the gateway. The `account:<id>:…` prefix keeps every composed grant on the
+ * account token where the gateway owns decomposition.
+ *
+ * This Phase-1 PR only DEFINES + PARSES the grammar. Nothing emits or mints these
+ * forms yet; consent, minting, and the gateway are later phases that consume this
+ * vocabulary. Every new form below is NON-REQUESTABLE — a client can never
+ * pre-narrow or pre-widen itself into one; the consent step is the sole author.
+ *
+ * The composed granted forms (all built by consent, never requested):
+ *   - `account:<id>:vaults:*:<verb>`      — WILDCARD vault grant: every vault the
+ *                                            account owns, at `<verb>`. `*` can
+ *                                            never collide with a vault name (the
+ *                                            vault-name charset excludes `*`).
+ *   - `account:<id>:vaults:<vault>:<verb>` — a PER-VAULT grant at `<verb>` (5-part).
+ *   - `account:<id>:vault-create`          — the "create new vaults" capability
+ *                                            (3-part; a distinct `vault-create`
+ *                                            verb-slot, NOT a member of the
+ *                                            `vaults` family).
+ *   - `account:<id>:mod:<module>:<verb>`   — a MODULE grant (future modules).
+ *
+ * `<verb>` here is the three-rung vault/module ladder `read|write|admin` (NOT the
+ * two-rung account ladder `read|admin` — a composed vault grant can be `write`).
+ *
+ * The LEGACY Wave A forms keep their exact meaning, frozen — existing tokens and
+ * refresh families must parse identically:
+ *   - `account:<id>:vaults`          — the blanket account-vaults connection grant.
+ *   - `account:<id>:vaults:<vault>`  — the consent-narrowed 4-part grant.
+ * Neither carries a verb; they remain `accountVaultsGrant`'s domain and are NOT
+ * folded into the composed coverage below (which is verb-carrying).
+ */
+
+/** The three-rung composed vault/module verb ladder (`admin ⊇ write ⊇ read`). */
+export type ComposedVaultVerb = "read" | "write" | "admin";
+
+/** `admin ⊇ write ⊇ read` — the rank used for "requiredVerb ≤ grantedVerb" checks. */
+export const COMPOSED_VERB_RANK: Record<ComposedVaultVerb, number> = {
+  read: 0,
+  write: 1,
+  admin: 2,
+};
+
+/** Narrow an arbitrary string to a composed vault/module verb. */
+export function isComposedVaultVerb(s: string): s is ComposedVaultVerb {
+  return s === "read" || s === "write" || s === "admin";
+}
+
+/**
+ * Does a `granted` verb satisfy a `required` verb on the composed ladder? `admin`
+ * satisfies `write` and `read`; `write` satisfies `read`. The later gateway/mint
+ * phases use this for "the call needs `read`, the grant carries `write` → allow".
+ */
+export function composedVerbSatisfies(
+  granted: ComposedVaultVerb,
+  required: ComposedVaultVerb,
+): boolean {
+  return COMPOSED_VERB_RANK[granted] >= COMPOSED_VERB_RANK[required];
+}
+
+/** The wildcard vault-slot sentinel (`account:<id>:vaults:*:<verb>`). */
+export const COMPOSED_VAULTS_WILDCARD = "*";
+/** The `vaults` family segment (composed vault grants + legacy Wave A forms). */
+export const COMPOSED_VAULTS_SEGMENT = "vaults";
+/** The 3-part "create new vaults" capability verb-slot. */
+export const COMPOSED_VAULT_CREATE_VERB = "vault-create";
+/** The `mod` family segment (`account:<id>:mod:<module>:<verb>`). */
+export const COMPOSED_MODULE_SEGMENT = "mod";
+
+/** A parsed composed account scope — the discriminated union over every family. */
+export type ComposedAccountScope =
+  | { kind: "wildcard-vaults"; id: string; verb: ComposedVaultVerb }
+  | { kind: "vault"; id: string; vault: string; verb: ComposedVaultVerb }
+  | { kind: "vault-create"; id: string }
+  | { kind: "module"; id: string; module: string; verb: ComposedVaultVerb }
+  | { kind: "legacy-blanket"; id: string }
+  | { kind: "legacy-vault"; id: string; vault: string };
+
+/**
+ * Build the wildcard vault grant `account:<id>:vaults:*:<verb>`. */
+export function composedWildcardVaultsScope(id: string, verb: ComposedVaultVerb): string {
+  return `account:${id}:${COMPOSED_VAULTS_SEGMENT}:${COMPOSED_VAULTS_WILDCARD}:${verb}`;
+}
+
+/** Build a per-vault grant `account:<id>:vaults:<vault>:<verb>`. */
+export function composedVaultScope(id: string, vault: string, verb: ComposedVaultVerb): string {
+  return `account:${id}:${COMPOSED_VAULTS_SEGMENT}:${vault}:${verb}`;
+}
+
+/** Build the "create new vaults" capability `account:<id>:vault-create`. */
+export function composedVaultCreateScope(id: string): string {
+  return `account:${id}:${COMPOSED_VAULT_CREATE_VERB}`;
+}
+
+/** Build a module grant `account:<id>:mod:<module>:<verb>`. */
+export function composedModuleScope(id: string, module: string, verb: ComposedVaultVerb): string {
+  return `account:${id}:${COMPOSED_MODULE_SEGMENT}:${module}:${verb}`;
+}
+
+/**
+ * Parse ANY composed account scope into its discriminated shape, or `null` for
+ * anything unrecognized (fail-closed — mirrors `parseAccountVaultsScope`). This
+ * recognizer is deliberately a SUPERSET: it covers both the new composed families
+ * AND the legacy Wave A forms so that a single pass extracts `<id>` from every
+ * `account:`-namespaced grant.
+ *
+ * §1.4 guardrail (unified-MCP design): the hub's cross-account mint gate
+ * (`denyForeignAccountMint`) id-checks only the forms its parser RECOGNIZES — a
+ * form that parses to `null` would SKIP the id check. The composed forms are
+ * non-requestable (thus unreachable by that gate today), but when a later phase
+ * makes them mintable the gate must already extract their `<id>`. Recognizing
+ * every family HERE is what lets the gate reject a foreign-id composed scope then.
+ *
+ * The `account:<id>:{read|admin}` account-verb ladder is intentionally NOT a
+ * composed form (it is `parseAccountScope`'s domain) and yields `null` here.
+ *
+ * Fail-closed rules: `account` resource required, `<id>` non-empty, verbs from the
+ * composed ladder, and `*` is ONLY ever the wildcard sentinel — it is never
+ * accepted as a concrete vault name (a 4-part `account:<id>:vaults:*` → `null`).
+ */
+export function parseComposedAccountScope(scope: string): ComposedAccountScope | null {
+  const parts = scope.split(":");
+  if (parts[0] !== "account") return null;
+  const id = parts[1];
+  if (!id || id.length === 0) return null;
+
+  if (parts.length === 3) {
+    const slot = parts[2] as string;
+    if (slot === COMPOSED_VAULTS_SEGMENT) return { kind: "legacy-blanket", id };
+    if (slot === COMPOSED_VAULT_CREATE_VERB) return { kind: "vault-create", id };
+    return null;
+  }
+
+  if (parts.length === 4) {
+    // Legacy Wave A consent-narrowed form `account:<id>:vaults:<vault>`. `*` is
+    // never a concrete vault name, so a `*` in the vault slot fails closed.
+    const [, , family, vault] = parts as [string, string, string, string];
+    if (family !== COMPOSED_VAULTS_SEGMENT) return null;
+    if (vault.length === 0 || vault === COMPOSED_VAULTS_WILDCARD) return null;
+    return { kind: "legacy-vault", id, vault };
+  }
+
+  if (parts.length === 5) {
+    const [, , family, target, verb] = parts as [string, string, string, string, string];
+    if (!isComposedVaultVerb(verb)) return null;
+    if (family === COMPOSED_VAULTS_SEGMENT) {
+      if (target === COMPOSED_VAULTS_WILDCARD) return { kind: "wildcard-vaults", id, verb };
+      if (target.length === 0) return null;
+      return { kind: "vault", id, vault: target, verb };
+    }
+    if (family === COMPOSED_MODULE_SEGMENT) {
+      if (target.length === 0) return null;
+      return { kind: "module", id, module: target, verb };
+    }
+    return null;
+  }
+
+  return null;
+}
+
+/**
+ * The coverage a COMPOSED grant confers for one account id — derived from the
+ * verb-carrying composed forms plus the create capability and modules:
+ *   - `wildcard` — the highest wildcard verb granted (`account:<id>:vaults:*:<verb>`),
+ *     or `null` if no wildcard vault grant is present. A wildcard covers every
+ *     owned vault at that verb.
+ *   - `vaults`   — a Map of vault-name → highest explicitly-granted verb
+ *     (`account:<id>:vaults:<vault>:<verb>`).
+ *   - `create`   — whether `account:<id>:vault-create` is present.
+ *   - `modules`  — a Map of module-name → highest granted verb
+ *     (`account:<id>:mod:<module>:<verb>`).
+ * Duplicate/overlapping grants collapse to the highest verb per key. Foreign-id
+ * scopes are ignored. The LEGACY (verb-less) `account:<id>:vaults[:<vault>]` forms
+ * are NOT folded in here — they carry no verb and remain `accountVaultsGrant`'s
+ * domain; this keeps legacy Wave A semantics untouched.
+ */
+export interface ComposedAccountCoverage {
+  wildcard: ComposedVaultVerb | null;
+  vaults: Map<string, ComposedVaultVerb>;
+  create: boolean;
+  modules: Map<string, ComposedVaultVerb>;
+}
+
+/** Fold `<verb>` into `map[key]`, keeping the higher rung. */
+function raiseVerb(
+  map: Map<string, ComposedVaultVerb>,
+  key: string,
+  verb: ComposedVaultVerb,
+): void {
+  const cur = map.get(key);
+  if (!cur || COMPOSED_VERB_RANK[verb] > COMPOSED_VERB_RANK[cur]) map.set(key, verb);
+}
+
+export function composedAccountGrant(
+  grantedScopes: readonly string[],
+  accountId: string,
+): ComposedAccountCoverage {
+  const coverage: ComposedAccountCoverage = {
+    wildcard: null,
+    vaults: new Map(),
+    create: false,
+    modules: new Map(),
+  };
+  for (const s of grantedScopes) {
+    const parsed = parseComposedAccountScope(s);
+    if (!parsed || parsed.id !== accountId) continue;
+    switch (parsed.kind) {
+      case "wildcard-vaults":
+        if (
+          !coverage.wildcard ||
+          COMPOSED_VERB_RANK[parsed.verb] > COMPOSED_VERB_RANK[coverage.wildcard]
+        ) {
+          coverage.wildcard = parsed.verb;
+        }
+        break;
+      case "vault":
+        raiseVerb(coverage.vaults, parsed.vault, parsed.verb);
+        break;
+      case "vault-create":
+        coverage.create = true;
+        break;
+      case "module":
+        raiseVerb(coverage.modules, parsed.module, parsed.verb);
+        break;
+      // Legacy verb-less forms are not part of the composed (verb-carrying)
+      // coverage — they stay in `accountVaultsGrant`.
+      case "legacy-blanket":
+      case "legacy-vault":
+        break;
+    }
+  }
+  return coverage;
+}
