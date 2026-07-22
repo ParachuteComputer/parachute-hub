@@ -1,5 +1,67 @@
 # @openparachute/door-contract
 
+## 0.6.0
+
+The COMPOSED account-scope grammar (unified `/mcp` — Phase 1). The ratified
+unified-MCP design collapses the per-resource MCP endpoints into ONE `/mcp`
+gateway whose OAuth consent composes a single grant across the account, its
+vaults, the "create vaults" capability, and future modules; the whole composed
+grant rides one `aud="account"` token that the gateway decomposes per-call into
+60s single-audience mints. Because the gateway owns decomposition, ALL composed
+vault/module authority is encoded INSIDE the `account:` namespace (never a raw
+`vault:<name>:<verb>`, which `inferAudience` would stamp as a vault audience and
+route around the gateway).
+
+This bump only DEFINES + PARSES the grammar — nothing emits or mints these forms
+yet; consent, minting, and the gateway are LATER phases that consume this
+vocabulary. Purely additive: new exports only, zero change to any existing
+signature or behavior, and every new form is NON-REQUESTABLE (consent is the sole
+author — `isRequestableAccountScope` is unchanged and refuses all of them).
+
+New granted forms (all consent-authored, none requestable):
+
+- `account:<id>:vaults:*:<verb>` — WILDCARD vault grant (every owned vault at
+  `<verb>`; `*` can never collide with a vault name — the vault-name charset
+  excludes `*`).
+- `account:<id>:vaults:<vault>:<verb>` — per-vault 5-part grant at a verb.
+- `account:<id>:vault-create` — the "create new vaults" capability (a distinct
+  3-part verb-slot, NOT a member of the `vaults` family).
+- `account:<id>:mod:<module>:<verb>` — module grant (future modules).
+
+`<verb>` is the three-rung vault/module ladder `read|write|admin` (distinct from
+the two-rung account ladder `read|admin`). The LEGACY Wave A forms keep their
+exact frozen meaning — `account:<id>:vaults` (blanket) and
+`account:<id>:vaults:<vault>` (4-part narrowed) parse identically; existing
+tokens + refresh families are untouched.
+
+New in `scopes.ts` (re-exported from the package root):
+
+- `ComposedVaultVerb` + `COMPOSED_VERB_RANK` (`admin ⊇ write ⊇ read`) +
+  `isComposedVaultVerb` + `composedVerbSatisfies(granted, required)` — the verb
+  ladder + the "requiredVerb ≤ grantedVerb" helper the later mint phase uses.
+- Segment/sentinel constants (`COMPOSED_VAULTS_WILDCARD`,
+  `COMPOSED_VAULTS_SEGMENT`, `COMPOSED_VAULT_CREATE_VERB`,
+  `COMPOSED_MODULE_SEGMENT`) + builders (`composedWildcardVaultsScope`,
+  `composedVaultScope`, `composedVaultCreateScope`, `composedModuleScope`).
+- `ComposedAccountScope` + `parseComposedAccountScope(scope)` — a fail-closed,
+  discriminated-union recognizer that is deliberately a SUPERSET (covers the new
+  composed families AND the legacy Wave A forms) so ONE pass extracts `<id>` from
+  every `account:`-namespaced grant. §1.4 rationale: the hub's cross-account mint
+  gate id-checks only the forms its parser recognizes — a form parsing to `null`
+  would SKIP the id check; recognizing every family here means that when a later
+  phase makes them mintable, the gate already extracts (and can reject) a
+  foreign-id composed scope. `*` is ONLY ever the wildcard sentinel — never a
+  concrete vault name.
+- `ComposedAccountCoverage` + `composedAccountGrant(grantedScopes, accountId)` —
+  the coverage deriver over the verb-carrying composed forms: `wildcard` (highest
+  wildcard verb, or null), `vaults` (Map name→highest verb), `create` (boolean),
+  `modules` (Map module→highest verb). Foreign-id scopes ignored; the verb-less
+  legacy forms are NOT folded in (they remain `accountVaultsGrant`'s domain — Wave
+  A semantics untouched).
+
+The existing Wave A surface (`isRequestableAccountScope`, `parseAccountVaultsScope`,
+`accountVaultsGrant`) and the account read/admin ladder are unchanged.
+
 ## 0.5.0
 
 The `account:<id>:vaults` scope grammar (Wave A PR1) — the foundation the cloud

@@ -47,6 +47,22 @@ export {
   isRequestableAccountScope,
   parseAccountVaultsScope,
   accountVaultsGrant,
+  type ComposedVaultVerb,
+  COMPOSED_VERB_RANK,
+  isComposedVaultVerb,
+  composedVerbSatisfies,
+  COMPOSED_VAULTS_WILDCARD,
+  COMPOSED_VAULTS_SEGMENT,
+  COMPOSED_VAULT_CREATE_VERB,
+  COMPOSED_MODULE_SEGMENT,
+  type ComposedAccountScope,
+  composedWildcardVaultsScope,
+  composedVaultScope,
+  composedVaultCreateScope,
+  composedModuleScope,
+  parseComposedAccountScope,
+  type ComposedAccountCoverage,
+  composedAccountGrant,
 } from "./scopes.js";
 
 export {
