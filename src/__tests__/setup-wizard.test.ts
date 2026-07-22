@@ -1786,15 +1786,15 @@ describe("handleSetupVaultPost", () => {
     }
   });
 
-  test("second POST while supervisor is running provisions (idempotent) without a second `bun add` (N2)", async () => {
+  test("second POST while supervisor is running but vault UNREGISTERED — synthesize success, no 2nd bun add, no double provision (N2 race)", async () => {
     // Reviewer-flagged race: two concurrent POSTs before either seeds
-    // services.json both pass `state.hasVault === false`. The wizard mirrors
-    // the `handleInstall` guard pattern: if the supervisor already has a live
-    // (starting/running/restarting) state for vault, it does NOT fire a second
-    // `bun add -g`. Post the e2e wizard-skip fix it no longer SYNTHESIZES a
-    // succeeded op (which created nothing on a boot-spawned-child box) — it
-    // drives `provisionVault` to actually create the named vault, which is
-    // idempotent (returns created:false when a racing POST already made it).
+    // services.json both pass `state.hasVault === false`. The supervisor is
+    // already running vault (a prior POST's runInstall spawned it) but the
+    // services.json row hasn't been written yet — so `vaultAlreadyRegistered`
+    // is false. The wizard must NOT fire a second `bun add -g` AND must NOT
+    // fire `provisionVault` (which would `parachute install vault` a second
+    // time in this pre-seed window — reviewer N2). Instead it synthesizes a
+    // succeeded op and lets the in-flight install create the vault.
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -1810,8 +1810,9 @@ describe("handleSetupVaultPost", () => {
       });
       const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
       // Real supervisor with the never-exits spawn stub from makeSupervisor.
-      // Pre-spawn vault so `supervisor.get("vault").status === "starting"`
-      // by the time the wizard's POST runs.
+      // Pre-spawn vault so `supervisor.get("vault").status === "starting"`.
+      // The harness manifest is EMPTY (vault not registered) — the pre-seed
+      // window.
       const supervisor = makeSupervisor();
       await supervisor.start({ short: "vault", cmd: ["bun", "noop"] });
       const runCalls: string[][] = [];
@@ -1819,15 +1820,13 @@ describe("handleSetupVaultPost", () => {
         runCalls.push([...cmd]);
         return 0;
       };
-      // Stub provisionVault so the short-circuit doesn't shell out to the real
-      // `parachute-vault create`. Idempotent case: the racing POST already
-      // created the vault, so this returns created:false.
+      // provisionVault must NOT be called in the unregistered race window.
       const provisionCalls: string[] = [];
       const provisionVaultImpl = async (name: string) => {
         provisionCalls.push(name);
         return {
           ok: true as const,
-          created: false,
+          created: true,
           entry: { name, url: `https://hub.example/vault/${name}`, version: "1.0.0" },
           createJson: null,
         };
@@ -1858,13 +1857,11 @@ describe("handleSetupVaultPost", () => {
       expect(post.status).toBe(303);
       const location = post.headers.get("location") ?? "";
       expect(location).toMatch(/^\/admin\/setup\?op=/);
-      // Yield enough for any background runInstall promise to fire if
-      // the guard failed. Then assert: no `bun add` was invoked, the vault was
-      // provisioned via provisionVault (default name), and the op succeeded
-      // with the canonical "already supervised" log line.
+      // Yield for any background promise. Then assert: no `bun add`, NO
+      // provisionVault call (no double-install), op synthesized succeeded.
       await new Promise((r) => setTimeout(r, 50));
       expect(runCalls.length).toBe(0);
-      expect(provisionCalls).toEqual(["default"]);
+      expect(provisionCalls).toEqual([]);
       const opId = new URL(location, "http://x").searchParams.get("op") ?? "";
       const op = getDefaultOperationsRegistry().get(opId);
       expect(op?.status).toBe("succeeded");
@@ -1978,6 +1975,91 @@ describe("handleSetupVaultPost", () => {
       const op = getDefaultOperationsRegistry().get(opId);
       expect(op?.status).toBe("succeeded");
       expect(op?.log.join("\n")).toContain('vault "e2e" created');
+    } finally {
+      db.close();
+    }
+  });
+
+  test("import mode on an already-supervised box is REJECTED (no empty vault + fake success) — review must-fix", async () => {
+    // On a boot-spawned box (vault module already supervised), the short-circuit
+    // create path provisions an EMPTY vault. An IMPORT request must NOT be run
+    // through it: that would leave an empty vault named after the import target
+    // + a false "vault created" banner (a data-integrity footgun). The wizard
+    // rejects import with an actionable message + a FAILED op instead.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession, SESSION_COOKIE_NAME: SC } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.7.4-rc.1",
+              port: 1940,
+              paths: [],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      const supervisor = makeSupervisor();
+      await supervisor.start({ short: "vault", cmd: ["bun", "noop"] });
+      const provisionCalls: string[] = [];
+      const post = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            "content-type": "application/json",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SC}=${session.id}`,
+          },
+          body: JSON.stringify({
+            [CSRF_FIELD_NAME]: csrf,
+            mode: "import",
+            vault_name: "fromgit",
+            remote_url: "https://example.com/repo.git",
+            import_mode: "merge",
+          }),
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
+          issuer: "https://hub.example",
+          supervisor,
+          registry: getDefaultOperationsRegistry(),
+          provisionVaultImpl: async (name: string) => {
+            provisionCalls.push(name);
+            return {
+              ok: true as const,
+              created: true,
+              entry: { name, url: `https://hub.example/vault/${name}`, version: "0.7.4-rc.1" },
+              createJson: null,
+            };
+          },
+        },
+      );
+      expect(post.status).toBe(200);
+      const body = (await post.json()) as { op_id?: string; message?: string };
+      expect(body.message ?? "").toContain("isn't supported");
+      // Import was NOT provisioned (no empty vault created).
+      expect(provisionCalls).toEqual([]);
+      // The op is FAILED, not a fake success.
+      const op = body.op_id ? getDefaultOperationsRegistry().get(body.op_id) : undefined;
+      expect(op?.status).toBe("failed");
     } finally {
       db.close();
     }

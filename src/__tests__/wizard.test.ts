@@ -687,4 +687,51 @@ describe("runCliWizard", () => {
       });
     }
   });
+
+  test("headless runCliWizard with NO --transcribe-mode completes (transcription defaults to none, not a throw)", async () => {
+    // Regression guard for the review must-fix: `runCliWizard` used to forward
+    // its (throwing) `defaultPrompt` into the transcription step, so a headless
+    // run with account/vault/expose all supplied via flags but NO
+    // `--transcribe-mode` would THROW at the transcription step ("cannot prompt
+    // for: Pick [1]:") instead of defaulting to none. The wizard now forwards a
+    // prompt to the transcription step ONLY when a real seam is injected, so
+    // headless hits `resolveChoice`'s undefined-prompt non-TTY guard → none.
+    const { state, fetchImpl } = makeFakeHub();
+    const logs: string[] = [];
+    let ran = false;
+    const origIsTTY = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    try {
+      const code = await runCliWizard({
+        hubUrl: "http://127.0.0.1:1939",
+        log: (l) => logs.push(l),
+        fetchImpl,
+        sleep: async () => {},
+        accountUsername: "admin",
+        accountPassword: "longpassword",
+        vaultMode: "skip",
+        exposeMode: "localhost",
+        configDir: "/tmp/pcli-wizard-headless-none", // triggers the step; none writes nothing
+        // NO transcribeMode, NO prompt seam → headless must default to none.
+        transcribeRunCommand: async () => {
+          ran = true;
+          return 0;
+        },
+      });
+      expect(code).toBe(0); // completed, did NOT throw
+      expect(ran).toBe(false); // none → no scribe install
+      expect(logs.join("\n")).toContain("Transcription off");
+      // Full flow still walked account → vault → expose.
+      expect(state.posted.map((p) => p.path)).toEqual([
+        "/admin/setup/account",
+        "/admin/setup/vault",
+        "/admin/setup/expose",
+      ]);
+    } finally {
+      Object.defineProperty(process.stdin, "isTTY", {
+        value: origIsTTY,
+        configurable: true,
+      });
+    }
+  });
 });

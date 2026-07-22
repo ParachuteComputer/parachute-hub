@@ -807,7 +807,16 @@ export async function runCliWizard(opts: RunCliWizardOpts): Promise<number> {
     await walkTranscriptionStep({
       configDir: opts.configDir,
       log,
-      prompt,
+      // Only forward a REAL injected prompt seam — NOT the resolved
+      // `prompt` (which is the throwing `defaultPrompt` when the caller
+      // supplied none). Passing the default here would defeat
+      // `resolveChoice`'s `opts.prompt === undefined` non-TTY guard: on a
+      // headless box with no `--transcribe-mode`, the transcription step
+      // would call the throwing default mid-wizard instead of defaulting to
+      // `none`. With the seam forwarded only when present, headless runs hit
+      // the guard (default none) and interactive/test runs still get their
+      // reader.
+      ...(opts.prompt !== undefined ? { prompt: opts.prompt } : {}),
       ...(opts.transcribeMode !== undefined ? { transcribeMode: opts.transcribeMode } : {}),
       ...(opts.transcribeApiKey !== undefined ? { transcribeApiKey: opts.transcribeApiKey } : {}),
       ...(opts.transcribeRunCommand !== undefined ? { runCommand: opts.transcribeRunCommand } : {}),
