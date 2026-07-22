@@ -1,5 +1,45 @@
 # @openparachute/door-contract
 
+## 0.5.0
+
+The `account:<id>:vaults` scope grammar (Wave A PR1) — the foundation the cloud
+Wave A PRs consume as a pinned dependency (a cloud pin-bump follows). Wave A is
+an account-level MCP connection (list-vaults + create-vault + query-across-vaults)
+opened by a NEW narrow requestable scope, the SINGLE deliberate exception to the
+account wall. Purely additive: new exports + one optional descriptor field, zero
+change to any existing signature or behavior.
+
+New in `scopes.ts` (re-exported from the package root):
+
+- `isRequestableAccountScope(scope)` — the account wall stays closed except for
+  the account-vaults connection scope. `account:vaults` (un-narrowed, the
+  PRM-advertised request form) and `account:<id>:vaults` (consent-bound blanket)
+  are requestable; `account:<id>:{admin,read}`, `account:admin`, `account:read`,
+  and the 4-part `account:<id>:vaults:<vault>` (consent-narrowed — consent
+  narrows, a client can't pre-narrow itself) are NOT. Exact-lowercase; casing
+  variants fail closed.
+- `ACCOUNT_VAULTS_VERB` (`"vaults"`), `ACCOUNT_VAULTS_UNNARROWED`
+  (`"account:vaults"`), and `accountVaultsScope(id)` → `account:<id>:vaults`.
+- `parseAccountVaultsScope(scope)` — 3-part → `{ id, vault: null }` (blanket),
+  4-part → `{ id, vault }` (narrowed), else `null` (fail-closed on empty id/vault
+  or extra parts).
+- `accountVaultsGrant(grantedScopes, accountId)` — the coverage-set deriver:
+  `{ blanket: true }` when a bare 3-part scope for this id is present (blanket
+  always wins), else `{ vaults: [...] }` (the de-duped set of narrowed vault
+  names for this id), else `null`. Foreign-id scopes are ignored.
+
+The narrowing rides the SCOPE STRING (a set of 4-part scopes), NOT a side
+`vault_scope` claim — a vault_scope wouldn't survive token refresh, whereas the
+scope string does. The existing `account:<id>:<verb>` grammar
+(`parseAccountScope` / `hasAccountScope` / `NON_REQUESTABLE_SCOPES`) and the REST
+read/admin ladder are untouched.
+
+`ParachuteAccountDescriptor` gains an optional `account_mcp_endpoint?: string` —
+the account-MCP endpoint a client opens against the `account:<id>:vaults` scope.
+Unset today (no door advertises it yet; `checkAccountDescriptor` does not require
+it). This bump does NOT flip the `auth` field required — that flip stays gated on
+both doors serving it (its own later PR), out of scope for this additive change.
+
 ## 0.4.0
 
 The auth block + the session/token wire canon (hub-parity P0). `signup_path` and

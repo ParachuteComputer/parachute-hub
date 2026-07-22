@@ -41,6 +41,12 @@ export {
   accountScope,
   parseAccountScope,
   hasAccountScope,
+  ACCOUNT_VAULTS_VERB,
+  ACCOUNT_VAULTS_UNNARROWED,
+  accountVaultsScope,
+  isRequestableAccountScope,
+  parseAccountVaultsScope,
+  accountVaultsGrant,
 } from "./scopes.js";
 
 export {

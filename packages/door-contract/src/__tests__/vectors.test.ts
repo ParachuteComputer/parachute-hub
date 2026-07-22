@@ -5,10 +5,14 @@ import {
   ACCOUNT_ROUTES,
   ACCOUNT_SELF_ADMIN_SCOPE,
   ACCOUNT_SELF_READ_SCOPE,
+  ACCOUNT_VAULTS_UNNARROWED,
+  ACCOUNT_VAULTS_VERB,
   REFRESH_GRACE_MS,
   REFRESH_TOKEN_TTL_MS,
   TOKEN_TYPE,
   accountScope,
+  accountVaultsGrant,
+  accountVaultsScope,
   checkAccountDescriptor,
   checkAccountSessionResponse,
   checkAccountTokenMintResponse,
@@ -19,7 +23,9 @@ import {
   expectedAuthorizationServerMetadata,
   expectedProtectedResourceMetadata,
   hasAccountScope,
+  isRequestableAccountScope,
   parseAccountScope,
+  parseAccountVaultsScope,
   validateVaultScopes,
 } from "../index.js";
 
@@ -66,6 +72,98 @@ describe("account scope grammar", () => {
     expect(hasAccountScope(["account:self:read"], "self", "admin")).toBe(false);
     expect(hasAccountScope(["account:u_1:admin"], "u_2", "read")).toBe(false);
     expect(hasAccountScope(["vault:x:admin"], "self", "read")).toBe(false);
+  });
+});
+
+describe("account-vaults scope grammar (Wave A)", () => {
+  test("constants + builder", () => {
+    expect(ACCOUNT_VAULTS_VERB).toBe("vaults");
+    expect(ACCOUNT_VAULTS_UNNARROWED).toBe("account:vaults");
+    expect(accountVaultsScope("self")).toBe("account:self:vaults");
+    expect(accountVaultsScope("u_123")).toBe("account:u_123:vaults");
+  });
+
+  // The account wall stays closed to everything except the account-vaults
+  // connection scope — the single deliberate exception (Wave A). This table is
+  // the requestable/refused contract the door's consent gate enforces.
+  test("isRequestableAccountScope — the requestable/refused vector table", () => {
+    // Requestable: the un-narrowed PRM form + the consent-bound blanket form.
+    for (const scope of ["account:vaults", "account:self:vaults", "account:u_123:vaults"]) {
+      expect(isRequestableAccountScope(scope)).toBe(true);
+    }
+    // Refused: the account wall (admin/read, 2- and 3-part), the 4-part
+    // consent-NARROWED form (consent narrows; a client can't pre-narrow itself),
+    // casing variants (exact-lowercase, fail closed), and non-account scopes.
+    for (const scope of [
+      "account:self:admin",
+      "account:self:read",
+      "account:u_123:admin",
+      "account:u_123:read",
+      "account:admin",
+      "account:read",
+      "account:self:vaults:work", // 4-part narrowed — NOT requestable
+      "account:self:vaults:work:extra", // over-long
+      "account::vaults", // empty id
+      "Account:self:vaults", // casing
+      "account:self:Vaults", // casing
+      "account:vaults:extra", // 3-part but not <id>:vaults
+      "vault:work:read", // non-account
+      "account", // bare
+      "",
+    ]) {
+      expect(isRequestableAccountScope(scope)).toBe(false);
+    }
+  });
+
+  test("parseAccountVaultsScope — blanket / narrowed / foreign / malformed", () => {
+    // 3-part blanket.
+    expect(parseAccountVaultsScope("account:self:vaults")).toEqual({ id: "self", vault: null });
+    expect(parseAccountVaultsScope("account:u_1:vaults")).toEqual({ id: "u_1", vault: null });
+    // 4-part narrowed.
+    expect(parseAccountVaultsScope("account:self:vaults:work")).toEqual({
+      id: "self",
+      vault: "work",
+    });
+    expect(parseAccountVaultsScope("account:u_1:vaults:moss")).toEqual({
+      id: "u_1",
+      vault: "moss",
+    });
+    // Malformed / non-member → null.
+    expect(parseAccountVaultsScope("account:self:admin")).toBeNull(); // wrong verb
+    expect(parseAccountVaultsScope("account:self:read")).toBeNull(); // wrong verb
+    expect(parseAccountVaultsScope("vault:work:read")).toBeNull(); // wrong resource
+    expect(parseAccountVaultsScope("account::vaults")).toBeNull(); // empty id (3-part)
+    expect(parseAccountVaultsScope("account::vaults:work")).toBeNull(); // empty id (4-part)
+    expect(parseAccountVaultsScope("account:self:vaults:")).toBeNull(); // empty vault
+    expect(parseAccountVaultsScope("account:vaults")).toBeNull(); // 2-part un-narrowed has no id
+    expect(parseAccountVaultsScope("account:self:vaults:a:b")).toBeNull(); // over-long
+  });
+
+  test("accountVaultsGrant — blanket wins, narrowed set, foreign-id ignored, empty→null", () => {
+    // Blanket present → { blanket: true } (covers every vault the account owns).
+    expect(accountVaultsGrant(["account:self:vaults"], "self")).toEqual({ blanket: true });
+    // Blanket wins even alongside narrowed scopes and regardless of order.
+    expect(accountVaultsGrant(["account:self:vaults:work", "account:self:vaults"], "self")).toEqual(
+      { blanket: true },
+    );
+    // Narrowed only → the de-duped set of vault names.
+    expect(accountVaultsGrant(["account:self:vaults:work"], "self")).toEqual({ vaults: ["work"] });
+    expect(
+      accountVaultsGrant(
+        ["account:self:vaults:work", "account:self:vaults:moss", "account:self:vaults:work"],
+        "self",
+      ),
+    ).toEqual({ vaults: ["work", "moss"] });
+    // Foreign-id scopes are ignored — a grant for account A never covers B.
+    expect(accountVaultsGrant(["account:u_2:vaults"], "u_1")).toBeNull();
+    expect(accountVaultsGrant(["account:u_2:vaults:work"], "u_1")).toBeNull();
+    // A foreign blanket alongside this id's narrowed → only this id's set.
+    expect(accountVaultsGrant(["account:u_2:vaults", "account:u_1:vaults:work"], "u_1")).toEqual({
+      vaults: ["work"],
+    });
+    // No account-vaults scope at all → null.
+    expect(accountVaultsGrant([], "self")).toBeNull();
+    expect(accountVaultsGrant(["account:self:admin", "vault:work:read"], "self")).toBeNull();
   });
 });
 
