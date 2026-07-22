@@ -138,6 +138,14 @@ export interface ParachuteAccountDescriptor {
   /** The `/account/*` API base — always `${issuer}/account`. */
   account_endpoint: string;
   /**
+   * The account-level MCP endpoint (Wave A) — the connection a client opens
+   * against the `account:<id>:vaults` scope for list-vaults + create-vault +
+   * query-across-vaults. Optional and unset today: no door advertises it yet
+   * (`checkAccountDescriptor` does not require it). Present only once a door
+   * mounts its account-MCP surface.
+   */
+  account_mcp_endpoint?: string;
+  /**
    * How a person signs IN at this door. Optional in 0.4.0 so cloud@main keeps
    * typechecking while it lands its own twin (P3); P7 flips this required once
    * both doors serve it.
