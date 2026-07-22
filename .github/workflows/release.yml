@@ -1,28 +1,32 @@
 # Release workflow — triggered by pushing a semver tag.
 #
-# This workflow publishes THREE packages on different tag namespaces:
+# This workflow publishes FOUR packages on different tag namespaces:
 #
-#   - @openparachute/hub          ← tag prefix `v...`            (e.g. v0.5.13-rc.33)
-#   - @openparachute/scope-guard  ← tag prefix `scope-guard-v...` (e.g. scope-guard-v0.4.0-rc.2)
-#   - @openparachute/depcheck     ← tag prefix `depcheck-v...`    (e.g. depcheck-v0.1.0-rc.1)
+#   - @openparachute/hub            ← tag prefix `v...`              (e.g. v0.5.13-rc.33)
+#   - @openparachute/scope-guard    ← tag prefix `scope-guard-v...`   (e.g. scope-guard-v0.4.0-rc.2)
+#   - @openparachute/depcheck       ← tag prefix `depcheck-v...`      (e.g. depcheck-v0.1.0-rc.1)
+#   - @openparachute/door-contract  ← tag prefix `door-contract-v...` (e.g. door-contract-v0.6.0)
 #
 # All packages have npm Trusted Publisher rules pointing at this workflow
 # file. The jobs below gate on the tag prefix so only one package publishes
 # per tag push. Independent release cadences; hub doesn't have to bump when
-# scope-guard / depcheck ship and vice versa.
+# scope-guard / depcheck / door-contract ship and vice versa.
 #
 # Tag conventions (matches governance rule 2, https://github.com/ParachuteComputer/parachute-workspace/blob/main/docs/process/governance.md):
 #   - rc:     v<X>.<Y>.<Z>-rc.<N>   (e.g. v0.5.13-rc.33)
 #                                    (scope-guard-v0.4.0-rc.2)
 #                                    (depcheck-v0.1.0-rc.1)
+#                                    (door-contract-v0.6.0-rc.1)
 #   - stable: v<X>.<Y>.<Z>          (e.g. v0.5.13)
 #                                    (scope-guard-v0.4.0)
 #                                    (depcheck-v0.1.0)
+#                                    (door-contract-v0.6.0)
 #
 # Release flow:
 #   1. When ready to ship: bump version in the relevant package.json on main
 #      (root for hub, packages/scope-guard/ for scope-guard,
-#      packages/depcheck/ for depcheck).
+#      packages/depcheck/ for depcheck, packages/door-contract/ for
+#      door-contract).
 #   2. Push a matching tag:
 #        # for hub
 #        git tag v$(bun -e "console.log(require('./package.json').version)") && git push --tags
@@ -30,13 +34,15 @@
 #        git tag scope-guard-v$(bun -e "console.log(require('./packages/scope-guard/package.json').version)") && git push --tags
 #        # for depcheck
 #        git tag depcheck-v$(bun -e "console.log(require('./packages/depcheck/package.json').version)") && git push --tags
+#        # for door-contract
+#        git tag door-contract-v$(bun -e "console.log(require('./packages/door-contract/package.json').version)") && git push --tags
 #   3. CI runs tests once (workspace-wide), then publishes the package matching
 #      the tag prefix. Hub also publishes a container image to ghcr.io.
 #
 # Operator setup (one-time) — see RELEASING.md:
-#   - npm Trusted Publisher rules: one per package (hub, scope-guard, depcheck).
-#     All rules point at: org=ParachuteComputer, repo=parachute-hub,
-#     workflow=release.yml, env blank.
+#   - npm Trusted Publisher rules: one per package (hub, scope-guard, depcheck,
+#     door-contract). All rules point at: org=ParachuteComputer,
+#     repo=parachute-hub, workflow=release.yml, env blank.
 #   - ghcr.io needs no secret (uses the runner's GITHUB_TOKEN).
 
 name: Release
@@ -53,6 +59,9 @@ on:
       # depcheck release tags
       - 'depcheck-v[0-9]+.[0-9]+.[0-9]+'
       - 'depcheck-v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+      # door-contract release tags
+      - 'door-contract-v[0-9]+.[0-9]+.[0-9]+'
+      - 'door-contract-v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
 
 concurrency:
   # Don't let two releases race on the same tag.
@@ -105,8 +114,8 @@ jobs:
   publish-hub-npm:
     name: publish hub to npm
     needs: test
-    # Hub-only: skip on scope-guard / depcheck tags (a `v*` tag is hub's).
-    if: ${{ !startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') }}
+    # Hub-only: skip on scope-guard / depcheck / door-contract tags (a `v*` tag is hub's).
+    if: ${{ !startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -257,11 +266,61 @@ jobs:
           echo "publishing @openparachute/depcheck with dist-tag=$DIST_TAG"
           npm publish --tag "$DIST_TAG" --access public --provenance
 
+  publish-door-contract-npm:
+    name: publish door-contract to npm
+    needs: test
+    # door-contract-only: skip on hub (`v*`) + scope-guard + depcheck tags.
+    if: ${{ startsWith(github.ref_name, 'door-contract-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        # All shell steps default to the door-contract package dir. Steps that
+        # need to run from the repo root explicitly override
+        # `working-directory: ${{ github.workspace }}`.
+        working-directory: packages/door-contract
+    steps:
+      - uses: actions/checkout@v6
+        # checkout has no working-directory option; runs from repo root.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: install deps
+        # Install at workspace root so hoisted deps resolve.
+        working-directory: ${{ github.workspace }}
+        run: bun install --frozen-lockfile
+      - name: verify package.json version matches tag
+        run: |
+          PKG_VERSION=$(bun -e "console.log(require('./package.json').version)")
+          # Strip the `door-contract-v` prefix from the tag.
+          TAG_VERSION="${GITHUB_REF_NAME#door-contract-v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::packages/door-contract/package.json version ($PKG_VERSION) doesn't match tag ($TAG_VERSION)"
+            exit 1
+          fi
+      - name: publish
+        # prepublishOnly runs `bun run build` (tsc → dist/) before the tarball
+        # is assembled, so the published package ships compiled JS + d.ts.
+        run: |
+          if [[ "$GITHUB_REF_NAME" =~ -rc\. ]]; then
+            DIST_TAG=rc
+          else
+            DIST_TAG=latest
+          fi
+          echo "publishing @openparachute/door-contract with dist-tag=$DIST_TAG"
+          npm publish --tag "$DIST_TAG" --access public --provenance
+
   publish-image:
     name: publish to ghcr.io
     needs: test
-    # Hub-only: scope-guard / depcheck don't ship a container image.
-    if: ${{ !startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') }}
+    # Hub-only: scope-guard / depcheck / door-contract don't ship a container image.
+    if: ${{ !startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
