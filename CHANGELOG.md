@@ -6,6 +6,14 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.7-rc.16] - 2026-07-22
+
+The npm-boot fix, step 2/3: hub now resolves `@openparachute/door-contract` from the registry, so the published hub boots from a clean `bun add -g @openparachute/hub@rc` install instead of crash-looping.
+
+### Fixed
+
+- **`@openparachute/door-contract` moved from a `workspace:*` devDependency to a real `^0.6.0` runtime `dependency`** (mirroring `@openparachute/depcheck`). `src/account-api.ts` does a VALUE import of the contract (`validateVaultScopes`, account/descriptor types), so it must resolve at runtime — but the published hub tarball ships only `src` (not `packages/`), so a `workspace:*` spec could never resolve outside the bun-linked dev checkout. An npm-installed hub therefore crashed at boot with `Cannot find module '@openparachute/door-contract'`. Now that door-contract@0.6.0 is published to npm (step 1/3, #766), the npm-installed hub resolves it from the registry. Proven locally with a `npm pack` + clean-install-outside-the-workspace smoke (the exact crash is gone); CI's `e2e.yml` `HUB_SOURCE=npm:rc` run against this rc is the authoritative gate. Step 3/3 = promote (drop `-rc` → `0.7.7`) once e2e is green. Stale "dep-flip pending" comment removed from `src/account-api.ts`.
+
 ## [0.7.7-rc.13] - 2026-07-20
 
 Serve the Parachute app at the origin root — the self-hosted mirror of the hosted door. Hitting a self-host URL now lands in the app directly (no redirect hop), configurable, with every existing funnel preserved.

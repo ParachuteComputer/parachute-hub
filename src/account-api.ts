@@ -33,16 +33,12 @@
  * ownership gate the cloud twin runs per-vault is trivially satisfied here.
  */
 import type { Database } from "bun:sqlite";
-// NOTE (npm-boot fix, step 3/3 follow-on): this is a VALUE import — hub can't
-// run without `@openparachute/door-contract` resolving at runtime. It's still a
-// `workspace:*` devDependency (package.json), which resolves only under the
-// bun-linked local install; the published hub tarball doesn't ship `packages/`,
-// so a `bun add -g @openparachute/hub@rc` install can't resolve it → boot
-// crash. Step 1 (this repo's release.yml) makes door-contract publishable to
-// npm; once Aaron adds its npm Trusted Publisher rule and it's tagged +
-// published, a follow-on PR flips this dep to a real `^0.6.0` (mirroring
-// `@openparachute/depcheck`) so the npm-installed hub boots. See RELEASING.md
-// → "Releasing door-contract".
+// NOTE: this is a VALUE import — hub can't run without
+// `@openparachute/door-contract` resolving at runtime, so it's a real
+// `^0.6.0` runtime `dependency` (package.json, mirroring `@openparachute/depcheck`)
+// and NOT a `workspace:*` devDependency. The published hub tarball doesn't ship
+// `packages/`, so the npm-installed hub resolves door-contract from the registry.
+// See RELEASING.md → "Releasing door-contract".
 import {
   type AccountBootstrap,
   type ParachuteAccountDescriptor,
