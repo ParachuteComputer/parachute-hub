@@ -1,5 +1,31 @@
 # @openparachute/door-contract
 
+## 0.6.1
+
+Fail-closed hardening of the composed account-scope grammar (unified `/mcp` —
+MCP Phase 2 PR1, hub #765 findings 1/3/4). Purely additive: every currently-valid
+composed / legacy form still parses byte-identically; this bump only NEWLY rejects
+malformed inputs that the Phase-1 grammar let through. No change to
+`isRequestableAccountScope` (composed forms stay non-requestable; consent is their
+sole author).
+
+- **Finding 1 — builders validate their slots and THROW.** The composed-scope
+  builders (`composedWildcardVaultsScope`, `composedVaultScope`,
+  `composedVaultCreateScope`, `composedModuleScope`) now reject any interpolated
+  `id` / `vault` / `module` slot that is empty, the wildcard sentinel `*`, or
+  contains a `:` — either would inject extra scope segments or forge a wildcard
+  grant a user never consented to. A malformed slot throws a clear `Error` at
+  build time, so it can never be minted. Wildcard authority is expressed ONLY by
+  the dedicated `composedWildcardVaultsScope` builder, never by passing `*` as a
+  name.
+- **Finding 4 — the parser rejects `*` as a module name.** `parseComposedAccountScope`
+  now returns `null` for `account:<id>:mod:*:<verb>` (previously it parsed as a
+  literal `*` module), mirroring the vault slot's existing `*`-fails-closed rule.
+  Fail-closed: an unrecognized form is denied downstream.
+- **Finding 3 — doc fix.** Corrected the §1.4 guardrail comment that mislabeled
+  the cross-account mint gate as "the hub's" — it is the CLOUD door's mint gate
+  (`parachute-cloud workers/identity/src/oauth-token.ts`, `denyForeignAccountMint`).
+
 ## 0.6.0
 
 The COMPOSED account-scope grammar (unified `/mcp` — Phase 1). The ratified
