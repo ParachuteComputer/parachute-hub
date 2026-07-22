@@ -219,6 +219,80 @@ describe("deriveWizardState", () => {
     }
   });
 
+  test("real-version vault row with paths:[] is NOT a real vault (e2e boot-spawned-child fix)", async () => {
+    // The Tier-1 e2e wizard-skip root cause. When the hub boot-spawns the vault
+    // MODULE child, vault's selfRegister writes its services.json row at the
+    // REAL package version (e.g. 0.7.4-rc.1, NOT SEED_VERSION) but with
+    // `paths: []` because no vault instance exists yet. The SEED_VERSION
+    // sentinel alone did NOT catch this — a bare `version !== SEED_VERSION`
+    // check read the empty-paths row as a real vault, so the wizard skipped its
+    // vault step and `--vault-name` was ignored. hasRealVault must be
+    // INSTANCE-aware: no mount path → not a real vault (the #478 empty-paths
+    // discrimination findExistingVault already uses).
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.7.4-rc.1",
+              port: 1940,
+              paths: [],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.hasRealVault).toBe(false);
+      expect(s.hasVault).toBe(false);
+      expect(s.step).toBe("vault");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("real-version vault row WITH a mount path IS a real vault (positive control)", async () => {
+    // The counterpart to the empty-paths case: a genuinely-created vault carries
+    // a `/vault/<name>` path at a real version, so hasRealVault must be true and
+    // the wizard advances past the vault step.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.7.4-rc.1",
+              port: 1940,
+              paths: ["/vault/e2e"],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const s = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(s.hasRealVault).toBe(true);
+      expect(s.hasVault).toBe(true);
+      expect(s.step).toBe("expose");
+    } finally {
+      db.close();
+    }
+  });
+
   test("expose step when admin + vault exist but expose mode not set yet (hub#268 Item 2)", async () => {
     const db = openHubDb(hubDbPath(h.dir));
     try {
@@ -1712,13 +1786,15 @@ describe("handleSetupVaultPost", () => {
     }
   });
 
-  test("idempotent — second POST while supervisor is running doesn't fire a second `bun add` (N2)", async () => {
+  test("second POST while supervisor is running provisions (idempotent) without a second `bun add` (N2)", async () => {
     // Reviewer-flagged race: two concurrent POSTs before either seeds
-    // services.json both pass `state.hasVault === false` and each fire
-    // `runInstall` → each fires `bun add -g`. The wizard mirrors the
-    // `handleInstall` guard pattern: if the supervisor already has a
-    // live (starting/running/restarting) state for vault, mark the new
-    // op succeeded synchronously and skip the second install.
+    // services.json both pass `state.hasVault === false`. The wizard mirrors
+    // the `handleInstall` guard pattern: if the supervisor already has a live
+    // (starting/running/restarting) state for vault, it does NOT fire a second
+    // `bun add -g`. Post the e2e wizard-skip fix it no longer SYNTHESIZES a
+    // succeeded op (which created nothing on a boot-spawned-child box) — it
+    // drives `provisionVault` to actually create the named vault, which is
+    // idempotent (returns created:false when a racing POST already made it).
     const db = openHubDb(hubDbPath(h.dir));
     try {
       const user = await createUser(db, "owner", "pw");
@@ -1743,6 +1819,19 @@ describe("handleSetupVaultPost", () => {
         runCalls.push([...cmd]);
         return 0;
       };
+      // Stub provisionVault so the short-circuit doesn't shell out to the real
+      // `parachute-vault create`. Idempotent case: the racing POST already
+      // created the vault, so this returns created:false.
+      const provisionCalls: string[] = [];
+      const provisionVaultImpl = async (name: string) => {
+        provisionCalls.push(name);
+        return {
+          ok: true as const,
+          created: false,
+          entry: { name, url: `https://hub.example/vault/${name}`, version: "1.0.0" },
+          createJson: null,
+        };
+      };
       const post = await handleSetupVaultPost(
         req("/admin/setup/vault", {
           method: "POST",
@@ -1763,21 +1852,132 @@ describe("handleSetupVaultPost", () => {
           supervisor,
           registry: getDefaultOperationsRegistry(),
           run: stubbedRun,
+          provisionVaultImpl,
         },
       );
       expect(post.status).toBe(303);
       const location = post.headers.get("location") ?? "";
       expect(location).toMatch(/^\/admin\/setup\?op=/);
       // Yield enough for any background runInstall promise to fire if
-      // the guard failed. Then assert: no `bun add` was invoked, and
-      // the op went straight to `succeeded` with the canonical
-      // "already supervised" log line.
+      // the guard failed. Then assert: no `bun add` was invoked, the vault was
+      // provisioned via provisionVault (default name), and the op succeeded
+      // with the canonical "already supervised" log line.
       await new Promise((r) => setTimeout(r, 50));
       expect(runCalls.length).toBe(0);
+      expect(provisionCalls).toEqual(["default"]);
       const opId = new URL(location, "http://x").searchParams.get("op") ?? "";
       const op = getDefaultOperationsRegistry().get(opId);
       expect(op?.status).toBe("succeeded");
       expect(op?.log.join("\n")).toContain("already supervised");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("boot-spawned vault child (real version, paths:[]) — wizard create actually provisions the named vault (e2e wizard-skip fix)", async () => {
+    // The exact Tier-1 e2e bug. The hub boot-spawns the vault MODULE child so it
+    // can selfRegister; that child writes a services.json row at the REAL
+    // package version (NOT SEED_VERSION) with `paths: []` because no vault
+    // instance exists yet, AND the supervisor already reports vault "running".
+    // Pre-fix: hasRealVault read the real-version row as a real vault, the
+    // wizard skipped its vault step, and even if it POSTed, the already-
+    // supervised short-circuit synthesized a succeeded op that created NOTHING
+    // — `--vault-name e2e` was silently dropped. Post-fix: the empty-paths row
+    // reads as no-real-vault (hasRealVault=false), the POST is honored, and the
+    // short-circuit drives provisionVault to actually create the named vault.
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      const user = await createUser(db, "owner", "pw");
+      const { createSession, SESSION_COOKIE_NAME: SC } = await import("../sessions.ts");
+      const session = createSession(db, { userId: user.id });
+      // Boot-spawned child's self-registered row: real version, paths: [].
+      writeManifest(
+        {
+          services: [
+            {
+              name: "parachute-vault",
+              version: "0.7.4-rc.1",
+              port: 1940,
+              paths: [],
+              health: "/health",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      // deriveWizardState must NOT treat the empty-paths real-version row as a
+      // real vault (this is what un-skipped the wizard's vault step).
+      const derived = deriveWizardState({
+        db,
+        manifestPath: h.manifestPath,
+        readExposeStateFn: h.readExposeStateFn,
+      });
+      expect(derived.hasRealVault).toBe(false);
+      expect(derived.step).toBe("vault");
+
+      const get = handleSetupGet(req("/admin/setup"), {
+        db,
+        manifestPath: h.manifestPath,
+        configDir: h.dir,
+        readExposeStateFn: h.readExposeStateFn,
+        issuer: "https://hub.example",
+        registry: getDefaultOperationsRegistry(),
+      });
+      const csrf = setCookie(get, CSRF_COOKIE_NAME) ?? "";
+      // Supervisor already running the boot-spawned vault module child.
+      const supervisor = makeSupervisor();
+      await supervisor.start({ short: "vault", cmd: ["bun", "noop"] });
+      const runCalls: string[][] = [];
+      const provisionCalls: string[] = [];
+      const provisionVaultImpl = async (name: string) => {
+        provisionCalls.push(name);
+        return {
+          ok: true as const,
+          created: true,
+          entry: { name, url: `https://hub.example/vault/${name}`, version: "0.7.4-rc.1" },
+          createJson: null,
+        };
+      };
+      const post = await handleSetupVaultPost(
+        req("/admin/setup/vault", {
+          method: "POST",
+          body: new URLSearchParams({
+            [CSRF_FIELD_NAME]: csrf,
+            mode: "create",
+            vault_name: "e2e",
+          }).toString(),
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            cookie: `${CSRF_COOKIE_NAME}=${csrf}; ${SC}=${session.id}`,
+          },
+        }),
+        {
+          db,
+          manifestPath: h.manifestPath,
+          configDir: h.dir,
+          readExposeStateFn: h.readExposeStateFn,
+          issuer: "https://hub.example",
+          supervisor,
+          registry: getDefaultOperationsRegistry(),
+          run: async (cmd) => {
+            runCalls.push([...cmd]);
+            return 0;
+          },
+          provisionVaultImpl,
+        },
+      );
+      expect(post.status).toBe(303);
+      const location = post.headers.get("location") ?? "";
+      expect(location).toMatch(/^\/admin\/setup\?op=/);
+      await new Promise((r) => setTimeout(r, 50));
+      // The named vault WAS provisioned (not silently dropped) …
+      expect(provisionCalls).toEqual(["e2e"]);
+      // … and no `bun add -g` fired (module already supervised).
+      expect(runCalls.some((c) => c.join(" ").includes("bun add -g"))).toBe(false);
+      const opId = new URL(location, "http://x").searchParams.get("op") ?? "";
+      const op = getDefaultOperationsRegistry().get(opId);
+      expect(op?.status).toBe("succeeded");
+      expect(op?.log.join("\n")).toContain('vault "e2e" created');
     } finally {
       db.close();
     }

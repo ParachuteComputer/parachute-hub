@@ -655,4 +655,36 @@ describe("runCliWizard", () => {
       "/admin/setup/expose",
     ]);
   });
+
+  test("non-interactive stdin fails fast (no hang) when a required answer is missing", async () => {
+    // Headless-hardening: with stdin closed (cloud-init, `ssh host 'parachute
+    // setup-wizard …'`, run.sh-exec'd stages.sh) an unanswered prompt would
+    // busy-hang Bun's readline question() forever. defaultPrompt now throws a
+    // clear, flag-naming error instead. We drive the real defaultPrompt (no
+    // `prompt` seam) with the account username unsupplied, forcing the account
+    // step to prompt — and force isTTY=false so the assertion is deterministic
+    // regardless of how the test runner's stdin is wired.
+    const { fetchImpl } = makeFakeHub();
+    const origIsTTY = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    try {
+      await expect(
+        runCliWizard({
+          hubUrl: "http://127.0.0.1:1939",
+          log: () => {},
+          fetchImpl,
+          sleep: async () => {},
+          // no accountUsername → account step calls the real defaultPrompt.
+          accountPassword: "longpassword",
+          vaultMode: "skip",
+          exposeMode: "localhost",
+        }),
+      ).rejects.toThrow(/stdin is not interactive/);
+    } finally {
+      Object.defineProperty(process.stdin, "isTTY", {
+        value: origIsTTY,
+        configurable: true,
+      });
+    }
+  });
 });

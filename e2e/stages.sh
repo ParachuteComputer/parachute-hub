@@ -173,15 +173,38 @@ record "stage1-init" "PASS" "systemd unit active, /health db:ok, channel=${PARAC
 # This stage now asserts that fixed end-to-end behavior directly.
 note "Driving the setup wizard over loopback (account → create vault '${VAULT_NAME}' → expose)…"
 WIZ_LOG=/tmp/parachute-wizard.log
-if ! parachute setup-wizard \
+# `--transcribe-mode none` is REQUIRED here: run.sh execs stages.sh without a
+# TTY (stdin closed), so an interactive transcription prompt would busy-hang
+# Bun's readline question() forever until the outer job timeout — the exact
+# wedge this run guards against. The wizard also fails-fast on any other
+# non-TTY prompt now, but supplying every answer via flags keeps it silent.
+# `timeout 420` is a hard belt: if the wizard EVER wedges again (a regression
+# in the non-TTY guards), we trip in 7 minutes and dump diagnostics instead of
+# hanging until the 25-min CI job cancel — which never reaches this failure
+# branch. `timeout` exits 124 on expiry. Capture the real exit code via
+# `|| wiz_rc=$?` (a plain `if ! cmd` would report 0 inside the then-block, not
+# the wizard's / timeout's actual code); the `|| ...` also keeps `set -e` happy.
+wiz_rc=0
+timeout 420 parachute setup-wizard \
       --hub-url "${HUB}" \
       --account-username "${ADMIN_USER}" \
       --account-password "${ADMIN_PASS}" \
       --vault-mode create \
       --vault-name "${VAULT_NAME}" \
-      --expose-mode localhost >"$WIZ_LOG" 2>&1; then
+      --transcribe-mode none \
+      --expose-mode localhost >"$WIZ_LOG" 2>&1 || wiz_rc=$?
+if [ "${wiz_rc}" -ne 0 ]; then
   cat "$WIZ_LOG" >&2
-  die "stage1-wizard" "setup-wizard exited non-zero"
+  # Dump extra context so a wizard failure/timeout is diagnosable from the
+  # transcript alone (a hang leaves WIZ_LOG mid-stream; these show the hub side).
+  printf '\n---- journalctl -u parachute-hub (tail) ----\n' >&2
+  journalctl -u parachute-hub --no-pager 2>/dev/null | tail -n 80 >&2 || true
+  printf '\n---- parachute status ----\n' >&2
+  parachute status >&2 2>&1 || true
+  if [ "${wiz_rc}" = "124" ]; then
+    die "stage1-wizard" "setup-wizard TIMED OUT after 420s (non-TTY prompt wedge? — see journalctl/status above)"
+  fi
+  die "stage1-wizard" "setup-wizard exited non-zero (rc=${wiz_rc})"
 fi
 cat "$WIZ_LOG"
 grep -qi "Setup complete" "$WIZ_LOG" || die "stage1-wizard" "wizard did not report 'Setup complete'"

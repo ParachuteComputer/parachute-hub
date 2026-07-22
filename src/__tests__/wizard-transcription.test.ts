@@ -82,6 +82,41 @@ describe("walkTranscriptionStep — mode resolution (the CLI question)", () => {
     }
   });
 
+  test("non-interactive stdin (no flag) DEFAULTS to none — never hangs on the prompt", async () => {
+    // Headless-hardening: with no `--transcribe-mode` flag AND a closed / non-
+    // interactive stdin, an interactive `prompt("Pick [1]:")` would busy-hang
+    // Bun's readline question() forever (the exact e2e wedge). Transcription is
+    // optional and documented as never-blocking, so resolveChoice DEFAULTS to
+    // "none" (with an honest log line) rather than throwing. We drive the real
+    // defaultPrompt (no `prompt` seam) and force isTTY=false for determinism;
+    // if the guard regressed, this test would HANG instead of passing.
+    const h = makeHarness();
+    const origIsTTY = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    try {
+      const r = recordingRunner();
+      const logs: string[] = [];
+      const code = await walkTranscriptionStep({
+        configDir: h.dir,
+        log: (l) => logs.push(l),
+        // no transcribeMode, no prompt seam → real defaultPrompt would be hit
+        runCommand: r.run,
+        platform: "linux",
+      });
+      expect(code).toBe(0);
+      expect(r.cmds).toEqual([]); // nothing installed
+      expect(readCfg(h.dir)).toBeUndefined(); // no provider recorded
+      expect(logs.join("\n")).toContain("not interactive");
+      expect(logs.join("\n")).toContain("Transcription off");
+    } finally {
+      Object.defineProperty(process.stdin, "isTTY", {
+        value: origIsTTY,
+        configurable: true,
+      });
+      h.cleanup();
+    }
+  });
+
   test("interactive prompt: '3' then 'g' chooses groq cloud", async () => {
     const h = makeHarness();
     try {

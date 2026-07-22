@@ -72,6 +72,14 @@ export interface TranscriptionStepOpts {
 
 /** Default readline prompt (matches wizard.ts's defaultPrompt). */
 async function defaultPrompt(question: string): Promise<string> {
+  // Non-TTY guard (headless-hardening): unlike wizard.ts's required-step
+  // prompts (which throw), the transcription step is optional and must NEVER
+  // block setup. On a closed / non-interactive stdin, return the empty answer
+  // — which the callers already treat as a benign default (a blank cloud API
+  // key means "set it later"; a blank local-install confirm takes the [Y]
+  // default). `resolveChoice` short-circuits to "none" before ever reaching
+  // here without a flag; this covers the flag-supplied-mode downstream prompts.
+  if (!process.stdin.isTTY) return "";
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     return await rl.question(question);
@@ -139,6 +147,22 @@ async function resolveChoice(
   log: (l: string) => void,
 ): Promise<ResolvedChoice> {
   if (opts.transcribeMode !== undefined) return opts.transcribeMode;
+  // Non-TTY guard (headless-hardening): with no `--transcribe-mode` flag AND a
+  // closed / non-interactive stdin (cloud-init, ssh heredoc, the e2e
+  // container), the real `defaultPrompt`'s `prompt("Pick [1]:")` would busy-hang
+  // forever on Bun's `readline/promises` question() — the exact wedge that
+  // timed out the Tier-1 e2e. Transcription is optional / opt-in and documented
+  // as NEVER blocking setup, so we DEFAULT to "none" (not throw — unlike the
+  // required account / vault / expose prompts in wizard.ts) with an honest log
+  // line. Guarded on `opts.prompt === undefined` so an injected prompt seam (a
+  // scripted test queue, or a caller supplying its own reader) is still honored
+  // — the wedge only exists for the real readline-backed default prompt.
+  if (opts.prompt === undefined && !process.stdin.isTTY) {
+    log("");
+    log("  stdin is not interactive — defaulting transcription to none.");
+    log("  Turn it on later with `parachute install scribe` (or re-run with --transcribe-mode).");
+    return "none";
+  }
   log("");
   log("  1) None — skip transcription (default)");
   log("  2) Local — run the engine on this box (no API key, needs ~2 GB RAM)");
