@@ -280,6 +280,11 @@ export type ComposedAccountScope =
  *   - a value containing `:` — the scope separator, which would inject EXTRA
  *     segments (e.g. a `vault` of `"x:*"` becomes `…:vaults:x:*:<verb>`, forging
  *     a wildcard, or shifts the verb slot).
+ *   - a value containing WHITESPACE — OAuth `scope` claims are space-delimited, so
+ *     a space/tab/newline in a slot splits the scope on the wire into a fragment
+ *     that can re-parse as a VALID (e.g. legacy) grant — it would NOT fail closed
+ *     the way `:` does. Defense-in-depth: real slot sources are charset-constrained
+ *     today, but this validation layer must be complete.
  * Throws a clear Error on violation so a malformed grant can never be built (and
  * therefore never minted) — fail-closed at construction time. Well-typed callers
  * pass real ids/names and never trip this; it exists to reject smuggled sentinels
@@ -297,6 +302,11 @@ function assertComposedSlot(kind: "id" | "vault" | "module", value: string): voi
   if (value.includes(":")) {
     throw new Error(
       `composed scope ${kind} slot must not contain ":" (got ${JSON.stringify(value)})`,
+    );
+  }
+  if (/\s/.test(value)) {
+    throw new Error(
+      `composed scope ${kind} slot must not contain whitespace (got ${JSON.stringify(value)})`,
     );
   }
 }

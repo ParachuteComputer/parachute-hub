@@ -12,12 +12,14 @@ sole author).
 - **Finding 1 — builders validate their slots and THROW.** The composed-scope
   builders (`composedWildcardVaultsScope`, `composedVaultScope`,
   `composedVaultCreateScope`, `composedModuleScope`) now reject any interpolated
-  `id` / `vault` / `module` slot that is empty, the wildcard sentinel `*`, or
-  contains a `:` — either would inject extra scope segments or forge a wildcard
-  grant a user never consented to. A malformed slot throws a clear `Error` at
-  build time, so it can never be minted. Wildcard authority is expressed ONLY by
-  the dedicated `composedWildcardVaultsScope` builder, never by passing `*` as a
-  name.
+  `id` / `vault` / `module` slot that is empty, the wildcard sentinel `*`,
+  contains a `:`, or contains WHITESPACE — any would inject extra scope segments
+  or forge a wildcard grant a user never consented to (whitespace splits the
+  space-delimited OAuth `scope` claim on the wire into a fragment that can
+  re-parse as a valid grant, so it must fail closed at build too). A malformed
+  slot throws a clear `Error` at build time, so it can never be minted. Wildcard
+  authority is expressed ONLY by the dedicated `composedWildcardVaultsScope`
+  builder, never by passing `*` as a name.
 - **Finding 4 — the parser rejects `*` as a module name.** `parseComposedAccountScope`
   now returns `null` for `account:<id>:mod:*:<verb>` (previously it parsed as a
   literal `*` module), mirroring the vault slot's existing `*`-fails-closed rule.

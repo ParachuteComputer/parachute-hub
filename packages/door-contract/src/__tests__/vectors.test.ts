@@ -196,21 +196,22 @@ describe("composed account-scope grammar (unified /mcp — Phase 1)", () => {
   // THROW on a malformed value, so a forged wildcard or a `:`-separator-injected
   // scope can never be constructed (and therefore never minted). Fail-closed at
   // build time. Wildcard authority is ONLY ever composedWildcardVaultsScope's job.
-  test("composed builders throw on empty / `*` / `:`-containing slots (#765 finding 1)", () => {
+  test("composed builders throw on empty / `*` / `:` / whitespace slots (#765 finding 1)", () => {
     // The `id` slot — every composed builder takes an id; each rejects a bad one.
-    for (const badId of ["", "*", "a:b", "self:extra", ":", "u_1:vaults:*:admin"]) {
-      expect(() => composedWildcardVaultsScope(badId, "read")).toThrow();
-      expect(() => composedVaultScope(badId, "work", "read")).toThrow();
-      expect(() => composedVaultCreateScope(badId)).toThrow();
-      expect(() => composedModuleScope(badId, "scribe", "read")).toThrow();
+    // `.toThrow(/composed scope/)` pins the guard's own message (not a stray throw).
+    for (const badId of ["", "*", "a:b", "self:extra", ":", "u_1:vaults:*:admin", "u 1", "a\tb"]) {
+      expect(() => composedWildcardVaultsScope(badId, "read")).toThrow(/composed scope/);
+      expect(() => composedVaultScope(badId, "work", "read")).toThrow(/composed scope/);
+      expect(() => composedVaultCreateScope(badId)).toThrow(/composed scope/);
+      expect(() => composedModuleScope(badId, "scribe", "read")).toThrow(/composed scope/);
     }
     // The `vault` slot — composedVaultScope only.
-    for (const badVault of ["", "*", "work:read", ":", "a:*"]) {
-      expect(() => composedVaultScope("self", badVault, "read")).toThrow();
+    for (const badVault of ["", "*", "work:read", ":", "a:*", "my vault", "a\nb"]) {
+      expect(() => composedVaultScope("self", badVault, "read")).toThrow(/composed scope/);
     }
     // The `module` slot — composedModuleScope only.
-    for (const badModule of ["", "*", "scribe:admin", ":", "x:*"]) {
-      expect(() => composedModuleScope("self", badModule, "read")).toThrow();
+    for (const badModule of ["", "*", "scribe:admin", ":", "x:*", "my mod", "a\tb"]) {
+      expect(() => composedModuleScope("self", badModule, "read")).toThrow(/composed scope/);
     }
     // Sanity: valid slots do NOT throw and still emit the canonical wire strings
     // (the wildcard builder's OWN `*` is legitimate — it is the dedicated builder).
