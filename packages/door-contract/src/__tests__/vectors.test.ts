@@ -192,6 +192,61 @@ describe("composed account-scope grammar (unified /mcp — Phase 1)", () => {
     expect(composedModuleScope("u_1", "scribe", "admin")).toBe("account:u_1:mod:scribe:admin");
   });
 
+  // #765 finding 1 — the composed BUILDERS validate every interpolated slot and
+  // THROW on a malformed value, so a forged wildcard or a `:`-separator-injected
+  // scope can never be constructed (and therefore never minted). Fail-closed at
+  // build time. Wildcard authority is ONLY ever composedWildcardVaultsScope's job.
+  test("composed builders throw on empty / `*` / `:` / whitespace slots (#765 finding 1)", () => {
+    // The `id` slot — every composed builder takes an id; each rejects a bad one.
+    // `.toThrow(/composed scope/)` pins the guard's own message (not a stray throw).
+    for (const badId of ["", "*", "a:b", "self:extra", ":", "u_1:vaults:*:admin", "u 1", "a\tb"]) {
+      expect(() => composedWildcardVaultsScope(badId, "read")).toThrow(/composed scope/);
+      expect(() => composedVaultScope(badId, "work", "read")).toThrow(/composed scope/);
+      expect(() => composedVaultCreateScope(badId)).toThrow(/composed scope/);
+      expect(() => composedModuleScope(badId, "scribe", "read")).toThrow(/composed scope/);
+    }
+    // The `vault` slot — composedVaultScope only.
+    for (const badVault of ["", "*", "work:read", ":", "a:*", "my vault", "a\nb"]) {
+      expect(() => composedVaultScope("self", badVault, "read")).toThrow(/composed scope/);
+    }
+    // The `module` slot — composedModuleScope only.
+    for (const badModule of ["", "*", "scribe:admin", ":", "x:*", "my mod", "a\tb"]) {
+      expect(() => composedModuleScope("self", badModule, "read")).toThrow(/composed scope/);
+    }
+    // Sanity: valid slots do NOT throw and still emit the canonical wire strings
+    // (the wildcard builder's OWN `*` is legitimate — it is the dedicated builder).
+    expect(composedWildcardVaultsScope("self", "read")).toBe("account:self:vaults:*:read");
+    expect(composedVaultScope("u_1", "work", "write")).toBe("account:u_1:vaults:work:write");
+    expect(composedVaultCreateScope("u_1")).toBe("account:u_1:vault-create");
+    expect(composedModuleScope("u_1", "scribe", "admin")).toBe("account:u_1:mod:scribe:admin");
+  });
+
+  // Byte-identical regression guard: every currently-valid composed / legacy form
+  // still parses to EXACTLY the same shape after the #765 hardening. This is
+  // additive hardening — recognition of any valid input must NOT change.
+  test("parseComposedAccountScope — the valid-form table round-trips unchanged", () => {
+    const table: Array<[string, ReturnType<typeof parseComposedAccountScope>]> = [
+      ["account:self:vaults:*:read", { kind: "wildcard-vaults", id: "self", verb: "read" }],
+      ["account:u_1:vaults:*:admin", { kind: "wildcard-vaults", id: "u_1", verb: "admin" }],
+      [
+        "account:self:vaults:work:write",
+        { kind: "vault", id: "self", vault: "work", verb: "write" },
+      ],
+      ["account:u_1:vaults:moss:read", { kind: "vault", id: "u_1", vault: "moss", verb: "read" }],
+      ["account:self:vault-create", { kind: "vault-create", id: "self" }],
+      [
+        "account:self:mod:scribe:admin",
+        { kind: "module", id: "self", module: "scribe", verb: "admin" },
+      ],
+      ["account:u_1:mod:notes:read", { kind: "module", id: "u_1", module: "notes", verb: "read" }],
+      ["account:self:vaults", { kind: "legacy-blanket", id: "self" }],
+      ["account:u_1:vaults:work", { kind: "legacy-vault", id: "u_1", vault: "work" }],
+    ];
+    for (const [scope, expected] of table) {
+      expect(parseComposedAccountScope(scope)).toEqual(expected);
+    }
+  });
+
   test("the composed verb ladder is admin ⊇ write ⊇ read", () => {
     expect(COMPOSED_VERB_RANK).toEqual({ read: 0, write: 1, admin: 2 });
     for (const v of ["read", "write", "admin"]) expect(isComposedVaultVerb(v)).toBe(true);
@@ -342,16 +397,20 @@ describe("composed account-scope grammar (unified /mcp — Phase 1)", () => {
     }
   });
 
-  test("parseComposedAccountScope — `*` is ONLY the wildcard, never a vault name", () => {
-    // 5-part `vaults:*:<verb>` → wildcard (above). A 4-part legacy narrowed form
-    // with `*` in the vault slot is NOT a real vault → fail closed.
+  test("parseComposedAccountScope — `*` is ONLY the wildcard, never a vault OR module name", () => {
+    // 5-part `vaults:*:<verb>` → the legitimate wildcard vault grant (below).
+    // Everywhere else `*` is a smuggled sentinel and fails closed:
+    //   - a 4-part legacy narrowed form with `*` in the vault slot is not a real
+    //     vault → null;
+    //   - a 5-part `mod:*:<verb>` is not a real module → null (#765 finding 4; a
+    //     `*` module name would otherwise forge an all-modules grant).
     expect(parseComposedAccountScope("account:self:vaults:*")).toBeNull();
-    // And a `*` module name (empty-ish sentinel misuse) still parses as a literal
-    // module string only in the 5-part mod family — `*` is not special there.
-    expect(parseComposedAccountScope("account:self:mod:*:read")).toEqual({
-      kind: "module",
+    expect(parseComposedAccountScope("account:self:mod:*:read")).toBeNull();
+    expect(parseComposedAccountScope("account:u_1:mod:*:admin")).toBeNull();
+    // The legitimate vaults wildcard is UNCHANGED by the module-slot hardening.
+    expect(parseComposedAccountScope("account:self:vaults:*:read")).toEqual({
+      kind: "wildcard-vaults",
       id: "self",
-      module: "*",
       verb: "read",
     });
   });

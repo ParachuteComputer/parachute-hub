@@ -270,23 +270,78 @@ export type ComposedAccountScope =
   | { kind: "legacy-vault"; id: string; vault: string };
 
 /**
- * Build the wildcard vault grant `account:<id>:vaults:*:<verb>`. */
+ * Guard an interpolated composed-scope SLOT (an account `id`, a `vault` name, or
+ * a `module` name) before a builder concatenates it into a scope string. A slot
+ * may never be:
+ *   - empty (`""`) — a builder must never emit a scope with a blank segment;
+ *   - the wildcard sentinel `*` — wildcard authority is expressed ONLY by the
+ *     dedicated `composedWildcardVaultsScope` builder; smuggling `*` through a
+ *     name slot would forge a wildcard grant a consenting user never approved;
+ *   - a value containing `:` — the scope separator, which would inject EXTRA
+ *     segments (e.g. a `vault` of `"x:*"` becomes `…:vaults:x:*:<verb>`, forging
+ *     a wildcard, or shifts the verb slot).
+ *   - a value containing WHITESPACE — OAuth `scope` claims are space-delimited, so
+ *     a space/tab/newline in a slot splits the scope on the wire into a fragment
+ *     that can re-parse as a VALID (e.g. legacy) grant — it would NOT fail closed
+ *     the way `:` does. Defense-in-depth: real slot sources are charset-constrained
+ *     today, but this validation layer must be complete.
+ * Throws a clear Error on violation so a malformed grant can never be built (and
+ * therefore never minted) — fail-closed at construction time. Well-typed callers
+ * pass real ids/names and never trip this; it exists to reject smuggled sentinels
+ * and separator-injection at the door.
+ */
+function assertComposedSlot(kind: "id" | "vault" | "module", value: string): void {
+  if (value.length === 0) {
+    throw new Error(`composed scope ${kind} slot must not be empty`);
+  }
+  if (value === COMPOSED_VAULTS_WILDCARD) {
+    throw new Error(
+      `composed scope ${kind} slot must not be "*" — wildcard is composedWildcardVaultsScope's job, never a name`,
+    );
+  }
+  if (value.includes(":")) {
+    throw new Error(
+      `composed scope ${kind} slot must not contain ":" (got ${JSON.stringify(value)})`,
+    );
+  }
+  if (/\s/.test(value)) {
+    throw new Error(
+      `composed scope ${kind} slot must not contain whitespace (got ${JSON.stringify(value)})`,
+    );
+  }
+}
+
+/**
+ * Build the wildcard vault grant `account:<id>:vaults:*:<verb>`. Throws if `id`
+ * is empty, `*`, or contains `:` (see `assertComposedSlot`). */
 export function composedWildcardVaultsScope(id: string, verb: ComposedVaultVerb): string {
+  assertComposedSlot("id", id);
   return `account:${id}:${COMPOSED_VAULTS_SEGMENT}:${COMPOSED_VAULTS_WILDCARD}:${verb}`;
 }
 
-/** Build a per-vault grant `account:<id>:vaults:<vault>:<verb>`. */
+/**
+ * Build a per-vault grant `account:<id>:vaults:<vault>:<verb>`. Throws if `id` or
+ * `vault` is empty, `*`, or contains `:` (see `assertComposedSlot`). */
 export function composedVaultScope(id: string, vault: string, verb: ComposedVaultVerb): string {
+  assertComposedSlot("id", id);
+  assertComposedSlot("vault", vault);
   return `account:${id}:${COMPOSED_VAULTS_SEGMENT}:${vault}:${verb}`;
 }
 
-/** Build the "create new vaults" capability `account:<id>:vault-create`. */
+/**
+ * Build the "create new vaults" capability `account:<id>:vault-create`. Throws if
+ * `id` is empty, `*`, or contains `:` (see `assertComposedSlot`). */
 export function composedVaultCreateScope(id: string): string {
+  assertComposedSlot("id", id);
   return `account:${id}:${COMPOSED_VAULT_CREATE_VERB}`;
 }
 
-/** Build a module grant `account:<id>:mod:<module>:<verb>`. */
+/**
+ * Build a module grant `account:<id>:mod:<module>:<verb>`. Throws if `id` or
+ * `module` is empty, `*`, or contains `:` (see `assertComposedSlot`). */
 export function composedModuleScope(id: string, module: string, verb: ComposedVaultVerb): string {
+  assertComposedSlot("id", id);
+  assertComposedSlot("module", module);
   return `account:${id}:${COMPOSED_MODULE_SEGMENT}:${module}:${verb}`;
 }
 
@@ -297,19 +352,21 @@ export function composedModuleScope(id: string, module: string, verb: ComposedVa
  * AND the legacy Wave A forms so that a single pass extracts `<id>` from every
  * `account:`-namespaced grant.
  *
- * §1.4 guardrail (unified-MCP design): the hub's cross-account mint gate
- * (`denyForeignAccountMint`) id-checks only the forms its parser RECOGNIZES — a
- * form that parses to `null` would SKIP the id check. The composed forms are
- * non-requestable (thus unreachable by that gate today), but when a later phase
- * makes them mintable the gate must already extract their `<id>`. Recognizing
- * every family HERE is what lets the gate reject a foreign-id composed scope then.
+ * §1.4 guardrail (unified-MCP design): the CLOUD door's cross-account mint gate
+ * (`parachute-cloud workers/identity/src/oauth-token.ts`, `denyForeignAccountMint`)
+ * id-checks only the forms its parser RECOGNIZES — a form that parses to `null`
+ * would SKIP the id check. The composed forms are non-requestable (thus
+ * unreachable by that gate today), but when a later phase makes them mintable the
+ * gate must already extract their `<id>`. Recognizing every family HERE is what
+ * lets the gate reject a foreign-id composed scope then.
  *
  * The `account:<id>:{read|admin}` account-verb ladder is intentionally NOT a
  * composed form (it is `parseAccountScope`'s domain) and yields `null` here.
  *
  * Fail-closed rules: `account` resource required, `<id>` non-empty, verbs from the
  * composed ladder, and `*` is ONLY ever the wildcard sentinel — it is never
- * accepted as a concrete vault name (a 4-part `account:<id>:vaults:*` → `null`).
+ * accepted as a concrete vault OR module name (a 4-part `account:<id>:vaults:*`
+ * and a 5-part `account:<id>:mod:*:<verb>` both → `null`).
  */
 export function parseComposedAccountScope(scope: string): ComposedAccountScope | null {
   const parts = scope.split(":");
@@ -342,7 +399,10 @@ export function parseComposedAccountScope(scope: string): ComposedAccountScope |
       return { kind: "vault", id, vault: target, verb };
     }
     if (family === COMPOSED_MODULE_SEGMENT) {
-      if (target.length === 0) return null;
+      // `*` is never a concrete module name — a `*` in the module slot fails
+      // closed (mirrors the vault slot above), so a wildcard sentinel can never
+      // be smuggled in to forge an all-modules grant.
+      if (target.length === 0 || target === COMPOSED_VAULTS_WILDCARD) return null;
       return { kind: "module", id, module: target, verb };
     }
     return null;
