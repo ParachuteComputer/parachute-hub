@@ -3,7 +3,7 @@
 /**
  * Tiny static-file server for a Parachute PWA bundle — originally written
  * for @openparachute/notes, generalized in hub-parity P5 (2026-07-11) to
- * also serve @openparachute/parachute-app (the super-surface front door,
+ * also serve @openparachute/app (the super-surface front door,
  * port 1944, mount `/app`) via the same shim. Any package matching this
  * shape (a prebuilt SPA `dist/` with no server of its own) can reuse it.
  *
@@ -27,7 +27,7 @@
  * `--package` (default `@openparachute/notes`, back-compat) names the npm
  * package whose `dist/` we resolve when `--dist` is omitted. Passed by
  * FIRST_PARTY_FALLBACKS entries whose startCmd composes this shim for a
- * package other than notes (e.g. `app`'s `--package @openparachute/parachute-app`).
+ * package other than notes (e.g. `app`'s `--package @openparachute/app`).
  *
  * If --dist is omitted, we resolve the package's dist directory via
  * Bun.resolveSync. If that fails (package not installed globally, or

@@ -774,7 +774,7 @@ function dropRetiredModuleRows(raw: unknown, where: string): { raw: unknown; cha
  * that would have GC'd their stale row. Without a heal, that stale row would:
  *   - crash-loop on boot — `reconcilePortToCanonical` rewrites its port to
  *     1944, then the supervisor spawns the app static-serve shim against a
- *     `@openparachute/parachute-app` that isn't installed → exit 1 → a
+ *     `@openparachute/app` that isn't installed → exit 1 → a
  *     forever-restarting "app" unit the operator never installed;
  *   - hijack `/surface/*` if a real `parachute-surface` row is also present
  *     (both claim `/surface`);

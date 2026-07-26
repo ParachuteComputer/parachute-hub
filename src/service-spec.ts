@@ -74,7 +74,7 @@ export const PORT_RESERVATIONS: readonly PortReservation[] = [
   { port: 1942, name: "parachute-notes", status: "assigned" },
   { port: 1943, name: "parachute-scribe", status: "assigned" },
   // hub-parity P5 (2026-07-11): parachute-app's canonical slot — the NEW
-  // super-surface front door (@openparachute/parachute-app), landing as a
+  // super-surface front door (@openparachute/app), landing as a
   // FIRST_PARTY_FALLBACKS entry (short "app") with its own hub-side static-
   // serve shim (notes-serve.ts --package). This is a DIFFERENT, unrelated
   // module from the pre-2026-05-27 `app` package described in the 1946
@@ -296,10 +296,10 @@ export function composeServiceSpec(opts: {
 //     — its startCmd is composed from the services.json entry's port + mount,
 //     which is hub-side logic, not something notes itself runs. (The archive
 //     isn't done — notes-daemon Phase 3 retirement hasn't landed.)
-//   - app: the NEW super-surface front door (@openparachute/parachute-app,
+//   - app: the NEW super-surface front door (@openparachute/app,
 //     hub-parity P5, 2026-07-11) — same shape as notes: a frontend bundle
 //     with no server of its own, served by the SAME hub-side shim
-//     (`notes-serve.ts --package @openparachute/parachute-app`). Unrelated
+//     (`notes-serve.ts --package @openparachute/app`). Unrelated
 //     to the pre-2026-05-27 `app` package that renamed to `surface` (see
 //     the KNOWN_MODULES.surface tagline + the RETIRED_MODULES note below).
 //
@@ -341,7 +341,7 @@ const NOTES_FALLBACK: FirstPartyFallback = {
   },
 };
 
-// FALLBACK: Delete when @openparachute/parachute-app ships
+// FALLBACK: Delete when @openparachute/app ships
 // .parachute/module.json AND self-registers its services.json row at boot.
 // As of hub-parity P5 the app repo doesn't carry the real module.json yet —
 // only a stale `dist/.parachute/info` artifact (name: "parachute-notes")
@@ -354,7 +354,7 @@ const NOTES_FALLBACK: FirstPartyFallback = {
 // (port + mount), running through the SAME `notes-serve.ts` shim
 // generalized in hub-parity P5 via `--package`.
 const APP_FALLBACK: FirstPartyFallback = {
-  package: "@openparachute/parachute-app",
+  package: "@openparachute/app",
   manifest: {
     name: "app",
     manifestName: "parachute-app",
@@ -376,7 +376,7 @@ const APP_FALLBACK: FirstPartyFallback = {
         "--mount",
         mount,
         "--package",
-        "@openparachute/parachute-app",
+        "@openparachute/app",
       ];
     },
     postInstallFooter: () => [
@@ -594,7 +594,7 @@ export const RETIRED_MODULES: Record<string, { retiredAt: string; replacement?: 
   // this table carried `app` + `parachute-app` (retired 2026-05-27, the
   // app → surface rename, patterns#102) from hub#219 through hub-parity P4.
   // They are REMOVED as of this note: a NEW, unrelated module — the real
-  // `@openparachute/parachute-app` super-surface front door (see
+  // `@openparachute/app` super-surface front door (see
   // FIRST_PARTY_FALLBACKS.app + PORT_RESERVATIONS' port-1944 comment) —
   // claims the `parachute-app` manifestName (and the bare `app` short) for
   // real. Keeping these entries would make `dropRetiredModuleRows`

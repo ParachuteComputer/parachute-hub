@@ -176,7 +176,7 @@ const BLURBS: Record<string, string> = {
   vault: "knowledge graph (MCP) — your owner-authenticated note + tag store",
   surface: "Parachute UI host — auto-installs Notes on first boot (the recommended UI path)",
   // hub-parity P5 (2026-07-11): `app` is now the NEW super-surface front
-  // door (@openparachute/parachute-app) — a real FIRST_PARTY_FALLBACKS
+  // door (@openparachute/app) — a real FIRST_PARTY_FALLBACKS
   // entry, not a legacy survey row. It is UNRELATED to the pre-2026-05-27
   // `app` package that renamed to `surface` (that blurb lives under the
   // `surface` key above); the two just happen to share the short name
