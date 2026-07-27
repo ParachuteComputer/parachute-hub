@@ -1236,12 +1236,15 @@ describe("approve(mcp) — start OAuth flow", () => {
     expect(flow?.scope).toBe("vault:eng:read vault:eng:write");
   });
 
-  // #775: a REMOTE hub's canonical root `/mcp` (the URL-addressed form has no
-  // name segment to derive from) requests the broad unnamed pair via the
-  // deliberate root-form path — NOT the resource's advertised scopes_supported
-  // (the fake discovery above advertises `vault:eng:read vault:eng:write`,
-  // which this must NOT match, proving the root path wins over the fallback).
-  test("#775 root-form MCP target → requests the broad pair, not scopes_supported", async () => {
+  // #775: a PARACHUTE remote's canonical root `/mcp` (the URL-addressed form
+  // has no name segment to derive from) requests the broad unnamed pair via
+  // the deliberate root-form path — NOT the resource's advertised
+  // scopes_supported (the fake discovery above advertises
+  // `vault:eng:read vault:eng:write`, which this must NOT match, proving the
+  // root path wins over the fallback). The `vault:eng:*` advertisement is
+  // ALSO the Parachute signal that gates this branch — see the companion
+  // "generic MCP server" test right below for the ungated complement.
+  test("#775 root-form MCP target (Parachute remote) → requests the broad pair, not scopes_supported", async () => {
     currentOAuth = fakeOAuth();
     const bearer = await moduleBearer();
     const cookie = await operatorCookie();
@@ -1260,6 +1263,41 @@ describe("approve(mcp) — start OAuth flow", () => {
     expect(flow?.scope).toBe("vault:read vault:write");
     const body = await json(res);
     expect(body.authorizeUrl as string).toContain(encodeURIComponent("vault:read vault:write"));
+  });
+
+  // #775 (reviewer finding on #778): bare `/mcp` is ALSO the generic industry
+  // MCP convention — most third-party MCP servers live at exactly `/mcp` or
+  // `/mcp/`. A generic (non-Parachute) server there must NOT be handed the
+  // Parachute-shaped broad pair it never advertised — it keeps the old
+  // fallback behavior (request its own advertised scopes_supported), same as
+  // any other non-vault MCP target.
+  test("#775 root-form MCP target (generic, non-Parachute remote) → falls back to its own scopes_supported", async () => {
+    currentOAuth = fakeOAuth({
+      discover: async () => ({
+        issuer: "https://issuer.test",
+        authorizationEndpoint: "https://issuer.test/oauth/authorize",
+        tokenEndpoint: "https://issuer.test/oauth/token",
+        registrationEndpoint: "https://issuer.test/oauth/register",
+        revocationEndpoint: "https://issuer.test/oauth/revoke",
+        // No `vault:`-prefixed scope anywhere — no Parachute signal.
+        scopesSupported: ["read", "write"],
+      }),
+    });
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    expect(res.status).toBe(200);
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.scope).toBe("read write");
   });
 });
 

@@ -962,10 +962,13 @@ async function approveMcpGrant(
   // derives the single least-privilege `vault:<name>:read` (write is a
   // deliberate future knob, not the default); root `…/mcp` has no name in the
   // URL to narrow against, so it derives the broad unnamed pair instead — the
-  // remote's own consent picker narrows THAT to one vault at authorize time.
-  // For any other MCP URL, fall back to the resource's advertised scopes
-  // (9728→8414), space-joined; omit if none.
-  const vaultScope = deriveVaultScopeFromMcpUrl(mcpUrl);
+  // remote's own consent picker narrows THAT to one vault at authorize time —
+  // but ONLY when `discovery.scopesSupported` actually signals a Parachute
+  // vault (bare `/mcp` is also the generic industry MCP convention, so root
+  // form alone isn't evidence; see `advertisesVaultScopes`). For any other
+  // MCP URL, fall back to the resource's advertised scopes (9728→8414),
+  // space-joined; omit if none.
+  const vaultScope = deriveVaultScopeFromMcpUrl(mcpUrl, discovery.scopesSupported);
   const scope = vaultScope
     ? vaultScope
     : discovery.scopesSupported?.length

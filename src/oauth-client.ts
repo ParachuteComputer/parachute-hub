@@ -317,6 +317,24 @@ const ROOT_MCP_PATH_RE = /^\/mcp\/?$/i;
 const ROOT_VAULT_SCOPE = "vault:read vault:write";
 
 /**
+ * Whether a resource's advertised `scopes_supported` signals a Parachute vault
+ * MCP server — the gate for the ROOT-form branch below. Unlike
+ * `…/vault/<name>/mcp`, bare `…/mcp` is the generic industry MCP convention
+ * (most third-party MCP servers live at exactly `/mcp` or `/mcp/`), NOT itself
+ * a Parachute signal. Without this gate, ANY server at root `/mcp` — Parachute
+ * or not — would unconditionally get handed `ROOT_VAULT_SCOPE`, a
+ * Parachute-specific scope shape it may never have advertised: a lenient
+ * server ignores the unrecognized scope, but a strict one 400s `invalid_scope`
+ * and the grant breaks. `vault:`-prefixed scopes are Parachute's own
+ * namespace (`docs/contracts/oauth-scopes.md`) — no non-Parachute server
+ * advertises them — so their presence is good-enough evidence without an
+ * extra round-trip.
+ */
+function advertisesVaultScopes(scopesSupported: readonly string[] | undefined): boolean {
+  return (scopesSupported ?? []).some((s) => s.startsWith("vault:"));
+}
+
+/**
  * Derive the least-privilege OAuth scope to request when starting an mcp-grant
  * OAuth flow against a remote MCP URL (#671, #775).
  *
@@ -328,18 +346,29 @@ const ROOT_VAULT_SCOPE = "vault:read vault:write";
  *
  *   - **URL-addressed** `…/vault/<name>/mcp` → the name is in the path, so we
  *     request a single least-privilege `vault:<name>:read` scope instead of
- *     the full set. Write is a deliberate future knob, not the default.
+ *     the full set. Write is a deliberate future knob, not the default. This
+ *     path shape is unambiguously Parachute — no gate needed.
  *   - **Root** `…/mcp` → no name is derivable from the URL at all (the
  *     token's audience carries it instead), so the broad unnamed pair
- *     (`ROOT_VAULT_SCOPE`) is the correct ask, not a fallback — the remote's
- *     consent picker narrows it to one vault at authorize time.
+ *     (`ROOT_VAULT_SCOPE`) would be the correct ask — BUT bare `/mcp` is also
+ *     the generic MCP convention, so this branch only fires when
+ *     `advertisesVaultScopes(scopesSupported)` confirms the remote is
+ *     actually Parachute-shaped. A non-Parachute server at root `/mcp` falls
+ *     through to `null` like any other non-vault MCP.
  *
- * For any other MCP URL (non-vault-shaped, or a `/vault/<name>/mcp` with no
- * parseable name), returns `null` — the caller keeps the existing behavior
- * (request `scopes_supported`, or omit `scope` when the resource advertises
- * none).
+ * `scopesSupported` is the caller's already-discovered advertised set (RFC
+ * 9728 → 8414) — passed in rather than fetched here because discovery is a
+ * network call the caller has already made.
+ *
+ * For any other MCP URL (non-vault-shaped, a `/vault/<name>/mcp` with no
+ * parseable name, or a root `/mcp` with no Parachute signal), returns `null`
+ * — the caller keeps the existing behavior (request `scopes_supported`, or
+ * omit `scope` when the resource advertises none).
  */
-export function deriveVaultScopeFromMcpUrl(mcpUrl: string): string | null {
+export function deriveVaultScopeFromMcpUrl(
+  mcpUrl: string,
+  scopesSupported?: readonly string[],
+): string | null {
   let parsed: URL;
   try {
     parsed = new URL(mcpUrl);
@@ -348,7 +377,9 @@ export function deriveVaultScopeFromMcpUrl(mcpUrl: string): string | null {
   }
   const name = VAULT_MCP_PATH_RE.exec(parsed.pathname)?.[1];
   if (name) return `vault:${name}:read`;
-  if (ROOT_MCP_PATH_RE.test(parsed.pathname)) return ROOT_VAULT_SCOPE;
+  if (ROOT_MCP_PATH_RE.test(parsed.pathname) && advertisesVaultScopes(scopesSupported)) {
+    return ROOT_VAULT_SCOPE;
+  }
   return null;
 }
 
