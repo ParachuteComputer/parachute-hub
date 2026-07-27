@@ -6,6 +6,13 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.8-rc.3] - 2026-07-27
+
+**fix(oauth-client): recognize the remote root-form MCP URL for outbound-grant scope derivation (#775).** `deriveVaultScopeFromMcpUrl` only recognized the URL-addressed `…/vault/<name>/mcp` shape; a remote's canonical root `…/mcp` (the form PR #774 just made the advertised canonical URL for self-hosted, matching Cloud) fell through the null path to the resource's full advertised `scopes_supported` — the broad pair `vault:read vault:write`, bypassing the least-privilege posture #671 established. Now root form is recognized too, but resolves differently: it has no vault name in the path to narrow against (the token's audience carries it instead), so requesting the broad unnamed pair IS correct — the remote's own consent picker narrows it to one vault at authorize time. The new `ROOT_MCP_PATH_RE` (anchored `^/mcp/?$`) makes that an explicit, commented branch rather than an accidental null-fallback; `VAULT_MCP_PATH_RE`'s URL-addressed derivation is unchanged and still wins when a name is present. `admin-agent-grants.ts`'s scope-selection comment updated to describe both branches.
+
+- Tests: root form (with/without trailing slash, with query/fragment) → the broad pair via the deliberate path; a near-miss (`/notmcp`) does NOT match root; URL-addressed form still derives `vault:<name>:read` (regression guard). Two pre-existing tests that used `https://remote.test/mcp` as a generic "non-vault" stand-in were repointed to `https://remote.test/some/other/mcp` (genuinely non-vault, non-root) since root form now resolves differently; a new grant-flow-level test pins that a root-form target requests the broad pair, not the resource's advertised `scopes_supported`.
+- No migration file — this only affects OAuth-start scope selection for a not-yet-authorized outbound grant; no persisted shape changes.
+
 ## [0.7.8-rc.2] - 2026-07-27
 
 **feat(mcp): forward canonical root `/mcp` to the vault module's daemon.** Vault has shipped root `/mcp` — a vault-agnostic MCP surface where the TOKEN's audience (not the URL) names the target vault — since 0.7.3, but the hub had no route to it: `POST /mcp` 404'd even with a vault module installed and running. This closes that missing leg.

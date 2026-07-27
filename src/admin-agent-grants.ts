@@ -955,13 +955,16 @@ async function approveMcpGrant(
   const verifier = client.generateCodeVerifier();
   const challenge = client.generateCodeChallenge(verifier);
   const state = client.generateState();
-  // Scope (#671). When the target is a Parachute vault MCP (`…/vault/<name>/mcp`),
-  // request a single least-privilege `vault:<name>:read` scope rather than the
-  // resource's full advertised set (which for a vault includes hub:admin,
-  // vault:<name>:write, … — wildly over-privileged for a read-only agent).
-  // Write is a deliberate future knob, not the default. For any non-vault MCP
-  // URL, fall back to the resource's advertised scopes (9728→8414), space-joined;
-  // omit if none.
+  // Scope (#671, #775). When the target is a Parachute vault MCP, request a
+  // Parachute-shaped scope rather than the resource's full advertised set
+  // (which for a vault includes hub:admin, vault:<name>:write, … — wildly
+  // over-privileged for a read-only agent): URL-addressed `…/vault/<name>/mcp`
+  // derives the single least-privilege `vault:<name>:read` (write is a
+  // deliberate future knob, not the default); root `…/mcp` has no name in the
+  // URL to narrow against, so it derives the broad unnamed pair instead — the
+  // remote's own consent picker narrows THAT to one vault at authorize time.
+  // For any other MCP URL, fall back to the resource's advertised scopes
+  // (9728→8414), space-joined; omit if none.
   const vaultScope = deriveVaultScopeFromMcpUrl(mcpUrl);
   const scope = vaultScope
     ? vaultScope

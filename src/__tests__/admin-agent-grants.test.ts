@@ -1136,7 +1136,10 @@ describe("approve(mcp) — start OAuth flow", () => {
       await dispatch(
         bearerReq("PUT", "/admin/grants", bearer, {
           agent: "a",
-          connection: { kind: "mcp", target: "https://remote.test/mcp" },
+          // A non-vault, non-root target — this test is about the generic
+          // discover/DCR/persist mechanics, not scope derivation (#671/#775
+          // cover that separately), so it stays off both special paths.
+          connection: { kind: "mcp", target: "https://remote.test/some/other/mcp" },
         }),
       ),
     );
@@ -1213,9 +1216,32 @@ describe("approve(mcp) — start OAuth flow", () => {
     expect(body.authorizeUrl as string).not.toContain("vault%3Aeng%3Awrite");
   });
 
-  // #671: the complement — a non-vault MCP target keeps the old behavior
-  // (request the resource's advertised scopes_supported).
+  // #671: the complement — a non-vault, non-root MCP target keeps the old
+  // behavior (request the resource's advertised scopes_supported).
   test("#671 non-vault MCP target → falls back to the advertised scopes_supported", async () => {
+    currentOAuth = fakeOAuth();
+    const bearer = await moduleBearer();
+    const cookie = await operatorCookie();
+    const created = await json(
+      await dispatch(
+        bearerReq("PUT", "/admin/grants", bearer, {
+          agent: "a",
+          connection: { kind: "mcp", target: "https://remote.test/some/other/mcp" },
+        }),
+      ),
+    );
+    const id = created.id as string;
+    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
+    expect(flow?.scope).toBe("vault:eng:read vault:eng:write");
+  });
+
+  // #775: a REMOTE hub's canonical root `/mcp` (the URL-addressed form has no
+  // name segment to derive from) requests the broad unnamed pair via the
+  // deliberate root-form path — NOT the resource's advertised scopes_supported
+  // (the fake discovery above advertises `vault:eng:read vault:eng:write`,
+  // which this must NOT match, proving the root path wins over the fallback).
+  test("#775 root-form MCP target → requests the broad pair, not scopes_supported", async () => {
     currentOAuth = fakeOAuth();
     const bearer = await moduleBearer();
     const cookie = await operatorCookie();
@@ -1228,9 +1254,12 @@ describe("approve(mcp) — start OAuth flow", () => {
       ),
     );
     const id = created.id as string;
-    await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    const res = await dispatch(cookieReq("POST", `/admin/grants/${id}/approve`, cookie));
+    expect(res.status).toBe(200);
     const flow = getFlowByState(harness.flowsStorePath, "fixed-state");
-    expect(flow?.scope).toBe("vault:eng:read vault:eng:write");
+    expect(flow?.scope).toBe("vault:read vault:write");
+    const body = await json(res);
+    expect(body.authorizeUrl as string).toContain(encodeURIComponent("vault:read vault:write"));
   });
 });
 

@@ -502,8 +502,7 @@ describe("deriveVaultScopeFromMcpUrl", () => {
     );
   });
 
-  test("a non-vault MCP URL → null (caller falls back to scopes_supported)", () => {
-    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp")).toBeNull();
+  test("a non-vault, non-root MCP URL → null (caller falls back to scopes_supported)", () => {
     expect(deriveVaultScopeFromMcpUrl("https://remote.test/some/other/mcp")).toBeNull();
   });
 
@@ -517,5 +516,31 @@ describe("deriveVaultScopeFromMcpUrl", () => {
 
   test("an unparseable URL → null", () => {
     expect(deriveVaultScopeFromMcpUrl("not a url")).toBeNull();
+  });
+
+  // === root form (#775) ======================================================
+
+  test("root /mcp (no vault name in the URL) → the broad unnamed pair, deliberately", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp")).toBe("vault:read vault:write");
+  });
+
+  test("root /mcp with a trailing slash still matches", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp/")).toBe("vault:read vault:write");
+  });
+
+  test("root /mcp with a query string / fragment still matches", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp?x=1#frag")).toBe(
+      "vault:read vault:write",
+    );
+  });
+
+  test("a near-miss path that merely ends in 'mcp' is NOT root form → null", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/notmcp")).toBeNull();
+  });
+
+  test("URL-addressed form still wins over root form (regression guard, #671)", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://hub.test/vault/research/mcp")).toBe(
+      "vault:research:read",
+    );
   });
 });
