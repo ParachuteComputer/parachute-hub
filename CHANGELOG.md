@@ -6,6 +6,21 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.8-rc.2] - 2026-07-27
+
+**feat(mcp): forward canonical root `/mcp` to the vault module's daemon.** Vault has shipped root `/mcp` — a vault-agnostic MCP surface where the TOKEN's audience (not the URL) names the target vault — since 0.7.3, but the hub had no route to it: `POST /mcp` 404'd even with a vault module installed and running. This closes that missing leg.
+
+- **`/mcp` + `/mcp/*` proxy to the vault module's daemon**, same resolution (`findServiceByShort(services, "vault")`) and `publicExposure: "loopback"` cloak as the existing `/vault/admin` daemon-level mount — dispatched before the per-vault proxy and generic service mounts so no installed module can claim the namespace via `services.json` paths. The response is returned raw (no chrome injection — it's a JSON-RPC protocol surface, not a page). No running vault module → a legible JSON 404 (`{"error":"vault_module_not_running", ...}`) naming the fix, not a bare branded 404.
+- **`/.well-known/oauth-protected-resource/mcp` (RFC 9728) forwards too**, folding the same wildcard CORS headers the hub's own well-known docs carry onto the vault's proxied response (its `Response.json` carries none of its own) — browser-side MCP clients can discover root `/mcp`'s scopes cross-origin.
+- **`proxyToVaultAdmin`'s body extracted into `proxyToVaultDaemon`**, shared by both `/vault/admin` and `/mcp`; `proxyToVaultAdmin` is now a thin caller. Same documented old-install degradation as before: a legacy per-instance `parachute-vault-<name>` row doesn't resolve via `findServiceByShort`, so on such an install both surfaces 404 until vault's boot `selfRegister` rewrites the canonical row.
+- **`root-serve.ts` reserves `/mcp` from the serve-app SPA shell** (belt-and-suspenders — the hub-owned `/mcp` dispatch above already always returns before reaching the serve-app tail, but this closes the gap explicitly rather than incidentally, matching the existing `/api`, `/oauth`, `/.well-known` reservations).
+
+### Known follow-ups (deliberately out of scope — tracked as issues)
+
+- `deriveVaultScopeFromMcpUrl` (`oauth-client.ts`) doesn't recognize a remote root-form `…/mcp`, so an outbound grant falls back to broad `vault:read vault:write` instead of least-privilege.
+- Path-inserted per-vault PRM forms (`/.well-known/oauth-protected-resource/vault/<name>[/mcp]`) 404 at the hub while the vault daemon implements them.
+- Operator-facing copy (setup wizard, docs, `hub.html`) should advertise `https://<host>/mcp` as the MCP URL now that both doors accept it.
+
 ## [0.7.8-rc.1] - 2026-07-25
 
 **chore(app-package): point the app front door at its renamed npm package — `@openparachute/parachute-app` → `@openparachute/app`.** The app package was renamed to drop the scope stutter (every other `@openparachute` package is a bare noun); this bump repoints every hub site that names it. Clean switch, no dual-name fallback (see below).

@@ -6702,3 +6702,209 @@ describe("hubFetch — root_mode serve-app", () => {
     }
   });
 });
+
+describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () => {
+  // The vault daemon ships canonical root /mcp (vault-agnostic — the
+  // TOKEN's audience names the target vault) since 0.7.3. This suite pins
+  // the hub-side leg: forwarding root /mcp + its PRM well-known to the
+  // vault module's daemon via `proxyToVaultDaemon`, the same resolution +
+  // loopback-cloak `/vault/admin` already uses.
+
+  /** Upstream that RECORDS every request it sees (method/path/body/forwarded
+   * host) so tests can assert both what reached the daemon and — for the
+   * cloak test — that nothing did. */
+  function startRecordingUpstream(): {
+    port: number;
+    stop: () => void;
+    requests: () => Array<{
+      method: string;
+      pathname: string;
+      body: string;
+      forwardedHost: string | null;
+    }>;
+  } {
+    const seen: Array<{
+      method: string;
+      pathname: string;
+      body: string;
+      forwardedHost: string | null;
+    }> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (r) => {
+        const u = new URL(r.url);
+        const body = r.body ? await r.text() : "";
+        seen.push({
+          method: r.method,
+          pathname: u.pathname,
+          body,
+          forwardedHost: r.headers.get("x-forwarded-host"),
+        });
+        return new Response(JSON.stringify({ tag: "vault-daemon", pathname: u.pathname }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    return { port: server.port as number, stop: () => server.stop(true), requests: () => seen };
+  }
+
+  // The CANONICAL self-registered row — findServiceByShort resolves
+  // "parachute-vault" → short "vault". Deliberately NOT the vaultEntry()
+  // helper used elsewhere in this file: that emits legacy
+  // `parachute-vault-<name>` rows, which findServiceByShort intentionally
+  // does not resolve — using it here would fail these tests for the wrong
+  // reason (the same trap the /vault/admin suite above calls out).
+  function canonicalVaultRow(port: number, extra?: Partial<ServiceEntry>): ServiceEntry {
+    return {
+      name: "parachute-vault",
+      port,
+      paths: ["/vault/default"],
+      health: "/vault/default/health",
+      version: "0.7.3",
+      ...extra,
+    };
+  }
+
+  const fakeServer = (address: string) => ({ requestIP: () => ({ address }) });
+
+  test("POST/GET/DELETE /mcp reach the daemon with the JSON-RPC body + forwarded host intact", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const rpcBody = JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1 });
+      for (const method of ["POST", "GET", "DELETE"]) {
+        const init: RequestInit = { method, headers: { host: "hub.example.com" } };
+        if (method === "POST") {
+          init.headers = { ...init.headers, "content-type": "application/json" };
+          init.body = rpcBody;
+        }
+        const res = await fetcher(new Request("http://hub.example.com/mcp", init));
+        expect(res.status).toBe(200);
+      }
+      const seen = upstream.requests();
+      expect(seen.map((r) => r.method)).toEqual(["POST", "GET", "DELETE"]);
+      for (const r of seen) {
+        expect(r.pathname).toBe("/mcp");
+        // Forwarded so the vault daemon's getBaseUrl names the public origin
+        // in the challenge + PRM (hub#358), not its internal loopback URL.
+        expect(r.forwardedHost).toBe("hub.example.com");
+      }
+      const postSeen = seen.find((r) => r.method === "POST");
+      expect(postSeen?.body).toBe(rpcBody);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("GET /.well-known/oauth-protected-resource/mcp forwards + carries wildcard CORS; OPTIONS answers locally", async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    try {
+      writeManifest({ services: [canonicalVaultRow(upstream.port)] }, h.manifestPath);
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+
+      const getRes = await fetcher(req("/.well-known/oauth-protected-resource/mcp"));
+      expect(getRes.status).toBe(200);
+      // The vault's Response.json carries no CORS of its own — hub folds it on.
+      expect(getRes.headers.get("access-control-allow-origin")).toBe("*");
+      expect(upstream.requests().map((r) => r.pathname)).toEqual([
+        "/.well-known/oauth-protected-resource/mcp",
+      ]);
+
+      const optRes = await fetcher(
+        req("/.well-known/oauth-protected-resource/mcp", { method: "OPTIONS" }),
+      );
+      expect(optRes.status).toBe(204);
+      expect(optRes.headers.get("access-control-allow-origin")).toBe("*");
+      // OPTIONS answered locally — the daemon only ever saw the earlier GET.
+      expect(upstream.requests().length).toBe(1);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test('loopback cloak: publicExposure:"loopback" + non-loopback peer → 404, daemon never reached (#526 posture)', async () => {
+    const h = makeHarness();
+    const upstream = startRecordingUpstream();
+    try {
+      writeManifest(
+        { services: [canonicalVaultRow(upstream.port, { publicExposure: "loopback" })] },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      // Header-absent NON-loopback peer (0.0.0.0 bind) — #526 posture.
+      const res = await fetcher(req("/mcp", { method: "POST" }), fakeServer("198.51.100.4"));
+      expect(res.status).toBe(404);
+      // The 404 alone passes on unfixed (unrouted) code too — the load-bearing
+      // assertion is that the cloak fired BEFORE the daemon was ever hit.
+      expect(upstream.requests().length).toBe(0);
+    } finally {
+      upstream.stop();
+      h.cleanup();
+    }
+  });
+
+  test("no vault module installed → legible JSON 404 (vault_module_not_running)", async () => {
+    const h = makeHarness();
+    try {
+      writeManifest(
+        {
+          services: [
+            // Some other module installed — must not satisfy findServiceByShort("vault").
+            {
+              name: "parachute-scribe",
+              port: 1942,
+              paths: ["/scribe"],
+              health: "/scribe/health",
+              version: "0.1.0",
+            },
+          ],
+        },
+        h.manifestPath,
+      );
+      const fetcher = hubFetch(h.dir, { manifestPath: h.manifestPath });
+      const res = await fetcher(req("/mcp", { method: "POST" }));
+      expect(res.status).toBe(404);
+      const body = (await res.json()) as { error?: string; message?: string };
+      expect(body.error).toBe("vault_module_not_running");
+      expect(body.message).toContain("/mcp");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("serve-app mode does NOT SPA-shell /mcp when no vault module is installed (masking pin)", async () => {
+    const h = makeHarness();
+    // A legacy-named instance row (parachute-vault-default) satisfies
+    // hasVaultInstalled (bypasses the fresh-hub wizard funnel) WITHOUT
+    // resolving via findServiceByShort — the realistic "old-install
+    // degradation" shape the proxyToVaultDaemon docstring calls out, not a
+    // contrived empty manifest.
+    writeManifest({ services: [vaultEntry("default")] }, h.manifestPath);
+    const db = openHubDb(hubDbPath(h.dir));
+    try {
+      await createUser(db, "owner", "pw");
+      setRootMode(db, "serve-app");
+      const dist = join(h.dir, "app-dist");
+      mkdirSync(dist, { recursive: true });
+      writeFileSync(join(dist, "index.html"), "<!doctype html><title>PARACHUTE-APP-SHELL</title>");
+      const res = await hubFetch(h.dir, {
+        getDb: () => db,
+        manifestPath: h.manifestPath,
+        resolveAppDist: () => dist,
+      })(req("/mcp", { headers: { accept: "text/html" } }));
+      expect(res.status).toBe(404);
+      const body = await res.text();
+      expect(body).not.toContain("PARACHUTE-APP-SHELL");
+    } finally {
+      db.close();
+      h.cleanup();
+    }
+  });
+});

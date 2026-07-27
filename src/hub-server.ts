@@ -52,6 +52,10 @@
  *   /.well-known/jwks.json                     → JWKS from hub.db
  *   /.well-known/parachute-account             → account-door capabilities descriptor (public, H2)
  *   /.well-known/oauth-authorization-server    → RFC 8414 metadata (issuer, endpoints)
+ *   /.well-known/oauth-protected-resource/mcp  → RFC 9728 PRM for root /mcp,
+ *                                                FORWARDED from the vault daemon
+ *                                                (not built locally like the
+ *                                                hub-issued PRM)
  *
  *   # OAuth issuer.
  *   /oauth/authorize  (GET + POST)             → login → consent → auth code
@@ -167,6 +171,13 @@
  *   # hub-module-boundary). Runs BEFORE the per-vault proxy; "admin" is a
  *   # reserved vault name so no instance can claim the mount.
  *   /vault/admin, /vault/admin/*               → proxy to the vault module's daemon
+ *
+ *   # Root MCP surface (hub-owned protocol namespace, dispatched BEFORE the
+ *   # per-vault proxy and generic service mounts so no module can claim it
+ *   # via services.json paths). Vault-agnostic — the TOKEN's audience names
+ *   # the target vault, re-validated by the daemon; no "which vault" in the
+ *   # URL. Same daemon resolution + loopback-cloak as /vault/admin above.
+ *   /mcp, /mcp/*                                → proxy to the vault module's daemon
  *
  *   # Per-vault content proxy (user-facing vault data: Notes PWA, MCP, etc.).
  *   /vault/<name>/*                            → proxy to the vault backend
@@ -1124,34 +1135,39 @@ async function proxyToVault(
 }
 
 /**
- * Reverse-proxy `/vault/admin` + `/vault/admin/*` to the vault MODULE's
- * daemon — the daemon-level multi-vault admin surface (B-route, 2026-06-09
- * hub-module-boundary migration), NOT a per-instance path.
+ * Reverse-proxy a request onto the vault MODULE's daemon — the shared
+ * plumbing behind two hub-owned protocol mounts: `/vault/admin` (the
+ * daemon-level multi-vault admin surface, B-route, 2026-06-09
+ * hub-module-boundary migration) and root `/mcp` (the canonical
+ * vault-agnostic MCP surface the vault daemon has shipped since 0.7.3 — the
+ * TOKEN's audience, not the URL, names the target vault, so there's no
+ * "which vault" question at this layer).
  *
  * Resolution is via `findServiceByShort(services, "vault")` (the canonical
  * self-registered `parachute-vault` row — same shape as the agentEntry
  * lookup in the Connections deps), deliberately NOT `findVaultUpstream`:
- * vault must NOT self-register `/vault/admin` in `paths[]`, because every
+ * vault must NOT self-register either mount in `paths[]`, because every
  * consumer that derives instance names from paths (`vaultInstanceNameFor`,
  * the well-known vaults[] fan-out, `findExistingVault`, the mint
  * allowlists, the users vault-picker) would fabricate a phantom vault named
- * "admin". The mount is hub-owned and gated on the B2h `admin` name
- * reservation, so no real instance can ever claim it.
+ * "admin" or "mcp". Both mounts are hub-owned (the B2h `admin` name
+ * reservation covers the first; `/mcp` lives outside `/vault/*` entirely),
+ * so no real instance can ever claim them.
  *
  * Applies the SAME `publicExposure: "loopback"` 404-cloak as `proxyToVault`
  * (the per-vault proxy's only layer-gate; "allowed"/"auth-required" pass
  * through and the daemon self-gates). Vault's row declares no `stripPrefix`
- * — the FULL path forwards, so the daemon's own `/vault/admin` routing
- * branch (vault wave, B3) serves it.
+ * — the FULL path forwards, so the daemon's own routing (the `/vault/admin`
+ * branch, vault wave B3, and root `/mcp`, vault 0.7.3) serves it.
  *
  * Returns `undefined` when no vault module is installed (caller 404s).
  * NOTE: legacy per-instance rows named `parachute-vault-<name>` don't
  * resolve through `findServiceByShort` (it only knows the canonical
- * manifest name) — on such an install this surface 404s until vault's boot
+ * manifest name) — on such an install both surfaces 404 until vault's boot
  * selfRegister rewrites the canonical row, which is the documented
  * old-install degradation, not a routing hole.
  */
-async function proxyToVaultAdmin(
+async function proxyToVaultDaemon(
   req: Request,
   manifestPath: string,
   supervisor: Supervisor | undefined,
@@ -1165,6 +1181,21 @@ async function proxyToVaultAdmin(
     return new Response("not found", { status: 404 });
   }
   return proxyRequest(req, entry.port, "vault", "vault", supervisor, peerAddr);
+}
+
+/**
+ * `/vault/admin` + `/vault/admin/*` specifically — thin caller over
+ * `proxyToVaultDaemon` (see its docstring for the full resolution + cloak +
+ * old-install-degradation detail), kept as its own named entry point since
+ * its call site reads clearer naming the mount it serves.
+ */
+async function proxyToVaultAdmin(
+  req: Request,
+  manifestPath: string,
+  supervisor: Supervisor | undefined,
+  peerAddr: string | null,
+): Promise<Response | undefined> {
+  return proxyToVaultDaemon(req, manifestPath, supervisor, peerAddr);
 }
 
 /**
@@ -1712,6 +1743,22 @@ function dbNotConfigured(): Response {
   return Response.json(
     { error: "service_unavailable", error_description: "hub db not configured" },
     { status: 503 },
+  );
+}
+
+// Canonical 404 body for root `/mcp` + its PRM well-known when
+// `proxyToVaultDaemon` resolves no vault module row — a legible JSON error
+// (vs the branded-text 404 the rest of dispatch falls back to) naming the
+// fix, since `/mcp` is a protocol surface API clients parse, not a page a
+// human reads.
+function vaultModuleNotRunning(): Response {
+  return Response.json(
+    {
+      error: "vault_module_not_running",
+      message:
+        "This hub has no running vault module, so /mcp cannot answer. Install and start the vault module, then use https://<host>/mcp as your MCP URL.",
+    },
+    { status: 404 },
   );
 }
 
@@ -2884,6 +2931,30 @@ export function hubFetch(
         const merged = new Headers(res.headers);
         for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
         return new Response(res.body, { status: res.status, headers: merged });
+      }
+
+      // /.well-known/oauth-protected-resource/mcp — the PRM for root /mcp
+      // (RFC 9728, path-suffixed per the MCP spec's per-resource discovery
+      // convention). UNLIKE the bare PRM above, this doc is FORWARDED from
+      // the vault daemon rather than built locally — the daemon names /mcp
+      // as the resource + its own scopes (vault:read / vault:write). Same
+      // wildcard CORS shape as its sibling; the vault's `Response.json`
+      // carries none of its own, so we fold it onto the proxied response —
+      // this well-known surface is deliberately CORS-open for browser-side
+      // MCP client discovery.
+      if (pathname === "/.well-known/oauth-protected-resource/mcp") {
+        const corsHeaders = {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, OPTIONS",
+        };
+        if (req.method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        const proxied = await proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr);
+        if (!proxied) return vaultModuleNotRunning();
+        const merged = new Headers(proxied.headers);
+        for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
+        return new Response(proxied.body, { status: proxied.status, headers: merged });
       }
 
       // GET /.well-known/parachute-account — the account-door capabilities
@@ -4076,6 +4147,30 @@ export function hubFetch(
         const proxied = await proxyToVaultAdmin(req, manifestPath, deps?.supervisor, peerAddr);
         if (proxied) return decorateWithChrome(proxied, req, pathname, getDb);
         return new Response("not found", { status: 404 });
+      }
+
+      // /mcp + /mcp/* — the canonical, vault-agnostic root MCP surface the
+      // vault daemon has served since 0.7.3. Hub-owned protocol namespace,
+      // dispatched here (BEFORE the /vault/ per-vault proxy and the generic
+      // service mounts) so no service can claim it via services.json paths.
+      // There's no "which vault" question at this layer — the TOKEN's
+      // audience names the target vault, re-validated by the daemon itself
+      // — so we forward via `proxyToVaultDaemon` unconditionally, the same
+      // resolution + loopback-cloak as `/vault/admin`. The response is
+      // returned RAW (no `decorateWithChrome`): this is a JSON-RPC protocol
+      // surface, not an HTML page, so chrome injection would be wrong even
+      // when it no-ops on non-HTML bodies.
+      if (pathname === "/mcp" || pathname.startsWith("/mcp/")) {
+        // Same per-request force-change-password gate as the twins above —
+        // a pre-rotation signed-in user can't reach vault data through here
+        // either.
+        if (getDb) {
+          const gate = forceChangePasswordGate(getDb(), req);
+          if (gate) return gate;
+        }
+        const proxied = await proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr);
+        if (proxied) return proxied;
+        return vaultModuleNotRunning();
       }
 
       // /vault/<name>/* — per-vault content proxy. Stays as user-facing

@@ -38,14 +38,18 @@ export const APP_PACKAGE = "@openparachute/app";
 /**
  * Namespaces that keep the hub's branded 404 even in serve-app mode. These are
  * hub / protocol surfaces, never app client-side routes, so an SPA shell there
- * would be wrong — and would mask a genuine 404 for an API/OAuth/well-known
+ * would be wrong — and would mask a genuine 404 for an API/OAuth/well-known/MCP
  * typo. (Real dist files never live under these prefixes anyway; this makes the
- * "don't shell it" decision explicit rather than incidental.)
+ * "don't shell it" decision explicit rather than incidental.) In practice
+ * `hub-server.ts` dispatches `/mcp` itself before ever reaching this tail —
+ * this entry is belt-and-suspenders so a future reordering can't regress into
+ * SPA-shelling a protocol 404.
  */
 export const ROOT_SERVE_RESERVED_PREFIXES: readonly string[] = [
   "/api/",
   "/oauth/",
   "/.well-known/",
+  "/mcp/",
 ];
 
 /**
@@ -108,6 +112,9 @@ export function serveAppAtRoot(dist: string, req: Request, pathname: string): Re
   if (req.method !== "GET") return null;
 
   // Hub/protocol namespaces are never the app's — leave their 404 branded.
+  // The bare `/mcp` (no trailing slash) needs its own check since the
+  // prefixes below are all trailing-slash-based.
+  if (pathname === "/mcp") return null;
   for (const prefix of ROOT_SERVE_RESERVED_PREFIXES) {
     if (pathname.startsWith(prefix)) return null;
   }
