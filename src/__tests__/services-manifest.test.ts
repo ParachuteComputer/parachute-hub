@@ -1396,7 +1396,7 @@ describe("stale OLD-UI-host app row heal (hub-parity P5, B1)", () => {
       );
       const m = readManifest(path);
       // The stale row is gone — it never survives to spawn a crash-looping
-      // `--package @openparachute/parachute-app` unit the operator never
+      // `--package @openparachute/app` unit the operator never
       // installed.
       expect(m.services).toHaveLength(0);
       // Rewritten clean on disk too.

@@ -5,7 +5,7 @@
  *
  * When an operator flips the root mode to `serve-app` (or a fresh hub installs
  * the app during setup), the hub answers its own origin root with the installed
- * `@openparachute/parachute-app` bundle instead of 302-ing to `/admin`. This is
+ * `@openparachute/app` bundle instead of 302-ing to `/admin`. This is
  * the self-hosted mirror of the hosted door: hit your box's URL, land in the
  * app — no redirect hop.
  *
@@ -33,7 +33,7 @@ import { join } from "node:path";
 import { resolveNotesDistFrom } from "./notes-serve.ts";
 
 /** The npm package whose built `dist/` is the app front door. */
-export const APP_PACKAGE = "@openparachute/parachute-app";
+export const APP_PACKAGE = "@openparachute/app";
 
 /**
  * Namespaces that keep the hub's branded 404 even in serve-app mode. These are

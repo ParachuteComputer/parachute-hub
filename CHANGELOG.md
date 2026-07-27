@@ -6,6 +6,14 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.8-rc.1] - 2026-07-25
+
+**chore(app-package): point the app front door at its renamed npm package — `@openparachute/parachute-app` → `@openparachute/app`.** The app package was renamed to drop the scope stutter (every other `@openparachute` package is a bare noun); this bump repoints every hub site that names it. Clean switch, no dual-name fallback (see below).
+
+- **The npm-name sites move, the identity sites don't.** Changed: `APP_PACKAGE` (`src/root-serve.ts`, the root-serve dist resolver), `APP_FALLBACK.package` + its `--package` startCmd arg (`src/service-spec.ts`), the `help` module-start-command line, and the resolver test's fixture package name — plus the comments that name the package. **Unchanged:** the `parachute-app` `manifestName` (hub's services.json discovery key, still matches the app's `dist/.parachute/info` name), the `app` short name, the port-1944 reservation, and every `parachute-app#N` / design-doc reference (those are the GitHub repo, which keeps its name).
+- **Clean switch, not dual-name.** Hub resolves only `@openparachute/app`. This is safe because (1) the merge order publishes `@openparachute/app` before this hub ships, so hub never names a package that doesn't exist; (2) the old `@openparachute/parachute-app` stays published (deprecated), so any un-upgraded hub keeps resolving it; (3) the npm-install base is ~zero — the app became installable-from-npm one day ago, and Aaron's dogfood box is bun-linked, not npm-installed. The one residual: an operator who npm-installed the app in that <1-day window and upgrades hub without re-running `parachute install app` re-resolves the now-absent old package until they do — a single command, and the resolver's uncached-failure recovery heals it with no restart.
+- **Depends on the app publish landing first** (`@openparachute/app` on npm) before this hub tags a release.
+
 ## [0.7.7-rc.17] - 2026-07-22
 
 Two real product/harness bugs that chronically hung the Tier-1 e2e (blocking the 0.7.7 stable push): the CLI setup-wizard busy-hangs on a closed stdin, and — once unhung — silently skips its vault step on an init'd box so `--vault-mode create --vault-name` is dropped.

@@ -190,8 +190,8 @@ describe("notesFetch /health (2026-07-11, hub-parity P5)", () => {
 });
 
 // hub-parity P5 (2026-07-11): the shim generalized beyond notes to serve
-// @openparachute/parachute-app (mount `/app`, port 1944) via the same
-// FIRST_PARTY_FALLBACKS startCmd shape (`--package @openparachute/parachute-app`).
+// @openparachute/app (mount `/app`, port 1944) via the same
+// FIRST_PARTY_FALLBACKS startCmd shape (`--package @openparachute/app`).
 // These tests re-run the load-bearing PWA regression (sw.js / manifest
 // content-type, SPA fallback, mount-strip) for a NON-notes package/mount to
 // prove the generalization didn't accidentally hardcode "notes" anywhere in
@@ -424,7 +424,7 @@ describe("resolveNotesDistFrom (hub#194)", () => {
  * is the caller's `pkg`, not a hardcoded "notes" string.
  */
 describe("resolveNotesDistFrom --package (hub-parity P5)", () => {
-  const APP_PKG = "@openparachute/parachute-app";
+  const APP_PKG = "@openparachute/app";
 
   function makeAppFixture(): { home: string; cleanup: () => void; dist: string } {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "pcli-app-resolve-")));
@@ -505,7 +505,7 @@ describe("resolveNotesDistFrom --package (hub-parity P5)", () => {
         cwd: "/cwd-with-app",
         home: "/h",
         pkg: APP_PKG,
-        resolveSync: () => "/cwd-with-app/node_modules/@openparachute/parachute-app/package.json",
+        resolveSync: () => "/cwd-with-app/node_modules/@openparachute/app/package.json",
         existsSync: () => false,
       }),
     ).toThrow(new RegExp(`${APP_PKG.replace("/", "\\/")} resolved at .* has no dist/ directory`));

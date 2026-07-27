@@ -1439,7 +1439,7 @@ export interface HubFetchDeps {
    * Resolve the installed app's `dist/` directory for `root_mode = serve-app`.
    * Returns the dist dir, or `null` when the app isn't installed (→ serve-app
    * falls back to the redirect). Production defaults to a memoizing resolver
-   * over the real `@openparachute/parachute-app` package (`makeAppDistResolver`);
+   * over the real `@openparachute/app` package (`makeAppDistResolver`);
    * tests inject a fixture dir or a `() => null` to drive the not-installed
    * fallback without a real global install.
    */
