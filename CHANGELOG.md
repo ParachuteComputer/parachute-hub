@@ -6,6 +6,40 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.8] - 2026-07-28
+
+**Stable promotion of the 0.7.8 line (7 commits over 0.7.7).** Promotes rc.1–rc.5
+to `@latest`. The theme is the unified `/mcp` root and two silent-failure fixes.
+
+- **Canonical root `/mcp` forwarded to the vault daemon (#774)**, and the OAuth
+  client now recognizes the remote root-form MCP URL when deriving scope (#778).
+  Self-host reaches parity with the hosted door: one `/mcp` at the root, rather
+  than only per-module endpoints.
+- **The install cache can no longer silently roll back a bun-linked bundle
+  (#780 / #782).** Supervised services launch with `cwd = /`, and resolution
+  tried `cwd` first — from `/`, Bun's resolver prefers its own install cache over
+  the global link. A linked checkout was therefore ignored in favour of whatever
+  npm version happened to be cached. Observed in the wild: a hub served a
+  months-old published bundle for nine hours while `parachute status` reported the
+  linked checkout, because that line described *resolution*, not what was served.
+  `/` is dropped from the candidate list, and `status` now reports the version at
+  the path it actually serves from, printing `! SERVED-DRIFT:` when resolution
+  lands anywhere other than the link.
+- **A test whose fuse had already burned (#784).** `operator-token.test.ts` minted
+  a token at a pinned 2026-04-26 and validated it against the real clock; with the
+  90-day operator TTL it began failing permanently on 2026-07-25. It went unseen
+  because hub PRs gate on container-smoke only — the full suite runs at tag time,
+  and the previous tag predated the fuse. Fixed, plus a sweep confirming it was
+  the only armed instance.
+- **App front door repointed** to the renamed `@openparachute/app` package (#772),
+  and door-contract fail-closed slot validation (#770, published separately as
+  `@openparachute/door-contract` 0.6.1).
+
+Also: CLAUDE.md slimmed to gotchas-only (#771, docs-only).
+
+Operator note: this is the first 0.7.8 artifact published to `@latest`; the line
+was gated green end-to-end (unit suite, e2e, publish, container) at `v0.7.8-rc.5`.
+
 ## [0.7.8-rc.5] - 2026-07-28
 
 **fix(test): defuse an operator-token test whose fuse had already burned — a self-expiring assertion, invisible because the gate that runs it only fires at tag time.** `operator-token.test.ts`'s "returns a JWT with operator audience, broad scopes, …" minted the operator token at a **pinned past clock** (`now: () => 2026-04-26`) and then validated it with `validateAccessToken`, which enforces `exp` against **jose's real clock** (no override). With the 90-day operator TTL, the minted `exp` landed at **2026-07-25** — so from that date on the test failed on every run with `JWTExpired`, permanently, not as a flake. It went unseen because a hub PR runs container-smoke only; the full unit suite runs at tag time, and the hub hadn't tagged since `v0.7.7` (2026-07-22, green) — three days before the fuse.
