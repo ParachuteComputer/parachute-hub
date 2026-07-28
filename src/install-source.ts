@@ -17,6 +17,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { resolveNotesDistFrom } from "./notes-serve.ts";
 import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES, shortNameForManifest } from "./service-spec.ts";
 
 export type InstallSourceKind = "bun-linked" | "npm" | "unknown";
@@ -289,4 +290,129 @@ export function formatInstallSourceLabel(source: InstallSource): string {
     return "npm";
   }
   return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// Served-bundle resolution guardrail (hub#780).
+//
+// The install-source detection above answers "where does the operator's bun
+// link / installDir point?" — the SOURCE column. It does NOT answer "where does
+// the notes-serve shim actually resolve the bundle from at serve time?" On
+// Aaron's box those two diverged silently: SOURCE read `bun-linked → app @ sha`
+// (true of the link) while the shim, launched with cwd `/`, resolved the bundle
+// from bun's install *cache* and served a months-old `@openparachute/app@0.22.5`
+// for nine hours. Part 1 (dropping `/` as a resolution candidate) fixes the
+// known cause; this makes any residual/future divergence self-evident in
+// `status` at a glance instead of a multi-hour asset-hash trace.
+// ---------------------------------------------------------------------------
+
+/**
+ * The cwd the supervisor launches shim-served (notes/app) processes with.
+ * launchd/systemd hand a supervised child `/` when no per-module cwd is set —
+ * exactly the notes-serve case (hub#780). Served resolution is computed from
+ * here so `status` mirrors the running shim rather than the CLI's own cwd.
+ */
+export const SUPERVISOR_CWD = "/";
+
+export interface ServedResolution {
+  /**
+   * Absolute package root the notes-serve shim actually resolves + serves from,
+   * computed via the SAME candidate walk the shim uses. Undefined when the
+   * package can't be resolved from the supervisor cwd (not installed).
+   */
+  readonly servedPath?: string;
+  /** Version read from the served package's `package.json` — the version really served. */
+  readonly servedVersion?: string;
+  /** Where the bun-global link/install for the package points, if any. */
+  readonly linkedPath?: string;
+  /**
+   * True when a global link exists for the package but shim resolution landed
+   * somewhere else — the hub#780 divergence the operator can act on.
+   */
+  readonly divergent: boolean;
+}
+
+export interface DetectServedResolutionDeps {
+  /** Home dir the resolution candidates are anchored on. Defaults to `homedir()`. */
+  readonly home?: string;
+  /** Supervisor launch cwd. Defaults to {@link SUPERVISOR_CWD} (`/`). */
+  readonly cwd?: string;
+  /** Override `Bun.resolveSync` for tests (passed straight to the shim resolver). */
+  readonly resolveSync?: (specifier: string, base: string) => string;
+  /** Override `existsSync` for tests (passed straight to the shim resolver). */
+  readonly existsSync?: (path: string) => boolean;
+  /** Reads + parses a JSON file. Shared shape with {@link DetectInstallSourceDeps}. */
+  readonly readJson?: (path: string) => unknown;
+  /** Returns the bun-global link target for a package, or null. Shared shape with detect. */
+  readonly resolveBunGlobal?: (packageName: string) => string | null;
+}
+
+/**
+ * Resolve a shim-served package the way `notes-serve.ts` does at serve time and
+ * compare against its bun-global link. Pure + total: never throws (status is a
+ * diagnostic), degrading to `{ divergent: false }` when nothing resolves.
+ *
+ * `resolveNotesDistFrom` returns `<root>/dist`; the package root (where
+ * `package.json` lives) is its parent. Post-fix, resolving from cwd `/` lands on
+ * the global link, so `servedPath === linkedPath` and `divergent` is false — no
+ * false positive. It fires only when resolution genuinely lands off the link.
+ */
+export function detectServedResolution(
+  pkg: string,
+  deps: DetectServedResolutionDeps = {},
+): ServedResolution {
+  const readJson = deps.readJson ?? defaultReadJson;
+  const resolveBunGlobal = deps.resolveBunGlobal ?? defaultResolveBunGlobal;
+  const cwd = deps.cwd ?? SUPERVISOR_CWD;
+
+  let servedPath: string | undefined;
+  try {
+    const dist = resolveNotesDistFrom({
+      pkg,
+      cwd,
+      ...(deps.home !== undefined && { home: deps.home }),
+      ...(deps.resolveSync !== undefined && { resolveSync: deps.resolveSync }),
+      ...(deps.existsSync !== undefined && { existsSync: deps.existsSync }),
+    });
+    servedPath = dirname(dist);
+  } catch {
+    // Not resolvable from the supervisor cwd (package not installed, or no
+    // dist/). status still renders the row; nothing to compare against here.
+    servedPath = undefined;
+  }
+
+  const servedVersion = servedPath ? readVersion(servedPath, readJson) : undefined;
+  const linkedPath = resolveBunGlobal(pkg) ?? undefined;
+
+  const divergent =
+    linkedPath !== undefined &&
+    servedPath !== undefined &&
+    realpathOrResolve(servedPath) !== realpathOrResolve(linkedPath);
+
+  return {
+    ...(servedPath !== undefined && { servedPath }),
+    ...(servedVersion !== undefined && { servedVersion }),
+    ...(linkedPath !== undefined && { linkedPath }),
+    divergent,
+  };
+}
+
+/** realpath a path, falling back to a plain resolve so a missing target still compares. */
+function realpathOrResolve(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/**
+ * Continuation-line warning for `status` when a shim-served package resolves
+ * somewhere other than its bun-global link (hub#780). Mirrors the `STALE:` note
+ * shape for consistency. Returns undefined when resolution is consistent.
+ */
+export function servedDivergenceNote(pkg: string, served: ServedResolution): string | undefined {
+  if (!served.divergent) return undefined;
+  const version = served.servedVersion ?? "unknown";
+  return `SERVED-DRIFT: serving ${pkg}@${version} from ${served.servedPath}, not the global link at ${served.linkedPath} — clear the stale \`~/.bun/install/cache\` entry and \`bun link\` the checkout, then restart`;
 }

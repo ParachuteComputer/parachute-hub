@@ -98,7 +98,8 @@ export function normalizeMount(raw: string): string {
  *
  *   1. `process.cwd()` — works when the shim is invoked from inside the
  *      package's own checkout (e.g. via `installDir` cwd in lifecycle.ts) or
- *      from any project that depends on the package.
+ *      from any project that depends on the package. OMITTED when cwd is `/`
+ *      (see the hub#780 carve-out below).
  *   2. `~/.bun/install/global/node_modules` — modern Bun's global-install
  *      layout. This is where `bun add -g <package>` lands the package, and
  *      where `bun link <package>` symlinks it.
@@ -111,12 +112,29 @@ export function normalizeMount(raw: string): string {
  * (2)/(3). hub#194: Aaron hit silent 502 on tailnet `/notes/` because of
  * this — fixed by trying the global install dirs.
  *
+ * hub#780 — the `/` carve-out. The supervisor launches shim-served services
+ * (notes/app) with **cwd = `/`** (launchd/systemd hand a supervised child `/`
+ * when no per-module cwd is set). From `/`, `Bun.resolveSync` finds nothing up
+ * the tree and falls through to bun's own install *cache*
+ * (`~/.bun/install/cache/<pkg>@<ver>@@@1`) — a copy laid down by any
+ * `bun add`/install. That cached copy then WINS as candidate (1), before the
+ * global link at (2) is ever consulted, so a bun-linked checkout is silently
+ * ignored in favour of an arbitrarily old published version (Aaron's box served
+ * `@openparachute/app@0.22.5` for nine hours while `status` reported the linked
+ * checkout). A real checkout cwd is never `/`, so dropping `/` as a candidate
+ * loses nothing legitimate and forces resolution through the global link table
+ * — the intended source for a supervised service.
+ *
  * Exported (and parameterized via `cwd`/`home`) so tests can drive the
  * resolution order against a real fixture install without monkey-patching
  * `Bun.resolveSync`.
  */
 export function notesDistCandidates(cwd: string, home: string): string[] {
-  return [cwd, join(home, ".bun/install/global/node_modules"), join(home, ".bun/install/global")];
+  const globals = [
+    join(home, ".bun/install/global/node_modules"),
+    join(home, ".bun/install/global"),
+  ];
+  return cwd === "/" ? globals : [cwd, ...globals];
 }
 
 export interface ResolveNotesDistDeps {
