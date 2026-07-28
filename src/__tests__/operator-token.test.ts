@@ -39,15 +39,19 @@ function makeHarness(): Harness {
 const TEST_ISSUER = "http://127.0.0.1:1939";
 
 describe("mintOperatorToken", () => {
-  test("returns a JWT with operator audience, broad scopes, and ~1y TTL", async () => {
+  test("returns a JWT with operator audience, broad scopes, and a 90-day TTL", async () => {
     const h = makeHarness();
     try {
       const db = openHubDb(hubDbPath(h.dir));
       try {
         rotateSigningKey(db);
+        // Mint at the real clock (no pinned `now`): `validateAccessToken` below
+        // enforces `exp` against jose's real clock, which has no override, so a
+        // pinned past mint date would eventually push `exp` into the past and
+        // fail this on every run (the 2026-07-25 fuse that already burned). The
+        // TTL assertion is exp - iat, invariant of the mint instant.
         const minted = await mintOperatorToken(db, "user-abc", {
           issuer: TEST_ISSUER,
-          now: () => new Date("2026-04-26T00:00:00Z"),
         });
         expect(minted.token.split(".")).toHaveLength(3);
         const validated = await validateAccessToken(db, minted.token, TEST_ISSUER);
