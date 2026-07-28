@@ -502,8 +502,7 @@ describe("deriveVaultScopeFromMcpUrl", () => {
     );
   });
 
-  test("a non-vault MCP URL → null (caller falls back to scopes_supported)", () => {
-    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp")).toBeNull();
+  test("a non-vault, non-root MCP URL → null (caller falls back to scopes_supported)", () => {
     expect(deriveVaultScopeFromMcpUrl("https://remote.test/some/other/mcp")).toBeNull();
   });
 
@@ -517,5 +516,56 @@ describe("deriveVaultScopeFromMcpUrl", () => {
 
   test("an unparseable URL → null", () => {
     expect(deriveVaultScopeFromMcpUrl("not a url")).toBeNull();
+  });
+
+  // === root form (#775) ======================================================
+  //
+  // Root `/mcp` is ALSO the generic industry MCP convention — most third-party
+  // MCP servers live at exactly `/mcp` — so it's gated on the resource's
+  // advertised `scopes_supported` actually signaling a Parachute vault (a
+  // `vault:`-prefixed scope). The caller passes this in as the second arg
+  // (its already-discovered `scopesSupported`).
+
+  const PARACHUTE_SCOPES = ["vault:eng:read", "vault:eng:write"];
+  const GENERIC_SCOPES = ["read", "write"];
+
+  test("root /mcp + a Parachute signal (vault:-prefixed scopes) → the broad unnamed pair, deliberately", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp", PARACHUTE_SCOPES)).toBe(
+      "vault:read vault:write",
+    );
+  });
+
+  test("root /mcp with a trailing slash still matches, same signal", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp/", PARACHUTE_SCOPES)).toBe(
+      "vault:read vault:write",
+    );
+  });
+
+  test("root /mcp with a query string / fragment still matches, same signal", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp?x=1#frag", PARACHUTE_SCOPES)).toBe(
+      "vault:read vault:write",
+    );
+  });
+
+  test("root /mcp WITHOUT a Parachute signal → null (a generic MCP server, not Parachute)", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp", GENERIC_SCOPES)).toBeNull();
+  });
+
+  test("root /mcp with no scopesSupported at all → null", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp")).toBeNull();
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/mcp", [])).toBeNull();
+  });
+
+  test("a near-miss path that merely ends in 'mcp' is NOT root form → null (even with the signal)", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://remote.test/notmcp", PARACHUTE_SCOPES)).toBeNull();
+  });
+
+  test("URL-addressed form still wins, signal or not (regression guard, #671)", () => {
+    expect(deriveVaultScopeFromMcpUrl("https://hub.test/vault/research/mcp")).toBe(
+      "vault:research:read",
+    );
+    expect(deriveVaultScopeFromMcpUrl("https://hub.test/vault/research/mcp", GENERIC_SCOPES)).toBe(
+      "vault:research:read",
+    );
   });
 });
