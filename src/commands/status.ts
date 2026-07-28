@@ -13,10 +13,13 @@ import {
 } from "../hub-unit.ts";
 import {
   type DetectInstallSourceDeps,
+  type DetectServedResolutionDeps,
   detectHubInstallSource,
   detectInstallSource,
+  detectServedResolution,
   formatInstallSourceLabel,
   isStale,
+  servedDivergenceNote,
 } from "../install-source.ts";
 import {
   type DriveModuleOpDeps,
@@ -40,6 +43,13 @@ export interface StatusOpts {
    * the operator's actual bun globals.
    */
   installSourceDeps?: DetectInstallSourceDeps;
+  /**
+   * Test seam for the served-bundle guardrail (hub#780). Production resolves the
+   * shim-served package (notes/app) from the real supervisor cwd + filesystem;
+   * tests inject stubs so the divergence case (served path ≠ bun-global link) is
+   * exercised deterministically. Empty in production.
+   */
+  servedResolutionDeps?: DetectServedResolutionDeps;
   /**
    * Directory containing the running hub source. Defaults to `import.meta.dir`
    * (the directory of this file). Tests override so the hub row's install
@@ -167,6 +177,14 @@ interface StatusRow {
    */
   staleNote?: string;
   /**
+   * Served-bundle divergence warning (hub#780). Set for shim-served rows
+   * (notes/app) when the notes-serve shim resolves the bundle somewhere other
+   * than the bun-global link the SOURCE column reflects — the silent
+   * version-rollback signal (a stale bundle served while status looks healthy).
+   * Surfaced as a continuation line so the operator sees it at a glance.
+   */
+  servedNote?: string;
+  /**
    * Persisted last-start failure (`lastStartError`, written by the lifecycle
    * start preflight when a startCmd binary is missing). Surfaced on a
    * continuation line so a *later* `parachute status` explains why the row
@@ -222,6 +240,13 @@ interface ManifestRowBase {
   driftWarning?: string;
   sourceLabel: string;
   staleNote?: string;
+  /**
+   * Served-bundle divergence warning (hub#780). Set for shim-served rows
+   * (notes/app) when the notes-serve resolution lands somewhere other than the
+   * bun-global link the SOURCE column reflects — the silent-version-rollback
+   * signal. Surfaced as a continuation line alongside `staleNote`.
+   */
+  servedNote?: string;
   /** The persisted `lastStartError` note (detached preflight wrote it). */
   manifestStartErrorNote?: string;
 }
@@ -229,6 +254,7 @@ interface ManifestRowBase {
 function manifestRowBase(
   entry: ServiceEntry,
   installSourceDeps: DetectInstallSourceDeps,
+  servedResolutionDeps: DetectServedResolutionDeps,
 ): ManifestRowBase {
   // Third-party rows (with `installDir`) live under `~/.parachute/<entry.name>/`,
   // matching what `parachute start` uses as the short. First-party rows still
@@ -256,6 +282,22 @@ function manifestRowBase(
     ? `STALE: services.json cached ${entry.version}; live package.json ${source.livePackageVersion}`
     : undefined;
 
+  // Served-bundle guardrail (hub#780). Only shim-served rows (notes/app —
+  // served via `notes-serve.ts`) have a resolution distinct from their launch
+  // command; for those, resolve the bundle the way the shim does at serve time
+  // and warn if it diverges from the bun-global link the SOURCE column shows.
+  // The `startCmd` referencing the shim is the shim-served signal (getSpec
+  // returns undefined → no note for unknown/third-party rows). Never throws.
+  let servedNote: string | undefined;
+  const spec = short ? getSpec(short) : undefined;
+  const shimServed = spec?.startCmd?.(entry)?.some((a) => a.endsWith("notes-serve.ts")) ?? false;
+  if (shimServed && spec?.package) {
+    servedNote = servedDivergenceNote(
+      spec.package,
+      detectServedResolution(spec.package, servedResolutionDeps),
+    );
+  }
+
   // Persisted last-start failure (lifecycle preflight wrote a missing-dependency
   // wire onto services.json). Surface a one-line summary; the full install
   // recipe lives in services.json + the admin SPA card.
@@ -266,7 +308,7 @@ function manifestRowBase(
         : `failed to start: ${entry.lastStartError.error_description.split("\n")[0]}`
       : undefined;
 
-  return { short, url, driftWarning, sourceLabel, staleNote, manifestStartErrorNote };
+  return { short, url, driftWarning, sourceLabel, staleNote, servedNote, manifestStartErrorNote };
 }
 
 export async function status(opts: StatusOpts = {}): Promise<number> {
@@ -274,6 +316,7 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
   const print = opts.print ?? ((line) => console.log(line));
   const configDir = opts.configDir ?? CONFIG_DIR;
   const installSourceDeps = opts.installSourceDeps ?? {};
+  const servedResolutionDeps = opts.servedResolutionDeps ?? {};
   const hubSrcDir = opts.hubSrcDir ?? import.meta.dir;
 
   const manifest = readManifest(manifestPath);
@@ -288,6 +331,7 @@ export async function status(opts: StatusOpts = {}): Promise<number> {
     manifest,
     configDir,
     installSourceDeps,
+    servedResolutionDeps,
     hubSrcDir,
     sup,
   });
@@ -353,6 +397,7 @@ function renderRows(rows: StatusRow[], print: (line: string) => void): void {
     if (row.probeNote) print(`  → ${row.probeNote}`);
     if (row.driftWarning) print(`  ! ${row.driftWarning}`);
     if (row.staleNote) print(`  ! ${row.staleNote}`);
+    if (row.servedNote) print(`  ! ${row.servedNote}`);
     if (row.startErrorNote) print(`  ! ${row.startErrorNote}`);
   }
 }
@@ -489,6 +534,7 @@ interface BuildSupervisorRowsArgs {
   manifest: ReturnType<typeof readManifest>;
   configDir: string;
   installSourceDeps: DetectInstallSourceDeps;
+  servedResolutionDeps: DetectServedResolutionDeps;
   hubSrcDir: string;
   sup: ResolvedStatusSupervisor;
 }
@@ -499,7 +545,7 @@ interface BuildSupervisorRowsArgs {
  * Never throws — every read is wrapped + degrades to a sensible readout.
  */
 async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<StatusRow[]> {
-  const { manifest, configDir, installSourceDeps, hubSrcDir, sup } = args;
+  const { manifest, configDir, installSourceDeps, servedResolutionDeps, hubSrcDir, sup } = args;
   const port = readHubPort(configDir) ?? HUB_UNIT_DEFAULT_PORT;
 
   // Probe the hub once: it's both the hub row's liveness signal AND the gate for
@@ -585,7 +631,7 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
   }
 
   const rows: StatusRow[] = manifest.services.map((entry) => {
-    const base = manifestRowBase(entry, installSourceDeps);
+    const base = manifestRowBase(entry, installSourceDeps, servedResolutionDeps);
     const snap = base.short ? stateByShort.get(base.short) : undefined;
 
     if (!hubHealthy) {
@@ -606,6 +652,7 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
         skipped: true,
         ...(base.driftWarning ? { driftWarning: base.driftWarning } : {}),
         ...(base.staleNote ? { staleNote: base.staleNote } : {}),
+        ...(base.servedNote ? { servedNote: base.servedNote } : {}),
         managerNote: "hub is down — its modules are stopped",
       };
     }
@@ -634,6 +681,7 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
       row.probeNote = "live via unauthenticated health probe — sign in for full supervisor state";
       if (base.driftWarning) row.driftWarning = base.driftWarning;
       if (base.staleNote) row.staleNote = base.staleNote;
+      if (base.servedNote) row.servedNote = base.servedNote;
       if (base.manifestStartErrorNote) row.startErrorNote = base.manifestStartErrorNote;
       // Surface the degraded-read note ONCE (first module row), same as below.
       if (moduleReadNote) {
@@ -667,6 +715,7 @@ async function buildSupervisorRows(args: BuildSupervisorRowsArgs): Promise<Statu
     };
     if (base.driftWarning) row.driftWarning = base.driftWarning;
     if (base.staleNote) row.staleNote = base.staleNote;
+    if (base.servedNote) row.servedNote = base.servedNote;
     if (startErrorNote) row.startErrorNote = startErrorNote;
     // Surface the degraded-read note ONCE — on the first module row so the
     // operator sees why run-state is missing, without repeating it on every row.

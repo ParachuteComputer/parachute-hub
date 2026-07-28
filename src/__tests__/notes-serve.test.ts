@@ -276,6 +276,70 @@ describe("notesDistCandidates", () => {
       "/home/user/.bun/install/global",
     ]);
   });
+
+  // hub#780: the supervisor launches shim-served services (notes/app) with
+  // cwd = "/". From "/", `Bun.resolveSync` falls through to bun's own install
+  // *cache*, which can shadow the bun-global link and silently serve a
+  // months-old published bundle. A real checkout cwd is never "/", so "/" is
+  // dropped as a candidate — resolution is forced through the global link table.
+  test("omits cwd when it is '/' — the supervisor's launch cwd (hub#780)", () => {
+    expect(notesDistCandidates("/", "/home/user")).toEqual([
+      "/home/user/.bun/install/global/node_modules",
+      "/home/user/.bun/install/global",
+    ]);
+  });
+});
+
+/**
+ * hub#780 regression. On Aaron's live box (2026-07-27) the supervisor launched
+ * notes-serve with cwd `/`; from `/`, `Bun.resolveSync` fell through to bun's
+ * install *cache* (`~/.bun/install/cache/<pkg>@<ver>@@@1`), which shadowed the
+ * bun-global link — hub served npm `@openparachute/app@0.22.5` for nine hours
+ * while `status` reported the linked checkout. The fix drops `/` as a resolution
+ * candidate so the global link (the intended source for a supervised service)
+ * always wins. These tests drive the exact resolver ordering with a stubbed
+ * `resolveSync`, so they fail on the unfixed candidate list and pass on the fix.
+ */
+describe("resolveNotesDistFrom cwd=/ cache-shadow (hub#780)", () => {
+  const APP_PKG = "@openparachute/app";
+
+  test("with cwd '/' and a resolvable install-cache entry, resolution takes the global link, never the cache", () => {
+    const home = "/home/op";
+    const globalNodeModules = join(home, ".bun/install/global/node_modules");
+    const linkPkgJson = join(globalNodeModules, APP_PKG, "package.json");
+    const linkDist = join(globalNodeModules, APP_PKG, "dist");
+    // What real Bun returns when it resolves the package from cwd `/`: an entry
+    // inside its own install cache, laid down by any `bun add`/install.
+    const cachePkgJson = join(
+      home,
+      ".bun/install/cache",
+      `${APP_PKG}@0.22.5@@@1`,
+      "node_modules",
+      APP_PKG,
+      "package.json",
+    );
+
+    const probed: string[] = [];
+    const out = resolveNotesDistFrom({
+      cwd: "/",
+      home,
+      pkg: APP_PKG,
+      resolveSync: (_specifier, base) => {
+        probed.push(base);
+        if (base === "/") return cachePkgJson; // the shadow — must NOT win
+        if (base === globalNodeModules) return linkPkgJson; // the intended source
+        throw new Error(`unexpected base: ${base}`);
+      },
+      existsSync: () => true, // every resolved package has a dist/ in this fixture
+    });
+
+    // The global link's dist — never the cache path the cwd `/` resolve returned.
+    expect(out).toBe(linkDist);
+    expect(out).not.toContain(".bun/install/cache");
+    // "/" is dropped from the candidate list entirely, so it's never probed.
+    expect(probed).not.toContain("/");
+    expect(probed[0]).toBe(globalNodeModules);
+  });
 });
 
 /**
