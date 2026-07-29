@@ -121,6 +121,58 @@ export interface CreateRevocationCacheOptions {
   ttlMs?: number;
   /** Test seam for time. Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Called when a fetch fails. `fatal` is true for the fail-CLOSED case (no
+   * last-good list, so every hub JWT is about to be rejected) and false for
+   * the fail-OPEN case (a stale list is still in hand).
+   *
+   * Defaults to a throttled `console.warn` on the fatal case only — see
+   * `warnFailClosed`. Pass a function to route it into a real logger, or
+   * `() => {}` to silence it.
+   */
+  onFetchError?: (info: { origin: string; fatal: boolean; error: unknown }) => void;
+}
+
+/**
+ * How often a single origin may emit the fail-closed warning. The check runs
+ * on every validation, so an unthrottled warn would print per rejected
+ * request — thousands of lines that bury the one that matters.
+ */
+const FAIL_CLOSED_WARN_INTERVAL_MS = 60_000;
+
+/** origin → last time we warned about it. */
+const lastFailClosedWarnAt = new Map<string, number>();
+
+/**
+ * Default `onFetchError`. Silent on fail-open (a stale list is a non-event
+ * the security model explicitly allows); LOUD on fail-closed.
+ *
+ * The fail-closed state means this resource server is rejecting **100% of
+ * hub-issued tokens** — every request, every client. That was previously
+ * swallowed entirely ("logging is the consumer's call"), so the only
+ * evidence was a terse `401 revocation list unavailable` on the wire, which
+ * downstream UIs cheerfully rendered as "you're not signed in." An operator
+ * had no way to reach the actual cause. It costs one line a minute to say it.
+ */
+function warnFailClosed(info: { origin: string; fatal: boolean; error: unknown }): void {
+  if (!info.fatal) return;
+  const now = Date.now();
+  const last = lastFailClosedWarnAt.get(info.origin);
+  if (last !== undefined && now - last < FAIL_CLOSED_WARN_INTERVAL_MS) return;
+  lastFailClosedWarnAt.set(info.origin, now);
+  const reason = info.error instanceof Error ? info.error.message : String(info.error);
+  console.warn(
+    `[scope-guard] REJECTING ALL hub-issued tokens: cannot fetch the revocation list from ` +
+      `${info.origin}/.well-known/parachute-revocation.json (${reason}). ` +
+      `This resource server fails closed until that URL is reachable. If this origin is the ` +
+      `PUBLIC hub URL, the box likely cannot resolve or hairpin its own FQDN — point ` +
+      `revocationOrigin at the local hub (e.g. http://127.0.0.1:1939) instead.`,
+  );
+}
+
+/** Test seam: forget which origins have been warned about. */
+export function _resetFailClosedWarnStateForTest(): void {
+  lastFailClosedWarnAt.clear();
 }
 
 export function createRevocationCache(opts: CreateRevocationCacheOptions): RevocationCache {
@@ -128,6 +180,7 @@ export function createRevocationCache(opts: CreateRevocationCacheOptions): Revoc
   const fetcher = opts.fetcher ?? defaultRevocationFetcher;
   const ttlMs = opts.ttlMs ?? REVOCATION_CACHE_TTL_MS;
   const now = opts.now ?? (() => Date.now());
+  const onFetchError = opts.onFetchError ?? warnFailClosed;
 
   let entry: CacheEntry | undefined;
   let inFlight: Promise<CacheEntry | undefined> | undefined;
@@ -154,12 +207,17 @@ export function createRevocationCache(opts: CreateRevocationCacheOptions): Revoc
         const next: CacheEntry = { jtis: new Set(body.jtis), fetchedAt: now() };
         entry = next;
         return next;
-      } catch {
-        // Swallow — caller decides fail-open vs fail-closed based on whether
-        // `entry` is set. Logging is the consumer's call (we don't know
-        // their logger). When last-good exists, bump its timestamp so we
-        // honour the TTL window before retrying — see comment above.
+      } catch (error) {
+        // Caller decides fail-open vs fail-closed based on whether `entry` is
+        // set. When last-good exists, bump its timestamp so we honour the TTL
+        // window before retrying — see comment above.
+        const fatal = entry === undefined;
         if (entry) entry = { jtis: entry.jtis, fetchedAt: now() };
+        try {
+          onFetchError({ origin, fatal, error });
+        } catch {
+          // A throwing logger must never turn a fetch failure into a crash.
+        }
         return undefined;
       } finally {
         inFlight = undefined;

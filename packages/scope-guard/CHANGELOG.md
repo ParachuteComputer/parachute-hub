@@ -4,6 +4,48 @@ All notable changes to `@openparachute/scope-guard` are documented here. The for
 
 The library's RC cadence is independent of `@openparachute/hub`'s — they ship from the same repo but aren't coupled in version.
 
+## [0.5.1-rc.1]
+
+**`revocationOrigin` — the revocation fetch no longer hairpins through a
+public FQDN, and a fail-closed fetch no longer happens in silence.**
+
+### Why
+
+`jwksOrigin` landed in vault#464 because a co-located resource server must not
+fetch keys from the PUBLIC hub URL: that hairpins out through the tunnel and
+back to the same box — slow on a VPS, a hard failure under Docker NAT-loopback
+or a tailnet whose MagicDNS the box itself can't resolve.
+
+The revocation-list fetch has the identical topology and did **not** get the
+identical fix. It stayed pinned to the canonical `hubOrigin`. And because
+revocation **fails closed** on a cold cache, getting it wrong is far worse than
+the JWKS case: a box that can't reach its own public FQDN rejects *every*
+hub-issued JWT with `revocation_unavailable`. Observed live — a vault whose
+admin SPA rendered that 401 as "You're not signed in to the hub," so signing in
+again could never help, and the SPA's recovery poll spun forever because the
+token mint kept succeeding.
+
+The failure was also completely silent: the cache swallowed fetch errors on the
+grounds that "logging is the consumer's call." The only evidence anywhere was a
+terse 401 body.
+
+### Changed
+
+- **`revocationOrigin?: string | (() => string)`** — origin the revocation list
+  is fetched from. **Defaults to `jwksOrigin` when supplied, else `hubOrigin`.**
+  Chaining the default off `jwksOrigin` is the point: a consumer can no longer
+  fix one fetch and silently leave the other aimed at an unreachable origin.
+  Any consumer already opting into a loopback JWKS fetch (vault does) is fixed
+  with no code change on their side.
+- **`revocationOnFetchError`** — reports fetch failures, with `fatal: true` for
+  the fail-CLOSED case. Defaults to a throttled (1/min/origin) `console.warn`
+  naming the unreachable URL and pointing at `revocationOrigin`. Silent on
+  fail-open, which the security model explicitly allows. Pass `() => {}` to
+  silence entirely.
+
+Back-compat: a guard that supplies neither `jwksOrigin` nor `revocationOrigin`
+fetches from `hubOrigin` exactly as before.
+
 ## Unreleased
 
 JWKS force-reload-and-retry on rotation-class verification failures (hub#543). Closes the latent gap where `validateHubJwt` could hard-401 until `cacheMaxAge` expiry or a process restart after certain key rotations.

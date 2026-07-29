@@ -1467,3 +1467,108 @@ describe("createScopeGuard — jwksOrigin seam (vault#464)", () => {
     fixture.setKeys([kp]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// revocationOrigin — the co-located-hairpin fix.
+//
+// `jwksOrigin` landed in vault#464 because a co-located resource server must
+// not fetch keys from the PUBLIC hub FQDN (hairpins out and back to the same
+// box; hard-fails under Docker NAT-loopback or a tailnet whose MagicDNS the
+// box can't resolve). The revocation fetch has the identical topology and did
+// NOT get the identical fix — and because revocation fails CLOSED on a cold
+// cache, getting it wrong bricks the resource server entirely: every
+// hub-issued JWT rejected with `revocation_unavailable`, surfacing to
+// operators as a 401 their UI renders as "you're not signed in."
+// ---------------------------------------------------------------------------
+describe("createScopeGuard — revocationOrigin", () => {
+  /** Capture which origin the revocation fetcher was handed. */
+  function captureOrigin() {
+    const seen: string[] = [];
+    const fetcher = async (origin: string) => {
+      seen.push(origin);
+      return { generated_at: new Date(0).toISOString(), jtis: [] };
+    };
+    return { seen, fetcher };
+  }
+
+  test("defaults to jwksOrigin when one is supplied — the fix", async () => {
+    const { seen, fetcher } = captureOrigin();
+    const guard = createScopeGuard({
+      hubOrigin: "https://public.example.ts.net",
+      allowedIssuers: () => ["https://public.example.ts.net"],
+      jwksOrigin: fixture.origin,
+      revocationFetcher: fetcher,
+    });
+    const token = await signJwt(kp, { iss: "https://public.example.ts.net" });
+    await guard.validateHubJwt(token);
+    // NOT the public FQDN — that's the origin the box may be unable to reach.
+    expect(seen).toEqual([fixture.origin]);
+    expect(seen).not.toContain("https://public.example.ts.net");
+  });
+
+  test("explicit revocationOrigin wins over jwksOrigin", async () => {
+    const { seen, fetcher } = captureOrigin();
+    const guard = createScopeGuard({
+      hubOrigin: "https://public.example.ts.net",
+      allowedIssuers: () => ["https://public.example.ts.net"],
+      // JWKS must actually resolve for the token to reach the revocation
+      // check at all; the point of the case is that revocation goes somewhere
+      // ELSE than jwksOrigin when told to.
+      jwksOrigin: fixture.origin,
+      revocationOrigin: "http://127.0.0.1:1939",
+      revocationFetcher: fetcher,
+    });
+    const token = await signJwt(kp, { iss: "https://public.example.ts.net" });
+    await guard.validateHubJwt(token);
+    expect(seen).toEqual(["http://127.0.0.1:1939"]);
+  });
+
+  test("falls back to hubOrigin when neither is supplied (back-compat)", async () => {
+    const { seen, fetcher } = captureOrigin();
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      revocationFetcher: fetcher,
+    });
+    const token = await signJwt(kp, { iss: fixture.origin });
+    await guard.validateHubJwt(token);
+    expect(seen).toEqual([fixture.origin]);
+  });
+
+  test("resolver form is re-evaluated per call, like the other origins", async () => {
+    const { seen, fetcher } = captureOrigin();
+    let target = "http://127.0.0.1:1939";
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      revocationOrigin: () => target,
+      revocationFetcher: fetcher,
+      revocationTtlMs: 0, // always stale → always refetch
+    });
+    const token = await signJwt(kp, { iss: fixture.origin });
+    await guard.validateHubJwt(token);
+    target = "http://127.0.0.1:2939";
+    await guard.validateHubJwt(token);
+    expect(seen).toEqual(["http://127.0.0.1:1939", "http://127.0.0.1:2939"]);
+  });
+
+  test("a fail-CLOSED fetch failure is reported, not swallowed", async () => {
+    const errors: { origin: string; fatal: boolean }[] = [];
+    const guard = createScopeGuard({
+      hubOrigin: fixture.origin,
+      revocationOrigin: "https://unreachable.invalid",
+      revocationFetcher: async () => {
+        throw new Error("getaddrinfo ENOTFOUND");
+      },
+      revocationOnFetchError: (info) => errors.push({ origin: info.origin, fatal: info.fatal }),
+    });
+    const token = await signJwt(kp, { iss: fixture.origin });
+    let caught: HubJwtError | undefined;
+    try {
+      await guard.validateHubJwt(token);
+    } catch (err) {
+      caught = err as HubJwtError;
+    }
+    expect(caught?.code).toBe("revocation_unavailable");
+    // The operator gets told WHY every token is being rejected, and where.
+    expect(errors).toEqual([{ origin: "https://unreachable.invalid", fatal: true }]);
+  });
+});
