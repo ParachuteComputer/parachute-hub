@@ -76,7 +76,7 @@ export const PORT_RESERVATIONS: readonly PortReservation[] = [
   // hub-parity P5 (2026-07-11): parachute-app's canonical slot — the NEW
   // super-surface front door (@openparachute/app), landing as a
   // FIRST_PARTY_FALLBACKS entry (short "app") with its own hub-side static-
-  // serve shim (notes-serve.ts --package). This is a DIFFERENT, unrelated
+  // serve shim (bundle-serve.ts --package). This is a DIFFERENT, unrelated
   // module from the pre-2026-05-27 `app` package described in the 1946
   // comment below — the two just happen to share the name across a rename.
   // Status `assigned` keeps the fallback-port walker (`assignPort` in
@@ -157,6 +157,24 @@ export interface FirstPartyFallback {
   readonly manifest: ModuleManifest;
   /** Imperative behaviors not expressible in module.json. Optional. */
   readonly extras?: FirstPartyExtras;
+  /**
+   * RETIRED — the entry exists solely so an EXISTING services.json row keeps
+   * booting (hub#788). The module is gone from every operator-facing surface:
+   * not discoverable, not installable, not offered by the wizard or the admin
+   * catalog, and `parachute install <short>` refuses it.
+   *
+   * Why an entry at all, rather than deletion: notes is a prebuilt PWA bundle
+   * with no `module.json` of its own, so its startCmd is hub-side logic. Delete
+   * the entry and a box that already runs notes silently loses its startCmd
+   * and gets log-and-skipped at boot — the operator's installed PWA just stops
+   * being served. Retirement shouldn't break a running install; it should stop
+   * pushing the thing at anyone new.
+   *
+   * `retiredNote` is logged once per boot when such a row is found, so an
+   * operator learns the module is on its way out from the box itself rather
+   * than from a changelog.
+   */
+  readonly retired?: { readonly note: string };
 }
 
 /**
@@ -192,7 +210,7 @@ export interface ServiceSpec {
   readonly postInstallFooter?: () => readonly string[];
 }
 
-const NOTES_SERVE_PATH = fileURLToPath(new URL("./notes-serve.ts", import.meta.url));
+const BUNDLE_SERVE_PATH = fileURLToPath(new URL("./bundle-serve.ts", import.meta.url));
 
 /**
  * Seed entries land in services.json as placeholder rows when a freshly
@@ -292,14 +310,14 @@ export function composeServiceSpec(opts: {
 // schema.
 //
 // What remains in FIRST_PARTY_FALLBACKS:
-//   - notes: still a frontend with a hub-side static-serve shim (`notes-serve.ts`)
+//   - notes: still a frontend with a hub-side static-serve shim (`bundle-serve.ts`)
 //     — its startCmd is composed from the services.json entry's port + mount,
 //     which is hub-side logic, not something notes itself runs. (The archive
 //     isn't done — notes-daemon Phase 3 retirement hasn't landed.)
 //   - app: the NEW super-surface front door (@openparachute/app,
 //     hub-parity P5, 2026-07-11) — same shape as notes: a frontend bundle
 //     with no server of its own, served by the SAME hub-side shim
-//     (`notes-serve.ts --package @openparachute/app`). Unrelated
+//     (`bundle-serve.ts --package @openparachute/app`). Unrelated
 //     to the pre-2026-05-27 `app` package that renamed to `surface` (see
 //     the KNOWN_MODULES.surface tagline + the RETIRED_MODULES note below).
 //
@@ -309,7 +327,7 @@ export function composeServiceSpec(opts: {
 
 // FALLBACK: Delete when @openparachute/notes ships .parachute/module.json AND
 // self-registers its services.json row at boot (notes#105). Notes is a
-// frontend bundle served by hub's `notes-serve.ts` shim, so its startCmd is
+// frontend bundle served by hub's `bundle-serve.ts` shim, so its startCmd is
 // hub-side logic (port + mount derived from the entry); when notes ships its
 // own server it can self-register and this fallback retires alongside the
 // shim.
@@ -321,23 +339,35 @@ const NOTES_FALLBACK: FirstPartyFallback = {
     name: "notes",
     manifestName: "parachute-notes",
     displayName: "Notes",
-    tagline: "Notes PWA — daemon deprecated 2026-05-22; install `surface` for the current path.",
+    tagline: "Notes PWA — RETIRED. Kept only so an existing install keeps serving.",
     port: 1942,
     paths: ["/notes"],
     health: "/notes/health",
+  },
+  retired: {
+    note:
+      "The `notes` module is retired and is no longer offered, installable, or " +
+      "discoverable. This box keeps serving it because a services.json row already " +
+      "exists. `@openparachute/app` is the current front door; remove the row with " +
+      "`parachute uninstall notes` once you've moved over.",
   },
   extras: {
     startCmd: (entry) => {
       const first = entry.paths[0] ?? "/notes";
       const mount = first === "/" ? "" : first.replace(/\/+$/, "");
-      return ["bun", NOTES_SERVE_PATH, "--port", String(entry.port), "--mount", mount];
+      // `--package` explicit now that the shim's default points at app.
+      return [
+        "bun",
+        BUNDLE_SERVE_PATH,
+        "--port",
+        String(entry.port),
+        "--mount",
+        mount,
+        "--package",
+        "@openparachute/notes",
+      ];
     },
-    postInstallFooter: () => [
-      "",
-      "Open your Notes UI at http://localhost:1942/notes — paste the vault URL",
-      "  http://127.0.0.1:1940/vault/default",
-      "and the API token from your vault install.",
-    ],
+
   },
 };
 
@@ -351,7 +381,7 @@ const NOTES_FALLBACK: FirstPartyFallback = {
 // doesn't block this fallback path. parachute-app is a frontend bundle (the
 // super-surface front door) with no server of its own, so — same as notes —
 // its startCmd is hub-side logic composed from the services.json entry
-// (port + mount), running through the SAME `notes-serve.ts` shim
+// (port + mount), running through the SAME `bundle-serve.ts` shim
 // generalized in hub-parity P5 via `--package`.
 const APP_FALLBACK: FirstPartyFallback = {
   package: "@openparachute/app",
@@ -370,7 +400,7 @@ const APP_FALLBACK: FirstPartyFallback = {
       const mount = first === "/" ? "" : first.replace(/\/+$/, "");
       return [
         "bun",
-        NOTES_SERVE_PATH,
+        BUNDLE_SERVE_PATH,
         "--port",
         String(entry.port),
         "--mount",
@@ -455,6 +485,13 @@ export interface KnownModule {
   readonly canonicalStripPrefix?: boolean;
   /** CLI install-time imperatives (init, postInstallFooter, urlForEntry quirk). */
   readonly extras?: FirstPartyExtras;
+  /**
+   * RETIRED — same semantics as `FirstPartyFallback.retired`. The entry stays
+   * so an EXISTING services.json row keeps resolving (lifecycle, status,
+   * expose), but the module is gone from discovery, the install catalog, the
+   * wizard, and `parachute install`.
+   */
+  readonly retired?: { readonly note: string };
 }
 
 export const KNOWN_MODULES: Record<string, KnownModule> = {
@@ -528,13 +565,11 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
     manifestName: "parachute-surface",
     canonicalPort: 1946,
     displayName: "Surface",
-    // Tagline telegraphs the auto-bootstrap so wizard + admin-SPA copy explain
-    // the architecture: installing `surface` brings Notes (and other UIs)
-    // along via the Phase 2.1 bootstrap-default-apps step. The notes-daemon
-    // path still exists as a back-compat install (CURATED_MODULES still
-    // lists `notes`) but `surface` is the recommended first install
-    // post-vault. Renamed from `app` 2026-05-27 per patterns#102.
-    tagline: "Host module for Parachute surfaces — auto-installs Notes on first boot.",
+    // Surface hosts CUSTOM surfaces. It no longer drags Notes along on first
+    // boot — Notes is retired (hub#788), and `@openparachute/app` is the
+    // front door, served by hub directly rather than by this host.
+    // Renamed from `app` 2026-05-27 per patterns#102.
+    tagline: "Host module for custom Parachute surfaces (SDK + build-on-push).",
     canonicalPaths: ["/surface", "/.parachute"],
     canonicalHealth: "/surface/healthz",
     canonicalStripPrefix: false,
@@ -702,12 +737,16 @@ export function knownServices(): string[] {
  */
 const FOCUS_DEFAULTS: Record<string, ModuleFocus> = {
   vault: "core",
-  scribe: "core",
   hub: "core",
-  surface: "core",
   app: "core",
+  surface: "core",
+  scribe: "core",
 
-  notes: "deprecated",
+  // notes is RETIRED (hub#788) — it doesn't appear here because it doesn't
+  // appear in the catalog at all. `focus: "deprecated"` was the old, softer
+  // treatment: still listed, still installable, just sorted last. That wasn't
+  // enough — a retired module showing up in a list of things to install reads
+  // as an endorsement, and operators kept installing it.
 };
 
 /**
@@ -752,15 +791,51 @@ export function discoverableShorts(): string[] {
   for (const short of [...Object.keys(FIRST_PARTY_FALLBACKS), ...Object.keys(KNOWN_MODULES)]) {
     if (seen.has(short)) continue;
     seen.add(short);
+    // Retired modules resolve (so existing rows keep working) but are never
+    // discovered, offered, or installable. See `FirstPartyFallback.retired`.
+    if (isRetiredShort(short)) continue;
     out.push(short);
   }
   return out;
 }
 
-/** True iff `short` is a module the hub can resolve a package/manifest for
- *  (the install-path gate, replacing the `CURATED_MODULES` whitelist). */
+/**
+ * True iff `short` names a RETIRED module — one whose registry entry exists
+ * only to keep an already-installed row working. Retired shorts are excluded
+ * from discovery, the admin install catalog, the setup wizard, and
+ * `parachute install`.
+ */
+export function isRetiredShort(short: string): boolean {
+  return (
+    FIRST_PARTY_FALLBACKS[short]?.retired !== undefined ||
+    KNOWN_MODULES[short]?.retired !== undefined
+  );
+}
+
+/** The retirement note for a short, when it has one. */
+export function retirementNote(short: string): string | undefined {
+  return FIRST_PARTY_FALLBACKS[short]?.retired?.note ?? KNOWN_MODULES[short]?.retired?.note;
+}
+
+/**
+ * True iff `short` is a module the hub can RESOLVE a package/manifest for.
+ *
+ * Deliberately still true for retired shorts — lifecycle, status, and expose
+ * all need to resolve an existing `parachute-notes` / `parachute-scribe` row.
+ * The INSTALL gate is `isInstallableShort` below; don't reuse this one for it.
+ */
 export function isKnownModuleShort(short: string): boolean {
   return short in FIRST_PARTY_FALLBACKS || short in KNOWN_MODULES;
+}
+
+/**
+ * True iff `short` may be INSTALLED — resolvable AND not retired. This is the
+ * gate for `parachute install <short>` and `POST /api/modules/:short/install`;
+ * `isKnownModuleShort` is the broader resolve-it gate that keeps existing
+ * installs working.
+ */
+export function isInstallableShort(short: string): boolean {
+  return isKnownModuleShort(short) && !isRetiredShort(short);
 }
 
 /**

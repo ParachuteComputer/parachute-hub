@@ -552,8 +552,8 @@ Module start commands (run by the supervisor under \`serve\`):
   vault     parachute-vault serve
   scribe    parachute-scribe serve
   surface   parachute-surface serve
-  app       bun <cli>/notes-serve.ts --port <configured> --mount <paths[0]> --package @openparachute/app
-  notes     bun <cli>/notes-serve.ts --port <configured> --mount <paths[0]>   # back-compat: legacy notes-daemon
+  app       bun <cli>/bundle-serve.ts --port <configured> --mount <paths[0]> --package @openparachute/app
+  notes     bun <cli>/bundle-serve.ts --port <configured> --mount <paths[0]>   # back-compat: legacy notes-daemon
 `;
 }
 

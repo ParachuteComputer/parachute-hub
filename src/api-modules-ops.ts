@@ -50,6 +50,8 @@ import {
   composeKnownModuleSpec,
   getSpec,
   isKnownModuleShort,
+  isRetiredShort,
+  retirementNote,
   synthesizeManifestForKnownModule,
 } from "./service-spec.ts";
 import { findService, readManifestLenient, removeService } from "./services-manifest.ts";
@@ -657,6 +659,18 @@ export async function handleInstall(
   if (req.method !== "POST") return jsonError(405, "method_not_allowed", "use POST");
   const authFail = await authorize(req, deps);
   if (authFail) return authFail;
+
+  // Retired modules resolve for lifecycle (an existing row must keep
+  // starting/stopping/uninstalling) but must never be INSTALLED afresh —
+  // hub#788. `parseModulesPath` deliberately still admits them, so the refusal
+  // lives here rather than in the route match.
+  if (isRetiredShort(short)) {
+    return jsonError(
+      410,
+      "module_retired",
+      retirementNote(short) ?? `The "${short}" module is retired and can no longer be installed.`,
+    );
+  }
 
   // Optional `{ channel: "rc" | "latest" }` in the body — per-call override
   // for the SPA's "install X at rc" affordance (hub#337). Missing body /

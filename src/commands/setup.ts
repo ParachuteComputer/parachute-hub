@@ -12,6 +12,7 @@ import {
   type ServiceSpec,
   composeServiceSpec,
   focusForShort,
+  isRetiredShort,
   knownServices,
 } from "../service-spec.ts";
 import type { ServiceEntry } from "../services-manifest.ts";
@@ -158,14 +159,17 @@ function surveyServices(manifestPath: string): ServiceChoice[] {
 
 /**
  * A surveyed service is OFFERED on a fresh setup iff it is not already
- * installed AND its discovery tier is not `deprecated` (2026-06-25). The
- * deprecated tier (notes-daemon) stays resolvable + manageable for an
- * existing install — it just isn't pushed on a fresh box. `agent`
- * (`experimental`) is still offered. Exported so the setup tests can pin the
- * exclusion directly.
+ * installed, is not RETIRED, and its discovery tier is not `deprecated`.
+ *
+ * Retired (hub#788 — notes, scribe) is the stronger of the two exclusions and
+ * the one that actually matters now: a retired module stays resolvable and
+ * manageable for an existing install but must never appear in a list of things
+ * to add. The `deprecated` tier remains for a module that's on its way out but
+ * still installable. `agent` (`experimental`) is still offered.
  */
 export function isOfferable(choice: { short: string; installed: boolean }): boolean {
   if (choice.installed) return false;
+  if (isRetiredShort(choice.short)) return false;
   // No `declared` arg: the survey fires PRE-install, before any module.json is
   // on disk to read a self-declared `focus` from — so the static default map is
   // the only signal available + the right one here.
@@ -174,7 +178,7 @@ export function isOfferable(choice: { short: string; installed: boolean }): bool
 
 const BLURBS: Record<string, string> = {
   vault: "knowledge graph (MCP) — your owner-authenticated note + tag store",
-  surface: "Parachute UI host — auto-installs Notes on first boot (the recommended UI path)",
+  surface: "host for custom Parachute surfaces (SDK + build-on-push)",
   // hub-parity P5 (2026-07-11): `app` is now the NEW super-surface front
   // door (@openparachute/app) — a real FIRST_PARTY_FALLBACKS
   // entry, not a legacy survey row. It is UNRELATED to the pre-2026-05-27

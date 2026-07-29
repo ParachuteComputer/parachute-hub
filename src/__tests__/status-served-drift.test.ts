@@ -36,7 +36,7 @@ const LINK_ROOT = join(HOME, ".bun/install/global/node_modules", APP_PKG);
 
 /**
  * A services.json carrying a single shim-served row: `parachute-app` resolves
- * to short `app`, whose spec `startCmd` runs `notes-serve.ts` — the exact
+ * to short `app`, whose spec `startCmd` runs `bundle-serve.ts` — the exact
  * `shimServed` signal `manifestRowBase` keys the guardrail on. Written to disk
  * so `status()` reads it through the real `readManifest` path.
  */

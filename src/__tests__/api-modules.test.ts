@@ -259,33 +259,37 @@ describe("GET /api/modules", () => {
       supervisor_available: boolean;
     };
     const shorts = body.modules.map((m) => m.short);
-    // The core tier leads, in the recommended install order (vault → scribe),
-    // ahead of every experimental module, which lead the deprecated ones.
+    // The core tier leads, in the recommended install order, ahead of every
+    // experimental module.
     expect(shorts.indexOf("vault")).toBeLessThan(shorts.indexOf("scribe"));
-    expect(shorts.indexOf("scribe")).toBeLessThan(shorts.indexOf("notes"));
-    for (const s of ["vault", "scribe", "surface", "app", "notes"]) {
+    for (const s of ["vault", "scribe", "surface", "app"]) {
       expect(shorts).toContain(s);
     }
     expect(shorts).not.toContain("agent");
     expect(shorts).not.toContain("runner");
     expect(shorts).not.toContain("parachute-runner");
+    // hub#788 — a retired module is absent from the catalog entirely. Notes
+    // used to appear under `focus: "deprecated"`, which read as an
+    // endorsement: a thing listed among installables is a thing to install.
+    expect(shorts).not.toContain("notes");
     // Focus tier resolves from the default map.
     const byShort = new Map(body.modules.map((m) => [m.short, m]));
     expect(byShort.get("vault")?.focus).toBe("core");
     expect(byShort.get("scribe")?.focus).toBe("core");
-    expect(byShort.get("surface")?.focus).toBe("core");
+    expect(byShort.get("scribe")?.focus).toBe("core");
     expect(byShort.get("app")?.focus).toBe("core");
     expect(byShort.get("agent")).toBeUndefined();
-    expect(byShort.get("notes")?.focus).toBe("deprecated");
     // `available` stays true for every known module (re-installable), but the
     // fresh-install OFFER (`available_to_install`) drops the deprecated tier —
     // notes isn't pushed on a fresh box; agent (experimental) still is.
     expect(body.modules.every((m) => m.available)).toBe(true);
     expect(byShort.get("vault")?.available_to_install).toBe(true);
     expect(byShort.get("scribe")?.available_to_install).toBe(true);
-    expect(byShort.get("surface")?.available_to_install).toBe(true);
+    expect(byShort.get("scribe")?.available_to_install).toBe(true);
     expect(byShort.get("app")?.available_to_install).toBe(true);
-    expect(byShort.get("notes")?.available_to_install).toBe(false);
+    // hub#788 — notes has no row at all now, so there is nothing to mark
+    // un-installable. Absence IS the assertion.
+    expect(byShort.has("notes")).toBe(false);
     expect(body.modules.every((m) => !m.installed)).toBe(true);
     expect(body.modules.every((m) => m.latest_version === "0.9.9")).toBe(true);
     // Supervisor wasn't injected → flag reflects that.
@@ -376,6 +380,8 @@ describe("GET /api/modules", () => {
     expect(scribe?.display_name).toBe("Scribe");
     expect(scribe?.tagline).toContain("transcription");
     expect(scribe?.available).toBe(true);
+    // hub#788 — notes is retired and no longer carries a catalog row at all.
+    expect(body.modules.find((m) => m.short === "notes")).toBeUndefined();
   });
 
   test("retired Agent rows do not surface in the module catalog", async () => {
@@ -482,10 +488,10 @@ describe("GET /api/modules", () => {
     expect(vault?.latest_version).toBe("0.5.0");
     expect(vault?.install_dir).toBe("/parachute/modules/node_modules/@openparachute/vault");
     // The other curated row stays installed:false — the test installed
-    // only vault, so scribe still renders as available-but-not-installed.
-    const scribe = body.modules.find((m) => m.short === "scribe");
-    expect(scribe?.installed).toBe(false);
-    expect(scribe?.installed_version).toBeNull();
+    // only vault, so surface still renders as available-but-not-installed.
+    const surface = body.modules.find((m) => m.short === "surface");
+    expect(surface?.installed).toBe(false);
+    expect(surface?.installed_version).toBeNull();
   });
 
   // ── hub#243: upgrade-offer must be semver-aware + installed-version must be live ──
@@ -659,9 +665,9 @@ describe("GET /api/modules", () => {
     expect(vault?.pid).toBe(12345);
     // Modules without a supervisor entry get null status — the UI
     // disables Restart/Stop for those since there's no live process.
-    const scribe = body.modules.find((m) => m.short === "scribe");
-    expect(scribe?.supervisor_status).toBeNull();
-    expect(scribe?.pid).toBeNull();
+    const surface = body.modules.find((m) => m.short === "surface");
+    expect(surface?.supervisor_status).toBeNull();
+    expect(surface?.pid).toBeNull();
     expect(body.supervisor_available).toBe(true);
   });
 
@@ -715,8 +721,8 @@ describe("GET /api/modules", () => {
     expect(vault?.supervisor_start_error?.binary).toBe("parachute-vault");
     expect(vault?.supervisor_start_error?.error_type).toBe("missing_dependency");
     // A module with no supervisor entry surfaces null (uniform wire shape).
-    const scribe = body.modules.find((m) => m.short === "scribe");
-    expect(scribe?.supervisor_start_error).toBeNull();
+    const surface = body.modules.find((m) => m.short === "surface");
+    expect(surface?.supervisor_start_error).toBeNull();
   });
 
   test("populates management_url from a RELATIVE managementUrl + module mount (B4 per-instance form)", async () => {
@@ -1328,8 +1334,8 @@ describe("GET /api/modules", () => {
         },
       ]);
       // Other curated rows stay empty — uis is per-row, not global.
-      const scribe = body.modules.find((m) => m.short === "scribe");
-      expect(scribe?.uis).toEqual([]);
+      const surface = body.modules.find((m) => m.short === "surface");
+      expect(surface?.uis).toEqual([]);
     });
 
     test("optional fields ride through verbatim, missing fields become null on the wire", async () => {

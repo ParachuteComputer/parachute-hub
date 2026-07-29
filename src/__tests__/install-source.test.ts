@@ -254,7 +254,7 @@ describe("detectHubInstallSource", () => {
 /**
  * Served-bundle guardrail (hub#780). `detectInstallSource` answers "where does
  * the operator's bun link point?" (the SOURCE column); `detectServedResolution`
- * answers the different, load-bearing question "where does the notes-serve shim
+ * answers the different, load-bearing question "where does the bundle-serve shim
  * actually resolve the bundle at serve time, and does that match the link?" On
  * Aaron's box those diverged silently for nine hours. These tests drive the
  * resolution + comparison with injected seams (no real bun globals / cache).

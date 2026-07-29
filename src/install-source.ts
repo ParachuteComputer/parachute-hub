@@ -17,7 +17,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { resolveNotesDistFrom } from "./notes-serve.ts";
+import { resolveBundleDistFrom } from "./bundle-serve.ts";
 import { FIRST_PARTY_FALLBACKS, KNOWN_MODULES, shortNameForManifest } from "./service-spec.ts";
 
 export type InstallSourceKind = "bun-linked" | "npm" | "unknown";
@@ -297,7 +297,7 @@ export function formatInstallSourceLabel(source: InstallSource): string {
 //
 // The install-source detection above answers "where does the operator's bun
 // link / installDir point?" — the SOURCE column. It does NOT answer "where does
-// the notes-serve shim actually resolve the bundle from at serve time?" On
+// the bundle-serve shim actually resolve the bundle from at serve time?" On
 // Aaron's box those two diverged silently: SOURCE read `bun-linked → app @ sha`
 // (true of the link) while the shim, launched with cwd `/`, resolved the bundle
 // from bun's install *cache* and served a months-old `@openparachute/app@0.22.5`
@@ -309,14 +309,14 @@ export function formatInstallSourceLabel(source: InstallSource): string {
 /**
  * The cwd the supervisor launches shim-served (notes/app) processes with.
  * launchd/systemd hand a supervised child `/` when no per-module cwd is set —
- * exactly the notes-serve case (hub#780). Served resolution is computed from
+ * exactly the bundle-serve case (hub#780). Served resolution is computed from
  * here so `status` mirrors the running shim rather than the CLI's own cwd.
  */
 export const SUPERVISOR_CWD = "/";
 
 export interface ServedResolution {
   /**
-   * Absolute package root the notes-serve shim actually resolves + serves from,
+   * Absolute package root the bundle-serve shim actually resolves + serves from,
    * computed via the SAME candidate walk the shim uses. Undefined when the
    * package can't be resolved from the supervisor cwd (not installed).
    */
@@ -348,11 +348,11 @@ export interface DetectServedResolutionDeps {
 }
 
 /**
- * Resolve a shim-served package the way `notes-serve.ts` does at serve time and
+ * Resolve a shim-served package the way `bundle-serve.ts` does at serve time and
  * compare against its bun-global link. Pure + total: never throws (status is a
  * diagnostic), degrading to `{ divergent: false }` when nothing resolves.
  *
- * `resolveNotesDistFrom` returns `<root>/dist`; the package root (where
+ * `resolveBundleDistFrom` returns `<root>/dist`; the package root (where
  * `package.json` lives) is its parent. Post-fix, resolving from cwd `/` lands on
  * the global link, so `servedPath === linkedPath` and `divergent` is false — no
  * false positive. It fires only when resolution genuinely lands off the link.
@@ -367,7 +367,7 @@ export function detectServedResolution(
 
   let servedPath: string | undefined;
   try {
-    const dist = resolveNotesDistFrom({
+    const dist = resolveBundleDistFrom({
       pkg,
       cwd,
       ...(deps.home !== undefined && { home: deps.home }),

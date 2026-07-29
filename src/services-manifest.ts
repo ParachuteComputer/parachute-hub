@@ -207,7 +207,7 @@ export interface ServiceEntry {
    * matches what notes / agent / vault expect today.
    *
    * Per-module rather than uniform because conventions differ:
-   *   - notes-serve.ts strips internally via `--mount`; expects the prefix.
+   *   - bundle-serve.ts strips internally via `--mount`; expects the prefix.
    *   - parachute-agent reads PARACHUTE_AGENT_WEB_MOUNT and strips itself.
    *   - parachute-vault routes by `/vault/<name>/...` and expects the prefix.
    *   - parachute-scribe serves bare paths (`/health`, `/v1/...`); the proxy

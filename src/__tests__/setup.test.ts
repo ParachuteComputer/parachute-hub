@@ -119,7 +119,10 @@ describe("isOfferable (fresh-install OFFER, 2026-06-25)", () => {
     expect(isOfferable({ short: "agent", installed: false })).toBe(true);
   });
 
-  test("does NOT offer a deprecated module (notes) on a fresh install", () => {
+  test("does NOT offer a RETIRED module (notes) on a fresh install", () => {
+    // hub#788: a retired module resolves for an existing install but is never
+    // offered to anyone new. Stronger than the old `deprecated` tier, which
+    // still listed it as installable.
     expect(isOfferable({ short: "notes", installed: false })).toBe(false);
     // runner is stronger than deprecated now: it left the registries entirely
     // (2026-07-01), so it never reaches the survey → isOfferable never sees
@@ -185,11 +188,11 @@ describe("setup", () => {
     }
   });
 
-  test("fresh box: the offered list excludes deprecated notes and removed Agent/runner", async () => {
+  test("fresh box: the offered list excludes RETIRED notes and removed Agent/runner", async () => {
     const h = makeHarness();
     try {
-      // 'all' picks every offered service. The clean-box offer excludes notes
-      // (deprecated) and retired Agent/runner, keeping vault/scribe/surface/app.
+      // 'all' picks every offered service. The clean-box offer excludes the
+      // retired notes (hub#788) and removed Agent/runner.
       const availability = scriptedAvailability([
         "all",
         "default", // vault name
