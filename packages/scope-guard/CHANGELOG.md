@@ -4,10 +4,16 @@ All notable changes to `@openparachute/scope-guard` are documented here. The for
 
 The library's RC cadence is independent of `@openparachute/hub`'s — they ship from the same repo but aren't coupled in version.
 
-## [0.5.1-rc.1]
+## [0.5.1]
 
 **`revocationOrigin` — the revocation fetch no longer hairpins through a
 public FQDN, and a fail-closed fetch no longer happens in silence.**
+
+> Shipped straight to STABLE rather than sitting on `@rc`. Vault depends on
+> `^0.5.0`, and semver excludes prereleases from a caret range — `^0.5.0` does
+> not match `0.5.1-rc.1`. So an rc could never reach the consumer that needs
+> the fix; a box would keep resolving 0.5.0 and keep rejecting every token.
+> The change is additive to the options surface and covered by 135 tests.
 
 ### Why
 
