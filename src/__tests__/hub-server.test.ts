@@ -2977,7 +2977,7 @@ describe("hubFetch /<svc>/* generic proxy dispatch (#182)", () => {
   test("routes /notes/sw.js to the matching upstream (notes-redirect opt-out)", async () => {
     // Notes is the canonical path-mount case — the PWA shell has to see the
     // full `/notes/...` path so its service worker registers correctly (the
-    // motivator for the `--mount` strip in notes-serve.ts).
+    // motivator for the `--mount` strip in bundle-serve.ts).
     //
     // Post-parachute-app §16 Phase 2 the `/notes/*` path 301-redirects to
     // `/surface/notes/*` by default. This test pins the notes-as-module legacy

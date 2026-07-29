@@ -11,7 +11,7 @@
  *
  * Why this is asset-correct with no rebuild: the app's Vite build is ROOT-based
  * (absolute `/assets/*`, PWA scope `/`, OAuth redirect URIs at the origin root).
- * The `/app` service mount serves the SAME dist through the `notes-serve.ts`
+ * The `/app` service mount serves the SAME dist through the `bundle-serve.ts`
  * shim with a `/app` prefix-strip; here we serve that identical dist verbatim at
  * `/`, which is exactly the origin the build assumes. So `serveAppAtRoot` and
  * the `/app` mount hand back byte-identical bundle files — the only difference
@@ -30,7 +30,7 @@
 
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { resolveNotesDistFrom } from "./notes-serve.ts";
+import { resolveBundleDistFrom } from "./bundle-serve.ts";
 
 /** The npm package whose built `dist/` is the app front door. */
 export const APP_PACKAGE = "@openparachute/app";
@@ -55,7 +55,7 @@ export const ROOT_SERVE_RESERVED_PREFIXES: readonly string[] = [
 /**
  * Build a resolver for the installed app's `dist/` directory.
  *
- * Resolution goes through the SAME `resolveNotesDistFrom` machinery the `/app`
+ * Resolution goes through the SAME `resolveBundleDistFrom` machinery the `/app`
  * mount's static-serve shim uses (so root-serve and `/app` resolve to one dist).
  * A SUCCESSFUL resolution is memoized for the process lifetime — a resolved dist
  * path doesn't move while the hub runs, and re-walking `Bun.resolveSync` on every
@@ -68,7 +68,7 @@ export const ROOT_SERVE_RESERVED_PREFIXES: readonly string[] = [
  * / ships no `dist/`).
  */
 export function makeAppDistResolver(
-  resolve: () => string = () => resolveNotesDistFrom({ pkg: APP_PACKAGE }),
+  resolve: () => string = () => resolveBundleDistFrom({ pkg: APP_PACKAGE }),
 ): () => string | null {
   let cached: string | null = null;
   return () => {
@@ -82,7 +82,7 @@ export function makeAppDistResolver(
   };
 }
 
-/** MIME overrides Bun.file doesn't infer (mirrors notes-serve.ts). */
+/** MIME overrides Bun.file doesn't infer (mirrors bundle-serve.ts). */
 function mimeFor(path: string): string | undefined {
   // Without this the PWA install prompt sees text/html for the manifest + bails.
   if (path.endsWith(".webmanifest")) return "application/manifest+json";

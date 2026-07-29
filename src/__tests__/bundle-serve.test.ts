@@ -7,8 +7,8 @@ import {
   notesDistCandidates,
   notesFetch,
   notesServeOptions,
-  resolveNotesDistFrom,
-} from "../notes-serve.ts";
+  resolveBundleDistFrom,
+} from "../bundle-serve.ts";
 
 interface Harness {
   dir: string;
@@ -16,7 +16,7 @@ interface Harness {
 }
 
 function makeHarness(): Harness {
-  const dir = mkdtempSync(join(tmpdir(), "pcli-notes-serve-"));
+  const dir = mkdtempSync(join(tmpdir(), "pcli-bundle-serve-"));
   writeFileSync(join(dir, "index.html"), "<html><body>notes spa</body></html>");
   writeFileSync(join(dir, "sw.js"), "self.addEventListener('install', () => {});");
   writeFileSync(join(dir, "manifest.webmanifest"), '{"name":"Notes","start_url":"/notes/"}');
@@ -179,7 +179,7 @@ describe("notesFetch /health (2026-07-11, hub-parity P5)", () => {
     // A harness with NO index.html written — the SPA-shell fallback would
     // throw/404 on this dist, but /health is answered before that code path
     // is ever reached.
-    const dir = mkdtempSync(join(tmpdir(), "pcli-notes-serve-empty-"));
+    const dir = mkdtempSync(join(tmpdir(), "pcli-bundle-serve-empty-"));
     try {
       const res = notesFetch(dir, "/app")(req("/app/health"));
       expect(res.status).toBe(200);
@@ -195,7 +195,7 @@ describe("notesFetch /health (2026-07-11, hub-parity P5)", () => {
 // These tests re-run the load-bearing PWA regression (sw.js / manifest
 // content-type, SPA fallback, mount-strip) for a NON-notes package/mount to
 // prove the generalization didn't accidentally hardcode "notes" anywhere in
-// the serving path (only `resolveNotesDistFrom`'s package resolution is
+// the serving path (only `resolveBundleDistFrom`'s package resolution is
 // notes-specific, and that's parameterized separately below).
 describe("notesFetch generalized for a non-notes package (hub-parity P5 — the app mount)", () => {
   function makeAppHarness(): Harness {
@@ -292,7 +292,7 @@ describe("notesDistCandidates", () => {
 
 /**
  * hub#780 regression. On Aaron's live box (2026-07-27) the supervisor launched
- * notes-serve with cwd `/`; from `/`, `Bun.resolveSync` fell through to bun's
+ * bundle-serve with cwd `/`; from `/`, `Bun.resolveSync` fell through to bun's
  * install *cache* (`~/.bun/install/cache/<pkg>@<ver>@@@1`), which shadowed the
  * bun-global link — hub served npm `@openparachute/app@0.22.5` for nine hours
  * while `status` reported the linked checkout. The fix drops `/` as a resolution
@@ -300,7 +300,7 @@ describe("notesDistCandidates", () => {
  * always wins. These tests drive the exact resolver ordering with a stubbed
  * `resolveSync`, so they fail on the unfixed candidate list and pass on the fix.
  */
-describe("resolveNotesDistFrom cwd=/ cache-shadow (hub#780)", () => {
+describe("resolveBundleDistFrom cwd=/ cache-shadow (hub#780)", () => {
   const APP_PKG = "@openparachute/app";
 
   test("with cwd '/' and a resolvable install-cache entry, resolution takes the global link, never the cache", () => {
@@ -320,7 +320,7 @@ describe("resolveNotesDistFrom cwd=/ cache-shadow (hub#780)", () => {
     );
 
     const probed: string[] = [];
-    const out = resolveNotesDistFrom({
+    const out = resolveBundleDistFrom({
       cwd: "/",
       home,
       pkg: APP_PKG,
@@ -343,24 +343,24 @@ describe("resolveNotesDistFrom cwd=/ cache-shadow (hub#780)", () => {
 });
 
 /**
- * `resolveNotesDistFrom` is the hub#194 fix — when the cwd-relative resolve
+ * `resolveBundleDistFrom` is the hub#194 fix — when the cwd-relative resolve
  * fails (hub repo dir doesn't depend on @openparachute/notes), we walk down
  * to bun's global install dirs before giving up. Tests use a stub
  * `resolveSync` so we can drive the candidate order without writing real
  * fixtures into `~/.bun/install/global`.
  */
-describe("resolveNotesDistFrom (hub#194)", () => {
+describe("resolveBundleDistFrom (hub#194)", () => {
   function makeFixture(): { home: string; cleanup: () => void; pkgRoot: string; dist: string } {
     // realpathSync — on macOS `mkdtempSync` returns a /var/folders path
     // that resolves to /private/var/folders; we want the resolved form so
     // string comparisons against `Bun.resolveSync` output line up.
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "pcli-notes-resolve-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "pcli-bundle-resolve-")));
     const home = join(root, "home");
-    const pkgRoot = join(home, ".bun/install/global/node_modules/@openparachute/notes");
+    const pkgRoot = join(home, ".bun/install/global/node_modules/@openparachute/app");
     mkdirSync(pkgRoot, { recursive: true });
     const dist = join(pkgRoot, "dist");
     mkdirSync(dist, { recursive: true });
-    writeFileSync(join(pkgRoot, "package.json"), '{"name":"@openparachute/notes"}');
+    writeFileSync(join(pkgRoot, "package.json"), '{"name":"@openparachute/app"}');
     return { home, pkgRoot, dist, cleanup: () => rmSync(root, { recursive: true, force: true }) };
   }
 
@@ -368,21 +368,21 @@ describe("resolveNotesDistFrom (hub#194)", () => {
     const f = makeFixture();
     try {
       const calls: string[] = [];
-      const out = resolveNotesDistFrom({
-        cwd: "/cwd-with-notes",
+      const out = resolveBundleDistFrom({
+        cwd: "/cwd-with-app",
         home: f.home,
         resolveSync: (specifier, base) => {
           calls.push(base);
-          if (base === "/cwd-with-notes") {
-            return "/cwd-with-notes/node_modules/@openparachute/notes/package.json";
+          if (base === "/cwd-with-app") {
+            return "/cwd-with-app/node_modules/@openparachute/app/package.json";
           }
           throw new Error(`unexpected base: ${base}`);
         },
-        existsSync: (p) => p === "/cwd-with-notes/node_modules/@openparachute/notes/dist",
+        existsSync: (p) => p === "/cwd-with-app/node_modules/@openparachute/app/dist",
       });
-      expect(out).toBe("/cwd-with-notes/node_modules/@openparachute/notes/dist");
+      expect(out).toBe("/cwd-with-app/node_modules/@openparachute/app/dist");
       // Only the cwd candidate should be probed — we short-circuit on hit.
-      expect(calls).toEqual(["/cwd-with-notes"]);
+      expect(calls).toEqual(["/cwd-with-app"]);
     } finally {
       f.cleanup();
     }
@@ -395,7 +395,7 @@ describe("resolveNotesDistFrom (hub#194)", () => {
     const f = makeFixture();
     try {
       const calls: string[] = [];
-      const out = resolveNotesDistFrom({
+      const out = resolveBundleDistFrom({
         cwd: "/hub-repo-cwd-without-notes",
         home: f.home,
         resolveSync: (specifier, base) => {
@@ -424,7 +424,7 @@ describe("resolveNotesDistFrom (hub#194)", () => {
     // that the third is reached.
     const probed: string[] = [];
     expect(() =>
-      resolveNotesDistFrom({
+      resolveBundleDistFrom({
         cwd: "/cwd",
         home: "/h",
         resolveSync: (_specifier, base) => {
@@ -432,7 +432,7 @@ describe("resolveNotesDistFrom (hub#194)", () => {
           throw new Error(`Cannot find module from '${base}'`);
         },
       }),
-    ).toThrow(/Could not resolve @openparachute\/notes from any of/);
+    ).toThrow(/Could not resolve @openparachute\/app from any of/);
     expect(probed).toEqual([
       "/cwd",
       "/h/.bun/install/global/node_modules",
@@ -443,7 +443,7 @@ describe("resolveNotesDistFrom (hub#194)", () => {
   test("error message names every candidate that was tried", () => {
     let caught: unknown;
     try {
-      resolveNotesDistFrom({
+      resolveBundleDistFrom({
         cwd: "/probe-cwd",
         home: "/probe-home",
         resolveSync: (_specifier, base) => {
@@ -459,7 +459,7 @@ describe("resolveNotesDistFrom (hub#194)", () => {
     expect(msg).toContain("/probe-home/.bun/install/global/node_modules");
     expect(msg).toContain("/probe-home/.bun/install/global");
     // Hint operators at the actionable next step.
-    expect(msg).toMatch(/bun add -g @openparachute\/notes|parachute install notes/);
+    expect(msg).toMatch(/bun add -g @openparachute\/app|parachute install app/);
   });
 
   test("resolved package without dist/ throws a hard error (no fallthrough)", () => {
@@ -468,8 +468,8 @@ describe("resolveNotesDistFrom (hub#194)", () => {
     // re-resolve the same package. Surface the problem with the resolved
     // path so the operator can file the right issue against the package.
     expect(() =>
-      resolveNotesDistFrom({
-        cwd: "/cwd-with-notes",
+      resolveBundleDistFrom({
+        cwd: "/cwd-with-app",
         home: "/h",
         resolveSync: () => "/cwd-with-notes/node_modules/@openparachute/notes/package.json",
         existsSync: () => false,
@@ -479,7 +479,7 @@ describe("resolveNotesDistFrom (hub#194)", () => {
 });
 
 /**
- * `--package` generalization (hub-parity P5, 2026-07-11). `resolveNotesDistFrom`
+ * `--package` generalization (hub-parity P5, 2026-07-11). `resolveBundleDistFrom`
  * defaults `pkg` to `@openparachute/notes` (every test above omits it and
  * still resolves notes — back-compat), but a caller like the `app`
  * FIRST_PARTY_FALLBACKS entry passes a different package name. These tests
@@ -487,7 +487,7 @@ describe("resolveNotesDistFrom (hub#194)", () => {
  * proving the specifier passed to `Bun.resolveSync` (and every error message)
  * is the caller's `pkg`, not a hardcoded "notes" string.
  */
-describe("resolveNotesDistFrom --package (hub-parity P5)", () => {
+describe("resolveBundleDistFrom --package (hub-parity P5)", () => {
   const APP_PKG = "@openparachute/app";
 
   function makeAppFixture(): { home: string; cleanup: () => void; dist: string } {
@@ -504,7 +504,7 @@ describe("resolveNotesDistFrom --package (hub-parity P5)", () => {
   test("resolves a non-notes package's dist/ via the global node_modules fallback", () => {
     const f = makeAppFixture();
     try {
-      const out = resolveNotesDistFrom({
+      const out = resolveBundleDistFrom({
         cwd: "/hub-repo-cwd-without-app",
         home: f.home,
         pkg: APP_PKG,
@@ -521,13 +521,13 @@ describe("resolveNotesDistFrom --package (hub-parity P5)", () => {
     }
   });
 
-  test("default pkg (no --package) still resolves @openparachute/notes — back-compat", () => {
-    // Every earlier describe block already exercises this implicitly (none
-    // pass `pkg`); this test pins it explicitly against the specifier the
-    // resolver hands to `resolveSync`.
+  // hub#788: the shim's default flipped notes → app when notes was retired.
+  // Every earlier describe block exercises the default implicitly (none pass
+  // `pkg`); this pins it explicitly against the specifier handed to resolveSync.
+  test("default pkg (no --package) resolves @openparachute/app — was notes pre-hub#788", () => {
     const specifiers: string[] = [];
     expect(() =>
-      resolveNotesDistFrom({
+      resolveBundleDistFrom({
         cwd: "/cwd",
         home: "/h",
         resolveSync: (specifier) => {
@@ -537,19 +537,22 @@ describe("resolveNotesDistFrom --package (hub-parity P5)", () => {
       }),
     ).toThrow();
     expect(specifiers).toEqual([
-      "@openparachute/notes/package.json",
-      "@openparachute/notes/package.json",
-      "@openparachute/notes/package.json",
+      "@openparachute/app/package.json",
+      "@openparachute/app/package.json",
+      "@openparachute/app/package.json",
     ]);
   });
 
-  test("error message names the caller's package, not a hardcoded 'notes'", () => {
+  test("error message names the caller's package, not the hardcoded default", () => {
+    // The probe package must NOT be the default (now @openparachute/app), or
+    // the assertion can't tell "named the caller's package" from "hardcoded".
+    const OTHER_PKG = "@acme/custom-surface";
     let caught: unknown;
     try {
-      resolveNotesDistFrom({
+      resolveBundleDistFrom({
         cwd: "/probe-cwd",
         home: "/probe-home",
-        pkg: APP_PKG,
+        pkg: OTHER_PKG,
         resolveSync: () => {
           throw new Error("nope");
         },
@@ -558,14 +561,14 @@ describe("resolveNotesDistFrom --package (hub-parity P5)", () => {
       caught = err;
     }
     const msg = (caught as Error).message;
-    expect(msg).toContain(`Could not resolve ${APP_PKG}`);
-    expect(msg).toContain(`bun add -g ${APP_PKG}`);
-    expect(msg).not.toContain("@openparachute/notes");
+    expect(msg).toContain("Could not resolve @acme/custom-surface");
+    expect(msg).toContain("bun add -g @acme/custom-surface");
+    expect(msg).not.toContain("@openparachute/app");
   });
 
   test("no-dist/ hard error names the caller's package", () => {
     expect(() =>
-      resolveNotesDistFrom({
+      resolveBundleDistFrom({
         cwd: "/cwd-with-app",
         home: "/h",
         pkg: APP_PKG,

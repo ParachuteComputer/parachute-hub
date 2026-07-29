@@ -43,8 +43,16 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-/** Back-compat default — the shim's original (and still primary) consumer. */
-const DEFAULT_PACKAGE = "@openparachute/notes";
+/**
+ * Default bundle when `--package` is omitted.
+ *
+ * Was `@openparachute/notes` — the shim's original consumer. Notes is retired
+ * (hub#788) and `@openparachute/app` is the front door now, so the default
+ * points at app. Every FIRST_PARTY_FALLBACKS entry passes `--package`
+ * explicitly, including the retired notes one, so this default only governs a
+ * bare hand-run of the shim.
+ */
+const DEFAULT_PACKAGE = "@openparachute/app";
 
 interface Args {
   port: number;
@@ -137,7 +145,7 @@ export function notesDistCandidates(cwd: string, home: string): string[] {
   return cwd === "/" ? globals : [cwd, ...globals];
 }
 
-export interface ResolveNotesDistDeps {
+export interface ResolveBundleDistDeps {
   cwd?: string;
   home?: string;
   /** npm package name to resolve. Defaults to `@openparachute/notes` (back-compat). */
@@ -147,7 +155,7 @@ export interface ResolveNotesDistDeps {
   existsSync?: (path: string) => boolean;
 }
 
-export function resolveNotesDistFrom(deps: ResolveNotesDistDeps = {}): string {
+export function resolveBundleDistFrom(deps: ResolveBundleDistDeps = {}): string {
   const cwd = deps.cwd ?? process.cwd();
   const home = deps.home ?? homedir();
   const pkg = deps.pkg ?? DEFAULT_PACKAGE;
@@ -182,7 +190,7 @@ export function resolveNotesDistFrom(deps: ResolveNotesDistDeps = {}): string {
 }
 
 function resolveNotesDist(pkg: string): string {
-  return resolveNotesDistFrom({ pkg });
+  return resolveBundleDistFrom({ pkg });
 }
 
 function mimeFor(path: string): string | undefined {

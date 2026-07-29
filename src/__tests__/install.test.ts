@@ -283,7 +283,7 @@ describe("install", () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       const logs: string[] = [];
-      const code = await install("notes", {
+      const code = await install("app", {
         runner: async (cmd) => (cmd[0] === "bun" ? 1 : 0),
         manifestPath: path,
         configDir,
@@ -291,15 +291,15 @@ describe("install", () => {
         isLinked: () => false,
         portProbe: async () => false,
         findGlobalInstall: (pkg) =>
-          pkg === "@openparachute/notes"
-            ? "/fake/bun/global/node_modules/@openparachute/notes/package.json"
+          pkg === "@openparachute/app"
+            ? "/fake/bun/global/node_modules/@openparachute/app/package.json"
             : null,
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
-      const seeded = findService("parachute-notes", path);
-      expect(seeded?.port).toBe(1942);
-      expect(logs.join("\n")).toMatch(/Seeded services\.json entry for parachute-notes/);
+      const seeded = findService("parachute-app", path);
+      expect(seeded?.port).toBe(1944);
+      expect(logs.join("\n")).toMatch(/Seeded services\.json entry for parachute-app/);
       expect(logs.join("\n")).toMatch(/bun 1\.2\.x lockfile quirk/);
     } finally {
       cleanup();
@@ -381,15 +381,15 @@ describe("install", () => {
     const { path, configDir, cleanup } = makeTempPath();
     try {
       const logs: string[] = [];
-      const code = await install("notes", {
+      const code = await install("app", {
         runner: async (cmd) => {
           if (cmd[0] === "bun") {
             upsertService(
               {
-                name: "parachute-notes",
+                name: "parachute-app",
                 port: 5173,
-                paths: ["/notes"],
-                health: "/notes/health",
+                paths: ["/app"],
+                health: "/app/health",
                 version: "0.0.1",
               },
               path,
@@ -405,11 +405,11 @@ describe("install", () => {
         log: (l) => logs.push(l),
       });
       expect(code).toBe(0);
-      expect(logs.join("\n")).toMatch(/Updated services\.json port to 1942/);
-      expect(logs.join("\n")).toMatch(/registered on port 1942/);
+      expect(logs.join("\n")).toMatch(/Updated services\.json port to 1944/);
+      expect(logs.join("\n")).toMatch(/registered on port 1944/);
       expect(logs.join("\n")).not.toMatch(/outside the canonical Parachute range/);
-      const entry = findService("parachute-notes", path);
-      expect(entry?.port).toBe(1942);
+      const entry = findService("parachute-app", path);
+      expect(entry?.port).toBe(1944);
     } finally {
       cleanup();
     }
@@ -1466,22 +1466,29 @@ describe("install", () => {
     }
   });
 
-  test("notes install emits the post-install footer pointing at the Notes UI", async () => {
+  // hub#788 — notes + scribe are retired. The install path refuses them
+  // BEFORE `bun add -g`, so a retired package is never pulled down. (An
+  // existing services.json row keeps working; see the retirement tests in
+  // service-spec-discovery.test.ts.)
+  test("refuses to install the retired notes module", async () => {
     const { path, cleanup } = makeTempPath();
     try {
       const logs: string[] = [];
+      let ranBunAdd = false;
       const code = await install("notes", {
-        runner: async () => 0,
+        runner: async () => {
+          ranBunAdd = true;
+          return 0;
+        },
         manifestPath: path,
         startService: async () => 0,
         isLinked: () => false,
         portProbe: async () => false,
         log: (l) => logs.push(l),
       });
-      expect(code).toBe(0);
-      const joined = logs.join("\n");
-      expect(joined).toMatch(/Open your Notes UI at http:\/\/localhost:1942\/notes/);
-      expect(joined).toMatch(/http:\/\/127\.0\.0\.1:1940\/vault\/default/);
+      expect(code).toBe(1);
+      expect(ranBunAdd).toBe(false);
+      expect(logs.join("\n")).toMatch(/retired/i);
     } finally {
       cleanup();
     }
@@ -2548,7 +2555,7 @@ describe("app-only serve-app set-if-unset default", () => {
     try {
       const db = openHubDb(hubDbPath(configDir));
       try {
-        const code = await install("notes", {
+        const code = await install("scribe", {
           runner: async () => 0,
           manifestPath: path,
           configDir,

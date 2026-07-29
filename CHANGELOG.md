@@ -6,6 +6,46 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.9-rc.1] - 2026-07-29
+
+**Notes is retired.** It stopped being maintained a long time ago, but it kept
+showing up: in the module catalog, in the fresh-install offer, in the surface
+tagline, and as the default package of the static-bundle shim. A retired module
+sitting in a list of things to install reads as an endorsement, and operators
+kept installing it.
+
+Retirement here is **graceful, and that word is load-bearing**. Notes is a
+prebuilt PWA bundle with no `module.json` of its own, so its start command is
+hub-side logic. Deleting the registry entry outright would have left a box that
+already runs notes with no start command at all — log-and-skipped at boot, the
+operator's installed PWA silently no longer served. Retiring a module shouldn't
+break a running install; it should stop pushing the thing at anyone new.
+
+So the entry stays, marked `retired`, and the two questions get separated:
+
+- `isKnownModuleShort` — **can we RESOLVE this?** Still true for notes, so
+  lifecycle / status / expose keep working on an existing row.
+- `isInstallableShort` — **may we INSTALL this?** Now false. `parachute install
+  notes` refuses *before* `bun add -g`, and `POST /api/modules/notes/install`
+  returns `410 module_retired`.
+
+Notes is gone from `discoverableShorts()`, the admin catalog, and the setup
+wizard's offer. An existing row logs an operator-facing retirement note that
+says what to do about it.
+
+Also:
+
+- `notes-serve.ts` → **`bundle-serve.ts`**, and its default package flips from
+  `@openparachute/notes` to `@openparachute/app`. It has served any prebuilt
+  SPA bundle since hub-parity P5; the name and default were leftovers.
+- The `surface` tagline no longer advertises "auto-installs Notes on first
+  boot" — surface hosts custom surfaces; app is the front door.
+
+Scribe's retirement is deliberately **not** in this release. It drags ~830
+lines of install machinery (provider config, the transcription wizard, the
+`SCRIBE_AUTH_TOKEN` auto-wire) plus the vault-side `SCRIBE_URL` removal with
+it, and bundling the two would make both harder to review.
+
 ## [0.7.8] - 2026-07-28
 
 **Stable promotion of the 0.7.8 line (7 commits over 0.7.7).** Promotes rc.1–rc.5

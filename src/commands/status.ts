@@ -178,7 +178,7 @@ interface StatusRow {
   staleNote?: string;
   /**
    * Served-bundle divergence warning (hub#780). Set for shim-served rows
-   * (notes/app) when the notes-serve shim resolves the bundle somewhere other
+   * (notes/app) when the bundle-serve shim resolves the bundle somewhere other
    * than the bun-global link the SOURCE column reflects — the silent
    * version-rollback signal (a stale bundle served while status looks healthy).
    * Surfaced as a continuation line so the operator sees it at a glance.
@@ -242,7 +242,7 @@ interface ManifestRowBase {
   staleNote?: string;
   /**
    * Served-bundle divergence warning (hub#780). Set for shim-served rows
-   * (notes/app) when the notes-serve resolution lands somewhere other than the
+   * (notes/app) when the bundle-serve resolution lands somewhere other than the
    * bun-global link the SOURCE column reflects — the silent-version-rollback
    * signal. Surfaced as a continuation line alongside `staleNote`.
    */
@@ -283,14 +283,14 @@ function manifestRowBase(
     : undefined;
 
   // Served-bundle guardrail (hub#780). Only shim-served rows (notes/app —
-  // served via `notes-serve.ts`) have a resolution distinct from their launch
+  // served via `bundle-serve.ts`) have a resolution distinct from their launch
   // command; for those, resolve the bundle the way the shim does at serve time
   // and warn if it diverges from the bun-global link the SOURCE column shows.
   // The `startCmd` referencing the shim is the shim-served signal (getSpec
   // returns undefined → no note for unknown/third-party rows). Never throws.
   let servedNote: string | undefined;
   const spec = short ? getSpec(short) : undefined;
-  const shimServed = spec?.startCmd?.(entry)?.some((a) => a.endsWith("notes-serve.ts")) ?? false;
+  const shimServed = spec?.startCmd?.(entry)?.some((a) => a.endsWith("bundle-serve.ts")) ?? false;
   if (shimServed && spec?.package) {
     servedNote = servedDivergenceNote(
       spec.package,

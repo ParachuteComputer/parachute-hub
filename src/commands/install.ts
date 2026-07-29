@@ -44,6 +44,8 @@ import {
   type ServiceSpec,
   composeServiceSpec,
   isCanonicalPort,
+  isRetiredShort,
+  retirementNote,
   synthesizeManifestForKnownModule,
 } from "../service-spec.ts";
 import { findService, readManifest, upsertService } from "../services-manifest.ts";
@@ -908,6 +910,16 @@ export async function install(input: string, opts: InstallOpts = {}): Promise<nu
 
   const target = resolveInstallTarget(input, opts, log);
   if (!target) return 1;
+
+  // Retired modules (hub#788 — notes, scribe) resolve for lifecycle so an
+  // existing install keeps working, but must not be installed afresh. Refuse
+  // BEFORE `bun add -g` so we never pull the package down. A local-path
+  // install is exempt: that's an operator deliberately pointing at a checkout,
+  // not the registry handing out a retired module.
+  if (target.kind !== "local-path" && isRetiredShort(input)) {
+    log(retirementNote(input) ?? `"${input}" is retired and can no longer be installed.`);
+    return 1;
+  }
 
   // bun-add gate: skip when the package is already wired up.
   //   - first-party + isLinked: scribe-style `bun link` against an unpublished

@@ -7,8 +7,12 @@ import {
   discoverableShorts,
   findServiceByShort,
   focusForShort,
+  isInstallableShort,
   isKnownModuleShort,
+  isRetiredShort,
+  retirementNote,
   shortNameForManifest,
+  getSpec,
 } from "../service-spec.ts";
 
 // 2026-06-09 modular-UI architecture (P2): discovery is driven by the union of
@@ -16,29 +20,32 @@ import {
 // whitelist. These helpers are the seam.
 
 describe("discoverableShorts", () => {
-  test("is the deduped union of FIRST_PARTY_FALLBACKS ∪ KNOWN_MODULES", () => {
+  test("is the deduped union of FIRST_PARTY_FALLBACKS ∪ KNOWN_MODULES, minus retired", () => {
     const shorts = discoverableShorts();
-    const expected = new Set([
-      ...Object.keys(FIRST_PARTY_FALLBACKS),
-      ...Object.keys(KNOWN_MODULES),
-    ]);
+    const expected = new Set(
+      [...Object.keys(FIRST_PARTY_FALLBACKS), ...Object.keys(KNOWN_MODULES)].filter(
+        (s) => !isRetiredShort(s),
+      ),
+    );
     expect(new Set(shorts)).toEqual(expected);
     // No duplicates.
     expect(shorts.length).toBe(new Set(shorts).size);
   });
 
-  test("includes the supported module set and excludes retired Agent", () => {
+  test("includes the supported set; excludes removed Agent and retired notes", () => {
     const shorts = discoverableShorts();
-    for (const s of ["vault", "scribe", "surface", "app", "notes"]) {
+    for (const s of ["vault", "scribe", "surface", "app"]) {
       expect(shorts).toContain(s);
     }
     expect(shorts).not.toContain("agent");
+    // hub#788 — notes is retired. It resolves, but it is not discovered.
+    expect(shorts).not.toContain("notes");
   });
 
   test("FIRST_PARTY_FALLBACKS shorts lead KNOWN_MODULES shorts (registry order)", () => {
     const shorts = discoverableShorts();
-    // notes (a FALLBACK) appears before vault (KNOWN_MODULES) in the union.
-    expect(shorts.indexOf("notes")).toBeLessThan(shorts.indexOf("vault"));
+    // app (a FALLBACK) appears before vault (KNOWN_MODULES) in the union.
+    expect(shorts.indexOf("app")).toBeLessThan(shorts.indexOf("vault"));
   });
 });
 
@@ -52,13 +59,10 @@ describe("focusForShort", () => {
 
   test("falls back to the default tier map when undeclared", () => {
     expect(focusForShort("vault")).toBe("core");
-    expect(focusForShort("scribe")).toBe("core");
     expect(focusForShort("surface")).toBe("core");
+    expect(focusForShort("app")).toBe("core");
     // agent stays a legit experimental preview — still offered on a fresh install.
     expect(focusForShort("agent")).toBe("experimental");
-    // notes (notes-daemon, deprecated 2026-05-22) is `deprecated`: still
-    // resolvable + shown-if-installed, but NOT offered on a fresh setup.
-    expect(focusForShort("notes")).toBe("deprecated");
   });
 
   test("unlisted shorts default to experimental", () => {
@@ -70,13 +74,41 @@ describe("focusForShort", () => {
     expect(focusForShort("agent", "deprecated")).toBe("deprecated");
   });
 
-  test("deprecated shorts stay resolvable (discoverable) — back-compat for existing installs", () => {
-    // The deprecated tier de-emphasizes + drops the fresh-install OFFER; it does
-    // NOT remove the short from the resolution surface, so an existing
-    // notes install keeps routing + lifecycle.
-    const shorts = discoverableShorts();
-    expect(shorts).toContain("notes");
-    expect(isKnownModuleShort("notes")).toBe(true);
+});
+
+// hub#788 — notes + scribe retirement. Graceful by design: an operator who
+// already runs them keeps running them; nobody new is offered them.
+//
+// The distinction that carries the whole thing is `isKnownModuleShort`
+// (RESOLVE — still true, so lifecycle/status/expose work on an existing row)
+// vs `isInstallableShort` (INSTALL — now false). Collapsing those two would
+// either break existing installs or keep handing out retired modules.
+describe("retired modules (hub#788)", () => {
+  for (const short of ["notes"]) {
+    test(`${short} still RESOLVES so an existing services.json row keeps working`, () => {
+      expect(isKnownModuleShort(short)).toBe(true);
+      expect(isRetiredShort(short)).toBe(true);
+      // A spec is still composable — that's what lifecycle needs.
+      expect(getSpec(short)?.manifestName).toBe(`parachute-${short}`);
+    });
+
+    test(`${short} is NOT discoverable and NOT installable`, () => {
+      expect(discoverableShorts()).not.toContain(short);
+      expect(isInstallableShort(short)).toBe(false);
+    });
+
+    test(`${short} carries an operator-facing retirement note`, () => {
+      const note = retirementNote(short);
+      expect(note).toBeTruthy();
+      expect(note).toMatch(/retired/i);
+    });
+  }
+
+  test("live modules stay installable", () => {
+    for (const short of ["vault", "scribe", "surface", "app"]) {
+      expect(isInstallableShort(short)).toBe(true);
+      expect(isRetiredShort(short)).toBe(false);
+    }
   });
 });
 
