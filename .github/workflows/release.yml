@@ -49,6 +49,11 @@ name: Release
 
 on:
   push:
+    # hub#790: publish-on-merge. See the `plan` job for why the tag was
+    # replaced as the release SIGNAL (it's still honoured, and still cut as a
+    # record).
+    branches:
+      - main
     tags:
       # Hub release tags
       - 'v[0-9]+.[0-9]+.[0-9]+'
@@ -69,6 +74,45 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # What, if anything, needs publishing.
+  #
+  # hub#790: releasing used to require remembering `git tag && git push` after
+  # every merge. The remembering is the weak link — several PRs merged in one
+  # session with no tags, so nothing published and nobody noticed until an
+  # operator asked why their box was stale.
+  #
+  # Governance rule 2 already requires every code-touching PR to bump `version`,
+  # so package.json IS the per-PR release intent; the tag was a second, manual
+  # copy of a decision the PR already made. The decision logic lives in
+  # `scripts/release-plan.ts` (unit-tested — release logic that can
+  # double-publish or drop a release shouldn't be untested shell in a `run:`).
+  #
+  # Note the tag-push path is unchanged: an explicit tag still publishes, and
+  # still overrides every check, because a tag is a human saying "release this".
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      hub: ${{ steps.hub.outputs.should_publish }}
+      scope_guard: ${{ steps.scope_guard.outputs.should_publish }}
+      depcheck: ${{ steps.depcheck.outputs.should_publish }}
+      door_contract: ${{ steps.door_contract.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3
+      - id: hub
+        run: bun scripts/release-plan.ts . @openparachute/hub
+      - id: scope_guard
+        run: bun scripts/release-plan.ts packages/scope-guard @openparachute/scope-guard
+      - id: depcheck
+        run: bun scripts/release-plan.ts packages/depcheck @openparachute/depcheck
+      - id: door_contract
+        run: bun scripts/release-plan.ts packages/door-contract @openparachute/door-contract
+
   test:
     name: test
     runs-on: ubuntu-latest
@@ -113,9 +157,9 @@ jobs:
 
   publish-hub-npm:
     name: publish hub to npm
-    needs: test
+    needs: [plan, test]
     # Hub-only: skip on scope-guard / depcheck / door-contract tags (a `v*` tag is hub's).
-    if: ${{ !startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-') }}
+    if: ${{ (github.ref_type == 'tag' && (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) || (github.ref_type != 'tag' && needs.plan.outputs.hub == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -136,6 +180,9 @@ jobs:
       - name: install deps
         run: bun install --frozen-lockfile
       - name: verify package.json version matches tag
+        # Tag path only — on a branch push the version comes FROM
+        # package.json, so there is nothing to drift against.
+        if: github.ref_type == 'tag'
         # Defense against tag-vs-package.json drift. If they don't match,
         # we'd publish under the wrong version.
         run: |
@@ -168,9 +215,9 @@ jobs:
 
   publish-scope-guard-npm:
     name: publish scope-guard to npm
-    needs: test
+    needs: [plan, test]
     # scope-guard-only: skip on hub (`v*`) tags.
-    if: ${{ startsWith(github.ref_name, 'scope-guard-') }}
+    if: ${{ (github.ref_type == 'tag' && (startsWith(github.ref_name, 'scope-guard-'))) || (github.ref_type != 'tag' && needs.plan.outputs.scope_guard == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -198,6 +245,9 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: bun install --frozen-lockfile
       - name: verify package.json version matches tag
+        # Tag path only — on a branch push the version comes FROM
+        # package.json, so there is nothing to drift against.
+        if: github.ref_type == 'tag'
         run: |
           PKG_VERSION=$(bun -e "console.log(require('./package.json').version)")
           # Strip the `scope-guard-v` prefix from the tag.
@@ -218,9 +268,9 @@ jobs:
 
   publish-depcheck-npm:
     name: publish depcheck to npm
-    needs: test
+    needs: [plan, test]
     # depcheck-only: skip on hub (`v*`) + scope-guard tags.
-    if: ${{ startsWith(github.ref_name, 'depcheck-') }}
+    if: ${{ (github.ref_type == 'tag' && (startsWith(github.ref_name, 'depcheck-'))) || (github.ref_type != 'tag' && needs.plan.outputs.depcheck == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -246,6 +296,9 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: bun install --frozen-lockfile
       - name: verify package.json version matches tag
+        # Tag path only — on a branch push the version comes FROM
+        # package.json, so there is nothing to drift against.
+        if: github.ref_type == 'tag'
         run: |
           PKG_VERSION=$(bun -e "console.log(require('./package.json').version)")
           # Strip the `depcheck-v` prefix from the tag.
@@ -268,9 +321,9 @@ jobs:
 
   publish-door-contract-npm:
     name: publish door-contract to npm
-    needs: test
+    needs: [plan, test]
     # door-contract-only: skip on hub (`v*`) + scope-guard + depcheck tags.
-    if: ${{ startsWith(github.ref_name, 'door-contract-') }}
+    if: ${{ (github.ref_type == 'tag' && (startsWith(github.ref_name, 'door-contract-'))) || (github.ref_type != 'tag' && needs.plan.outputs.door_contract == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -296,6 +349,9 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: bun install --frozen-lockfile
       - name: verify package.json version matches tag
+        # Tag path only — on a branch push the version comes FROM
+        # package.json, so there is nothing to drift against.
+        if: github.ref_type == 'tag'
         run: |
           PKG_VERSION=$(bun -e "console.log(require('./package.json').version)")
           # Strip the `door-contract-v` prefix from the tag.
@@ -318,9 +374,9 @@ jobs:
 
   publish-image:
     name: publish to ghcr.io
-    needs: test
+    needs: [plan, test]
     # Hub-only: scope-guard / depcheck / door-contract don't ship a container image.
-    if: ${{ !startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-') }}
+    if: ${{ (github.ref_type == 'tag' && (!startsWith(github.ref_name, 'scope-guard-') && !startsWith(github.ref_name, 'depcheck-') && !startsWith(github.ref_name, 'door-contract-'))) || (github.ref_type != 'tag' && needs.plan.outputs.hub == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -360,3 +416,43 @@ jobs:
           # fast (typically ~30s warm vs ~3min cold).
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Record what shipped as git tags.
+  #
+  # A RECORD, not a trigger — nothing fires off these, which is exactly why
+  # GITHUB_TOKEN pushing them is fine (a token-pushed tag can't start a
+  # workflow, and here it doesn't need to). `always()` with per-package result
+  # checks so one package's publish failure doesn't suppress the others' tags.
+  # ---------------------------------------------------------------------------
+  tag-record:
+    name: tag what shipped
+    needs: [plan, publish-hub-npm, publish-scope-guard-npm, publish-depcheck-npm, publish-door-contract-npm]
+    if: ${{ always() && github.ref_type != 'tag' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3
+      - name: tag published packages
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          tag_if() {  # <prefix> <dir> <published?>
+            [ "$3" = "success" ] || return 0
+            V=$(bun -e "console.log(require('./$2/package.json').version)")
+            T="$1$V"
+            if git rev-parse "$T" >/dev/null 2>&1; then
+              echo "$T already exists"
+            else
+              git tag "$T" && git push origin "$T" && echo "tagged $T"
+            fi
+          }
+          tag_if "v"              "."                      "${{ needs.publish-hub-npm.result }}"
+          tag_if "scope-guard-v"  "packages/scope-guard"   "${{ needs.publish-scope-guard-npm.result }}"
+          tag_if "depcheck-v"     "packages/depcheck"      "${{ needs.publish-depcheck-npm.result }}"
+          tag_if "door-contract-v" "packages/door-contract" "${{ needs.publish-door-contract-npm.result }}"
