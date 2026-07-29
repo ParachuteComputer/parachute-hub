@@ -283,12 +283,54 @@ export interface CreateScopeGuardOptions {
   jwksGetter?: JwksGetter;
 
   /**
+   * Origin the revocation list is FETCHED from — the exact sibling of
+   * `jwksOrigin`, and for the exact same reason.
+   *
+   * **Defaults to `jwksOrigin` when that is supplied, else to `hubOrigin`.**
+   *
+   * Motivation (the bug this option exists to close): `jwksOrigin` landed in
+   * vault#464 because a co-located resource server must not fetch keys from
+   * the PUBLIC hub FQDN — that hairpins out and back to the same box, which
+   * is slow on a VPS and a hard failure under Docker NAT-loopback or a
+   * tailnet whose MagicDNS the box itself can't resolve. The revocation
+   * fetch has the identical topology and did NOT get the identical fix: it
+   * stayed pinned to the canonical `hubOrigin`.
+   *
+   * The consequence was worse than the JWKS case, because revocation
+   * **fails closed** on a cold cache. A box that couldn't reach its own
+   * public FQDN rejected *every* hub-issued JWT with
+   * `revocation_unavailable` — a fully bricked resource server, presenting
+   * to the operator as a 401 that downstream UIs render as "you're not
+   * signed in." Signing in again could never help.
+   *
+   * Defaulting to `jwksOrigin` means any consumer that already opted into
+   * the loopback JWKS fetch (vault does) is fixed without a code change on
+   * their side; the two fetches now travel the same path by construction,
+   * which is the property that was missing. Consumers with a genuinely
+   * split topology can still set this explicitly.
+   */
+  revocationOrigin?: string | (() => string);
+
+  /**
    * Inject a revocation-list fetcher. Tests use this to drive list contents
    * (revoked / clear / failure) deterministically without needing a real
    * `<origin>/.well-known/parachute-revocation.json` endpoint. Production
-   * uses the default fetcher (`globalThis.fetch` against the hub origin).
+   * uses the default fetcher (`globalThis.fetch` against the revocation
+   * origin).
    */
   revocationFetcher?: RevocationFetcher;
+
+  /**
+   * Called when a revocation-list fetch fails. See
+   * `CreateRevocationCacheOptions.onFetchError` — defaults to a throttled
+   * `console.warn` on the fail-CLOSED case (which means this resource server
+   * is rejecting 100% of hub tokens and an operator needs to know).
+   */
+  revocationOnFetchError?: (info: {
+    origin: string;
+    fatal: boolean;
+    error: unknown;
+  }) => void;
 
   /**
    * Override the revocation cache TTL (ms). Tests use small values to
@@ -360,6 +402,7 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
     hubOrigin,
     allowedIssuers,
     jwksOrigin,
+    revocationOrigin,
     jwks: jwksOpts,
     jwksGetter: injected,
     allowMissingJti = false,
@@ -372,6 +415,15 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
   // while accepting a public `iss` (vault#464). Both resolvers are re-evaluated
   // per request, so env changes propagate without a restart.
   const jwksOriginInput = jwksOrigin ?? hubOrigin;
+
+  // The origin the REVOCATION LIST is fetched from. Follows `jwksOrigin` by
+  // default, falling back to `hubOrigin` — see the `revocationOrigin` jsdoc.
+  // The short version: this fetch has the same co-located-hairpin problem
+  // vault#464 fixed for JWKS, but it fails CLOSED, so getting it wrong bricks
+  // the resource server rather than merely slowing it down. Chaining the
+  // default off `jwksOrigin` means a consumer can't fix one and silently
+  // leave the other pointed at an unreachable public FQDN.
+  const revocationOriginInput = revocationOrigin ?? jwksOriginInput;
 
   const reloadMinIntervalMs = opts.jwksReloadMinIntervalMs ?? DEFAULT_JWKS_RELOAD_MIN_INTERVAL_MS;
   const reloadNow = opts.jwksReloadNow ?? (() => Date.now());
@@ -400,6 +452,7 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
       fetcher: opts.revocationFetcher,
       ttlMs: opts.revocationTtlMs,
       now: opts.revocationNow,
+      onFetchError: opts.revocationOnFetchError,
     });
     revocation = { origin, cache };
     return cache;
@@ -644,7 +697,7 @@ export function createScopeGuard(opts: CreateScopeGuardOptions): ScopeGuard {
       // we may have undefined jti — those tokens skip the lookup entirely
       // since revocation can't be enforced without an index key.
       if (jti !== undefined) {
-        const cache = pickRevocationCache(origin);
+        const cache = pickRevocationCache(resolveOrigin(revocationOriginInput));
         const outcome = await cache.check(jti);
         if (outcome === "revoked") {
           // Surface the jti in the error message for operator audit visibility.
