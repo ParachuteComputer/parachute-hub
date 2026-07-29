@@ -6,6 +6,79 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.9-rc.5] - 2026-07-29
+
+**Root `/mcp` now advertises `vault:admin`, so MCP clients can manage tag
+schemas again.**
+
+The RFC 9728 document for root `/mcp` was being FORWARDED from the vault
+daemon. That was wrong in kind: root `/mcp` is a hub resource, so its metadata
+was authored by a service that doesn't know hub's scope registry. Vault's root
+PRM hard-codes `[vault:read, vault:write]`, on reasoning that predates the
+2026-05-29 single-consent change — per-vault `vault:<name>:admin` has been
+genuinely requestable through public consent since then, capped to the
+consenting user's own authority at the mint choke-point.
+
+So the issuer would grant admin happily; the advertisement was the only thing
+withholding it. A spec-following MCP client reads `scopes_supported` and
+requests exactly what it lists, so admin never got requested — and **updating
+tags needs admin**, which put a core workflow out of reach over MCP.
+
+Hub now authors the document, sharing `advertisedScopes` with the bare PRM so
+the two can't drift: one registry, one filter (requestable ∧
+module-installed), two documents. Non-requestable operator scopes are still
+excluded — advertising what the issuer always rejects would mislead clients.
+
+Forwarding also made hub-level scopes structurally impossible to surface here,
+since vault has no concept of them. That's now unblocked, though `account:self:*`
+remains in `NON_REQUESTABLE_SCOPES` and so is still (correctly) absent — see the
+PR discussion.
+
+## [0.7.9-rc.4] - 2026-07-29
+
+**Fix: publish-on-merge sent rc versions to `@latest`.**
+
+The `plan` job derived the dist-tag correctly, but the four publish steps
+re-derived their own from `GITHUB_REF_NAME` — which on a merge-triggered run is
+`"main"`, matching no rc pattern, so every publish-on-merge landed on `latest`.
+`0.7.9-rc.3` became `@latest` that way, meaning `bun add -g @openparachute/hub`
+installed a prerelease.
+
+The dist-tag now comes from the version being published, read from that
+package's own `package.json` at publish time — the only source that cannot drift
+from the artifact.
+
+Required a manual `npm dist-tag add @openparachute/hub@0.7.8 latest` to repair
+the tag already moved; CI has no credential that can move a dist-tag backwards.
+
+Also surfaced (pre-existing): `@openparachute/door-contract@0.6.1` fails to
+publish with `404 … you do not have permission` — a missing npm
+Trusted-Publisher rule, long listed in `RELEASING.md` as an operator TODO. Left
+failing loudly rather than skipped, since a silent skip hides a package that
+never ships.
+
+## [0.7.9-rc.3] - 2026-07-29
+
+**Publish on merge, and promote scope-guard 0.5.1 to stable.**
+
+Releasing required remembering `git tag && git push` after every merge, and the
+remembering was the weak link — several PRs merged in one session with no tags,
+so nothing published until someone asked why a box was stale. Governance rule 2
+already requires every code-touching PR to bump `version`, so package.json is
+the per-PR release intent; the tag was a second, manual copy of that decision.
+
+Tag-on-merge-and-let-the-tag-fire does not work: events triggered by
+`GITHUB_TOKEN` never start another workflow run. One workflow, no recursion.
+
+Decision logic lives in `scripts/release-plan.ts`, unit-tested, with three
+guards: idempotent (skip an already-published version), ambiguity refuses (a
+registry 5xx exits non-zero rather than guessing), and no backwards publishes
+(refuses to move a dist-tag to an older version — the parallel-merge hazard).
+
+`@openparachute/scope-guard` 0.5.1 went straight to stable, skipping `@rc`:
+vault depends on `^0.5.0` and semver excludes prereleases from a caret range, so
+an rc could never reach the consumer that needs the revocation-origin fix.
+
 ## [0.7.9-rc.1] - 2026-07-29
 
 **Notes is retired.** It stopped being maintained a long time ago, but it kept

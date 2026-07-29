@@ -339,6 +339,7 @@ import {
   handleRevoke,
   handleToken,
   protectedResourceMetadata,
+  rootMcpProtectedResourceMetadata,
 } from "./oauth-handlers.ts";
 import { renderNotFoundPage } from "./oauth-ui.ts";
 import { assertSameOriginForCookieMutation, buildHubBoundOrigins } from "./origin-check.ts";
@@ -2935,13 +2936,21 @@ export function hubFetch(
 
       // /.well-known/oauth-protected-resource/mcp — the PRM for root /mcp
       // (RFC 9728, path-suffixed per the MCP spec's per-resource discovery
-      // convention). UNLIKE the bare PRM above, this doc is FORWARDED from
-      // the vault daemon rather than built locally — the daemon names /mcp
-      // as the resource + its own scopes (vault:read / vault:write). Same
-      // wildcard CORS shape as its sibling; the vault's `Response.json`
-      // carries none of its own, so we fold it onto the proxied response —
-      // this well-known surface is deliberately CORS-open for browser-side
-      // MCP client discovery.
+      // convention).
+      //
+      // hub#789: this used to be FORWARDED from the vault daemon. That was
+      // wrong in kind — root /mcp is a HUB resource, so its metadata was being
+      // authored by a service that doesn't know hub's scope registry. The
+      // visible symptom was `vault:admin` missing from the advertisement (so a
+      // spec-following MCP client never requested it, and tag-schema
+      // management was unreachable over MCP even though the issuer grants
+      // admin happily since the 2026-05-29 single-consent change). It also
+      // made hub-level scopes structurally impossible to advertise here.
+      //
+      // Now built locally from the same `advertisedScopes` the bare PRM uses,
+      // so the two documents share one registry and one filter and can't drift.
+      // Same wildcard CORS shape as its sibling — this well-known surface is
+      // deliberately CORS-open for browser-side MCP client discovery.
       if (pathname === "/.well-known/oauth-protected-resource/mcp") {
         const corsHeaders = {
           "access-control-allow-origin": "*",
@@ -2950,11 +2959,10 @@ export function hubFetch(
         if (req.method === "OPTIONS") {
           return new Response(null, { status: 204, headers: corsHeaders });
         }
-        const proxied = await proxyToVaultDaemon(req, manifestPath, deps?.supervisor, peerAddr);
-        if (!proxied) return vaultModuleNotRunning();
-        const merged = new Headers(proxied.headers);
+        const res = rootMcpProtectedResourceMetadata(oauthDeps(req));
+        const merged = new Headers(res.headers);
         for (const [k, v] of Object.entries(corsHeaders)) merged.set(k, v);
-        return new Response(proxied.body, { status: proxied.status, headers: merged });
+        return new Response(res.body, { status: res.status, headers: merged });
       }
 
       // GET /.well-known/parachute-account — the account-door capabilities

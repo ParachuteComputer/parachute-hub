@@ -35,6 +35,7 @@ import {
   handleRevoke,
   handleToken,
   protectedResourceMetadata,
+  rootMcpProtectedResourceMetadata,
   vaultScopeForUser,
 } from "../oauth-handlers.ts";
 import { PENDING_LOGIN_COOKIE_NAME, _resetPendingLogins } from "../pending-login.ts";
@@ -296,6 +297,70 @@ describe("protectedResourceMetadata (RFC 9728, closes hub#393)", () => {
     expect(scopes).toContain("vault:read");
     expect(scopes).toContain("widget:read");
     expect(scopes).not.toContain("parachute:host:admin");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hub#789 — the root /mcp PRM is HUB-authored, not vault-forwarded.
+//
+// Root /mcp is a hub resource, so hub must author its metadata. It used to be
+// proxied straight from the vault daemon, which hard-codes
+// [vault:read, vault:write] — so `vault:admin` never appeared in the
+// advertisement, a spec-following MCP client never requested it, and
+// tag-schema management was unreachable over MCP even though the issuer
+// grants admin fine (per-vault admin became requestable in the 2026-05-29
+// single-consent change). Hub-level scopes could never appear at all, since
+// vault has no concept of them.
+// ---------------------------------------------------------------------------
+describe("rootMcpProtectedResourceMetadata (hub#789)", () => {
+  const declared = new Set<string>([
+    "vault:read",
+    "vault:write",
+    "vault:admin",
+    "parachute:host:admin",
+  ]);
+  const call = () =>
+    rootMcpProtectedResourceMetadata({
+      issuer: ISSUER,
+      loadDeclaredScopes: () => declared,
+      loadServicesManifest: fixtureLoadServicesManifest,
+    });
+
+  test("advertises vault:admin — the regression that made tag editing unreachable over MCP", async () => {
+    const body = (await call().json()) as Record<string, unknown>;
+    expect(body.scopes_supported as string[]).toContain("vault:admin");
+  });
+
+  test("names the /mcp endpoint as the resource, not the bare origin", async () => {
+    // The client matches this against the endpoint that 401'd it; the bare
+    // origin is a different resource and wouldn't match.
+    const body = (await call().json()) as Record<string, unknown>;
+    expect(body.resource).toBe(`${ISSUER}/mcp`);
+    expect(body.authorization_servers).toEqual([ISSUER]);
+  });
+
+  test("still filters non-requestable scopes — advertising what we always reject misleads clients", async () => {
+    const body = (await call().json()) as Record<string, unknown>;
+    expect(body.scopes_supported as string[]).not.toContain("parachute:host:admin");
+  });
+
+  test("shares the bare PRM's scope set, so the two documents can't drift apart", async () => {
+    // The point of authoring locally: one registry, one filter, two documents.
+    const root = (await call().json()) as Record<string, unknown>;
+    const bare = (await protectedResourceMetadata({
+      issuer: ISSUER,
+      loadDeclaredScopes: () => declared,
+      loadServicesManifest: fixtureLoadServicesManifest,
+    }).json()) as Record<string, unknown>;
+    expect([...(root.scopes_supported as string[])].sort()).toEqual(
+      [...(bare.scopes_supported as string[])].sort(),
+    );
+  });
+
+  test("conforms to the door contract, same as its sibling", async () => {
+    const body = (await call().json()) as Record<string, unknown>;
+    expect(body.bearer_methods_supported).toEqual(["header"]);
+    expect(body.resource_documentation).toMatch(/parachute\.computer/);
   });
 });
 
