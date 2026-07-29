@@ -6,6 +6,30 @@ All notable changes to `@openparachute/hub` are documented here. The format foll
 >
 > This backfill covers the 0.6.x line only. Two pre-existing gaps remain undocumented and are **not** addressed here: the `0.5.13` stable itself (the file's newest entry is `0.5.13-rc.48`, never the stable) and the entire `0.5.14-rc` chain (rc.1–rc.21 on npm), which never promoted to a `0.5.14` stable — its work folded forward into 0.6.0.
 
+## [0.7.9-rc.6] - 2026-07-29
+
+**`/` lands on the app when the app is installed, and `parachute init`
+installs it.**
+
+Self-hosted has been landing operators on the admin SPA — a maintenance
+console — while the hosted door lands them in the app. Same stack, same vault,
+and one of them opens on settings.
+
+- **`parachute init` now installs `@openparachute/app`** alongside the vault.
+  Non-fatal: a failed app install leaves a working hub that lands on `/admin`,
+  because failing setup over the front door would be the worse outcome.
+  `skipApp` opts out for headless / API-only boxes.
+- **The bare-`/` default becomes `/app`** when the app module is installed,
+  `/admin` otherwise.
+
+A **default, not an override.** It sits at the bottom of the existing chain —
+`hub_settings.root_redirect` → `PARACHUTE_HUB_ROOT_REDIRECT` → here — so an
+operator who has ever set a root target keeps it. Installing the app cannot
+move a front door someone chose.
+
+A **redirect**, not serve-at-root, so the address bar shows `/app` and where you
+are stays legible. `root_mode=serve-app` remains for the no-hop version.
+
 ## [0.7.9-rc.5] - 2026-07-29
 
 **Root `/mcp` now advertises `vault:admin`, so MCP clients can manage tag

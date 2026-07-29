@@ -496,8 +496,40 @@ export function setNotesRedirectDisabled(db: Database, value: boolean): void {
 /** Env override for the bare-`/` redirect target. Below the DB row, above the default. */
 export const PARACHUTE_HUB_ROOT_REDIRECT_ENV = "PARACHUTE_HUB_ROOT_REDIRECT";
 
-/** Fallback when neither DB row nor env is set — the admin shell (unchanged behavior). */
+/**
+ * Fallback when neither DB row nor env is set, on a box with no app installed.
+ *
+ * The admin shell is a maintenance surface, not a front door — it's the right
+ * landing only when there's nothing better to land on. See
+ * {@link defaultRootRedirectFor}.
+ */
 export const DEFAULT_ROOT_REDIRECT = "/admin";
+
+/** Where `/` lands by default when `@openparachute/app` IS installed. */
+export const APP_ROOT_REDIRECT = "/app";
+
+/**
+ * The DEFAULT bare-`/` target for this box (hub#791).
+ *
+ * `/app` when the app module is installed, `/admin` otherwise.
+ *
+ * Self-hosted has been landing operators on the admin SPA — a maintenance
+ * console — while the hosted door lands them in the app. That's the single
+ * most visible way the two doors diverge: same stack, same vault, and one of
+ * them opens on settings. Once an operator has installed the app, it is the
+ * front door, and `/` should say so.
+ *
+ * Deliberately a DEFAULT, not an override. It sits at the bottom of the
+ * precedence chain (db → env → here), so an operator who has ever set a root
+ * target keeps it — installing the app can't silently move someone's front
+ * door out from under them. It is also *redirect* rather than serve-at-root:
+ * the address bar ends up showing `/app`, so where you are is legible rather
+ * than implicit.
+ */
+export function defaultRootRedirectFor(manifest: { services: { name: string }[] }): string {
+  const hasApp = manifest.services.some((s) => s.name === "parachute-app");
+  return hasApp ? APP_ROOT_REDIRECT : DEFAULT_ROOT_REDIRECT;
+}
 
 /**
  * Open-redirect guard for the configurable bare-`/` redirect target.
@@ -600,7 +632,16 @@ export interface ResolvedRootRedirect {
  */
 export function resolveRootRedirectDetailed(
   db: Database | null,
-  opts: { env?: NodeJS.ProcessEnv; warn?: (msg: string) => void } = {},
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    warn?: (msg: string) => void;
+    /**
+     * services.json, used only to pick the DEFAULT when nothing is configured
+     * (app installed → `/app`). Omitted → the historical `/admin` default, so
+     * every existing caller behaves exactly as before.
+     */
+     manifest?: { services: { name: string }[] };
+  } = {},
 ): ResolvedRootRedirect {
   const env = opts.env ?? process.env;
   const warn = opts.warn ?? ((msg: string) => console.warn(msg));
@@ -625,14 +666,21 @@ export function resolveRootRedirectDetailed(
     );
   }
 
-  // 3. Default — unchanged behavior.
-  return { value: DEFAULT_ROOT_REDIRECT, source: "default" };
+  // 3. Default — `/app` when the app is installed, else the admin shell.
+  return {
+    value: opts.manifest ? defaultRootRedirectFor(opts.manifest) : DEFAULT_ROOT_REDIRECT,
+    source: "default",
+  };
 }
 
 /** Convenience: just the resolved path (see `resolveRootRedirectDetailed`). */
 export function resolveRootRedirect(
   db: Database | null,
-  opts: { env?: NodeJS.ProcessEnv; warn?: (msg: string) => void } = {},
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    warn?: (msg: string) => void;
+    manifest?: { services: { name: string }[] };
+  } = {},
 ): string {
   return resolveRootRedirectDetailed(db, opts).value;
 }
