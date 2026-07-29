@@ -205,11 +205,16 @@ jobs:
         run: |
           # Detect rc vs stable from tag name. Tag pattern in `on:` above
           # enforces the shape, so this is just disambiguation.
-          if [[ "$GITHUB_REF_NAME" =~ -rc\. ]]; then
-            DIST_TAG=rc
-          else
-            DIST_TAG=latest
-          fi
+          # dist-tag comes from the VERSION BEING PUBLISHED, not from the ref.
+          # This used to read GITHUB_REF_NAME, which on a merge-triggered run is
+          # "main" — matching no rc pattern, so every publish-on-merge landed on
+          # `latest`. hub 0.7.9-rc.3 became @latest that way (hub#792). The
+          # package's own version is the only honest source here.
+          PKG_VERSION=$(bun -e "console.log(require('${{ github.workspace }}/package.json').version)")
+          case "$PKG_VERSION" in
+            *-rc.*) DIST_TAG=rc ;;
+            *)      DIST_TAG=latest ;;
+          esac
           echo "publishing with dist-tag=$DIST_TAG"
           npm publish --tag "$DIST_TAG" --access public --provenance
 
@@ -258,11 +263,16 @@ jobs:
           fi
       - name: publish
         run: |
-          if [[ "$GITHUB_REF_NAME" =~ -rc\. ]]; then
-            DIST_TAG=rc
-          else
-            DIST_TAG=latest
-          fi
+          # dist-tag comes from the VERSION BEING PUBLISHED, not from the ref.
+          # This used to read GITHUB_REF_NAME, which on a merge-triggered run is
+          # "main" — matching no rc pattern, so every publish-on-merge landed on
+          # `latest`. hub 0.7.9-rc.3 became @latest that way (hub#792). The
+          # package's own version is the only honest source here.
+          PKG_VERSION=$(bun -e "console.log(require('${{ github.workspace }}/packages/scope-guard/package.json').version)")
+          case "$PKG_VERSION" in
+            *-rc.*) DIST_TAG=rc ;;
+            *)      DIST_TAG=latest ;;
+          esac
           echo "publishing @openparachute/scope-guard with dist-tag=$DIST_TAG"
           npm publish --tag "$DIST_TAG" --access public --provenance
 
@@ -311,11 +321,16 @@ jobs:
         # prepublishOnly runs `bun run build` (tsc → dist/) before the tarball
         # is assembled, so the published package ships compiled JS + d.ts.
         run: |
-          if [[ "$GITHUB_REF_NAME" =~ -rc\. ]]; then
-            DIST_TAG=rc
-          else
-            DIST_TAG=latest
-          fi
+          # dist-tag comes from the VERSION BEING PUBLISHED, not from the ref.
+          # This used to read GITHUB_REF_NAME, which on a merge-triggered run is
+          # "main" — matching no rc pattern, so every publish-on-merge landed on
+          # `latest`. hub 0.7.9-rc.3 became @latest that way (hub#792). The
+          # package's own version is the only honest source here.
+          PKG_VERSION=$(bun -e "console.log(require('${{ github.workspace }}/packages/depcheck/package.json').version)")
+          case "$PKG_VERSION" in
+            *-rc.*) DIST_TAG=rc ;;
+            *)      DIST_TAG=latest ;;
+          esac
           echo "publishing @openparachute/depcheck with dist-tag=$DIST_TAG"
           npm publish --tag "$DIST_TAG" --access public --provenance
 
@@ -364,11 +379,16 @@ jobs:
         # prepublishOnly runs `bun run build` (tsc → dist/) before the tarball
         # is assembled, so the published package ships compiled JS + d.ts.
         run: |
-          if [[ "$GITHUB_REF_NAME" =~ -rc\. ]]; then
-            DIST_TAG=rc
-          else
-            DIST_TAG=latest
-          fi
+          # dist-tag comes from the VERSION BEING PUBLISHED, not from the ref.
+          # This used to read GITHUB_REF_NAME, which on a merge-triggered run is
+          # "main" — matching no rc pattern, so every publish-on-merge landed on
+          # `latest`. hub 0.7.9-rc.3 became @latest that way (hub#792). The
+          # package's own version is the only honest source here.
+          PKG_VERSION=$(bun -e "console.log(require('${{ github.workspace }}/packages/door-contract/package.json').version)")
+          case "$PKG_VERSION" in
+            *-rc.*) DIST_TAG=rc ;;
+            *)      DIST_TAG=latest ;;
+          esac
           echo "publishing @openparachute/door-contract with dist-tag=$DIST_TAG"
           npm publish --tag "$DIST_TAG" --access public --provenance
 
