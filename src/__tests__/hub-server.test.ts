@@ -6801,7 +6801,13 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
     }
   });
 
-  test("GET /.well-known/oauth-protected-resource/mcp forwards + carries wildcard CORS; OPTIONS answers locally", async () => {
+  // hub#789: this document is now HUB-authored, not forwarded. Root /mcp is a
+  // hub resource, so hub owns its metadata; forwarding meant vault — which
+  // hard-codes [read, write] and knows nothing of hub's scope registry — was
+  // describing a hub endpoint. The visible cost was `vault:admin` missing from
+  // the advertisement, so MCP clients never requested it and tag-schema
+  // management was unreachable over MCP.
+  test("GET /.well-known/oauth-protected-resource/mcp is answered LOCALLY (not forwarded), with wildcard CORS", async () => {
     const h = makeHarness();
     const upstream = startRecordingUpstream();
     try {
@@ -6810,19 +6816,23 @@ describe("hubFetch root /mcp forwarding (vault 0.7.3 canonical root MCP)", () =>
 
       const getRes = await fetcher(req("/.well-known/oauth-protected-resource/mcp"));
       expect(getRes.status).toBe(200);
-      // The vault's Response.json carries no CORS of its own — hub folds it on.
       expect(getRes.headers.get("access-control-allow-origin")).toBe("*");
-      expect(upstream.requests().map((r) => r.pathname)).toEqual([
-        "/.well-known/oauth-protected-resource/mcp",
-      ]);
+
+      const body = (await getRes.json()) as Record<string, unknown>;
+      // Names the /mcp endpoint as the resource, and advertises hub's set —
+      // including admin, which the forwarded vault document omitted.
+      expect(String(body.resource)).toMatch(/\/mcp$/);
+      expect(body.scopes_supported as string[]).toContain("vault:admin");
+
+      // The decisive assertion: the vault daemon is never consulted.
+      expect(upstream.requests().length).toBe(0);
 
       const optRes = await fetcher(
         req("/.well-known/oauth-protected-resource/mcp", { method: "OPTIONS" }),
       );
       expect(optRes.status).toBe(204);
       expect(optRes.headers.get("access-control-allow-origin")).toBe("*");
-      // OPTIONS answered locally — the daemon only ever saw the earlier GET.
-      expect(upstream.requests().length).toBe(1);
+      expect(upstream.requests().length).toBe(0);
     } finally {
       upstream.stop();
       h.cleanup();

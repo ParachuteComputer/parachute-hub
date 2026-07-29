@@ -451,6 +451,53 @@ function advertisedScopes(declared: ReadonlySet<string>, manifest: ServicesManif
     });
 }
 
+/**
+ * RFC 9728 PRM for the ROOT `/mcp` resource, authored HERE rather than
+ * forwarded from the vault daemon (hub#789).
+ *
+ * Root `/mcp` is a HUB resource — hub owns the endpoint, the issuer, and the
+ * scope registry. Until now hub proxied this document straight from the vault
+ * daemon, which meant the metadata describing a hub resource was written by a
+ * service that doesn't know hub's scope set. Two consequences, both observed
+ * live:
+ *
+ *   - **`vault:admin` was missing.** Vault's root PRM hard-codes
+ *     `[read, write]` on the reasoning that "admin is an operator concern, not
+ *     something the consent picker offers". That reasoning predates the
+ *     2026-05-29 single-consent change, which made per-vault
+ *     `vault:<name>:admin` genuinely requestable through public consent
+ *     (capped to the consenting user's own authority at the mint
+ *     choke-point). So the issuer would happily grant admin — the
+ *     advertisement was the only thing withholding it, and a spec-following
+ *     client reads the advertisement and requests exactly what it lists.
+ *     Admin is what MCP clients need to manage tag schemas, so the gap made a
+ *     core workflow unreachable over MCP.
+ *
+ *   - **Hub-level scopes could never appear at all.** Vault has no concept of
+ *     them, so no edit to vault could have surfaced them here.
+ *
+ * Sharing `advertisedScopes` with the bare PRM is the point: one scope
+ * registry, filtered by one rule (requestable ∧ module-installed), so the two
+ * documents cannot drift apart again.
+ */
+export function rootMcpProtectedResourceMetadata(deps: OAuthDeps): Response {
+  const iss = deps.issuer;
+  const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
+  return jsonResponse({
+    // The resource is the root MCP endpoint, not the origin — that's what
+    // distinguishes this document from the bare PRM, and what the client
+    // matches against the endpoint it got the 401 from.
+    resource: `${iss}/mcp`,
+    authorization_servers: [iss],
+    scopes_supported: advertisedScopes(
+      declared,
+      (deps.loadServicesManifest ?? readServicesManifest)(),
+    ),
+    bearer_methods_supported: ["header"],
+    resource_documentation: "https://parachute.computer",
+  });
+}
+
 export function protectedResourceMetadata(deps: OAuthDeps): Response {
   const iss = deps.issuer;
   const declared = (deps.loadDeclaredScopes ?? loadDeclaredScopes)();
