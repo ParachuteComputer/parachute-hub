@@ -2691,9 +2691,12 @@ export function hubFetch(
       // modules, user surfaces) that used to live here.
       //
       // The target is operator-configurable (resolveRootRedirect): a hub_settings
-      // `root_redirect` row → `PARACHUTE_HUB_ROOT_REDIRECT` env → `/admin`
-      // default. Lets an operator point their hub's root at a surface (e.g. a
-      // team reading-room) instead of the admin shell, without redeploying. The
+      // `root_redirect` row → `PARACHUTE_HUB_ROOT_REDIRECT` env → a default that
+      // is `/app` when the app module is installed and `/admin` otherwise
+      // (hub#791 — self-hosted was landing operators on a maintenance console
+      // while the hosted door lands them in the app; once the app is installed
+      // it IS the front door). Lets an operator point their hub's root at a
+      // surface (e.g. a team reading-room) instead, without redeploying. The
       // resolver re-validates every layer through the same-origin guard
       // (`isSafeRedirectPath`) so a stored/env value can NEVER produce an open
       // redirect — an unsafe value is ignored and falls back to `/admin`.
@@ -2735,7 +2738,14 @@ export function hubFetch(
         }
         return new Response(null, {
           status: 302,
-          headers: { location: resolveRootRedirect(getDb ? getDb() : null) },
+          headers: {
+            // The manifest only picks the DEFAULT (app installed → /app); a
+            // stored or env-set target still wins, so installing the app can't
+            // move an operator's configured front door out from under them.
+            location: resolveRootRedirect(getDb ? getDb() : null, {
+              manifest: readManifestLenient(manifestPath),
+            }),
+          },
         });
       }
 

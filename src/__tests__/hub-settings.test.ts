@@ -32,6 +32,8 @@ import {
   isFirstClientAutoApproveWindowOpen,
   isModuleInstallChannel,
   isNotesRedirectDisabled,
+  APP_ROOT_REDIRECT,
+  defaultRootRedirectFor,
   isRootMode,
   isSafeRedirectPath,
   isSetupExposeMode,
@@ -903,5 +905,71 @@ describe("hub-settings — root_mode storage + resolution", () => {
     expect(resolveRootMode(null, { env: { [PARACHUTE_HUB_ROOT_MODE_ENV]: "serve-app" } })).toBe(
       "serve-app",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hub#791 — `/` defaults to the app when the app is installed.
+//
+// Self-hosted was landing operators on the admin SPA — a maintenance console —
+// while the hosted door lands them in the app. Same stack, same vault, and one
+// of them opens on settings. Once an operator has installed the app it IS the
+// front door, and `/` should say so.
+//
+// The load-bearing constraint is that this is a DEFAULT, not an override: it
+// sits at the bottom of db → env → default, so installing the app can never
+// silently move a front door someone deliberately configured.
+// ---------------------------------------------------------------------------
+describe("defaultRootRedirectFor (hub#791)", () => {
+  const withApp = { services: [{ name: "parachute-vault" }, { name: "parachute-app" }] };
+  const withoutApp = { services: [{ name: "parachute-vault" }] };
+
+  test("app installed → /app", () => {
+    expect(defaultRootRedirectFor(withApp)).toBe(APP_ROOT_REDIRECT);
+  });
+
+  test("no app → the admin shell, unchanged", () => {
+    expect(defaultRootRedirectFor(withoutApp)).toBe(DEFAULT_ROOT_REDIRECT);
+  });
+
+  test("an empty box → the admin shell", () => {
+    expect(defaultRootRedirectFor({ services: [] })).toBe(DEFAULT_ROOT_REDIRECT);
+  });
+});
+
+describe("resolveRootRedirect with a manifest (hub#791)", () => {
+  const withApp = { services: [{ name: "parachute-app" }] };
+
+  test("nothing configured + app installed → /app, source=default", () => {
+    const r = resolveRootRedirectDetailed(null, { env: {}, manifest: withApp });
+    expect(r).toEqual({ value: "/app", source: "default" });
+  });
+
+  test("an EXPLICIT env target still wins over the app default", () => {
+    // The whole point: installing the app must not move a configured root.
+    const r = resolveRootRedirectDetailed(null, {
+      env: { PARACHUTE_HUB_ROOT_REDIRECT: "/surface/reading-room" },
+      manifest: withApp,
+    });
+    expect(r).toEqual({ value: "/surface/reading-room", source: "env" });
+  });
+
+  test("omitting the manifest preserves the historical /admin default", () => {
+    // Every existing caller passes no manifest and must be unaffected.
+    const r = resolveRootRedirectDetailed(null, { env: {} });
+    expect(r).toEqual({ value: "/admin", source: "default" });
+  });
+
+  test("an unsafe env value still falls back safely, app or not", () => {
+    const warns: string[] = [];
+    const r = resolveRootRedirectDetailed(null, {
+      env: { PARACHUTE_HUB_ROOT_REDIRECT: "https://evil.example.com" },
+      manifest: withApp,
+      warn: (m) => warns.push(m),
+    });
+    // Falls to the DEFAULT layer — which, with the app installed, is /app.
+    expect(r.source).toBe("default");
+    expect(r.value).toBe("/app");
+    expect(warns.length).toBe(1);
   });
 });

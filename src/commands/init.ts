@@ -181,6 +181,18 @@ export interface InitOpts {
     channel?: "latest" | "rc",
   ) => Promise<number>;
   /**
+   * Test seam for the app-module install (hub#791). Production installs
+   * `@openparachute/app` so a fresh self-hosted box has a front door rather
+   * than only a maintenance console. Pass `skipApp: true` to opt out.
+   */
+  installAppModuleImpl?: (
+    configDir: string,
+    manifestPath: string,
+    channel?: "latest" | "rc",
+  ) => Promise<number>;
+  /** Skip the app install (headless / API-only boxes that want no frontend). */
+  skipApp?: boolean;
+  /**
    * Override the wizard-choice prompt (hub#168 Cut 4). When set, the
    * "Continue setup in the browser or CLI?" question is answered without
    * a prompt; otherwise default is `browser`. Non-interactive shells
@@ -589,6 +601,35 @@ async function defaultInstallVaultModule(
 }
 
 /**
+ * Default impl for the app-module install step (hub#791).
+ *
+ * A self-hosted box that installs only the vault lands its operator on the
+ * admin SPA — a maintenance console — while the hosted door lands them in the
+ * app. Installing the app during init is what closes that gap; the root
+ * redirect then defaults to `/app` (see `defaultRootRedirectFor`).
+ *
+ * `noStart: true` for the same reason vault uses it: the hub supervises its
+ * modules, and init's job is to put the package on disk, not to race the
+ * supervisor. Non-fatal by design — a box without the app is still a working
+ * box, and failing init over the front door would be a worse outcome than
+ * landing on `/admin`.
+ */
+async function defaultInstallAppModule(
+  configDir: string,
+  manifestPath: string,
+  channel?: "latest" | "rc",
+): Promise<number> {
+  const installOpts: InstallOpts = {
+    configDir,
+    manifestPath,
+    noStart: true,
+    log: (line) => console.log(`[install app] ${line}`),
+  };
+  if (channel) installOpts.channel = channel;
+  return await defaultInstall("app", installOpts);
+}
+
+/**
  * Default impl for the CLI wizard chain (hub#168 Cut 3). Lazy-imports
  * `runCliWizard` from `./wizard.ts`. Tests pass a stub via
  * `runCliWizardImpl` rather than triggering the real HTTP-to-localhost
@@ -793,6 +834,7 @@ export async function init(opts: InitOpts = {}): Promise<number> {
   const exposeTailnetImpl = opts.exposeTailnetImpl ?? defaultExposeTailnet;
   const exposeCloudflareImpl = opts.exposeCloudflareImpl ?? defaultExposeCloudflare;
   const installVaultModuleImpl = opts.installVaultModuleImpl ?? defaultInstallVaultModule;
+  const installAppModuleImpl = opts.installAppModuleImpl ?? defaultInstallAppModule;
   // hub#694 bug 2: resolve the channel for the vault module install. Precedence:
   // explicit `--channel <v>` (opts.channel) > `PARACHUTE_CHANNEL` /
   // `PARACHUTE_INSTALL_CHANNEL` env > undefined (install's own "latest"
@@ -869,6 +911,29 @@ export async function init(opts: InitOpts = {}): Promise<number> {
     if (installCode !== 0) {
       log(
         `⚠ vault module install returned ${installCode}; the wizard can retry from /admin/setup.`,
+      );
+    }
+    log("");
+  }
+
+  // hub#791 — install the app so `/` has somewhere real to land. Without it a
+  // fresh box redirects to the admin SPA, which is a maintenance console, not
+  // a front door; the hosted door lands people in the app and self-hosted
+  // should match. Non-fatal: a box without the app still works, it just lands
+  // on `/admin`.
+  const appAlreadyInstalled = (() => {
+    try {
+      return findService("parachute-app", manifestPath) !== undefined;
+    } catch {
+      return false;
+    }
+  })();
+  if (!opts.skipApp && !appAlreadyInstalled) {
+    log("Installing the Parachute app so your hub has a front door…");
+    const appCode = await installAppModuleImpl(configDir, manifestPath, installChannel);
+    if (appCode !== 0) {
+      log(
+        `⚠ app install returned ${appCode}; your hub still works and \`/\` will land on /admin. Retry with \`parachute install app\`.`,
       );
     }
     log("");
