@@ -30,9 +30,29 @@ export interface AdminAuthContext {
 export class AdminAuthError extends Error {
   override name = "AdminAuthError";
   status: number;
-  constructor(status: number, message: string) {
+  /**
+   * The scope the caller needed, when the failure was an insufficient-scope
+   * 403. Rendered as the RFC 6750 §3 `scope` parameter on the
+   * `WWW-Authenticate` challenge — the field spec-following clients actually
+   * parse, as opposed to `error_description`, which is prose for humans.
+   *
+   * This is the standard discovery path for a scope that isn't advertised.
+   * Parachute deliberately keeps `account:*` out of `scopes_supported` (RFC
+   * 8414 §2 and RFC 9728 §2 both say a server MAY do exactly that, and MCP's
+   * 2025-11-25 authorization spec goes further — `scopes_supported` is meant
+   * to be the MINIMAL set, with more obtained through step-up). The cost was
+   * that an unattended agent had no mechanical way to learn those scopes
+   * exist. Naming the scope in the challenge closes that: attempt the
+   * operation, get a 403 that says which scope to ask for, step up.
+   *
+   * Same shape `git-transport.ts` already emits — this brings the account
+   * surface in line with in-repo precedent.
+   */
+  requiredScope: string | undefined;
+  constructor(status: number, message: string, requiredScope?: string) {
     super(message);
     this.status = status;
+    this.requiredScope = requiredScope;
   }
 }
 
@@ -96,7 +116,7 @@ export async function requireScope(
     typeof scopeClaim === "string" ? scopeClaim.split(/\s+/).filter((s) => s.length > 0) : [];
 
   if (!scopes.includes(requiredScope)) {
-    throw new AdminAuthError(403, `token missing required scope: ${requiredScope}`);
+    throw new AdminAuthError(403, `token missing required scope: ${requiredScope}`, requiredScope);
   }
 
   const clientIdRaw = (validated.payload as { client_id?: unknown }).client_id;
@@ -111,6 +131,21 @@ export async function requireScope(
  * Convenience for route handlers that want to do
  * `try { ctx = await requireScope(...) } catch (err) { return adminAuthErrorResponse(err); }`.
  */
+/**
+ * Build the `WWW-Authenticate` challenge, including the RFC 6750 §3 `scope`
+ * parameter when we know which scope was missing.
+ *
+ * Quoted-string values can't contain a raw `"`, so the description is
+ * sanitised; the scope token is emitted verbatim because scope values are
+ * already constrained to a safe charset.
+ */
+function buildChallenge(err: AdminAuthError): string {
+  const code = err.status === 403 ? "insufficient_scope" : "invalid_token";
+  const parts = [`Bearer error="${code}"`, `error_description="${err.message.replace(/"/g, "'")}"`];
+  if (err.status === 403 && err.requiredScope) parts.push(`scope="${err.requiredScope}"`);
+  return parts.join(", ");
+}
+
 export function adminAuthErrorResponse(err: unknown): Response {
   if (err instanceof AdminAuthError) {
     return new Response(
@@ -122,7 +157,7 @@ export function adminAuthErrorResponse(err: unknown): Response {
         status: err.status,
         headers: {
           "content-type": "application/json",
-          "www-authenticate": `Bearer error="${err.status === 403 ? "insufficient_scope" : "invalid_token"}", error_description="${err.message.replace(/"/g, "'")}"`,
+          "www-authenticate": buildChallenge(err),
         },
       },
     );
