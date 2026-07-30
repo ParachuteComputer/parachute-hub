@@ -524,6 +524,25 @@ export const KNOWN_MODULES: Record<string, KnownModule> = {
     canonicalPaths: ["/scribe"],
     canonicalHealth: "/scribe/health",
     canonicalStripPrefix: true,
+    // Retired 2026-07-30. Scribe's job — turning vault recordings into text —
+    // moved INTO vault: `TRANSCRIPTION_PROVIDER=whisper-cpp` runs whisper.cpp
+    // locally, installed and verified end-to-end by `parachute-vault
+    // transcription install` (vault#635/#636), and it is vault's default on any
+    // box without a reachable scribe (vault#640). A separate transcription
+    // service is a second process, a second port, and a second thing to break
+    // for something the vault now does in-process.
+    //
+    // Graceful, exactly like notes: an existing row keeps being supervised and
+    // vault keeps resolving it, because a box that transcribes today must not
+    // stop transcribing on upgrade. Only NEW installs are refused.
+    retired: {
+      note:
+        "The `scribe` module is retired and is no longer offered or installable. " +
+        "Vault transcribes locally now — run `parachute-vault transcription install` " +
+        "to set up whisper.cpp, then check the Transcription page in the vault admin " +
+        "UI. An existing scribe keeps working and keeps being used until you remove " +
+        "it with `parachute uninstall scribe`.",
+    },
     extras: {
       // Backward-compat startCmd for rows without installDir (legacy
       // services.json from pre-installDir-stamping, or test fixtures).
