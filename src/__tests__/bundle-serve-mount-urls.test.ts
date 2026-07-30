@@ -16,7 +16,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { rewriteManifestScope, rewriteRootAbsoluteUrls } from "../bundle-serve.ts";
+import { injectMountMeta, rewriteManifestScope, rewriteRootAbsoluteUrls } from "../bundle-serve.ts";
 
 const REAL_SHELL = `<!doctype html>
 <html lang="en">
@@ -129,5 +129,37 @@ describe("rewriteManifestScope", () => {
       rewriteManifestScope(JSON.stringify({ start_url: "https://x.example/" }), "/app"),
     );
     expect(out.start_url).toBe("https://x.example/");
+  });
+});
+
+describe("injectMountMeta", () => {
+  test("tells the bundle where it's mounted, in <head>, before the module script", () => {
+    // `@openparachute/app` resolves its router basename from
+    // `<meta name="parachute-mount">` — its own documented, highest-priority
+    // contract — and nothing was injecting one. Its pathname fallback knows
+    // `/surface/<slug>` and `/notes/` but NOT `/app`, so a bundle served at
+    // `/app` fell through to ROOT_FALLBACK ("") and believed it lived at the
+    // origin root: opening a note produced `/n/<id>` instead of `/app/n/<id>`.
+    const out = injectMountMeta("<html><head><script src=x></script></head></html>", "/app");
+    expect(out).toContain('<meta name="parachute-mount" content="/app">');
+    expect(out.indexOf("parachute-mount")).toBeLessThan(out.indexOf("<script"));
+  });
+
+  test("does NOT override a tag the host already injected", () => {
+    // A surface host injects its own; the host's contract must win, or we'd
+    // silently remount someone else's embed.
+    const html = '<html><head><meta name="parachute-mount" content="/surface/notes"></head></html>';
+    expect(injectMountMeta(html, "/app")).toBe(html);
+  });
+
+  test("empty mount is a no-op — the origin-root case is already correct", () => {
+    const html = "<html><head></head></html>";
+    expect(injectMountMeta(html, "")).toBe(html);
+  });
+
+  test("works for a nested mount", () => {
+    expect(injectMountMeta("<html><head></head></html>", "/surface/notes")).toContain(
+      'content="/surface/notes"',
+    );
   });
 });
